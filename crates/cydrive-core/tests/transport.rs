@@ -4,8 +4,10 @@
 //!
 //! Contract under test (design doc "核心抽象：CloudTransport" + compat
 //! contracts 3/5): connection gating, msg_id allocation from 1, chunk
-//! naming `{stem}.part{NNN}` (3-digit zero-padded, 1-based), captions
-//! containing the rel_path and `i/n`, `telegram_msg_id` = chunk 0's msg_id,
+//! naming `{name}.part{NNN}` (name = rel_path basename incl. extension,
+//! 3-digit zero-padded, 0-based index), captions
+//! containing the rel_path and 1-based `i/n`, `telegram_msg_id` = chunk 0's
+//! msg_id,
 //! scripted error injection (FloodWait retry, FailAfterChunks), byte-exact
 //! open / open_range slicing, delete semantics, and drain-once incoming
 //! events.
@@ -172,7 +174,8 @@ async fn single_chunk_upload_stores_bytes_name_and_caption() {
 }
 
 /// 4. Multi-chunk upload (7 bytes / chunk_size 3 -> 3 chunks): consecutive
-///    msg ids, `{stem}.part{NNN}` names, per-chunk captions (contract 3).
+///    msg ids, `{name}.part{NNN}` names (rel_path basename incl.
+///    extension), per-chunk captions (contract 3).
 #[tokio::test]
 async fn multi_chunk_upload_names_and_captions_follow_contract() {
     let (_dir, path) = write_temp_file("data.bin", b"abcdefg");
@@ -188,9 +191,9 @@ async fn multi_chunk_upload_names_and_captions_follow_contract() {
     assert_eq!(
         t.message_names(),
         vec![
-            "data.part001".to_string(),
-            "data.part002".to_string(),
-            "data.part003".to_string(),
+            "data.bin.part000".to_string(),
+            "data.bin.part001".to_string(),
+            "data.bin.part002".to_string(),
         ]
     );
     assert_eq!(t.message(1), Some(b"abc".to_vec()));
@@ -281,7 +284,10 @@ async fn fail_after_chunks_persists_prefix_then_retry_completes() {
     // The two prefix chunks were really stored.
     assert_eq!(
         t.message_names(),
-        vec!["clip.part001".to_string(), "clip.part002".to_string(),]
+        vec![
+            "clip.bin.part000".to_string(),
+            "clip.bin.part001".to_string(),
+        ]
     );
     assert_eq!(t.message_captions().len(), 2);
     assert_eq!(t.message(1), Some(b"abc".to_vec()));
@@ -295,9 +301,9 @@ async fn fail_after_chunks_persists_prefix_then_retry_completes() {
     assert_eq!(
         &names[2..],
         &[
-            "clip.part001".to_string(),
-            "clip.part002".to_string(),
-            "clip.part003".to_string(),
+            "clip.bin.part000".to_string(),
+            "clip.bin.part001".to_string(),
+            "clip.bin.part002".to_string(),
         ]
     );
 }
