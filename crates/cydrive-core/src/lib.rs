@@ -7,6 +7,7 @@
 
 pub mod cache;
 pub mod chunker;
+pub mod config;
 pub mod crypto;
 pub mod database;
 pub mod rel_path;
