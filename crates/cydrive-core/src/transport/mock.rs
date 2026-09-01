@@ -281,9 +281,12 @@ impl CloudTransport for MockTransport {
 /// following the naming and caption contract (contract 3). Returns the
 /// allocated ids in order.
 ///
-/// Naming: `{stem}.part{NNN}` (1-based, 3-digit zero-padded) for
-/// multi-chunk uploads, the plain file name for single chunks. Every
-/// chunk caption carries the rel_path and an `i/n` part marker.
+/// Naming: `{name}.part{NNN}` (0-based index, 3-digit zero-padded) for
+/// multi-chunk uploads, the plain file name for single chunks, where
+/// `name` is the rel_path basename including its extension (Python
+/// baseline: `os.path.basename` of the virtual path). Every chunk caption
+/// carries the rel_path and a 1-based `i/n` part marker (Python baseline:
+/// enumerate is 0-based for names, captions print `idx + 1`).
 fn store_chunks(
     state: &mut MockState,
     job: &UploadJob,
@@ -291,16 +294,9 @@ fn store_chunks(
     total_chunks: usize,
     count: usize,
 ) -> Vec<i32> {
-    let original_name = job
-        .local_path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or_else(|| job.rel_path.as_str());
-    let stem = job
-        .local_path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .unwrap_or(original_name);
+    // Naming source is the virtual path's full basename (extension
+    // included), mirroring the Python baseline (telegram_client.py:155).
+    let file_name = job.rel_path.name();
     let chunk_size = job.chunk_size.max(1);
 
     let mut ids = Vec::with_capacity(count);
@@ -312,9 +308,9 @@ fn store_chunks(
             .saturating_mul(chunk_size)
             .min(data.len() as u64)) as usize;
         let name = if total_chunks > 1 {
-            format!("{stem}.part{:03}", index + 1)
+            format!("{file_name}.part{:03}", index)
         } else {
-            original_name.to_owned()
+            file_name.to_owned()
         };
         let caption = format!(
             "{} (part {}/{})",
