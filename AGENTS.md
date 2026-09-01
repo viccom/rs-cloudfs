@@ -7,7 +7,16 @@
 - 行为基线与兼容契约：见 `E:\GitHub\CyDrive`（Python 版）根目录 `AGENTS.md` 的「契约」节——DB schema、加密格式、分块命名/caption、端口、注册表行为，破坏即与现有用户数据不兼容
 
 ## 当前阶段
-M0 之前的引导阶段（尚无 Cargo workspace）。首个任务按设计文档 M0 里程碑搭 workspace 脚手架。
+M0 进行中（分支 `feat/m0-core`）。已完成：workspace 脚手架 + cydrive-core 六模块（config / cache / chunker / crypto / database / rel_path），85 个测试全绿，含与 Python 版的互操作契约测试（`tests/compat/fixtures/`：真实 Python CyCrypto 密文向量、真实 MetaDatabase SQL dump；由 `scripts/gen_compat_fixtures.py` 再生成）。
+M0 剩余：tracing 日志接入。M1 下一步：`CloudTransport` trait + `MockTransport` + 上传队列状态机 + VFS 装配（见设计文档）。
+
+## 常用命令（仓库根）
+```
+cargo test -p cydrive-core --no-fail-fast   # 全部 85 测试
+cargo clippy -p cydrive-core --all-targets -- -D warnings
+cargo fmt --all -- --check
+python scripts/gen_compat_fixtures.py       # 重新生成互操作 fixture（需能 import E:\GitHub\CyDrive）
+```
 
 ## 硬性规则
 - 兼容红线（设计文档「兼容契约」节）不经用户明确同意不得改动；契约测试必须双向（Python 生成样本 ↔ Rust 实现）
