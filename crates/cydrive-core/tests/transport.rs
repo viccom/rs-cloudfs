@@ -195,7 +195,7 @@ async fn multi_chunk_upload_names_and_captions_follow_contract() {
     );
     assert_eq!(t.message(1), Some(b"abc".to_vec()));
     assert_eq!(t.message(2), Some(b"def".to_vec()));
-    assert_eq!(t.message(3), Some(b"fg".to_vec()));
+    assert_eq!(t.message(3), Some(b"g".to_vec()));
 
     let captions = t.message_captions();
     assert_eq!(captions.len(), 3);
@@ -293,7 +293,7 @@ async fn fail_after_chunks_persists_prefix_then_retry_completes() {
     let names = t.message_names();
     assert_eq!(names.len(), 5);
     assert_eq!(
-        &names[3..],
+        &names[2..],
         &[
             "clip.part001".to_string(),
             "clip.part002".to_string(),
