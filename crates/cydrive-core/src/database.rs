@@ -15,6 +15,7 @@
 //!   the *previous* insert instead of the surviving row.
 
 use std::path::Path;
+use std::sync::Mutex;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use rusqlite::{params, Connection, OptionalExtension};
@@ -118,8 +119,14 @@ pub struct FileUpsert {
 }
 
 /// SQLite metadata manager for the CyDrive virtual file system.
+///
+/// The connection sits behind a [`Mutex`] so that `&self` methods are
+/// safe from multiple threads (a bare `rusqlite::Connection` is Send but
+/// not Sync, which blocked sharing `Arc<MetaDatabase>` across tokio
+/// tasks). Every public method takes the lock for its full body; no
+/// public method calls another, so the lock is never re-entered.
 pub struct MetaDatabase {
-    conn: Connection,
+    conn: Mutex<Connection>,
 }
 
 /// Column list shared by every `files` SELECT (index-mapped by
@@ -225,7 +232,9 @@ impl MetaDatabase {
             CREATE INDEX IF NOT EXISTS idx_files_msg_id ON files(telegram_msg_id);
             CREATE INDEX IF NOT EXISTS idx_files_uploaded ON files(is_uploaded);",
         )?;
-        Ok(Self { conn })
+        Ok(Self {
+            conn: Mutex::new(conn),
+        })
     }
 
     /// Inserts or updates the row keyed by `rel_path`.
@@ -237,8 +246,12 @@ impl MetaDatabase {
     /// write. Returns the surviving row's real id via `RETURNING id`
     /// (repeat upserts of the same `rel_path` return the same id).
     pub fn upsert_file(&self, entry: &FileUpsert) -> Result<i64, DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let now = now();
-        let id = self.conn.query_row(
+        let id = conn.query_row(
             "INSERT INTO files (
                 rel_path, name, parent_dir, size, mtime, sha256, is_dir,
                 telegram_msg_id, is_uploaded, is_cached, is_encrypted, chunk_count, mime_type,
@@ -282,20 +295,22 @@ impl MetaDatabase {
 
     /// Looks up a single row by its unique virtual path.
     pub fn get_file(&self, rel_path: &str) -> Result<Option<FileRecord>, DbError> {
-        let sql = format!("SELECT {FILE_COLUMNS} FROM files WHERE rel_path = ?1");
-        Ok(self
+        let conn = self
             .conn
-            .query_row(&sql, [rel_path], row_to_file)
-            .optional()?)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sql = format!("SELECT {FILE_COLUMNS} FROM files WHERE rel_path = ?1");
+        Ok(conn.query_row(&sql, [rel_path], row_to_file).optional()?)
     }
 
     /// Looks up a single row by the Telegram message id of its chunk 0.
     pub fn get_file_by_msg_id(&self, msg_id: i64) -> Result<Option<FileRecord>, DbError> {
-        let sql = format!("SELECT {FILE_COLUMNS} FROM files WHERE telegram_msg_id = ?1");
-        Ok(self
+        let conn = self
             .conn
-            .query_row(&sql, [msg_id], row_to_file)
-            .optional()?)
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sql = format!("SELECT {FILE_COLUMNS} FROM files WHERE telegram_msg_id = ?1");
+        Ok(conn.query_row(&sql, [msg_id], row_to_file).optional()?)
     }
 
     /// Lists direct children of `parent_dir`.
@@ -303,17 +318,25 @@ impl MetaDatabase {
     /// Python ordering: `ORDER BY is_dir DESC, name ASC` — directories
     /// first, then name-ascending.
     pub fn list_dir(&self, parent_dir: &str) -> Result<Vec<FileRecord>, DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let sql = format!(
             "SELECT {FILE_COLUMNS} FROM files \
              WHERE parent_dir = ?1 ORDER BY is_dir DESC, name ASC"
         );
-        query_files(&self.conn, &sql, &[&parent_dir])
+        query_files(&conn, &sql, &[&parent_dir])
     }
 
     /// Lists every row (files and directories) by `updated_at DESC`.
     pub fn list_all_files(&self) -> Result<Vec<FileRecord>, DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         let sql = format!("SELECT {FILE_COLUMNS} FROM files ORDER BY updated_at DESC");
-        query_files(&self.conn, &sql, &[])
+        query_files(&conn, &sql, &[])
     }
 
     /// Substring search over `name` and `rel_path`.
@@ -321,13 +344,17 @@ impl MetaDatabase {
     /// Python semantics: `LIKE '%query%'` with no escaping of `%` / `_`,
     /// ordered by `is_dir DESC, name ASC`.
     pub fn search_files(&self, query: &str) -> Result<Vec<FileRecord>, DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // Python parity: no escaping of LIKE wildcards in the query.
         let pattern = format!("%{query}%");
         let sql = format!(
             "SELECT {FILE_COLUMNS} FROM files \
              WHERE name LIKE ?1 OR rel_path LIKE ?1 ORDER BY is_dir DESC, name ASC"
         );
-        query_files(&self.conn, &sql, &[&pattern])
+        query_files(&conn, &sql, &[&pattern])
     }
 
     /// Inserts or updates one chunk of `file_id`.
@@ -342,7 +369,11 @@ impl MetaDatabase {
         size: i64,
         sha256: Option<&str>,
     ) -> Result<(), DbError> {
-        self.conn.execute(
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
             "INSERT INTO chunks (file_id, chunk_index, telegram_msg_id, size, sha256)
             VALUES (?1, ?2, ?3, ?4, ?5)
             ON CONFLICT(file_id, chunk_index) DO UPDATE SET
@@ -356,7 +387,11 @@ impl MetaDatabase {
 
     /// Lists the chunks of `file_id` ordered by `chunk_index ASC`.
     pub fn get_chunks_by_file_id(&self, file_id: i64) -> Result<Vec<ChunkRecord>, DbError> {
-        let mut stmt = self.conn.prepare(
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = conn.prepare(
             "SELECT chunk_index, telegram_msg_id, size, sha256 FROM chunks \
                           WHERE file_id = ?1 ORDER BY chunk_index ASC",
         )?;
@@ -377,9 +412,14 @@ impl MetaDatabase {
     /// older databases intact even though `foreign_keys = ON` would cascade.
     /// Deleting a missing path is a no-op, not an error.
     pub fn delete_file(&self, rel_path: &str) -> Result<(), DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // `unchecked_transaction`: `&self` API (Connection::transaction
-        // needs &mut) — single writer, no reentrancy here.
-        let tx = self.conn.unchecked_transaction()?;
+        // needs &mut) — no reentrancy, and the guard keeps the whole
+        // transaction exclusive anyway.
+        let tx = conn.unchecked_transaction()?;
         tx.execute(
             "DELETE FROM chunks WHERE file_id = (SELECT id FROM files WHERE rel_path = ?1)",
             [rel_path],
@@ -393,13 +433,17 @@ impl MetaDatabase {
     /// totals over `is_dir = 0` rows, dirs over `is_dir = 1`, uploaded
     /// over `is_uploaded = 1 AND is_dir = 0`, pending as the difference.
     pub fn get_stats(&self) -> Result<Stats, DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         // `or 0` in Python: SUM over zero rows is NULL, COUNT is never NULL.
-        let (total_files, total_bytes): (i64, Option<i64>) = self.conn.query_row(
+        let (total_files, total_bytes): (i64, Option<i64>) = conn.query_row(
             "SELECT COUNT(*), SUM(size) FROM files WHERE is_dir = 0",
             [],
             |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        let (total_dirs, uploaded_files): (i64, i64) = self.conn.query_row(
+        let (total_dirs, uploaded_files): (i64, i64) = conn.query_row(
             "SELECT (SELECT COUNT(*) FROM files WHERE is_dir = 1),
                     (SELECT COUNT(*) FROM files WHERE is_uploaded = 1 AND is_dir = 0)",
             [],
