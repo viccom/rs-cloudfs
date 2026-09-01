@@ -9,11 +9,12 @@
 ## 当前阶段
 M1 进行中（分支 `feat/m1-core`，自 feat/m0-core 切出）。M0 已完成：workspace + cydrive-core 七模块（config / cache / chunker / crypto / database / logging / rel_path），含与 Python 版的互操作契约测试（`tests/compat/fixtures/`：真实 Python CyCrypto 密文向量、真实 MetaDatabase SQL dump；由 `scripts/gen_compat_fixtures.py` 再生成）；设计文档 M0 验收行还列有 CI / keyring / cargo-deny 三项未做，归属待裁决（见 `docs/decisions.md`）。
 M1 已完成：`transport` 模块——`CloudTransport` trait（async_trait，dyn 兼容）+ 配套类型（UploadJob/UploadReceipt/RemoteHandle/IncomingEvent、ByteStream/IncomingStream 别名、TransportError 含 FloodWait{seconds} 归一化）+ `MockTransport`（脚本化错误注入 FloodWait/Fail/FailAfterChunks；分块命名 `{stem}.part{NNN}` 与 caption 含 rel_path+i/n 契约在 Mock 侧强制；open/open_range 切片语义；drain-once incoming；检视 API 供后续队列/WebDAV 测试用），13 个测试。
-M1 下一步：上传队列状态机（UploadQueue：mpsc + Semaphore 并发 2、`is_uploaded=0` 行即队列/启动重入队、指数退避 + FloodWait 按服务端秒数 sleep、连续失败降级标记）→ VFS 装配（见设计文档）。
+M1 已完成：`upload_queue` 模块——有界 mpsc + N worker（默认 2）、`decide_retry` 纯函数（指数退避封顶 5min；FloodWait 按服务端秒数精确等待且不计入降级）、连续失败达 max_attempts 降级停试、成功才写 DB（is_uploaded=1 + telegram_msg_id + chunks 行）并删本地缓存（修复 Python 无条件删）、0 字节跳过传输、未知行降级不传、`requeue_pending` 只入队本地仍存在的行；配套 `MetaDatabase` 已内部 `Mutex<Connection>` 化支持 Arc 跨 await（选型裁决见 decisions.md），13 个测试。
+M1 下一步：VFS 装配（DB+cache+queue 组合成虚拟文件系统门面，含下载水合路径）→ 降级持久化标记（upload_failed 列，迁移单元，见 decisions.md）。（见设计文档）
 
 ## 常用命令（仓库根）
 ```
-cargo test -p cydrive-core --no-fail-fast   # 全部 105 测试
+cargo test -p cydrive-core --no-fail-fast   # 全部 119 测试
 cargo clippy -p cydrive-core --all-targets -- -D warnings
 cargo fmt --all -- --check
 python scripts/gen_compat_fixtures.py       # 重新生成互操作 fixture（需能 import E:\GitHub\CyDrive）
