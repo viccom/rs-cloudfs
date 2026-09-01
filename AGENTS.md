@@ -14,11 +14,12 @@
 - `MetaDatabase` 已内部 Mutex 化支持 Arc 跨 await（选型裁决见 decisions.md）
 - 语义裁决与延后项见 decisions.md 2026-09-02 三条（FloodWait 不降级/持久化失败不重传/upload_failed 列延后到迁移单元）
 
-**下一步 M2**（新分支 `feat/m2-telegram`，自 feat/m1-core 切出）：新 crate `cydrive-telegram`——GrammersTransport 实现 CloudTransport（grammers git 依赖锁精确 commit；登录/上传/下载/Range=skip_chunks/入站索引/Bot 命令含补齐 /get）；Mock 可测部分全测，真机三档 smoke（100MB/2GB/3GB）登记「待人工」。设计文档「深度调研补遗」grammers 节是 API 权威。
+**M2 进行中**（分支 `feat/m2-telegram`，自 feat/m1-core 切出）：新 crate `cydrive-telegram`。已完成首单元（3f878e2 红 + 9607457 绿，15 测试）：纯契约模块——`caption.rs`（单文件/多块 caption **Python 逐字快照**：Path:/File:/Part: 标签、KB 整除、加密后缀；`clean_rel_path` 按基线求值顺序（先 strip '/' 后替换 '\'，反斜杠输入产出 `//a/b` 是基线真实行为）；`part_document_name` 复用 core `chunker::part_name`）、`flood.rs`（`parse_flood_wait`：FLOOD_WAIT_N 秒数解析、裸 FLOOD_WAIT=0、其余 None）、`range.rs`（`range_plan`：skip/head/take 换算 + chunk_size 4096 整倍数且 4096..=512KB 校验）。
+M2 剩余：grammers 依赖接入（AGENTS 红线要求 git 锁精确 commit；若以 crates.io `=0.10.0` 精确锁替代须记 decisions.md）→ `GrammersTransport` glue（upload 走 `upload_stream`+caption/命名用上述纯模块、open/open_range 用 `DownloadIter` 的 chunk_size/skip_chunks、connect=bot_sign_in、错误映射走 `parse_flood_wait`）→ 入站 stream_updates 索引 + Bot 命令（含补齐 /get）→ 真机三档 smoke（100MB/2GB/3GB）登记「待人工」。设计文档「深度调研补遗」grammers 节是 API 权威。
 
 ## 常用命令（仓库根）
 ```
-cargo test -p cydrive-core --no-fail-fast   # 全部 130 测试
+cargo test --workspace --no-fail-fast            # 全部 145 测试（core 130 + telegram 15）
 cargo clippy -p cydrive-core --all-targets -- -D warnings
 cargo fmt --all -- --check
 python scripts/gen_compat_fixtures.py       # 重新生成互操作 fixture（需能 import E:\GitHub\CyDrive）
