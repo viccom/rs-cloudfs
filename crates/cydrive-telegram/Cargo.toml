@@ -1,0 +1,13 @@
+[package]
+name = "cydrive-telegram"
+description = "CloudTransport implementation over Telegram MTProto (grammers); pure contract logic first"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+cydrive-core = { path = "../cydrive-core" }
+thiserror = "2"
