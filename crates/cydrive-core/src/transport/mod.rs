@@ -5,8 +5,8 @@
 //! Telegram MTProto client and lives outside this crate; the in-memory
 //! [`mock::MockTransport`] is the shared test infrastructure.
 //!
-//! RED phase stub: every function body is `todo!()`; tests under
-//! `tests/transport.rs` encode the frozen behavior contract.
+//! The frozen behavior contract is encoded by the tests under
+//! `tests/transport.rs`.
 
 pub mod mock;
 
