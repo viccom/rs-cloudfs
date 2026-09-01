@@ -2,7 +2,8 @@
 //!
 //! Pure domain layer: virtual-filesystem path semantics, SQLite metadata,
 //! LRU cache management, client-side encryption and large-file chunking.
-//! No network or transport concerns live here; see the design document at
+//! Remote storage is abstracted behind the `transport` trait seam; no
+//! concrete network client lives here. See the design document at
 //! `docs/rust-rewrite-design.md` (repository root).
 
 pub mod cache;
@@ -12,3 +13,4 @@ pub mod crypto;
 pub mod database;
 pub mod logging;
 pub mod rel_path;
+pub mod transport;
