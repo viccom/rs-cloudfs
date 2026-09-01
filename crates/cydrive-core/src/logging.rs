@@ -1,12 +1,15 @@
 //! Structured logging setup (tracing + tracing-subscriber).
 //!
-//! RED-phase stub: every function body is `todo!()`. Signatures, derives and
-//! constants below are frozen by the task spec; real logic lands in the GREEN
-//! phase. Selected per `docs/rust-rewrite-design.md` (logging/observability
-//! row): tracing + tracing-subscriber (JSON/pretty switch) + tracing-appender
+//! Selected per `docs/rust-rewrite-design.md` (logging/observability row):
+//! tracing + tracing-subscriber (JSON/pretty switch) + tracing-appender
 //! rolling files, `RUST_LOG` for ad-hoc control.
 
 use std::path::PathBuf;
+
+use tracing_appender::rolling::{InitError, RollingFileAppender, Rotation};
+use tracing_subscriber::filter::EnvFilter;
+use tracing_subscriber::layer::{Layer, SubscriberExt};
+use tracing_subscriber::Registry;
 
 /// Output format of the fmt layer.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -31,7 +34,11 @@ pub struct LogConfig {
 
 impl Default for LogConfig {
     fn default() -> Self {
-        todo!()
+        Self {
+            format: LogFormat::Pretty,
+            level: tracing::Level::INFO,
+            file: None,
+        }
     }
 }
 
@@ -51,11 +58,6 @@ pub enum LogInitError {
 pub const LOG_FILE_PREFIX: &str = "cydrive.log";
 
 /// Build a complete subscriber (filter + formatter) writing events to `writer`.
-// `todo!()` alone does not type-check here: the never type falls back to `()`
-// for return-position `impl Trait`, and `()` does not implement `Subscriber`.
-// The unreachable `Registry` tail exists purely to satisfy the opaque return
-// type's bounds; runtime behavior is still "not yet implemented".
-#[allow(unreachable_code)]
 pub fn build_subscriber<W>(
     cfg: &LogConfig,
     writer: W,
@@ -63,9 +65,49 @@ pub fn build_subscriber<W>(
 where
     W: for<'a> tracing_subscriber::fmt::MakeWriter<'a> + Send + Sync + 'static,
 {
-    let _ = (cfg, &writer);
-    todo!();
-    tracing_subscriber::Registry::default()
+    // `pretty()` and `json()` return distinct `fmt::Layer` types, so the
+    // chosen layer is type-erased behind a boxed layer to give both arms of
+    // the match one shared type.
+    let fmt_layer: Box<dyn Layer<Registry> + Send + Sync + 'static> = match cfg.format {
+        LogFormat::Pretty => tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .pretty()
+            .boxed(),
+        LogFormat::Json => tracing_subscriber::fmt::layer()
+            .with_writer(writer)
+            .json()
+            .boxed(),
+    };
+    Registry::default()
+        .with(fmt_layer)
+        .with(filter_from_env(cfg))
+}
+
+/// Resolve the filter layer: a strictly parseable `RUST_LOG` wins, otherwise
+/// `cfg.level` becomes the global directive.
+///
+/// `RUST_LOG` is read with [`EnvFilter::try_from_default_env`], the strict
+/// parser; any error (variable unset or malformed) falls back to a global
+/// directive built from `cfg.level`. Raw `RUST_LOG` content must never be fed
+/// to [`EnvFilter::new`]: that constructor is lossy and silently drops
+/// invalid directives.
+fn filter_from_env(cfg: &LogConfig) -> EnvFilter {
+    EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(cfg.level.to_string()))
+}
+
+/// Map a rolling-appender [`InitError`] to [`LogInitError::Io`], recovering
+/// the underlying [`std::io::Error`] via `Error::source` (the fields of
+/// `InitError` are private).
+fn appender_io_error(err: InitError) -> LogInitError {
+    use std::error::Error as _;
+    match err
+        .source()
+        .and_then(|source| source.downcast_ref::<std::io::Error>())
+    {
+        // `io::Error` is not `Clone`; rebuild it from kind + display text.
+        Some(io) => LogInitError::Io(std::io::Error::new(io.kind(), io.to_string())),
+        None => LogInitError::Io(std::io::Error::other(err)),
+    }
 }
 
 /// Install the subscriber built from `cfg` as the process-global default.
@@ -76,6 +118,20 @@ where
 /// the global directive. Returns [`LogInitError::AlreadyInstalled`] when a
 /// global default subscriber already exists.
 pub fn init(cfg: &LogConfig) -> Result<(), LogInitError> {
-    let _ = cfg;
-    todo!()
+    match &cfg.file {
+        Some(dir) => {
+            // The `rolling::daily` convenience constructor panics on IO
+            // failure; the equivalent builder reports the error instead, so
+            // it can be routed into `LogInitError::Io`.
+            let appender = RollingFileAppender::builder()
+                .rotation(Rotation::DAILY)
+                .filename_prefix(LOG_FILE_PREFIX)
+                .build(dir)
+                .map_err(appender_io_error)?;
+            tracing::subscriber::set_global_default(build_subscriber(cfg, appender))
+        }
+        None => tracing::subscriber::set_global_default(build_subscriber(cfg, std::io::stdout)),
+    }
+    .map_err(|_| LogInitError::AlreadyInstalled)?;
+    Ok(())
 }
