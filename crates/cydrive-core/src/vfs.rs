@@ -2,18 +2,25 @@
 //! the upload queue and the transport into the two operations every
 //! consumer drives: `put` (upload path) and `hydrate` (download path).
 //!
-//! RED-phase stub: every body is `todo!()`; the frozen behavior contract
-//! is encoded by the tests under `tests/vfs.rs`.
+//! The frozen behavior contract is pinned by the tests under
+//! `tests/vfs.rs`.
 
-use std::path::PathBuf;
+use std::ffi::OsStr;
+use std::io::Write;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
+use futures_util::stream::StreamExt;
+
 use crate::cache::CacheManager;
-use crate::crypto::CryptoError;
-use crate::database::{DbError, MetaDatabase};
+use crate::crypto::{self, CryptoError};
+use crate::database::{DbError, FileRecord, FileUpsert, MetaDatabase};
 use crate::rel_path::RelPath;
-use crate::transport::{CloudTransport, TransportError};
-use crate::upload_queue::{QueueStats, RetryPolicy};
+use crate::transport::{CloudTransport, RemoteHandle, TransportError, UploadJob};
+use crate::upload_queue::{
+    spawn_queue, QueueError, QueueStats, RetryPolicy, UploadQueueConfig, UploadQueueHandle,
+    DEFAULT_CHUNK_SIZE_MB,
+};
 
 /// Knobs of the VFS: queue shape, upload chunk split and the optional
 /// client-side encryption password.
@@ -34,8 +41,15 @@ pub struct VfsConfig {
 }
 
 impl Default for VfsConfig {
+    /// Mirrors [`UploadQueueConfig::default`] field by field.
     fn default() -> Self {
-        todo!()
+        Self {
+            chunk_size_bytes: DEFAULT_CHUNK_SIZE_MB * 1024 * 1024,
+            workers: 2,
+            queue_capacity: 256,
+            retry: RetryPolicy::default(),
+            encryption_password: None,
+        }
     }
 }
 
@@ -68,23 +82,105 @@ pub enum VfsError {
     Io(#[from] std::io::Error),
 }
 
+/// Sibling staging path of `target`: the full file name plus a `.tmp`
+/// suffix (`foo.txt` -> `foo.txt.tmp`). Appending beats `with_extension`,
+/// which would replace an existing extension and can collide across files
+/// sharing a stem.
+fn tmp_sibling(target: &Path) -> PathBuf {
+    let file_name = target.file_name().unwrap_or_else(|| OsStr::new("cydrive"));
+    let mut staged = file_name.to_os_string();
+    staged.push(".tmp");
+    target.with_file_name(staged)
+}
+
+/// Writes `bytes` to `target` through a `.tmp` sibling plus an atomic
+/// rename (creating parent directories): the final path only ever holds a
+/// complete file, and no staging file survives the call.
+fn write_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    if let Some(parent) = target.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let staged = tmp_sibling(target);
+    std::fs::write(&staged, bytes)?;
+    std::fs::rename(&staged, target)
+}
+
+/// Rebuilds the upsert of `row` with `is_cached` flipped and every other
+/// field carried over verbatim (used by hydration and by eviction).
+fn cached_upsert(row: &FileRecord, is_cached: bool) -> FileUpsert {
+    FileUpsert {
+        rel_path: row.rel_path.clone(),
+        name: row.name.clone(),
+        parent_dir: row.parent_dir.clone(),
+        size: row.size,
+        mtime: row.mtime,
+        sha256: row.sha256.clone(),
+        is_dir: row.is_dir,
+        telegram_msg_id: row.telegram_msg_id,
+        is_uploaded: row.is_uploaded,
+        is_cached,
+        is_encrypted: row.is_encrypted,
+        chunk_count: row.chunk_count,
+        mime_type: row.mime_type.clone(),
+    }
+}
+
+/// Narrows an i64 metadata message id to the transport's i32; an id that
+/// does not fit is corrupt metadata, surfaced as a transport error.
+fn narrow_msg_id(id: i64) -> Result<i32, VfsError> {
+    i32::try_from(id).map_err(|_| {
+        VfsError::Transport(TransportError::Remote(format!(
+            "message id {id} does not fit an i32"
+        )))
+    })
+}
+
+/// Maps queue-handle errors onto the facade's error surface.
+fn map_queue_error(error: QueueError) -> VfsError {
+    match error {
+        QueueError::Closed => VfsError::QueueClosed,
+        QueueError::Db(error) => VfsError::Db(error),
+        QueueError::Io(error) => VfsError::Io(error),
+    }
+}
+
 /// The virtual filesystem: metadata DB + LRU cache + upload queue +
-/// transport, fronting `put` / `hydrate`. Interior state is private
-/// (empty placeholder while stubbed).
-pub struct Vfs {}
+/// transport, fronting `put` / `hydrate`. Interior state is private.
+pub struct Vfs {
+    db: Arc<MetaDatabase>,
+    cache: Arc<CacheManager>,
+    transport: Arc<dyn CloudTransport>,
+    cfg: VfsConfig,
+    queue: UploadQueueHandle,
+}
 
 impl Vfs {
     /// Assembles the VFS and spawns its upload queue; the
     /// `UploadQueueConfig` is derived from `cfg` (`chunk_size_bytes`
     /// carried over unchanged).
-    #[allow(unused_variables)]
     pub fn new(
         db: Arc<MetaDatabase>,
         cache: CacheManager,
         transport: Arc<dyn CloudTransport>,
         cfg: VfsConfig,
     ) -> Self {
-        todo!()
+        let queue = spawn_queue(
+            Arc::clone(&db),
+            Arc::clone(&transport),
+            UploadQueueConfig {
+                workers: cfg.workers,
+                queue_capacity: cfg.queue_capacity,
+                retry: cfg.retry.clone(),
+                chunk_size_bytes: cfg.chunk_size_bytes,
+            },
+        );
+        Self {
+            db,
+            cache: Arc::new(cache),
+            transport,
+            cfg,
+            queue,
+        }
     }
 
     /// Upload path (fire-and-forget, Python parity). Stages the bytes to
@@ -93,9 +189,59 @@ impl Vfs {
     /// Python direct-write defect) — upserts the row as
     /// `is_uploaded = false, is_cached = true` and enqueues the upload
     /// job. Returning means accepted, not uploaded.
-    #[allow(unused_variables)]
     pub async fn put(&self, rel: &RelPath, bytes: &[u8], mtime: f64) -> Result<(), VfsError> {
-        todo!()
+        // Stage the bytes before touching metadata: the queue reads the
+        // local copy (and only deletes it after a successful upload).
+        let local = self.cache.local_path(rel);
+        write_atomic(&local, bytes)?;
+
+        let size = bytes.len() as i64;
+        // 0-byte rows carry a zero chunk plan (the queue never touches
+        // the transport for them); otherwise ceil(len / chunk_size) >= 1.
+        let chunk_count = if size == 0 {
+            0
+        } else {
+            (bytes.len() as u64).div_ceil(self.cfg.chunk_size_bytes.max(1)) as u32
+        };
+        let parent_dir = match rel.parent() {
+            Some(parent) => parent.as_str().to_string(),
+            None => "/".to_string(),
+        };
+        self.db.upsert_file(&FileUpsert {
+            rel_path: rel.as_str().to_string(),
+            name: rel.name().to_string(),
+            parent_dir,
+            size,
+            mtime,
+            sha256: None,
+            is_dir: false,
+            // None keeps a previously recorded msg id (upsert coalesce)
+            // until the re-upload replaces it.
+            telegram_msg_id: None,
+            is_uploaded: false,
+            is_cached: true,
+            // The staged bytes are plaintext and the queue ships them
+            // unchanged, so the row must not claim encryption (hydrate
+            // would try to decrypt the remote copy otherwise).
+            is_encrypted: false,
+            chunk_count: chunk_count as i64,
+            mime_type: None,
+        })?;
+
+        // Last await point: after the enqueue returns this method must
+        // not yield again — callers rely on the row still being pending
+        // the instant `put` returns.
+        self.queue
+            .enqueue(UploadJob {
+                rel_path: rel.clone(),
+                local_path: local,
+                size: bytes.len() as u64,
+                chunk_count,
+                chunk_size: self.cfg.chunk_size_bytes,
+            })
+            .await
+            .map_err(map_queue_error)?;
+        Ok(())
     }
 
     /// Download path: returns the local cache path of `rel`, hydrating
@@ -103,18 +249,114 @@ impl Vfs {
     /// eviction included; evicted rows keep every field except
     /// `is_cached`). Encrypted rows decrypt before the cache copy is
     /// written (the cached file is plaintext, Python behavior).
-    #[allow(unused_variables)]
     pub async fn hydrate(&self, rel: &RelPath) -> Result<PathBuf, VfsError> {
-        todo!()
+        let row = self
+            .db
+            .get_file(rel.as_str())?
+            .ok_or_else(|| VfsError::NotFound(rel.as_str().to_string()))?;
+        if row.is_dir {
+            return Err(VfsError::IsDirectory(row.rel_path));
+        }
+        let local = self.cache.local_path(rel);
+
+        // Cached copy wins: the remote is never consulted, and the cache
+        // holds plaintext by contract.
+        if self.cache.is_cached(rel) {
+            self.cache.record_access(rel);
+            return Ok(local);
+        }
+
+        // Password gate before any download work.
+        if row.is_encrypted && self.cfg.encryption_password.is_none() {
+            return Err(VfsError::MissingPassword);
+        }
+
+        // 0-byte rows have no remote bytes; materialize an empty copy.
+        if row.size == 0 {
+            write_atomic(&local, &[])?;
+            self.db.upsert_file(&cached_upsert(&row, true))?;
+            self.cache.record_access(rel);
+            return Ok(local);
+        }
+
+        // Remote handle: per-chunk rows first (already index-ordered),
+        // else the row's chunk-0 msg id covers single-chunk files.
+        let chunks = self.db.get_chunks_by_file_id(row.id)?;
+        let mut msg_ids = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            let id = chunk.telegram_msg_id.ok_or_else(|| {
+                VfsError::Transport(TransportError::Remote(format!(
+                    "chunk {} of {} has no remote message id",
+                    chunk.chunk_index, row.rel_path
+                )))
+            })?;
+            msg_ids.push(narrow_msg_id(id)?);
+        }
+        if msg_ids.is_empty() {
+            msg_ids.push(narrow_msg_id(
+                // Pending upload whose local copy vanished: the bytes
+                // live neither locally nor remotely.
+                row.telegram_msg_id
+                    .ok_or_else(|| VfsError::NotFound(row.rel_path.clone()))?,
+            )?);
+        }
+        // Non-empty by construction: chunk rows yielded ids, or the
+        // fallback above pushed one (else we already returned).
+        let first_msg_id = msg_ids[0];
+
+        // Make room before filling: every evicted row keeps all fields
+        // except the cached flag.
+        for victim in self.cache.evict_lru(row.size.max(0) as u64)? {
+            if let Some(victim_row) = self.db.get_file(victim.as_str())? {
+                self.db.upsert_file(&cached_upsert(&victim_row, false))?;
+            }
+        }
+
+        // Stream the remote bytes into the cache through the same
+        // tmp+rename pair (close the handle before renaming on Windows).
+        let handle = RemoteHandle {
+            first_msg_id,
+            chunk_msg_ids: msg_ids,
+            total_size: row.size.max(0) as u64,
+        };
+        let mut stream = self.transport.open(&handle).await?;
+        let staged = tmp_sibling(&local);
+        if let Some(parent) = local.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        {
+            let mut file = std::fs::File::create(&staged)?;
+            while let Some(frame) = stream.next().await {
+                file.write_all(&frame?)?;
+            }
+            file.flush()?;
+        }
+        std::fs::rename(&staged, &local)?;
+
+        // Python behavior: the cache copy is plaintext, so decrypt after
+        // the ciphertext landed locally.
+        if row.is_encrypted {
+            let password = self
+                .cfg
+                .encryption_password
+                .as_deref()
+                .ok_or(VfsError::MissingPassword)?;
+            let plaintext = crypto::decrypt(password, &std::fs::read(&local)?)?;
+            write_atomic(&local, &plaintext)?;
+        }
+
+        self.db.upsert_file(&cached_upsert(&row, true))?;
+        self.cache.record_access(rel);
+        Ok(local)
     }
 
     /// Snapshot of the upload queue counters.
     pub fn queue_stats(&self) -> QueueStats {
-        todo!()
+        self.queue.stats()
     }
 
     /// Shuts the upload queue down and waits for it to drain.
     pub async fn shutdown(&self) {
-        todo!()
+        self.queue.shutdown().await
     }
 }
