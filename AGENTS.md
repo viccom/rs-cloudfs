@@ -7,14 +7,18 @@
 - 行为基线与兼容契约：见 `E:\GitHub\CyDrive`（Python 版）根目录 `AGENTS.md` 的「契约」节——DB schema、加密格式、分块命名/caption、端口、注册表行为，破坏即与现有用户数据不兼容
 
 ## 当前阶段
-M1 进行中（分支 `feat/m1-core`，自 feat/m0-core 切出）。M0 已完成：workspace + cydrive-core 七模块（config / cache / chunker / crypto / database / logging / rel_path），含与 Python 版的互操作契约测试（`tests/compat/fixtures/`：真实 Python CyCrypto 密文向量、真实 MetaDatabase SQL dump；由 `scripts/gen_compat_fixtures.py` 再生成）；设计文档 M0 验收行还列有 CI / keyring / cargo-deny 三项未做，归属待裁决（见 `docs/decisions.md`）。
-M1 已完成：`transport` 模块——`CloudTransport` trait（async_trait，dyn 兼容）+ 配套类型（UploadJob/UploadReceipt/RemoteHandle/IncomingEvent、ByteStream/IncomingStream 别名、TransportError 含 FloodWait{seconds} 归一化）+ `MockTransport`（脚本化错误注入 FloodWait/Fail/FailAfterChunks；分块命名 `{stem}.part{NNN}` 与 caption 含 rel_path+i/n 契约在 Mock 侧强制；open/open_range 切片语义；drain-once incoming；检视 API 供后续队列/WebDAV 测试用），13 个测试。
-M1 已完成：`upload_queue` 模块——有界 mpsc + N worker（默认 2）、`decide_retry` 纯函数（指数退避封顶 5min；FloodWait 按服务端秒数精确等待且不计入降级）、连续失败达 max_attempts 降级停试、成功才写 DB（is_uploaded=1 + telegram_msg_id + chunks 行）并删本地缓存（修复 Python 无条件删）、0 字节跳过传输、未知行降级不传、`requeue_pending` 只入队本地仍存在的行；配套 `MetaDatabase` 已内部 `Mutex<Connection>` 化支持 Arc 跨 await（选型裁决见 decisions.md），13 个测试。
-M1 下一步：VFS 装配（DB+cache+queue 组合成虚拟文件系统门面，含下载水合路径）→ 降级持久化标记（upload_failed 列，迁移单元，见 decisions.md）。（见设计文档）
+**M1 已完成**（分支 `feat/m1-core`，自 feat/m0-core 切出；M0 内容见 git 历史：workspace + config/cache/chunker/crypto/database/logging/rel_path 七模块 + 互操作契约测试；CI/keyring/deny 归属待裁决见 `docs/decisions.md`）。M1 交付（130 测试全绿）：
+- `transport`：`CloudTransport` trait（async_trait，dyn 兼容）+ UploadJob/UploadReceipt/RemoteHandle/IncomingEvent/TransportError（FloodWait{seconds} 归一化）+ `MockTransport`（脚本化错误注入；`{stem}.part{NNN}` 命名与 caption 契约在 Mock 侧强制；open/open_range 切片；drain-once incoming）
+- `upload_queue`：有界 mpsc + N worker；`decide_retry` 纯函数（指数退避封顶；FloodWait 按服务端秒数精确等待且不计入降级）；连续失败达 max_attempts 降级停试；成功才写 DB+删缓存；0 字节跳传输；`requeue_pending` 只入队本地存在的行
+- `vfs`：门面装配——`put`（.tmp+原子 rename→pending 行→入队，enqueue 后无 await 点保证受理语义）、`hydrate`（缓存命中优先→分块合并下载→加密行解密为明文缓存→LRU 驱逐并清被逐行 is_cached）、queue_stats/shutdown 委托
+- `MetaDatabase` 已内部 Mutex 化支持 Arc 跨 await（选型裁决见 decisions.md）
+- 语义裁决与延后项见 decisions.md 2026-09-02 三条（FloodWait 不降级/持久化失败不重传/upload_failed 列延后到迁移单元）
+
+**下一步 M2**（新分支 `feat/m2-telegram`，自 feat/m1-core 切出）：新 crate `cydrive-telegram`——GrammersTransport 实现 CloudTransport（grammers git 依赖锁精确 commit；登录/上传/下载/Range=skip_chunks/入站索引/Bot 命令含补齐 /get）；Mock 可测部分全测，真机三档 smoke（100MB/2GB/3GB）登记「待人工」。设计文档「深度调研补遗」grammers 节是 API 权威。
 
 ## 常用命令（仓库根）
 ```
-cargo test -p cydrive-core --no-fail-fast   # 全部 119 测试
+cargo test -p cydrive-core --no-fail-fast   # 全部 130 测试
 cargo clippy -p cydrive-core --all-targets -- -D warnings
 cargo fmt --all -- --check
 python scripts/gen_compat_fixtures.py       # 重新生成互操作 fixture（需能 import E:\GitHub\CyDrive）
