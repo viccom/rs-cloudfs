@@ -1,0 +1,25 @@
+# Rust
+/target/
+**/*.rs.bk
+
+# 运行期产物（绝不提交）
+config.toml
+config.json
+*.session
+*.session-journal
+*.db
+*.db-wal
+*.db-shm
+Telegram_Cache/
+Telegram_Drive/
+downloads/
+
+# 凭据与环境
+.env
+.env.local
+
+# IDE / OS
+.idea/
+.vscode/
+.DS_Store
+Thumbs.db

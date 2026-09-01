@@ -1,0 +1,15 @@
+[package]
+name = "cydrive-core"
+description = "CyDrive domain core: VFS paths, metadata DB, cache, crypto, chunking"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+thiserror = "2"
+
+[dev-dependencies]
+tempfile = "3"
