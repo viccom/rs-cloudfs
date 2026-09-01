@@ -20,12 +20,19 @@ pub struct RangePlan {
 /// multiple of `MIN_CHUNK_SIZE` within `MIN_CHUNK_SIZE..=MAX_CHUNK_SIZE`
 /// (else `Err`); then `skip_chunks = offset / chunk_size`,
 /// `skip_bytes_in_first_chunk = offset % chunk_size`, `bytes_to_yield = length`.
-// TODO(M2 green): drop the allow once the parameters are read by the real body.
-#[allow(unused_variables)]
 pub fn range_plan(
     offset: u64,
     length: u64,
     chunk_size: i32,
 ) -> Result<RangePlan, InvalidChunkSize> {
-    todo!()
+    if chunk_size % MIN_CHUNK_SIZE != 0 || !(MIN_CHUNK_SIZE..=MAX_CHUNK_SIZE).contains(&chunk_size)
+    {
+        return Err(InvalidChunkSize(chunk_size));
+    }
+    let chunk_size = chunk_size as u64;
+    Ok(RangePlan {
+        skip_chunks: (offset / chunk_size) as i32,
+        skip_bytes_in_first_chunk: offset % chunk_size,
+        bytes_to_yield: length,
+    })
 }
