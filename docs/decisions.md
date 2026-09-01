@@ -25,3 +25,9 @@
 - **FloodWait 不计入降级判定**：设计文档只说「指数退避 + FloodWait 按服务端秒数 sleep；连续失败 N 次降级」。落地为：FloodWait 是服务端限速信号（等待后必然可重试），不计入连续失败；仅其他错误连续达 max_attempts 降级。`decide_retry` 纯函数单测锁定该语义。
 - **成功路径持久化失败不重传**：transport 已成功后再遇 DB 错误时重传只会产生远端重复数据且救不了 DB，故直接降级（保留本地文件供 requeue），不重试。
 - **降级的持久化标记（upload_failed 列）延后**：设计文档要求降级后「DB 标记 upload_failed 并在 WebUI 徽章展示」。当前降级仅停止重试 + 行保持 is_uploaded=0 + 内存 stats；持久化标记需要 schema 迁移（ALTER TABLE ADD COLUMN，模式同 last_access_at 计划），与 WebUI 徽章（M4）同批落地为独立迁移单元，避免本单元夹带 schema 变更。
+
+## 2026-09-03 分块命名契约勘误（M1 规格错误的自我修正）
+
+- **事实**：M1 transport 单元主会话规格将契约 3「分块远端名 `{name}.part{NNN}`」误读为 `{stem}.part{NNN}`（去扩展名）且编号 1 基。对照基线源码（telegram_client.py:155,203-204、chunker.py:36）逐条核实：① `file_name = os.path.basename(clean_rel)` **含扩展名**；② `enumerate(chunks)` 的 part 名 **0 基**（`data.bin.part000` 起）；③ caption `Part: {idx+1}/{n}` **1 基**；④ DB `chunk_index` 0 基（core ChunkRecord 同）。命名源应为虚拟路径 basename（rel_path.name()）而非本地文件名。
+- **采纳裁决**：两轮 TDD 修正（64c1391 + 40b89c3）——测试期望先改为基线值（红），MockTransport 命名改为 `rel_path.name()` + 0 基编号，caption 保持 1 基；130 测试全绿。
+- **教训与风险**：契约速记符号（`{name}`、`{NNN}`）有歧义时必须回基线源码逐字核实，不能凭直觉解读——M0 chunker 单元（part000、含扩展名）本已正确，M1 规格重新表述时引入偏差。GrammersTransport（M2）实现时命名/caption 必须以本条勘误后的契约为准；caption 全文快照在 M2 用基线源码转录（telethon 依赖使 fixture 自动生成暂不可用，人工转录待双向补强）。

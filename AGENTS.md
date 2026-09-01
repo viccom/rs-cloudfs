@@ -8,7 +8,7 @@
 
 ## 当前阶段
 **M1 已完成**（分支 `feat/m1-core`，自 feat/m0-core 切出；M0 内容见 git 历史：workspace + config/cache/chunker/crypto/database/logging/rel_path 七模块 + 互操作契约测试；CI/keyring/deny 归属待裁决见 `docs/decisions.md`）。M1 交付（130 测试全绿）：
-- `transport`：`CloudTransport` trait（async_trait，dyn 兼容）+ UploadJob/UploadReceipt/RemoteHandle/IncomingEvent/TransportError（FloodWait{seconds} 归一化）+ `MockTransport`（脚本化错误注入；`{stem}.part{NNN}` 命名与 caption 契约在 Mock 侧强制；open/open_range 切片；drain-once incoming）
+- `transport`：`CloudTransport` trait（async_trait，dyn 兼容）+ UploadJob/UploadReceipt/RemoteHandle/IncomingEvent/TransportError（FloodWait{seconds} 归一化）+ `MockTransport`（脚本化错误注入；分块命名 **`{basename含扩展名}.part{000起0基三位}`**、caption `i/n` 1 基——契约 3 勘误版，见 decisions.md 2026-09-03；open/open_range 切片；drain-once incoming）
 - `upload_queue`：有界 mpsc + N worker；`decide_retry` 纯函数（指数退避封顶；FloodWait 按服务端秒数精确等待且不计入降级）；连续失败达 max_attempts 降级停试；成功才写 DB+删缓存；0 字节跳传输；`requeue_pending` 只入队本地存在的行
 - `vfs`：门面装配——`put`（.tmp+原子 rename→pending 行→入队，enqueue 后无 await 点保证受理语义）、`hydrate`（缓存命中优先→分块合并下载→加密行解密为明文缓存→LRU 驱逐并清被逐行 is_cached）、queue_stats/shutdown 委托
 - `MetaDatabase` 已内部 Mutex 化支持 Arc 跨 await（选型裁决见 decisions.md）
