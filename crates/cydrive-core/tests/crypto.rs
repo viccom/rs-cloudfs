@@ -1,0 +1,176 @@
+//! RED-phase tests for `cydrive_core::crypto`.
+//!
+//! Wire format (frozen compatibility contract, byte-compatible with the
+//! Python `CyCrypto`): `[16B salt][12B nonce][AES-256-GCM ciphertext + 16B
+//! tag]`, key = PBKDF2-HMAC-SHA256(password_utf8, salt, 100_000) → 32B,
+//! AAD = None. Total ciphertext length is therefore
+//! `plaintext.len() + SALT_SIZE + NONCE_SIZE + 16` (i.e. +44, verified
+//! against a real Python-generated fixture).
+
+use base64::Engine as _;
+use cydrive_core::crypto::{
+    decrypt, derive_key, encrypt, CryptoError, KEY_SIZE, NONCE_SIZE, PBKDF2_ITERATIONS, SALT_SIZE,
+};
+
+const PW: &str = "correct horse battery staple";
+const GCM_TAG_SIZE: usize = 16;
+/// salt + nonce + GCM tag = per-message overhead over the plaintext.
+const TOTAL_OVERHEAD: usize = SALT_SIZE + NONCE_SIZE + GCM_TAG_SIZE;
+
+// ------------------------------------------------------------ roundtrip ---
+
+#[test]
+fn encrypt_decrypt_roundtrip_across_sizes() {
+    let sizes: [usize; 4] = [0, 1, 1_000, 70_003];
+    for &n in &sizes {
+        let plaintext: Vec<u8> = (0..n).map(|i| (i % 251) as u8).collect();
+        let ct = encrypt(PW, &plaintext);
+        let pt = decrypt(PW, &ct).unwrap_or_else(|e| panic!("roundtrip failed for size {n}: {e}"));
+        assert_eq!(pt, plaintext, "roundtrip mismatch for size {n}");
+    }
+}
+
+#[test]
+fn roundtrip_with_unicode_password() {
+    let plaintext = "零知识加密 🔐 passwort-пароль".as_bytes();
+    let ct = encrypt("密码🔑123", plaintext);
+    assert_eq!(decrypt("密码🔑123", &ct).unwrap(), plaintext);
+}
+
+// ------------------------------------------------------ layout / random ---
+
+#[test]
+fn ciphertext_length_is_plaintext_plus_44() {
+    // Constant contracts (kept here so this test exercises todo! code too).
+    assert_eq!((SALT_SIZE, NONCE_SIZE, KEY_SIZE), (16, 12, 32));
+    assert_eq!(PBKDF2_ITERATIONS, 100_000);
+
+    for &n in &[0usize, 1, 64, 1_024] {
+        let plaintext = vec![0xABu8; n];
+        let ct = encrypt(PW, &plaintext);
+        assert_eq!(ct.len(), n + TOTAL_OVERHEAD, "wrong length for size {n}");
+    }
+}
+
+#[test]
+fn layout_is_salt_then_nonce_then_gcm_body() {
+    let plaintext = b"layout probe";
+    let ct = encrypt(PW, plaintext);
+    let salt = &ct[..SALT_SIZE];
+    let nonce = &ct[SALT_SIZE..SALT_SIZE + NONCE_SIZE];
+    let body = &ct[SALT_SIZE + NONCE_SIZE..];
+
+    // Header sizes are fixed by the format.
+    assert_eq!(salt.len(), SALT_SIZE);
+    assert_eq!(nonce.len(), NONCE_SIZE);
+    // Body = ciphertext + tag: exactly plaintext + 16 bytes.
+    assert_eq!(body.len(), plaintext.len() + GCM_TAG_SIZE);
+
+    // The key derived from the embedded salt must be the one in use:
+    // decrypting with the same password succeeds (guards header layout).
+    assert_eq!(decrypt(PW, &ct).unwrap(), plaintext);
+}
+
+#[test]
+fn fresh_salt_and_nonce_per_encryption() {
+    let plaintext = b"randomness probe";
+    let a = encrypt(PW, plaintext);
+    let b = encrypt(PW, plaintext);
+    assert_ne!(&a[..SALT_SIZE], &b[..SALT_SIZE], "salt must be random");
+    assert_ne!(
+        &a[SALT_SIZE..SALT_SIZE + NONCE_SIZE],
+        &b[SALT_SIZE..SALT_SIZE + NONCE_SIZE],
+        "nonce must be random"
+    );
+}
+
+// ------------------------------------------------------------- failures ---
+
+#[test]
+fn wrong_password_is_auth_failed() {
+    let ct = encrypt(PW, b"secret");
+    assert!(matches!(
+        decrypt("not the password", &ct),
+        Err(CryptoError::AuthFailed)
+    ));
+}
+
+#[test]
+fn tampered_last_byte_is_rejected() {
+    let mut ct = encrypt(PW, b"tamper probe");
+    let last = ct.len() - 1;
+    ct[last] ^= 0xFF;
+    assert!(matches!(decrypt(PW, &ct), Err(CryptoError::AuthFailed)));
+}
+
+#[test]
+fn tampered_salt_is_rejected() {
+    let mut ct = encrypt(PW, b"tamper probe");
+    ct[0] ^= 0x01;
+    assert!(matches!(decrypt(PW, &ct), Err(CryptoError::AuthFailed)));
+}
+
+#[test]
+fn truncated_input_is_too_short() {
+    for len in [0usize, 1, 16, 27] {
+        let ct = encrypt(PW, b"truncate probe");
+        assert!(
+            matches!(decrypt(PW, &ct[..len]), Err(CryptoError::TooShort)),
+            "expected TooShort for input of {len} bytes"
+        );
+    }
+}
+
+// ------------------------------------------------------------ derive_key ---
+
+#[test]
+fn derive_key_is_deterministic_and_salt_sensitive() {
+    let salt_a = [7u8; SALT_SIZE];
+    let salt_b = [9u8; SALT_SIZE];
+
+    let k1 = derive_key(PW, &salt_a);
+    let k2 = derive_key(PW, &salt_a);
+    let k3 = derive_key(PW, &salt_b);
+    let k4 = derive_key("other password", &salt_a);
+
+    assert_eq!(k1.len(), KEY_SIZE);
+    assert_eq!(k1, k2, "same password + salt must derive the same key");
+    assert_ne!(k1, k3, "different salts must derive different keys");
+    assert_ne!(k1, k4, "different passwords must derive different keys");
+}
+
+// ------------------------------------------- interop with Python CyCrypto ---
+
+/// Reads the vector generated by the real Python `CyCrypto`
+/// (`tests/compat/fixtures/crypto_vector.json`) and asserts the Rust
+/// implementation decrypts it byte-for-byte. The integration-test working
+/// directory is the crate root, so the relative path resolves.
+#[test]
+fn decrypts_python_generated_ciphertext() {
+    let raw = std::fs::read_to_string("tests/compat/fixtures/crypto_vector.json")
+        .expect("compat fixture must be present");
+    let v: serde_json::Value = serde_json::from_str(&raw).expect("fixture must be valid JSON");
+
+    let password = v["password"].as_str().expect("password field").to_string();
+    let plaintext = base64::engine::general_purpose::STANDARD
+        .decode(
+            v["plaintext_base64"]
+                .as_str()
+                .expect("plaintext_base64 field"),
+        )
+        .expect("base64 plaintext");
+    let ciphertext = base64::engine::general_purpose::STANDARD
+        .decode(
+            v["ciphertext_base64"]
+                .as_str()
+                .expect("ciphertext_base64 field"),
+        )
+        .expect("base64 ciphertext");
+
+    // Fixture sanity: Python overhead is salt+nonce+tag = 44 bytes.
+    assert_eq!(ciphertext.len(), plaintext.len() + TOTAL_OVERHEAD);
+
+    let decrypted =
+        decrypt(&password, &ciphertext).expect("Rust must decrypt Python CyCrypto output");
+    assert_eq!(decrypted, plaintext);
+}

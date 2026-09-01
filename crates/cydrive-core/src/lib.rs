@@ -4,3 +4,7 @@
 //! LRU cache management, client-side encryption and large-file chunking.
 //! No network or transport concerns live here; see the design document at
 //! `docs/rust-rewrite-design.md` (repository root).
+
+pub mod chunker;
+pub mod crypto;
+pub mod rel_path;
