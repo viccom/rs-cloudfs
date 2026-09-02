@@ -20,7 +20,7 @@ use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use cydrive_cli::{discover_config, run_with_transport, RunHandle};
+use cydrive_cli::{discover_config, run_with_transport, vfs_config, RunHandle};
 use cydrive_core::config::CyDriveConfig;
 use cydrive_core::database::{FileUpsert, MetaDatabase};
 use cydrive_core::transport::mock::MockTransport;
@@ -274,6 +274,30 @@ async fn auto_mount_disabled_leaves_mounted_letter_none() {
     let handle = boot(&cfg, mock).await;
     assert_eq!(handle.mounted_letter, None);
     handle.shutdown().await;
+}
+
+/// 8. `vfs_config` applies the Python AND semantics
+///    (`enable_encryption && encryption_password`, telegram_client.py:167):
+///    a configured password reaches the VFS only while the flag is on; the
+///    flag off means plaintext uploads even with a password in the config.
+#[test]
+fn vfs_config_respects_enable_encryption_flag() {
+    let mut cfg = temp_config(Path::new("."), 0);
+    cfg.encryption_password = Some("x".to_string());
+
+    cfg.enable_encryption = false;
+    assert_eq!(
+        vfs_config(&cfg).encryption_password,
+        None,
+        "flag off: the password must not reach the VFS"
+    );
+
+    cfg.enable_encryption = true;
+    assert_eq!(
+        vfs_config(&cfg).encryption_password,
+        Some("x".to_string()),
+        "flag on: the configured password reaches the VFS"
+    );
 }
 
 /// 4. With both files present, discovery prefers `config.toml` over a

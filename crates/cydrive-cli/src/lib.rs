@@ -88,13 +88,26 @@ impl RunHandle {
 /// Maps the application config onto the VFS knobs: chunk split from
 /// `chunk_size_mb`, two queue workers, a 256-slot queue, the default
 /// retry policy and the optional encryption password.
-fn vfs_config(cfg: &CyDriveConfig) -> VfsConfig {
+///
+/// The password reaches the VFS only while `enable_encryption` is on —
+/// the Python AND semantics (`telegram_client.py:167`:
+/// `enable_encryption and encryption_password`): a stale password in the
+/// config with the flag off must not silently flip uploads to encrypted.
+///
+/// Public for the pure-mapping tests (frozen API addition, trait-evolution
+/// adjudication 2026-09-02); the mapping itself is part of the upload
+/// encryption contract.
+pub fn vfs_config(cfg: &CyDriveConfig) -> VfsConfig {
     VfsConfig {
         chunk_size_bytes: cfg.chunk_size_mb * 1024 * 1024,
         workers: 2,
         queue_capacity: 256,
         retry: Default::default(),
-        encryption_password: cfg.encryption_password.clone(),
+        encryption_password: if cfg.enable_encryption {
+            cfg.encryption_password.clone()
+        } else {
+            None
+        },
         hydrate_timeout: Duration::from_secs(180),
     }
 }

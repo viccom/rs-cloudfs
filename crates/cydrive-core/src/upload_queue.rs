@@ -18,6 +18,7 @@
 //! so a single-worker queue is strictly FIFO. The frozen behavior
 //! contract is encoded by the tests under `tests/upload_queue.rs`.
 
+use std::ffi::OsStr;
 use std::path::Path;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -137,16 +138,23 @@ pub struct UploadQueueConfig {
     pub retry: RetryPolicy,
     /// Chunk split size used for re-enqueued pending rows.
     pub chunk_size_bytes: u64,
+    /// Password enabling client-side encryption of uploaded rows
+    /// (Python AND semantics: a row is encrypted only when its own
+    /// `is_encrypted` flag is set *and* this is `Some`); default `None`
+    /// keeps every upload byte-identical to the plaintext path.
+    pub encryption_password: Option<String>,
 }
 
 impl Default for UploadQueueConfig {
-    /// 2 workers, capacity 256, default retry, 1900 MB chunks.
+    /// 2 workers, capacity 256, default retry, 1900 MB chunks, no
+    /// encryption.
     fn default() -> Self {
         Self {
             workers: 2,
             queue_capacity: 256,
             retry: RetryPolicy::default(),
             chunk_size_bytes: DEFAULT_CHUNK_SIZE_MB * 1024 * 1024,
+            encryption_password: None,
         }
     }
 }
@@ -317,10 +325,89 @@ async fn worker_loop(
             rx.recv().await
         };
         match job {
-            Some(job) => {
-                process_job(db.as_ref(), transport.as_ref(), &cfg.retry, &stats, job).await
-            }
+            Some(job) => process_job(db.as_ref(), transport.as_ref(), &cfg, &stats, job).await,
             None => return, // channel closed and drained: shut down
+        }
+    }
+}
+
+/// The staged encryption of one job: the effective ciphertext job plus
+/// the pre-computed plaintext sha256 (Python `telegram_client.py:160`:
+/// the digest covers the plaintext, computed before encryption).
+struct StagedUpload {
+    /// Effective job over the ciphertext temp file (same rel_path and
+    /// chunk split size; size/chunk_count re-planned on the ciphertext).
+    job: UploadJob,
+    /// Plaintext digest (None for oversized files / failed computation).
+    sha256: Option<String>,
+}
+
+/// Sibling staging path of the plaintext cache copy for the encrypted
+/// upload: the full file name plus `.enc.tmp` (`foo.txt` ->
+/// `foo.txt.enc.tmp`), in the same directory so the cleanup and the
+/// cache-tree walks both see it.
+fn enc_tmp_sibling(target: &Path) -> std::path::PathBuf {
+    let file_name = target.file_name().unwrap_or_else(|| OsStr::new("cydrive"));
+    let mut staged = file_name.to_os_string();
+    staged.push(".enc.tmp");
+    target.with_file_name(staged)
+}
+
+/// Whole-file encryption staging (Python `telegram_client.py:162-177`,
+/// the adjudicated v1 semantics: plaintext -> whole-file v1 crypto format
+/// -> the ciphertext is what gets chunked and uploaded).
+///
+/// 1. hash the plaintext local copy first (E2 semantics, size gate on the
+///    plaintext size);
+/// 2. read the plaintext, encrypt it in memory (Python parity — the
+///    whole file is buffered; streaming is an explicitly deferred v2
+///    item) and write the ciphertext to a sibling `{name}.enc.tmp`;
+/// 3. re-plan the chunk split over the ciphertext bytes.
+///
+/// I/O failures surface to the caller as ordinary upload failures
+/// (retry/degrade; the plaintext is never touched).
+fn stage_encrypted(job: &UploadJob, password: &str) -> std::io::Result<StagedUpload> {
+    // Python order: the digest is computed on the plaintext (and its
+    // size gate uses the plaintext size) before any encryption happens.
+    let sha256 = hash_after_upload(job, job.size);
+    let plaintext = std::fs::read(&job.local_path)?;
+    let ciphertext = crate::crypto::encrypt(password, &plaintext);
+    let tmp = enc_tmp_sibling(&job.local_path);
+    std::fs::write(&tmp, &ciphertext)?;
+    let size = ciphertext.len() as u64;
+    let chunk_count = size.div_ceil(job.chunk_size.max(1)) as u32;
+    Ok(StagedUpload {
+        job: UploadJob {
+            rel_path: job.rel_path.clone(),
+            local_path: tmp,
+            size,
+            chunk_count,
+            chunk_size: job.chunk_size,
+        },
+        sha256,
+    })
+}
+
+/// finally-semantics cleanup of the encrypted staging file: dropped on
+/// every exit path of [`process_job`] (success, degradation, panic),
+/// deleting the ciphertext temp file whether or not the upload succeeded
+/// (Python `finally` in `telegram_client.py:290-296`). The plaintext
+/// cache copy is *not* this guard's business — that one is still deleted
+/// only after a successful upload.
+struct EncTempGuard(Option<std::path::PathBuf>);
+
+impl Drop for EncTempGuard {
+    fn drop(&mut self) {
+        if let Some(path) = &self.0 {
+            if let Err(error) = std::fs::remove_file(path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        path = %path.display(),
+                        %error,
+                        "failed to delete the encrypted staging file"
+                    );
+                }
+            }
         }
     }
 }
@@ -330,7 +417,7 @@ async fn worker_loop(
 async fn process_job(
     db: &MetaDatabase,
     transport: &dyn CloudTransport,
-    retry_policy: &RetryPolicy,
+    cfg: &UploadQueueConfig,
     stats: &StatsCounters,
     job: UploadJob,
 ) {
@@ -370,16 +457,80 @@ async fn process_job(
         return;
     }
 
+    // Encrypted staging: required only when the row is flagged encrypted
+    // AND the queue carries a password (Python AND semantics). Staged
+    // once and reused across retries of the same job; the guard deletes
+    // the temp ciphertext on every exit path.
+    let mut staged: Option<StagedUpload> = None;
+    let mut enc_tmp = EncTempGuard(None);
+
     let mut consecutive_failures = 0u32;
     loop {
-        match transport.upload(&job).await {
+        // Lazily (re)attempt the staging: an I/O failure here behaves
+        // like any other upload failure — backoff/degrade, plaintext
+        // untouched, retried on the next loop pass.
+        if staged.is_none() && row.is_encrypted && cfg.encryption_password.is_some() {
+            let password = cfg.encryption_password.as_deref().expect("checked above");
+            match stage_encrypted(&job, password) {
+                Ok(s) => {
+                    enc_tmp.0 = Some(s.job.local_path.clone());
+                    staged = Some(s);
+                }
+                Err(error) => {
+                    let error = TransportError::Io(error);
+                    consecutive_failures += 1;
+                    match decide_retry(&cfg.retry, &error, consecutive_failures) {
+                        RetryDecision::RetryAfter(delay) => {
+                            tracing::info!(
+                                rel_path = %job.rel_path,
+                                attempt = consecutive_failures,
+                                delay = ?delay,
+                                %error,
+                                "encryption staging failed; backing off"
+                            );
+                            tokio::time::sleep(delay).await;
+                            bump(&stats.retries);
+                            continue;
+                        }
+                        RetryDecision::Degrade => {
+                            tracing::warn!(
+                                rel_path = %job.rel_path,
+                                attempts = consecutive_failures,
+                                %error,
+                                "encryption staging retries exhausted; degrading"
+                            );
+                            bump(&stats.degraded);
+                            return;
+                        }
+                    }
+                }
+            }
+        }
+        // What the transport sees: the ciphertext job when staged, the
+        // plaintext job otherwise (password None is byte-identical to the
+        // pre-encryption behavior).
+        let target = staged.as_ref().map(|s| &s.job).unwrap_or(&job);
+        match transport.upload(target).await {
             Ok(receipt) => {
                 // Python baseline: files <= 100 MB carry a sha256 in their
-                // row (sha-ETag, contract 6). Computed after remote
-                // success but before the local copy is deleted, so a hash
-                // failure never fails an upload that already made it.
-                let sha256 = hash_after_upload(&job, receipt.uploaded_bytes);
-                match persist_success(db, &row, &job, &receipt, sha256) {
+                // row (sha-ETag, contract 6). Encrypted uploads hashed the
+                // plaintext during staging; plaintext uploads compute it
+                // now, after remote success but before the local copy is
+                // deleted, so a hash failure never fails an upload that
+                // already made it.
+                let sha256 = match &staged {
+                    Some(s) => s.sha256.clone(),
+                    None => hash_after_upload(&job, receipt.uploaded_bytes),
+                };
+                // Row size: encrypted rows keep their plaintext size
+                // (Python upserts `file_size`, the plaintext length);
+                // plaintext rows take the receipt's byte count as before.
+                let file_size = if staged.is_some() {
+                    row.size
+                } else {
+                    receipt.uploaded_bytes as i64
+                };
+                match persist_success(db, &row, target, &receipt, file_size, sha256) {
                     Ok(()) => {
                         delete_local_copy(&job.local_path);
                         bump(&stats.succeeded);
@@ -397,7 +548,7 @@ async fn process_job(
                         bump(&stats.degraded);
                     }
                 }
-                return;
+                return; // `enc_tmp` drops here: ciphertext temp deleted.
             }
             Err(TransportError::FloodWait { seconds }) => {
                 tracing::info!(
@@ -411,7 +562,7 @@ async fn process_job(
             }
             Err(error) => {
                 consecutive_failures += 1;
-                match decide_retry(retry_policy, &error, consecutive_failures) {
+                match decide_retry(&cfg.retry, &error, consecutive_failures) {
                     RetryDecision::RetryAfter(delay) => {
                         tracing::info!(
                             rel_path = %job.rel_path,
@@ -433,7 +584,7 @@ async fn process_job(
                             "upload retries exhausted; degrading"
                         );
                         bump(&stats.degraded);
-                        return;
+                        return; // `enc_tmp` drops here too.
                     }
                 }
             }
@@ -511,20 +662,27 @@ fn persist_zero_byte(
     Ok(())
 }
 
-/// Success persistence for a real receipt: refresh size/chunk_count from
-/// the receipt, then write one `chunks` row per uploaded message — every
-/// full chunk at `chunk_size`, the last one carrying the remainder.
+/// Success persistence for a real receipt: the row's size becomes
+/// `file_size` (the plaintext row size for encrypted uploads — the
+/// receipt's byte count is the *ciphertext* length there — and the
+/// receipt's byte count for plaintext uploads), `chunk_count` counts the
+/// receipt's messages, and one `chunks` row is written per uploaded
+/// message — every full chunk at the `job`'s chunk size, the last one
+/// carrying the remainder. `job` is the job the transport actually saw
+/// (the ciphertext job for encrypted uploads), so the per-chunk sizes
+/// follow the ciphertext boundaries.
 fn persist_success(
     db: &MetaDatabase,
     row: &FileRecord,
     job: &UploadJob,
     receipt: &UploadReceipt,
+    file_size: i64,
     sha256: Option<String>,
 ) -> Result<(), QueueError> {
     let chunk_count = receipt.chunk_msg_ids.len() as i64;
     let file_id = db.upsert_file(&uploaded_upsert(
         row,
-        receipt.uploaded_bytes as i64,
+        file_size,
         Some(i64::from(receipt.first_msg_id)),
         chunk_count,
         sha256,
@@ -569,21 +727,33 @@ fn delete_local_copy(local_path: &Path) {
 ///    uploads never go remote), persist as success (`telegram_msg_id =
 ///    None`, the row's `chunk_count` kept, `is_cached = false`, local
 ///    file deleted), count succeeded.
-/// 3. Otherwise loop over `transport.upload(job)`:
+/// 3. Rows flagged `is_encrypted` while `cfg.encryption_password` is
+///    `Some` are staged first (Python `telegram_client.py:162-177`): the
+///    plaintext is hashed (<= [`SHA256_MAX_BYTES`]), encrypted whole-file
+///    into a sibling `{name}.enc.tmp`, and the *ciphertext* is what gets
+///    uploaded and chunk-planned. Staging I/O failures count as ordinary
+///    upload failures (retry/degrade, plaintext kept); the temp file is
+///    deleted on every exit path (success and failure alike). A row
+///    without either half of the AND condition uploads plaintext,
+///    byte-identical to the pre-encryption behavior.
+/// 4. Otherwise loop over `transport.upload(job)`:
 ///    - `Ok(receipt)` → persist `is_uploaded = true`, `telegram_msg_id =
 ///      Some(first)`, `chunk_count` and the per-chunk rows from the
-///      receipt (last chunk = `uploaded_bytes - (n-1) * chunk_size`),
-///      `size = uploaded_bytes`, `sha256` = the freshly computed
-///      plaintext digest when `should_hash(uploaded_bytes)` (None for
-///      oversized files or a failed hash — warn only, never an upload
-///      failure); delete the local file; count succeeded.
+///      receipt (last chunk = `uploaded_bytes - (n-1) * chunk_size`, over
+///      the bytes the transport saw — ciphertext boundaries when
+///      encrypted), `size` = the receipt's byte count (plaintext rows)
+///      or the row's kept plaintext size (encrypted rows),
+///      `sha256` = the freshly computed plaintext digest when
+///      `should_hash(uploaded_bytes)` (None for oversized files or a
+///      failed hash — warn only, never an upload failure); delete the
+///      local file; count succeeded.
 ///    - `Err(FloodWait { s })` → sleep `s` (0 sleeps nothing), count
 ///      retries, retry the whole upload (never counts toward
 ///      degradation).
 ///    - any other `Err` → [`decide_retry`]: sleep-and-retry (count
 ///      retries) or degrade (count degraded, keep the local file, row
 ///      stays `is_uploaded = 0`).
-/// 4. Persistence errors on the success path → no re-upload (a retry
+/// 5. Persistence errors on the success path → no re-upload (a retry
 ///    cannot fix the DB and would duplicate remote data): count
 ///    degraded, `warn`.
 pub fn spawn_queue(

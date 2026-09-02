@@ -183,6 +183,7 @@ impl Vfs {
                 queue_capacity: cfg.queue_capacity,
                 retry: cfg.retry.clone(),
                 chunk_size_bytes: cfg.chunk_size_bytes,
+                encryption_password: cfg.encryption_password.clone(),
             },
         );
         Self {
@@ -266,10 +267,13 @@ impl Vfs {
             telegram_msg_id: None,
             is_uploaded: false,
             is_cached: true,
-            // The staged bytes are plaintext and the queue ships them
-            // unchanged, so the row must not claim encryption (hydrate
-            // would try to decrypt the remote copy otherwise).
-            is_encrypted: false,
+            // The global switch decides the flag up front (Python
+            // `is_encrypted` in telegram_client.py:164-174); the queue
+            // then encrypts rows whose flag is set while it holds a
+            // password (the AND semantics). `chunk_count` above is still
+            // planned on the plaintext — the worker overwrites it with
+            // the real ciphertext chunk count on success.
+            is_encrypted: self.cfg.encryption_password.is_some(),
             chunk_count: chunk_count as i64,
             mime_type: None,
         })?;

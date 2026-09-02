@@ -12,7 +12,7 @@
 //! rows whose local copy still exists.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -45,7 +45,17 @@ fn test_cfg(chunk_size_bytes: u64) -> UploadQueueConfig {
         queue_capacity: 16,
         retry: fast_retry(),
         chunk_size_bytes,
+        encryption_password: None,
     }
+}
+
+/// [`test_cfg`] plus an encryption password: the queue stages an
+/// encrypted copy for rows flagged `is_encrypted` (Python AND semantics:
+/// both the config password and the row flag are required).
+fn encrypted_cfg(chunk_size_bytes: u64, password: &str) -> UploadQueueConfig {
+    let mut cfg = test_cfg(chunk_size_bytes);
+    cfg.encryption_password = Some(password.to_string());
+    cfg
 }
 
 /// Real temp environment: SQLite db + cache tree + pre-connected mock
@@ -122,6 +132,56 @@ fn seed_pending(
     fs::create_dir_all(local.parent().expect("local parent dir")).expect("create cache dirs");
     fs::write(&local, bytes).expect("write cache file");
     local
+}
+
+/// Seeds a pending *encrypted* row (is_encrypted=true, the flag half of
+/// the Python AND condition) plus its plaintext bytes in the mirrored
+/// cache tree; returns the local cache path.
+fn seed_encrypted_pending(
+    db: &MetaDatabase,
+    cache: &CacheManager,
+    rel: &str,
+    bytes: &[u8],
+    chunk_count: i64,
+) -> PathBuf {
+    let rel_path = RelPath::new(rel).expect("valid rel path");
+    let parent = rel_path.parent().expect("non-root path");
+    db.upsert_file(&FileUpsert {
+        rel_path: rel_path.as_str().to_string(),
+        name: rel_path.name().to_string(),
+        parent_dir: parent.as_str().to_string(),
+        size: bytes.len() as i64,
+        mtime: 1_700_000_000.0,
+        sha256: None,
+        is_dir: false,
+        telegram_msg_id: None,
+        is_uploaded: false,
+        is_cached: true,
+        is_encrypted: true,
+        chunk_count,
+        mime_type: Some("application/octet-stream".to_string()),
+    })
+    .expect("seed encrypted files row");
+    let local = cache.local_path(&rel_path);
+    fs::create_dir_all(local.parent().expect("local parent dir")).expect("create cache dirs");
+    fs::write(&local, bytes).expect("write cache file");
+    local
+}
+
+/// Recursively collects every regular file under `dir`.
+fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
+    let entries = match fs::read_dir(dir) {
+        Ok(entries) => entries,
+        Err(_) => return,
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_files(&path, out);
+        } else {
+            out.push(path);
+        }
+    }
 }
 
 /// The UploadJob a worker would derive for a seeded row.
@@ -610,4 +670,175 @@ fn oversized_files_skip_sha256() {
         !should_hash(u64::MAX),
         "no overflow surprise far over the cap"
     );
+}
+
+/// 16. Encrypted upload round-trip: 5 B plaintext at chunk_size 16 becomes
+///     a 49 B ciphertext (44 B crypto overhead) split into 4 remote chunks;
+///     concatenating the stored messages in chunk order yields ciphertext
+///     that decrypts back to the plaintext. Salt/nonce are fresh per run,
+///     so only the decrypt round-trip (not a fixed blob) can be asserted.
+#[tokio::test]
+async fn encrypted_upload_stores_decryptable_ciphertext() {
+    let (_dir, db, cache, mock) = test_env().await;
+    seed_encrypted_pending(&db, &cache, "/enc/a.bin", b"12345", 1);
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let handle = spawn_queue(db.clone(), transport, encrypted_cfg(16, "pw"));
+
+    handle
+        .enqueue(job_for(&cache, "/enc/a.bin", 5, 1, 16))
+        .await
+        .expect("enqueue");
+    handle.shutdown().await;
+
+    let row = db
+        .get_file("/enc/a.bin")
+        .expect("db read")
+        .expect("row exists");
+    assert!(row.is_uploaded, "encrypted upload succeeds");
+    assert_eq!(
+        row.chunk_count, 4,
+        "ciphertext (49 B) split at 16 B per chunk"
+    );
+
+    let chunks = db.get_chunks_by_file_id(row.id).expect("read chunks");
+    let mut joined = Vec::new();
+    for chunk in &chunks {
+        let id = i32::try_from(chunk.telegram_msg_id.expect("chunk msg id"))
+            .expect("msg id fits an i32");
+        joined.extend_from_slice(&mock.message(id).expect("stored remote message"));
+    }
+    assert_eq!(joined.len(), 49, "5 B plaintext + 44 B crypto overhead");
+    assert_eq!(
+        cydrive_core::crypto::decrypt("pw", &joined).expect("decrypt the joined ciphertext"),
+        b"12345",
+        "remote chunks concatenate into decryptable ciphertext"
+    );
+}
+
+/// 17. Encrypted row shape (Python telegram_client.py:235-242): the row
+///     keeps the *plaintext* size while `chunk_count` counts *ciphertext*
+///     chunks, and every chunk row carries its ciphertext boundary sizes
+///     (49 B at chunk_size 16 -> [16, 16, 16, 1]).
+#[tokio::test]
+async fn encrypted_row_keeps_plaintext_size_and_cipher_chunk_count() {
+    let (_dir, db, cache, _mock) = test_env().await;
+    seed_encrypted_pending(&db, &cache, "/enc/shape.bin", b"12345", 1);
+    let transport: Arc<dyn CloudTransport> = _mock.clone();
+    let handle = spawn_queue(db.clone(), transport, encrypted_cfg(16, "pw"));
+
+    handle
+        .enqueue(job_for(&cache, "/enc/shape.bin", 5, 1, 16))
+        .await
+        .expect("enqueue");
+    handle.shutdown().await;
+
+    let row = db
+        .get_file("/enc/shape.bin")
+        .expect("db read")
+        .expect("row exists");
+    assert!(row.is_uploaded);
+    assert_eq!(row.size, 5, "row size stays the plaintext size");
+    assert_eq!(row.chunk_count, 4, "chunk_count counts ciphertext chunks");
+    assert!(row.is_encrypted, "row keeps its encrypted flag");
+    assert_eq!(row.telegram_msg_id, Some(1), "chunk-0 msg id recorded");
+
+    let chunks = db.get_chunks_by_file_id(row.id).expect("read chunks");
+    let sizes: Vec<i64> = chunks.iter().map(|c| c.size).collect();
+    assert_eq!(
+        sizes,
+        vec![16, 16, 16, 1],
+        "chunk rows carry ciphertext boundary sizes"
+    );
+}
+
+/// 18. Encrypted success stores the *plaintext* sha256 (Python
+///     telegram_client.py:160: the digest is computed on the local
+///     plaintext before encryption), recomputed here from the seeded file
+///     with the same `chunker::sha256_file`.
+#[tokio::test]
+async fn encrypted_upload_hashes_plaintext_sha256() {
+    let (_dir, db, cache, mock) = test_env().await;
+    let local = seed_encrypted_pending(&db, &cache, "/enc/hash.bin", b"12345", 1);
+    let expected_sha =
+        cydrive_core::chunker::sha256_file(&local).expect("hash the seeded plaintext");
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let handle = spawn_queue(db.clone(), transport, encrypted_cfg(16, "pw"));
+
+    handle
+        .enqueue(job_for(&cache, "/enc/hash.bin", 5, 1, 16))
+        .await
+        .expect("enqueue");
+    handle.shutdown().await;
+
+    let row = db
+        .get_file("/enc/hash.bin")
+        .expect("db read")
+        .expect("row exists");
+    assert_eq!(
+        row.sha256,
+        Some(expected_sha),
+        "encrypted upload stores the plaintext digest, not a ciphertext one"
+    );
+}
+
+/// 19. Encrypted success cleans up after itself: the `.enc.tmp` staging
+///     file is gone (deleted on success and failure alike — the Python
+///     `finally` semantics), the plaintext cache copy is deleted (success
+///     only, the standing fix of the Python unconditional delete), and no
+///     file of any kind survives in the cache tree.
+#[tokio::test]
+async fn encrypted_success_cleans_temp_and_cache() {
+    let (dir, db, cache, mock) = test_env().await;
+    let local = seed_encrypted_pending(&db, &cache, "/enc/clean.bin", b"12345", 1);
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let handle = spawn_queue(db.clone(), transport, encrypted_cfg(16, "pw"));
+
+    handle
+        .enqueue(job_for(&cache, "/enc/clean.bin", 5, 1, 16))
+        .await
+        .expect("enqueue");
+    handle.shutdown().await;
+
+    assert!(
+        !local.exists(),
+        "plaintext cache copy deleted after success"
+    );
+    let mut files = Vec::new();
+    collect_files(&dir.path().join("cache"), &mut files);
+    assert!(
+        files.is_empty(),
+        "cache tree holds no .enc.tmp/.tmp/other residue: {files:?}"
+    );
+}
+
+/// 20. Encryption-off regression guard (contrast with test 16): with no
+///     password configured the very same 5 B row uploads as plaintext —
+///     the remote message equals the plaintext verbatim and the row is
+///     not flagged encrypted.
+#[tokio::test]
+async fn encryption_disabled_uploads_plaintext_unchanged() {
+    let (_dir, db, cache, mock) = test_env().await;
+    let local = seed_pending(&db, &cache, "/plain/a.bin", b"12345", 1);
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let handle = spawn_queue(db.clone(), transport, test_cfg(16));
+
+    handle
+        .enqueue(job_for(&cache, "/plain/a.bin", 5, 1, 16))
+        .await
+        .expect("enqueue");
+    handle.shutdown().await;
+
+    let row = db
+        .get_file("/plain/a.bin")
+        .expect("db read")
+        .expect("row exists");
+    assert!(row.is_uploaded);
+    assert!(!row.is_encrypted, "row not flagged encrypted");
+    assert_eq!(row.chunk_count, 1, "5 B plaintext is a single chunk");
+    assert_eq!(
+        mock.message(1).expect("stored remote message"),
+        b"12345",
+        "remote holds the plaintext verbatim"
+    );
+    assert!(!local.exists(), "local copy deleted after success");
 }

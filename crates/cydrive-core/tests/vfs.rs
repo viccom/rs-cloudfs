@@ -698,7 +698,62 @@ async fn hydrate_completes_within_generous_timeout() {
         .await
         .expect("slow download still within budget");
     assert_eq!(
-        fs::read(&hydrated).expect("read hydrated copy"),
+        fs::read(hydrated).expect("read hydrated copy"),
         b"slow but fine"
+    );
+}
+
+/// 17. Encrypted full cycle: `put` under a configured password flags the
+///     row encrypted, the drained upload ships ciphertext (the joined
+///     remote chunks decrypt to the plaintext — offline proof of the
+///     Python<->Rust cross compatibility), and `hydrate` downloads +
+///     decrypts back to the plaintext.
+#[tokio::test]
+async fn encrypted_roundtrip_put_upload_hydrate() {
+    let (_dir, db, cache, _cache_root, mock) = test_env(1 << 20).await;
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let vfs = Vfs::new(db.clone(), cache, transport, test_cfg(16, Some("pw")));
+    let rel = RelPath::new("/enc-cycle.bin").expect("valid rel path");
+    let plaintext = b"secret payload"; // 14 B -> 58 B ciphertext -> 4 chunks at 16 B
+
+    vfs.put(&rel, plaintext, 1_700_000_000.0)
+        .await
+        .expect("put accepted");
+
+    let row = db
+        .get_file("/enc-cycle.bin")
+        .expect("db read")
+        .expect("row exists");
+    assert!(
+        row.is_encrypted,
+        "put flags the row encrypted when a password is configured"
+    );
+
+    vfs.shutdown().await;
+
+    let row = db
+        .get_file("/enc-cycle.bin")
+        .expect("db read")
+        .expect("row exists");
+    assert!(row.is_uploaded, "upload drained during shutdown");
+    assert_eq!(row.size, 14, "row keeps the plaintext size");
+    let chunks = db.get_chunks_by_file_id(row.id).expect("read chunks");
+    let mut joined = Vec::new();
+    for chunk in &chunks {
+        let id = i32::try_from(chunk.telegram_msg_id.expect("chunk msg id")).expect("msg id fits");
+        joined.extend_from_slice(&mock.message(id).expect("stored remote message"));
+    }
+    assert_eq!(joined.len(), 58, "14 B plaintext + 44 B crypto overhead");
+    assert_eq!(
+        cydrive_core::crypto::decrypt("pw", &joined).expect("decrypt the joined remote bytes"),
+        plaintext,
+        "the remote holds decryptable ciphertext"
+    );
+
+    let hydrated = vfs.hydrate(&rel).await.expect("hydrate after upload");
+    assert_eq!(
+        fs::read(hydrated).expect("read hydrated copy"),
+        plaintext,
+        "upload-encrypt + download-decrypt round-trips the plaintext"
     );
 }
