@@ -16,7 +16,7 @@ use crate::cache::CacheManager;
 use crate::crypto::{self, CryptoError};
 use crate::database::{DbError, FileRecord, FileUpsert, MetaDatabase};
 use crate::rel_path::RelPath;
-use crate::transport::{CloudTransport, RemoteHandle, TransportError, UploadJob};
+use crate::transport::{CloudTransport, InboundFile, RemoteHandle, TransportError, UploadJob};
 use crate::upload_queue::{
     spawn_queue, QueueError, QueueStats, RetryPolicy, UploadQueueConfig, UploadQueueHandle,
     DEFAULT_CHUNK_SIZE_MB,
@@ -419,6 +419,71 @@ impl Vfs {
     /// Snapshot of the upload queue counters.
     pub fn queue_stats(&self) -> QueueStats {
         self.queue.stats()
+    }
+
+    /// Indexes one inbound remote file at the root (metadata only; payload
+    /// stays remote until hydrated on demand). Returns the rel_path used.
+    ///
+    /// Python baseline (`telegram_client.py:55-85`): the row always sits at
+    /// the root — `parent_dir = "/"` even when the filename itself contains
+    /// `/` (a nested virtual path forms, unsanitized) — and a filename that
+    /// is missing or cannot form a valid path falls back to
+    /// `Telegram_File_{first_msg_id}.bin`. Single-message media is recorded
+    /// with `chunk_count = 1`, `is_uploaded = true`, `is_cached = false`;
+    /// a same-named file overwrites the row through the rel_path unique
+    /// key. `InboundFile` carries no mime field, so `mime_type` is `None`
+    /// where the Python baseline stored `msg.file.mime_type`.
+    pub async fn index_inbound(&self, file: InboundFile) -> Result<RelPath, VfsError> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap_or_default()
+            .as_secs_f64();
+        let msg_id = file.handle.first_msg_id;
+
+        // Python mirrors the filename verbatim into both rel_path and
+        // name; an unusable name (empty, backslash, `..` segment, ...)
+        // degrades to the per-message fallback name. An empty filename
+        // would otherwise degenerate the path to the root itself, so a
+        // root result is rejected too.
+        let candidate = RelPath::new(&format!("/{}", file.filename))
+            .ok()
+            .filter(|rel| !rel.is_root());
+        let (rel, name) = match candidate {
+            Some(rel) => (rel, file.filename),
+            None => {
+                let fallback = format!("Telegram_File_{msg_id}.bin");
+                // A single clean segment by construction (digits plus a
+                // fixed extension), so this cannot fail; building it via
+                // `RelPath::new` keeps the fallback subject to the same
+                // validation instead of blind trust.
+                let rel = RelPath::new(&format!("/{fallback}"))
+                    .expect("the fallback name is a single clean segment");
+                (rel, fallback)
+            }
+        };
+
+        self.db.upsert_file(&FileUpsert {
+            rel_path: rel.as_str().to_string(),
+            name,
+            parent_dir: "/".to_string(),
+            size: file.handle.total_size as i64,
+            mtime: now,
+            sha256: None,
+            is_dir: false,
+            telegram_msg_id: Some(i64::from(msg_id)),
+            is_uploaded: true,
+            is_cached: false,
+            is_encrypted: false,
+            chunk_count: 1,
+            mime_type: None,
+        })?;
+        tracing::info!(
+            path = %rel,
+            msg_id,
+            size = file.handle.total_size,
+            "indexed inbound remote file (metadata only)"
+        );
+        Ok(rel)
     }
 
     /// Boot-time recovery: re-enqueues every pending upload row whose

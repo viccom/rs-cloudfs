@@ -29,6 +29,7 @@ use anyhow::{Context, Result};
 use cydrive_core::cache::CacheManager;
 use cydrive_core::config::CyDriveConfig;
 use cydrive_core::database::MetaDatabase;
+use cydrive_core::inbound::{spawn_inbound_worker, InboundWorkerHandle};
 use cydrive_core::transport::CloudTransport;
 use cydrive_core::vfs::{Vfs, VfsConfig};
 use cydrive_webdav::{CyDriveFs, WebDavServer};
@@ -43,6 +44,11 @@ const BYTES_PER_GB: u64 = 1024 * 1024 * 1024;
 pub struct RunHandle {
     server: WebDavServer,
     vfs: Arc<Vfs>,
+    /// The inbound indexing worker consuming `transport.incoming()`
+    /// (files sent to the bot land in the VFS as metadata-only rows).
+    /// [`RunHandle::shutdown`] joins it last, after the queue has
+    /// drained, so no index write races the shutdown.
+    inbound: InboundWorkerHandle,
     /// The drive letter the boot-time auto-mount actually claimed
     /// (`None` when unmounted: non-Windows, `auto_mount_drive` off, or a
     /// failed mount that only warned). [`RunHandle::shutdown`] releases
@@ -66,6 +72,7 @@ impl RunHandle {
     pub async fn shutdown(self) {
         self.server.shutdown().await;
         self.vfs.shutdown().await;
+        self.inbound.shutdown().await;
         if let Some(letter) = self.mounted_letter {
             if let Err(e) = cydrive_platform::windows::unmount_drive(&letter) {
                 tracing::warn!(
@@ -126,6 +133,14 @@ pub async fn run_with_transport(
         .context("re-enqueueing pending uploads")?;
     tracing::info!(pending = requeued, "requeued pending uploads");
 
+    // Same boot segment as the requeue, before the server accepts
+    // traffic: inbound remote files (media sent to the bot) begin
+    // indexing into the VFS before the first client request can arrive
+    // (Python parity: the Telegram handlers run alongside the WebDAV
+    // server from boot).
+    let inbound = spawn_inbound_worker(Arc::clone(&vfs), Arc::clone(&transport));
+    tracing::info!("inbound indexing worker spawned");
+
     // A second cache handle over the same root backs the FS adapter's
     // path math and cache-copy housekeeping (same construction as the
     // webdav crate's own tests).
@@ -146,6 +161,7 @@ pub async fn run_with_transport(
     Ok(RunHandle {
         server,
         vfs,
+        inbound,
         mounted_letter,
     })
 }

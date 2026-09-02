@@ -68,7 +68,9 @@ struct MockState {
     /// Scripted upload outcomes, consumed in order.
     upload_script: VecDeque<UploadAction>,
     /// Events handed out by `incoming()`; drained on the first call.
-    incoming_events: Vec<IncomingEvent>,
+    /// Results so a scripted transport error can interleave with events
+    /// (the inbound worker must survive `Err` frames).
+    incoming_events: Vec<Result<IncomingEvent, TransportError>>,
     /// Snapshot of every `upload()` job, in call order.
     upload_calls: Vec<UploadJob>,
     /// msg_ids successfully deleted, in order.
@@ -291,7 +293,7 @@ impl CloudTransport for MockTransport {
             .lock()
             .map(|mut state| std::mem::take(&mut state.incoming_events))
             .unwrap_or_default();
-        frame_stream(events.into_iter().map(Ok).collect())
+        frame_stream(events)
     }
 }
 
@@ -374,7 +376,7 @@ where
 pub struct MockTransportBuilder {
     connect_result: Option<Result<(), TransportError>>,
     upload_script: VecDeque<UploadAction>,
-    incoming_events: Vec<IncomingEvent>,
+    incoming_events: Vec<Result<IncomingEvent, TransportError>>,
     open_delay: Duration,
 }
 
@@ -401,6 +403,14 @@ impl MockTransportBuilder {
 
     /// Sets the events yielded by `incoming` (drained once).
     pub fn incoming(mut self, events: Vec<IncomingEvent>) -> Self {
+        self.incoming_events = events.into_iter().map(Ok).collect();
+        self
+    }
+
+    /// Sets the results yielded by `incoming` (drained once), errors
+    /// included — the scripted-transport-error counterpart of
+    /// [`MockTransportBuilder::incoming`].
+    pub fn incoming_results(mut self, events: Vec<Result<IncomingEvent, TransportError>>) -> Self {
         self.incoming_events = events;
         self
     }

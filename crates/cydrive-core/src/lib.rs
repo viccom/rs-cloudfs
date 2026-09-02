@@ -11,6 +11,7 @@ pub mod chunker;
 pub mod config;
 pub mod crypto;
 pub mod database;
+pub mod inbound;
 pub mod logging;
 pub mod rel_path;
 pub mod transport;

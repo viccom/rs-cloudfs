@@ -13,6 +13,9 @@ async-trait = "0.1"
 bytes = "1"
 cydrive-core = { path = "../cydrive-core" }
 futures-core = "0.3"
+# `stream::unfold` wraps the update-forwarding channel into the boxed
+# `IncomingStream` shape (same crate/features as cydrive-core uses).
+futures-util = { version = "0.3", default-features = false }
 # Exact `=` pins: grammers treats minor versions as breaking (TL layer
 # changes), so any semver-compatible drift must be a deliberate upgrade.
 grammers-client = "=0.10.0"
@@ -25,7 +28,8 @@ grammers-session = { version = "=0.10.0", default-features = false, features = [
     "sqlite-storage",
 ] }
 thiserror = "2"
-tokio = { version = "1", features = ["rt", "fs", "io-util"] }
+# "sync" feeds the update receiver (mpsc) kept from the SenderPool.
+tokio = { version = "1", features = ["rt", "fs", "io-util", "sync"] }
 
 [dev-dependencies]
 tempfile = "3"

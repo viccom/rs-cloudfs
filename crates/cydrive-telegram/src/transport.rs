@@ -29,14 +29,18 @@
 use std::sync::Arc;
 
 use async_trait::async_trait;
+use grammers_client::client::UpdatesConfiguration;
 use grammers_client::media::Media;
 use grammers_client::message::InputMessage;
 use grammers_client::sender::SenderPool;
+use grammers_client::update::Update;
 use grammers_client::{Client, InvocationError};
 use grammers_session::storages::SqliteSession;
 use grammers_session::types::PeerId;
+use grammers_session::updates::UpdatesLike;
 use grammers_session::Session;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
+use tokio::sync::mpsc;
 
 use crate::config::TransportConfig;
 use crate::flood::parse_flood_wait;
@@ -44,8 +48,8 @@ use crate::plan::plan_chunk_sends;
 use crate::range::{range_plan, MAX_CHUNK_SIZE};
 use crate::stream::serve_range;
 use cydrive_core::transport::{
-    ByteStream, CloudTransport, IncomingStream, RemoteHandle, TransportError, UploadJob,
-    UploadReceipt,
+    ByteStream, CloudTransport, InboundFile, IncomingEvent, IncomingStream, RemoteHandle,
+    TransportError, UploadJob, UploadReceipt,
 };
 
 /// Maps a grammers [`InvocationError`] onto [`TransportError`].
@@ -88,6 +92,12 @@ pub struct GrammersTransport {
     client: Client,
     chat: grammers_session::types::PeerRef,
     config: TransportConfig,
+    /// The raw update receiver kept from the `SenderPool` (the
+    /// NOTE(inbound) anchor in [`GrammersTransport::connect`]).
+    /// `incoming()` consumes it exactly once to feed
+    /// `Client::stream_updates`; a plain mutex works because the
+    /// `Option::take` never holds the guard across an await.
+    updates_rx: std::sync::Mutex<Option<mpsc::UnboundedReceiver<UpdatesLike>>>,
 }
 
 impl GrammersTransport {
@@ -114,9 +124,10 @@ impl GrammersTransport {
         let pool = SenderPool::new(Arc::clone(&session), config.api_id);
         let client = Client::new(pool.handle);
         tokio::spawn(pool.runner.run());
-        // NOTE(inbound): `pool.updates` (the raw update receiver) is dropped
-        // here. The M2 inbound unit must keep it and feed it to
-        // `Client::stream_updates`; see `incoming()` below.
+        // NOTE(inbound): the raw update receiver is kept (not dropped)
+        // so `incoming()` can hand it to `Client::stream_updates`; it is
+        // a single-consumer channel, hence the Option-behind-a-mutex.
+        let updates_rx = pool.updates;
 
         if !client.is_authorized().await.map_err(map_invocation_error)? {
             client
@@ -141,6 +152,7 @@ impl GrammersTransport {
             client,
             chat,
             config,
+            updates_rx: std::sync::Mutex::new(Some(updates_rx)),
         })
     }
 
@@ -353,14 +365,133 @@ impl CloudTransport for GrammersTransport {
         Ok(())
     }
 
-    /// Not wired in this unit: grammers 0.10 moved the update stream behind
-    /// `Client::stream_updates(receiver, config)`, which *consumes* the
-    /// `SenderPool`'s raw update receiver at construction time (see the
-    /// NOTE(inbound) in [`GrammersTransport::connect`]), and mapping the
-    /// `Update` enum onto `IncomingEvent` is the inbound indexing unit's
-    /// work. TODO(M2 inbound): keep `pool.updates`, spawn
-    /// `stream_updates`, map NewMessage media/commands.
+    /// Wires the M2 inbound unit: consumes the pool's raw update receiver
+    /// (kept from [`GrammersTransport::connect`]) through
+    /// `Client::stream_updates`, forwarding mapped events over a channel
+    /// that backs the returned stream. The receiver is single-consumer,
+    /// so only the first call wires the stream; later calls get a
+    /// single-error stream (never a panic — a reconnecting caller just
+    /// keeps consuming the first stream).
     fn incoming(&self) -> IncomingStream {
-        todo!("inbound indexing lands with the M2 inbound unit (stream_updates wiring)")
+        let rx_updates = self
+            .updates_rx
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take();
+        let Some(rx_updates) = rx_updates else {
+            return Box::pin(futures_util::stream::iter(vec![Err(
+                TransportError::Remote(
+                    "the incoming stream is already wired (the update receiver was consumed)"
+                        .into(),
+                ),
+            )]));
+        };
+
+        let client = self.client.clone();
+        // PeerRef is Copy: cheap to move into the forwarding task.
+        let chat = self.chat;
+        let (tx, rx) = mpsc::unbounded_channel();
+        tokio::spawn(async move {
+            let mut updates = match client
+                .stream_updates(rx_updates, UpdatesConfiguration::default())
+                .await
+            {
+                Ok(stream) => stream,
+                Err(error) => {
+                    // stream_updates failed before any update arrived:
+                    // surface the failure once and end the forwarding
+                    // task (the consumer sees an Err item, then EOF).
+                    let _ = tx.send(Err(TransportError::Remote(format!(
+                        "stream_updates failed to start: {error}"
+                    ))));
+                    return;
+                }
+            };
+            loop {
+                match updates.next().await {
+                    Ok(update) => {
+                        let Some(event) = map_update(&update, &chat) else {
+                            continue;
+                        };
+                        if tx.send(Ok(event)).is_err() {
+                            break; // consumer dropped the stream
+                        }
+                    }
+                    Err(error) => {
+                        if tx.send(Err(map_invocation_error(error))).is_err() {
+                            break; // consumer dropped the stream
+                        }
+                    }
+                }
+            }
+        });
+
+        // Channel-as-stream: recv() returning None (forwarding task gone)
+        // ends the stream like any exhausted iterator.
+        Box::pin(futures_util::stream::unfold(rx, |mut rx| async move {
+            rx.recv().await.map(|item| (item, rx))
+        }))
+    }
+}
+
+/// Maps one processed grammers update onto the core's inbound event
+/// shape, mirroring the Python handler registration
+/// (`telegram_client.py:48-53`): only messages from the configured chat
+/// are considered (`chats=self.config.chat_id` in the Python filter);
+/// within those, media wins over text — downloadable media becomes
+/// [`IncomingEvent::File`] (a missing document filename arrives as an
+/// empty string so `Vfs::index_inbound` applies the
+/// `Telegram_File_{id}.bin` fallback), other messages degrade to a
+/// [`IncomingEvent::Command`] only when they carry text.
+///
+/// NOTE(real-machine): this mapping cannot be exercised offline — which
+/// media shapes real chats produce (document vs sticker vs photo,
+/// unnamed documents, album grouping) needs a live bot account sending
+/// real media. The unit-testable policy (fallback naming, chat
+/// filtering semantics) lives in `cydrive-core`'s inbound tests.
+fn map_update(update: &Update, chat: &grammers_session::types::PeerRef) -> Option<IncomingEvent> {
+    let Update::NewMessage(message) = update else {
+        return None;
+    };
+    if message.peer_id() != chat.id {
+        return None;
+    }
+    let msg_id = message.id();
+    match message.media() {
+        Some(Media::Document(document)) => Some(IncomingEvent::File(InboundFile {
+            filename: document.name().unwrap_or_default().to_string(),
+            handle: RemoteHandle {
+                first_msg_id: msg_id,
+                chunk_msg_ids: vec![msg_id],
+                total_size: document.size().unwrap_or_default() as u64,
+            },
+        })),
+        Some(Media::Sticker(sticker)) => Some(IncomingEvent::File(InboundFile {
+            filename: sticker.document.name().unwrap_or_default().to_string(),
+            handle: RemoteHandle {
+                first_msg_id: msg_id,
+                chunk_msg_ids: vec![msg_id],
+                total_size: sticker.document.size().unwrap_or_default() as u64,
+            },
+        })),
+        Some(Media::Photo(photo)) => Some(IncomingEvent::File(InboundFile {
+            // Photos carry no filename (Python: `msg.file.name` is None);
+            // the empty name triggers the fallback naming in the core.
+            filename: String::new(),
+            handle: RemoteHandle {
+                first_msg_id: msg_id,
+                chunk_msg_ids: vec![msg_id],
+                total_size: photo.size().unwrap_or_default() as u64,
+            },
+        })),
+        // Other media shapes (contacts, polls, geo...) are not files the
+        // VFS can hydrate; a message with no downloadable media is only
+        // interesting as a potential bot command.
+        _ => {
+            let text = message.text();
+            (!text.is_empty()).then(|| IncomingEvent::Command {
+                text: text.to_string(),
+            })
+        }
     }
 }

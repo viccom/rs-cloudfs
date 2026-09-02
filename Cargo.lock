@@ -467,6 +467,7 @@ dependencies = [
  "bytes",
  "cydrive-core",
  "futures-core",
+ "futures-util",
  "grammers-client",
  "grammers-session",
  "tempfile",
