@@ -25,6 +25,12 @@ pub fn ensure_webclient_service() -> Result<(), PlatformError> {
     unsupported()
 }
 
+/// Stub: no Windows registry exists here, so the values read as absent
+/// (`None`) — doctor reports the matching guidance.
+pub fn read_webclient_params() -> Option<(u32, u32)> {
+    None
+}
+
 /// Stub: [`unsupported`].
 pub fn optimize_webdav_registry() -> Result<(), PlatformError> {
     unsupported()

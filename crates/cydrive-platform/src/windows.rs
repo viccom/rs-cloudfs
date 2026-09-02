@@ -69,6 +69,23 @@ pub fn optimize_webdav_registry() -> Result<(), PlatformError> {
     Ok(())
 }
 
+/// Reads the two WebClient tuning values this crate writes
+/// (`FileSizeLimitInBytes`, `BasicAuthLevel`) as `(limit, auth)` — the
+/// read-only leg of the `doctor` subcommand (M5-2). `None` when the
+/// `Parameters` key or either value is missing/unreadable; reading is a
+/// diagnosis, so callers report the absence instead of erroring.
+pub fn read_webclient_params() -> Option<(u32, u32)> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+
+    let hklm = winreg::RegKey::predef(HKEY_LOCAL_MACHINE);
+    let key = hklm
+        .open_subkey_with_flags(WEBCLIENT_REG_PATH, KEY_READ)
+        .ok()?;
+    let limit: u32 = key.get_value("FileSizeLimitInBytes").ok()?;
+    let auth: u32 = key.get_value("BasicAuthLevel").ok()?;
+    Some((limit, auth))
+}
+
 /// Maps the WebDAV endpoint at `url` to a drive letter and returns the
 /// letter actually mounted.
 ///

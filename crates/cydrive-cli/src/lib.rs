@@ -41,10 +41,66 @@ use cydrive_webdav::{CyDriveFs, WebDavServer};
 
 mod keyring_store;
 
+pub mod doctor;
+pub mod setup;
+
 pub use keyring_store::KeyringStore;
 
 /// Bytes per GB — cache capacity conversion (`cache_limit_gb`).
 const BYTES_PER_GB: u64 = 1024 * 1024 * 1024;
+
+/// Bytes per MiB — the stats size math (`total_bytes / (1024 * 1024)`),
+/// the same constant the bot `/stats` reply uses.
+const BYTES_PER_MB: f64 = 1024.0 * 1024.0;
+
+/// Human-readable cloud-storage size with the bot `/stats` semantics
+/// (`bot.rs`): a true-division MB value, the GB branch opening at
+/// `size_gb >= 1.0` (not `>= 1024` MB), two decimals.
+fn format_storage_size(total_bytes: i64) -> String {
+    let size_mb = total_bytes as f64 / BYTES_PER_MB;
+    let size_gb = size_mb / 1024.0;
+    if size_gb >= 1.0 {
+        format!("{size_gb:.2} GB")
+    } else {
+        format!("{size_mb:.2} MB")
+    }
+}
+
+/// Renders the `stats` subcommand's report: a comfy-table carrying the
+/// Python `/stats` rows (Total Files / Total Folders / Total Cloud
+/// Storage / Synced Files / Pending Uploads) plus the Drive and URL
+/// extras the web dashboard's `/api/stats` also exposes. Pure — the CLI
+/// feeds it `MetaDatabase::get_stats` output and prints verbatim.
+pub fn format_stats_report(
+    stats: &cydrive_core::database::Stats,
+    drive_letter: &str,
+    webdav_url: &str,
+) -> String {
+    use comfy_table::{Cell, Table};
+
+    let mut table = Table::new();
+    table.set_header(vec![Cell::new("Metric"), Cell::new("Value")]);
+    table.add_row(vec![Cell::new("Total Files"), Cell::new(stats.total_files)]);
+    table.add_row(vec![
+        Cell::new("Total Folders"),
+        Cell::new(stats.total_dirs),
+    ]);
+    table.add_row(vec![
+        Cell::new("Total Cloud Storage"),
+        Cell::new(format_storage_size(stats.total_bytes)),
+    ]);
+    table.add_row(vec![
+        Cell::new("Synced Files"),
+        Cell::new(stats.uploaded_files),
+    ]);
+    table.add_row(vec![
+        Cell::new("Pending Uploads"),
+        Cell::new(stats.pending_uploads),
+    ]);
+    table.add_row(vec![Cell::new("Drive"), Cell::new(drive_letter)]);
+    table.add_row(vec![Cell::new("URL"), Cell::new(webdav_url)]);
+    table.to_string()
+}
 
 /// A running CyDrive stack: the WebDAV server, the web dashboard, the
 /// VFS whose upload queue backs both, and the drive letter

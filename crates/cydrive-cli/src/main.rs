@@ -3,9 +3,11 @@
 //! `run` = discover config → validate / configured-ness gates (clear
 //! guidance instead of a wizard) → tracing init (Pretty/INFO on stdout,
 //! a parseable `RUST_LOG` wins) → connect the `GrammersTransport` → boot
-//! the stack → wait for Ctrl+C → graceful shutdown → exit 0. The other
-//! Python subcommands (mount/unmount/fix-reg/stats/setup) are future
-//! units; clap rejects them as unknown today.
+//! the stack → wait for Ctrl+C → graceful shutdown → exit 0. The
+//! operational subcommands: mount/unmount (drive mapping), fix-reg
+//! (WebClient tuning, elevated), migrate (legacy Python import), stats
+//! (drive statistics table), doctor (offline diagnosis + platform
+//! checks) and setup (interactive first-time wizard).
 
 use std::sync::Arc;
 
@@ -53,6 +55,15 @@ enum Command {
     /// zero-copy adoption of any existing `cydrive_meta.db` /
     /// `Telegram_Cache` in the working directory.
     Migrate,
+    /// Print drive statistics from the metadata DB (files, folders,
+    /// cloud storage, pending uploads) as a table.
+    Stats,
+    /// Diagnose the local installation: config, DB, cache, ports, and
+    /// the Windows WebClient registry/service state.
+    Doctor,
+    /// Interactive first-time configuration wizard (bot token, chat ID,
+    /// drive letter); secrets go to the OS credential store.
+    Setup,
 }
 
 #[tokio::main]
@@ -64,6 +75,9 @@ async fn main() -> Result<()> {
         Command::Unmount { letter } => unmount_cmd(letter).await,
         Command::FixReg => fix_reg_cmd().await,
         Command::Migrate => migrate_cmd(),
+        Command::Stats => stats_cmd(),
+        Command::Doctor => doctor_cmd(),
+        Command::Setup => setup_cmd(),
     }
 }
 
@@ -110,6 +124,68 @@ fn migrate_cmd() -> Result<()> {
     let report = cydrive_cli::run_migrate(&store).context("migration failed")?;
     print!("{report}");
     Ok(())
+}
+
+/// `cydrive stats`: discover the config (keyring backfill included),
+/// open the metadata DB and print the report table.
+fn stats_cmd() -> Result<()> {
+    let cfg = discover_config().context("config discovery failed")?;
+    let db = cydrive_core::database::MetaDatabase::open(std::path::Path::new(&cfg.db_path))
+        .with_context(|| format!("opening metadata db {:?}", cfg.db_path))?;
+    let stats = db.get_stats().context("reading drive statistics")?;
+    println!(
+        "{}",
+        cydrive_cli::format_stats_report(
+            &stats,
+            &cfg.drive_letter,
+            &cydrive_cli::default_mount_url(&cfg)
+        )
+    );
+    Ok(())
+}
+
+/// `cydrive doctor`: offline checks from the discovered config (a config
+/// that will not load still gets diagnosed — `config_present: false`
+/// with the default ports), then the platform/remote checks, all merged
+/// into one report. Never fails on an unhealthy installation; the report
+/// is the answer.
+fn doctor_cmd() -> Result<()> {
+    let discovered = discover_config();
+    let config_present = discovered.is_ok();
+    let cfg = discovered.unwrap_or_default();
+    let ctx = cydrive_cli::doctor::DoctorContext {
+        config_present,
+        db_path: config_present.then(|| std::path::PathBuf::from(&cfg.db_path)),
+        cache_path: config_present.then(|| std::path::PathBuf::from(&cfg.cache_path)),
+        webdav_port: cfg.webdav_port,
+        web_ui_port: cfg.web_ui_port,
+    };
+    let mut results = cydrive_cli::doctor::run_doctor(&ctx);
+    results.extend(cydrive_cli::doctor::platform_checks());
+    print!("{}", cydrive_cli::doctor::render_report(&results));
+    Ok(())
+}
+
+/// `cydrive setup`: the interactive wizard against the production OS
+/// credential store. Unlike `migrate`, an unusable store degrades to the
+/// in-memory fallback with a warning (same as config discovery): the
+/// scrubbed `config.toml` still lands on disk, and the warning tells the
+/// user the token did not persist beyond this process.
+fn setup_cmd() -> Result<()> {
+    let store: Box<dyn cydrive_core::credentials::CredentialStore> =
+        match cydrive_cli::KeyringStore::new() {
+            Ok(store) => Box::new(store),
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    "OS credential store unavailable; the wizard's scrubbed config.toml is \
+                     still written, but the bot token will not survive this process — bring \
+                     the platform keyring up and re-run cydrive setup"
+                );
+                Box::new(cydrive_core::credentials::InMemoryStore::new())
+            }
+        };
+    cydrive_cli::setup::run_setup_interactive(store.as_ref())
 }
 
 /// The production run flow; every step here is covered by the library
