@@ -32,17 +32,23 @@ use cydrive_core::database::MetaDatabase;
 use cydrive_core::inbound::{spawn_inbound_worker, InboundWorkerHandle};
 use cydrive_core::transport::CloudTransport;
 use cydrive_core::vfs::{Vfs, VfsConfig};
+use cydrive_web::WebUiServer;
 use cydrive_webdav::{CyDriveFs, WebDavServer};
 
 /// Bytes per GB — cache capacity conversion (`cache_limit_gb`).
 const BYTES_PER_GB: u64 = 1024 * 1024 * 1024;
 
-/// A running CyDrive stack: the WebDAV server, the VFS whose upload
-/// queue backs it, and the drive letter auto-mounted at boot (if any).
-/// Dropping the handle without [`RunHandle::shutdown`] leaves the
-/// workers to die with the runtime; prefer an explicit shutdown.
+/// A running CyDrive stack: the WebDAV server, the web dashboard, the
+/// VFS whose upload queue backs both, and the drive letter
+/// auto-mounted at boot (if any). Dropping the handle without
+/// [`RunHandle::shutdown`] leaves the workers to die with the runtime;
+/// prefer an explicit shutdown.
 pub struct RunHandle {
     server: WebDavServer,
+    /// The web dashboard (unit M4), served when `enable_web_ui` is on.
+    /// [`RunHandle::shutdown`] stops it after the WebDAV server (its
+    /// in-flight uploads finish before the queue drains).
+    web_ui: Option<cydrive_web::WebUiServer>,
     vfs: Arc<Vfs>,
     /// The inbound indexing worker consuming `transport.incoming()`
     /// (files sent to the bot land in the VFS as metadata-only rows).
@@ -63,14 +69,25 @@ impl RunHandle {
         self.server.local_addr()
     }
 
+    /// The dashboard listener's actual bound address when
+    /// `enable_web_ui` was on (`None` otherwise; a `:0` config port
+    /// resolves to the real ephemeral port, same semantics as
+    /// [`RunHandle::local_addr`]).
+    pub fn web_ui_local_addr(&self) -> Option<SocketAddr> {
+        self.web_ui.as_ref().map(WebUiServer::local_addr)
+    }
+
     /// Graceful stop: the WebDAV server shuts down first (it stops
-    /// accepting and in-flight requests drain), then the upload queue
-    /// drains — every job enqueued before this call reaches a terminal
-    /// state before the future resolves — and finally an auto-mounted
-    /// drive is released; an unmount failure only warns, it must never
-    /// block the exit.
+    /// accepting and in-flight requests drain), then the web dashboard
+    /// stops the same way, then the upload queue drains — every job
+    /// enqueued before this call reaches a terminal state before the
+    /// future resolves — and finally an auto-mounted drive is released;
+    /// an unmount failure only warns, it must never block the exit.
     pub async fn shutdown(self) {
         self.server.shutdown().await;
+        if let Some(web_ui) = &self.web_ui {
+            web_ui.shutdown().await;
+        }
         self.vfs.shutdown().await;
         self.inbound.shutdown().await;
         if let Some(letter) = self.mounted_letter {
@@ -174,9 +191,40 @@ pub async fn run_with_transport(
         .await
         .context("starting the WebDAV server")?;
     tracing::info!(addr = %server.local_addr(), "WebDAV listening");
+
+    // Dashboard (unit M4): same boot segment as the inbound worker —
+    // up before the first client request can arrive (Python parity:
+    // the aiohttp dashboard runs alongside WebDAV from boot). The
+    // stats extras map straight off the config; `is_configured`
+    // mirrors Python's bot-token check.
+    let web_ui = if cfg.enable_web_ui {
+        let host: IpAddr = cfg
+            .web_ui_host
+            .parse()
+            .with_context(|| format!("parsing web_ui_host {:?}", cfg.web_ui_host))?;
+        let ui_cfg = cydrive_web::WebUiConfig {
+            drive_letter: cfg.drive_letter.clone(),
+            webdav_url: default_mount_url(cfg),
+            chat_id: cfg.chat_id,
+            is_configured: cfg.is_configured(),
+        };
+        let web_ui = WebUiServer::serve(
+            Arc::clone(&vfs),
+            ui_cfg,
+            SocketAddr::new(host, cfg.web_ui_port),
+        )
+        .await
+        .context("starting the web dashboard")?;
+        tracing::info!(addr = %web_ui.local_addr(), "web UI listening");
+        Some(web_ui)
+    } else {
+        tracing::info!("web UI disabled (enable_web_ui = false)");
+        None
+    };
     let mounted_letter = mount_if_configured(cfg);
     Ok(RunHandle {
         server,
+        web_ui,
         vfs,
         inbound,
         mounted_letter,

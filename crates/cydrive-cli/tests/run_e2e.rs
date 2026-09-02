@@ -80,7 +80,10 @@ fn chdir(dir: &Path) -> CwdGuard {
 
 /// A test config anchored in `dir`: ephemeral WebDAV port, temp DB and
 /// cache, plus a fully "configured" token/chat pair. Auto-mount stays
-/// OFF so the offline gate never maps a real network drive.
+/// OFF so the offline gate never maps a real network drive, and the web
+/// dashboard stays OFF too: the config *default* is `true` (Python
+/// parity) but these boots would all contend on the fixed 8088 port
+/// when the test binary runs them in parallel.
 fn temp_config(dir: &Path, webdav_port: u16) -> CyDriveConfig {
     CyDriveConfig {
         bot_token: "123456:ABC-DEF".to_string(),
@@ -89,6 +92,7 @@ fn temp_config(dir: &Path, webdav_port: u16) -> CyDriveConfig {
         cache_path: dir.join("cache").to_string_lossy().into_owned(),
         webdav_port,
         auto_mount_drive: false,
+        enable_web_ui: false,
         ..CyDriveConfig::default()
     }
 }
@@ -274,6 +278,38 @@ async fn auto_mount_disabled_leaves_mounted_letter_none() {
     let handle = boot(&cfg, mock).await;
     assert_eq!(handle.mounted_letter, None);
     handle.shutdown().await;
+}
+
+/// 9. With `enable_web_ui` on and an ephemeral `web_ui_port = 0` (same
+///    `:0` semantics as the WebDAV port — validation of non-zero ports
+///    is the config layer's concern), the boot also serves the
+///    dashboard: GET / answers the real index.html and the listener
+///    closes on shutdown.
+#[tokio::test]
+async fn web_ui_enabled_serves_dashboard() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut cfg = temp_config(dir.path(), 0);
+    cfg.enable_web_ui = true;
+    cfg.web_ui_port = 0;
+    let mock = mock_transport().await;
+    let handle = boot(&cfg, mock).await;
+
+    let addr = handle.web_ui_local_addr().expect("web ui bound");
+    assert_ne!(addr.port(), 0, ":0 must resolve to the real bound port");
+
+    let resp = send(addr, &request("GET", "/", addr, &[], "")).await;
+    assert_eq!(status_of(&resp), 200, "dashboard served: {resp}");
+    assert!(
+        resp.contains("<title>CyDrive"),
+        "real index.html, not a stub: {resp}"
+    );
+
+    handle.shutdown().await;
+    let refused = TcpStream::connect(addr).await;
+    assert!(
+        refused.is_err(),
+        "web ui listener must refuse connections after shutdown"
+    );
 }
 
 /// 8. `vfs_config` applies the Python AND semantics

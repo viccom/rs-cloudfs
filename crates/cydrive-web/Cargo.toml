@@ -1,0 +1,28 @@
+[package]
+name = "cydrive-web"
+description = "CyDrive web dashboard: the six-route aiohttp UI contract on axum"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# Exact pin, mirroring the dav-server precedent for HTTP frameworks:
+# the dashboard contract was written against 0.8 route syntax.
+axum = { version = "=0.8.9", default-features = false, features = [
+    "http1",
+    "json",
+    "multipart",
+    "tokio",
+] }
+cydrive-core = { path = "../cydrive-core" }
+mime_guess = "2"
+rust-embed = "8"
+serde_json = "1"
+thiserror = "2"
+tokio = { version = "1", features = ["io-util", "net", "rt", "sync"] }
+
+[dev-dependencies]
+tempfile = "3"
