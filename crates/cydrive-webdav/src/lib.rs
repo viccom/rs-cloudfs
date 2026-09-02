@@ -17,6 +17,12 @@
 //!   drag-copy rides the PUT path; see the design doc);
 //! - quota reports the DB total bytes with 10 TB of headroom (compat
 //!   contract 6).
+//!
+//! [`WebDavServer`] assembles the hyper listener (see `server.rs`).
+
+pub mod server;
+
+pub use server::{ServerError, WebDavServer};
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
