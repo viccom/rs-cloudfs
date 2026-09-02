@@ -32,12 +32,13 @@ M2 剩余（让位于垂直切片，可用优先，见下）：入站 stream_upd
 - **M2 遗留③上传加密已完成（13d38d4，7 新测试，工作区 233 全绿；负责人批复整文件语义、流式列 v2，见 decisions.md）**：队列侧整文件加密——`UploadQueueConfig.encryption_password` + 行 is_encrypted 双条件；sha256 对**明文**、行 size=明文/chunk_count=密文块数（密文=明文+44B 恒定开销，块边界按密文）、`{name}.enc.tmp` 成败均清、明文缓存仍仅成功删；CLI `vfs_config`（已 pub）补 `enable_encryption AND password` 映射；**离线全闭环证明**：put→上传密文（mock 内可解密回明文）→hydrate 回明文。0 字节不加密（契约）。已知微差：跨重试复用同一密文文件（Python 每次重加密，字节等价）。
 - **M2 全部闭环（2026-09-02）**：传输壳/session 持久化/纯契约模块/入站索引/Bot 命令（/get 补齐）/上传加密。真机 smoke（100MB/2GB/3GB + Bot 命令 + FloodWait）仍待人工。
 - **M4 已完成（d7f7413，10 新测试，工作区 243 全绿）**：`cydrive-web`——axum `=0.8.9` :8088 六契约路由逐字段镜像 app.py（/api/files 16 键 is_* 发 0/1 int、/api/stats 11 键全集含 host/port 反解、upload multipart `file`+DefaultBodyLimit 1900MB+受理即回、**delete 单次**（修复 Python 调两次，设计文档授权）、download hydrate 流式+inline disposition+逐字 404 正文、`GET /` 静态）；前端资产（css/js/img/templates）**拷贝自 Python 版且 byte-identical**，rust-embed 嵌入（debug 读盘/release 编译期嵌入——release 验证属 M6）；CLI 按 enable_web_ui 接线（**注意 CyDriveConfig 默认 true**，e2e 需显式关否则 8088 互撞），shutdown 顺序 WebDAV→WebUI→队列→inbound→卸载。已知差距：delete 不清孤儿缓存副本（注释标注）；新路由（/api/list、Range 下载、/api/queue）为设计文档增量，未做（下批）。
-- **回补队列（下一步）**：M4 增量路由（/api/list 目录树、/api/download Range、/api/queue 队列徽章）→ M5 平台全量 migrate/doctor + keyring + stats/setup 子命令 → M6 性能/发布（CI、cargo-deny 可提前、vendor LICENSE 补文本、cargo-dist、release build 首验 + rust-embed release 嵌入验证）
+- **M4 增量路由已完成（95ffaf9，7 新测试，工作区 250 全绿）**：`/api/list?path=`（归一 + 空目录 200/不存在 404/非法 400 语义固化；**空盘根 404 是规则直接后果**已注释）、`/api/download` 标准 HTTP 单区间 Range（206 精确切片+Content-Range、a≥size 416、畸形/多区间宽容回 200——aiohttp 基线能力）、`/api/queue`（四计数器+pending）。实现注：axum 无 query feature，手写 ~30 行 query 解析（`+` 不解空格——路径组件语义，注释声明）。
+- **回补队列（下一步）**：M5 平台全量 migrate/doctor + keyring + stats/setup 子命令 → M6 性能/发布（CI、cargo-deny 可提前、vendor LICENSE 补文本、cargo-dist、release build 首验 + rust-embed release 嵌入验证）
 M2 已完成第二单元（34e2476 红 + 356009c 绿，10 测试）：纯适配逻辑——`plan.rs`（`plan_chunk_sends`：单/多块发送计划，name/caption/byte_len 全走契约模块，纯函数不触盘）、`stream.rs`（`serve_range`：RangeStream 状态机，head-skip/take 裁剪、迭代器耗尽不报错，coerce 到 ByteStream；为此 crate 直接依赖 bytes/futures-core，版本同 cydrive-core）、`config.rs`（`DEFAULT_API_ID=6`/`DEFAULT_API_HASH="eb06d4abfb49dc3eeb1aeb98ae0f581e"`/`DEFAULT_SESSION_STEM="cynet_bot_session"` 契约常量 + `TransportConfig`）。grammers 接入与 transport 壳是下一步（编译验证的 wiring，纯逻辑已全部就绪）。
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 全部 243 测试（core 163 + telegram 29 + webdav 30 + web 9 + cli 18 + platform 9；另有 2 个 #[ignore] 真机项）
+cargo test --workspace --no-fail-fast            # 全部 250 测试（core 163 + telegram 29 + webdav 30 + web 16 + cli 18 + platform 9；另有 2 个 #[ignore] 真机项）
 cargo clippy -p cydrive-core --all-targets -- -D warnings
 cargo fmt --all -- --check
 python scripts/gen_compat_fixtures.py       # 重新生成互操作 fixture（需能 import E:\GitHub\CyDrive）
