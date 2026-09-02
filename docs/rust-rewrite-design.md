@@ -173,7 +173,7 @@ pub trait CloudTransport: Send + Sync {
 
 | 里程碑 | 内容 | 验收标准 |
 |---|---|---|
-| M0 基础 | workspace、CI、clippy/rustfmt/deny、config+keyring、tracing、crypto/chunker + 契约向量 | Python 加密的样本 Rust 能解；分块命名/合并与 Python 字节一致；`cargo test` 全绿 |
+| M0 基础 | workspace、clippy/rustfmt、config、tracing、crypto/chunker + 契约向量（keyring 归 M5、CI/cargo-deny 归 M6，2026-09-02 裁决见 docs/decisions.md） | Python 加密的样本 Rust 能解；分块命名/合并与 Python 字节一致；`cargo test` 全绿 |
 | M1 core | VFS/DB（含旧库采用+迁移）/LRU/上传队列 + MockTransport | Python 生成的 db 打开读写通过；队列状态机单测覆盖断连/FloodWait/重试 |
 | M2 telegram | GrammersTransport：登录/上传/下载/Range/入站索引/Bot 命令（含补齐 `/get`） | 真实 bot token smoke：收发 100MB/2GB/3GB 三档文件；FloodWait 注入自动恢复 |
 | M3 webdav | DavFileSystem 适配 + 挂载 + fix-reg | litmus 全过；Explorer 实测拖入/删除/重命名/属性；Range 下载正确 |
