@@ -1,0 +1,32 @@
+[package]
+name = "cydrive-cli"
+description = "CyDrive binary: minimal run orchestration (config discovery, VFS + transport + WebDAV boot)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "cydrive_cli"
+path = "src/lib.rs"
+
+[[bin]]
+name = "cydrive"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+clap = { version = "4", features = ["derive"] }
+cydrive-core = { path = "../cydrive-core" }
+cydrive-telegram = { path = "../cydrive-telegram" }
+cydrive-webdav = { path = "../cydrive-webdav" }
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+tracing = "0.1"
+
+[dev-dependencies]
+tempfile = "3"
+# lib deps already union in rt-multi-thread/macros/signal; the e2e tests
+# additionally drive raw TCP (net) with async read/write (io-util).
+tokio = { version = "1", features = ["rt", "macros", "net", "io-util"] }

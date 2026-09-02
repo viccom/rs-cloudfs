@@ -387,6 +387,16 @@ impl Vfs {
         self.queue.stats()
     }
 
+    /// Boot-time recovery: re-enqueues every pending upload row whose
+    /// local cache copy still exists (rows without one are skipped — the
+    /// Python baseline lost such files on power loss). Returns the number
+    /// of jobs enqueued. Callers booting a serving surface should run
+    /// this before accepting traffic so crash-staged uploads resume
+    /// ahead of new client writes.
+    pub async fn requeue_pending(&self) -> Result<usize, QueueError> {
+        self.queue.requeue_pending(&self.cache).await
+    }
+
     /// Shuts the upload queue down and waits for it to drain.
     pub async fn shutdown(&self) {
         self.queue.shutdown().await
