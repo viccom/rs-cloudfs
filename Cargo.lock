@@ -418,6 +418,7 @@ dependencies = [
  "anyhow",
  "clap",
  "cydrive-core",
+ "cydrive-platform",
  "cydrive-telegram",
  "cydrive-webdav",
  "tempfile",
@@ -448,6 +449,14 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "cydrive-platform"
+version = "0.1.0"
+dependencies = [
+ "thiserror",
+ "winreg",
 ]
 
 [[package]]
@@ -2461,6 +2470,16 @@ name = "winnow"
 version = "1.0.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "23b97319f7b8343df12cc98938e5c3eb436064524c8d2b4e30a1d3a36eecdf81"
+
+[[package]]
+name = "winreg"
+version = "0.56.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d6f32a0ff4a9f6f01231eb2059cc85479330739333e0e58cadf03b6af2cca10"
+dependencies = [
+ "cfg-if",
+ "windows-sys",
+]
 
 [[package]]
 name = "writeable"

@@ -3,6 +3,7 @@ resolver = "2"
 members = [
     "crates/cydrive-cli",
     "crates/cydrive-core",
+    "crates/cydrive-platform",
     "crates/cydrive-telegram",
     "crates/cydrive-webdav",
 ]

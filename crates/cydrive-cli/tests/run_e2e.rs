@@ -13,7 +13,8 @@
 //! 3. crash-staged pending rows re-enter the queue at boot;
 //! 4. config discovery prefers `config.toml` over a legacy `config.json`;
 //! 5. discovery in an empty directory is an actionable error;
-//! 6. a legacy `config.json` alone is discovered and loads.
+//! 6. a legacy `config.json` alone is discovered and loads;
+//! 7. with `auto_mount_drive` off, the handle reports no mounted letter.
 
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
@@ -78,7 +79,8 @@ fn chdir(dir: &Path) -> CwdGuard {
 }
 
 /// A test config anchored in `dir`: ephemeral WebDAV port, temp DB and
-/// cache, plus a fully "configured" token/chat pair.
+/// cache, plus a fully "configured" token/chat pair. Auto-mount stays
+/// OFF so the offline gate never maps a real network drive.
 fn temp_config(dir: &Path, webdav_port: u16) -> CyDriveConfig {
     CyDriveConfig {
         bot_token: "123456:ABC-DEF".to_string(),
@@ -86,6 +88,7 @@ fn temp_config(dir: &Path, webdav_port: u16) -> CyDriveConfig {
         db_path: dir.join("meta.db").to_string_lossy().into_owned(),
         cache_path: dir.join("cache").to_string_lossy().into_owned(),
         webdav_port,
+        auto_mount_drive: false,
         ..CyDriveConfig::default()
     }
 }
@@ -258,6 +261,19 @@ async fn pending_rows_requeued_at_boot() {
         !mock.upload_calls().is_empty(),
         "the requeued job reached the mock remote"
     );
+}
+
+/// 7. With `auto_mount_drive` off (every offline test config), the run
+///    handle reports no mounted letter — the offline gate never maps a
+///    real network drive — and shutdown skips the unmount path.
+#[tokio::test]
+async fn auto_mount_disabled_leaves_mounted_letter_none() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cfg = temp_config(dir.path(), 0);
+    let mock = mock_transport().await;
+    let handle = boot(&cfg, mock).await;
+    assert_eq!(handle.mounted_letter, None);
+    handle.shutdown().await;
 }
 
 /// 4. With both files present, discovery prefers `config.toml` over a

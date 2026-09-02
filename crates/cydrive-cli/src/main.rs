@@ -30,6 +30,24 @@ struct Cli {
 enum Command {
     /// Start the full stack: metadata DB, upload queue, WebDAV server.
     Run,
+    /// Map a drive letter to the WebDAV server (`net use`).
+    Mount {
+        /// WebDAV URL (default: glued from the config's host/port).
+        #[arg(long)]
+        url: Option<String>,
+        /// Drive letter (default: the config's `drive_letter`, e.g. "Y:").
+        #[arg(long)]
+        letter: Option<String>,
+    },
+    /// Remove a mapped drive letter.
+    Unmount {
+        /// Drive letter (default: the config's `drive_letter`).
+        #[arg(long)]
+        letter: Option<String>,
+    },
+    /// Tune the WebClient registry (4 GB limit + Basic auth) and restart
+    /// the service. Needs an elevated shell.
+    FixReg,
 }
 
 #[tokio::main]
@@ -37,7 +55,40 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Run => run().await,
+        Command::Mount { url, letter } => mount_cmd(url, letter).await,
+        Command::Unmount { letter } => unmount_cmd(letter).await,
+        Command::FixReg => fix_reg_cmd().await,
     }
+}
+
+/// `cydrive mount`: resolve flags against the config, then map the best
+/// available letter. Windows-only (the platform stub reports otherwise).
+async fn mount_cmd(url: Option<String>, letter: Option<String>) -> Result<()> {
+    let cfg = discover_config().context("config discovery failed")?;
+    let (letter, url) = cydrive_cli::resolve_mount_params(&cfg, url, letter);
+    let mounted = cydrive_platform::windows::mount_drive(&letter, &url)
+        .with_context(|| format!("mounting {url} at {letter}"))?;
+    println!("CyDrive mounted at {mounted} -> {url}");
+    Ok(())
+}
+
+/// `cydrive unmount`: remove the mapping for the resolved letter.
+async fn unmount_cmd(letter: Option<String>) -> Result<()> {
+    let cfg = discover_config().context("config discovery failed")?;
+    let letter = cydrive_cli::resolve_unmount_letter(&cfg, letter);
+    cydrive_platform::windows::unmount_drive(&letter)
+        .with_context(|| format!("unmounting {letter}"))?;
+    println!("CyDrive unmounted from {letter}");
+    Ok(())
+}
+
+/// `cydrive fix-reg`: write the WebClient tuning values and restart the
+/// service (mirrors the Python `fix-reg` subcommand).
+async fn fix_reg_cmd() -> Result<()> {
+    cydrive_platform::windows::optimize_webdav_registry()
+        .context("tuning the WebClient registry")?;
+    println!("WebClient registry tuned (4 GB limit, Basic auth) and restarted");
+    Ok(())
 }
 
 /// The production run flow; every step here is covered by the library

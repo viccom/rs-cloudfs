@@ -20,6 +20,7 @@ path = "src/main.rs"
 anyhow = "1"
 clap = { version = "4", features = ["derive"] }
 cydrive-core = { path = "../cydrive-core" }
+cydrive-platform = { path = "../cydrive-platform" }
 cydrive-telegram = { path = "../cydrive-telegram" }
 cydrive-webdav = { path = "../cydrive-webdav" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
