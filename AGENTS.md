@@ -16,10 +16,11 @@
 
 **M2 进行中**（分支 `feat/m2-telegram`，自 feat/m1-core 切出）：新 crate `cydrive-telegram`。已完成首单元（3f878e2 红 + 9607457 绿，15 测试）：纯契约模块——`caption.rs`（单文件/多块 caption **Python 逐字快照**：Path:/File:/Part: 标签、KB 整除、加密后缀；`clean_rel_path` 按基线求值顺序（先 strip '/' 后替换 '\'，反斜杠输入产出 `//a/b` 是基线真实行为）；`part_document_name` 复用 core `chunker::part_name`）、`flood.rs`（`parse_flood_wait`：FLOOD_WAIT_N 秒数解析、裸 FLOOD_WAIT=0、其余 None）、`range.rs`（`range_plan`：skip/head/take 换算 + chunk_size 4096 整倍数且 4096..=512KB 校验）。
 M2 剩余：grammers 依赖接入（AGENTS 红线要求 git 锁精确 commit；若以 crates.io `=0.10.0` 精确锁替代须记 decisions.md）→ `GrammersTransport` glue（upload 走 `upload_stream`+caption/命名用上述纯模块、open/open_range 用 `DownloadIter` 的 chunk_size/skip_chunks、connect=bot_sign_in、错误映射走 `parse_flood_wait`）→ 入站 stream_updates 索引 + Bot 命令（含补齐 /get）→ 真机三档 smoke（100MB/2GB/3GB）登记「待人工」。设计文档「深度调研补遗」grammers 节是 API 权威。
+M2 已完成第二单元（34e2476 红 + 356009c 绿，10 测试）：纯适配逻辑——`plan.rs`（`plan_chunk_sends`：单/多块发送计划，name/caption/byte_len 全走契约模块，纯函数不触盘）、`stream.rs`（`serve_range`：RangeStream 状态机，head-skip/take 裁剪、迭代器耗尽不报错，coerce 到 ByteStream；为此 crate 直接依赖 bytes/futures-core，版本同 cydrive-core）、`config.rs`（`DEFAULT_API_ID=6`/`DEFAULT_API_HASH="eb06d4abfb49dc3eeb1aeb98ae0f581e"`/`DEFAULT_SESSION_STEM="cynet_bot_session"` 契约常量 + `TransportConfig`）。grammers 接入与 transport 壳是下一步（编译验证的 wiring，纯逻辑已全部就绪）。
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 全部 145 测试（core 130 + telegram 15）
+cargo test --workspace --no-fail-fast            # 全部 155 测试（core 130 + telegram 25）
 cargo clippy -p cydrive-core --all-targets -- -D warnings
 cargo fmt --all -- --check
 python scripts/gen_compat_fixtures.py       # 重新生成互操作 fixture（需能 import E:\GitHub\CyDrive）
