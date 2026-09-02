@@ -1,5 +1,5 @@
 //! Range-serving stream adapter over grammers `DownloadIter` chunk
-//! iterators (the glue between [`range::range_plan`] and `ByteStream`).
+//! iterators (the glue between [`crate::range::range_plan`] and `ByteStream`).
 
 use bytes::Bytes;
 use cydrive_core::transport::{ByteStream, TransportError};

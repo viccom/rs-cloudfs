@@ -9,7 +9,16 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+async-trait = "0.1"
 bytes = "1"
 cydrive-core = { path = "../cydrive-core" }
 futures-core = "0.3"
+# Exact `=` pins: grammers treats minor versions as breaking (TL layer
+# changes), so any semver-compatible drift must be a deliberate upgrade.
+grammers-client = "=0.10.0"
+# default-features off: the sqlite-storage backend statically bundles its own
+# SQLite (libsql), which symbol-collides on MSVC with rusqlite(bundled) used
+# by cydrive-core; see transport.rs for the persistence TODO this leaves.
+grammers-session = { version = "=0.10.0", default-features = false }
 thiserror = "2"
+tokio = { version = "1", features = ["rt", "fs", "io-util"] }
