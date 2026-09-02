@@ -52,6 +52,8 @@ impl Default for MockState {
             upload_calls: Vec::new(),
             deleted: Vec::new(),
             open_delay: Duration::ZERO,
+            sent_texts: Vec::new(),
+            sent_documents: Vec::new(),
         }
     }
 }
@@ -78,6 +80,10 @@ struct MockState {
     /// Artificial pre-stream delay injected by `open`/`open_range`
     /// (tests simulate a stalling remote); zero by default.
     open_delay: Duration,
+    /// Bot reply texts recorded by `send_text`, in call order.
+    sent_texts: Vec<String>,
+    /// Documents recorded by `send_document`, in call order.
+    sent_documents: Vec<(String, Vec<u8>)>,
 }
 
 /// In-memory transport; interior state is private.
@@ -158,6 +164,20 @@ impl MockTransport {
     pub fn deleted(&self) -> Vec<i32> {
         self.lock()
             .map(|state| state.deleted.clone())
+            .unwrap_or_default()
+    }
+
+    /// Bot reply texts recorded by `send_text`, in call order.
+    pub fn sent_texts(&self) -> Vec<String> {
+        self.lock()
+            .map(|state| state.sent_texts.clone())
+            .unwrap_or_default()
+    }
+
+    /// Documents recorded by `send_document`, in call order.
+    pub fn sent_documents(&self) -> Vec<(String, Vec<u8>)> {
+        self.lock()
+            .map(|state| state.sent_documents.clone())
             .unwrap_or_default()
     }
 }
@@ -294,6 +314,20 @@ impl CloudTransport for MockTransport {
             .map(|mut state| std::mem::take(&mut state.incoming_events))
             .unwrap_or_default();
         frame_stream(events)
+    }
+
+    async fn send_text(&self, text: &str) -> Result<(), TransportError> {
+        let mut state = self.lock()?;
+        state.sent_texts.push(text.to_string());
+        Ok(())
+    }
+
+    async fn send_document(&self, name: &str, bytes: &[u8]) -> Result<(), TransportError> {
+        let mut state = self.lock()?;
+        state
+            .sent_documents
+            .push((name.to_string(), bytes.to_vec()));
+        Ok(())
     }
 }
 

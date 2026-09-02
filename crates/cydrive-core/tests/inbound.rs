@@ -261,7 +261,7 @@ async fn worker_indexes_scripted_events() {
     ])
     .await;
 
-    let handle = spawn_inbound_worker(Arc::clone(&vfs), transport);
+    let handle = spawn_inbound_worker(Arc::clone(&vfs), transport, "Y:".to_string());
     wait_for_rows(&db, 2).await;
     assert!(
         db.get_file("/one.bin").expect("db read").is_some(),
@@ -283,7 +283,7 @@ async fn worker_survives_error_events() {
     ])
     .await;
 
-    let handle = spawn_inbound_worker(Arc::clone(&vfs), transport);
+    let handle = spawn_inbound_worker(Arc::clone(&vfs), transport, "Y:".to_string());
     // The error must not kill the worker: the file behind it is still
     // indexed once the stream is consumed.
     wait_for_rows(&db, 1).await;
@@ -302,7 +302,7 @@ async fn worker_logs_and_skips_commands() {
     ])
     .await;
 
-    let handle = spawn_inbound_worker(Arc::clone(&vfs), transport);
+    let handle = spawn_inbound_worker(Arc::clone(&vfs), transport, "Y:".to_string());
     wait_for_rows(&db, 1).await;
     // The command produced no row: only the file is indexed.
     let rows = db.list_all_files().expect("list files");

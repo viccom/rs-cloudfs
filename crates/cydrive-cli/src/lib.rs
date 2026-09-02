@@ -138,7 +138,11 @@ pub async fn run_with_transport(
     // indexing into the VFS before the first client request can arrive
     // (Python parity: the Telegram handlers run alongside the WebDAV
     // server from boot).
-    let inbound = spawn_inbound_worker(Arc::clone(&vfs), Arc::clone(&transport));
+    let inbound = spawn_inbound_worker(
+        Arc::clone(&vfs),
+        Arc::clone(&transport),
+        cfg.drive_letter.clone(),
+    );
     tracing::info!("inbound indexing worker spawned");
 
     // A second cache handle over the same root backs the FS adapter's

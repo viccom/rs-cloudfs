@@ -432,6 +432,39 @@ impl CloudTransport for GrammersTransport {
             rx.recv().await.map(|item| (item, rx))
         }))
     }
+
+    /// Sends a plain text message to the configured chat (bot replies).
+    ///
+    /// NOTE(real-machine): wiring follows `upload`'s `send_message` shape
+    /// verbatim; actual delivery needs a live bot account (offline this
+    /// is compile-verified only — see the module's grammers notes).
+    async fn send_text(&self, text: &str) -> Result<(), TransportError> {
+        self.client
+            .send_message(self.chat, InputMessage::new().text(text.to_string()))
+            .await
+            .map(|_| ())
+            .map_err(map_invocation_error)
+    }
+
+    /// Uploads `bytes` as a document named `name` and sends it to the
+    /// configured chat — the `/get` reply path (the document is the
+    /// reply; no caption, the remote document name carries the filename).
+    ///
+    /// NOTE(real-machine): the in-memory cursor mirrors `upload`'s
+    /// stream plumbing; actual delivery needs a live bot account
+    /// (offline this is compile-verified only).
+    async fn send_document(&self, name: &str, bytes: &[u8]) -> Result<(), TransportError> {
+        let mut cursor = std::io::Cursor::new(bytes.to_vec());
+        let uploaded = self
+            .client
+            .upload_stream(&mut cursor, bytes.len(), name.to_string())
+            .await?;
+        self.client
+            .send_message(self.chat, InputMessage::new().document(uploaded))
+            .await
+            .map(|_| ())
+            .map_err(map_invocation_error)
+    }
 }
 
 /// Maps one processed grammers update onto the core's inbound event

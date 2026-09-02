@@ -132,4 +132,16 @@ pub trait CloudTransport: Send + Sync {
     async fn delete_remote(&self, msg_id: i32) -> Result<(), TransportError>;
     /// Stream of inbound events; not gated by `connect()`.
     fn incoming(&self) -> IncomingStream;
+    /// Bot reply surface; storage-only transports keep the default (unsupported).
+    async fn send_text(&self, _text: &str) -> Result<(), TransportError> {
+        Err(TransportError::Remote(
+            "send_text not supported by this transport".to_string(),
+        ))
+    }
+    /// Sends a document message to the configured chat.
+    async fn send_document(&self, _name: &str, _bytes: &[u8]) -> Result<(), TransportError> {
+        Err(TransportError::Remote(
+            "send_document not supported by this transport".to_string(),
+        ))
+    }
 }

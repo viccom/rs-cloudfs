@@ -45,12 +45,14 @@ impl InboundWorkerHandle {
 
 /// Spawns the inbound worker: consumes `transport.incoming()`, indexes
 /// [`IncomingEvent::File`] events into the VFS at the root (metadata
-/// only, Python baseline), logs-and-skips [`IncomingEvent::Command`]
-/// events (bot command unit pending) and `Err` events (a bad event
-/// never kills the worker).
+/// only, Python baseline) and dispatches [`IncomingEvent::Command`]
+/// events to the bot command handler (replies go back over the same
+/// transport). `Err` events and failed command handling only warn — a bad
+/// event never kills the worker.
 pub fn spawn_inbound_worker(
     vfs: Arc<Vfs>,
     transport: Arc<dyn CloudTransport>,
+    drive_letter: String,
 ) -> InboundWorkerHandle {
     let task = tokio::spawn(async move {
         let mut stream = transport.incoming();
@@ -68,12 +70,21 @@ pub fn spawn_inbound_worker(
                     }
                 }
                 Ok(IncomingEvent::Command { text }) => {
-                    // TODO(bot-commands): parse and dispatch bot commands
-                    // (/stats, /search — the M2 bot-command unit).
-                    tracing::info!(
-                        %text,
-                        "inbound bot command received; command handling is pending"
-                    );
+                    // Bot command dispatch: the reply target is the
+                    // configured chat (send_text/send_document on the
+                    // same transport). A failed reply only warns — the
+                    // worker keeps consuming events.
+                    if let Err(error) = crate::bot::handle_command(
+                        &vfs.db(),
+                        &vfs,
+                        transport.as_ref(),
+                        &drive_letter,
+                        &text,
+                    )
+                    .await
+                    {
+                        tracing::warn!(%error, %text, "bot command failed; continuing");
+                    }
                 }
                 Err(error) => {
                     tracing::warn!(%error, "inbound stream error; continuing");

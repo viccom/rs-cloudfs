@@ -421,6 +421,14 @@ impl Vfs {
         self.queue.stats()
     }
 
+    /// Handle to the metadata DB (Arc clone) — surfaces that need direct
+    /// reads next to the VFS operations (bot `/stats` + `/search`, the
+    /// WebDAV adapter) share the exact same store the VFS writes through.
+    /// Frozen API addition (trait-evolution adjudication, 2026-09-02).
+    pub fn db(&self) -> Arc<MetaDatabase> {
+        Arc::clone(&self.db)
+    }
+
     /// Indexes one inbound remote file at the root (metadata only; payload
     /// stays remote until hydrated on demand). Returns the rel_path used.
     ///

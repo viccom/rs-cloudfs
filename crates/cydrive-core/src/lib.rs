@@ -6,6 +6,7 @@
 //! concrete network client lives here. See the design document at
 //! `docs/rust-rewrite-design.md` (repository root).
 
+pub mod bot;
 pub mod cache;
 pub mod chunker;
 pub mod config;
