@@ -22,14 +22,14 @@ M2 剩余（让位于垂直切片，可用优先，见下）：入站 stream_upd
 
 **垂直切片（可用优先，2026-09-02 负责人指令 + decisions.md 队列重排条；自动化已提频至每小时）**：
 - **A 已完成（bd5e877，19 新测试，工作区 178 全绿）**：`cydrive-webdav`——`CyDriveFs` 实现 dav-server 0.11 `DavFileSystem`（**trait 非 async_trait，手写 FsFuture/Box::pin**；其余与设计文档差异见提交信息：symlink_metadata 转发 metadata、DavMetaData 是 DynClone、etag() 需覆写、mime 无 FS 接口由库按扩展名推导）：metadata/read_dir/open 读写/create_dir/remove_dir/remove_file/rename/get_quota（used=DB 总量、total=used+10TB 契约）；写入 `.tmp` staging + **flush=PUT 提交点**（dav-server 语义核实）原子入队；copy NotImplemented（Explorer 复制走 PUT）。基线镜像：DELETE 不删远端（同 Python）、MKCOL 同；**MOVE 基线本来就是坏的（500），定义稳健语义**：`MetaDatabase::rename_path` 原位 UPDATE（保 file_id→chunks 链接防孤儿化）+ 缓存子树移动 + 远端不动。core 增 `Vfs::put_staged`（大文件不整文件读回）+ `rename_path`，均带测试。边界：range PUT 安全但不做 RFC 补丁合并；rename 后远端 caption 过期（无碍重组）。
-- **B 下一步**：dav-server+hyper 服务装配（127.0.0.1:8080 loopback 无认证=契约）+ 离线 HTTP 冒烟（PROPFIND/GET/PUT/DELETE/MKCOL/RANGE，MockTransport）
-- **C**：cydrive-cli 最小 run 编排（config→logging→connect→Vfs→requeue_pending→serve→ctrl_c 优雅退出）
+- **B 已完成（1660ba5，9 冒烟测试，工作区 187 全绿）**：`src/server.rs`——`WebDavServer::serve(fs, addr)`（dav-server 0.11 **无自带 hyper 装配**，照 examples/hyper.rs 自起：TcpListener → accept loop → http1 serve_connection；`DavHandler` 直接对接 hyper 1.x Body）+ **FakeLs 锁系统**（不装则 ALLOW 不含 LOCK/UNLOCK，Explorer 挂载必需）+ 方法集 WEBDAV_RW + principal("cydrive") + `local_addr()`（:0 → 实际端口）+ 幂等 graceful shutdown（hyper 1.x `Connection::graceful_shutdown`）。冒烟：PROPFIND 207/GET 字节与头/Range 206/PUT→队列全周期/0 字节 PUT/MKCOL 201 重复 405/DELETE 204 不删远端/MOVE 改名/OPTIONS DAV 头与 ALLOW。实测语义记录：OPTIONS 对 collection 的 ALLOW 不含 PUT（dav-server 策略）；hyper 用 "1"（Cargo.lock 锁 1.11.1，semver 稳定不 exact-pin）。
+- **C 下一步**：cydrive-cli 最小 run 编排（config→logging→connect→Vfs→requeue_pending→serve→ctrl_c 优雅退出）
 - **D**：cydrive-platform（windows）：net use 挂载（Y: 回退链）+ fix-reg + WebClient 重启
 M2 已完成第二单元（34e2476 红 + 356009c 绿，10 测试）：纯适配逻辑——`plan.rs`（`plan_chunk_sends`：单/多块发送计划，name/caption/byte_len 全走契约模块，纯函数不触盘）、`stream.rs`（`serve_range`：RangeStream 状态机，head-skip/take 裁剪、迭代器耗尽不报错，coerce 到 ByteStream；为此 crate 直接依赖 bytes/futures-core，版本同 cydrive-core）、`config.rs`（`DEFAULT_API_ID=6`/`DEFAULT_API_HASH="eb06d4abfb49dc3eeb1aeb98ae0f581e"`/`DEFAULT_SESSION_STEM="cynet_bot_session"` 契约常量 + `TransportConfig`）。grammers 接入与 transport 壳是下一步（编译验证的 wiring，纯逻辑已全部就绪）。
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 全部 178 测试（core 134 + telegram 29 + webdav 15）
+cargo test --workspace --no-fail-fast            # 全部 187 测试（core 134 + telegram 29 + webdav 24）
 cargo clippy -p cydrive-core --all-targets -- -D warnings
 cargo fmt --all -- --check
 python scripts/gen_compat_fixtures.py       # 重新生成互操作 fixture（需能 import E:\GitHub\CyDrive）
