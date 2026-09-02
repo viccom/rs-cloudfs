@@ -9,7 +9,9 @@
 //! prefers the local cache, otherwise downloads — merging chunks,
 //! decrypting encrypted rows into a plaintext cache copy — after LRU
 //! eviction that clears evicted rows' `is_cached` flag while preserving
-//! every other field.
+//! every other field. The remote-dependent span of a hydration is
+//! bounded by `hydrate_timeout` (Python parity: the WebDAV thread's 180s
+//! `future.result` cap); cache hits bypass the bound.
 //!
 //! Determinism note: `#[tokio::test]` runs a current-thread runtime, so
 //! between `put(...).await` returning and the next await the upload
@@ -44,6 +46,7 @@ fn test_cfg(chunk_size_bytes: u64, encryption_password: Option<&str>) -> VfsConf
             max_attempts: 3,
         },
         encryption_password: encryption_password.map(str::to_string),
+        hydrate_timeout: Duration::from_secs(180),
     }
 }
 
@@ -607,5 +610,95 @@ async fn put_staged_zero_byte_skips_transport() {
     assert!(
         !final_local.exists(),
         "empty local copy deleted by the drain"
+    );
+}
+
+/// 14. Stalled remote: an `open_delay` of 500ms against a 50ms
+///     `hydrate_timeout` surfaces `Timeout(50ms)` (Python parity: the
+///     WebDAV thread's `future.result(timeout=180)` download cap) and
+///     leaves no `.tmp` staging file anywhere in the cache tree.
+#[tokio::test]
+async fn hydrate_times_out_when_transport_stalls() {
+    let mock = MockTransport::builder()
+        .open_delay(Duration::from_millis(500))
+        .build();
+    let (_dir, db, cache, cache_root, mock) = test_env_with_mock(mock, 1 << 20).await;
+    seed_remote_file(&db, &mock, "/stalled.bin", b"stalled bytes", 64, false).await;
+
+    let mut cfg = test_cfg(64, None);
+    cfg.hydrate_timeout = Duration::from_millis(50);
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let vfs = Vfs::new(db.clone(), cache, transport, cfg);
+    let rel = RelPath::new("/stalled.bin").expect("valid rel path");
+
+    let result = vfs.hydrate(&rel).await;
+    assert!(
+        matches!(&result, Err(VfsError::Timeout(d)) if *d == Duration::from_millis(50)),
+        "expected Timeout(50ms), got: {result:?}"
+    );
+
+    let mut all_files = Vec::new();
+    collect_files(&cache_root, &mut all_files);
+    assert!(
+        all_files
+            .iter()
+            .all(|path| path.extension().is_none_or(|ext| ext != "tmp")),
+        "no .tmp files left in the cache tree: {all_files:?}"
+    );
+}
+
+/// 15. Cache hits bypass the timeout: a pre-seeded local copy wins over
+///     a stalling remote (500ms open delay, 50ms timeout) — the remote
+///     is never consulted and the local bytes come back.
+#[tokio::test]
+async fn hydrate_cache_hit_ignores_timeout() {
+    let mock = MockTransport::builder()
+        .open_delay(Duration::from_millis(500))
+        .build();
+    let (_dir, db, cache, _cache_root, mock) = test_env_with_mock(mock, 1 << 20).await;
+    seed_remote_file(&db, &mock, "/hit.bin", b"REMOTE", 64, false).await;
+    seed_local(&cache, "/hit.bin", b"LOCAL");
+
+    let mut cfg = test_cfg(64, None);
+    cfg.hydrate_timeout = Duration::from_millis(50);
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let vfs = Vfs::new(db.clone(), cache, transport, cfg);
+    let rel = RelPath::new("/hit.bin").expect("valid rel path");
+
+    let hydrated = vfs
+        .hydrate(&rel)
+        .await
+        .expect("cache hit returns despite the tight timeout");
+    assert_eq!(
+        fs::read(&hydrated).expect("read cache copy"),
+        b"LOCAL",
+        "local bytes win; the stalling remote was never consulted"
+    );
+}
+
+/// 16. A generous timeout never bites a merely slow download: a 50ms
+///     open delay under a 5s budget hydrates normally with the right
+///     bytes.
+#[tokio::test]
+async fn hydrate_completes_within_generous_timeout() {
+    let mock = MockTransport::builder()
+        .open_delay(Duration::from_millis(50))
+        .build();
+    let (_dir, db, cache, _cache_root, mock) = test_env_with_mock(mock, 1 << 20).await;
+    seed_remote_file(&db, &mock, "/slow.bin", b"slow but fine", 64, false).await;
+
+    let mut cfg = test_cfg(64, None);
+    cfg.hydrate_timeout = Duration::from_secs(5);
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let vfs = Vfs::new(db.clone(), cache, transport, cfg);
+    let rel = RelPath::new("/slow.bin").expect("valid rel path");
+
+    let hydrated = vfs
+        .hydrate(&rel)
+        .await
+        .expect("slow download still within budget");
+    assert_eq!(
+        fs::read(&hydrated).expect("read hydrated copy"),
+        b"slow but fine"
     );
 }

@@ -38,6 +38,11 @@ pub struct VfsConfig {
     pub retry: RetryPolicy,
     /// Password enabling client-side encryption; default `None`.
     pub encryption_password: Option<String>,
+    /// Upper bound on the remote-dependent span of a hydration
+    /// (transport open through the final cache copy); default 180s,
+    /// mirroring the Python WebDAV thread's `future.result(timeout=180)`
+    /// download deadline. Cache hits are local reads and never bounded.
+    pub hydrate_timeout: std::time::Duration,
 }
 
 impl Default for VfsConfig {
@@ -49,6 +54,7 @@ impl Default for VfsConfig {
             queue_capacity: 256,
             retry: RetryPolicy::default(),
             encryption_password: None,
+            hydrate_timeout: std::time::Duration::from_secs(180),
         }
     }
 }
@@ -80,6 +86,11 @@ pub enum VfsError {
     /// Local file I/O failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// Hydration exceeded `hydrate_timeout` (Python parity: the WebDAV
+    /// thread's 180s `future.result` cap; the remote-dependent span
+    /// never hangs a GET forever).
+    #[error("hydration timed out after {0:?}")]
+    Timeout(std::time::Duration),
 }
 
 /// Sibling staging path of `target`: the full file name plus a `.tmp`
@@ -346,38 +357,61 @@ impl Vfs {
 
         // Stream the remote bytes into the cache through the same
         // tmp+rename pair (close the handle before renaming on Windows).
+        // The remote-dependent span — transport open through the final DB
+        // upsert — is bounded by `hydrate_timeout`: a stalled remote
+        // surfaces as `Timeout` instead of a hung GET (Python parity:
+        // the WebDAV thread's `future.result(timeout=180)` cap). Cache
+        // hits and the LRU bookkeeping above are local fast paths and
+        // stay outside the bound.
         let handle = RemoteHandle {
             first_msg_id,
             chunk_msg_ids: msg_ids,
             total_size: row.size.max(0) as u64,
         };
-        let mut stream = self.transport.open(&handle).await?;
         let staged = tmp_sibling(&local);
         if let Some(parent) = local.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        {
-            let mut file = std::fs::File::create(&staged)?;
-            while let Some(frame) = stream.next().await {
-                file.write_all(&frame?)?;
+        let timeout = self.cfg.hydrate_timeout;
+        let download = async {
+            let mut stream = self.transport.open(&handle).await?;
+            {
+                let mut file = std::fs::File::create(&staged)?;
+                while let Some(frame) = stream.next().await {
+                    file.write_all(&frame?)?;
+                }
+                file.flush()?;
             }
-            file.flush()?;
-        }
-        std::fs::rename(&staged, &local)?;
+            std::fs::rename(&staged, &local)?;
 
-        // Python behavior: the cache copy is plaintext, so decrypt after
-        // the ciphertext landed locally.
-        if row.is_encrypted {
-            let password = self
-                .cfg
-                .encryption_password
-                .as_deref()
-                .ok_or(VfsError::MissingPassword)?;
-            let plaintext = crypto::decrypt(password, &std::fs::read(&local)?)?;
-            write_atomic(&local, &plaintext)?;
-        }
+            // Python behavior: the cache copy is plaintext, so decrypt
+            // after the ciphertext landed locally.
+            if row.is_encrypted {
+                let password = self
+                    .cfg
+                    .encryption_password
+                    .as_deref()
+                    .ok_or(VfsError::MissingPassword)?;
+                let plaintext = crypto::decrypt(password, &std::fs::read(&local)?)?;
+                write_atomic(&local, &plaintext)?;
+            }
 
-        self.db.upsert_file(&cached_upsert(&row, true))?;
+            self.db.upsert_file(&cached_upsert(&row, true))?;
+            Ok(())
+        };
+        let failed = match tokio::time::timeout(timeout, download).await {
+            Ok(Ok(())) => None,
+            Ok(Err(error)) => Some(error),
+            Err(_elapsed) => Some(VfsError::Timeout(timeout)),
+        };
+        if let Some(error) = failed {
+            // No staging file survives a failed hydration (timeout,
+            // transport or I/O): a half-written `.tmp` copy is never
+            // left in the cache tree. Removal of a not-yet-created
+            // staging file is a benign no-op.
+            let _ = std::fs::remove_file(&staged);
+            return Err(error);
+        }
         self.cache.record_access(rel);
         Ok(local)
     }

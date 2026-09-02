@@ -23,6 +23,7 @@
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
+use std::time::Duration;
 
 use anyhow::{Context, Result};
 use cydrive_core::cache::CacheManager;
@@ -87,6 +88,7 @@ fn vfs_config(cfg: &CyDriveConfig) -> VfsConfig {
         queue_capacity: 256,
         retry: Default::default(),
         encryption_password: cfg.encryption_password.clone(),
+        hydrate_timeout: Duration::from_secs(180),
     }
 }
 

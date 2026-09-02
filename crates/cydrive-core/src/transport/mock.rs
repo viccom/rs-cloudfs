@@ -15,6 +15,7 @@ use futures_core::Stream;
 use std::collections::{BTreeMap, VecDeque};
 use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
 
 /// Scripted outcome of one `upload` call.
 pub enum UploadAction {
@@ -50,6 +51,7 @@ impl Default for MockState {
             incoming_events: Vec::new(),
             upload_calls: Vec::new(),
             deleted: Vec::new(),
+            open_delay: Duration::ZERO,
         }
     }
 }
@@ -71,6 +73,9 @@ struct MockState {
     upload_calls: Vec<UploadJob>,
     /// msg_ids successfully deleted, in order.
     deleted: Vec<i32>,
+    /// Artificial pre-stream delay injected by `open`/`open_range`
+    /// (tests simulate a stalling remote); zero by default.
+    open_delay: Duration,
 }
 
 /// In-memory transport; interior state is private.
@@ -94,6 +99,7 @@ impl MockTransport {
             connect_result: None,
             upload_script: VecDeque::new(),
             incoming_events: Vec::new(),
+            open_delay: Duration::ZERO,
         }
     }
 
@@ -225,11 +231,18 @@ impl CloudTransport for MockTransport {
     }
 
     async fn open(&self, file: &RemoteHandle) -> Result<ByteStream, TransportError> {
-        let state = self.lock()?;
-        if !state.connected {
-            return Err(TransportError::NotConnected);
-        }
-        let data = concat_chunks(&state, &file.chunk_msg_ids)?;
+        let (delay, data) = {
+            let state = self.lock()?;
+            if !state.connected {
+                return Err(TransportError::NotConnected);
+            }
+            (
+                state.open_delay,
+                concat_chunks(&state, &file.chunk_msg_ids)?,
+            )
+        };
+        // Guard dropped before sleeping: locks never span an await.
+        tokio::time::sleep(delay).await;
         Ok(frame_stream(vec![Ok(Bytes::from(data))]))
     }
 
@@ -239,19 +252,24 @@ impl CloudTransport for MockTransport {
         off: u64,
         len: u64,
     ) -> Result<ByteStream, TransportError> {
-        let state = self.lock()?;
-        if !state.connected {
-            return Err(TransportError::NotConnected);
-        }
-        let data = concat_chunks(&state, &file.chunk_msg_ids)?;
-        let total = data.len() as u64;
-        let slice = if off >= total {
-            Vec::new()
-        } else {
-            let end = off.saturating_add(len).min(total);
-            data[off as usize..end as usize].to_vec()
+        let (delay, data) = {
+            let state = self.lock()?;
+            if !state.connected {
+                return Err(TransportError::NotConnected);
+            }
+            let data = concat_chunks(&state, &file.chunk_msg_ids)?;
+            let total = data.len() as u64;
+            let slice = if off >= total {
+                Vec::new()
+            } else {
+                let end = off.saturating_add(len).min(total);
+                data[off as usize..end as usize].to_vec()
+            };
+            (state.open_delay, slice)
         };
-        Ok(frame_stream(vec![Ok(Bytes::from(slice))]))
+        // Guard dropped before sleeping: locks never span an await.
+        tokio::time::sleep(delay).await;
+        Ok(frame_stream(vec![Ok(Bytes::from(data))]))
     }
 
     async fn delete_remote(&self, msg_id: i32) -> Result<(), TransportError> {
@@ -357,12 +375,20 @@ pub struct MockTransportBuilder {
     connect_result: Option<Result<(), TransportError>>,
     upload_script: VecDeque<UploadAction>,
     incoming_events: Vec<IncomingEvent>,
+    open_delay: Duration,
 }
 
 impl MockTransportBuilder {
     /// Sets the result of the first `connect` call (default `Ok`).
     pub fn connect_result(mut self, result: Result<(), TransportError>) -> Self {
         self.connect_result = Some(result);
+        self
+    }
+
+    /// Sets an artificial delay `open`/`open_range` sleep before
+    /// returning the stream (simulates a stalling remote); default zero.
+    pub fn open_delay(mut self, delay: Duration) -> Self {
+        self.open_delay = delay;
         self
     }
 
@@ -386,6 +412,7 @@ impl MockTransportBuilder {
                 connect_result: self.connect_result,
                 upload_script: self.upload_script,
                 incoming_events: self.incoming_events,
+                open_delay: self.open_delay,
                 ..MockState::default()
             })),
         }

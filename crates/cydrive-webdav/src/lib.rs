@@ -644,9 +644,11 @@ fn vfs_err(error: VfsError) -> FsError {
         // EISDIR to Forbidden, so mirror that. MissingPassword is a
         // policy refusal -> Forbidden as well.
         VfsError::IsDirectory(_) | VfsError::MissingPassword => FsError::Forbidden,
-        VfsError::QueueClosed | VfsError::Db(_) | VfsError::Transport(_) | VfsError::Crypto(_) => {
-            FsError::GeneralFailure
-        }
+        VfsError::QueueClosed
+        | VfsError::Db(_)
+        | VfsError::Transport(_)
+        | VfsError::Crypto(_)
+        | VfsError::Timeout(_) => FsError::GeneralFailure,
         VfsError::Io(error) => io_err(error),
     }
 }
