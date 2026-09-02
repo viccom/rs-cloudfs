@@ -1,6 +1,10 @@
 [workspace]
 resolver = "2"
 members = ["crates/cydrive-core", "crates/cydrive-telegram"]
+# Not a member on purpose: an external path dependency keeps rustc's
+# cap-lints=allow for upstream code (fmt/clippy gates stay ours), while
+# the exclude below also allows running its own tests standalone.
+exclude = ["crates/vendor/grammers-session"]
 
 [workspace.package]
 version = "0.1.0"
@@ -12,3 +16,11 @@ missing_docs = "allow"
 
 [workspace.lints.clippy]
 all = { level = "warn", priority = -1 }
+
+# Redirect every grammers-session consumer in the graph — including the
+# transitive dependency from grammers-client — to the in-tree vendored
+# copy whose sqlite-storage backend is rusqlite(bundled) instead of
+# libsql, so the whole workspace links exactly one SQLite C library.
+# See crates/vendor/grammers-session/VENDOR.md.
+[patch.crates-io]
+grammers-session = { path = "crates/vendor/grammers-session" }

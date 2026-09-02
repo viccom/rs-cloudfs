@@ -16,9 +16,17 @@ futures-core = "0.3"
 # Exact `=` pins: grammers treats minor versions as breaking (TL layer
 # changes), so any semver-compatible drift must be a deliberate upgrade.
 grammers-client = "=0.10.0"
-# default-features off: the sqlite-storage backend statically bundles its own
-# SQLite (libsql), which symbol-collides on MSVC with rusqlite(bundled) used
-# by cydrive-core; see transport.rs for the persistence TODO this leaves.
-grammers-session = { version = "=0.10.0", default-features = false }
+# Redirected by the workspace [patch.crates-io] to the in-tree vendored copy
+# (crates/vendor/grammers-session) whose sqlite-storage backend is
+# rusqlite(bundled) — same SQLite cydrive-core links — instead of libsql.
+# sqlite-storage is now needed by transport.rs for file-backed persistence;
+# default-features stays off to keep the feature set explicit.
+grammers-session = { version = "=0.10.0", default-features = false, features = [
+    "sqlite-storage",
+] }
 thiserror = "2"
 tokio = { version = "1", features = ["rt", "fs", "io-util"] }
+
+[dev-dependencies]
+tempfile = "3"
+tokio = { version = "1", features = ["rt", "macros"] }

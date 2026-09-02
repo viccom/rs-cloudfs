@@ -1,0 +1,69 @@
+# Vendored from crates.io `grammers-session 0.10.0` and modified: the
+# sqlite-storage backend was ported from libsql to rusqlite (bundled) to
+# avoid the MSVC LNK2005 duplicate-symbol clash between libsql-ffi's
+# statically bundled SQLite and the rusqlite(bundled) already linked by
+# cydrive-core. See VENDOR.md in this directory for the modification list
+# and re-vendor guidance. Upstream: https://codeberg.org/Lonami/grammers
+
+[package]
+edition = "2024"
+name = "grammers-session"
+version = "0.10.0"
+authors = ["Lonami Exo <totufals@hotmail.com>"]
+description = """
+Different session storages for Telegram data.
+"""
+homepage = "https://codeberg.org/Lonami/grammers"
+documentation = "https://docs.rs/grammers-session"
+readme = "README.md"
+keywords = [
+    "telegram",
+    "tl",
+]
+license = "MIT OR Apache-2.0"
+repository = "https://codeberg.org/Lonami/grammers"
+resolver = "2"
+
+[features]
+default = ["sqlite-storage"]
+serde = [
+    "dep:serde",
+    "dep:serde_with",
+]
+sqlite-storage = ["dep:rusqlite"]
+
+[lib]
+name = "grammers_session"
+path = "src/lib.rs"
+
+[dependencies.grammers-tl-types]
+version = "0.10.0"
+
+[dependencies.log]
+version = "0.4.33"
+
+[dependencies.rusqlite]
+version = "0.40"
+features = ["bundled"]
+optional = true
+
+[dependencies.serde]
+version = "1"
+features = ["derive"]
+optional = true
+
+[dependencies.serde_with]
+version = "3"
+features = ["hex"]
+optional = true
+
+# Dev-only: keeps the ported inline `storages/sqlite.rs` test runnable when
+# this crate is tested standalone (`cargo test` inside this directory).
+# Dev-dependencies never propagate to workspace consumers.
+[dev-dependencies.tokio]
+version = "1.52.3"
+features = [
+    "sync",
+    "rt",
+]
+default-features = false

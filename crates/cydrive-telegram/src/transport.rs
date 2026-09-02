@@ -13,16 +13,14 @@
 //!   api_id`, its **runner is spawned on a tokio task** to drive all network
 //!   I/O, and the [`Client`] is created from the pool's fat handle.
 //!   `api_hash` is only consumed by `Client::bot_sign_in`.
-//! * Session persistence is currently **memory-only**
-//!   ([`MemorySession`]): grammers 0.10's only file-backed storage
-//!   (`SqliteSession`) statically bundles its own SQLite via libsql, whose
-//!   C symbols collide on MSVC with the `rusqlite(bundled)` already linked
-//!   by `cydrive-core`, and a custom `Session` implementation cannot
-//!   bootstrap the datacenter address table (it is crate-private in
-//!   grammers-session). Every process start therefore re-runs
-//!   `bot_sign_in`. TODO(M2 session-persistence): land a file-backed
-//!   storage once that conflict is adjudicated (fork grammers-session to a
-//!   rusqlite backend, or upstream support).
+//! * Session persistence is file-backed ([`SqliteSession`] at
+//!   `config.session_path`, write-through): grammers-session is redirected
+//!   by the workspace `[patch.crates-io]` to an in-tree vendored copy whose
+//!   sqlite-storage backend is rusqlite(bundled) — the same SQLite
+//!   cydrive-core links — because upstream's libsql backend statically
+//!   bundles a second SQLite whose C symbols collide on MSVC with
+//!   rusqlite(bundled) (`LNK2005`). A stored authorization key means
+//!   `bot_sign_in` is skipped on restarts.
 //! * `DownloadIter` is not an `Iterator`/`Stream`: chunks are pulled with
 //!   `async fn next()`, so requested spans are buffered (bounded by the
 //!   request length, plus at most one chunk) before [`serve_range`] wraps
@@ -35,7 +33,7 @@ use grammers_client::media::Media;
 use grammers_client::message::InputMessage;
 use grammers_client::sender::SenderPool;
 use grammers_client::{Client, InvocationError};
-use grammers_session::storages::MemorySession;
+use grammers_session::storages::SqliteSession;
 use grammers_session::types::PeerId;
 use grammers_session::Session;
 use tokio::io::{AsyncReadExt, AsyncSeekExt};
@@ -94,13 +92,12 @@ pub struct GrammersTransport {
 
 impl GrammersTransport {
     /// Creates a signed-in transport: spawns the sender-pool runner driving
-    /// all network I/O, signs in with the bot token if the session is not
-    /// yet authorized, and resolves the target chat from `config.chat_id`
-    /// (a Bot API dialog id).
-    ///
-    /// The session is memory-only (see the module docs): each process start
-    /// performs a fresh `bot_sign_in`; `config.session_path` is accepted but
-    /// unused until a file-backed storage lands.
+    /// all network I/O, opens the file-backed session at
+    /// `config.session_path` (created on first use, write-through — see the
+    /// module docs for the vendored rusqlite backend), signs in with the
+    /// bot token only if the stored session is not yet authorized, and
+    /// resolves the target chat from `config.chat_id` (a Bot API dialog
+    /// id).
     ///
     /// Chat resolution is cache-first: the session's cached access hash is
     /// used when present (populated automatically as the bot interacts with
@@ -109,10 +106,11 @@ impl GrammersTransport {
     /// a member of). The first send/delete against the chat is what
     /// ultimately validates it.
     pub async fn connect(config: TransportConfig) -> Result<Self, TransportError> {
-        // TODO(M2 session-persistence): swap MemorySession for a file-backed
-        // storage (SqliteSession is blocked by an MSVC symbol conflict with
-        // rusqlite(bundled); see module docs).
-        let session: Arc<MemorySession> = Arc::new(MemorySession::default());
+        let session: Arc<SqliteSession> = Arc::new(
+            SqliteSession::open(&config.session_path)
+                .await
+                .map_err(|e| TransportError::Remote(format!("session open: {e}")))?,
+        );
         let pool = SenderPool::new(Arc::clone(&session), config.api_id);
         let client = Client::new(pool.handle);
         tokio::spawn(pool.runner.run());
