@@ -519,3 +519,93 @@ async fn put_after_shutdown_is_queue_closed() {
         "expected QueueClosed, got: {result:?}"
     );
 }
+
+/// 12. put_staged: a caller-staged tmp file is renamed onto the final cache
+///     path (no in-memory buffering, WebDAV PUT path), the row goes pending
+///     immediately, and the drained upload round-trips the bytes.
+#[tokio::test]
+async fn put_staged_renames_then_uploads_full_cycle() {
+    let (_dir, db, cache, cache_root, mock) = test_env(1 << 20).await;
+    let paths = CacheManager::new(cache_root.clone(), u64::MAX);
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let vfs = Vfs::new(db.clone(), cache, transport, test_cfg(64, None));
+    let rel = RelPath::new("/nested/staged.txt").expect("valid rel path");
+
+    let final_local = paths.local_path(&rel);
+    let staged = final_local.with_file_name(".staged.txt.tmp");
+    fs::create_dir_all(staged.parent().expect("staged parent")).expect("create staged dirs");
+    fs::write(&staged, b"staged bytes").expect("write staged file");
+
+    vfs.put_staged(&rel, &staged, 1_700_000_000.0)
+        .await
+        .expect("put_staged accepted");
+
+    assert!(!staged.exists(), "staging file renamed away");
+    assert_eq!(
+        fs::read(&final_local).expect("read cache copy"),
+        b"staged bytes"
+    );
+    let row = db
+        .get_file("/nested/staged.txt")
+        .expect("db read")
+        .expect("row exists");
+    assert!(!row.is_uploaded, "row pending right after put_staged");
+    assert!(row.is_cached);
+    assert_eq!(row.size, 12, "size from the staged file");
+
+    vfs.shutdown().await;
+
+    let row = db
+        .get_file("/nested/staged.txt")
+        .expect("db read")
+        .expect("row exists");
+    assert!(row.is_uploaded, "upload finished during the drain");
+    assert!(row.telegram_msg_id.is_some(), "chunk-0 msg id recorded");
+    assert!(
+        !final_local.exists(),
+        "cache copy deleted after the successful upload"
+    );
+    let hydrated = vfs.hydrate(&rel).await.expect("hydrate after upload");
+    assert_eq!(
+        fs::read(hydrated).expect("read hydrated copy"),
+        b"staged bytes",
+        "bytes came back from the mock remote"
+    );
+}
+
+/// 13. put_staged 0-byte: same semantics as `put` — the transport is never
+///     called, the row ends uploaded without a msg id and the empty local
+///     file is removed by the drain.
+#[tokio::test]
+async fn put_staged_zero_byte_skips_transport() {
+    let (_dir, db, cache, cache_root, mock) = test_env(1 << 20).await;
+    let paths = CacheManager::new(cache_root.clone(), u64::MAX);
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let vfs = Vfs::new(db.clone(), cache, transport, test_cfg(64, None));
+    let rel = RelPath::new("/empty-staged.txt").expect("valid rel path");
+
+    let final_local = paths.local_path(&rel);
+    let staged = final_local.with_file_name(".empty-staged.txt.tmp");
+    fs::create_dir_all(staged.parent().expect("staged parent")).expect("create staged dirs");
+    fs::write(&staged, b"").expect("write empty staged file");
+
+    vfs.put_staged(&rel, &staged, 1_700_000_000.0)
+        .await
+        .expect("put_staged accepted");
+    vfs.shutdown().await;
+
+    assert!(
+        mock.upload_calls().is_empty(),
+        "0-byte put_staged never touches the transport"
+    );
+    let row = db
+        .get_file("/empty-staged.txt")
+        .expect("db read")
+        .expect("row exists");
+    assert!(row.is_uploaded, "0-byte counts as uploaded");
+    assert_eq!(row.telegram_msg_id, None);
+    assert!(
+        !final_local.exists(),
+        "empty local copy deleted by the drain"
+    );
+}

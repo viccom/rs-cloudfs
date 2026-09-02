@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["crates/cydrive-core", "crates/cydrive-telegram"]
+members = ["crates/cydrive-core", "crates/cydrive-telegram", "crates/cydrive-webdav"]
 # Not a member on purpose: an external path dependency keeps rustc's
 # cap-lints=allow for upstream code (fmt/clippy gates stay ours), while
 # the exclude below also allows running its own tests standalone.

@@ -433,3 +433,99 @@ fn adopts_python_generated_database() {
     db.delete_file("/adopted-new.txt").expect("delete");
     assert!(db.get_file("/adopted-new.txt").expect("query").is_none());
 }
+
+// ------------------------------------------------------------ rename ---
+
+/// rename_path on a file: the row moves to the new rel_path with name /
+/// parent_dir rewritten, keeps its id (so chunk rows stay linked) and
+/// every other field verbatim; the old path is gone.
+#[test]
+fn rename_path_moves_file_row_keeping_chunks_linkage() {
+    let (_dir, db) = fresh_db("rename_file");
+    let file_id = db
+        .upsert_file(&FileUpsert {
+            telegram_msg_id: Some(4242),
+            is_uploaded: true,
+            chunk_count: 3,
+            ..entry("/old.bin", 7)
+        })
+        .expect("seed file row");
+    for index in 0..3 {
+        db.upsert_chunk(file_id, index, 4242 + index, 3, None)
+            .expect("seed chunk row");
+    }
+
+    db.rename_path("/old.bin", "/new-dir/new.bin")
+        .expect("rename file");
+
+    assert!(
+        db.get_file("/old.bin").expect("query old").is_none(),
+        "old path gone"
+    );
+    let row = db
+        .get_file("/new-dir/new.bin")
+        .expect("query new")
+        .expect("row moved");
+    assert_eq!(row.id, file_id, "row keeps its id");
+    assert_eq!(row.name, "new.bin");
+    assert_eq!(row.parent_dir, "/new-dir");
+    assert_eq!(row.telegram_msg_id, Some(4242), "msg id carried over");
+    assert_eq!(row.size, 7);
+    let chunks = db.get_chunks_by_file_id(file_id).expect("chunks");
+    assert_eq!(chunks.len(), 3, "chunk rows still linked to the same id");
+    assert_eq!(chunks[0].telegram_msg_id, Some(4242));
+}
+
+/// rename_path on a directory: the dir row and every descendant row have
+/// rel_path / parent_dir rewritten under the new prefix (dir first, then
+/// children, in one transaction); nothing else changes.
+#[test]
+fn rename_path_moves_dir_subtree() {
+    let (_dir, db) = fresh_db("rename_dir");
+    db.upsert_file(&dir_entry("/docs")).expect("seed dir");
+    db.upsert_file(&dir_entry("/docs/sub"))
+        .expect("seed subdir");
+    db.upsert_file(&entry("/docs/a.txt", 1)).expect("seed file");
+    db.upsert_file(&entry("/docs/sub/b.txt", 2))
+        .expect("seed nested file");
+    // A sibling sharing the prefix text must not be touched.
+    db.upsert_file(&dir_entry("/docs2"))
+        .expect("seed prefix sibling");
+
+    db.rename_path("/docs", "/books").expect("rename dir");
+
+    for old in ["/docs", "/docs/a.txt", "/docs/sub", "/docs/sub/b.txt"] {
+        assert!(
+            db.get_file(old).expect("query old").is_none(),
+            "old path gone: {old}"
+        );
+    }
+    let dir = db.get_file("/books").expect("q").expect("dir moved");
+    assert_eq!((dir.name.as_str(), dir.parent_dir.as_str()), ("books", "/"));
+    let sub = db.get_file("/books/sub").expect("q").expect("sub moved");
+    assert_eq!(sub.parent_dir, "/books");
+    let a = db.get_file("/books/a.txt").expect("q").expect("file moved");
+    assert_eq!(
+        (a.name.as_str(), a.parent_dir.as_str()),
+        ("a.txt", "/books")
+    );
+    let b = db
+        .get_file("/books/sub/b.txt")
+        .expect("q")
+        .expect("nested file moved");
+    assert_eq!(b.parent_dir, "/books/sub");
+    // The dir row itself is not its own parent.
+    assert!(
+        db.get_file("/books/books").expect("q").is_none(),
+        "no self-nesting artifact"
+    );
+    assert!(
+        db.get_file("/docs2").expect("q").is_some(),
+        "prefix sibling untouched"
+    );
+    assert_eq!(
+        names(&db.list_dir("/books").expect("list")),
+        vec!["sub", "a.txt"],
+        "listing works through the new paths (dirs first, name asc)"
+    );
+}

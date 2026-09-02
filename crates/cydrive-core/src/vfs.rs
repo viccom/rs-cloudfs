@@ -194,14 +194,49 @@ impl Vfs {
         // local copy (and only deletes it after a successful upload).
         let local = self.cache.local_path(rel);
         write_atomic(&local, bytes)?;
+        self.commit_put(rel, local, bytes.len() as u64, mtime).await
+    }
 
-        let size = bytes.len() as i64;
+    /// Upload path for externally staged bytes (the WebDAV PUT writer):
+    /// the caller already wrote the payload to `staged_tmp`; this renames
+    /// it onto the final cache path (same-directory atomic rename, parent
+    /// directories created), then runs the exact [`Vfs::put`] lifecycle —
+    /// pending row, `is_cached = true`, enqueued upload. The payload is
+    /// never read back into memory.
+    pub async fn put_staged(
+        &self,
+        rel: &RelPath,
+        staged_tmp: &Path,
+        mtime: f64,
+    ) -> Result<(), VfsError> {
+        let local = self.cache.local_path(rel);
+        if let Some(parent) = local.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let size = std::fs::metadata(staged_tmp)?.len();
+        std::fs::rename(staged_tmp, &local)?;
+        self.commit_put(rel, local, size, mtime).await
+    }
+
+    /// Shared `put` tail once the full payload sits at `local`: upsert the
+    /// pending row sized off the staged bytes, then enqueue the upload.
+    ///
+    /// Last await point contract (see [`Vfs::put`]): after the enqueue
+    /// returns this method must not yield again — callers rely on the row
+    /// still being pending the instant the future resolves.
+    async fn commit_put(
+        &self,
+        rel: &RelPath,
+        local: PathBuf,
+        size: u64,
+        mtime: f64,
+    ) -> Result<(), VfsError> {
         // 0-byte rows carry a zero chunk plan (the queue never touches
         // the transport for them); otherwise ceil(len / chunk_size) >= 1.
         let chunk_count = if size == 0 {
             0
         } else {
-            (bytes.len() as u64).div_ceil(self.cfg.chunk_size_bytes.max(1)) as u32
+            size.div_ceil(self.cfg.chunk_size_bytes.max(1)) as u32
         };
         let parent_dir = match rel.parent() {
             Some(parent) => parent.as_str().to_string(),
@@ -211,7 +246,7 @@ impl Vfs {
             rel_path: rel.as_str().to_string(),
             name: rel.name().to_string(),
             parent_dir,
-            size,
+            size: size as i64,
             mtime,
             sha256: None,
             is_dir: false,
@@ -228,14 +263,11 @@ impl Vfs {
             mime_type: None,
         })?;
 
-        // Last await point: after the enqueue returns this method must
-        // not yield again — callers rely on the row still being pending
-        // the instant `put` returns.
         self.queue
             .enqueue(UploadJob {
                 rel_path: rel.clone(),
                 local_path: local,
-                size: bytes.len() as u64,
+                size,
                 chunk_count,
                 chunk_size: self.cfg.chunk_size_bytes,
             })

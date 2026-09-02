@@ -429,6 +429,52 @@ impl MetaDatabase {
         Ok(())
     }
 
+    /// Moves the row at `from` to `to`, rewriting `rel_path` / `name` /
+    /// `parent_dir`; when the row is a directory, every descendant row's
+    /// path fields move under the new prefix as well. All of it in one
+    /// transaction.
+    ///
+    /// Rows keep their ids, so `chunks` linkage and every other column
+    /// survive verbatim — an upsert-at-dest + delete-at-source pair would
+    /// orphan the chunk rows (they key on the old `files.id`). Renaming a
+    /// missing path is a no-op, mirroring [`MetaDatabase::delete_file`].
+    pub fn rename_path(&self, from: &str, to: &str) -> Result<(), DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tx = conn.unchecked_transaction()?;
+        // Prefix matching uses substr comparisons, not LIKE: virtual paths
+        // may legitimately contain `%` or `_`, which LIKE treats as
+        // wildcards. Direct children carry `parent_dir = from` exactly and
+        // must land on `to` itself, not on a rewritten prefix.
+        tx.execute(
+            "UPDATE files SET
+                rel_path = ?2 || substr(rel_path, length(?1) + 1),
+                parent_dir = CASE
+                    WHEN parent_dir = ?1 THEN ?2
+                    ELSE ?2 || substr(parent_dir, length(?1) + 1)
+                END
+            WHERE rel_path <> ?1
+              AND substr(rel_path, 1, length(?1) + 1) = ?1 || '/'",
+            params![from, to],
+        )?;
+        // Path fields of the moved node itself, derived the same way the
+        // upsert helpers do (final segment, parent with `/` root).
+        let name = to.rsplit_once('/').map_or(to, |(_, name)| name);
+        let parent = match to.rfind('/') {
+            Some(0) | None => "/",
+            Some(i) => &to[..i],
+        };
+        tx.execute(
+            "UPDATE files SET rel_path = ?2, name = ?3, parent_dir = ?4, updated_at = ?5
+             WHERE rel_path = ?1",
+            params![from, to, name, parent, now()],
+        )?;
+        tx.commit()?;
+        Ok(())
+    }
+
     /// Aggregated statistics, exactly the Python `get_stats` SQL:
     /// totals over `is_dir = 0` rows, dirs over `is_dir = 1`, uploaded
     /// over `is_uploaded = 1 AND is_dir = 0`, pending as the difference.
