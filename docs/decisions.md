@@ -54,3 +54,9 @@
 
 - **指令**：「加快进度，我需要可用的程序」。北极星不变（稳定好用），门禁（fmt/clippy/test 全绿）仍为底线不为速度牺牲；但**队列按可用性重排**。
 - **采纳裁决**：最快到可运行程序的路径是 M3 垂直切片——A. cydrive-webdav 的 DavFileSystem 适配（Vfs 之上，离线 TDD 全测）→ B. dav-server+hyper 服务装配 + 离线 HTTP 冒烟 → C. cydrive-cli 最小 run 编排 → D. Windows net use 挂载 + fix-reg。A–D 达成即「可运行程序」（真机 bot token 冒烟仍待人工）。M2 非必要单元（入站 Bot 命令、加密上传路径）让位延后；M4/M5/M6 顺延。自动化频率 2h→1h。垂直切片期间新 crate 直接建于 feat/m2-telegram 分支（减摩擦），切片完成后恢复里程碑分支惯例。
+
+## 2026-09-02 CloudTransport trait 演进：Bot 回复能力（send_text/send_document provided 方法）
+
+- **需求**：Bot 命令单元（/stats /search /help 补 /get）需要向 chat 回复文本与发送文档，CloudTransport 原面（存储语义）无此能力。
+- **采纳裁决**：以 **provided 方法 + 默认 Unsupported** 追加 `send_text(&self, &str)` / `send_document(&self, name, bytes)`（async_trait provided 方法，非 breaking——既有实现者零改动）；MockTransport 覆写并记录供离线断言；GrammersTransport 真接线（NOTE(real-machine)）。备选「独立 BotSurface trait」被否：实现方总是同一 transport，拆 trait 徒增装配复杂度。回复目标=配置 chat（与入站 chat 过滤一致）。
+- **/get 语义（新定义，基线只承诺未实现）**：`/get <token>`——先按精确 rel_path 查；miss 则按名搜索，唯一命中用之，0/多命中分别回复 not-found/ambiguous；命中后 hydrate 再 send_document。
