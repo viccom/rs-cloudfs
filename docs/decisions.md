@@ -49,3 +49,8 @@
 - **session 持久化终局（批准 fork）**：落地形式采 **in-tree vendor**——`crates/vendor/grammers-session` 作为 workspace 路径成员 + 根 Cargo.toml `[patch.crates-io]` 把 grammers-session 统一重定向到该副本（grammers-client 的传递依赖也用同一份，类型合一），存储后端 libsql→rusqlite(bundled)（与 cydrive-core 同一 SQLite，消除 MSVC LNK2005）。相比外部 GitHub fork：技术效果等同（重启免登录、契约 3 `cynet_bot_session` 文件落地），但不引入外部仓库、零漂移、完全可回滚，更符合北极星。代价：上游升级需手动 re-vendor，接受（grammers 节奏慢且我们本就精确锁版本）。
 - **M0 三项归属确认**：keyring→M5 `migrate`（修复 Python 明文凭据缺陷，该问题 Python 版同样存在）；CI→M6（开始 push 前无收益）；cargo-deny→M6 但允许作为任意运行的填充单元提前。设计文档 M0 验收行同步修订。
 - **日期勘误**：本文件此前 3 条误记为 2026-09-03/09-04（实际系统日期未到），已订正为 2026-09-02。
+
+## 2026-09-02 负责人指令：加快进度、可用优先（队列重排）
+
+- **指令**：「加快进度，我需要可用的程序」。北极星不变（稳定好用），门禁（fmt/clippy/test 全绿）仍为底线不为速度牺牲；但**队列按可用性重排**。
+- **采纳裁决**：最快到可运行程序的路径是 M3 垂直切片——A. cydrive-webdav 的 DavFileSystem 适配（Vfs 之上，离线 TDD 全测）→ B. dav-server+hyper 服务装配 + 离线 HTTP 冒烟 → C. cydrive-cli 最小 run 编排 → D. Windows net use 挂载 + fix-reg。A–D 达成即「可运行程序」（真机 bot token 冒烟仍待人工）。M2 非必要单元（入站 Bot 命令、加密上传路径）让位延后；M4/M5/M6 顺延。自动化频率 2h→1h。垂直切片期间新 crate 直接建于 feat/m2-telegram 分支（减摩擦），切片完成后恢复里程碑分支惯例。
