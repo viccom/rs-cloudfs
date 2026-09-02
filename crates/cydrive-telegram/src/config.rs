@@ -18,9 +18,16 @@ pub struct TransportConfig {
 }
 
 impl Default for TransportConfig {
-    // api creds from consts, token empty, chat 0,
-    // session_path = format!("{DEFAULT_SESSION_STEM}.session") into PathBuf
+    // Public baseline credentials, empty bot token, chat 0, session file
+    // `<stem>.session` relative to the working directory (Python baseline
+    // keeps its session file in the CWD as well).
     fn default() -> Self {
-        todo!()
+        Self {
+            api_id: DEFAULT_API_ID,
+            api_hash: DEFAULT_API_HASH.to_owned(),
+            bot_token: String::new(),
+            chat_id: 0,
+            session_path: format!("{DEFAULT_SESSION_STEM}.session").into(),
+        }
     }
 }

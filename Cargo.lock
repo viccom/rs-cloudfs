@@ -228,7 +228,9 @@ dependencies = [
 name = "cydrive-telegram"
 version = "0.1.0"
 dependencies = [
+ "bytes",
  "cydrive-core",
+ "futures-core",
  "thiserror",
 ]
 
