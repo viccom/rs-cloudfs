@@ -7,5 +7,8 @@
 //! (repository root) and the chunk-naming erratum in `docs/decisions.md`.
 
 pub mod caption;
+pub mod config;
 pub mod flood;
+pub mod plan;
 pub mod range;
+pub mod stream;
