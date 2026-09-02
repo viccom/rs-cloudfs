@@ -10,6 +10,12 @@
 //! `static/js/app.js` consumes exactly these), the multipart upload
 //! seam into `Vfs::put`, the single-call delete fix, hydrated downloads
 //! and the Python 404 semantics for unknown files.
+//!
+//! The three M4 incremental routes (no Python baseline; frozen by the
+//! Rust design doc) follow: `/api/list` (flat directory listing with
+//! 400/404 semantics), single-range `Range` support on `/api/download`
+//! (206/416, lenient fallback to 200) and `/api/queue` (queue counters
+//! plus the DB pending tally).
 
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
@@ -718,4 +724,308 @@ async fn unknown_download_404() {
         "File not found in CyDrive cloud",
         "Python 404 body verbatim"
     );
+}
+
+/// The exact key set of `GET /api/queue`: the four queue counters plus
+/// the DB pending tally.
+const QUEUE_KEYS: [&str; 5] = ["enqueued", "succeeded", "degraded", "retries", "pending"];
+
+/// 10. GET /api/list without a `path` defaults to the root and answers
+///     the root's direct children flat (the frontend builds the tree),
+///     each entry shaped exactly like an `/api/files` row.
+#[tokio::test]
+async fn list_root_default_and_shape() {
+    let env = test_env().await;
+    let addr = env.server.local_addr();
+    seed_row(&env.db, "/docs", true, 0, true);
+    seed_row(&env.db, "/readme.txt", false, 11, true);
+
+    let resp = send(addr, &request("GET", "/api/list", addr, &[], "")).await;
+    assert_eq!(status_of(&resp), 200, "ok: {resp}");
+    assert!(
+        header(&resp, "content-type")
+            .expect("content-type")
+            .starts_with("application/json"),
+        "json content type: {resp}"
+    );
+
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse list body");
+    assert_eq!(body["path"], "/", "default path is the root");
+    let entries = body["entries"].as_array().expect("entries array");
+    assert_eq!(entries.len(), 2, "one entry per direct root child");
+
+    let expected: BTreeSet<String> = FILE_ROW_KEYS.iter().map(|s| s.to_string()).collect();
+    for entry in entries {
+        assert_eq!(
+            keys_of(entry).into_iter().collect::<BTreeSet<_>>(),
+            expected,
+            "entry key set mirrors /api/files rows: {entry}"
+        );
+    }
+    let paths: BTreeSet<&str> = entries
+        .iter()
+        .map(|e| e["rel_path"].as_str().expect("rel_path string"))
+        .collect();
+    assert_eq!(
+        paths,
+        BTreeSet::from(["/docs", "/readme.txt"]),
+        "direct children only, flat"
+    );
+
+    // An explicit `path=/` answers the same listing.
+    let resp = send(addr, &request("GET", "/api/list?path=/", addr, &[], "")).await;
+    assert_eq!(status_of(&resp), 200, "explicit root ok: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse list body");
+    assert_eq!(body["path"], "/");
+    assert_eq!(body["entries"].as_array().expect("entries").len(), 2);
+}
+
+/// 11. GET /api/list?path=/docs lists only /docs's direct children; the
+///     leading-slash guarantee and the backslash fold normalize the
+///     query value first.
+#[tokio::test]
+async fn list_subdir_entries() {
+    let env = test_env().await;
+    let addr = env.server.local_addr();
+    seed_row(&env.db, "/docs", true, 0, true);
+    seed_row(&env.db, "/docs/a.txt", false, 3, true);
+    seed_row(&env.db, "/docs/nested", true, 0, true);
+    seed_row(&env.db, "/other/b.txt", false, 4, true);
+    seed_row(&env.db, "/root.txt", false, 5, true);
+
+    let resp = send(addr, &request("GET", "/api/list?path=/docs", addr, &[], "")).await;
+    assert_eq!(status_of(&resp), 200, "ok: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse list body");
+    assert_eq!(body["path"], "/docs", "normalized path echoed");
+    let entries = body["entries"].as_array().expect("entries array");
+    let paths: BTreeSet<&str> = entries
+        .iter()
+        .map(|e| e["rel_path"].as_str().expect("rel_path string"))
+        .collect();
+    assert_eq!(
+        paths,
+        BTreeSet::from(["/docs/a.txt", "/docs/nested"]),
+        "only /docs children — no grandchildren, no siblings, not /docs itself"
+    );
+
+    // No leading slash: normalized onto `/docs`.
+    let resp = send(addr, &request("GET", "/api/list?path=docs", addr, &[], "")).await;
+    assert_eq!(status_of(&resp), 200, "leading slash guaranteed: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse list body");
+    assert_eq!(body["path"], "/docs");
+    assert_eq!(body["entries"].as_array().expect("entries").len(), 2);
+
+    // Backslash query (`%5C`) folds onto the separator.
+    let resp = send(
+        addr,
+        &request("GET", "/api/list?path=%5Cdocs", addr, &[], ""),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 200, "backslash folded: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse list body");
+    assert_eq!(body["path"], "/docs");
+}
+
+/// 12. Directory existence semantics: a path with neither a row nor any
+///     child 404s, while an existing-but-empty directory answers 200
+///     with an empty `entries` array.
+#[tokio::test]
+async fn list_missing_dir_404_but_empty_dir_ok() {
+    let env = test_env().await;
+    let addr = env.server.local_addr();
+    seed_row(&env.db, "/empty", true, 0, true);
+
+    let resp = send(
+        addr,
+        &request("GET", "/api/list?path=/missing", addr, &[], ""),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 404, "no row and no children: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse error body");
+    assert_eq!(body, serde_json::json!({"error": "Directory not found"}));
+
+    let resp = send(
+        addr,
+        &request("GET", "/api/list?path=/empty", addr, &[], ""),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 200, "empty but existing: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse list body");
+    assert_eq!(body["path"], "/empty");
+    assert_eq!(body["entries"], serde_json::json!([]), "empty entry list");
+}
+
+/// 13. Path pollution in `?path=` answers 400 with the uniform error
+///     shape (`..` traversal, empty segments).
+#[tokio::test]
+async fn list_invalid_path_400() {
+    let env = test_env().await;
+    let addr = env.server.local_addr();
+
+    for bad in ["/../etc", "/a//b"] {
+        let resp = send(
+            addr,
+            &request("GET", &format!("/api/list?path={bad}"), addr, &[], ""),
+        )
+        .await;
+        assert_eq!(status_of(&resp), 400, "rejected {bad}: {resp}");
+        let body: serde_json::Value =
+            serde_json::from_str(&body_of(&resp)).expect("parse error body");
+        assert_eq!(body, serde_json::json!({"error": "Invalid path"}));
+    }
+}
+
+/// 14. GET /api/download honors a single-byte `Range`: 206 with an exact
+///     slice and `Content-Range`, including the open-ended and suffix
+///     forms (standard single-range semantics, aiohttp FileResponse
+///     baseline).
+#[tokio::test]
+async fn download_range_serves_206_slice() {
+    let env = test_env().await;
+    let addr = env.server.local_addr();
+    seed_remote_file(&env.db, &env.mock, "/blob.bin", b"payload", 64).await;
+
+    let resp = send(
+        addr,
+        &request(
+            "GET",
+            "/api/download/blob.bin",
+            addr,
+            &[("Range", "bytes=2-4")],
+            "",
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 206, "partial content: {resp}");
+    assert_eq!(header(&resp, "content-range"), Some("bytes 2-4/7"));
+    assert_eq!(header(&resp, "content-length"), Some("3"));
+    assert_eq!(body_of(&resp), "ylo", "exact slice bytes[2..=4]");
+
+    // Open-ended `a-` runs to the last byte.
+    let resp = send(
+        addr,
+        &request(
+            "GET",
+            "/api/download/blob.bin",
+            addr,
+            &[("Range", "bytes=5-")],
+            "",
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 206, "open-ended range: {resp}");
+    assert_eq!(header(&resp, "content-range"), Some("bytes 5-6/7"));
+    assert_eq!(body_of(&resp), "ad");
+
+    // Suffix `-n` covers the final n bytes.
+    let resp = send(
+        addr,
+        &request(
+            "GET",
+            "/api/download/blob.bin",
+            addr,
+            &[("Range", "bytes=-3")],
+            "",
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 206, "suffix range: {resp}");
+    assert_eq!(header(&resp, "content-range"), Some("bytes 4-6/7"));
+    assert_eq!(body_of(&resp), "oad");
+}
+
+/// 15. Range edge cases: a start past the end answers 416 with
+///     `Content-Range: bytes */size`, while malformed or multi-range
+///     headers are ignored and the full body is served with 200.
+#[tokio::test]
+async fn download_range_out_of_bounds_416_and_malformed_ignored() {
+    let env = test_env().await;
+    let addr = env.server.local_addr();
+    seed_remote_file(&env.db, &env.mock, "/blob.bin", b"payload", 64).await;
+
+    let resp = send(
+        addr,
+        &request(
+            "GET",
+            "/api/download/blob.bin",
+            addr,
+            &[("Range", "bytes=7-9")],
+            "",
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 416, "unsatisfiable range: {resp}");
+    assert_eq!(header(&resp, "content-range"), Some("bytes */7"));
+
+    for ignored in ["bytes=abc", "bytes=0-1,3-4"] {
+        let resp = send(
+            addr,
+            &request(
+                "GET",
+                "/api/download/blob.bin",
+                addr,
+                &[("Range", ignored)],
+                "",
+            ),
+        )
+        .await;
+        assert_eq!(status_of(&resp), 200, "ignored Range {ignored}: {resp}");
+        assert_eq!(
+            header(&resp, "content-range"),
+            None,
+            "no Content-Range on a full body"
+        );
+        assert_eq!(body_of(&resp), "payload", "full body on ignored Range");
+        assert_eq!(header(&resp, "content-length"), Some("7"));
+    }
+}
+
+/// 16. GET /api/queue reports the four upload-queue counters plus the
+///     DB pending tally; after one upload drains, the numbers agree with
+///     the library reads.
+#[tokio::test]
+async fn queue_endpoint_counters() {
+    let env = test_env().await;
+    let addr = env.server.local_addr();
+
+    let resp = send(
+        addr,
+        &upload_request(addr, "queue-boundary", "hello.txt", "queued body"),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 200, "upload accepted: {resp}");
+
+    // The queue drains asynchronously; poll until the job succeeded.
+    // (persist_success flips the DB row before `succeeded` increments,
+    // so a >=1 reading implies the DB is settled too.)
+    let mut queue = None;
+    for _ in 0..200 {
+        let resp = send(addr, &request("GET", "/api/queue", addr, &[], "")).await;
+        assert_eq!(status_of(&resp), 200, "queue ok: {resp}");
+        let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse queue");
+        if body["succeeded"].as_u64().unwrap_or(0) >= 1 {
+            queue = Some(body);
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    let queue = queue.expect("upload drained within the poll window");
+
+    let expected: BTreeSet<String> = QUEUE_KEYS.iter().map(|s| s.to_string()).collect();
+    assert_eq!(
+        keys_of(&queue).into_iter().collect::<BTreeSet<_>>(),
+        expected,
+        "exact key set: {queue}"
+    );
+    assert_eq!(queue["enqueued"], 1, "one job accepted");
+    assert_eq!(queue["succeeded"], 1, "one job uploaded");
+    assert_eq!(queue["degraded"], 0, "always-succeeding mock");
+    assert_eq!(queue["retries"], 0, "no scripted failures");
+    let db_pending = env.db.get_stats().expect("db stats").pending_uploads;
+    assert_eq!(
+        queue["pending"].as_i64(),
+        Some(db_pending),
+        "pending mirrors the DB"
+    );
+    assert_eq!(db_pending, 0, "drained upload is no longer pending");
 }

@@ -23,6 +23,23 @@
 //!   answer the bytes with Python's inline disposition; unknown files
 //!   get Python's verbatim 404 body.
 //!
+//! Three incremental routes (no Python baseline; frozen by the Rust
+//! design doc, all additive — the six routes above are untouched):
+//!
+//! - `GET /api/list?path=/docs` — one directory's direct children as a
+//!   flat `/api/files`-shaped array (the frontend assembles the tree).
+//!   The query value is normalized (leading `/` guaranteed, `\` folded
+//!   onto `/`); segment pollution 400s, a directory with neither a row
+//!   nor children 404s, an existing-but-empty one lists 200.
+//! - `GET /api/download/{filename}` with `Range` — standard HTTP
+//!   single-range semantics (the aiohttp `FileResponse` baseline): a
+//!   satisfiable range answers 206 with an exact slice and
+//!   `Content-Range`; an unsatisfiable start answers 416 with
+//!   `Content-Range: bytes */size`; malformed or multi-range headers
+//!   are ignored and the full body is served with 200.
+//! - `GET /api/queue` — the four upload-queue counters plus the DB
+//!   pending-uploads tally.
+//!
 //! Production binds `127.0.0.1:8088` (the caller's concern); tests bind
 //! `127.0.0.1:0`.
 
@@ -31,7 +48,7 @@ use std::sync::{Arc, Mutex};
 use std::time::SystemTime;
 
 use axum::body::Body;
-use axum::extract::{DefaultBodyLimit, Multipart, Path, State};
+use axum::extract::{DefaultBodyLimit, Multipart, Path, Request, State};
 use axum::http::{header, StatusCode};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
@@ -176,6 +193,8 @@ fn router(vfs: Arc<Vfs>, cfg: WebUiConfig) -> axum::Router {
         // the wildcard keeps those requests identical while making
         // nested paths work).
         .route("/api/download/{*filename}", get(api_download))
+        .route("/api/list", get(api_list))
+        .route("/api/queue", get(api_queue))
         .route("/static/{*path}", get(static_asset))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
         .with_state(state)
@@ -367,12 +386,92 @@ async fn api_delete(State(state): State<AppState>, body: Json<serde_json::Value>
     }
 }
 
+/// One parsed single-range byte spec (the `bytes=a-b` family).
+enum ByteRange {
+    /// `bytes=a-b` (end inclusive).
+    Span(u64, u64),
+    /// `bytes=a-` (start through the last byte).
+    Open(u64),
+    /// `bytes=-n` (the final n bytes).
+    Suffix(u64),
+}
+
+/// Parses a `Range` header value into a single byte range. `None` means
+/// the value does not name exactly one well-formed range — a missing
+/// `bytes=` unit, several comma-separated ranges, an inverted `a-b`, or
+/// non-numeric bounds — and the caller serves the full body instead
+/// (HTTP's lenient ignore-a-bad-Range convention).
+fn parse_byte_range(value: &str) -> Option<ByteRange> {
+    let rest = value.trim().strip_prefix("bytes=")?;
+    if rest.contains(',') {
+        return None; // multi-range: never served here, ignored wholesale
+    }
+    let (start, end) = rest.split_once('-')?;
+    let (start, end) = (start.trim(), end.trim());
+    match (start.is_empty(), end.is_empty()) {
+        (false, false) => {
+            let (start, end) = (start.parse().ok()?, end.parse().ok()?);
+            (start <= end).then_some(ByteRange::Span(start, end))
+        }
+        (false, true) => Some(ByteRange::Open(start.parse().ok()?)),
+        (true, false) => Some(ByteRange::Suffix(end.parse().ok()?)),
+        (true, true) => None,
+    }
+}
+
+/// Resolves a parsed range against a body of `size` bytes to an
+/// inclusive `(start, end)` slice, clamping per RFC 9110 (an end past
+/// the last byte is the last byte; a suffix longer than the body is the
+/// whole body). `None` is unsatisfiable — 416 territory.
+fn resolve_byte_range(spec: ByteRange, size: u64) -> Option<(u64, u64)> {
+    if size == 0 {
+        return None; // no byte can satisfy any range of an empty body
+    }
+    match spec {
+        ByteRange::Span(start, end) => (start < size).then(|| (start, end.min(size - 1))),
+        ByteRange::Open(start) => (start < size).then(|| (start, size - 1)),
+        // A suffix-length of zero is unsatisfiable (RFC 9110).
+        ByteRange::Suffix(len) => (len > 0).then(|| (size - len.min(size), size - 1)),
+    }
+}
+
 /// A hydrated download: Python's inline disposition, a mime guessed
 /// from the name (`mimetypes.guess_type` analog) and the exact bytes
-/// (which sets the Content-Length).
-fn download_response(filename: &str, bytes: Vec<u8>) -> Response {
+/// (which sets the Content-Length). A present-and-parseable `Range`
+/// header narrows the answer to one slice: 206 + `Content-Range` when
+/// satisfiable, 416 + `Content-Range: bytes */size` when not; anything
+/// the parser rejects falls through to the full 200 body.
+fn download_response(filename: &str, bytes: Vec<u8>, range: Option<&str>) -> Response {
     let mime = mime_guess::from_path(filename).first_or_octet_stream();
     let disposition = format!("inline; filename=\"{filename}\"");
+    if let Some(spec) = range.and_then(parse_byte_range) {
+        return match resolve_byte_range(spec, bytes.len() as u64) {
+            Some((start, end)) => {
+                let slice = &bytes[start as usize..=end as usize];
+                (
+                    StatusCode::PARTIAL_CONTENT,
+                    [
+                        (header::CONTENT_TYPE, mime.as_ref().to_string()),
+                        (header::CONTENT_DISPOSITION, disposition),
+                        (
+                            header::CONTENT_RANGE,
+                            format!("bytes {start}-{end}/{}", bytes.len()),
+                        ),
+                    ],
+                    Body::from(slice.to_vec()),
+                )
+                    .into_response()
+            }
+            // Parseable but unsatisfiable: name the size so the client
+            // can re-request against reality.
+            None => (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [(header::CONTENT_RANGE, format!("bytes */{}", bytes.len()))],
+                Body::empty(),
+            )
+                .into_response(),
+        };
+    }
     (
         [
             (header::CONTENT_TYPE, mime.as_ref().to_string()),
@@ -384,11 +483,16 @@ fn download_response(filename: &str, bytes: Vec<u8>) -> Response {
 }
 
 /// `GET /api/download/{filename}`: hydrate through the VFS (cache hit
-/// or remote pull with LRU eviction) and answer the bytes. Sub-paths
-/// resolve as their virtual RelPath; a missing row, a directory or an
-/// unusable path all land on Python's verbatim 404 body, and other
-/// failures surface as 500 errors.
-async fn api_download(State(state): State<AppState>, Path(filename): Path<String>) -> Response {
+/// or remote pull with LRU eviction) and answer the bytes, honoring a
+/// single-range `Range` header when present. Sub-paths resolve as
+/// their virtual RelPath; a missing row, a directory or an unusable
+/// path all land on Python's verbatim 404 body, and other failures
+/// surface as 500 errors.
+async fn api_download(
+    State(state): State<AppState>,
+    Path(filename): Path<String>,
+    request: Request,
+) -> Response {
     let normalized = filename.replace('\\', "/");
     let trimmed = normalized.trim_start_matches('/');
     let Ok(rel) = RelPath::new(&format!("/{trimmed}")) else {
@@ -401,9 +505,13 @@ async fn api_download(State(state): State<AppState>, Path(filename): Path<String
         )
             .into_response();
     };
+    let range = request
+        .headers()
+        .get(header::RANGE)
+        .and_then(|value| value.to_str().ok());
     match state.vfs.hydrate(&rel).await {
         Ok(path) => match std::fs::read(&path) {
-            Ok(bytes) => download_response(&filename, bytes),
+            Ok(bytes) => download_response(&filename, bytes, range),
             Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
         },
         Err(VfsError::NotFound(_)) | Err(VfsError::IsDirectory(_)) => (
@@ -416,4 +524,117 @@ async fn api_download(State(state): State<AppState>, Path(filename): Path<String
             .into_response(),
         Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
+}
+
+/// Percent-decodes one query component: `%XX` escapes become their
+/// bytes, everything else passes through verbatim — including `+`,
+/// which never means space here (path components are not form fields,
+/// so a literal `+` in a filename survives). A malformed escape stays
+/// literal; the component is data, not a parsed structure.
+fn percent_decode(component: &str) -> String {
+    fn hex_digit(byte: u8) -> Option<u8> {
+        match byte {
+            b'0'..=b'9' => Some(byte - b'0'),
+            b'a'..=b'f' => Some(byte - b'a' + 10),
+            b'A'..=b'F' => Some(byte - b'A' + 10),
+            _ => None,
+        }
+    }
+    let bytes = component.as_bytes();
+    let mut out = Vec::with_capacity(bytes.len());
+    let mut index = 0;
+    while index < bytes.len() {
+        if bytes[index] == b'%' && index + 2 < bytes.len() {
+            if let (Some(high), Some(low)) =
+                (hex_digit(bytes[index + 1]), hex_digit(bytes[index + 2]))
+            {
+                out.push(high * 16 + low);
+                index += 3;
+                continue;
+            }
+        }
+        out.push(bytes[index]);
+        index += 1;
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// First value of `key` in a raw query string (percent-decoded).
+fn query_param(query: &str, key: &str) -> Option<String> {
+    query.split('&').find_map(|pair| {
+        let (name, value) = pair.split_once('=')?;
+        (percent_decode(name) == key).then(|| percent_decode(value))
+    })
+}
+
+/// Normalizes a `?path=` value into a canonical virtual path: the
+/// leading `/` is guaranteed, `\` folds onto `/`, and [`RelPath`]
+/// validates the segments. `None` is segment pollution (`..`, `.`,
+/// empty segments) — 400 territory.
+fn normalize_list_path(raw: &str) -> Option<String> {
+    let folded = raw.replace('\\', "/");
+    let slashed = if folded.starts_with('/') {
+        folded
+    } else {
+        format!("/{folded}")
+    };
+    RelPath::new(&slashed)
+        .map(|rel| rel.as_str().to_string())
+        .ok()
+}
+
+/// `GET /api/list?path=/docs`: one directory's direct children as a
+/// flat array of `/api/files`-shaped entries (`updated_at DESC`, like
+/// `/api/files`) — the frontend assembles the tree. A missing or empty
+/// `path` is the root. Existence semantics: a directory with neither a
+/// row of its own nor any child 404s, while an existing-but-empty one
+/// answers 200 with `entries: []` (the root of a fully empty drive has
+/// neither, so it 404s under the same rule until anything exists).
+async fn api_list(State(state): State<AppState>, request: Request) -> Response {
+    let path = match query_param(request.uri().query().unwrap_or(""), "path") {
+        None => "/".to_string(),
+        Some(raw) => match normalize_list_path(&raw) {
+            Some(path) => path,
+            None => return error_json(StatusCode::BAD_REQUEST, "Invalid path"),
+        },
+    };
+    let db = state.vfs.db();
+    let mut entries = match db.list_dir(&path) {
+        Ok(entries) => entries,
+        Err(error) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    };
+    if entries.is_empty() && db.get_file(&path).ok().flatten().is_none() {
+        return error_json(StatusCode::NOT_FOUND, "Directory not found");
+    }
+    // `list_dir` orders directories-first/name-ascending; the route
+    // contract orders `updated_at DESC` like `/api/files`.
+    entries.sort_by(|a, b| {
+        b.updated_at
+            .unwrap_or_default()
+            .total_cmp(&a.updated_at.unwrap_or_default())
+    });
+    Json(serde_json::json!({
+        "path": path,
+        "entries": serde_json::Value::Array(entries.iter().map(file_row_json).collect()),
+    }))
+    .into_response()
+}
+
+/// `GET /api/queue`: the four upload-queue counters
+/// ([`Vfs::queue_stats`]) plus the DB pending-uploads tally
+/// (`get_stats().pending_uploads`).
+async fn api_queue(State(state): State<AppState>) -> Response {
+    let stats = state.vfs.queue_stats();
+    let pending = match state.vfs.db().get_stats() {
+        Ok(stats) => stats.pending_uploads,
+        Err(error) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    };
+    Json(serde_json::json!({
+        "enqueued": stats.enqueued,
+        "succeeded": stats.succeeded,
+        "degraded": stats.degraded,
+        "retries": stats.retries,
+        "pending": pending,
+    }))
+    .into_response()
 }
