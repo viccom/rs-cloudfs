@@ -24,8 +24,25 @@ cydrive-platform = { path = "../cydrive-platform" }
 cydrive-telegram = { path = "../cydrive-telegram" }
 cydrive-web = { path = "../cydrive-web" }
 cydrive-webdav = { path = "../cydrive-webdav" }
+# OS credential vault (M5). keyring 3.x has no default features: the
+# platform store must be picked per target below (the base dep keeps the
+# crate linkable everywhere; CyDrive's supported platforms all carry a
+# real store in the target sections).
+keyring = "3"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tracing = "0.1"
+
+# Platform credential stores: Windows Credential Manager, macOS Keychain,
+# and the DBus Secret Service on Linux (pure-Rust crypto; persistence
+# across reboots, unlike the session-scoped keyutils `linux-native`).
+[target.'cfg(windows)'.dependencies]
+keyring = { version = "3", features = ["windows-native"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+keyring = { version = "3", features = ["apple-native"] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
 tempfile = "3"

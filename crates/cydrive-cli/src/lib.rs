@@ -20,6 +20,7 @@
 //! (`src/main.rs`) injects a `GrammersTransport`; tests inject a
 //! `MockTransport` through the same seam, [`run_with_transport`].
 
+use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
 use std::path::Path;
 use std::sync::Arc;
@@ -28,12 +29,19 @@ use std::time::Duration;
 use anyhow::{Context, Result};
 use cydrive_core::cache::CacheManager;
 use cydrive_core::config::CyDriveConfig;
+use cydrive_core::credentials::{
+    CredentialStore, InMemoryStore, BOT_TOKEN, ENCRYPTION_PASSWORD, SERVICE,
+};
 use cydrive_core::database::MetaDatabase;
 use cydrive_core::inbound::{spawn_inbound_worker, InboundWorkerHandle};
 use cydrive_core::transport::CloudTransport;
 use cydrive_core::vfs::{Vfs, VfsConfig};
 use cydrive_web::WebUiServer;
 use cydrive_webdav::{CyDriveFs, WebDavServer};
+
+mod keyring_store;
+
+pub use keyring_store::KeyringStore;
 
 /// Bytes per GB — cache capacity conversion (`cache_limit_gb`).
 const BYTES_PER_GB: u64 = 1024 * 1024 * 1024;
@@ -287,23 +295,193 @@ pub fn resolve_unmount_letter(cfg: &CyDriveConfig, letter: Option<String>) -> St
 ///
 /// Discovery order: `./config.toml` (canonical) → `./config.json`
 /// (legacy Python format) → [`anyhow::Error`] with guidance naming both
-/// files. `CYDRIVE_*` environment overrides apply on top of whichever
-/// file won (precedence env > file > defaults).
+/// files. The M5 precedence chain applies on top of whichever file won:
+/// **`CYDRIVE_*` env > file > OS credential store** — the store
+/// backfills only secret fields the file left empty. The production OS
+/// store is [`KeyringStore`]; when it is unavailable this degrades to an
+/// empty [`InMemoryStore`] with a warning instead of refusing to start
+/// (the config file alone still carries everything needed).
 pub fn discover_config() -> Result<CyDriveConfig> {
+    let store: Box<dyn CredentialStore> = match KeyringStore::new() {
+        Ok(store) => Box::new(store),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "OS credential store unavailable; continuing without keyring backfill"
+            );
+            Box::new(InMemoryStore::new())
+        }
+    };
+    discover_config_with_store(store.as_ref())
+}
+
+/// [`discover_config`] with the credential store injected (tests pass an
+/// [`InMemoryStore`]; production passes a [`KeyringStore`]). The store
+/// leg only ever fills empty file values, then `CYDRIVE_*` environment
+/// overrides apply last, keeping env on top of everything.
+pub fn discover_config_with_store(store: &dyn CredentialStore) -> Result<CyDriveConfig> {
     let toml_path = Path::new("config.toml");
     if toml_path.exists() {
         let cfg = CyDriveConfig::load_toml(toml_path)
             .with_context(|| format!("loading {}", toml_path.display()))?;
-        return Ok(cfg.with_env_overrides());
+        return Ok(cfg.with_credential_backfill(store).with_env_overrides());
     }
     let legacy_path = Path::new("config.json");
     if legacy_path.exists() {
         let cfg = CyDriveConfig::load_legacy_json(legacy_path)
             .with_context(|| format!("loading legacy {}", legacy_path.display()))?;
-        return Ok(cfg.with_env_overrides());
+        return Ok(cfg.with_credential_backfill(store).with_env_overrides());
     }
     anyhow::bail!(
         "no config found in the current directory: write a config.toml (or a legacy \
          Python config.json) with bot_token and chat_id, then run cydrive again"
     )
+}
+
+/// The `migrate` subcommand body (M5): import a legacy Python
+/// installation into the Rust layout. Steps:
+///
+/// 1. pick the source — `./config.json` (legacy Python) wins over an
+///    existing `./config.toml`; neither → actionable error;
+/// 2. move the secrets into `store` (bot_token when non-empty;
+///    encryption_password when `enable_encryption` carries one) — a
+///    store failure aborts the migration, because silently keeping the
+///    secrets in plaintext would defeat the whole point;
+/// 3. adopt Python-default data artifacts found in the cwd
+///    (`cydrive_meta.db`, `Telegram_Cache`) by pointing the config at
+///    them — zero-copy, nothing is moved or rewritten;
+/// 4. write a scrubbed `config.toml`
+///    ([`CyDriveConfig::save_toml_scrubbed`]): secrets stay in the
+///    store, every other field round-trips unchanged;
+/// 5. verify the metadata DB opens and answers `get_stats` — a failure
+///    becomes a warning line in the report, never an abort.
+///
+/// Idempotent: re-running overwrites the store entries and rewrites the
+/// toml without complaining. The legacy `config.json` is **never**
+/// deleted (irreversible; the report tells the user to remove it
+/// manually), and Telegram sessions cannot be carried over — the first
+/// `run` asks for a one-time sign-in.
+///
+/// Returns the human-readable report (the CLI prints it verbatim; tests
+/// assert on it).
+pub fn run_migrate(store: &dyn CredentialStore) -> Result<String> {
+    let legacy_path = Path::new("config.json");
+    let toml_path = Path::new("config.toml");
+    let (mut cfg, used_legacy) = if legacy_path.exists() {
+        let cfg = CyDriveConfig::load_legacy_json(legacy_path)
+            .with_context(|| format!("loading legacy {}", legacy_path.display()))?;
+        (cfg, true)
+    } else if toml_path.exists() {
+        let cfg = CyDriveConfig::load_toml(toml_path)
+            .with_context(|| format!("loading {}", toml_path.display()))?;
+        (cfg, false)
+    } else {
+        anyhow::bail!(
+            "nothing to migrate: neither ./config.json (legacy Python) nor ./config.toml \
+             exists in the current directory; run cydrive migrate in the directory that \
+             holds your Python CyDrive installation (or write a config.toml first)"
+        )
+    };
+
+    // 2. Secrets into the store, before the scrubbed write forgets them.
+    let mut moved: Vec<&str> = Vec::new();
+    if !cfg.bot_token.is_empty() {
+        store
+            .set(BOT_TOKEN, &cfg.bot_token)
+            .context("storing bot_token in the OS credential store")?;
+        moved.push(BOT_TOKEN);
+    }
+    if cfg.enable_encryption && cfg.encryption_password.is_some() {
+        if let Some(password) = cfg.encryption_password.as_deref() {
+            store
+                .set(ENCRYPTION_PASSWORD, password)
+                .context("storing encryption_password in the OS credential store")?;
+        }
+        moved.push(ENCRYPTION_PASSWORD);
+    }
+
+    // 3. Zero-copy adoption of Python-default data artifacts in the cwd.
+    let adopted_db = Path::new("cydrive_meta.db").exists();
+    if adopted_db {
+        cfg.db_path = "./cydrive_meta.db".to_string();
+    }
+    let adopted_cache = Path::new("Telegram_Cache").exists();
+    if adopted_cache {
+        cfg.cache_path = "./Telegram_Cache".to_string();
+    }
+
+    // 4. Scrubbed canonical write.
+    cfg.save_toml_scrubbed(toml_path)
+        .context("writing the scrubbed config.toml")?;
+
+    // 5. Verify the DB when its file exists; failures only warn.
+    let mut db_line = if adopted_db {
+        format!(
+            "- metadata database: adopted {} from the Python installation",
+            cfg.db_path
+        )
+    } else {
+        format!(
+            "- metadata database: {} (kept from the source config)",
+            cfg.db_path
+        )
+    };
+    if Path::new(&cfg.db_path).exists() {
+        match MetaDatabase::open(Path::new(&cfg.db_path)).and_then(|db| db.get_stats()) {
+            Ok(stats) => db_line.push_str(&format!(
+                "; verified readable ({} files, {} bytes, {} pending uploads)",
+                stats.total_files, stats.total_bytes, stats.pending_uploads
+            )),
+            Err(error) => {
+                db_line.push_str(&format!("; WARNING: could not verify readability: {error}"))
+            }
+        }
+    } else {
+        db_line.push_str(" (no existing file; it will be created on first run)");
+    }
+
+    let mut report = String::new();
+    let _ = writeln!(report, "CyDrive migration report:");
+    if used_legacy {
+        let _ = writeln!(
+            report,
+            "- source: legacy config.json (kept in place — delete it yourself once the \
+             migration checks out)"
+        );
+    } else {
+        let _ = writeln!(
+            report,
+            "- source: config.toml (already canonical; re-scrubbed)"
+        );
+    }
+    if moved.is_empty() {
+        let _ = writeln!(
+            report,
+            "- credentials: none found in the source config; the OS store was left untouched"
+        );
+    } else {
+        let _ = writeln!(
+            report,
+            "- credentials moved to the OS credential store (service \"{SERVICE}\"): {}",
+            moved.join(", ")
+        );
+    }
+    let _ = writeln!(report, "{db_line}");
+    if adopted_cache {
+        let _ = writeln!(
+            report,
+            "- local cache: adopted ./Telegram_Cache from the Python installation"
+        );
+    }
+    let _ = writeln!(
+        report,
+        "- wrote config.toml (secrets scrubbed; they return automatically via the \
+         credential store at startup)"
+    );
+    let _ = writeln!(
+        report,
+        "- Telegram session files cannot be migrated; the first `cydrive run` will ask \
+         for a one-time sign-in"
+    );
+    Ok(report)
 }

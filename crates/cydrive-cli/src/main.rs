@@ -48,6 +48,11 @@ enum Command {
     /// Tune the WebClient registry (4 GB limit + Basic auth) and restart
     /// the service. Needs an elevated shell.
     FixReg,
+    /// Import a legacy Python installation: secrets into the OS
+    /// credential store, a scrubbed canonical `config.toml`, and
+    /// zero-copy adoption of any existing `cydrive_meta.db` /
+    /// `Telegram_Cache` in the working directory.
+    Migrate,
 }
 
 #[tokio::main]
@@ -58,6 +63,7 @@ async fn main() -> Result<()> {
         Command::Mount { url, letter } => mount_cmd(url, letter).await,
         Command::Unmount { letter } => unmount_cmd(letter).await,
         Command::FixReg => fix_reg_cmd().await,
+        Command::Migrate => migrate_cmd(),
     }
 }
 
@@ -88,6 +94,21 @@ async fn fix_reg_cmd() -> Result<()> {
     cydrive_platform::windows::optimize_webdav_registry()
         .context("tuning the WebClient registry")?;
     println!("WebClient registry tuned (4 GB limit, Basic auth) and restarted");
+    Ok(())
+}
+
+/// `cydrive migrate`: run the migration against the production OS
+/// credential store. Unlike config discovery, an unusable store is a
+/// hard error here — migrating secrets into a volatile in-memory
+/// fallback would report success while losing them.
+fn migrate_cmd() -> Result<()> {
+    let store = cydrive_cli::KeyringStore::new().context(
+        "the OS credential store is unavailable, so cydrive migrate cannot persist \
+         your secrets; bring the platform keyring up (Windows Credential Manager / \
+         macOS Keychain / Secret Service) and retry",
+    )?;
+    let report = cydrive_cli::run_migrate(&store).context("migration failed")?;
+    print!("{report}");
     Ok(())
 }
 

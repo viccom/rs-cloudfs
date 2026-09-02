@@ -10,6 +10,7 @@ pub mod bot;
 pub mod cache;
 pub mod chunker;
 pub mod config;
+pub mod credentials;
 pub mod crypto;
 pub mod database;
 pub mod inbound;

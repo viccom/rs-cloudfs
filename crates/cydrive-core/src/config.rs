@@ -26,6 +26,8 @@
 use std::fs;
 use std::path::Path;
 
+use crate::credentials::{CredentialStore, BOT_TOKEN, ENCRYPTION_PASSWORD, SERVICE};
+
 /// Errors produced while loading, saving or validating configuration.
 #[derive(Debug, thiserror::Error)]
 pub enum ConfigError {
@@ -238,11 +240,45 @@ impl CyDriveConfig {
     /// parent directories (Python `save()` `os.makedirs(dirname, ...)`
     /// parity). Unlike the Python `save`, this does **not** create the
     /// `storage_path`/`cache_path` working directories.
+    ///
+    /// Secrets are written as-is; use [`CyDriveConfig::save_toml_scrubbed`]
+    /// for the credential-vault flow (M5) that keeps them out of the file.
     pub fn save_toml(&self, path: &Path) -> Result<(), ConfigError> {
         let text = toml::to_string_pretty(self).map_err(|err| ConfigError::Parse {
             path: path_as_str(path),
             message: err.to_string(),
         })?;
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent)?;
+        }
+        fs::write(path, text)?;
+        Ok(())
+    }
+
+    /// Serializes `self` with the two secret fields scrubbed and writes it
+    /// to `path`: `bot_token` becomes an empty string, the optional
+    /// `encryption_password` is omitted entirely, and a header comment
+    /// points readers at the OS credential store (keyring service
+    /// `"cydrive"`); the secrets re-enter the config at load time via
+    /// [`CyDriveConfig::with_credential_backfill`].
+    ///
+    /// This is the write side of the credential vault (M5): on-disk config
+    /// files stay non-sensitive while `enable_encryption` and every other
+    /// field round-trip unchanged. Directory creation matches
+    /// [`CyDriveConfig::save_toml`].
+    pub fn save_toml_scrubbed(&self, path: &Path) -> Result<(), ConfigError> {
+        let mut scrubbed = self.clone();
+        scrubbed.bot_token = String::new();
+        scrubbed.encryption_password = None;
+        let body = toml::to_string_pretty(&scrubbed).map_err(|err| ConfigError::Parse {
+            path: path_as_str(path),
+            message: err.to_string(),
+        })?;
+        let text = format!(
+            "# Secrets live in the OS credential manager (keyring service \"{SERVICE}\"), \
+             not in this file:\n# the bot token and the encryption password are \
+             intentionally empty here and return via the credential store.\n{body}"
+        );
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
@@ -335,6 +371,47 @@ impl CyDriveConfig {
         }
         if let Some(value) = env_string("CYDRIVE_ENABLE_ENCRYPTION") {
             config.enable_encryption = value == "1" || value == "true";
+        }
+        config
+    }
+
+    /// Returns a copy with the two secret fields backfilled from `store`
+    /// — but only where the file left them empty or absent. Consumes
+    /// `self`.
+    ///
+    /// This is the "file > store" leg of the M5 precedence chain
+    /// **env > file > OS credential store** (the CLI applies it as
+    /// `load → backfill → env-overrides`, so a `CYDRIVE_*` variable still
+    /// outranks everything). A non-empty file value is never overwritten.
+    ///
+    /// Store failures degrade to a warning and keep the file value: a
+    /// missing or locked credential vault must not refuse CyDrive from
+    /// starting.
+    pub fn with_credential_backfill(self, store: &dyn CredentialStore) -> Self {
+        let mut config = self;
+        if config.bot_token.is_empty() {
+            match store.get(BOT_TOKEN) {
+                Ok(Some(token)) => config.bot_token = token,
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    %error, key = BOT_TOKEN,
+                    "credential backfill failed; keeping the empty file value"
+                ),
+            }
+        }
+        if config
+            .encryption_password
+            .as_deref()
+            .is_none_or(str::is_empty)
+        {
+            match store.get(ENCRYPTION_PASSWORD) {
+                Ok(Some(password)) => config.encryption_password = Some(password),
+                Ok(None) => {}
+                Err(error) => tracing::warn!(
+                    %error, key = ENCRYPTION_PASSWORD,
+                    "credential backfill failed; keeping the file value"
+                ),
+            }
         }
         config
     }
