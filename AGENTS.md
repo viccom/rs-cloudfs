@@ -35,12 +35,22 @@ M2 剩余（让位于垂直切片，可用优先，见下）：入站 stream_upd
 - **M4 增量路由已完成（95ffaf9，7 新测试，工作区 250 全绿）**：`/api/list?path=`（归一 + 空目录 200/不存在 404/非法 400 语义固化；**空盘根 404 是规则直接后果**已注释）、`/api/download` 标准 HTTP 单区间 Range（206 精确切片+Content-Range、a≥size 416、畸形/多区间宽容回 200——aiohttp 基线能力）、`/api/queue`（四计数器+pending）。实现注：axum 无 query feature，手写 ~30 行 query 解析（`+` 不解空格——路径组件语义，注释声明）。
 - **M5-1 已完成（f32fc2c，9 新测试，工作区 259 全绿）**：凭据保管 + migrate——core `credentials.rs`（CredentialStore trait + InMemoryStore + SERVICE/USER 常量）、cli `keyring_store.rs`（**keyring 3.6.3**，平台 target features：windows-native/apple-native/sync-secret-service+crypto-rust；可用性=只读探测；docs 4.x API 不可用已按实查调整）、配置优先级 **env > 文件 > keyring**（`with_credential_backfill` 仅空值回填；discover 无凭据库降级 InMemory+warn，**migrate 硬失败**——秘密迁进易失内存比失败更危险）、`save_toml_scrubbed` 脱敏写入、`migrate` 子命令（json 优先源→凭据入 store→脱敏 toml→db/缓存零拷贝采用（Python 默认名检测）→DB 计数报告→json 不自动删→session 重登说明；幂等）。`#[ignore]` 新增 keyring 真机往返（未手动执行过）。
 - **M5-2 已完成（04b9f58，13 新测试，工作区 272 全绿）= M5 收官**：`doctor`（DoctorContext 注入式检查聚合：config/db/cache/双端口 bind 语义 Ok/Warn，端口占用=Warn 非 Fail；platform_checks：注册表只读对照（`read_webclient_params`+纯评估三态）+WebClient 运行态 + **telegram 连通恒 Warn 指引 run**——离线不拨号，诚实边界）；`stats`（comfy-table 8.0，含人类可读容量）；`setup`（dialoguer 0.12 交互薄层 + 纯逻辑全测：token 循环校验/apply/persist 脱敏入 store/roundtrip discover）。自定裁定已注明：无冒号 token 直接重问（Python 是 confirm 可保留）；db/cache 不存在=Warn（新装语义）。子命令全集：run/mount/unmount/fix-reg/migrate/stats/doctor/setup（对齐 Python + migrate/doctor 增量）。
-- **回补队列（下一步，最后一个里程碑）**：M6 性能/发布——release build 首验（rust-embed 编译期嵌入验证 + release 二进制冒烟）、vendor LICENSE 补文本、cargo-deny（deny.toml + 跑通）、CI（GitHub Actions windows/linux 矩阵）、cargo-dist 配置。M6 验收：PROPFIND 10 万条 <100ms（性能基准，criterion 可选）与 2GB 上传吞吐对照需真机；自动可做部分=发布管线与门禁设施。
+- **M6 自动可做部分已完成（5a40192）= 全队列（M1–M6 自动化项）交付完毕（2026-09-02）**：vendor LICENSE-MIT/APACHE 自上游 Codeberg（Lonami/grammers）取回入库；cargo-deny v0.20.2 安装并跑通 licenses/sources/bans（**零 GPL**，唯一 MPL-2.0=htmlescape 已注释；advisories 因本机 github.com 不通诚实降级，留 CI 首跑）；`cargo build --release` 首验（**13.1MB** vs debug 20.6MB，空目录自包含 `--version/--help/doctor` 通过，**rust-embed 编译期嵌入经二进制取证证实**——CSS 字节特征在 release 二进制内）；`.github/workflows/ci.yml`（win+linux 矩阵三步门禁，未 push 待人工激活）；cargo-dist 0.32.0 `[workspace.metadata.dist]` 配置（实跑留发布时刻）；`perf_read_path` 基准（10 万行真实 SQLite，list_dir("/") 0.32ms / 1000 行目录 2.7ms，**余量 34–300×**，#[ignore] 按需跑；XML 序列化层未计，注明）。工作区 272 测试零回归。
+- **剩余全部为人工项**（真机/凭据/网络）：见 decisions.md 与下「待人工总清单」。
 M2 已完成第二单元（34e2476 红 + 356009c 绿，10 测试）：纯适配逻辑——`plan.rs`（`plan_chunk_sends`：单/多块发送计划，name/caption/byte_len 全走契约模块，纯函数不触盘）、`stream.rs`（`serve_range`：RangeStream 状态机，head-skip/take 裁剪、迭代器耗尽不报错，coerce 到 ByteStream；为此 crate 直接依赖 bytes/futures-core，版本同 cydrive-core）、`config.rs`（`DEFAULT_API_ID=6`/`DEFAULT_API_HASH="eb06d4abfb49dc3eeb1aeb98ae0f581e"`/`DEFAULT_SESSION_STEM="cynet_bot_session"` 契约常量 + `TransportConfig`）。grammers 接入与 transport 壳是下一步（编译验证的 wiring，纯逻辑已全部就绪）。
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 全部 272 测试（core 167 + telegram 29 + webdav 30 + web 16 + cli 40 + platform 9；另有 3 个 #[ignore] 真机项）
+cargo test --workspace --no-fail-fast            # 全部 272 测试（core 167+1ignored基准 + telegram 29 + webdav 30 + web 16 + cli 40 + platform 9；另有 3 个 #[ignore] 真机项）
+
+## 待人工总清单（自动交付完成后剩余项）
+1. **真机 bot token 冒烟**：config（setup/migrate 产物）→ `cydrive run` → Explorer Y: 盘拖入/下载/播放；三档文件（100MB/2GB/3GB 分块）+ FloodWait 实测
+2. **Bot 命令实测**：/stats /search /get（含加密文件）；手机发文件 → 盘内出现（入站映射 NOTE(real-machine) 待验）
+3. **Explorer 挂盘全清单 + litmus 套件**（litmus 工具未装，可后续自动化补）
+4. **#[ignore] 真机测试 ×3**：mount/unmount 往返、注册表调优、keyring 往返（管理员）
+5. **push 激活 CI**（本地三步门禁已等效预验）；cargo deny advisories（需 github.com 连通）；cargo-dist 实跑（发布时刻）
+6. **性能真机对照**：PROPFIND XML 层与 2GB 吞吐（离线 DB 层基准已 0.32/2.7ms）
+7. 可选后续：rs-CyDrive README 刷新（M0 时代内容已过时）、分支合并策略（feat/m2-telegram 含全部工作，main 落后）
 cargo clippy -p cydrive-core --all-targets -- -D warnings
 cargo fmt --all -- --check
 python scripts/gen_compat_fixtures.py       # 重新生成互操作 fixture（需能 import E:\GitHub\CyDrive）
