@@ -31,3 +31,22 @@ all = { level = "warn", priority = -1 }
 # See crates/vendor/grammers-session/VENDOR.md.
 [patch.crates-io]
 grammers-session = { path = "crates/vendor/grammers-session" }
+
+# cargo-dist release-packaging config (M6). Latest cargo-dist at config
+# time: 0.32.0 (2026-05-21). To cut a release, run on a machine with
+# network access:
+#   cargo install cargo-dist --locked --version 0.32.0
+#   cargo dist plan     # dry-run sanity check
+#   cargo dist build    # local artifact build
+#   cargo dist manifest # inspect the resolved configuration
+# NOTE: not executed in this environment (tool not installed); this
+# config is committed ahead of the first real release. `ci = false`
+# keeps cargo-dist from generating its own GitHub workflows — CI gates
+# live in .github/workflows/ci.yml and releases are cut manually.
+[workspace.metadata.dist]
+version = "0.32.0"
+ci = false
+targets = [
+    "x86_64-unknown-linux-gnu",
+    "x86_64-pc-windows-msvc",
+]

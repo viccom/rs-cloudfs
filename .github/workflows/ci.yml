@@ -1,0 +1,49 @@
+# CyDrive CI (M6). Quality gates for every push/PR on both supported
+# desktop platforms: fmt, clippy (deny warnings), full test suite.
+#
+# NOTE (honesty): this workflow has NOT been triggered yet — it was
+# committed from a dev environment with no push access. Expect
+# first-run calibration. In particular:
+#   - Linux system deps: none are expected to be needed. SQLite is
+#     compiled from source by rusqlite's "bundled" feature (needs only a
+#     C toolchain, preinstalled on ubuntu-latest), and keyring's
+#     sync-secret-service backend talks D-Bus through zbus, a pure-Rust
+#     client (no libdbus). If the first Linux run fails on a missing
+#     system library, add the apt-get step here and record the lesson.
+#   - Windows: MSVC toolchain is preinstalled on windows-latest.
+
+name: CI
+
+on: [push, pull_request]
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  check:
+    name: fmt + clippy + test (${{ matrix.os }})
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [windows-latest, ubuntu-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Matches rust-toolchain.toml (channel = "stable").
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      # Cache cargo registry + target dir across runs; keys off the
+      # lockfile automatically.
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo fmt --check
+        run: cargo fmt --all --check
+
+      - name: cargo clippy
+        run: cargo clippy --workspace --all-targets -- -D warnings
+
+      - name: cargo test
+        run: cargo test --workspace

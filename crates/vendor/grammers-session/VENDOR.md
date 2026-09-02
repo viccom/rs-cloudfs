@@ -9,6 +9,11 @@
 - The crates.io package contains no `LICENSE*` files; the license texts
   live in the upstream repository. The `license = "MIT OR Apache-2.0"`
   field in `Cargo.toml` is preserved from upstream.
+  **Supplied 2026-09-02 (M6):** `LICENSE-MIT` and `LICENSE-APACHE` were
+  fetched verbatim from `https://codeberg.org/Lonami/grammers`
+  (`/raw/branch/master/LICENSE-MIT`, `/raw/branch/master/LICENSE-APACHE`,
+  both HTTP 200) and now live in this directory, so the dual-license
+  texts ship with the vendored copy instead of only upstream.
 - Removed during vendoring (registry packaging artifacts / network-dependent
   tests, not part of the upstream source tree):
   `tests/`, `.cargo_vcs_info.json`, `.cargo-ok`, `Cargo.lock`,

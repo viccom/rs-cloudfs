@@ -65,3 +65,10 @@
 
 - **裁决**：按 **Python 整文件加密语义**实现上传加密（明文→整文件 v1 格式加密→密文再分块上传），保双向兼容（Rust 写的加密文件 Python 可解、Python 写的 Rust 可解——hydrate 已然，上传侧补齐对称）；设计文档「每 .part 独立加密」的流式改进**列为 v2**（记录为后续可选，需格式版本协商，不进当前里程碑）。
 - **语义细节（镜像 telegram_client.py:170-186）**：加密条件 = enable_encryption **且** password 同时成立（CLI 映射须补 AND）；sha256 对**明文**计算（≤100MB）；DB 行 size=明文大小、chunk_count=密文块数、is_encrypted=true；chunk 行 size=密文块大小；caption/命名照常（与内容无关）；加密临时文件成功失败均清理；明文缓存副本仍仅成功后删（保持既有修复，不回退 Python 无条件删缺陷）。
+
+## 2026-09-02 M6 发布管线自动化执行降级记录（诚实留痕）
+
+- **cargo-deny advisories 未本地运行**：本机 github.com 443 完全不可达（Codeberg 可达），RustSec advisory-db 克隆两次失败（Connection reset / 连接超时）。licenses / sources / bans 三项在 Windows host 与 x86_64-unknown-linux-gnu 双 target 下全部通过（GPL 家族零出现；唯一 MPL-2.0 = htmlescape@0.3.1，经 keyring，文件级弱 copyleft 可二进制分发）。advisories 首跑留待 CI 或有网环境；deny.toml 的 advisories v2 配置已就位。
+- **CI 工作流已写未触发**：`.github/workflows/ci.yml`（win+ubuntu 矩阵，fmt/clippy -D warnings/test）按红线未 push，激活待人工。本地以相同三步门禁全绿（272 passed / 0 failed）等效预验；Linux 侧 apt 依赖按分析预计为零（rusqlite bundled 自带 C 编译即可、keyring 走 zbus 纯 Rust），首跑校准点已注释标注。
+- **cargo-dist 配置提交未实跑**：`[workspace.metadata.dist]`（v0.32.0，2026-05-21 最新，ci=false 手动发布模式）；工具未安装，plan/build 留给发布时刻。
+- **vendor LICENSE 补齐**：grammers-session 的 LICENSE-MIT/LICENSE-APACHE 从 Codeberg 上游 raw（HTTP 200）原样取回入库，VENDOR.md 状态已同步。
