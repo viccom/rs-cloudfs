@@ -7,7 +7,10 @@
 //! retries the whole upload, every other failure backs off exponentially
 //! and degrades after `max_attempts` consecutive tries, and the local
 //! cache copy is deleted only after a successful upload (fixing the
-//! Python unconditional-delete bug).
+//! Python unconditional-delete bug). Successful uploads additionally
+//! store the plaintext sha256 for files at or below [`SHA256_MAX_BYTES`]
+//! (Python baseline `telegram_client.py:160`), computed after remote
+//! success and before the local copy is deleted.
 //!
 //! Layout: the handle fronts one [`QueueInner`] (sender slot, worker
 //! join handles, atomic counters, config); worker tasks share the single
@@ -31,6 +34,20 @@ use crate::transport::{CloudTransport, TransportError, UploadJob, UploadReceipt}
 /// File size above which uploads split into `.partNNN` chunks; 1900 MB
 /// keeps every message under Telegram's 2 GB per-message cap (contract 5).
 pub const DEFAULT_CHUNK_SIZE_MB: u64 = 1900;
+
+/// Uploads at or below this size get a sha256 digest stored in their row;
+/// larger ones store None. Frozen by the Python baseline
+/// (`telegram_client.py:160`: `file_size <= 100 * 1024 * 1024`), which in
+/// turn feeds the sha-based WebDAV ETag (contract 6).
+pub const SHA256_MAX_BYTES: u64 = 100 * 1024 * 1024;
+
+/// Pure size gate for the sha256 side-computation on the upload success
+/// path (boundary-exact: `SHA256_MAX_BYTES` itself hashes, one byte over
+/// skips; 0 hashes — the Python baseline computes the empty digest).
+#[inline]
+pub fn should_hash(size: u64) -> bool {
+    size <= SHA256_MAX_BYTES
+}
 
 /// Backoff and degradation knobs for non-FloodWait upload failures.
 #[derive(Debug, Clone)]
@@ -333,7 +350,10 @@ async fn process_job(
 
     // Contract 6: 0-byte uploads never touch the remote.
     if job.size == 0 {
-        match persist_zero_byte(db, &row) {
+        // Python baseline: 0 bytes <= the cap, so the (empty) digest is
+        // computed too — sha256 of nothing is a well-defined value.
+        let sha256 = hash_after_upload(&job, 0);
+        match persist_zero_byte(db, &row, sha256) {
             Ok(()) => {
                 delete_local_copy(&job.local_path);
                 bump(&stats.succeeded);
@@ -354,7 +374,12 @@ async fn process_job(
     loop {
         match transport.upload(&job).await {
             Ok(receipt) => {
-                match persist_success(db, &row, &job, &receipt) {
+                // Python baseline: files <= 100 MB carry a sha256 in their
+                // row (sha-ETag, contract 6). Computed after remote
+                // success but before the local copy is deleted, so a hash
+                // failure never fails an upload that already made it.
+                let sha256 = hash_after_upload(&job, receipt.uploaded_bytes);
+                match persist_success(db, &row, &job, &receipt, sha256) {
                     Ok(()) => {
                         delete_local_copy(&job.local_path);
                         bump(&stats.succeeded);
@@ -416,13 +441,41 @@ async fn process_job(
     }
 }
 
+/// Computes the row's sha256 from the still-present local copy after a
+/// successful upload (Python baseline, `telegram_client.py:160`): sizes at
+/// or below [`SHA256_MAX_BYTES`] get the plaintext digest, larger ones
+/// None. The plaintext is hashed, not any encrypted staging file. A hash
+/// failure only warns and stores None — the remote upload already
+/// succeeded, the digest is bonus metadata and must not fail the job.
+fn hash_after_upload(job: &UploadJob, uploaded_bytes: u64) -> Option<String> {
+    if !should_hash(uploaded_bytes) {
+        return None;
+    }
+    match crate::chunker::sha256_file(&job.local_path) {
+        Ok(hex) => Some(hex),
+        Err(error) => {
+            tracing::warn!(
+                rel_path = %job.rel_path,
+                path = %job.local_path.display(),
+                %error,
+                "sha256 computation failed after a successful upload; storing None"
+            );
+            None
+        }
+    }
+}
+
 /// Builds the upsert flipping `row` to the uploaded state, keeping every
-/// row field the queue does not own (name/mtime/sha256/encryption/mime).
+/// row field the queue does not own (name/mtime/encryption/mime); sha256
+/// is the success path's own product — the freshly computed digest (None
+/// for oversized files or a failed computation; the DB layer then
+/// coalesces to any pre-existing value).
 fn uploaded_upsert(
     row: &FileRecord,
     size: i64,
     telegram_msg_id: Option<i64>,
     chunk_count: i64,
+    sha256: Option<String>,
 ) -> FileUpsert {
     FileUpsert {
         rel_path: row.rel_path.clone(),
@@ -430,7 +483,7 @@ fn uploaded_upsert(
         parent_dir: row.parent_dir.clone(),
         size,
         mtime: row.mtime,
-        sha256: row.sha256.clone(),
+        sha256,
         is_dir: row.is_dir,
         telegram_msg_id,
         is_uploaded: true,
@@ -443,8 +496,18 @@ fn uploaded_upsert(
 
 /// Success persistence for the 0-byte fast path: no receipt exists, so
 /// the row keeps its own size/chunk_count and gains no msg id.
-fn persist_zero_byte(db: &MetaDatabase, row: &FileRecord) -> Result<(), QueueError> {
-    db.upsert_file(&uploaded_upsert(row, row.size, None, row.chunk_count))?;
+fn persist_zero_byte(
+    db: &MetaDatabase,
+    row: &FileRecord,
+    sha256: Option<String>,
+) -> Result<(), QueueError> {
+    db.upsert_file(&uploaded_upsert(
+        row,
+        row.size,
+        None,
+        row.chunk_count,
+        sha256,
+    ))?;
     Ok(())
 }
 
@@ -456,6 +519,7 @@ fn persist_success(
     row: &FileRecord,
     job: &UploadJob,
     receipt: &UploadReceipt,
+    sha256: Option<String>,
 ) -> Result<(), QueueError> {
     let chunk_count = receipt.chunk_msg_ids.len() as i64;
     let file_id = db.upsert_file(&uploaded_upsert(
@@ -463,6 +527,7 @@ fn persist_success(
         receipt.uploaded_bytes as i64,
         Some(i64::from(receipt.first_msg_id)),
         chunk_count,
+        sha256,
     ))?;
     for (index, &msg_id) in receipt.chunk_msg_ids.iter().enumerate() {
         let index = index as i64;
@@ -508,7 +573,10 @@ fn delete_local_copy(local_path: &Path) {
 ///    - `Ok(receipt)` → persist `is_uploaded = true`, `telegram_msg_id =
 ///      Some(first)`, `chunk_count` and the per-chunk rows from the
 ///      receipt (last chunk = `uploaded_bytes - (n-1) * chunk_size`),
-///      `size = uploaded_bytes`; delete the local file; count succeeded.
+///      `size = uploaded_bytes`, `sha256` = the freshly computed
+///      plaintext digest when `should_hash(uploaded_bytes)` (None for
+///      oversized files or a failed hash — warn only, never an upload
+///      failure); delete the local file; count succeeded.
 ///    - `Err(FloodWait { s })` → sleep `s` (0 sleeps nothing), count
 ///      retries, retry the whole upload (never counts toward
 ///      degradation).

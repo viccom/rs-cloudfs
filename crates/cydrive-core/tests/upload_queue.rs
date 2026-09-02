@@ -551,3 +551,63 @@ async fn requeue_pending_skips_missing_local_and_uploads_rest() {
         "already-uploaded row untouched"
     );
 }
+
+/// 14. Small-file success (13 B <= the 100 MB cap): the success upsert
+///     stores the sha256 of the local plaintext, computed after remote
+///     success but before the cache copy is deleted — the Python
+///     baseline behavior that makes the sha-based ETag (contract 6)
+///     reachable for fresh uploads. The expected digest is recomputed
+///     from the seeded file with the same `chunker::sha256_file`
+///     (known plaintext through the tool, not a hardcoded hex).
+#[tokio::test]
+async fn success_computes_sha256_for_small_files() {
+    let (_dir, db, cache, mock) = test_env().await;
+    let local = seed_pending(&db, &cache, "/docs/hashed.bin", b"hello cydrive", 1);
+    let expected_sha =
+        cydrive_core::chunker::sha256_file(&local).expect("hash the seeded plaintext");
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let handle = spawn_queue(db.clone(), transport, test_cfg(64));
+
+    handle
+        .enqueue(job_for(&cache, "/docs/hashed.bin", 13, 1, 64))
+        .await
+        .expect("enqueue");
+    handle.shutdown().await;
+
+    let row = db
+        .get_file("/docs/hashed.bin")
+        .expect("db read")
+        .expect("row exists");
+    assert_eq!(
+        row.sha256,
+        Some(expected_sha),
+        "13-byte upload stores the plaintext sha256 in its row"
+    );
+}
+
+/// 15. Oversized files skip the sha256 side-computation: the size gate is
+///     the pure `should_hash`, tested at its boundaries (exactly 100 MB
+///     hashes, 100 MB + 1 skips, 0 hashes — the Python baseline computes
+///     the empty digest for 0-byte files). A full >100 MB upload is not
+///     faked with a giant fixture; the gate's use on the success path is
+///     covered by test 14 plus code review.
+#[test]
+fn oversized_files_skip_sha256() {
+    use cydrive_core::upload_queue::{should_hash, SHA256_MAX_BYTES};
+
+    assert_eq!(
+        SHA256_MAX_BYTES,
+        100 * 1024 * 1024,
+        "frozen Python baseline cap (telegram_client.py:160)"
+    );
+    assert!(should_hash(SHA256_MAX_BYTES), "exactly at the cap hashes");
+    assert!(
+        !should_hash(SHA256_MAX_BYTES + 1),
+        "one byte over the cap skips"
+    );
+    assert!(should_hash(0), "0-byte files hash (empty digest)");
+    assert!(
+        !should_hash(u64::MAX),
+        "no overflow surprise far over the cap"
+    );
+}
