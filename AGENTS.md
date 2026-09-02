@@ -3,6 +3,7 @@
 ## 项目信息
 - 项目：CyDrive 的 Rust 完全重写（Telegram 无限云盘：本地 WebDAV 服务挂载 Windows `Y:` 盘 + Web 仪表盘 :8088 + Bot 命令）
 - 技术栈：Rust（edition 2024）/ tokio / grammers（MTProto）/ dav-server（WebDAV）/ axum / rusqlite
+- **北极星（负责人 2026-09-02 裁决）**：「一个稳定好用的程序」——方向性取舍偏保守/稳定，总则见 docs/decisions.md
 - **权威设计文档：`docs/rust-rewrite-design.md`**——crate 划分、选型依据、已核实的 API 面、里程碑与验收标准都在其中，动工前必读
 - 行为基线与兼容契约：见 `E:\GitHub\CyDrive`（Python 版）根目录 `AGENTS.md` 的「契约」节——DB schema、加密格式、分块命名/caption、端口、注册表行为，破坏即与现有用户数据不兼容
 
@@ -15,13 +16,14 @@
 - 语义裁决与延后项见 decisions.md 2026-09-02 三条（FloodWait 不降级/持久化失败不重传/upload_failed 列延后到迁移单元）
 
 **M2 进行中**（分支 `feat/m2-telegram`，自 feat/m1-core 切出）：新 crate `cydrive-telegram`。已完成首单元（3f878e2 红 + 9607457 绿，15 测试）：纯契约模块——`caption.rs`（单文件/多块 caption **Python 逐字快照**：Path:/File:/Part: 标签、KB 整除、加密后缀；`clean_rel_path` 按基线求值顺序（先 strip '/' 后替换 '\'，反斜杠输入产出 `//a/b` 是基线真实行为）；`part_document_name` 复用 core `chunker::part_name`）、`flood.rs`（`parse_flood_wait`：FLOOD_WAIT_N 秒数解析、裸 FLOOD_WAIT=0、其余 None）、`range.rs`（`range_plan`：skip/head/take 换算 + chunk_size 4096 整倍数且 4096..=512KB 校验）。
-M2 已完成第三单元（70617a9，编译验证 wiring，无新测试）：`src/transport.rs`——`GrammersTransport` 实现 `CloudTransport`：connect（`SenderPool::new`+`tokio::spawn(pool.runner.run())` 驱动、`bot_sign_in`、chat 解析 `PeerId::from_bot_api_dialog_id`）、upload（`plan_chunk_sends` → 每块 `File::seek+take` 流式切片 → `upload_stream` → `send_message` 带 caption/document → UploadReceipt；加密 TODO(M2 encryption)）、open（逐 part 全量拉取 + serve_range；已知限制：整文件内存缓冲，M3 走 VFS 水合）、open_range（**part 边界从远端 document size 现场推导**——RemoteHandle 不带 chunk 计划；每相交 part `range_plan`+`chunk_size/skip_chunks`+`serve_range`）、delete_remote（0 删→NotFound）、错误映射（RpcError{name,value} 重构后走 `parse_flood_wait`；Dropped→Disconnected；client 内建 AutoSleep 与 Python FloodWait 语义对齐）；`incoming()` 为 todo!()（留给入站单元）。依赖 `grammers-client = "=0.10.0"` + `grammers-session = "=0.10.0"`（crates.io 精确锁替代 git-rev；0.10 实际 API 面与设计文档补遗差异 + **session 持久化被 libsql-ffi/rusqlite(bundled) MSVC 链接冲突阻塞、MemorySession 过渡**——fork/推上游/接受重登三选一待项目负责人裁决，均见 decisions.md 2026-09-02（grammers/session）两条）。
-M2 剩余：入站 stream_updates 索引 + Bot 命令（含补齐 /get，`pool.updates` receiver 须构造期消费，transport.rs 有 NOTE(inbound) 锚点）→ 加密上传路径（TODO(M2 encryption)）→ session 持久化裁决落地 → 真机三档 smoke（100MB/2GB/3GB）+ FloodWait 注入「待人工」。**grammers 0.10 API 以 `src/transport.rs` 实现为权威**，设计文档补遗节待回填。
+M2 已完成第三单元（70617a9，编译验证 wiring，无新测试）：`src/transport.rs`——`GrammersTransport` 实现 `CloudTransport`：connect（`SenderPool::new`+`tokio::spawn(pool.runner.run())` 驱动、`bot_sign_in`、chat 解析 `PeerId::from_bot_api_dialog_id`）、upload（`plan_chunk_sends` → 每块 `File::seek+take` 流式切片 → `upload_stream` → `send_message` 带 caption/document → UploadReceipt；加密 TODO(M2 encryption)）、open（逐 part 全量拉取 + serve_range；已知限制：整文件内存缓冲，M3 走 VFS 水合）、open_range（**part 边界从远端 document size 现场推导**——RemoteHandle 不带 chunk 计划；每相交 part `range_plan`+`chunk_size/skip_chunks`+`serve_range`）、delete_remote（0 删→NotFound）、错误映射（RpcError{name,value} 重构后走 `parse_flood_wait`；Dropped→Disconnected；client 内建 AutoSleep 与 Python FloodWait 语义对齐）；`incoming()` 为 todo!()（留给入站单元）。依赖 `grammers-client = "=0.10.0"` + `grammers-session = "=0.10.0"`（crates.io 精确锁替代 git-rev；0.10 实际 API 面与设计文档补遗差异 + **session 持久化已裁决落地（见第四单元）**）。
+M2 已完成第四单元（48f41ab 文档 + 4d1c771 实现，4 新测试）：**session 持久化**——in-tree vendor `crates/vendor/grammers-session`（上游 0.10.0 拷贝，仅 SqliteSession 的 libsql→rusqlite(bundled) 移植，write-through/表结构逐字保留；VENDOR.md 记来源与 re-vendor 指引）+ 根 `[patch.crates-io]` 重定向（`cargo tree -i` 证实全图单一份，MSVC LNK2005 消除）+ transport 接线 `SqliteSession::open(cfg.session_path)`（契约 3 `cynet_bot_session` 文件落地、重启免登录）。vendor 为 **workspace exclude 的外部 path dep**（cap-lints allow，fmt/clippy 门禁不覆盖上游代码）。⚠ M6 发布前需为 vendor 补上游 LICENSE 文本（crates.io 包不含，VENDOR.md 已注明来源）。
+M2 剩余：入站 stream_updates 索引 + Bot 命令（含补齐 /get，`pool.updates` receiver 须构造期消费，transport.rs 有 NOTE(inbound) 锚点）→ 加密上传路径（TODO(M2 encryption)）→ 真机三档 smoke（100MB/2GB/3GB）+ FloodWait 注入「待人工」。**grammers 0.10 API 以 `src/transport.rs` 实现为权威**，设计文档补遗节待回填。
 M2 已完成第二单元（34e2476 红 + 356009c 绿，10 测试）：纯适配逻辑——`plan.rs`（`plan_chunk_sends`：单/多块发送计划，name/caption/byte_len 全走契约模块，纯函数不触盘）、`stream.rs`（`serve_range`：RangeStream 状态机，head-skip/take 裁剪、迭代器耗尽不报错，coerce 到 ByteStream；为此 crate 直接依赖 bytes/futures-core，版本同 cydrive-core）、`config.rs`（`DEFAULT_API_ID=6`/`DEFAULT_API_HASH="eb06d4abfb49dc3eeb1aeb98ae0f581e"`/`DEFAULT_SESSION_STEM="cynet_bot_session"` 契约常量 + `TransportConfig`）。grammers 接入与 transport 壳是下一步（编译验证的 wiring，纯逻辑已全部就绪）。
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 全部 155 测试（core 130 + telegram 25）
+cargo test --workspace --no-fail-fast            # 全部 159 测试（core 130 + telegram 29）
 cargo clippy -p cydrive-core --all-targets -- -D warnings
 cargo fmt --all -- --check
 python scripts/gen_compat_fixtures.py       # 重新生成互操作 fixture（需能 import E:\GitHub\CyDrive）
