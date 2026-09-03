@@ -594,12 +594,30 @@ impl Vfs {
         Ok(())
     }
 
-    /// Empties the cache tree (the root itself survives) and clears the
-    /// `is_cached` flag on every file row, returning the number of flags
-    /// cleared. Uploaded payloads stay in Telegram — this is a local disk
-    /// operation only; I/O failures surface as [`VfsError::Io`].
+    /// Empties the cache of **uploaded** files (the root itself survives)
+    /// and clears the `is_cached` flag on those rows only, returning the
+    /// number of flags cleared. Pending uploads (`is_uploaded = 0`) keep
+    /// both their local cache copy — for them it is the only copy of the
+    /// bytes — and their flag (plan revision A1). Uploaded payloads stay
+    /// in Telegram — this is a local disk operation only; I/O failures
+    /// surface as [`VfsError::Io`].
     pub fn cache_clear(&self) -> Result<u64, VfsError> {
-        self.cache.clear_all()?;
+        let pending = self.db.pending_file_paths()?;
+        let keep: Vec<RelPath> = pending
+            .iter()
+            .filter_map(|path| match RelPath::new(path) {
+                Ok(rel) => Some(rel),
+                Err(error) => {
+                    tracing::warn!(
+                        %path,
+                        %error,
+                        "pending path failed to parse; cache clear cannot preserve its copy"
+                    );
+                    None
+                }
+            })
+            .collect();
+        self.cache.clear_except(&keep)?;
         Ok(self.db.clear_cached_flags()?)
     }
 

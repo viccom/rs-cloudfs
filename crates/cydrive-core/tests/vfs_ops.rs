@@ -10,8 +10,10 @@
 //! `create_dir` upserts a directory *row* only (no filesystem directory —
 //! those are created lazily by put/hydrate), `remove_file` deletes the
 //! row and the local cache copy while deliberately keeping the remote
-//! Telegram messages (Python parity), `cache_clear` empties the cache
-//! tree and clears `is_cached` on file rows only, and `ingest_file`
+//! Telegram messages (Python parity), `cache_clear` (plan revision A1)
+//! deletes only the cached copies of *uploaded* files — pending uploads
+//! keep their local copies, the only copy of the bytes — and clears
+//! `is_cached` on uploaded file rows only, and `ingest_file`
 //! streams a local source file through a staged cache sibling into the
 //! upload pipeline without ever reading it whole into memory.
 //!

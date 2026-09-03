@@ -430,20 +430,38 @@ impl MetaDatabase {
     }
 
     /// Clears the `is_cached` flag on every non-directory row that has it
-    /// set, returning the number of changed rows (the `cache clear`
-    /// command's freed-flags count). Directory rows keep their flag —
-    /// theirs is a row-shape constant (born uploaded + cached), not
-    /// evidence of a local cache copy.
+    /// set **and is already uploaded**, returning the number of changed
+    /// rows (the `cache clear` command's freed-flags count). Directory
+    /// rows keep their flag — theirs is a row-shape constant (born
+    /// uploaded + cached), not evidence of a local cache copy. Pending
+    /// uploads keep their flag too: their cache copy is the only copy of
+    /// the bytes (plan revision A1), so it must not read as freed.
     pub fn clear_cached_flags(&self) -> Result<u64, DbError> {
         let conn = self
             .conn
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner());
         let changed = conn.execute(
-            "UPDATE files SET is_cached = 0 WHERE is_dir = 0 AND is_cached = 1",
+            "UPDATE files SET is_cached = 0 \
+             WHERE is_dir = 0 AND is_cached = 1 AND is_uploaded = 1",
             [],
         )?;
         Ok(changed as u64)
+    }
+
+    /// Virtual paths of every pending upload (`is_uploaded = 0`,
+    /// non-directory). The `cache clear` command preserves these rows'
+    /// local cache copies — for a pending upload that copy is the only
+    /// copy of the bytes (plan revision A1).
+    pub fn pending_file_paths(&self) -> Result<Vec<String>, DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt =
+            conn.prepare("SELECT rel_path FROM files WHERE is_uploaded = 0 AND is_dir = 0")?;
+        let rows = stmt.query_map([], |row| row.get(0))?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
     /// Moves the row at `from` to `to`, rewriting `rel_path` / `name` /

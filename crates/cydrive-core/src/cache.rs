@@ -165,6 +165,16 @@ impl CacheManager {
     pub fn clear_all(&self) -> io::Result<()> {
         clear_dir(&self.root)
     }
+
+    /// [`CacheManager::clear_all`] minus the paths in `keep` (matched by
+    /// virtual path): the `cache clear` command hands it the pending
+    /// uploads, whose local copy is the only copy of the bytes (plan
+    /// revision A1). Directories are still cleaned bottom-up — a
+    /// directory whose kept files are gone goes too, and one that still
+    /// holds kept files simply stays.
+    pub fn clear_except(&self, keep: &[RelPath]) -> io::Result<()> {
+        clear_dir_except(&self.root, &self.root, keep)
+    }
 }
 
 /// Depth-first `clear_all` worker: deletes every file under `dir`, then
@@ -177,6 +187,34 @@ fn clear_dir(dir: &Path) -> io::Result<()> {
             fs::remove_dir(&path)?;
         } else {
             fs::remove_file(&path)?;
+        }
+    }
+    Ok(())
+}
+
+/// Depth-first [`CacheManager::clear_except`] worker: deletes every file
+/// under `dir` except the virtual paths in `keep` (`root` maps disk paths
+/// back to virtual ones), then removes the (now empty) subdirectories. A
+/// directory that still holds kept files cannot be removed — that
+/// `DirectoryNotEmpty` outcome is the expected "preserved" result, not a
+/// failure.
+fn clear_dir_except(dir: &Path, root: &Path, keep: &[RelPath]) -> io::Result<()> {
+    for entry in fs::read_dir(dir)? {
+        let path = entry?.path();
+        if path.is_dir() {
+            clear_dir_except(&path, root, keep)?;
+            if let Err(error) = fs::remove_dir(&path) {
+                if error.kind() != io::ErrorKind::DirectoryNotEmpty {
+                    return Err(error);
+                }
+            }
+        } else {
+            // A file that cannot be expressed as a virtual path can never
+            // be in `keep`, so it goes exactly as in clear_all.
+            let kept = rel_from_disk(root, &path).is_some_and(|rel| keep.contains(&rel));
+            if !kept {
+                fs::remove_file(&path)?;
+            }
         }
     }
     Ok(())
