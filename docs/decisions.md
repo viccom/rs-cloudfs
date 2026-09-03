@@ -82,3 +82,11 @@
 
 - **裁决**：负责人环境 = Clash Verge 本地混合端口 127.0.0.1:7897。采纳 SOCKS5 路线（grammers `proxy` feature + `ConnectionParams.proxy_url` + `CyDriveConfig.proxy_url`/`CYDRIVE_PROXY_URL`）。负责人原 MTProto 密钥经识别为 **fake-TLS（dd 型）伪装密钥**（42 hex，尾部嵌 ASCII 域名）——直接吃它需实现 fake-TLS 握手 + Intermediate 传输切换（grammers 连接硬编码 Full），工程量大且协议参考受网络限制，**列为 v2 待需求确认**。
 - **真机验证（2026-09-03，本机）**：经 7897 用负责人真实 bot token 完成 bot_sign_in（session 落盘），全栈启动；仪表盘 200 / api/stats 200 / WebDAV PROPFIND 207。首次真实 Telegram 互通达成。
+
+## 2026-09-03 Tier-1 实用功能批（TDD，worktree feat/tier1-utilities）：四处执行期裁决
+
+- **A1 cache clear 保护 pending 上传**（执行中发现计划缺陷）：原契约会连 pending 上传的本地 staging 副本（未上传数据的唯一副本）一起删——数据丢失风险，违背「稳定」北极星。修订：clear 只删 `is_uploaded=1` 行的缓存副本并只清这些行的 `is_cached`；`cache clear` 与 `Vfs::cache_clear` 同语义（pending_file_paths → clear_except → clear_cached_flags）。CLI Clear 的 help 文本明示该行为。
+- **/help 文本不属于 Python 兼容契约**：新增 /ls /mkdir /rm /quota /queue 需要更新 /help 输出，与「逐字基线」旧用例互斥。裁决：bot 回复文本是 Rust 侧扩展面，基线仅限 caption/分块命名/DB schema/端口；旧用例常量同步更新（test commit ca8f240）。
+- **降级通知恒开无开关**：上传降级是罕见终态且此前完全静默（仅 /api/queue 可见），bot 推送通知（send_text best-effort，失败仅 warn）对稳定目标净收益为正，不加配置项（YAGNI）。
+- **legacy config.json 拒收三个新调优键**（upload_workers/queue_capacity/hydrate_timeout_secs）：其余未知键维持静默忽略不变；新键出现在 json 中报 Parse 并提示改用 config.toml——防「新键写错地方被静默吞掉」。
+- **执行过程失误留痕**：Task 1 只跑 `-p cydrive-core` 门禁漏检 VfsError 新 variant 打断 cydrive-webdav 穷举 match（Task 4 红测试作者发现），主会话直修补臂（e2ccf8c：Exists→FsError::Exists、ParentMissing→FsError::NotFound 沿 require_dir_parent 的 409 语义）。教训已吸收：跨 crate enum 变更后门禁必须 workspace 级。
