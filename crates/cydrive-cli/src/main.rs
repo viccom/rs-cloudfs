@@ -224,6 +224,7 @@ async fn run() -> Result<()> {
         bot_token: cfg.bot_token.clone(),
         chat_id: cfg.chat_id,
         session_path: session_path.clone(),
+        proxy_url: cfg.proxy_url.clone(),
     };
     println!(
         "Connecting to Telegram (session: {}) ...",

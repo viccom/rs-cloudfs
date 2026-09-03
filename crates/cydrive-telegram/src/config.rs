@@ -15,6 +15,9 @@ pub struct TransportConfig {
     pub bot_token: String,
     pub chat_id: i64,
     pub session_path: std::path::PathBuf,
+    /// Optional SOCKS5 proxy URL (e.g. `"socks5://127.0.0.1:7897"`) handed
+    /// to grammers' `ConnectionParams::proxy_url`; `None` connects directly.
+    pub proxy_url: Option<String>,
 }
 
 impl Default for TransportConfig {
@@ -28,6 +31,7 @@ impl Default for TransportConfig {
             bot_token: String::new(),
             chat_id: 0,
             session_path: format!("{DEFAULT_SESSION_STEM}.session").into(),
+            proxy_url: None,
         }
     }
 }

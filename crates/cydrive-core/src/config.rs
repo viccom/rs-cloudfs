@@ -80,6 +80,7 @@ const KNOWN_TOML_KEYS: &[&str] = &[
     "cache_limit_gb",
     "encryption_password",
     "enable_encryption",
+    "proxy_url",
 ];
 
 /// Numeric fields for which legacy JSON additionally accepts a numeric
@@ -169,6 +170,12 @@ pub struct CyDriveConfig {
     pub encryption_password: Option<String>,
     /// Whether client-side encryption is enabled.
     pub enable_encryption: bool,
+    /// Optional SOCKS5 proxy URL for the Telegram MTProto connection
+    /// (e.g. `"socks5://127.0.0.1:7897"` for a local Clash mixed port);
+    /// `None` connects directly. `validate` imposes no rules on it — any
+    /// string (or `None`) is accepted here, the transport layer owns the
+    /// scheme semantics.
+    pub proxy_url: Option<String>,
 }
 
 impl Default for CyDriveConfig {
@@ -195,6 +202,7 @@ impl Default for CyDriveConfig {
             cache_limit_gb: 20,
             encryption_password: None,
             enable_encryption: false,
+            proxy_url: None,
         }
     }
 }
@@ -349,6 +357,7 @@ impl CyDriveConfig {
     /// | `CYDRIVE_DRIVE_LETTER` | `drive_letter` | verbatim string |
     /// | `CYDRIVE_CHUNK_SIZE_MB` | `chunk_size_mb` | `u64`; unparseable → ignored |
     /// | `CYDRIVE_ENABLE_ENCRYPTION` | `enable_encryption` | `"1"` or `"true"` (case-sensitive) → `true`; any other value → `false` |
+    /// | `CYDRIVE_PROXY_URL` | `proxy_url` | verbatim string; an empty value clears the proxy (`None`) |
     pub fn with_env_overrides(self) -> Self {
         let mut config = self;
         if let Some(value) = env_string("CYDRIVE_BOT_TOKEN") {
@@ -371,6 +380,9 @@ impl CyDriveConfig {
         }
         if let Some(value) = env_string("CYDRIVE_ENABLE_ENCRYPTION") {
             config.enable_encryption = value == "1" || value == "true";
+        }
+        if let Some(value) = env_string("CYDRIVE_PROXY_URL") {
+            config.proxy_url = (!value.is_empty()).then_some(value);
         }
         config
     }

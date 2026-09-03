@@ -27,6 +27,10 @@ cydrive.exe fix-reg
 cydrive.exe run
 ```
 
+> 网络封锁 Telegram？Clash/v2rayN 等本地代理用户在 `config.toml` 加一行
+> `proxy_url = "socks5://127.0.0.1:7897"`（Clash 混合端口即可，SOCKS5 协议），
+> 也可用环境变量 `CYDRIVE_PROXY_URL` 覆盖；不配置则直连。
+
 ## 子命令
 
 | 命令 | 作用 |

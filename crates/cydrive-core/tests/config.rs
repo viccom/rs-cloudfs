@@ -218,6 +218,7 @@ fn toml_roundtrip_preserves_full_config() {
         cache_limit_gb: 7,
         encryption_password: None,
         enable_encryption: false,
+        proxy_url: None,
     };
 
     cfg.save_toml(&path).expect("save_toml");

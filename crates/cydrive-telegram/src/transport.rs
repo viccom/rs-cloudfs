@@ -32,6 +32,7 @@ use async_trait::async_trait;
 use grammers_client::client::UpdatesConfiguration;
 use grammers_client::media::Media;
 use grammers_client::message::InputMessage;
+use grammers_client::sender::ConnectionParams;
 use grammers_client::sender::SenderPool;
 use grammers_client::update::Update;
 use grammers_client::{Client, InvocationError};
@@ -121,7 +122,31 @@ impl GrammersTransport {
                 .await
                 .map_err(|e| TransportError::Remote(format!("session open: {e}")))?,
         );
-        let pool = SenderPool::new(Arc::clone(&session), config.api_id);
+        // `SenderPool::new` would use `ConnectionParams::default()`, whose
+        // descriptive fields are machine-specific (probed 2026-09-03 on the
+        // dev machine): device_model = "{os_type} {bitness}" ("Windows
+        // 64-bit"), system_version = the OS version string, app_version =
+        // grammers-mtsender's own package version ("0.10.0"),
+        // system_lang_code/lang_code = system/user locale with an "en"
+        // fallback. We pin static values instead so the client fingerprint
+        // is stable across machines; `proxy_url` is forwarded verbatim
+        // (grammers passes the `socks5://host:port` URI to tokio-socks
+        // without parsing it beyond the scheme) and `use_ipv6` matches the
+        // default `false`.
+        let pool = SenderPool::with_configuration(
+            Arc::clone(&session),
+            config.api_id,
+            ConnectionParams {
+                device_model: "cydrive".to_string(),
+                system_version: std::env::consts::OS.to_string(),
+                app_version: env!("CARGO_PKG_VERSION").to_string(),
+                system_lang_code: "en".to_string(),
+                lang_code: "en".to_string(),
+                proxy_url: config.proxy_url.clone(),
+                use_ipv6: false,
+                __non_exhaustive: (),
+            },
+        );
         let client = Client::new(pool.handle);
         tokio::spawn(pool.runner.run());
         // NOTE(inbound): the raw update receiver is kept (not dropped)

@@ -18,7 +18,9 @@ futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false }
 # Exact `=` pins: grammers treats minor versions as breaking (TL layer
 # changes), so any semver-compatible drift must be a deliberate upgrade.
-grammers-client = "=0.10.0"
+# The `proxy` feature forwards to grammers-mtsender/proxy (tokio-socks) and
+# unlocks `ConnectionParams::proxy_url` for SOCKS5 transport.
+grammers-client = { version = "=0.10.0", features = ["proxy"] }
 # Redirected by the workspace [patch.crates-io] to the in-tree vendored copy
 # (crates/vendor/grammers-session) whose sqlite-storage backend is
 # rusqlite(bundled) — same SQLite cydrive-core links — instead of libsql.
