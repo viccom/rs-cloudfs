@@ -13,6 +13,7 @@ bytes = "1"
 cydrive-core = { path = "../cydrive-core" }
 dav-server = "=0.11.0"
 futures-util = "0.3"
+http = "1"
 hyper = { version = "1", default-features = false, features = ["http1", "server"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 thiserror = "2"

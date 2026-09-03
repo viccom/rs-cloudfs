@@ -9,8 +9,10 @@
 //! cache copy is deleted only after a successful upload (fixing the
 //! Python unconditional-delete bug). Successful uploads additionally
 //! store the plaintext sha256 for files at or below [`SHA256_MAX_BYTES`]
-//! (Python baseline `telegram_client.py:160`), computed after remote
-//! success and before the local copy is deleted.
+//! (Python baseline `telegram_client.py:160`), computed up front —
+//! before the first upload attempt, while the local copy is guaranteed
+//! to still exist (a post-success hash raced with a same-path rewrite's
+//! success-delete in the field: os error 2, digest lost).
 //!
 //! Layout: the handle fronts one [`QueueInner`] (sender slot, worker
 //! join handles, atomic counters, config); worker tasks share the single
@@ -42,9 +44,9 @@ pub const DEFAULT_CHUNK_SIZE_MB: u64 = 1900;
 /// turn feeds the sha-based WebDAV ETag (contract 6).
 pub const SHA256_MAX_BYTES: u64 = 100 * 1024 * 1024;
 
-/// Pure size gate for the sha256 side-computation on the upload success
-/// path (boundary-exact: `SHA256_MAX_BYTES` itself hashes, one byte over
-/// skips; 0 hashes — the Python baseline computes the empty digest).
+/// Pure size gate for the sha256 side-computation (boundary-exact:
+/// `SHA256_MAX_BYTES` itself hashes, one byte over skips; 0 hashes — the
+/// Python baseline computes the empty digest).
 #[inline]
 pub fn should_hash(size: u64) -> bool {
     size <= SHA256_MAX_BYTES
@@ -331,15 +333,14 @@ async fn worker_loop(
     }
 }
 
-/// The staged encryption of one job: the effective ciphertext job plus
-/// the pre-computed plaintext sha256 (Python `telegram_client.py:160`:
-/// the digest covers the plaintext, computed before encryption).
+/// The staged encryption of one job: the effective ciphertext job the
+/// transport must see. The plaintext sha256 is not staged here — it is
+/// computed once in [`process_job`] before the first attempt (same
+/// order as the Python baseline: digest first, then encryption).
 struct StagedUpload {
     /// Effective job over the ciphertext temp file (same rel_path and
     /// chunk split size; size/chunk_count re-planned on the ciphertext).
     job: UploadJob,
-    /// Plaintext digest (None for oversized files / failed computation).
-    sha256: Option<String>,
 }
 
 /// Sibling staging path of the plaintext cache copy for the encrypted
@@ -357,19 +358,17 @@ fn enc_tmp_sibling(target: &Path) -> std::path::PathBuf {
 /// the adjudicated v1 semantics: plaintext -> whole-file v1 crypto format
 /// -> the ciphertext is what gets chunked and uploaded).
 ///
-/// 1. hash the plaintext local copy first (E2 semantics, size gate on the
-///    plaintext size);
-/// 2. read the plaintext, encrypt it in memory (Python parity — the
-///    whole file is buffered; streaming is an explicitly deferred v2
-///    item) and write the ciphertext to a sibling `{name}.enc.tmp`;
+/// 1. read the plaintext (already hashed by the caller —
+///    [`precompute_sha256`] runs before staging, matching the Python
+///    digest-before-encryption order);
+/// 2. encrypt it in memory (Python parity — the whole file is buffered;
+///    streaming is an explicitly deferred v2 item) and write the
+///    ciphertext to a sibling `{name}.enc.tmp`;
 /// 3. re-plan the chunk split over the ciphertext bytes.
 ///
 /// I/O failures surface to the caller as ordinary upload failures
 /// (retry/degrade; the plaintext is never touched).
 fn stage_encrypted(job: &UploadJob, password: &str) -> std::io::Result<StagedUpload> {
-    // Python order: the digest is computed on the plaintext (and its
-    // size gate uses the plaintext size) before any encryption happens.
-    let sha256 = hash_after_upload(job, job.size);
     let plaintext = std::fs::read(&job.local_path)?;
     let ciphertext = crate::crypto::encrypt(password, &plaintext);
     let tmp = enc_tmp_sibling(&job.local_path);
@@ -384,7 +383,6 @@ fn stage_encrypted(job: &UploadJob, password: &str) -> std::io::Result<StagedUpl
             chunk_count,
             chunk_size: job.chunk_size,
         },
-        sha256,
     })
 }
 
@@ -435,11 +433,17 @@ async fn process_job(
         }
     };
 
+    // The plaintext digest is computed once, here — before the first
+    // upload attempt and before any encryption staging, while the local
+    // copy is guaranteed to still exist. Hashing after remote success
+    // raced with a same-path rewrite: the earlier job's success-delete
+    // removed the cache copy out from under this hash (field log: os
+    // error 2, digest silently dropped). 0 bytes hashes too — the empty
+    // digest is well-defined (Python parity).
+    let sha256 = precompute_sha256(&job);
+
     // Contract 6: 0-byte uploads never touch the remote.
     if job.size == 0 {
-        // Python baseline: 0 bytes <= the cap, so the (empty) digest is
-        // computed too — sha256 of nothing is a well-defined value.
-        let sha256 = hash_after_upload(&job, 0);
         match persist_zero_byte(db, &row, sha256) {
             Ok(()) => {
                 delete_local_copy(&job.local_path);
@@ -512,16 +516,10 @@ async fn process_job(
         let target = staged.as_ref().map(|s| &s.job).unwrap_or(&job);
         match transport.upload(target).await {
             Ok(receipt) => {
-                // Python baseline: files <= 100 MB carry a sha256 in their
-                // row (sha-ETag, contract 6). Encrypted uploads hashed the
-                // plaintext during staging; plaintext uploads compute it
-                // now, after remote success but before the local copy is
-                // deleted, so a hash failure never fails an upload that
-                // already made it.
-                let sha256 = match &staged {
-                    Some(s) => s.sha256.clone(),
-                    None => hash_after_upload(&job, receipt.uploaded_bytes),
-                };
+                // The digest was computed up front (before the first
+                // attempt), so it is already in hand for both the staged
+                // (plaintext digest of the encrypted upload) and the
+                // plaintext path — no hash runs after the remote success.
                 // Row size: encrypted rows keep their plaintext size
                 // (Python upserts `file_size`, the plaintext length);
                 // plaintext rows take the receipt's byte count as before.
@@ -592,14 +590,23 @@ async fn process_job(
     }
 }
 
-/// Computes the row's sha256 from the still-present local copy after a
-/// successful upload (Python baseline, `telegram_client.py:160`): sizes at
-/// or below [`SHA256_MAX_BYTES`] get the plaintext digest, larger ones
-/// None. The plaintext is hashed, not any encrypted staging file. A hash
-/// failure only warns and stores None — the remote upload already
-/// succeeded, the digest is bonus metadata and must not fail the job.
-fn hash_after_upload(job: &UploadJob, uploaded_bytes: u64) -> Option<String> {
-    if !should_hash(uploaded_bytes) {
+/// Computes the row's sha256 from the local plaintext copy BEFORE any
+/// upload attempt (Python baseline, `telegram_client.py:160`: the digest
+/// covers the plaintext and the size gate uses the plaintext size —
+/// `telegram_client.py:162-177` hashes before encrypting, so hashing
+/// before staging is the same order). Sizes at or below
+/// [`SHA256_MAX_BYTES`] get the plaintext digest, larger ones None. A
+/// hash failure only warns and yields None — the digest is bonus
+/// metadata and must not fail the upload.
+///
+/// Timing note: this used to run after remote success, but a same-path
+/// rewrite lets the earlier job's success-delete remove the cache copy
+/// out from under the hash (field log: os error 2, digest lost). Here
+/// the copy is guaranteed to still exist: it is deleted only after a
+/// successful persist, and every path that consumes the digest (0-byte
+/// persist, plaintext persist, encrypted staging) runs after this point.
+fn precompute_sha256(job: &UploadJob) -> Option<String> {
+    if !should_hash(job.size) {
         return None;
     }
     match crate::chunker::sha256_file(&job.local_path) {
@@ -609,7 +616,7 @@ fn hash_after_upload(job: &UploadJob, uploaded_bytes: u64) -> Option<String> {
                 rel_path = %job.rel_path,
                 path = %job.local_path.display(),
                 %error,
-                "sha256 computation failed after a successful upload; storing None"
+                "sha256 pre-computation failed; storing None"
             );
             None
         }
@@ -618,9 +625,9 @@ fn hash_after_upload(job: &UploadJob, uploaded_bytes: u64) -> Option<String> {
 
 /// Builds the upsert flipping `row` to the uploaded state, keeping every
 /// row field the queue does not own (name/mtime/encryption/mime); sha256
-/// is the success path's own product — the freshly computed digest (None
-/// for oversized files or a failed computation; the DB layer then
-/// coalesces to any pre-existing value).
+/// is the job's own pre-computed digest (None for oversized files or a
+/// failed computation; the DB layer then coalesces to any pre-existing
+/// value).
 fn uploaded_upsert(
     row: &FileRecord,
     size: i64,
@@ -729,7 +736,7 @@ fn delete_local_copy(local_path: &Path) {
 ///    file deleted), count succeeded.
 /// 3. Rows flagged `is_encrypted` while `cfg.encryption_password` is
 ///    `Some` are staged first (Python `telegram_client.py:162-177`): the
-///    plaintext is hashed (<= [`SHA256_MAX_BYTES`]), encrypted whole-file
+///    plaintext was already hashed before staging, is encrypted whole-file
 ///    into a sibling `{name}.enc.tmp`, and the *ciphertext* is what gets
 ///    uploaded and chunk-planned. Staging I/O failures count as ordinary
 ///    upload failures (retry/degrade, plaintext kept); the temp file is
@@ -743,10 +750,9 @@ fn delete_local_copy(local_path: &Path) {
 ///      the bytes the transport saw — ciphertext boundaries when
 ///      encrypted), `size` = the receipt's byte count (plaintext rows)
 ///      or the row's kept plaintext size (encrypted rows),
-///      `sha256` = the freshly computed plaintext digest when
-///      `should_hash(uploaded_bytes)` (None for oversized files or a
-///      failed hash — warn only, never an upload failure); delete the
-///      local file; count succeeded.
+///      `sha256` = the digest computed before the first attempt (None
+///      for oversized files or a failed hash — warn only, never an
+///      upload failure); delete the local file; count succeeded.
 ///    - `Err(FloodWait { s })` → sleep `s` (0 sleeps nothing), count
 ///      retries, retry the whole upload (never counts toward
 ///      degradation).

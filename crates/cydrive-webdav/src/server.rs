@@ -8,10 +8,11 @@
 //! - `FakeLs` locksystem — Windows Explorer refuses to mount a share
 //!   that does not answer LOCK, and dav-server only advertises
 //!   LOCK/UNLOCK in OPTIONS when a locksystem is installed;
-//! - an explicit method set (PROPFIND/GET/HEAD/PUT/DELETE/MKCOL/MOVE/
-//!   COPY/OPTIONS/LOCK/UNLOCK — COPY rides the adapter's built-in
-//!   `NotImplemented`, 501, by design: Explorer drag-copy goes through
-//!   PUT);
+//! - an explicit method set (PROPFIND/PROPPATCH/GET/HEAD/PUT/DELETE/
+//!   MKCOL/MOVE/COPY/OPTIONS/LOCK/UNLOCK — COPY rides the adapter's
+//!   built-in `NotImplemented`, 501, by design: Explorer drag-copy goes
+//!   through PUT; PROPPATCH answers 207 so MiniRedir does not roll
+//!   Explorer copies back);
 //! - no auth and no principal negotiation — loopback only is the
 //!   contract (production binds 127.0.0.1:8080, compat contract 1).
 
@@ -138,11 +139,15 @@ async fn accept_loop(
 
 /// The locked-down method set. COPY stays allowed so the adapter's
 /// `NotImplemented` (501) answers it, matching the design doc's
-/// "Explorer drag-copy goes through PUT".
+/// "Explorer drag-copy goes through PUT". PROPPATCH is required by
+/// Windows MiniRedir: it closes every Explorer copy with an mtime
+/// -preserving PROPPATCH and rolls the copy back (DELETE) on anything
+/// but a 2xx/207 answer.
 fn method_set() -> DavMethodSet {
     let mut set = DavMethodSet::none();
     for method in [
         DavMethod::PropFind,
+        DavMethod::PropPatch,
         DavMethod::Get,
         DavMethod::Head,
         DavMethod::Put,

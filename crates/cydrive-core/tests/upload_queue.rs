@@ -20,7 +20,7 @@ use cydrive_core::cache::CacheManager;
 use cydrive_core::database::{FileUpsert, MetaDatabase};
 use cydrive_core::rel_path::RelPath;
 use cydrive_core::transport::mock::{MockTransport, UploadAction};
-use cydrive_core::transport::{CloudTransport, TransportError, UploadJob};
+use cydrive_core::transport::{CloudTransport, TransportError, UploadJob, UploadReceipt};
 use cydrive_core::upload_queue::{
     decide_retry, spawn_queue, QueueError, QueueStats, RetryDecision, RetryPolicy,
     UploadQueueConfig,
@@ -841,4 +841,82 @@ async fn encryption_disabled_uploads_plaintext_unchanged() {
         "remote holds the plaintext verbatim"
     );
     assert!(!local.exists(), "local copy deleted after success");
+}
+
+/// 21. The plaintext sha256 is computed BEFORE the first upload attempt,
+///     not after remote success. Field bug (real-machine log): two writes
+///     to the same path race — the first job's success-delete removes the
+///     cache copy out from under the second job's post-upload hash, which
+///     dies with os error 2 and stores None, losing the sha-ETag.
+///     Harness: a delegating transport that deletes the local copy inside
+///     the upload call (the exact loss window). The digest must already
+///     be in hand when the upload completes, so the row still carries it.
+struct DeleteOnUploadTransport {
+    inner: Arc<MockTransport>,
+}
+
+#[async_trait::async_trait]
+impl CloudTransport for DeleteOnUploadTransport {
+    async fn connect(&self) -> Result<(), TransportError> {
+        self.inner.connect().await
+    }
+
+    async fn upload(&self, job: &UploadJob) -> Result<UploadReceipt, TransportError> {
+        let receipt = self.inner.upload(job).await?;
+        let _ = fs::remove_file(&job.local_path);
+        Ok(receipt)
+    }
+
+    async fn open(
+        &self,
+        file: &cydrive_core::transport::RemoteHandle,
+    ) -> Result<cydrive_core::transport::ByteStream, TransportError> {
+        self.inner.open(file).await
+    }
+
+    async fn open_range(
+        &self,
+        file: &cydrive_core::transport::RemoteHandle,
+        off: u64,
+        len: u64,
+    ) -> Result<cydrive_core::transport::ByteStream, TransportError> {
+        self.inner.open_range(file, off, len).await
+    }
+
+    async fn delete_remote(&self, msg_id: i32) -> Result<(), TransportError> {
+        self.inner.delete_remote(msg_id).await
+    }
+
+    fn incoming(&self) -> cydrive_core::transport::IncomingStream {
+        self.inner.incoming()
+    }
+}
+
+#[tokio::test]
+async fn sha256_computed_before_upload_survives_local_delete() {
+    let (_dir, db, cache, mock) = test_env().await;
+    let local = seed_pending(&db, &cache, "/race/hashed.bin", b"hello cydrive", 1);
+    let expected_sha =
+        cydrive_core::chunker::sha256_file(&local).expect("hash the seeded plaintext");
+    let transport: Arc<dyn CloudTransport> = Arc::new(DeleteOnUploadTransport {
+        inner: mock.clone(),
+    });
+    let handle = spawn_queue(db.clone(), transport, test_cfg(64));
+
+    handle
+        .enqueue(job_for(&cache, "/race/hashed.bin", 13, 1, 64))
+        .await
+        .expect("enqueue");
+    handle.shutdown().await;
+
+    let row = db
+        .get_file("/race/hashed.bin")
+        .expect("db read")
+        .expect("row exists");
+    assert!(row.is_uploaded, "upload itself succeeded");
+    assert_eq!(
+        row.sha256,
+        Some(expected_sha),
+        "digest computed before the upload survives the local delete"
+    );
 }

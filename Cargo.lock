@@ -815,6 +815,7 @@ dependencies = [
  "cydrive-core",
  "dav-server",
  "futures-util",
+ "http",
  "hyper",
  "hyper-util",
  "tempfile",

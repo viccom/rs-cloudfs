@@ -503,3 +503,72 @@ async fn options_advertise_dav() {
         "file allow set: {resp}"
     );
 }
+
+/// 10. PROPPATCH is accepted (207 multistatus), not 405. Windows
+///     MiniRedir closes every Explorer copy with a PROPPATCH that
+///     preserves the source file's mtime; a 405 there makes it roll the
+///     whole copy back with DELETE ("the device did not respond"). The
+///     body is the exact MiniRedir shape captured on the real machine
+///     (getlastmodified in the DAV: namespace). dav-server's liveprop
+///     policy answers DAV:getlastmodified with 403 *inside* the 207
+///     (read-only live property, same as Apache mod_dav — the outer 207
+///     is what MiniRedir gates on); asserting the outer status only.
+#[tokio::test]
+async fn proppatch_set_mtime_accepted() {
+    let env = test_env().await;
+    let addr = env.server.local_addr();
+    seed_remote_file(&env.db, &env.mock, "/docs/hello.txt", b"hello world", 64).await;
+
+    let body = "<?xml version=\"1.0\"?>\
+<D:propertyupdate xmlns:D=\"DAV:\"><D:set><D:prop>\
+<getlastmodified xmlns=\"DAV:\">Thu, 03 Sep 2026 07:49:15 GMT</getlastmodified>\
+</D:prop></D:set></D:propertyupdate>";
+    let resp = send(
+        addr,
+        &request("PROPPATCH", "/docs/hello.txt", addr, &[], body),
+    )
+    .await;
+
+    assert_eq!(status_of(&resp), 207, "multistatus accepted: {resp}");
+}
+
+/// 11. The captured Explorer copy sequence stays green end to end —
+///     empty PUT (placeholder) 201, real-body PUT 204, PROPPATCH 207,
+///     HEAD 200 — with no 405 anywhere (regression guard for the
+///     rollback bug: the file must survive its own copy).
+#[tokio::test]
+async fn copy_flow_no_rollback() {
+    let env = test_env().await;
+    let addr = env.server.local_addr();
+
+    let resp = send(addr, &request("PUT", "/copied.txt", addr, &[], "")).await;
+    assert_eq!(status_of(&resp), 201, "placeholder PUT: {resp}");
+
+    let resp = send(
+        addr,
+        &request("PUT", "/copied.txt", addr, &[], "copied payload"),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 204, "body PUT overwrites: {resp}");
+
+    let body = "<?xml version=\"1.0\"?>\
+<D:propertyupdate xmlns:D=\"DAV:\"><D:set><D:prop>\
+<getlastmodified xmlns=\"DAV:\">Thu, 03 Sep 2026 07:49:15 GMT</getlastmodified>\
+</D:prop></D:set></D:propertyupdate>";
+    let resp = send(addr, &request("PROPPATCH", "/copied.txt", addr, &[], body)).await;
+    let proppatch = status_of(&resp);
+    assert_ne!(proppatch, 405, "PROPPATCH must not be rejected: {resp}");
+    assert_eq!(proppatch, 207, "PROPPATCH accepted: {resp}");
+
+    let resp = send(addr, &request("HEAD", "/copied.txt", addr, &[], "")).await;
+    assert_eq!(status_of(&resp), 200, "file survives the copy: {resp}");
+
+    env.server.shutdown().await;
+    env.vfs.shutdown().await;
+    let row = env
+        .db
+        .get_file("/copied.txt")
+        .expect("db read")
+        .expect("row still exists (no DELETE rollback)");
+    assert_eq!(row.size, 14, "row holds the copied body size");
+}

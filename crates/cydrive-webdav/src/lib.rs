@@ -32,8 +32,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 use bytes::{Buf, Bytes};
 use dav_server::davpath::DavPath;
 use dav_server::fs::{
-    DavDirEntry, DavFile, DavFileSystem, DavMetaData, FsError, FsFuture, FsResult, FsStream,
-    OpenOptions, ReadDirMeta,
+    DavDirEntry, DavFile, DavFileSystem, DavMetaData, DavProp, FsError, FsFuture, FsResult,
+    FsStream, OpenOptions, ReadDirMeta,
 };
 use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
@@ -328,6 +328,31 @@ impl DavFileSystem for CyDriveFs {
         Box::pin(async move {
             let used = self.db.get_stats().map_err(db_err)?.total_bytes.max(0) as u64;
             Ok((used, Some(used + TEN_TB)))
+        })
+    }
+
+    fn patch_props<'a>(
+        &'a self,
+        _path: &'a DavPath,
+        patch: Vec<(bool, DavProp)>,
+    ) -> FsFuture<'a, Vec<(http::StatusCode, DavProp)>> {
+        Box::pin(async move {
+            // Windows MiniRedir ends every Explorer copy with a PROPPATCH
+            // meant to preserve the source file's mtime; answering 405 made
+            // it roll the whole copy back with DELETE. dav-server's liveprop
+            // policy intercepts DAV:getlastmodified (hardcoded 403 inside
+            // the 207, read-only live property — same as Apache mod_dav)
+            // and the MS `urn:schemas-microsoft-com:` Win32* props (fake
+            // OK), so the dead props reaching here come from other
+            // namespaces. Report success for every one of them: Explorer
+            // only needs the 207 to keep the copy; the mtime is
+            // deliberately not applied (known limitation — there is no
+            // mtime-update method on MetaDatabase and the rows' mtime is
+            // upload-owned).
+            Ok(patch
+                .into_iter()
+                .map(|(_, prop)| (http::StatusCode::OK, prop))
+                .collect())
         })
     }
 }
