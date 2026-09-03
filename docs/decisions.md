@@ -90,3 +90,12 @@
 - **降级通知恒开无开关**：上传降级是罕见终态且此前完全静默（仅 /api/queue 可见），bot 推送通知（send_text best-effort，失败仅 warn）对稳定目标净收益为正，不加配置项（YAGNI）。
 - **legacy config.json 拒收三个新调优键**（upload_workers/queue_capacity/hydrate_timeout_secs）：其余未知键维持静默忽略不变；新键出现在 json 中报 Parse 并提示改用 config.toml——防「新键写错地方被静默吞掉」。
 - **执行过程失误留痕**：Task 1 只跑 `-p cydrive-core` 门禁漏检 VfsError 新 variant 打断 cydrive-webdav 穷举 match（Task 4 红测试作者发现），主会话直修补臂（e2ccf8c：Exists→FsError::Exists、ParentMissing→FsError::NotFound 沿 require_dir_parent 的 409 语义）。教训已吸收：跨 crate enum 变更后门禁必须 workspace 级。
+
+## 2026-09-03 Tier-1 真机端到端验证（D:\Tools\rs-CyDrive 真实部署，经 Clash 7897）
+
+**全绿清单**：doctor 6ok2warn；cache stats/clear（A1 语义真机确认：4 文件标志清零、目录行保留、清后可重新水合）；push 8MB/100MB/2GB（多块 1900+148MiB，msg 59/60，883s ≈2.3MB/s）；pull 8MB/745KB(M2 老文件跨版本互操作)/2MB(1MB×2 块重组 SHA256 MATCH)；`CYDRIVE_CHUNK_SIZE_MB=1` 环境覆盖生效；新二进制 `run` 全栈（requeue=0/仪表盘 10 文件 2.31GB/PROPFIND 207 中文正确编码/Y: 自动挂载 4 测试文件可见）；Y: 经 WebClient 复制回读 MATCH（清缓存后按需多块水合）。部署位二进制已更新（旧版备份 .m2.bak）。
+
+**发现①hydrate_timeout 默认 180s 在真实带宽下过小**：实测下载方向仅 ~0.45MB/s（上传 2.3MB/s 的 1/5，Clash 节点不对称）→ ~80MB 以上文件 180s 必超时；2GB 回拉 1800s 仍超（需 ~80min）。**已用本批交付的 `hydrate_timeout_secs` 配置键缓解**（部署配置设 1800）。建议负责人裁决默认值上调（如 1800）——基线语义是 Python WebDAV 线程 180s，但 Python 用户同样会在此超时。
+**发现②vendor session 无 WAL/busy_timeout**（storages/sqlite.rs 无 journal_mode 设置）→ **服务运行中不可并发跑 CLI 传输命令**（push/pull 同开 session 有锁冲突风险），运维约束已验证遵守（全程串行）。
+**发现③2GB 全量回拉留待人工**：多块重组链路已由 1MB×2 小文件等价验证（同一代码路径），全量拉取仅剩带宽时间问题（~80min），不再阻塞。
+**运维小注**：Git Bash 下 `--dest /path` 会被 MSYS 路径改写吃掉，须 `MSYS_NO_PATHCONV=1`。
