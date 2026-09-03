@@ -4,17 +4,22 @@
 //! guidance instead of a wizard) → tracing init (Pretty/INFO on stdout,
 //! a parseable `RUST_LOG` wins) → connect the `GrammersTransport` → boot
 //! the stack → wait for Ctrl+C → graceful shutdown → exit 0. The
-//! operational subcommands: mount/unmount (drive mapping), fix-reg
-//! (WebClient tuning, elevated), migrate (legacy Python import), stats
-//! (drive statistics table), doctor (offline diagnosis + platform
-//! checks) and setup (interactive first-time wizard).
+//! operational subcommands: push/pull (direct upload/download data
+//! channel, no WebDAV size limits), cache (local disk cache stats /
+//! clear), mount/unmount (drive mapping), fix-reg (WebClient tuning,
+//! elevated), migrate (legacy Python import), stats (drive statistics
+//! table), doctor (offline diagnosis + platform checks) and setup
+//! (interactive first-time wizard).
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
 use cydrive_cli::{discover_config, run_with_transport};
+use cydrive_core::config::CyDriveConfig;
 use cydrive_core::logging::LogConfig;
+use cydrive_core::rel_path::RelPath;
 use cydrive_telegram::config::{
     TransportConfig, DEFAULT_API_HASH, DEFAULT_API_ID, DEFAULT_SESSION_STEM,
 };
@@ -32,6 +37,28 @@ struct Cli {
 enum Command {
     /// Start the full stack: metadata DB, upload queue, WebDAV server.
     Run,
+    /// Upload a local file into the drive (bypasses the 4 GB WebClient and
+    /// 1900 MB Web UI limits; uploads are chunked automatically).
+    Push {
+        /// Local file to upload.
+        path: PathBuf,
+        /// Destination path inside the drive (default: /<file name>).
+        #[arg(long)]
+        dest: Option<String>,
+    },
+    /// Download a drive file to a local path (hydrates from Telegram when
+    /// not cached).
+    Pull {
+        /// Path inside the drive.
+        path: String,
+        /// Local destination (file path or existing directory).
+        out: PathBuf,
+    },
+    /// Inspect or clear the local disk cache.
+    Cache {
+        #[command(subcommand)]
+        action: CacheAction,
+    },
     /// Map a drive letter to the WebDAV server (`net use`).
     Mount {
         /// WebDAV URL (default: glued from the config's host/port).
@@ -66,11 +93,23 @@ enum Command {
     Setup,
 }
 
+#[derive(Debug, Subcommand)]
+enum CacheAction {
+    /// Print cache root, used bytes and the configured limit.
+    Stats,
+    /// Delete cached copies of uploaded files; pending-upload staging
+    /// copies are preserved.
+    Clear,
+}
+
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Run => run().await,
+        Command::Push { path, dest } => push_cmd(path, dest).await,
+        Command::Pull { path, out } => pull_cmd(path, out).await,
+        Command::Cache { action } => cache_cmd(action),
         Command::Mount { url, letter } => mount_cmd(url, letter).await,
         Command::Unmount { letter } => unmount_cmd(letter).await,
         Command::FixReg => fix_reg_cmd().await,
@@ -78,6 +117,89 @@ async fn main() -> Result<()> {
         Command::Stats => stats_cmd(),
         Command::Doctor => doctor_cmd(),
         Command::Setup => setup_cmd(),
+    }
+}
+
+/// The run() gates shared by the data channel: without a bot token +
+/// chat id the Telegram connect cannot succeed, so fail with the same
+/// actionable message instead of a transport error.
+fn require_configured(cfg: &CyDriveConfig) -> Result<()> {
+    cfg.validate().context("invalid configuration")?;
+    if !cfg.is_configured() {
+        anyhow::bail!(
+            "CyDrive is not configured: set bot_token (a \"<id>:<secret>\" BotFather \
+             token) and chat_id in config.toml (or a legacy config.json) in the \
+             working directory, then run cydrive again"
+        );
+    }
+    Ok(())
+}
+
+/// `cydrive push`: upload a local file straight through the data channel
+/// (no WebDAV / Web UI size limits), drain the queue, then report the
+/// row's terminal state. A degraded upload keeps its local copy and
+/// retries on the next run.
+async fn push_cmd(path: PathBuf, dest: Option<String>) -> Result<()> {
+    let cfg = discover_config().context("config discovery failed")?;
+    require_configured(&cfg)?;
+    let file_name = path
+        .file_name()
+        .and_then(|name| name.to_str())
+        .with_context(|| format!("the source path {} carries no file name", path.display()))?;
+    let dest = dest.unwrap_or_else(|| format!("/{file_name}"));
+    let dest = RelPath::new(&dest).with_context(|| format!("invalid drive path {dest:?}"))?;
+
+    let stack = cydrive_cli::connect_stack(&cfg).await?;
+    let pushed = cydrive_cli::push_file(&stack.vfs, &path, &dest).await?;
+    println!("pushed {pushed} bytes; draining the upload queue ...");
+    stack.shutdown().await;
+
+    let terminal = stack
+        .db
+        .get_file(dest.as_str())
+        .context("reading the pushed file's terminal state")?
+        .filter(|row| row.is_uploaded);
+    match terminal {
+        Some(row) => println!(
+            "uploaded: {} ({})",
+            dest.as_str(),
+            cydrive_cli::format_storage_size(row.size)
+        ),
+        None => println!(
+            "queued but not uploaded yet (degraded or still pending); will retry on next run"
+        ),
+    }
+    Ok(())
+}
+
+/// `cydrive pull`: hydrate a drive file (downloading from Telegram when
+/// the local cache is cold) and copy it out to a local path.
+async fn pull_cmd(path: String, out: PathBuf) -> Result<()> {
+    let cfg = discover_config().context("config discovery failed")?;
+    require_configured(&cfg)?;
+    let rel = RelPath::new(&path).with_context(|| format!("invalid drive path {path:?}"))?;
+
+    let stack = cydrive_cli::connect_stack(&cfg).await?;
+    let pulled_to = cydrive_cli::pull_file(&stack.vfs, &rel, &out).await?;
+    let bytes = std::fs::metadata(&pulled_to)
+        .with_context(|| format!("reading the pulled file {}", pulled_to.display()))?
+        .len();
+    println!(
+        "pulled: {} -> {} ({bytes} bytes)",
+        rel.as_str(),
+        pulled_to.display()
+    );
+    stack.shutdown().await;
+    Ok(())
+}
+
+/// `cydrive cache stats|clear`: local-disk cache inspection and cleanup
+/// — no Telegram connection involved.
+fn cache_cmd(action: CacheAction) -> Result<()> {
+    let cfg = discover_config().context("config discovery failed")?;
+    match action {
+        CacheAction::Stats => cydrive_cli::cache_stats(&cfg),
+        CacheAction::Clear => cydrive_cli::cache_clear_cmd(&cfg),
     }
 }
 

@@ -22,7 +22,7 @@
 
 use std::fmt::Write as _;
 use std::net::{IpAddr, SocketAddr};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -34,8 +34,13 @@ use cydrive_core::credentials::{
 };
 use cydrive_core::database::MetaDatabase;
 use cydrive_core::inbound::{spawn_inbound_worker, InboundWorkerHandle};
+use cydrive_core::rel_path::RelPath;
 use cydrive_core::transport::CloudTransport;
-use cydrive_core::vfs::{Vfs, VfsConfig};
+use cydrive_core::vfs::{Vfs, VfsConfig, VfsError};
+use cydrive_telegram::config::{
+    TransportConfig, DEFAULT_API_HASH, DEFAULT_API_ID, DEFAULT_SESSION_STEM,
+};
+use cydrive_telegram::transport::GrammersTransport;
 use cydrive_web::WebUiServer;
 use cydrive_webdav::{CyDriveFs, WebDavServer};
 
@@ -98,8 +103,9 @@ const BYTES_PER_MB: f64 = 1024.0 * 1024.0;
 
 /// Human-readable cloud-storage size with the bot `/stats` semantics
 /// (`bot.rs`): a true-division MB value, the GB branch opening at
-/// `size_gb >= 1.0` (not `>= 1024` MB), two decimals.
-fn format_storage_size(total_bytes: i64) -> String {
+/// `size_gb >= 1.0` (not `>= 1024` MB), two decimals. Public for the
+/// `push` handler's terminal-state report (same formatting contract).
+pub fn format_storage_size(total_bytes: i64) -> String {
     let size_mb = total_bytes as f64 / BYTES_PER_MB;
     let size_gb = size_mb / 1024.0;
     if size_gb >= 1.0 {
@@ -210,8 +216,10 @@ impl RunHandle {
 }
 
 /// Maps the application config onto the VFS knobs: chunk split from
-/// `chunk_size_mb`, two queue workers, a 256-slot queue, the default
-/// retry policy and the optional encryption password.
+/// `chunk_size_mb`, queue/hydrate tuning from the tier-1 keys
+/// (`upload_workers` / `queue_capacity` / `hydrate_timeout_secs`,
+/// contract C7), the default retry policy and the optional encryption
+/// password.
 ///
 /// The password reaches the VFS only while `enable_encryption` is on —
 /// the Python AND semantics (`telegram_client.py:167`:
@@ -224,15 +232,15 @@ impl RunHandle {
 pub fn vfs_config(cfg: &CyDriveConfig) -> VfsConfig {
     VfsConfig {
         chunk_size_bytes: cfg.chunk_size_mb * 1024 * 1024,
-        workers: 2,
-        queue_capacity: 256,
+        workers: cfg.upload_workers as usize,
+        queue_capacity: cfg.queue_capacity as usize,
         retry: Default::default(),
         encryption_password: if cfg.enable_encryption {
             cfg.encryption_password.clone()
         } else {
             None
         },
-        hydrate_timeout: Duration::from_secs(180),
+        hydrate_timeout: Duration::from_secs(cfg.hydrate_timeout_secs),
     }
 }
 
@@ -336,6 +344,207 @@ pub async fn run_with_transport(
         inbound,
         mounted_letter,
     })
+}
+
+/// A one-shot CLI stack (the `push` / `pull` data channel, contract
+/// C11): a connected transport + the db + cache + VFS — and nothing
+/// else. Unlike [`run_with_transport`] this never starts the WebDAV
+/// server, the dashboard, the inbound worker or the boot-time pending
+/// requeue; the subcommand owns the whole lifecycle, and
+/// [`Stack::shutdown`] drains the upload queue.
+pub struct Stack {
+    /// The metadata db (terminal-state reads after the drain).
+    pub db: Arc<MetaDatabase>,
+    /// The VFS whose upload queue backs the data channel.
+    pub vfs: Arc<Vfs>,
+    /// The connected Telegram transport behind the [`CloudTransport`]
+    /// seam.
+    pub transport: Arc<dyn CloudTransport>,
+}
+
+impl Stack {
+    /// Drains the upload queue: every job enqueued before this call
+    /// reaches a terminal state before the future resolves (`&self`, so
+    /// the caller can still read `db` afterwards for a terminal-state
+    /// report). The data channel runs no servers, so the queue is the
+    /// entire shutdown.
+    pub async fn shutdown(&self) {
+        self.vfs.shutdown().await;
+    }
+}
+
+/// Boots the [`Stack`] for the `push` / `pull` subcommands: mirror of
+/// the `run` assembly (connect → db → cache → Vfs) minus everything a
+/// one-shot transfer does not need (WebDAV, dashboard, inbound worker,
+/// mount, pending requeue). The transport connect needs real Telegram
+/// credentials, so tests exercise the library bodies
+/// ([`push_file`] / [`pull_file`]) against a hand-assembled Vfs instead.
+pub async fn connect_stack(cfg: &CyDriveConfig) -> Result<Stack> {
+    let cwd = std::env::current_dir().context("resolving the working directory")?;
+    let transport_config = TransportConfig {
+        api_id: DEFAULT_API_ID,
+        api_hash: DEFAULT_API_HASH.to_owned(),
+        bot_token: cfg.bot_token.clone(),
+        chat_id: cfg.chat_id,
+        session_path: cwd.join(format!("{DEFAULT_SESSION_STEM}.session")),
+        proxy_url: cfg.proxy_url.clone(),
+    };
+    let transport: Arc<dyn CloudTransport> = Arc::new(
+        GrammersTransport::connect(transport_config)
+            .await
+            .context("connecting the Telegram transport")?,
+    );
+
+    let db = Arc::new(
+        MetaDatabase::open(Path::new(&cfg.db_path))
+            .with_context(|| format!("opening metadata db {:?}", cfg.db_path))?,
+    );
+    let cache_limit = cfg.cache_limit_gb * BYTES_PER_GB;
+    let vfs = Arc::new(Vfs::new(
+        Arc::clone(&db),
+        CacheManager::new(Path::new(&cfg.cache_path).to_path_buf(), cache_limit),
+        Arc::clone(&transport),
+        vfs_config(cfg),
+    ));
+    Ok(Stack { db, vfs, transport })
+}
+
+/// The `push` body (contract C11): stream `local` into the drive at
+/// `dest`, creating the missing ancestor directory rows on the way (an
+/// ancestor that already exists — file or directory — is simply kept).
+/// Returns the pushed byte count; the caller owns the queue drain
+/// ([`Stack::shutdown`]) and the terminal-state report.
+pub async fn push_file(vfs: &Vfs, local: &Path, dest: &RelPath) -> Result<u64> {
+    if dest.is_root() {
+        anyhow::bail!("the push destination may not be the drive root");
+    }
+    // Gate on the source before any db write so a missing file leaves no
+    // directory rows behind; the mtime keeps the source's timestamp (the
+    // same UNIX-epoch conversion the WebDAV adapter's staged metadata
+    // uses).
+    let source_meta = tokio::fs::metadata(local)
+        .await
+        .with_context(|| format!("reading the source file {}", local.display()))?;
+    let mtime = source_meta
+        .modified()
+        .ok()
+        .and_then(|t| t.duration_since(std::time::UNIX_EPOCH).ok())
+        .map_or(0.0, |d| d.as_secs_f64());
+
+    // Ancestors collected deepest-first, then created shallow-first so
+    // every parent row exists before its children (`create_dir`'s
+    // ParentMissing gate); an `Exists` answer means the row is already
+    // there and is swallowed.
+    let mut ancestors = Vec::new();
+    let mut current = dest.parent();
+    while let Some(dir) = current {
+        if dir.is_root() {
+            break;
+        }
+        current = dir.parent();
+        ancestors.push(dir);
+    }
+    for dir in ancestors.iter().rev() {
+        match vfs.create_dir(dir) {
+            Ok(()) | Err(VfsError::Exists(_)) => {}
+            Err(error) => {
+                return Err(error)
+                    .with_context(|| format!("creating the ancestor directory {dir}"));
+            }
+        }
+    }
+
+    vfs.ingest_file(dest, local, mtime)
+        .await
+        .with_context(|| format!("staging {dest} into the upload queue"))
+}
+
+/// The `pull` body (contract C11): hydrate `rel` (downloading from
+/// Telegram when the local cache is cold), then copy the hydrated file
+/// out to `out` — an existing directory receives the rel path's
+/// basename, any other `out` is the target file itself (overwritten
+/// when present). Returns the path written.
+pub async fn pull_file(vfs: &Vfs, rel: &RelPath, out: &Path) -> Result<PathBuf> {
+    let hydrated = vfs
+        .hydrate(rel)
+        .await
+        .with_context(|| format!("hydrating {rel}"))?;
+    let target = if out.is_dir() {
+        out.join(rel.name())
+    } else {
+        out.to_path_buf()
+    };
+    tokio::fs::copy(&hydrated, &target)
+        .await
+        .with_context(|| format!("copying {rel} to {}", target.display()))?;
+    Ok(target)
+}
+
+/// The `cache stats` body (contract C11): db + cache manager over the
+/// config paths alone, no transport. The db open doubles as the same
+/// early gate as `stats` — an unreadable metadata db fails the command
+/// instead of printing cache numbers against a broken drive. Prints the
+/// cache root, used bytes and the configured limit.
+pub fn cache_stats(cfg: &CyDriveConfig) -> Result<()> {
+    MetaDatabase::open(Path::new(&cfg.db_path))
+        .with_context(|| format!("opening metadata db {:?}", cfg.db_path))?;
+    let cache_limit = cfg.cache_limit_gb * BYTES_PER_GB;
+    let cache = CacheManager::new(Path::new(&cfg.cache_path).to_path_buf(), cache_limit);
+    println!("cache root: {}", cfg.cache_path);
+    println!(
+        "used:      {}",
+        format_storage_size(cache.total_size() as i64)
+    );
+    println!("limit:     {}", format_storage_size(cache_limit as i64));
+    Ok(())
+}
+
+/// The `cache clear` body (contract C11 + plan revision A1): db + cache
+/// manager over the config paths alone, no transport. Deletes the
+/// cached copies of **uploaded** files and clears their `is_cached`
+/// flags — the same pending-preserving path as `Vfs::cache_clear`:
+/// pending uploads (`is_uploaded = 0`) keep both their local copy (for
+/// them it is the only copy of the bytes) and their flag. Prints the
+/// freed bytes and the number of cleared flags.
+pub fn cache_clear_cmd(cfg: &CyDriveConfig) -> Result<()> {
+    let db = MetaDatabase::open(Path::new(&cfg.db_path))
+        .with_context(|| format!("opening metadata db {:?}", cfg.db_path))?;
+    let cache_limit = cfg.cache_limit_gb * BYTES_PER_GB;
+    let cache = CacheManager::new(Path::new(&cfg.cache_path).to_path_buf(), cache_limit);
+
+    // Plan revision A1: pending uploads survive the clear.
+    let pending = db
+        .pending_file_paths()
+        .context("listing pending uploads for the cache clear")?;
+    let keep: Vec<RelPath> = pending
+        .iter()
+        .filter_map(|path| match RelPath::new(path) {
+            Ok(rel) => Some(rel),
+            Err(error) => {
+                tracing::warn!(
+                    %path,
+                    %error,
+                    "pending path failed to parse; cache clear cannot preserve its copy"
+                );
+                None
+            }
+        })
+        .collect();
+
+    let before = cache.total_size();
+    cache
+        .clear_except(&keep)
+        .context("clearing the local cache")?;
+    let freed = before - cache.total_size();
+    let cleared = db
+        .clear_cached_flags()
+        .context("clearing is_cached flags")?;
+    println!(
+        "cache cleared: freed {}, cleared {} is_cached flag(s)",
+        format_storage_size(freed as i64),
+        cleared
+    );
+    Ok(())
 }
 
 /// Auto-mount step (unit D): on Windows with `auto_mount_drive`, map the
