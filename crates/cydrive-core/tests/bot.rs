@@ -26,8 +26,11 @@ use cydrive_core::transport::{CloudTransport, IncomingEvent};
 use cydrive_core::upload_queue::RetryPolicy;
 use cydrive_core::vfs::{Vfs, VfsConfig};
 
-/// Help text, verbatim Python baseline (`telegram_client.py:99-107`).
-const HELP_TEXT: &str = "🚀 **CyDrive Cloud Storage Engine v2.0**\nDeveloped by Cynet Security Team (https://cynetx.ir)\n\n**Available Commands:**\n📊 `/stats` - View cloud storage analytics\n🔍 `/search <query>` - Search files in your drive\n📥 `/get <filename>` - Download a file directly\nℹ️ Send any file to this chat to save it to your Windows Drive!";
+/// Help text: Python baseline (`telegram_client.py:99-107`) extended with
+/// the tier-1 command rows (plan contract C8, commit 5725976): `/ls`,
+/// `/mkdir`, `/rm`, `/quota`, `/queue` inserted after `/get`, before the
+/// footnote. Not a Python compat contract — adjudicated 2026-09-03.
+const HELP_TEXT: &str = "🚀 **CyDrive Cloud Storage Engine v2.0**\nDeveloped by Cynet Security Team (https://cynetx.ir)\n\n**Available Commands:**\n📊 `/stats` - View cloud storage analytics\n🔍 `/search <query>` - Search files in your drive\n📥 `/get <filename>` - Download a file directly\n📂 `/ls [path]` - List a directory\n📁 `/mkdir <path>` - Create a directory\n🗑️ `/rm <path>` - Delete a file\n💾 `/quota` - View storage usage\n📋 `/queue` - View the upload queue\nℹ️ Send any file to this chat to save it to your Windows Drive!";
 
 /// VfsConfig for the bot tests (same shape as `tests/inbound.rs`): the
 /// queue is only exercised by `/get`, it just has to spawn cleanly.
