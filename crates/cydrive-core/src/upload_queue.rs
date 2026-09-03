@@ -582,6 +582,22 @@ async fn process_job(
                             "upload retries exhausted; degrading"
                         );
                         bump(&stats.degraded);
+                        // Best-effort bot notice, always on (degradation is
+                        // a rare terminal state worth surfacing — one per
+                        // degraded job); a failed notification must never
+                        // break the degrade path.
+                        let notice = format!(
+                            "⚠️ CyDrive: upload failed after {n} attempts: {rel} — kept on disk, will retry on next start",
+                            n = consecutive_failures,
+                            rel = job.rel_path,
+                        );
+                        if let Err(notify_error) = transport.send_text(&notice).await {
+                            tracing::warn!(
+                                %notify_error,
+                                rel_path = %job.rel_path,
+                                "degrade notification failed"
+                            );
+                        }
                         return; // `enc_tmp` drops here too.
                     }
                 }
@@ -758,7 +774,9 @@ fn delete_local_copy(local_path: &Path) {
 ///      degradation).
 ///    - any other `Err` → [`decide_retry`]: sleep-and-retry (count
 ///      retries) or degrade (count degraded, keep the local file, row
-///      stays `is_uploaded = 0`).
+///      stays `is_uploaded = 0`, and one best-effort bot notice goes out
+///      via `send_text` — a failed notice only warns and never breaks
+///      the degrade path).
 /// 5. Persistence errors on the success path → no re-upload (a retry
 ///    cannot fix the DB and would duplicate remote data): count
 ///    degraded, `warn`.

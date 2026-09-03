@@ -24,13 +24,19 @@
 //! then a name search whose result must be unique, then hydrate +
 //! send_document. Its reply texts are self-designed (no baseline to
 //! mirror) and noted as such below.
+//!
+//! Tier-1 (2026-09-03) adds `/ls /mkdir /rm /quota /queue` to the same
+//! `startswith` chain ahead of the unknown fallthrough; every reply text
+//! is self-designed (no baseline) and pinned by `tests/bot.rs`. `/rm`
+//! keeps the Python baseline's remote-deletion stance: only the metadata
+//! row and the local cache copy go, the remote Telegram messages stay.
 
 use std::sync::Arc;
 
 use crate::database::MetaDatabase;
 use crate::rel_path::RelPath;
 use crate::transport::CloudTransport;
-use crate::vfs::Vfs;
+use crate::vfs::{Vfs, VfsError};
 
 /// Errors surfaced while handling one bot command.
 #[derive(Debug, thiserror::Error)]
@@ -46,11 +52,17 @@ pub enum BotError {
     Vfs(#[from] crate::vfs::VfsError),
 }
 
-/// Help text, verbatim Python baseline (`telegram_client.py:99-107`).
-const HELP_TEXT: &str = "🚀 **CyDrive Cloud Storage Engine v2.0**\nDeveloped by Cynet Security Team (https://cynetx.ir)\n\n**Available Commands:**\n📊 `/stats` - View cloud storage analytics\n🔍 `/search <query>` - Search files in your drive\n📥 `/get <filename>` - Download a file directly\nℹ️ Send any file to this chat to save it to your Windows Drive!";
+/// Help text: the Python baseline (`telegram_client.py:99-107`) verbatim
+/// plus the five tier-1 command lines (self-designed, inserted ahead of
+/// the trailing info footer).
+const HELP_TEXT: &str = "🚀 **CyDrive Cloud Storage Engine v2.0**\nDeveloped by Cynet Security Team (https://cynetx.ir)\n\n**Available Commands:**\n📊 `/stats` - View cloud storage analytics\n🔍 `/search <query>` - Search files in your drive\n📥 `/get <filename>` - Download a file directly\n📂 `/ls [path]` - List a directory\n📁 `/mkdir <path>` - Create a directory\n🗑️ `/rm <path>` - Delete a file\n💾 `/quota` - View storage usage\n📋 `/queue` - View the upload queue\nℹ️ Send any file to this chat to save it to your Windows Drive!";
 
 /// Max rows of a `/search` reply (Python `results[:15]`).
 const SEARCH_LIMIT: usize = 15;
+
+/// Max entry rows of a `/ls` reply; the overflow folds into one
+/// `… and {n} more` line (tier-1, self-designed).
+const LS_LIMIT: usize = 20;
 
 /// Bytes per MiB — the stats size math (`total_bytes / (1024 * 1024)`).
 const BYTES_PER_MB: f64 = 1024.0 * 1024.0;
@@ -96,6 +108,16 @@ pub async fn handle_command(
         handle_search(db, transport, text).await?;
     } else if text.starts_with("/get") {
         handle_get(db, vfs, transport, text).await?;
+    } else if text.starts_with("/ls") {
+        handle_ls(db, transport, text).await?;
+    } else if text.starts_with("/mkdir") {
+        handle_mkdir(vfs, transport, text).await?;
+    } else if text.starts_with("/rm") {
+        handle_rm(vfs, transport, text).await?;
+    } else if text.starts_with("/quota") {
+        handle_quota(db, transport, drive_letter).await?;
+    } else if text.starts_with("/queue") {
+        handle_queue(db, vfs, transport).await?;
     }
     Ok(())
 }
@@ -214,6 +236,187 @@ async fn handle_get(
                 .await?;
         }
     }
+    Ok(())
+}
+
+/// `/ls [path]`: the root (or an explicit directory path) lists its
+/// children — a header line echoing the path, then up to [`LS_LIMIT`]
+/// entry rows in the DB's order (dirs first, name ASC), folding the
+/// overflow into one `… and {n} more` line; an empty directory notes
+/// `(empty)`. A plain file path answers with that file's single entry
+/// line; a missing path answers `no such directory`. All wording is
+/// self-designed (tier-1, no Python baseline).
+async fn handle_ls(
+    db: &Arc<MetaDatabase>,
+    transport: &dyn CloudTransport,
+    text: &str,
+) -> Result<(), BotError> {
+    // The path defaults to the root (`/ls` == `/ls /`).
+    let token = split_maxsplit1(text).unwrap_or("/");
+    let Some(rel) = token_to_rel_path(token) else {
+        transport
+            .send_text(&format!("no such directory: {token}"))
+            .await?;
+        return Ok(());
+    };
+    // The root has no row of its own — it is always a listable directory.
+    let row = if rel.is_root() {
+        None
+    } else {
+        db.get_file(rel.as_str())?
+    };
+    match row {
+        // A file path answers with its single entry line, nothing else.
+        Some(row) if !row.is_dir => {
+            let size_kb = row.size.div_euclid(1024);
+            transport
+                .send_text(&format!("f {} ({size_kb} KB)", row.name))
+                .await?;
+            return Ok(());
+        }
+        // Missing, and not the root: the directory does not exist.
+        None if !rel.is_root() => {
+            transport
+                .send_text(&format!("no such directory: {token}"))
+                .await?;
+            return Ok(());
+        }
+        // A directory row, or the root: listed below.
+        _ => {}
+    }
+    let entries = db.list_dir(rel.as_str())?;
+    let mut lines = vec![format!("📁 {}", rel.as_str())];
+    if entries.is_empty() {
+        lines.push("(empty)".to_string());
+    } else {
+        for entry in entries.iter().take(LS_LIMIT) {
+            if entry.is_dir {
+                lines.push(format!("d {}/", entry.name));
+            } else {
+                // KB floor division, same as /search.
+                let size_kb = entry.size.div_euclid(1024);
+                lines.push(format!("f {} ({size_kb} KB)", entry.name));
+            }
+        }
+        let rest = entries.len().saturating_sub(LS_LIMIT);
+        if rest > 0 {
+            lines.push(format!("… and {rest} more"));
+        }
+    }
+    transport.send_text(&lines.join("\n")).await?;
+    Ok(())
+}
+
+/// `/mkdir <path>`: creates the directory row through [`Vfs::create_dir`]
+/// (DB only — no filesystem directory, mirroring the WebDAV layer);
+/// `Exists` / `ParentMissing` get their own short replies, anything else
+/// propagates. Self-designed wording (tier-1).
+async fn handle_mkdir(
+    vfs: &Vfs,
+    transport: &dyn CloudTransport,
+    text: &str,
+) -> Result<(), BotError> {
+    let Some(token) = split_maxsplit1(text) else {
+        transport.send_text("usage: /mkdir <path>").await?;
+        return Ok(());
+    };
+    // A polluted token cannot name a path; the usage line is the closest
+    // honest answer.
+    let Some(rel) = token_to_rel_path(token) else {
+        transport.send_text("usage: /mkdir <path>").await?;
+        return Ok(());
+    };
+    match vfs.create_dir(&rel) {
+        Ok(()) => transport.send_text(&format!("created: {token}")).await?,
+        Err(VfsError::Exists(_)) => {
+            transport
+                .send_text(&format!("already exists: {token}"))
+                .await?
+        }
+        Err(VfsError::ParentMissing(_)) => {
+            transport
+                .send_text(&format!("parent missing: {token}"))
+                .await?
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+/// `/rm <path>`: deletes the file's metadata row and its local cache copy
+/// ([`Vfs::remove_file`]); the remote Telegram messages are deliberately
+/// kept (Python parity) and the reply says so. Self-designed wording
+/// (tier-1).
+async fn handle_rm(vfs: &Vfs, transport: &dyn CloudTransport, text: &str) -> Result<(), BotError> {
+    let Some(token) = split_maxsplit1(text) else {
+        transport.send_text("usage: /rm <path>").await?;
+        return Ok(());
+    };
+    // A polluted token cannot name a stored path — "no such file" it is.
+    let Some(rel) = token_to_rel_path(token) else {
+        transport
+            .send_text(&format!("no such file: {token}"))
+            .await?;
+        return Ok(());
+    };
+    match vfs.remove_file(&rel).await {
+        Ok(()) => {
+            transport
+                .send_text(&format!(
+                    "deleted: {token} (remote Telegram messages are kept)"
+                ))
+                .await?
+        }
+        Err(VfsError::NotFound(_)) => {
+            transport
+                .send_text(&format!("no such file: {token}"))
+                .await?
+        }
+        Err(VfsError::IsDirectory(_)) => {
+            transport
+                .send_text(&format!("is a directory: {token}"))
+                .await?
+        }
+        Err(error) => return Err(error.into()),
+    }
+    Ok(())
+}
+
+/// `/quota`: the mapped drive letter, floor-divided MB total, dir count
+/// and the pending-upload tally (`Stats::pending_uploads`). Self-designed
+/// wording (tier-1).
+async fn handle_quota(
+    db: &Arc<MetaDatabase>,
+    transport: &dyn CloudTransport,
+    drive_letter: &str,
+) -> Result<(), BotError> {
+    let stats = db.get_stats()?;
+    // MB floor division, /stats style (`total_bytes // (1024*1024)`).
+    let total_mb = stats.total_bytes.div_euclid(1024 * 1024);
+    let quota_text = format!(
+        "💾 /{drive_letter}\nfiles: {} ({total_mb} MB)\ndirs: {}\npending uploads: {}",
+        stats.total_files, stats.total_dirs, stats.pending_uploads
+    );
+    transport.send_text(&quota_text).await?;
+    Ok(())
+}
+
+/// `/queue`: the four atomic queue counters plus the DB pending-uploads
+/// tally — the exact two sources the dashboard's `/api/queue` combines.
+/// One line, self-designed wording (tier-1).
+async fn handle_queue(
+    db: &Arc<MetaDatabase>,
+    vfs: &Vfs,
+    transport: &dyn CloudTransport,
+) -> Result<(), BotError> {
+    let queue = vfs.queue_stats();
+    let pending = db.get_stats()?.pending_uploads;
+    transport
+        .send_text(&format!(
+            "queue: enqueued={} succeeded={} retries={} degraded={} pending={pending}",
+            queue.enqueued, queue.succeeded, queue.retries, queue.degraded
+        ))
+        .await?;
     Ok(())
 }
 
