@@ -669,6 +669,11 @@ fn vfs_err(error: VfsError) -> FsError {
         // EISDIR to Forbidden, so mirror that. MissingPassword is a
         // policy refusal -> Forbidden as well.
         VfsError::IsDirectory(_) | VfsError::MissingPassword => FsError::Forbidden,
+        // Same conventions this adapter already uses: duplicate target is
+        // Exists (405); missing parent maps to NotFound, which dav-server
+        // turns into 409 on PUT/MKCOL (see `require_dir_parent`).
+        VfsError::Exists(_) => FsError::Exists,
+        VfsError::ParentMissing(_) => FsError::NotFound,
         VfsError::QueueClosed
         | VfsError::Db(_)
         | VfsError::Transport(_)
