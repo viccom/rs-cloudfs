@@ -78,6 +78,9 @@ const KNOWN_TOML_KEYS: &[&str] = &[
     "auto_mount_drive",
     "chunk_size_mb",
     "cache_limit_gb",
+    "upload_workers",
+    "queue_capacity",
+    "hydrate_timeout_secs",
     "encryption_password",
     "enable_encryption",
     "proxy_url",
@@ -94,6 +97,28 @@ const NUMERIC_JSON_KEYS: &[&str] = &[
     "chunk_size_mb",
     "cache_limit_gb",
 ];
+
+/// Rust-added tuning keys that a legacy `config.json` must **reject**
+/// (unlike the other unknown keys, which stay silently ignored per the
+/// Python filter semantics): accepting them would make the user believe a
+/// setting takes effect when the legacy loader cannot honour it. The
+/// canonical `config.toml` accepts all three.
+const LEGACY_REJECTED_KEYS: &[&str] = &["upload_workers", "queue_capacity", "hydrate_timeout_secs"];
+
+/// Default `upload_workers` (tier-1 contract C6).
+fn default_upload_workers() -> u32 {
+    2
+}
+
+/// Default `queue_capacity` (tier-1 contract C6).
+fn default_queue_capacity() -> u32 {
+    256
+}
+
+/// Default `hydrate_timeout_secs` (tier-1 contract C6).
+fn default_hydrate_timeout_secs() -> u64 {
+    180
+}
 
 /// Stringifies a path the way [`ConfigError`] variants expect ("as given").
 fn path_as_str(path: &Path) -> String {
@@ -165,6 +190,18 @@ pub struct CyDriveConfig {
     pub chunk_size_mb: u64,
     /// Cache capacity in GB.
     pub cache_limit_gb: u64,
+    /// Number of concurrent workers draining the upload queue
+    /// (valid range 1..=32).
+    #[serde(default = "default_upload_workers")]
+    pub upload_workers: u32,
+    /// Bounded capacity of the upload queue; must be `>= upload_workers`
+    /// and at most 100 000.
+    #[serde(default = "default_queue_capacity")]
+    pub queue_capacity: u32,
+    /// Per-file hydration (download) timeout in seconds
+    /// (valid range 1..=86 400).
+    #[serde(default = "default_hydrate_timeout_secs")]
+    pub hydrate_timeout_secs: u64,
     /// Client-side encryption password; must be set and non-empty when
     /// `enable_encryption` is `true`.
     pub encryption_password: Option<String>,
@@ -200,6 +237,9 @@ impl Default for CyDriveConfig {
             auto_mount_drive: true,
             chunk_size_mb: 1900,
             cache_limit_gb: 20,
+            upload_workers: default_upload_workers(),
+            queue_capacity: default_queue_capacity(),
+            hydrate_timeout_secs: default_hydrate_timeout_secs(),
             encryption_password: None,
             enable_encryption: false,
             proxy_url: None,
@@ -321,6 +361,23 @@ impl CyDriveConfig {
                 path: path_str.clone(),
                 message: err.to_string(),
             })?;
+        // The legacy key set is frozen at the Python dataclass fields: the
+        // Rust-added tuning keys are rejected instead of silently ignored
+        // (Python filter semantics) so the user is not left believing a
+        // setting takes effect when the legacy loader cannot honour it.
+        if let serde_json::Value::Object(map) = &root {
+            for key in LEGACY_REJECTED_KEYS {
+                if map.contains_key(*key) {
+                    return Err(ConfigError::Parse {
+                        path: path_str.clone(),
+                        message: format!(
+                            "unknown key `{key}`; this tuning key is not part of the \
+                             legacy config.json — use config.toml instead"
+                        ),
+                    });
+                }
+            }
+        }
         // Python leniency for numeric fields: accept numeric strings by
         // normalising them to JSON numbers before the typed conversion.
         // Non-numeric strings are left in place and rejected as a type
@@ -450,6 +507,9 @@ impl CyDriveConfig {
     /// * `webdav_port` and `web_ui_port`: must be non-zero.
     /// * `enable_encryption == true` requires `encryption_password` to be
     ///   `Some` and non-empty.
+    /// * `upload_workers`: must be in `1..=32`.
+    /// * `queue_capacity`: must be `>= upload_workers` and at most `100_000`.
+    /// * `hydrate_timeout_secs`: must be in `1..=86_400`.
     ///
     /// Returns `Ok(())` when every rule holds.
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -489,6 +549,24 @@ impl CyDriveConfig {
             return Err(ConfigError::Invalid(
                 "enable_encryption requires a non-empty encryption_password".to_string(),
             ));
+        }
+        if !(1..=32).contains(&self.upload_workers) {
+            return Err(ConfigError::Invalid(format!(
+                "upload_workers must be in 1..=32, got {}",
+                self.upload_workers
+            )));
+        }
+        if self.queue_capacity < self.upload_workers || self.queue_capacity > 100_000 {
+            return Err(ConfigError::Invalid(format!(
+                "queue_capacity must be >= upload_workers ({}) and <= 100000, got {}",
+                self.upload_workers, self.queue_capacity
+            )));
+        }
+        if !(1..=86_400).contains(&self.hydrate_timeout_secs) {
+            return Err(ConfigError::Invalid(format!(
+                "hydrate_timeout_secs must be in 1..=86400, got {}",
+                self.hydrate_timeout_secs
+            )));
         }
         Ok(())
     }

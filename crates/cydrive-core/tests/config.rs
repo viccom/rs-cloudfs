@@ -216,6 +216,9 @@ fn toml_roundtrip_preserves_full_config() {
         auto_mount_drive: false,
         chunk_size_mb: 2000,
         cache_limit_gb: 7,
+        upload_workers: 2,
+        queue_capacity: 256,
+        hydrate_timeout_secs: 180,
         encryption_password: None,
         enable_encryption: false,
         proxy_url: None,
@@ -494,7 +497,10 @@ fn toml_new_tuning_keys_parse_with_defaults_when_absent() {
 
     let cfg = CyDriveConfig::load_toml(&path).expect("toml without tuning keys loads");
     assert_eq!(cfg.upload_workers, 2, "upload_workers default must be 2");
-    assert_eq!(cfg.queue_capacity, 256, "queue_capacity default must be 256");
+    assert_eq!(
+        cfg.queue_capacity, 256,
+        "queue_capacity default must be 256"
+    );
     assert_eq!(
         cfg.hydrate_timeout_secs, 180,
         "hydrate_timeout_secs default must be 180"
