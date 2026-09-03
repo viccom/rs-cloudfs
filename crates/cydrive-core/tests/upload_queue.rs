@@ -920,3 +920,165 @@ async fn sha256_computed_before_upload_survives_local_delete() {
         "digest computed before the upload survives the local delete"
     );
 }
+
+// ---------------------------------------------------------------------------
+// Tier-1 degradation notification — plan contract C9: when a job degrades
+// (retry exhaustion), the queue sends exactly one best-effort bot notice
+// via `send_text`; a failing notification must never break the degrade
+// path. The notice itself names the file, reports the failure and the
+// attempt count ("upload failed after {n} attempts").
+// ---------------------------------------------------------------------------
+
+/// 22. Degradation sends exactly one `send_text` notice carrying the
+///     rel_path, the word "failed" and the attempt count (3 ==
+///     max_attempts). The row stays pending and the local copy is kept,
+///     as the notice promises.
+#[tokio::test]
+async fn degrade_sends_bot_notification() {
+    let mock = MockTransport::builder()
+        .upload_action(UploadAction::Fail {
+            error: TransportError::Disconnected("down 1".into()),
+        })
+        .upload_action(UploadAction::Fail {
+            error: TransportError::Disconnected("down 2".into()),
+        })
+        .upload_action(UploadAction::Fail {
+            error: TransportError::Disconnected("down 3".into()),
+        })
+        .build();
+    let (_dir, db, cache, mock) = test_env_with_mock(mock).await;
+    let local = seed_pending(&db, &cache, "/notified.bin", b"notify me", 1);
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let handle = spawn_queue(db.clone(), transport, test_cfg(64));
+
+    handle
+        .enqueue(job_for(&cache, "/notified.bin", 9, 1, 64))
+        .await
+        .expect("enqueue");
+    handle.shutdown().await;
+
+    assert_eq!(handle.stats().degraded, 1, "the job degraded");
+    let texts = mock.sent_texts();
+    assert_eq!(
+        texts.len(),
+        1,
+        "exactly one degradation notice, no retry chatter: {texts:?}"
+    );
+    assert!(
+        texts[0].contains("/notified.bin"),
+        "the notice names the file: {}",
+        texts[0]
+    );
+    assert!(
+        texts[0].contains("failed"),
+        "the notice reports the failure: {}",
+        texts[0]
+    );
+    assert!(
+        texts[0].contains("after 3 attempts"),
+        "the attempt count equals max_attempts: {}",
+        texts[0]
+    );
+    assert!(local.exists(), "degraded local file is kept");
+    let row = db
+        .get_file("/notified.bin")
+        .expect("db read")
+        .expect("row exists");
+    assert!(!row.is_uploaded, "row stays pending after degradation");
+}
+
+/// Harness for test 23: a fully delegating wrapper whose `send_text`
+/// always errors (counting attempts, so the red phase proves the notice
+/// is even attempted); every other operation passes through untouched.
+struct BrokenSendTextTransport {
+    inner: Arc<MockTransport>,
+    send_text_calls: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl CloudTransport for BrokenSendTextTransport {
+    async fn connect(&self) -> Result<(), TransportError> {
+        self.inner.connect().await
+    }
+
+    async fn upload(&self, job: &UploadJob) -> Result<UploadReceipt, TransportError> {
+        self.inner.upload(job).await
+    }
+
+    async fn open(
+        &self,
+        file: &cydrive_core::transport::RemoteHandle,
+    ) -> Result<cydrive_core::transport::ByteStream, TransportError> {
+        self.inner.open(file).await
+    }
+
+    async fn open_range(
+        &self,
+        file: &cydrive_core::transport::RemoteHandle,
+        off: u64,
+        len: u64,
+    ) -> Result<cydrive_core::transport::ByteStream, TransportError> {
+        self.inner.open_range(file, off, len).await
+    }
+
+    async fn delete_remote(&self, msg_id: i32) -> Result<(), TransportError> {
+        self.inner.delete_remote(msg_id).await
+    }
+
+    fn incoming(&self) -> cydrive_core::transport::IncomingStream {
+        self.inner.incoming()
+    }
+
+    async fn send_text(&self, _text: &str) -> Result<(), TransportError> {
+        self.send_text_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        Err(TransportError::Remote("send_text is broken".into()))
+    }
+}
+
+/// 23. A failing degradation notification is swallowed: the worker still
+///     counts the degrade, keeps the row pending and the local copy, and
+///     shuts down cleanly — no panic, no lost terminal state. The attempt
+///     counter pins that the notice was attempted exactly once.
+#[tokio::test]
+async fn degrade_notification_failure_is_swallowed() {
+    let mock = MockTransport::builder()
+        .upload_action(UploadAction::Fail {
+            error: TransportError::Disconnected("down 1".into()),
+        })
+        .upload_action(UploadAction::Fail {
+            error: TransportError::Disconnected("down 2".into()),
+        })
+        .upload_action(UploadAction::Fail {
+            error: TransportError::Disconnected("down 3".into()),
+        })
+        .build();
+    let (_dir, db, cache, mock) = test_env_with_mock(mock).await;
+    let local = seed_pending(&db, &cache, "/swallowed.bin", b"swallow me", 1);
+    let send_text_calls = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let transport: Arc<dyn CloudTransport> = Arc::new(BrokenSendTextTransport {
+        inner: mock.clone(),
+        send_text_calls: Arc::clone(&send_text_calls),
+    });
+    let handle = spawn_queue(db.clone(), transport, test_cfg(64));
+
+    handle
+        .enqueue(job_for(&cache, "/swallowed.bin", 10, 1, 64))
+        .await
+        .expect("enqueue");
+    handle.shutdown().await;
+
+    assert_eq!(
+        send_text_calls.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the degrade path attempted exactly one notification"
+    );
+    assert_eq!(handle.stats().degraded, 1, "the degrade still counted");
+    assert_eq!(handle.stats().succeeded, 0);
+    let row = db
+        .get_file("/swallowed.bin")
+        .expect("db read")
+        .expect("row exists");
+    assert!(!row.is_uploaded, "row stays pending");
+    assert!(local.exists(), "local copy kept");
+}

@@ -395,3 +395,312 @@ async fn worker_dispatches_stats() {
     handle.shutdown().await;
     vfs.shutdown().await;
 }
+
+// ---------------------------------------------------------------------------
+// Tier-1 bot commands (/ls /mkdir /rm /quota /queue) — plan contract C8.
+// All reply texts are new (no Python baseline); expected strings are pinned
+// to the plan's contract table verbatim.
+// ---------------------------------------------------------------------------
+
+/// `/help` must list the five new commands alongside the baseline ones.
+#[tokio::test]
+async fn help_text_lists_new_commands() {
+    let (_dir, db, vfs, mock) = bot_env().await;
+
+    handle_command(&db, &vfs, &*mock, "Y:", "/help")
+        .await
+        .expect("handle /help");
+
+    let texts = mock.sent_texts();
+    assert_eq!(texts.len(), 1);
+    for command in ["/ls", "/mkdir", "/rm", "/quota", "/queue"] {
+        assert!(
+            texts[0].contains(command),
+            "help text must list {command}: {}",
+            texts[0]
+        );
+    }
+    vfs.shutdown().await;
+}
+
+/// `/ls` at the root: 25 entries (24 files + 1 dir) collapse into the
+/// header line, exactly 20 entry lines (dirs first, then name ASC) and
+/// one `… and 5 more` line. Entry formats are pinned: `d {name}/` and
+/// `f {name} ({size/1024} KB)` with floor-divided KB.
+#[tokio::test]
+async fn ls_root_lists_entries_with_cap() {
+    let (_dir, db, vfs, mock) = bot_env().await;
+    for index in 0..24 {
+        seed_file(&db, &format!("/file_{index:02}.txt"), 2048, true);
+    }
+    seed_dir(&db, "/zdir");
+
+    handle_command(&db, &vfs, &*mock, "Y:", "/ls")
+        .await
+        .expect("handle /ls");
+
+    let texts = mock.sent_texts();
+    assert_eq!(texts.len(), 1);
+    let lines: Vec<&str> = texts[0].lines().collect();
+    assert_eq!(lines[0], "📁 /", "the first line echoes the path");
+    assert_eq!(
+        lines.len(),
+        22,
+        "1 header + 20 entry lines + 1 more-line, got: {texts:?}"
+    );
+    assert_eq!(
+        lines[1], "d zdir/",
+        "directory entries use the `d <name>/` format"
+    );
+    for (offset, line) in lines[2..=20].iter().enumerate() {
+        assert_eq!(
+            *line,
+            format!("f file_{offset:02}.txt (2 KB)"),
+            "file entries keep `f <name> (<kb> KB)`, name ASC after the dirs"
+        );
+    }
+    assert_eq!(lines[21], "… and 5 more");
+    assert!(
+        !texts[0].contains("file_19"),
+        "entries past the cap are folded into the more-line"
+    );
+    vfs.shutdown().await;
+}
+
+/// `/ls <file path>` answers with that file's single entry line.
+#[tokio::test]
+async fn ls_specific_file_replies_single_line() {
+    let (_dir, db, vfs, mock) = bot_env().await;
+    seed_file(&db, "/solo.txt", 2048, true);
+
+    handle_command(&db, &vfs, &*mock, "Y:", "/ls /solo.txt")
+        .await
+        .expect("handle /ls on a file path");
+
+    let texts = mock.sent_texts();
+    assert_eq!(texts.len(), 1);
+    assert_eq!(
+        texts[0], "f solo.txt (2 KB)",
+        "a file path answers with its single entry line, nothing else"
+    );
+    vfs.shutdown().await;
+}
+
+/// `/ls <missing path>` answers `no such directory: {path}`.
+#[tokio::test]
+async fn ls_missing_dir_errors() {
+    let (_dir, db, vfs, mock) = bot_env().await;
+
+    handle_command(&db, &vfs, &*mock, "Y:", "/ls /nope")
+        .await
+        .expect("handle /ls on a missing path");
+
+    let texts = mock.sent_texts();
+    assert_eq!(texts.len(), 1);
+    assert_eq!(texts[0], "no such directory: /nope");
+    vfs.shutdown().await;
+}
+
+/// `/ls` of a directory with no children answers `(empty)`.
+#[tokio::test]
+async fn ls_empty_dir_replies_empty_marker() {
+    let (_dir, db, vfs, mock) = bot_env().await;
+    vfs.create_dir(&RelPath::new("/empty").expect("valid path"))
+        .expect("create the empty directory");
+
+    handle_command(&db, &vfs, &*mock, "Y:", "/ls /empty")
+        .await
+        .expect("handle /ls on an empty directory");
+
+    let texts = mock.sent_texts();
+    assert_eq!(texts.len(), 1);
+    assert!(
+        texts[0].contains("(empty)"),
+        "an empty directory answers `(empty)`: {}",
+        texts[0]
+    );
+    vfs.shutdown().await;
+}
+
+/// `/mkdir` creates the directory row; a second `/mkdir` of the same path
+/// reports `already exists` instead of failing.
+#[tokio::test]
+async fn mkdir_creates_and_reports_exists() {
+    let (_dir, db, vfs, mock) = bot_env().await;
+
+    handle_command(&db, &vfs, &*mock, "Y:", "/mkdir /newdir")
+        .await
+        .expect("handle first /mkdir");
+    handle_command(&db, &vfs, &*mock, "Y:", "/mkdir /newdir")
+        .await
+        .expect("handle second /mkdir");
+
+    let texts = mock.sent_texts();
+    assert_eq!(texts.len(), 2);
+    assert_eq!(texts[0], "created: /newdir");
+    assert_eq!(texts[1], "already exists: /newdir");
+    let row = db
+        .get_file("/newdir")
+        .expect("db read")
+        .expect("directory row exists");
+    assert!(row.is_dir, "/mkdir produced a directory row");
+    vfs.shutdown().await;
+}
+
+/// `/rm` of a real file: the row is gone, the reply confirms the deletion
+/// and states that the remote Telegram message is kept (Python parity).
+#[tokio::test]
+async fn rm_deletes_file_and_mentions_remote_kept() {
+    let (_dir, db, vfs, mock) = bot_env().await;
+    mock.connect().await.expect("open the mock gate");
+    let rel = RelPath::new("/rm_me.bin").expect("valid path");
+    vfs.put(&rel, b"rm payload", 0.0)
+        .await
+        .expect("put the file");
+    wait_uploaded(&db, "/rm_me.bin").await;
+
+    handle_command(&db, &vfs, &*mock, "Y:", "/rm /rm_me.bin")
+        .await
+        .expect("handle /rm");
+
+    let texts = mock.sent_texts();
+    assert_eq!(texts.len(), 1);
+    assert!(
+        texts[0].contains("deleted: /rm_me.bin"),
+        "the reply confirms the deletion: {}",
+        texts[0]
+    );
+    assert!(
+        texts[0].to_lowercase().contains("remote"),
+        "the reply mentions the remote message being kept: {}",
+        texts[0]
+    );
+    assert!(
+        db.get_file("/rm_me.bin").expect("db read").is_none(),
+        "the row is gone after /rm"
+    );
+    vfs.shutdown().await;
+}
+
+/// `/rm` of a missing path answers `no such file: {path}`.
+#[tokio::test]
+async fn rm_missing_errors() {
+    let (_dir, db, vfs, mock) = bot_env().await;
+
+    handle_command(&db, &vfs, &*mock, "Y:", "/rm /ghost.bin")
+        .await
+        .expect("handle /rm on a missing path");
+
+    let texts = mock.sent_texts();
+    assert_eq!(texts.len(), 1);
+    assert_eq!(texts[0], "no such file: /ghost.bin");
+    vfs.shutdown().await;
+}
+
+/// `/rm` of a directory answers `is a directory: {path}` (no recursive
+/// delete in tier 1).
+#[tokio::test]
+async fn rm_directory_errors() {
+    let (_dir, db, vfs, mock) = bot_env().await;
+    seed_dir(&db, "/docs");
+
+    handle_command(&db, &vfs, &*mock, "Y:", "/rm /docs")
+        .await
+        .expect("handle /rm on a directory");
+
+    let texts = mock.sent_texts();
+    assert_eq!(texts.len(), 1);
+    assert_eq!(texts[0], "is a directory: /docs");
+    vfs.shutdown().await;
+}
+
+/// `/quota`: first line names the mapped drive letter, then the file
+/// count with the floor-divided MB total, the dir count and the pending
+/// upload count (2 files of 1 MiB + 2 MiB -> `files: 2 (3 MB)`).
+#[tokio::test]
+async fn quota_reports_counts_and_bytes() {
+    let (_dir, db, vfs, mock) = bot_env().await;
+    seed_file(&db, "/q_a.bin", 1_048_576, true);
+    seed_file(&db, "/q_b.bin", 2_097_152, true);
+    seed_dir(&db, "/qdir");
+
+    handle_command(&db, &vfs, &*mock, "Y:", "/quota")
+        .await
+        .expect("handle /quota");
+
+    let texts = mock.sent_texts();
+    assert_eq!(texts.len(), 1);
+    let lines: Vec<&str> = texts[0].lines().collect();
+    assert_eq!(
+        lines.len(),
+        4,
+        "header + files + dirs + pending uploads, got: {texts:?}"
+    );
+    assert!(
+        lines[0].contains("Y:"),
+        "the first line names the mapped drive letter: {lines:?}"
+    );
+    assert_eq!(
+        lines[1], "files: 2 (3 MB)",
+        "3 MiB over non-directory rows, MB floor-divided"
+    );
+    assert_eq!(lines[2], "dirs: 1");
+    assert_eq!(lines[3], "pending uploads: 0");
+    vfs.shutdown().await;
+}
+
+/// `/queue` reports the five counters on one line. Harness: the first job
+/// eats the two scripted failures (two retries) then succeeds against the
+/// exhausted script; the second job succeeds first try. All jobs drained
+/// before the command runs, so every value is deterministic.
+#[tokio::test]
+async fn queue_reports_counters() {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let db = Arc::new(MetaDatabase::open(&dir.path().join("meta.db")).expect("open temp db"));
+    let mock = Arc::new(
+        MockTransport::builder()
+            .upload_action(cydrive_core::transport::mock::UploadAction::Fail {
+                error: cydrive_core::transport::TransportError::Disconnected("flaky 1".into()),
+            })
+            .upload_action(cydrive_core::transport::mock::UploadAction::Fail {
+                error: cydrive_core::transport::TransportError::Disconnected("flaky 2".into()),
+            })
+            .build(),
+    );
+    mock.connect().await.expect("open the mock gate");
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let vfs = Arc::new(Vfs::new(
+        Arc::clone(&db),
+        CacheManager::new(dir.path().join("cache"), 64 * 1024 * 1024),
+        Arc::clone(&transport),
+        test_cfg(),
+    ));
+
+    for name in ["/q_one.bin", "/q_two.bin"] {
+        let rel = RelPath::new(name).expect("valid path");
+        vfs.put(&rel, b"queue payload", 0.0)
+            .await
+            .expect("put the file");
+    }
+    wait_uploaded(&db, "/q_one.bin").await;
+    wait_uploaded(&db, "/q_two.bin").await;
+    // Drain to the terminal state so succeeded/retries are final.
+    for _ in 0..200 {
+        if vfs.queue_stats().succeeded == 2 {
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    handle_command(&db, &vfs, &*mock, "Y:", "/queue")
+        .await
+        .expect("handle /queue");
+
+    let texts = mock.sent_texts();
+    assert_eq!(texts.len(), 1);
+    assert_eq!(
+        texts[0], "queue: enqueued=2 succeeded=2 retries=2 degraded=0 pending=0",
+        "one line, counter order enqueued/succeeded/retries/degraded/pending"
+    );
+    vfs.shutdown().await;
+}
