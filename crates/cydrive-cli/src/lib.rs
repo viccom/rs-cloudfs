@@ -46,6 +46,49 @@ pub mod setup;
 
 pub use keyring_store::KeyringStore;
 
+/// Failure modes of [`connect_with_deadline`].
+#[derive(Debug, thiserror::Error)]
+pub enum ConnectGuardError<E> {
+    /// The connect future did not finish within the budget.
+    #[error("connect did not finish within {0:?}")]
+    Deadline(std::time::Duration),
+    /// The connect future finished with this error before the deadline.
+    #[error(transparent)]
+    Inner(E),
+}
+
+/// Bounds a (potentially blocked) connect future by a deadline so the CLI
+/// can surface a human-readable diagnosis instead of hanging silently.
+///
+/// Real-machine regression (2026-09-02): a network-blocked Telegram
+/// connect showed zero output for tens of seconds and a Ctrl+C in that
+/// window hard-killed the process; every connect must therefore be
+/// visibly bounded.
+pub async fn connect_with_deadline<F, T, E>(
+    fut: F,
+    deadline: std::time::Duration,
+) -> Result<T, ConnectGuardError<E>>
+where
+    F: std::future::Future<Output = Result<T, E>>,
+{
+    match tokio::time::timeout(deadline, fut).await {
+        Ok(result) => result.map_err(ConnectGuardError::Inner),
+        Err(_elapsed) => Err(ConnectGuardError::Deadline(deadline)),
+    }
+}
+
+/// Human-readable diagnosis printed when the Telegram connect fails:
+/// the dominant real-world causes are an unreachable network (region
+/// blocking; CyDrive has no built-in proxy yet) and an invalid token.
+pub fn connect_failure_hint() -> String {
+    "Cannot reach Telegram. Common causes:\n  \
+     1) Telegram servers unreachable from this network (timeout / os error 10060) —\n\
+     \x20    use a system-wide VPN/TUN; CyDrive has no built-in proxy yet;\n  \
+     2) invalid bot token — re-run `cydrive setup`;\n  \
+     3) no internet — check the connection and retry."
+        .to_string()
+}
+
 /// Bytes per GB — cache capacity conversion (`cache_limit_gb`).
 const BYTES_PER_GB: u64 = 1024 * 1024 * 1024;
 
@@ -309,13 +352,17 @@ fn mount_if_configured(cfg: &CyDriveConfig) -> Option<String> {
         return None;
     }
     let url = default_mount_url(cfg);
+    println!("Mounting drive letter {} -> {} ...", cfg.drive_letter, url);
     match cydrive_platform::windows::mount_drive(&cfg.drive_letter, &url) {
         Ok(letter) => {
-            tracing::info!(letter = %letter, url = %url, "drive mapped");
+            println!("Drive mounted: {letter} -> {url}");
             Some(letter)
         }
         Err(error) => {
-            tracing::warn!(%error, url = %url, "auto-mount failed; WebDAV stays at its URL");
+            println!("Auto-mount FAILED ({error}); WebDAV stays reachable at {url}.");
+            println!(
+                "  Hints: run `cydrive fix-reg` in an elevated shell, ensure the WebClient                  service can start, and check that the letter is free (`cydrive doctor`)."
+            );
             None
         }
     }

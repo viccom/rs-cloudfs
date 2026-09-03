@@ -191,7 +191,19 @@ fn setup_cmd() -> Result<()> {
 /// The production run flow; every step here is covered by the library
 /// tests except the transport connect, which needs real Telegram
 /// credentials and is compile-verified only.
+///
+/// UX contract (real-machine regression 2026-09-02): every long phase
+/// prints visible progress BEFORE blocking, the Telegram connect is
+/// deadline-bounded (90s) with a human-readable diagnosis on failure,
+/// and Ctrl+C during the connect phase exits cleanly instead of
+/// hard-killing the process with no output.
 async fn run() -> Result<()> {
+    let cwd = std::env::current_dir().context("resolving the working directory")?;
+    println!(
+        "cydrive {} starting in {}",
+        env!("CARGO_PKG_VERSION"),
+        cwd.display()
+    );
     let cfg = discover_config().context("config discovery failed")?;
     cfg.validate().context("invalid configuration")?;
     if !cfg.is_configured() {
@@ -205,28 +217,60 @@ async fn run() -> Result<()> {
     // Pretty/INFO on stdout; a parseable RUST_LOG overrides the level.
     cydrive_core::logging::init(&LogConfig::default()).context("initializing logging")?;
 
+    let session_path = cwd.join(format!("{DEFAULT_SESSION_STEM}.session"));
     let transport_config = TransportConfig {
         api_id: DEFAULT_API_ID,
         api_hash: DEFAULT_API_HASH.to_owned(),
         bot_token: cfg.bot_token.clone(),
         chat_id: cfg.chat_id,
-        session_path: std::env::current_dir()
-            .context("resolving the working directory")?
-            .join(format!("{DEFAULT_SESSION_STEM}.session")),
+        session_path: session_path.clone(),
     };
-    let transport = GrammersTransport::connect(transport_config)
-        .await
-        .context("connecting the Telegram transport")?;
+    println!(
+        "Connecting to Telegram (session: {}) ...",
+        session_path.display()
+    );
+    let connect = cydrive_cli::connect_with_deadline(
+        GrammersTransport::connect(transport_config),
+        std::time::Duration::from_secs(90),
+    );
+    let transport = tokio::select! {
+        result = connect => match result {
+            Ok(transport) => transport,
+            Err(error) => {
+                eprintln!("Error: connecting the Telegram transport");
+                match &error {
+                    cydrive_cli::ConnectGuardError::Deadline(_) => {}
+                    cydrive_cli::ConnectGuardError::Inner(source) => {
+                        eprintln!("Caused by:\n    {source}");
+                    }
+                }
+                eprintln!("{}", cydrive_cli::connect_failure_hint());
+                std::process::exit(1);
+            }
+        },
+        _ = tokio::signal::ctrl_c() => {
+            println!("Interrupted while connecting to Telegram; exiting.");
+            return Ok(());
+        }
+    };
 
     let handle = run_with_transport(&cfg, Arc::new(transport)).await?;
-    tracing::info!(
-        webdav = %handle.local_addr(),
-        "CyDrive is running; press Ctrl+C to stop"
+    println!(
+        "CyDrive is running: WebDAV at http://{}  |  dashboard at http://127.0.0.1:{}  |  press Ctrl+C to stop",
+        handle.local_addr(),
+        cfg.web_ui_port
     );
+    if handle.mounted_letter.is_none() && cfg.auto_mount_drive && cfg!(windows) {
+        println!(
+            "Note: no drive letter was mapped (see the log above); `cydrive fix-reg` in an \
+             elevated shell and a running WebClient are prerequisites for Explorer mapping."
+        );
+    }
 
     tokio::signal::ctrl_c()
         .await
         .context("waiting for Ctrl+C")?;
+    println!("Shutting down (draining uploads, unmounting) ...");
     handle.shutdown().await;
     Ok(())
 }

@@ -31,6 +31,7 @@ dialoguer = "0.12.0"
 # crate linkable everywhere; CyDrive's supported platforms all carry a
 # real store in the target sections).
 keyring = "3"
+thiserror = "2"
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
 tracing = "0.1"
 

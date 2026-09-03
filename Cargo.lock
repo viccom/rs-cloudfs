@@ -714,6 +714,7 @@ dependencies = [
  "dialoguer",
  "keyring",
  "tempfile",
+ "thiserror",
  "tokio",
  "tracing",
 ]
