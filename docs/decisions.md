@@ -77,3 +77,8 @@
 
 - **现象与根因**：用户 `cydrive run` 零输出退出、无 Y 盘。复现确认：Telegram 连接阶段无任何日志（UX 缺陷），Ctrl+C 在 ctrl_c handler 安装前触发即硬杀进程（无输出）；底层错误为 os error 10060——**本机直连 Telegram DC 超时**（网络/地区封锁特征）。修复（connect_guard 3 测试 + main.rs/lib.rs UX）：启动横幅、连接进度 println、`connect_with_deadline` 90 秒死线 + 人话诊断（VPN/代理/token 三因）、连接期 Ctrl+C 干净退出、挂载结果醒目打印。本机实测输出完整。
 - **待负责人裁决**：grammers 0.10 未配代理参数，Python telethon 支持 `proxy=`——若用户网络常态封锁 Telegram，需评估 ①系统级 VPN/TUN（零改动，当前方案）vs ②内建 SOCKS/MTProto 代理支持（新功能单元，涉及 mtsender 连接器改造）。用户确认网络形态后定。
+
+## 2026-09-03 代理裁决落地：SOCKS5（负责人选定 Clash Verge 7897）；MTProto fake-TLS 延后
+
+- **裁决**：负责人环境 = Clash Verge 本地混合端口 127.0.0.1:7897。采纳 SOCKS5 路线（grammers `proxy` feature + `ConnectionParams.proxy_url` + `CyDriveConfig.proxy_url`/`CYDRIVE_PROXY_URL`）。负责人原 MTProto 密钥经识别为 **fake-TLS（dd 型）伪装密钥**（42 hex，尾部嵌 ASCII 域名）——直接吃它需实现 fake-TLS 握手 + Intermediate 传输切换（grammers 连接硬编码 Full），工程量大且协议参考受网络限制，**列为 v2 待需求确认**。
+- **真机验证（2026-09-03，本机）**：经 7897 用负责人真实 bot token 完成 bot_sign_in（session 落盘），全栈启动；仪表盘 200 / api/stats 200 / WebDAV PROPFIND 207。首次真实 Telegram 互通达成。
