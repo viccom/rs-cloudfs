@@ -72,3 +72,8 @@
 - **CI 工作流已写未触发**：`.github/workflows/ci.yml`（win+ubuntu 矩阵，fmt/clippy -D warnings/test）按红线未 push，激活待人工。本地以相同三步门禁全绿（272 passed / 0 failed）等效预验；Linux 侧 apt 依赖按分析预计为零（rusqlite bundled 自带 C 编译即可、keyring 走 zbus 纯 Rust），首跑校准点已注释标注。
 - **cargo-dist 配置提交未实跑**：`[workspace.metadata.dist]`（v0.32.0，2026-05-21 最新，ci=false 手动发布模式）；工具未安装，plan/build 留给发布时刻。
 - **vendor LICENSE 补齐**：grammers-session 的 LICENSE-MIT/LICENSE-APACHE 从 Codeberg 上游 raw（HTTP 200）原样取回入库，VENDOR.md 状态已同步。
+
+## 2026-09-02 真机首跑发现：连接期零输出 + 本机网络不可达 Telegram（10060）
+
+- **现象与根因**：用户 `cydrive run` 零输出退出、无 Y 盘。复现确认：Telegram 连接阶段无任何日志（UX 缺陷），Ctrl+C 在 ctrl_c handler 安装前触发即硬杀进程（无输出）；底层错误为 os error 10060——**本机直连 Telegram DC 超时**（网络/地区封锁特征）。修复（connect_guard 3 测试 + main.rs/lib.rs UX）：启动横幅、连接进度 println、`connect_with_deadline` 90 秒死线 + 人话诊断（VPN/代理/token 三因）、连接期 Ctrl+C 干净退出、挂载结果醒目打印。本机实测输出完整。
+- **待负责人裁决**：grammers 0.10 未配代理参数，Python telethon 支持 `proxy=`——若用户网络常态封锁 Telegram，需评估 ①系统级 VPN/TUN（零改动，当前方案）vs ②内建 SOCKS/MTProto 代理支持（新功能单元，涉及 mtsender 连接器改造）。用户确认网络形态后定。
