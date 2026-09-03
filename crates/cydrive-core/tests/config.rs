@@ -472,3 +472,121 @@ fn validate_requires_non_empty_password_for_encryption() {
         .validate()
         .expect("Some non-empty password with encryption is fine");
 }
+
+// ------------------------------------------------ tuning keys (C6) ---
+//
+// Tier-1 plan (`docs/plans/2026-09-03-tier1-utilities.md`, contract C6):
+// three new `config.toml` tuning keys — `upload_workers` (`u32`, default 2,
+// valid `1..=32`), `queue_capacity` (`u32`, default 256, must be
+// `>= upload_workers` and `<= 100_000`) and `hydrate_timeout_secs` (`u64`,
+// default 180, valid `1..=86_400`). Violations are
+// [`ConfigError::Invalid`] via [`CyDriveConfig::validate`], styled after
+// the existing rules. The legacy `config.json` key set stays frozen at the
+// Python dataclass fields — it must not grow the new keys.
+
+#[test]
+fn toml_new_tuning_keys_parse_with_defaults_when_absent() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    // Minimal TOML without any of the three tuning keys — the shape every
+    // pre-tier1 config file has; the keys must fall back to defaults.
+    fs::write(&path, "bot_token = \"tune:def\"\nchat_id = 42\n").expect("write config.toml");
+
+    let cfg = CyDriveConfig::load_toml(&path).expect("toml without tuning keys loads");
+    assert_eq!(cfg.upload_workers, 2, "upload_workers default must be 2");
+    assert_eq!(cfg.queue_capacity, 256, "queue_capacity default must be 256");
+    assert_eq!(
+        cfg.hydrate_timeout_secs, 180,
+        "hydrate_timeout_secs default must be 180"
+    );
+}
+
+#[test]
+fn toml_new_tuning_keys_roundtrip() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+
+    let cfg = CyDriveConfig {
+        upload_workers: 4,
+        queue_capacity: 512,
+        hydrate_timeout_secs: 300,
+        ..default_with("tune:rt", 42)
+    };
+
+    cfg.save_toml(&path).expect("save_toml");
+    let loaded = CyDriveConfig::load_toml(&path).expect("load_toml");
+    assert_eq!(loaded, cfg, "tuning keys must round-trip through toml");
+    assert_eq!(loaded.upload_workers, 4);
+    assert_eq!(loaded.queue_capacity, 512);
+    assert_eq!(loaded.hydrate_timeout_secs, 300);
+}
+
+#[test]
+fn toml_upload_workers_out_of_range_rejected() {
+    // Contract C6: `upload_workers` must be in `1..=32`.
+    for bad in [0u32, 33] {
+        let cfg = CyDriveConfig {
+            upload_workers: bad,
+            ..CyDriveConfig::default()
+        };
+        assert!(
+            matches!(cfg.validate(), Err(ConfigError::Invalid(_))),
+            "upload_workers={bad} must be invalid"
+        );
+    }
+}
+
+#[test]
+fn toml_queue_capacity_below_workers_rejected() {
+    // Contract C6: `queue_capacity` must be `>= upload_workers`.
+    let cfg = CyDriveConfig {
+        upload_workers: 2,
+        queue_capacity: 1,
+        ..CyDriveConfig::default()
+    };
+    assert!(
+        matches!(cfg.validate(), Err(ConfigError::Invalid(_))),
+        "queue_capacity below upload_workers must be invalid"
+    );
+}
+
+#[test]
+fn toml_hydrate_timeout_zero_rejected() {
+    // Contract C6: `hydrate_timeout_secs` must be in `1..=86_400` — zero
+    // and one past the upper bound are both rejected.
+    for bad in [0u64, 86_401] {
+        let cfg = CyDriveConfig {
+            hydrate_timeout_secs: bad,
+            ..CyDriveConfig::default()
+        };
+        assert!(
+            matches!(cfg.validate(), Err(ConfigError::Invalid(_))),
+            "hydrate_timeout_secs={bad} must be invalid"
+        );
+    }
+}
+
+#[test]
+fn legacy_json_unknown_new_key_rejected() {
+    // The legacy key set stays frozen at the Python dataclass fields: a
+    // tuning key smuggled into a legacy `config.json` must be rejected, not
+    // silently ignored (the user would believe it takes effect).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.json");
+    fs::write(
+        &path,
+        r#"{
+            "bot_token": "111:AA",
+            "chat_id": 5,
+            "upload_workers": 8
+        }"#,
+    )
+    .expect("write config.json");
+
+    let err = CyDriveConfig::load_legacy_json(&path)
+        .expect_err("legacy json must reject new tuning keys");
+    assert!(
+        matches!(err, ConfigError::Parse { .. }),
+        "expected Parse error, got: {err:?}"
+    );
+}
