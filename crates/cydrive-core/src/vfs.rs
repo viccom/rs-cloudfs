@@ -91,6 +91,12 @@ pub enum VfsError {
     /// never hangs a GET forever).
     #[error("hydration timed out after {0:?}")]
     Timeout(std::time::Duration),
+    /// The virtual path already holds a row (file or directory).
+    #[error("path already exists: {0}")]
+    Exists(String),
+    /// The parent path is missing or not a directory.
+    #[error("parent path is missing or not a directory: {0}")]
+    ParentMissing(String),
 }
 
 /// Sibling staging path of `target`: the full file name plus a `.tmp`
@@ -102,6 +108,16 @@ fn tmp_sibling(target: &Path) -> PathBuf {
     let mut staged = file_name.to_os_string();
     staged.push(".tmp");
     target.with_file_name(staged)
+}
+
+/// Current wall-clock time as fractional Unix seconds — the timestamp
+/// source for rows the VFS writes outside the DB layer (mirrors the
+/// `database::now` helper; the WebDAV adapter keeps its own copy).
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
 }
 
 /// Writes `bytes` to `target` through a `.tmp` sibling plus an atomic
@@ -506,6 +522,118 @@ impl Vfs {
     /// ahead of new client writes.
     pub async fn requeue_pending(&self) -> Result<usize, QueueError> {
         self.queue.requeue_pending(&self.cache).await
+    }
+
+    /// Creates a directory row at `rel` (no filesystem directory — put /
+    /// hydrate create those lazily), mirroring the WebDAV adapter's
+    /// `create_dir`. The root and any existing row collide with
+    /// [`VfsError::Exists`]; a missing or non-directory parent row fails
+    /// with [`VfsError::ParentMissing`]. Directory rows are zero-sized,
+    /// born uploaded + cached, with zero chunks (Python
+    /// `create_collection` parity).
+    pub fn create_dir(&self, rel: &RelPath) -> Result<(), VfsError> {
+        // The root collection always exists.
+        if rel.is_root() {
+            return Err(VfsError::Exists(rel.as_str().to_string()));
+        }
+        if self.db.get_file(rel.as_str())?.is_some() {
+            return Err(VfsError::Exists(rel.as_str().to_string()));
+        }
+        // Parent gate + parent_dir in one pass: the root has no row and
+        // always passes; any other parent must exist as a directory row.
+        let parent_dir = match rel.parent() {
+            Some(parent) => {
+                if !parent.is_root() {
+                    match self.db.get_file(parent.as_str())? {
+                        Some(row) if row.is_dir => {}
+                        _ => return Err(VfsError::ParentMissing(parent.as_str().to_string())),
+                    }
+                }
+                parent.as_str().to_string()
+            }
+            None => "/".to_string(),
+        };
+        self.db.upsert_file(&FileUpsert {
+            rel_path: rel.as_str().to_string(),
+            name: rel.name().to_string(),
+            parent_dir,
+            size: 0,
+            mtime: unix_now(),
+            sha256: None,
+            is_dir: true,
+            telegram_msg_id: None,
+            is_uploaded: true,
+            is_cached: true,
+            is_encrypted: false,
+            chunk_count: 0,
+            mime_type: None,
+        })?;
+        Ok(())
+    }
+
+    /// Deletes the `rel` row and the local cache copy. The remote
+    /// Telegram messages are deliberately NOT deleted (Python
+    /// `handle_delete` parity — the WebDAV adapter shares this semantic),
+    /// so a cache copy removal failure is logged, never propagated.
+    pub async fn remove_file(&self, rel: &RelPath) -> Result<(), VfsError> {
+        let row = self
+            .db
+            .get_file(rel.as_str())?
+            .ok_or_else(|| VfsError::NotFound(rel.as_str().to_string()))?;
+        if row.is_dir {
+            return Err(VfsError::IsDirectory(row.rel_path));
+        }
+        self.db.delete_file(rel.as_str())?;
+        // The cached copy goes too; a missing copy is the normal
+        // not-cached case, and other removal errors never fail the call.
+        if let Err(error) = tokio::fs::remove_file(self.cache.local_path(rel)).await {
+            if error.kind() != std::io::ErrorKind::NotFound {
+                tracing::warn!(%error, rel_path = %rel, "failed to remove cache copy");
+            }
+        }
+        Ok(())
+    }
+
+    /// Empties the cache tree (the root itself survives) and clears the
+    /// `is_cached` flag on every file row, returning the number of flags
+    /// cleared. Uploaded payloads stay in Telegram — this is a local disk
+    /// operation only; I/O failures surface as [`VfsError::Io`].
+    pub fn cache_clear(&self) -> Result<u64, VfsError> {
+        self.cache.clear_all()?;
+        Ok(self.db.clear_cached_flags()?)
+    }
+
+    /// Upload path for an existing local file (CLI `push`): streams the
+    /// source into the cache staging sibling (`tokio::fs::copy`, never
+    /// reading the file whole into memory), then hands the staged copy to
+    /// [`Vfs::put_staged`] — atomic rename onto the cache path, pending
+    /// row, enqueued upload. Returns the source size. Ancestor directory
+    /// rows are the caller's responsibility (put_staged only creates the
+    /// filesystem directories).
+    pub async fn ingest_file(
+        &self,
+        rel: &RelPath,
+        source: &Path,
+        mtime: f64,
+    ) -> Result<u64, VfsError> {
+        let size = tokio::fs::metadata(source).await?.len();
+        let local = self.cache.local_path(rel);
+        let staged = tmp_sibling(&local);
+        if let Some(parent) = local.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if let Err(error) = tokio::fs::copy(source, &staged).await {
+            let _ = std::fs::remove_file(&staged);
+            return Err(error.into());
+        }
+        if let Err(error) = self.put_staged(rel, &staged, mtime).await {
+            // Backstop cleanup for the copy/put failure paths; usually a
+            // no-op — put_staged either moved the staged copy with its
+            // rename or never got that far.
+            let _ = std::fs::remove_file(&staged);
+            return Err(error);
+        }
+        Ok(size)
     }
 
     /// Shuts the upload queue down and waits for it to drain.

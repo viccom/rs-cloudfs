@@ -429,6 +429,23 @@ impl MetaDatabase {
         Ok(())
     }
 
+    /// Clears the `is_cached` flag on every non-directory row that has it
+    /// set, returning the number of changed rows (the `cache clear`
+    /// command's freed-flags count). Directory rows keep their flag —
+    /// theirs is a row-shape constant (born uploaded + cached), not
+    /// evidence of a local cache copy.
+    pub fn clear_cached_flags(&self) -> Result<u64, DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let changed = conn.execute(
+            "UPDATE files SET is_cached = 0 WHERE is_dir = 0 AND is_cached = 1",
+            [],
+        )?;
+        Ok(changed as u64)
+    }
+
     /// Moves the row at `from` to `to`, rewriting `rel_path` / `name` /
     /// `parent_dir`; when the row is a directory, every descendant row's
     /// path fields move under the new prefix as well. All of it in one
