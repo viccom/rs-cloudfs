@@ -297,6 +297,19 @@ git commit -am "docs: tier-1 utilities done (push/pull, cache cmds, bot cmds, de
 
 ---
 
+## 修订 A1（2026-09-03，主会话裁决）：cache clear 保护 pending 上传
+
+Task 1 实现者发现：C5 原文会让 `cache_clear` 连 **pending 上传的本地 staging 副本**一起删——那是未上传数据的唯一副本，属数据丢失风险，与北极星「稳定」冲突。修订如下：
+
+- **C5'** `Vfs::cache_clear` 语义改为：只删除 `is_uploaded = 1` 行对应的缓存副本，并只对这些行清 `is_cached`；`is_uploaded = 0`（pending）行的本地副本与标志**原样保留**。实现路径：
+  - `MetaDatabase::clear_cached_flags` 的 SQL 追加 `AND is_uploaded = 1`（C1 修订）；
+  - `MetaDatabase::pending_file_paths() -> Result<Vec<String>, DbError>`（新增，`SELECT rel_path FROM files WHERE is_uploaded = 0 AND is_dir = 0`）；
+  - `CacheManager::clear_except(&self, keep: &[RelPath]) -> io::Result<()>`（cache.rs 新增，镜像 clear_all 但跳过 keep 中的路径；目录照旧清理）；
+  - `Vfs::cache_clear` = pending_file_paths → cache.clear_except → clear_cached_flags，返回值仍为清除的标志行数。
+- **Task 1 测试 6 改写（新红）**：文件 A 走 put+排干（uploaded）后 hydrate 回缓存（is_cached=1）→ 文件 B 仅 put 不排干（pending）→ `cache_clear` → 返回 1；A 的缓存副本被删、is_cached=0；B 的缓存副本仍在、is_cached 仍 1、行完好；随后 shutdown 排干 B 仍能正常上传成功。
+- **C11 修订**：`CacheAction::Clear` docstring 改为 "Delete cached copies of uploaded files; pending-upload staging copies are preserved."
+- decisions.md 记录该裁决（Task 5）。
+
 ## 明确不做（YAGNI / 边界）
 
 - 递归 push/pull 目录、push 进度条、pull 断点续传——不做。
