@@ -286,58 +286,117 @@ async fn remove_file_not_found_and_is_directory() {
 
 // ----------------------------------------------------------- cache_clear ---
 
-/// 6. cache_clear: two cached file rows and one directory row (born
-///    cached per the create_dir contract) collapse to an empty cache
-///    tree — the root itself survives — the call reports exactly the two
-///    file flags cleared, both file rows flip to `is_cached = 0`, and
-///    the directory row's flag is untouched.
+/// Bounded wait for a mid-test drain. `Vfs::shutdown` cannot be used to
+/// drain file A here — it closes the queue, and file B must still be
+/// enqueuable afterwards — so the test polls the terminal state the
+/// worker writes in order (row persisted -> local copy deleted ->
+/// success counter bumped): the counter must have reached `expected`
+/// and the copy must be gone, which guarantees the following hydrate
+/// really re-downloads instead of hitting the local copy.
+async fn wait_for_drained_uploads(vfs: &Vfs, paths: &CacheManager, rel: &RelPath, expected: u64) {
+    for _ in 0..2500 {
+        if vfs.queue_stats().succeeded >= expected && !paths.local_path(rel).exists() {
+            return;
+        }
+        tokio::time::sleep(Duration::from_millis(2)).await;
+    }
+    panic!("the queue never drained {expected} upload(s) for {rel}");
+}
+
+/// 6 (plan revision A1): cache_clear spares pending uploads. File A is
+/// put and drained (uploaded), then re-hydrated so it owns a cache copy
+/// again (`is_cached = 1`, `is_uploaded = 1`). File B is only put — it
+/// stays pending (`is_uploaded = 0`) with its local copy as the data's
+/// only copy — and a directory row sits alongside. cache_clear must then
+/// delete only the uploaded file's copy and clear only its flag (return
+/// value 1), while B's copy, B's flags and the directory row's flag stay
+/// untouched; the subsequent shutdown drains B to a successful upload,
+/// proving the preserved copy was the real, uploadable staging file.
 #[tokio::test]
-async fn cache_clear_empties_tree_and_clears_file_flags_only() {
+async fn cache_clear_preserves_pending_uploads_and_clears_uploaded_only() {
     let (_dir, db, cache, cache_root, mock) = test_env(1 << 20).await;
+    let paths = CacheManager::new(cache_root.clone(), u64::MAX);
     let vfs = build_vfs(&db, cache, &mock, 64);
-    let rel_a = RelPath::new("/keep1.txt").expect("valid rel path");
-    let rel_b = RelPath::new("/sub/keep2.txt").expect("valid rel path");
+    let rel_a = RelPath::new("/uploaded.txt").expect("valid rel path");
+    let rel_b = RelPath::new("/sub/pending.txt").expect("valid rel path");
     let dir_rel = RelPath::new("/docs").expect("valid rel path");
 
-    vfs.put(&rel_a, b"first", 1_700_000_000.0)
+    // File A: put + drain (the success path persists the row, deletes the
+    // cache copy and bumps the counter, in that order), then hydrate the
+    // copy back from the mock remote.
+    vfs.put(&rel_a, b"uploaded", 1_700_000_000.0)
         .await
         .expect("put accepted");
-    vfs.put(&rel_b, b"second", 1_700_000_000.0)
+    wait_for_drained_uploads(&vfs, &paths, &rel_a, 1).await;
+    vfs.hydrate(&rel_a).await.expect("hydrate file A back");
+    let local_a = paths.local_path(&rel_a);
+    assert!(local_a.exists(), "file A owns a cache copy again");
+    let row_a = db
+        .get_file("/uploaded.txt")
+        .expect("db read")
+        .expect("row exists");
+    assert!(row_a.is_uploaded, "file A finished uploading");
+    assert!(row_a.is_cached, "file A is cached after the hydrate");
+
+    // File B: put only. Nothing is awaited from here until after
+    // cache_clear (current-thread runtime, immediately-ready enqueue),
+    // so the worker is never polled and B stays pending with its local
+    // copy as the only copy of the bytes.
+    vfs.put(&rel_b, b"pending", 1_700_000_000.0)
         .await
         .expect("put accepted");
+    let local_b = paths.local_path(&rel_b);
+    assert!(
+        local_b.exists(),
+        "file B's pending copy is in the cache tree"
+    );
     vfs.create_dir(&dir_rel).expect("create_dir accepted");
 
     let cleared = vfs.cache_clear().expect("cache_clear accepted");
     assert_eq!(
-        cleared, 2,
-        "exactly the two file rows had their flag cleared"
+        cleared, 1,
+        "only the uploaded file row had its flag cleared; the pending row's flag survives"
     );
 
-    let mut remaining = Vec::new();
-    collect_files(&cache_root, &mut remaining);
     assert!(
-        remaining.is_empty(),
-        "no files remain under the cache root: {remaining:?}"
+        !local_a.exists(),
+        "the uploaded file's cache copy is deleted"
     );
     assert!(
-        cache_root.is_dir(),
-        "the cache root itself survives the clear"
+        local_b.exists(),
+        "the pending upload's local copy is preserved (it is the only copy)"
     );
 
     let row_a = db
-        .get_file("/keep1.txt")
+        .get_file("/uploaded.txt")
         .expect("db read")
         .expect("row kept");
-    assert!(!row_a.is_cached, "file row A flag cleared");
+    assert!(!row_a.is_cached, "the uploaded row's flag is cleared");
+    assert!(row_a.is_uploaded, "the uploaded row stays uploaded");
     let row_b = db
-        .get_file("/sub/keep2.txt")
+        .get_file("/sub/pending.txt")
         .expect("db read")
         .expect("row kept");
-    assert!(!row_b.is_cached, "file row B flag cleared");
+    assert!(row_b.is_cached, "the pending row's flag is untouched");
+    assert!(!row_b.is_uploaded, "the pending row is still pending");
     let dir_row = db.get_file("/docs").expect("db read").expect("row kept");
     assert!(dir_row.is_cached, "the directory row flag is untouched");
 
+    // The preserved copy is the real staging file: the drain uploads B.
     vfs.shutdown().await;
+    let row_b = db
+        .get_file("/sub/pending.txt")
+        .expect("db read")
+        .expect("row kept");
+    assert!(
+        row_b.is_uploaded,
+        "the preserved pending copy completed its upload during the shutdown drain"
+    );
+    assert!(
+        !local_b.exists(),
+        "file B's cache copy is deleted after its successful upload"
+    );
+    assert_eq!(vfs.queue_stats().succeeded, 2, "both files uploaded");
 }
 
 // ----------------------------------------------------------- ingest_file ---
