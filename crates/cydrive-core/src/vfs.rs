@@ -97,6 +97,15 @@ pub enum VfsError {
     /// The parent path is missing or not a directory.
     #[error("parent path is missing or not a directory: {0}")]
     ParentMissing(String),
+    /// Deleting was refused: the row is a pending upload whose local
+    /// cache copy still exists — for such a row that copy is the only
+    /// copy of the bytes (nothing is on the remote yet), so delete
+    /// surfaces refuse until the upload finishes. A ghost pending row
+    /// (its copy already vanished, the bytes neither local nor remote)
+    /// never raises this and stays deletable — otherwise it could never
+    /// be cleaned up.
+    #[error("upload still pending: {0}")]
+    UploadPending(String),
 }
 
 /// Sibling staging path of `target`: the full file name plus a `.tmp`
@@ -575,6 +584,10 @@ impl Vfs {
     /// Telegram messages are deliberately NOT deleted (Python
     /// `handle_delete` parity — the WebDAV adapter shares this semantic),
     /// so a cache copy removal failure is logged, never propagated.
+    /// A pending upload whose local cache copy still exists is refused
+    /// with [`VfsError::UploadPending`] — that copy is the only copy of
+    /// the bytes; a ghost pending row (copy already vanished) deletes
+    /// normally.
     pub async fn remove_file(&self, rel: &RelPath) -> Result<(), VfsError> {
         let row = self
             .db
@@ -582,6 +595,12 @@ impl Vfs {
             .ok_or_else(|| VfsError::NotFound(rel.as_str().to_string()))?;
         if row.is_dir {
             return Err(VfsError::IsDirectory(row.rel_path));
+        }
+        // Pending-upload guard (review H2 / plan F2): while the only
+        // copy of the bytes sits in the cache tree, deleting the row
+        // would orphan the upload. A vanished copy (ghost row) passes.
+        if !row.is_uploaded && self.local_copy_exists(rel) {
+            return Err(VfsError::UploadPending(rel.as_str().to_string()));
         }
         self.db.delete_file(rel.as_str())?;
         // The cached copy goes too; a missing copy is the normal
@@ -592,6 +611,15 @@ impl Vfs {
             }
         }
         Ok(())
+    }
+
+    /// Whether a local cache copy of `rel` is currently on disk — a
+    /// plain synchronous stat over the cache tree. The pending-upload
+    /// delete guard's copy check ([`Vfs::remove_file`] and the
+    /// dashboard's delete route, which holds no cache handle of its
+    /// own, share it).
+    pub fn local_copy_exists(&self, rel: &RelPath) -> bool {
+        std::fs::metadata(self.cache.local_path(rel)).is_ok()
     }
 
     /// Empties the cache of **uploaded** files (the root itself survives)

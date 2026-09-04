@@ -270,6 +270,16 @@ impl DavFileSystem for CyDriveFs {
             if row.is_dir {
                 return Err(FsError::Forbidden);
             }
+            // Pending-upload guard (review H2 / plan F2 — the same
+            // adjudication as core `Vfs::remove_file`): a pending row
+            // whose local cache copy still exists is refused — that copy
+            // is the only copy of the bytes (nothing is on the remote
+            // yet). A ghost pending row (copy already vanished) falls
+            // through and stays deletable, otherwise it could never be
+            // cleaned up.
+            if !row.is_uploaded && self.cache.local_path(&rel).exists() {
+                return Err(FsError::Forbidden);
+            }
             self.db.delete_file(rel.as_str()).map_err(db_err)?;
             // Cached copy goes too; removal errors are ignored (Python
             // `handle_delete` swallows OSError). The remote message is
@@ -671,9 +681,12 @@ fn vfs_err(error: VfsError) -> FsError {
         VfsError::IsDirectory(_) | VfsError::MissingPassword => FsError::Forbidden,
         // Same conventions this adapter already uses: duplicate target is
         // Exists (405); missing parent maps to NotFound, which dav-server
-        // turns into 409 on PUT/MKCOL (see `require_dir_parent`).
+        // turns into 409 on PUT/MKCOL (see `require_dir_parent`); a
+        // refused pending-upload delete is a policy refusal -> Forbidden,
+        // mirroring the adapter's own `remove_file` guard.
         VfsError::Exists(_) => FsError::Exists,
         VfsError::ParentMissing(_) => FsError::NotFound,
+        VfsError::UploadPending(_) => FsError::Forbidden,
         VfsError::QueueClosed
         | VfsError::Db(_)
         | VfsError::Transport(_)

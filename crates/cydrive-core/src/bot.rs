@@ -377,6 +377,16 @@ async fn handle_rm(vfs: &Vfs, transport: &dyn CloudTransport, text: &str) -> Res
                 .send_text(&format!("is a directory: {token}"))
                 .await?
         }
+        // The refused delete (review H2 / plan F2): the local cache copy
+        // is still the only copy of the bytes — tell the user to retry
+        // once the upload lands.
+        Err(VfsError::UploadPending(_)) => {
+            transport
+                .send_text(&format!(
+                    "still uploading, try again after it finishes: {token}"
+                ))
+                .await?
+        }
         Err(error) => return Err(error.into()),
     }
     Ok(())

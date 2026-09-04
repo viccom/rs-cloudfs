@@ -369,7 +369,10 @@ async fn api_upload(State(state): State<AppState>, mut multipart: Multipart) -> 
 /// touched (baseline mirror). Python also best-effort removed the
 /// cached copy; the frozen [`WebUiConfig`] carries no cache path, so
 /// that cleanup is left to the cache LRU (a stale orphan is inert: the
-/// row is gone, and a re-upload overwrites it).
+/// row is gone, and a re-upload overwrites it). A pending upload whose
+/// local cache copy still exists is refused with 409 (review H2 / plan
+/// F2, the same adjudication as core `Vfs::remove_file` and the WebDAV
+/// DELETE): that copy is the only copy of the bytes.
 async fn api_delete(State(state): State<AppState>, body: Json<serde_json::Value>) -> Response {
     let filename = body
         .0
@@ -380,6 +383,25 @@ async fn api_delete(State(state): State<AppState>, body: Json<serde_json::Value>
         return error_json(StatusCode::BAD_REQUEST, "No filename provided");
     }
     let clean_rel = format!("/{}", filename.trim_matches('/').replace('\\', "/"));
+    // Pending-upload guard: refuse while the row's local cache copy —
+    // the only copy of the bytes — still exists; a ghost pending row
+    // (copy already vanished, bytes nowhere) falls through and deletes
+    // normally. The route holds no cache handle of its own, so the copy
+    // check rides the VFS's cache tree; a name that cannot form a valid
+    // `RelPath` can never match a stored row, so it skips the guard.
+    if let Ok(rel) = RelPath::new(&clean_rel) {
+        let pending_with_copy = match state.vfs.db().get_file(&clean_rel) {
+            Ok(Some(row)) => !row.is_dir && !row.is_uploaded && state.vfs.local_copy_exists(&rel),
+            Ok(None) => false,
+            Err(error) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        };
+        if pending_with_copy {
+            return error_json(
+                StatusCode::CONFLICT,
+                format!("still uploading, try again after it finishes: {filename}"),
+            );
+        }
+    }
     match state.vfs.db().delete_file(&clean_rel) {
         Ok(()) => Json(serde_json::json!({ "success": true, "deleted": filename })).into_response(),
         Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),

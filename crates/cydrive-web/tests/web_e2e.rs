@@ -1048,8 +1048,7 @@ async fn delete_pending_upload_conflict() {
     let paths = CacheManager::new(env._dir.path().join("cache"), u64::MAX);
     let rel = RelPath::new("/conflict.bin").expect("valid rel path");
     let local = paths.local_path(&rel);
-    std::fs::create_dir_all(local.parent().expect("cache parent dir"))
-        .expect("create cache dirs");
+    std::fs::create_dir_all(local.parent().expect("cache parent dir")).expect("create cache dirs");
     std::fs::write(&local, b"only local copy").expect("write the only local copy");
 
     let resp = send(
@@ -1064,8 +1063,7 @@ async fn delete_pending_upload_conflict() {
     )
     .await;
     assert_eq!(status_of(&resp), 409, "pending upload conflicts: {resp}");
-    let body: serde_json::Value =
-        serde_json::from_str(&body_of(&resp)).expect("parse error body");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse error body");
     assert!(
         body["error"].as_str().is_some_and(|msg| !msg.is_empty()),
         "uniform error body explains the refusal: {body}"
