@@ -9,13 +9,22 @@
 //! 3. re-enqueue pending uploads **before** WebDAV accepts traffic, so
 //!    crash-staged uploads resume ahead of new client writes;
 //! 4. serve WebDAV on `(webdav_host, webdav_port)`;
-//! 5. on Windows with `auto_mount_drive`, map the configured drive letter
+//! 5. bind the loopback control channel behind `cydrive stop` (an
+//!    optional component — a bind failure only warns and the stack runs
+//!    on without it);
+//! 6. on Windows with `auto_mount_drive`, map the configured drive letter
 //!    to the server (unit D; a failed mount warns and the server lives on).
+//!
+//! The three shutdown sources — Ctrl+C, SIGTERM (unix) and the control
+//! channel's STOP — funnel into one [`ShutdownWatch`] gate, and a
+//! spawned stop task owns the graceful sequence so it runs exactly once
+//! no matter which source (or how many) fired.
 //!
 //! [`RunHandle::shutdown`] mirrors the Python graceful exit with the
 //! ordering flipped for safety: the WebDAV server stops first (in-flight
 //! requests drain), then the upload queue drains to a terminal state,
-//! and finally an auto-mounted drive is released (failure only warns —
+//! the inbound worker joins, the control port file is removed, and
+//! finally an auto-mounted drive is released (failure only warns —
 //! it must not block the exit). The production entry point
 //! (`src/main.rs`) injects a `GrammersTransport`; tests inject a
 //! `MockTransport` through the same seam, [`run_with_transport`].
@@ -33,7 +42,7 @@ use cydrive_core::credentials::{
     CredentialStore, InMemoryStore, BOT_TOKEN, ENCRYPTION_PASSWORD, SERVICE,
 };
 use cydrive_core::database::MetaDatabase;
-use cydrive_core::inbound::{spawn_inbound_worker, InboundWorkerHandle};
+use cydrive_core::inbound::spawn_inbound_worker;
 use cydrive_core::rel_path::RelPath;
 use cydrive_core::transport::CloudTransport;
 use cydrive_core::vfs::{Vfs, VfsConfig, VfsError};
@@ -45,12 +54,14 @@ use cydrive_web::WebUiServer;
 use cydrive_webdav::{CyDriveFs, WebDavServer};
 
 mod keyring_store;
+mod signals;
 
 pub mod control;
 pub mod doctor;
 pub mod setup;
 
 pub use keyring_store::KeyringStore;
+pub use signals::sigterm;
 
 /// Failure modes of [`connect_with_deadline`].
 #[derive(Debug, thiserror::Error)]
@@ -160,26 +171,71 @@ pub fn format_stats_report(
     table.to_string()
 }
 
+/// The unified stop gate the run flow's shutdown sources funnel through
+/// (service-lifecycle plan, contract C3): Ctrl+C and SIGTERM are selected
+/// alongside it in `run`'s shutdown wait, the control channel's STOP
+/// fires it directly, and [`RunHandle::shutdown`] fires it too — one
+/// gate, however many sources.
+///
+/// Triggering is idempotent and latched: once fired, every current and
+/// future [`ShutdownWatch::wait`] resolves immediately, so a second STOP
+/// arriving while the graceful drain is already running is a harmless
+/// no-op instead of a wedge.
+pub struct ShutdownWatch {
+    tx: tokio::sync::watch::Sender<bool>,
+    rx: tokio::sync::watch::Receiver<bool>,
+}
+
+impl ShutdownWatch {
+    /// A fresh, unfired gate.
+    #[allow(clippy::new_without_default)]
+    pub fn new() -> Self {
+        let (tx, rx) = tokio::sync::watch::channel(false);
+        Self { tx, rx }
+    }
+
+    /// Fires the gate. Any number of triggers — from any source, in any
+    /// order — leave it in the same fired state; there is no way back to
+    /// blocking.
+    pub fn trigger(&self) {
+        let _ = self.tx.send(true);
+    }
+
+    /// Resolves once the gate has fired (immediately when it already
+    /// has). Every waiter clones the shared value's view at call time,
+    /// so wait-then-trigger and trigger-then-wait both resolve. A gate
+    /// whose every [`ShutdownWatch`] has been dropped also releases its
+    /// waiters — nobody is left to fire it.
+    pub async fn wait(&self) {
+        let mut rx = self.rx.clone();
+        while !*rx.borrow_and_update() {
+            if rx.changed().await.is_err() {
+                return;
+            }
+        }
+    }
+}
+
 /// A running CyDrive stack: the WebDAV server, the web dashboard, the
 /// VFS whose upload queue backs both, and the drive letter
-/// auto-mounted at boot (if any). Dropping the handle without
-/// [`RunHandle::shutdown`] leaves the workers to die with the runtime;
-/// prefer an explicit shutdown.
+/// auto-mounted at boot (if any). The graceful stop sequence itself is
+/// owned by an internal stop task parked on the shared [`ShutdownWatch`]
+/// gate, so it runs exactly once no matter which shutdown source (or how
+/// many) fired. Dropping the handle without [`RunHandle::shutdown`]
+/// leaves the workers to die with the runtime; prefer an explicit
+/// shutdown.
 pub struct RunHandle {
-    server: WebDavServer,
-    /// The web dashboard (unit M4), served when `enable_web_ui` is on.
-    /// [`RunHandle::shutdown`] stops it after the WebDAV server (its
-    /// in-flight uploads finish before the queue drains).
-    web_ui: Option<cydrive_web::WebUiServer>,
-    vfs: Arc<Vfs>,
-    /// The inbound indexing worker consuming `transport.incoming()`
-    /// (files sent to the bot land in the VFS as metadata-only rows).
-    /// [`RunHandle::shutdown`] joins it last, after the queue has
-    /// drained, so no index write races the shutdown.
-    inbound: InboundWorkerHandle,
+    webdav_addr: SocketAddr,
+    web_ui_addr: Option<SocketAddr>,
+    watch: Arc<ShutdownWatch>,
+    /// The single runner of the graceful stop sequence (spawned inside
+    /// [`run_with_transport`]): it waits on the stop gate and owns the
+    /// shutdown ordering. [`RunHandle::shutdown`] fires the gate and
+    /// joins this task; dropping the handle detaches it.
+    stop_task: tokio::task::JoinHandle<()>,
     /// The drive letter the boot-time auto-mount actually claimed
     /// (`None` when unmounted: non-Windows, `auto_mount_drive` off, or a
-    /// failed mount that only warned). [`RunHandle::shutdown`] releases
+    /// failed mount that only warned). The stop sequence releases
     /// exactly this letter.
     pub mounted_letter: Option<String>,
 }
@@ -188,7 +244,7 @@ impl RunHandle {
     /// The WebDAV listener's actual bound address (a `:0` config port
     /// resolves to the real ephemeral port).
     pub fn local_addr(&self) -> SocketAddr {
-        self.server.local_addr()
+        self.webdav_addr
     }
 
     /// The dashboard listener's actual bound address when
@@ -196,30 +252,38 @@ impl RunHandle {
     /// resolves to the real ephemeral port, same semantics as
     /// [`RunHandle::local_addr`]).
     pub fn web_ui_local_addr(&self) -> Option<SocketAddr> {
-        self.web_ui.as_ref().map(WebUiServer::local_addr)
+        self.web_ui_addr
+    }
+
+    /// One arm of the run flow's shutdown wait: resolves when the shared
+    /// stop gate has fired — `run_with_transport` wires the control
+    /// channel's STOP to it, and `run` selects it alongside Ctrl+C and
+    /// SIGTERM, so any one of the three sources ends the wait.
+    pub async fn wait_for_stop_request(&self) {
+        self.watch.wait().await;
     }
 
     /// Graceful stop: the WebDAV server shuts down first (it stops
     /// accepting and in-flight requests drain), then the web dashboard
     /// stops the same way, then the upload queue drains — every job
     /// enqueued before this call reaches a terminal state before the
-    /// future resolves — and finally an auto-mounted drive is released;
+    /// future resolves — then the inbound worker joins, the control port
+    /// file is removed, and finally an auto-mounted drive is released;
     /// an unmount failure only warns, it must never block the exit.
+    ///
+    /// The sequence itself lives in the internal stop task; this method
+    /// fires the gate (a no-op when a source already did) and waits for
+    /// that one run to finish, so the sequence never executes twice.
     pub async fn shutdown(self) {
-        self.server.shutdown().await;
-        if let Some(web_ui) = &self.web_ui {
-            web_ui.shutdown().await;
-        }
-        self.vfs.shutdown().await;
-        self.inbound.shutdown().await;
-        if let Some(letter) = self.mounted_letter {
-            if let Err(e) = cydrive_platform::windows::unmount_drive(&letter) {
-                tracing::warn!(
-                    letter = %letter,
-                    error = %e,
-                    "unmounting the auto-mounted drive failed; continuing the shutdown"
-                );
-            }
+        let Self {
+            watch, stop_task, ..
+        } = self;
+        watch.trigger();
+        if let Err(error) = stop_task.await {
+            tracing::warn!(
+                %error,
+                "joining the stop task failed after the shutdown sequence"
+            );
         }
     }
 }
@@ -345,12 +409,80 @@ pub async fn run_with_transport(
         tracing::info!("web UI disabled (enable_web_ui = false)");
         None
     };
+    // The loopback control channel behind `cydrive stop` (contract C3):
+    // an optional component — a bind failure only warns and the stack
+    // runs on (Ctrl+C / SIGTERM still stop it); the STOP command fires
+    // the unified gate below.
+    let watch = Arc::new(ShutdownWatch::new());
+    let control_file = match control::ControlServer::bind(cfg).await {
+        Ok(server) => {
+            let path = control::control_file_path(cfg);
+            tracing::info!(addr = %server.local_addr(), "control channel listening");
+            let gate = Arc::clone(&watch);
+            tokio::spawn(async move {
+                if let Err(error) = server.run(move || gate.trigger()).await {
+                    tracing::warn!(%error, "the control channel accept loop ended");
+                }
+            });
+            Some(path)
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "binding the control channel failed; `cydrive stop` cannot reach this \
+                 instance (Ctrl+C / SIGTERM still work)"
+            );
+            None
+        }
+    };
+
     let mounted_letter = mount_if_configured(cfg);
+    let webdav_addr = server.local_addr();
+    let web_ui_addr = web_ui.as_ref().map(WebUiServer::local_addr);
+    let unmount_letter = mounted_letter.clone();
+    // The one runner of the graceful stop sequence: parked on the stop
+    // gate, it executes the shutdown ordering exactly once for any
+    // number of fires (control STOP, `RunHandle::shutdown`, or several
+    // of them racing).
+    let gate = Arc::clone(&watch);
+    let stop_task = tokio::spawn(async move {
+        watch.wait().await;
+        server.shutdown().await;
+        if let Some(web_ui) = &web_ui {
+            web_ui.shutdown().await;
+        }
+        vfs.shutdown().await;
+        inbound.shutdown().await;
+        // The control port file is this instance's runtime artifact:
+        // remove it just before the unmount so a `stop` racing the exit
+        // never finds a file that will never answer again (a NotFound
+        // means another path already cleaned up — silent).
+        if let Some(path) = &control_file {
+            if let Err(error) = std::fs::remove_file(path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        %error,
+                        path = %path.display(),
+                        "removing the control file failed; continuing the shutdown"
+                    );
+                }
+            }
+        }
+        if let Some(letter) = unmount_letter {
+            if let Err(e) = cydrive_platform::windows::unmount_drive(&letter) {
+                tracing::warn!(
+                    letter = %letter,
+                    error = %e,
+                    "unmounting the auto-mounted drive failed; continuing the shutdown"
+                );
+            }
+        }
+    });
     Ok(RunHandle {
-        server,
-        web_ui,
-        vfs,
-        inbound,
+        webdav_addr,
+        web_ui_addr,
+        watch: gate,
+        stop_task,
         mounted_letter,
     })
 }

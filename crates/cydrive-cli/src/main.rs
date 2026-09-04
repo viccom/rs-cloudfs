@@ -3,7 +3,8 @@
 //! `run` = discover config → validate / configured-ness gates (clear
 //! guidance instead of a wizard) → tracing init (Pretty/INFO on stdout,
 //! a parseable `RUST_LOG` wins) → connect the `GrammersTransport` → boot
-//! the stack → wait for Ctrl+C → graceful shutdown → exit 0. The
+//! the stack → wait for a stop source (Ctrl+C / SIGTERM / `cydrive stop`)
+//! → graceful shutdown → exit 0. The
 //! operational subcommands: stop (gracefully stop a background `run`
 //! instance via its loopback control channel), push/pull (direct
 //! upload/download data channel, no WebDAV size limits), cache (local
@@ -383,7 +384,7 @@ async fn run() -> Result<()> {
 
     let handle = run_with_transport(&cfg, Arc::new(transport)).await?;
     println!(
-        "CyDrive is running: WebDAV at http://{}  |  dashboard at http://127.0.0.1:{}  |  press Ctrl+C to stop",
+        "CyDrive is running: WebDAV at http://{}  |  dashboard at http://127.0.0.1:{}  |  press Ctrl+C to stop  |  or `cydrive stop`",
         handle.local_addr(),
         cfg.web_ui_port
     );
@@ -394,9 +395,15 @@ async fn run() -> Result<()> {
         );
     }
 
-    tokio::signal::ctrl_c()
-        .await
-        .context("waiting for Ctrl+C")?;
+    // The three shutdown sources race: Ctrl+C, SIGTERM (unix) and the
+    // control channel's STOP (a `cydrive stop` against this instance).
+    // Whichever wins, the same graceful drain follows.
+    let stop_source = tokio::select! {
+        _ = tokio::signal::ctrl_c() => "Ctrl+C",
+        _ = cydrive_cli::sigterm() => "SIGTERM",
+        _ = handle.wait_for_stop_request() => "stop command",
+    };
+    println!("{stop_source} received.");
     println!("Shutting down (draining uploads, unmounting) ...");
     handle.shutdown().await;
     Ok(())
