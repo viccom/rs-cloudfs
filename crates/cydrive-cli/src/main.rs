@@ -144,7 +144,8 @@ async fn push_cmd(path: PathBuf, dest: Option<String>) -> Result<()> {
         .and_then(|name| name.to_str())
         .with_context(|| format!("the source path {} carries no file name", path.display()))?;
     let dest = dest.unwrap_or_else(|| format!("/{file_name}"));
-    let dest = RelPath::new(&dest).with_context(|| format!("invalid drive path {dest:?}"))?;
+    let dest = RelPath::new(&dest)
+        .with_context(|| format!("invalid drive path {dest:?} (drive paths start with \"/\")"))?;
 
     let stack = cydrive_cli::connect_stack(&cfg).await?;
     let pushed = cydrive_cli::push_file(&stack.vfs, &path, &dest).await?;

@@ -453,6 +453,15 @@ pub async fn push_file(vfs: &Vfs, local: &Path, dest: &RelPath) -> Result<u64> {
     let source_meta = tokio::fs::metadata(local)
         .await
         .with_context(|| format!("reading the source file {}", local.display()))?;
+    // Gate directories before any db write: push has no recursive mode,
+    // and without this gate the copy would fail late (bare io error)
+    // leaving ancestor directory rows behind (review L).
+    if source_meta.is_dir() {
+        anyhow::bail!(
+            "the source is a directory; push uploads single files: {}",
+            local.display()
+        );
+    }
     let mtime = source_meta
         .modified()
         .ok()
