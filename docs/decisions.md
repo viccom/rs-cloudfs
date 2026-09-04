@@ -162,3 +162,15 @@
 - **实测（examples/history_spike.rs，真机 bot session 副本）**：`messages.getHistory`（iter_messages）与 `messages.search`（search_messages）均返回 400 BOT_METHOD_INVALID——Telegram 平台级限制，与文档一致；正常应用层错误，无封禁风险（spike 本身即证明：连发两次被拒调用，bot 与会话毫发无损）。
 - **保留的不对称**：`messages.getMessages`（按 ID 批量取，get_messages_by_id）对 bot 放行且生产长期使用——bot 拿得到「已知 ID 的消息」，拿不到「历史列表」。
 - **架构推论**：rescan（扫历史重建索引）**出局**；多实例/换机视图同步的阶梯变为：① 手动重发文件重建索引（零代码，现状可用）；② `cydrive export-meta / import-meta`（~200 行，索引文件拷贝导入，无基础设施）；③ 云端元数据同步（负责人提案：服务器以派生键聚合各实例推送，绕开本闸门，~2000-3500 行，LWW+墓碑一致性）。②③ 待负责人按需求频率裁决。
+
+## 2026-09-04 sync-lite 批（feat/sync-lite，0.5.0）：云端元数据同步落地与执行期裁决
+
+- **交付**：crate `cydrive-sync`（lib+bin `cydrive-sync-server`：SyncStore LWW 引擎 + wire 协议 + axum /v1/push /v1/pull + env 配置 + deploy/cydrive-sync.service）+ core `sync.rs` 纯内核（payload 序列化/row_hash/namespace_key/push-diff/pull-apply/sync_once + SyncClient trait）+ config 两键（sync_url/sync_interval_secs，legacy json 拒收）+ MetaDatabase `sync_mirror`/`sync_state` 纯增量表 + cli `cydrive sync` 子命令与 run 周期任务。workspace 436 测试（win）/343（wsl）全绿；TDD 全程红→绿、断言零漂移。
+- **max_pulled 只由 pull 推进（对计划原文的有意识修正）**：计划写「push → 更新 max_pulled」，但 push 响应的 max_version 可能已越过他实例并发推送行的版本，拿它推进游标会永久漏拉；改为 pull-only 游标 + push 后对整批行取 mirror.server_version=max_version（批内版本原子递增使「取 max」安全）。代价：下一轮 pull 会多回自己刚推的行，被幂等闸（version ≤ mirror.server_version 跳过）消化。
+- **payload 排除本地不可恢复字段**：is_cached（本地运行时旗标，apply 恒置 0）、id（本地 rowid）、created_at/updated_at（upsert_file 不可显式恢复，若入 payload 则 apply 后本地 hash 永远 ≠ mirror hash → 双端无限互推）；mtime（用户可见时间）原样携带——收敛与空转 push=0 的前提。
+- **墓碑闭环**：pull 端墓碑删 files/chunks/mirror 三处；push 端推出墓碑后同样删 mirror（否则「mirror 有本地无→再推墓碑」死循环）。已观察到的边界：推墓碑方下轮会一次性回声处理自己的墓碑（mirror 已删、version>0），无害且收敛。
+- **ghost-pending 语义**：payload 含 is_uploaded=0 的行照常传播；pull 端无本地字节副本即跳过（不写行不写 mirror），源端后来上传成功（hash 变）会以更高版本重新可达。
+- **secret 只 gate push**：wire 契约 pull 请求无 secret 字段（计划原文如此），读取暴露面由监听边界（默认 127.0.0.1/反代）承担；客户端 secret 走 env `CYDRIVE_SYNC_SECRET`（不加 config 键，计划外最小补面）。
+- **其他小裁定**：服务端 push body 上限 64MB（axum 默认 2MB 装不下全盘首次推送）；HTTP 客户端每请求 300s 宽超时；run 周期任务 shutdown 用 abort（引擎幂等可重跑）；`sync_mirror_all` ORDER BY rel_path 确定性。
+- **真机验收（2026-09-04，本机+WSL，生产 db 只读拷贝、事后哈希核验未变）**：server 0.0.0.0:18390；实例 A（生产 db 副本 9 行/10 chunks，含中文名与 2GB 多块行）push 9 → 空盘 B pull 9 全应用，双库全字段一致；B 侧 db 直改一行（LWW 后推者胜，双侧 size/mtime 一致）+ 删一行（墓碑双侧消失）；幂等轮全零；WSL 空盘实例 C（172.17.96.1 跨 NAT 到宿主 server）pull 9 = 8 应用 + 1 墓碑，与 A 全字段一致、二轮空转。
+- **待人工**：cydrive-sync-server 部署到负责人服务器（deploy/cydrive-sync.service 已就绪，SYNC_SECRET 建议 + TLS 归反代）；生产各机 config.toml 增 sync_url 指向该服务器。
