@@ -84,11 +84,13 @@ where
 
 /// Human-readable diagnosis printed when the Telegram connect fails:
 /// the dominant real-world causes are an unreachable network (region
-/// blocking; CyDrive has no built-in proxy yet) and an invalid token.
+/// blocking; a SOCKS5 `proxy_url` usually solves it) and an invalid
+/// token.
 pub fn connect_failure_hint() -> String {
     "Cannot reach Telegram. Common causes:\n  \
      1) Telegram servers unreachable from this network (timeout / os error 10060) —\n\
-     \x20    use a system-wide VPN/TUN; CyDrive has no built-in proxy yet;\n  \
+     \x20    set a SOCKS5 proxy in config.toml (`proxy_url`, e.g. \"socks5://127.0.0.1:7890\")\n\
+     \x20    or use a system-wide VPN/TUN;\n  \
      2) invalid bot token — re-run `cydrive setup`;\n  \
      3) no internet — check the connection and retry."
         .to_string()

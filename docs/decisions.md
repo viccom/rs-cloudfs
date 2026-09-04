@@ -109,3 +109,7 @@
 - **Low**：push 目录源前置门禁（在写任何祖先行之前，杜绝孤儿行）+ dest 路径提示（drive paths start with "/"）+ pull 覆盖已存在文件用例补缺。
 - **不修（理由）**：M3 create_dir TOCTOU（webdav 既有同款模式、单服务并发面极小、需事务设计）；M4 持久化失败降级不通知（该路径上传已成功，"upload failed" 文案语义不符，需要独立文案时再加）；cache clear 遇锁文件中止（可恢复态，继续清需行为设计）；unix_now 第三份拷贝（已注释自认）；/ls startswith 前缀怪癖（基线忠实）；一次性命令无 tracing subscriber（println 补偿）。`connect_failure_hint` 文案过时（"no built-in proxy yet" 与已落地 SOCKS5 不符）记为待办小修。
 - 门禁：workspace 325 passed / 0 failed（修复批 +8 测试）。
+
+## 2026-09-04 二复审结论（独立子代理全量重审修复批）
+
+无 Critical/High。F1 错误链/死线覆盖、F2 三面判定逐字段等价性、基线更新、F3/F4 均以证据通过；脚本无泄密路径（token 只从凭据管理器读、输出前替换）。遗留登记：**M-1 ghost 行复活竞态**（remove_file 放行 ghost 行后 worker 成功 upsert 可复活该行为 uploaded 孤儿——不丢数据、非本批引入；后续方向：删行时同步取消队列 job 或 worker 成功 upsert 前校验行存在）；**M-2 connect_failure_hint 过时文案**已当日修复（改提 proxy_url，commit 见下）；L 级：getme.py 对非 UTF-16 blob 裸异常/token 校验弱于 ps1 版、local_copy_exists 同步 stat、grammers runner 超时后 detached（进程即退无泄漏）。
