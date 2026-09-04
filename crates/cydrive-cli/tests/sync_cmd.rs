@@ -11,7 +11,7 @@ use cydrive_cli::sync_client::{
 use cydrive_cli::{parse_sync_secret, render_sync_summary, run_sync_command, sync_secret_from_env};
 use cydrive_core::config::CyDriveConfig;
 use cydrive_core::sync::{SyncOutcome, SyncPulledRow, SyncRowUpdate};
-use cydrive_sync::wire::{PulledRow, PullResponse, PushRow};
+use cydrive_sync::wire::{PullResponse, PulledRow, PushRow};
 
 // ------------------------------------------------------------- helpers ---
 
@@ -36,7 +36,10 @@ static SECRET_ENV_MUTEX: Mutex<()> = Mutex::new(());
 
 /// Holds [`SECRET_ENV_MUTEX`] and removes the secret env var on drop —
 /// including on panic, so a failing assertion cannot poison later runs.
-struct SecretEnvGuard<'a>(MutexGuard<'a, ()>);
+/// The guard field is held purely for its Drop (hence the underscore).
+struct SecretEnvGuard<'a> {
+    _guard: MutexGuard<'a, ()>,
+}
 
 impl Drop for SecretEnvGuard<'_> {
     fn drop(&mut self) {
@@ -49,7 +52,7 @@ fn lock_secret_env() -> SecretEnvGuard<'static> {
     let guard = SECRET_ENV_MUTEX
         .lock()
         .unwrap_or_else(|poisoned| poisoned.into_inner());
-    SecretEnvGuard(guard)
+    SecretEnvGuard { _guard: guard }
 }
 
 // --------------------------------------------------------------- tests ---

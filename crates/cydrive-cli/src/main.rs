@@ -9,10 +9,11 @@
 //! instance via its loopback control channel), status (probe the
 //! instance, both listening ports and the current drive mapping),
 //! push/pull (direct upload/download data channel, no WebDAV size
-//! limits), cache (local disk cache stats / clear), mount/unmount
-//! (drive mapping), fix-reg (WebClient tuning, elevated), migrate
-//! (legacy Python import), stats (drive statistics table), doctor
-//! (offline diagnosis + platform checks) and setup (interactive
+//! limits), cache (local disk cache stats / clear), sync (one manual
+//! metadata-sync pass against the configured cydrive-sync server),
+//! mount/unmount (drive mapping), fix-reg (WebClient tuning, elevated),
+//! migrate (legacy Python import), stats (drive statistics table),
+//! doctor (offline diagnosis + platform checks) and setup (interactive
 //! first-time wizard).
 
 use std::path::PathBuf;
@@ -68,6 +69,11 @@ enum Command {
         #[command(subcommand)]
         action: CacheAction,
     },
+    /// Run one metadata sync pass against the configured sync server
+    /// (`run` also syncs periodically on its own). The shared secret,
+    /// when the server requires one, comes from the CYDRIVE_SYNC_SECRET
+    /// environment variable.
+    Sync,
     /// Mount the WebDAV server: a drive letter on Windows (`net use`),
     /// a directory on Linux (gio → davfs2).
     Mount {
@@ -131,6 +137,7 @@ async fn main() -> Result<()> {
         Command::Push { path, dest } => push_cmd(path, dest).await,
         Command::Pull { path, out } => pull_cmd(path, out).await,
         Command::Cache { action } => cache_cmd(action),
+        Command::Sync => sync_cmd().await,
         Command::Mount { url, letter, path } => mount_cmd(url, letter, path).await,
         Command::Unmount { letter, path } => unmount_cmd(letter, path).await,
         Command::FixReg => fix_reg_cmd().await,
@@ -249,6 +256,18 @@ fn cache_cmd(action: CacheAction) -> Result<()> {
         CacheAction::Stats => cydrive_cli::cache_stats(&cfg),
         CacheAction::Clear => cydrive_cli::cache_clear_cmd(&cfg),
     }
+}
+
+/// `cydrive sync`: discover the config (same env > file > keyring chain
+/// as `run`), then run exactly one sync pass and print the counters.
+/// No tracing subscriber and no transport — a one-shot command prints
+/// its own output (the stats/doctor convention).
+async fn sync_cmd() -> Result<()> {
+    let cfg = discover_config().context("config discovery failed")?;
+    let secret = cydrive_cli::sync_secret_from_env();
+    let outcome = cydrive_cli::run_sync_command(&cfg, secret.as_deref()).await?;
+    println!("{}", cydrive_cli::render_sync_summary(&outcome));
+    Ok(())
 }
 
 /// `cydrive mount`: resolve flags against the config, then map the best

@@ -264,7 +264,10 @@ async fn dual_instances_converge_over_real_http() {
         .expect("B's first sync pass");
     assert_eq!(outcome_b.pulled, 3);
     assert_eq!(outcome_b.applied, 2, "directory + multi-chunk file apply");
-    assert_eq!(outcome_b.skipped_ghost, 1, "the pending ghost has no bytes on B");
+    assert_eq!(
+        outcome_b.skipped_ghost, 1,
+        "the pending ghost has no bytes on B"
+    );
     assert_eq!(outcome_b.pushed, 0, "B has nothing new to push");
 
     let db_b = MetaDatabase::open(&dir_b.path().join("meta.db")).expect("reopen B's db");
@@ -337,11 +340,7 @@ async fn run_boot_syncs_and_keeps_serving() {
 
     wait_for_push(&store, &test_namespace()).await;
 
-    let resp = send(
-        webdav,
-        &request("PROPFIND", "/", webdav, &[("Depth", "1")]),
-    )
-    .await;
+    let resp = send(webdav, &request("PROPFIND", "/", webdav, &[("Depth", "1")])).await;
     assert_eq!(status_of(&resp), 207, "service healthy after sync: {resp}");
 
     handle.shutdown().await;
@@ -369,11 +368,7 @@ async fn unreachable_sync_url_only_warns() {
     // Give the doomed first pass time to fail (it must only warn).
     sleep(Duration::from_millis(500)).await;
 
-    let resp = send(
-        webdav,
-        &request("PROPFIND", "/", webdav, &[("Depth", "1")]),
-    )
-    .await;
+    let resp = send(webdav, &request("PROPFIND", "/", webdav, &[("Depth", "1")])).await;
     assert_eq!(status_of(&resp), 207, "service unaffected: {resp}");
 
     handle.shutdown().await;

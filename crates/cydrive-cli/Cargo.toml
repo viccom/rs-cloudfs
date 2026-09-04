@@ -18,6 +18,8 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
+# Implementing core's #[async_trait] SyncClient seam for the HTTP client.
+async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 comfy-table = "8.0.0"
 cydrive-core = { path = "../cydrive-core" }
@@ -25,7 +27,24 @@ cydrive-platform = { path = "../cydrive-platform" }
 cydrive-telegram = { path = "../cydrive-telegram" }
 cydrive-web = { path = "../cydrive-web" }
 cydrive-webdav = { path = "../cydrive-webdav" }
+# Sync-lite client (Batch B4): the wire types this CLI maps onto core's
+# sync engine at runtime.
+cydrive-sync = { path = "../cydrive-sync" }
 dialoguer = "0.12.0"
+# Request/response types for the sync HTTP client (already in the lock
+# tree via the axum/hyper graph — zero new packages for Cargo.lock).
+bytes = "1"
+http = "1"
+http-body-util = "0.1"
+# Real-HTTP sync client (hyper-util legacy client; same feature set
+# cydrive-sync's own e2e tests use).
+hyper-util = { version = "0.1", default-features = false, features = [
+    "client",
+    "client-legacy",
+    "http1",
+    "tokio",
+] }
+serde_json = "1"
 # OS credential vault (M5). keyring 3.x has no default features: the
 # platform store must be picked per target below (the base dep keeps the
 # crate linkable everywhere; CyDrive's supported platforms all carry a
@@ -68,7 +87,6 @@ axum = { version = "=0.8.9", default-features = false, features = [
     "json",
     "tokio",
 ] }
-cydrive-sync = { path = "../cydrive-sync" }
 tempfile = "3"
 # lib deps already union in rt-multi-thread/macros/signal plus the
 # control channel's net/io-util/time; the e2e tests' explicit rt/macros

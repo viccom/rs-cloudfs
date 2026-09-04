@@ -46,6 +46,7 @@ use cydrive_core::credentials::{
 use cydrive_core::database::MetaDatabase;
 use cydrive_core::inbound::spawn_inbound_worker;
 use cydrive_core::rel_path::RelPath;
+use cydrive_core::sync::{namespace_key, sync_once, SyncOutcome};
 use cydrive_core::transport::CloudTransport;
 use cydrive_core::vfs::{Vfs, VfsConfig, VfsError};
 use cydrive_telegram::config::{
@@ -62,6 +63,7 @@ mod signals;
 pub mod control;
 pub mod doctor;
 pub mod setup;
+pub mod sync_client;
 
 pub use keyring_store::KeyringStore;
 pub use signals::sigterm;
@@ -247,6 +249,11 @@ pub struct RunHandle {
     /// [`RunHandle::mounted_letter`] (status plan C5). The stop sequence
     /// releases exactly this path.
     pub mounted_point: Option<PathBuf>,
+    /// The periodic metadata-sync task (`None` when `sync_url` is unset,
+    /// or the credentials to derive the namespace were missing at boot).
+    /// Shutdown aborts it — see [`RunHandle::shutdown`] for why abort is
+    /// the safe choice here.
+    sync_task: Option<tokio::task::JoinHandle<()>>,
 }
 
 impl RunHandle {
@@ -286,9 +293,29 @@ impl RunHandle {
     /// that one run to finish, so the sequence never executes twice.
     pub async fn shutdown(self) {
         let Self {
-            watch, stop_task, ..
+            watch,
+            stop_task,
+            sync_task,
+            ..
         } = self;
         watch.trigger();
+        // Abort, not a cooperative drain: a first-full-push pass can run
+        // for minutes, and an abort takes effect only at an await point —
+        // rusqlite statements complete atomically and the sync engine is
+        // idempotent for re-runs (own rows die at the pull idempotency
+        // gate, a half-pushed batch simply re-pushes), so nothing is
+        // corrupted and the exit stays prompt.
+        if let Some(task) = sync_task {
+            task.abort();
+            if let Err(error) = task.await {
+                if !error.is_cancelled() {
+                    tracing::warn!(
+                        %error,
+                        "joining the periodic sync task failed after aborting it"
+                    );
+                }
+            }
+        }
         if let Err(error) = stop_task.await {
             tracing::warn!(
                 %error,
@@ -375,11 +402,12 @@ pub async fn run_with_transport(
 
     // A second cache handle over the same root backs the FS adapter's
     // path math and cache-copy housekeeping (same construction as the
-    // webdav crate's own tests).
+    // webdav crate's own tests). `cache_root` stays alive for the
+    // periodic sync task's own handle below.
     let fs = CyDriveFs::new(
         Arc::clone(&vfs),
         Arc::clone(&db),
-        CacheManager::new(cache_root, cache_limit),
+        CacheManager::new(cache_root.clone(), cache_limit),
     );
     let host: IpAddr = cfg
         .webdav_host
@@ -446,6 +474,18 @@ pub async fn run_with_transport(
         }
     };
 
+    // Periodic metadata sync (sync-lite Batch B4): with sync_url set, a
+    // background task runs one pass immediately at boot and then every
+    // sync_interval_secs. Any failure only warns — the served stack is
+    // never affected; shutdown aborts the task (RunHandle::shutdown).
+    let sync_task = spawn_periodic_sync(
+        cfg,
+        Arc::clone(&db),
+        cache_root,
+        cache_limit,
+        Arc::clone(&watch),
+    );
+
     let (mounted_letter, mounted_point) = mount_if_configured(cfg);
     let webdav_addr = server.local_addr();
     let web_ui_addr = web_ui.as_ref().map(WebUiServer::local_addr);
@@ -510,6 +550,7 @@ pub async fn run_with_transport(
         stop_task,
         mounted_letter,
         mounted_point,
+        sync_task,
     })
 }
 
@@ -724,6 +765,136 @@ pub fn cache_clear_cmd(cfg: &CyDriveConfig) -> Result<()> {
         cleared
     );
     Ok(())
+}
+
+// ------------------------------------------------- sync (sync-lite B4) ---
+
+/// Parses a candidate sync secret: unset and empty both mean "send
+/// none"; only a non-empty value travels to the server.
+pub fn parse_sync_secret(value: Option<String>) -> Option<String> {
+    value.filter(|secret| !secret.is_empty())
+}
+
+/// Reads the optional family-level shared secret from the
+/// [`sync_client::SYNC_SECRET_ENV`] variable (`None` when unset/empty).
+pub fn sync_secret_from_env() -> Option<String> {
+    parse_sync_secret(std::env::var(sync_client::SYNC_SECRET_ENV).ok())
+}
+
+/// Renders one pass's counters for the `cydrive sync` output — the
+/// labels are pinned by the CLI tests.
+pub fn render_sync_summary(outcome: &SyncOutcome) -> String {
+    format!(
+        "sync done: pulled {}, applied {}, pushed {}, tombstoned {}, skipped_ghost {}, \
+         skipped_idempotent {}, pushed_tombstones {}",
+        outcome.pulled,
+        outcome.applied,
+        outcome.pushed,
+        outcome.tombstoned,
+        outcome.skipped_ghost,
+        outcome.skipped_idempotent,
+        outcome.pushed_tombstones
+    )
+}
+
+/// The `cydrive sync` body (sync-lite Batch B4): one manual pass against
+/// the configured sync server. No transport stack — sync touches only
+/// the metadata db and HTTP.
+///
+/// Gates (actionable errors, exit-non-zero via the anyhow error leaving
+/// `main`): a missing `sync_url` names the config.toml key; missing
+/// `bot_token`/`chat_id` name both halves of the namespace identity
+/// (the token arrives through the existing discovery chain — env >
+/// file > OS credential store — so `cfg.bot_token` is already resolved).
+/// The db/cache assembly mirrors the `run` flow's opening segment
+/// verbatim (same paths, same capacity math).
+///
+/// `secret` is the caller-resolved optional shared secret (production
+/// reads [`sync_secret_from_env`]; tests inject).
+pub async fn run_sync_command(cfg: &CyDriveConfig, secret: Option<&str>) -> Result<SyncOutcome> {
+    let Some(sync_url) = cfg.sync_url.clone() else {
+        anyhow::bail!(
+            "sync is not configured: set the sync_url key in config.toml (or export \
+             CYDRIVE_SYNC_URL) to your cydrive-sync-server address, e.g. \
+             \"http://192.168.1.10:8290\""
+        );
+    };
+    if cfg.bot_token.is_empty() || cfg.chat_id == 0 {
+        anyhow::bail!(
+            "cydrive sync needs bot_token and chat_id to derive the sync namespace: set \
+             them in config.toml (bot_token may come from the OS credential store) and \
+             retry"
+        );
+    }
+    let key = namespace_key(&cfg.bot_token, &cfg.chat_id.to_string());
+
+    let db = MetaDatabase::open(Path::new(&cfg.db_path))
+        .with_context(|| format!("opening metadata db {:?}", cfg.db_path))?;
+    let cache_limit = cfg.cache_limit_gb * BYTES_PER_GB;
+    let cache = CacheManager::new(Path::new(&cfg.cache_path).to_path_buf(), cache_limit);
+
+    let client = sync_client::HttpSyncClient::new(&sync_url);
+    sync_once(&db, &cache, &client, &key, secret)
+        .await
+        .with_context(|| format!("sync pass against {sync_url} failed"))
+}
+
+/// Spawns the `run` flow's periodic sync task (sync-lite Batch B4):
+/// one [`sync_once`] pass immediately at boot, then one every
+/// `sync_interval_secs`. Returns `None` when `sync_url` is unset (the
+/// feature is off) or the namespace identity is missing (a warn, never
+/// a boot failure). Every pass failure only warns — the served stack is
+/// unaffected. The task exits on its own when the shared stop gate
+/// fires; [`RunHandle::shutdown`] additionally aborts it so a pass in
+/// flight cannot delay the exit.
+fn spawn_periodic_sync(
+    cfg: &CyDriveConfig,
+    db: Arc<MetaDatabase>,
+    cache_root: PathBuf,
+    cache_limit: u64,
+    watch: Arc<ShutdownWatch>,
+) -> Option<tokio::task::JoinHandle<()>> {
+    let url = cfg.sync_url.clone()?;
+    if !cfg.is_configured() {
+        tracing::warn!(
+            "sync_url is set but bot_token/chat_id are missing; periodic sync stays off"
+        );
+        return None;
+    }
+    let key = namespace_key(&cfg.bot_token, &cfg.chat_id.to_string());
+    let secret = sync_secret_from_env();
+    let client = sync_client::HttpSyncClient::new(&url);
+    let cache = CacheManager::new(cache_root, cache_limit);
+    let period = Duration::from_secs(cfg.sync_interval_secs);
+    tracing::info!(
+        url = %url,
+        interval_secs = cfg.sync_interval_secs,
+        "periodic metadata sync enabled"
+    );
+    Some(tokio::spawn(async move {
+        // The interval's first tick completes immediately, which is
+        // exactly the desired boot-time first pass.
+        let mut ticker = tokio::time::interval(period);
+        loop {
+            tokio::select! {
+                _ = ticker.tick() => {}
+                _ = watch.wait() => break,
+            }
+            match sync_once(&db, &cache, &client, &key, secret.as_deref()).await {
+                Ok(outcome) => tracing::info!(
+                    applied = outcome.applied,
+                    pushed = outcome.pushed,
+                    tombstoned = outcome.tombstoned,
+                    skipped_ghost = outcome.skipped_ghost,
+                    "metadata sync pass complete"
+                ),
+                Err(error) => tracing::warn!(
+                    %error,
+                    "periodic metadata sync failed; the service is unaffected"
+                ),
+            }
+        }
+    }))
 }
 
 /// Auto-mount step (unit D; the Unix leg is status plan C5): with
