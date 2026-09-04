@@ -337,3 +337,26 @@ pub mod linux;
 #[cfg(not(target_os = "linux"))]
 #[path = "linux_stub.rs"]
 pub mod linux;
+
+/// davfs2's PID file path for a mount point: `/var/run/mount.davfs/`
+/// plus the absolute path with every `/` dashed, `.pid` appended (the
+/// scheme observed on WSL: `/root/CyDrive` → `root-CyDrive.pid`).
+pub fn davfs_pid_file_path(mount_point: &str) -> String {
+    format!(
+        "/var/run/mount.davfs/{}.pid",
+        mount_point.trim_start_matches('/').replace('/', "-")
+    )
+}
+
+/// Extracts the PID-file path from a mount.davfs failure text
+/// (`found PID file <path>.`) — None when the failure is anything else.
+pub fn parse_davfs_pid_file_hint(message: &str) -> Option<String> {
+    let marker = "found PID file ";
+    let start = message.find(marker)? + marker.len();
+    let rest = &message[start..];
+    // The path itself contains dots (`mount.davfs`), so the end is the
+    // first whitespace — davfs2 ends the sentence with `.` + newline.
+    let end = rest.find(|c: char| c.is_whitespace())?;
+    let path = rest[..end].trim_end_matches('.');
+    Some(path.to_string())
+}

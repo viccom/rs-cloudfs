@@ -574,7 +574,10 @@ fn parse_davfs_pid_file_hint_extracts_path() {
         cydrive_platform::parse_davfs_pid_file_hint(stderr).as_deref(),
         Some("/var/run/mount.davfs/root-CyDrive.pid")
     );
-    assert_eq!(cydrive_platform::parse_davfs_pid_file_hint("some other error"), None);
+    assert_eq!(
+        cydrive_platform::parse_davfs_pid_file_hint("some other error"),
+        None
+    );
 }
 
 /// The command runner must never wait forever: a hanging child (here
@@ -584,14 +587,21 @@ fn parse_davfs_pid_file_hint_extracts_path() {
 #[test]
 fn run_with_timeout_kills_hanging_child() {
     let start = std::time::Instant::now();
-    let argv = vec![
-        "sleep".to_string(),
-        "30".to_string(),
-    ];
-    let result = cydrive_platform::linux::run_with_timeout(&argv, std::time::Duration::from_secs(1));
+    let argv = vec!["sleep".to_string(), "30".to_string()];
+    let result =
+        cydrive_platform::linux::run_with_timeout(&argv, std::time::Duration::from_secs(1));
     let elapsed = start.elapsed();
-    assert!(result.is_err(), "the hanging child must fail, got: {result:?}");
+    assert!(
+        result.is_err(),
+        "the hanging child must fail, got: {result:?}"
+    );
     let message = format!("{result:?}");
-    assert!(message.contains("timed out"), "error must say timed out: {message}");
-    assert!(elapsed < std::time::Duration::from_secs(5), "killed fast, took {elapsed:?}");
+    assert!(
+        message.contains("timed out"),
+        "error must say timed out: {message}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "killed fast, took {elapsed:?}"
+    );
 }

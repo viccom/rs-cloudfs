@@ -18,8 +18,9 @@
 use std::path::Path;
 
 use crate::{
-    davfs_mount_command, davfs_unmount_command, detect_mount_backend, fusermount_unmount_command,
-    gio_mount_command, parse_proc_mounts_davfs, PlatformError,
+    davfs_mount_command, davfs_pid_file_path, davfs_unmount_command, detect_mount_backend,
+    fusermount_unmount_command, gio_mount_command, parse_davfs_pid_file_hint,
+    parse_proc_mounts_davfs, PlatformError,
 };
 
 /// Mounts the WebDAV endpoint at `url`, creating `mount_point` first
@@ -58,7 +59,39 @@ pub fn mount_drive(mount_point: &Path, url: &str) -> Result<String, PlatformErro
     }
 
     if davfs2 {
-        run_argv(&davfs_mount_command(url, &mount_point.to_string_lossy()))?;
+        let argv = davfs_mount_command(url, &mount_point.to_string_lossy());
+        match run_argv(&argv) {
+            Ok(_) => {}
+            // A leftover davfs2 PID file (mount.davfs died irregularly —
+            // killed service, SIGKILL, crash) makes every later mount
+            // fail with "found PID file ...". When the recorded process
+            // is gone the file is stale garbage: remove it and retry
+            // once (WSL regression, 2026-09-04).
+            Err(PlatformError::Command { command, message }) => {
+                if let Some(pid_file) = parse_davfs_pid_file_hint(&message) {
+                    if stale_pid_file(&pid_file) {
+                        let _ = std::fs::remove_file(&pid_file);
+                        run_argv(&argv).map_err(|error| match error {
+                            PlatformError::Command { command, message } => {
+                                PlatformError::Command {
+                                    command,
+                                    message: format!(
+                                        "{message} (removed stale davfs2 pid file {pid_file}                                          and retried)"
+                                    ),
+                                }
+                            }
+                            other => other,
+                        })?;
+                        return Ok(format!(
+                            "Mounted CyDrive via davfs2 to {} (after clearing a stale pid file)",
+                            mount_point.display()
+                        ));
+                    }
+                }
+                return Err(PlatformError::Command { command, message });
+            }
+            Err(other) => return Err(other),
+        }
         return Ok(format!(
             "Mounted CyDrive via davfs2 to {}",
             mount_point.display()
@@ -132,20 +165,85 @@ pub fn unmount_stale_for(url: &str) {
 /// [`PlatformError::Command`] with stderr, falling back to stdout when
 /// stderr is empty (the baseline's `result.stderr or result.stdout`) —
 /// the same contract as the Windows module's runner.
+/// How long any single external mount command may run before it is
+/// killed. Real-machine regression (WSL, 2026-09-04): a wedged
+/// `mount.davfs` blocked the run startup forever (no banner, no
+/// interactivity) and the shutdown path just as thoroughly — no child
+/// process gets to decide CyDrive's liveness.
+const COMMAND_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(15);
+
 fn run_argv(argv: &[String]) -> Result<std::process::Output, PlatformError> {
-    let output = std::process::Command::new(&argv[0])
+    run_with_timeout(argv, COMMAND_TIMEOUT)
+}
+
+/// [`run_argv`] with an explicit budget (the timeout test pins this
+/// seam): spawn, poll `try_wait` at 100ms granularity, and kill the
+/// child when the budget is spent — the error's message says
+/// `timed out after <secs>s` so callers (and users) can tell a hung
+/// child from a failing one.
+pub fn run_with_timeout(
+    argv: &[String],
+    timeout: std::time::Duration,
+) -> Result<std::process::Output, PlatformError> {
+    let mut child = std::process::Command::new(&argv[0])
         .args(&argv[1..])
-        .output()?;
-    if !output.status.success() {
-        let message = if output.stderr.is_empty() {
-            String::from_utf8_lossy(&output.stdout).into_owned()
-        } else {
-            String::from_utf8_lossy(&output.stderr).into_owned()
-        };
-        return Err(PlatformError::Command {
-            command: argv.join(" "),
-            message,
-        });
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()?;
+    let deadline = std::time::Instant::now() + timeout;
+    loop {
+        match child.try_wait() {
+            Ok(Some(status)) => {
+                let mut output = std::process::Output {
+                    status,
+                    stdout: Vec::new(),
+                    stderr: Vec::new(),
+                };
+                if let Some(mut pipe) = child.stdout.take() {
+                    use std::io::Read;
+                    let _ = pipe.read_to_end(&mut output.stdout);
+                }
+                if let Some(mut pipe) = child.stderr.take() {
+                    use std::io::Read;
+                    let _ = pipe.read_to_end(&mut output.stderr);
+                }
+                if !output.status.success() {
+                    let message = if output.stderr.is_empty() {
+                        String::from_utf8_lossy(&output.stdout).into_owned()
+                    } else {
+                        String::from_utf8_lossy(&output.stderr).into_owned()
+                    };
+                    return Err(PlatformError::Command {
+                        command: argv.join(" "),
+                        message,
+                    });
+                }
+                return Ok(output);
+            }
+            Ok(None) if std::time::Instant::now() < deadline => {
+                std::thread::sleep(std::time::Duration::from_millis(100));
+            }
+            _ => {
+                let _ = child.kill();
+                let _ = child.wait();
+                return Err(PlatformError::Command {
+                    command: argv.join(" "),
+                    message: format!("timed out after {}s", timeout.as_secs()),
+                });
+            }
+        }
     }
-    Ok(output)
+}
+
+/// True when the PID file exists but names no living process — safe to
+/// delete. A file whose PID is alive belongs to a real mount.davfs and
+/// stays untouched.
+fn stale_pid_file(path: &str) -> bool {
+    let Ok(text) = std::fs::read_to_string(path) else {
+        return false;
+    };
+    let Ok(pid) = text.trim().parse::<u32>() else {
+        return false;
+    };
+    !std::path::Path::new(&format!("/proc/{pid}")).exists()
 }
