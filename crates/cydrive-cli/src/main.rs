@@ -356,12 +356,22 @@ fn doctor_cmd() -> Result<()> {
     let discovered = discover_config();
     let config_present = discovered.is_ok();
     let cfg = discovered.unwrap_or_default();
+    // The keyring availability probe doubles as the credential store the
+    // doctor checks read; an unavailable keyring degrades like discovery
+    // (the config file alone still carries everything needed).
+    let credential_store: Arc<dyn cydrive_core::credentials::CredentialStore> =
+        match cydrive_cli::KeyringStore::new() {
+            Ok(store) => Arc::new(store),
+            Err(_error) => Arc::new(cydrive_core::credentials::InMemoryStore::new()),
+        };
     let ctx = cydrive_cli::doctor::DoctorContext {
         config_present,
         db_path: config_present.then(|| std::path::PathBuf::from(&cfg.db_path)),
         cache_path: config_present.then(|| std::path::PathBuf::from(&cfg.cache_path)),
         webdav_port: cfg.webdav_port,
         web_ui_port: cfg.web_ui_port,
+        bot_token: cfg.bot_token.clone(),
+        credential_store,
     };
     let mut results = cydrive_cli::doctor::run_doctor(&ctx);
     results.extend(cydrive_cli::doctor::platform_checks());

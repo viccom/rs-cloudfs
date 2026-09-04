@@ -25,7 +25,7 @@
 use std::fs;
 use std::net::TcpListener;
 use std::path::{Path, PathBuf};
-use std::sync::{Mutex, MutexGuard};
+use std::sync::{Arc, Mutex, MutexGuard};
 
 use cydrive_cli::doctor::{
     evaluate_webclient_params, render_report, run_doctor, CheckResult, CheckStatus, DoctorContext,
@@ -33,7 +33,7 @@ use cydrive_cli::doctor::{
 use cydrive_cli::setup::{apply_wizard, persist_setup, validate_token, WizardAnswers};
 use cydrive_cli::{discover_config_with_store, format_stats_report};
 use cydrive_core::config::CyDriveConfig;
-use cydrive_core::credentials::{CredentialStore, InMemoryStore, BOT_TOKEN};
+use cydrive_core::credentials::{CredentialError, CredentialStore, InMemoryStore, BOT_TOKEN};
 use cydrive_core::database::{FileUpsert, MetaDatabase, Stats};
 
 // ------------------------------------------------------------- helpers ---
@@ -189,6 +189,8 @@ fn doctor_config_missing_fails() {
         cache_path: None,
         webdav_port: 8080,
         web_ui_port: 8088,
+        bot_token: String::new(),
+        credential_store: Arc::new(InMemoryStore::new()),
     };
     let results = run_doctor(&ctx);
     let config = find_result(&results, "config");
@@ -217,6 +219,8 @@ fn doctor_db_opens_reports_count() {
         cache_path: None,
         webdav_port: 8080,
         web_ui_port: 8088,
+        bot_token: String::new(),
+        credential_store: Arc::new(InMemoryStore::new()),
     };
     let results = run_doctor(&ctx);
     let db = find_result(&results, "database");
@@ -239,6 +243,8 @@ fn doctor_db_unreadable_fails() {
         cache_path: None,
         webdav_port: 8080,
         web_ui_port: 8088,
+        bot_token: String::new(),
+        credential_store: Arc::new(InMemoryStore::new()),
     };
     let results = run_doctor(&ctx);
     assert_eq!(find_result(&results, "database").status, CheckStatus::Fail);
@@ -253,6 +259,8 @@ fn doctor_cache_writable_ok() {
         cache_path: Some(dir.path().join("Telegram_Cache")),
         webdav_port: 8080,
         web_ui_port: 8088,
+        bot_token: String::new(),
+        credential_store: Arc::new(InMemoryStore::new()),
     };
     let results = run_doctor(&ctx);
     let cache = find_result(&results, "cache directory");
@@ -286,6 +294,8 @@ fn doctor_port_checks_bind_semantics() {
         cache_path: None,
         webdav_port: held_port,
         web_ui_port: free_port,
+        bot_token: String::new(),
+        credential_store: Arc::new(InMemoryStore::new()),
     };
     let results = run_doctor(&ctx);
     let webdav = find_result(&results, "webdav port");
@@ -365,6 +375,77 @@ fn doctor_evaluate_webclient_params_three_states() {
     // The contract pair → Ok.
     let contract = evaluate_webclient_params(Some((0xFFFF_FFFF, 2)));
     assert_eq!(contract.status, CheckStatus::Ok);
+}
+
+// -------------------------------------------------- doctor: credentials ---
+
+/// A [`CredentialStore`] whose backend is unreachable: every operation
+/// answers [`CredentialError::Unavailable`], the shape a headless
+/// session (systemd service with no Secret Service / keyring) produces.
+struct UnreachableKeyring;
+
+impl CredentialStore for UnreachableKeyring {
+    fn get(&self, _key: &str) -> Result<Option<String>, CredentialError> {
+        Err(CredentialError::Unavailable(
+            "no secret service in this session".to_string(),
+        ))
+    }
+
+    fn set(&self, _key: &str, _value: &str) -> Result<(), CredentialError> {
+        Err(CredentialError::Unavailable(
+            "no secret service in this session".to_string(),
+        ))
+    }
+
+    fn delete(&self, _key: &str) -> Result<(), CredentialError> {
+        Err(CredentialError::Unavailable(
+            "no secret service in this session".to_string(),
+        ))
+    }
+}
+
+#[test]
+fn doctor_warns_headless_keyring_with_empty_token() {
+    fn ctx(token: &str, store: Arc<dyn CredentialStore>) -> DoctorContext {
+        DoctorContext {
+            config_present: true,
+            db_path: None,
+            cache_path: None,
+            webdav_port: 8080,
+            web_ui_port: 8088,
+            bot_token: token.to_string(),
+            credential_store: store,
+        }
+    }
+
+    // Empty token + unreachable keyring → Warn naming the headless
+    // remedy (the env var).
+    let results = run_doctor(&ctx("", Arc::new(UnreachableKeyring)));
+    let check = find_result(&results, "credentials");
+    assert_eq!(check.status, CheckStatus::Warn, "detail: {}", check.detail);
+    assert!(
+        check.detail.contains("CYDRIVE_BOT_TOKEN"),
+        "guidance names the env var: {}",
+        check.detail
+    );
+
+    // Token resolved from file/env → no warning even with the keyring
+    // down: the credential exists for headless boot.
+    let results = run_doctor(&ctx("123456789:ABCdef", Arc::new(UnreachableKeyring)));
+    assert_eq!(
+        find_result(&results, "credentials").status,
+        CheckStatus::Ok,
+        "token present outranks the keyring state"
+    );
+
+    // Keyring reachable → no warning either: `cydrive setup` can
+    // persist the token there.
+    let results = run_doctor(&ctx("", Arc::new(InMemoryStore::new())));
+    assert_eq!(
+        find_result(&results, "credentials").status,
+        CheckStatus::Ok,
+        "reachable keyring with no token yet is not a warning"
+    );
 }
 
 // ---------------------------------------------------------------- setup ---

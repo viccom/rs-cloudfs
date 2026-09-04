@@ -20,7 +20,9 @@
 
 use std::net::TcpListener;
 use std::path::PathBuf;
+use std::sync::Arc;
 
+use cydrive_core::credentials::CredentialStore;
 use cydrive_core::database::MetaDatabase;
 use cydrive_platform::{BASIC_AUTH_LEVEL, FILE_SIZE_LIMIT_BYTES};
 
@@ -49,8 +51,9 @@ pub struct CheckResult {
 }
 
 /// Everything [`run_doctor`] needs, injected so tests stay offline: what
-/// config discovery found and where the data paths / ports live.
-#[derive(Debug, Clone)]
+/// config discovery found and where the data paths / ports live, plus
+/// the credential leg (resolved bot token + the store probed for
+/// headless usability — see [`headless_credential_check`]).
 pub struct DoctorContext {
     /// Whether a usable config file was discovered in the cwd.
     pub config_present: bool,
@@ -63,6 +66,12 @@ pub struct DoctorContext {
     pub webdav_port: u16,
     /// Web dashboard listen port to probe.
     pub web_ui_port: u16,
+    /// Bot token as config discovery resolved it (env > file > keyring);
+    /// empty = no source carries one.
+    pub bot_token: String,
+    /// Credential store to probe (production: the OS keyring; tests
+    /// inject fakes). Only ever read, never written.
+    pub credential_store: Arc<dyn CredentialStore>,
 }
 
 /// Runs the offline checks: config, database, cache directory, both
