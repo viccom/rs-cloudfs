@@ -129,3 +129,9 @@
 - **缺陷**：WSL/服务器无 Secret Service 时，setup 降级 InMemoryStore + tracing::warn——但 setup 不初始化日志订阅（审查已记录的 L 级缺口），警告不可见；向导打印「secrets live in the credential store」成功假象，token 实际随进程消亡（真机 WSL 复现）。migrate 对同场景是硬失败（「迁进易失内存比失败更危险」），setup 漏掉了同等处理。
 - **修复**：`persist_setup(Option<&dyn CredentialStore>)`——None=headless 模式，secrets 经 `save_toml` 落 config.toml（文件值优先级链已支持）；main.rs setup_cmd 无 keyring 时 println 可见警告 + dialoguer Confirm 二选一（同意→文件模式；拒绝→带指引中止），删除静默 InMemory 路径。TDD：红= persist_setup_headless_writes_secrets_into_config（含空 keyring 下 discover 取文件值断言）。
 - 已合并 main（474512f）+ 推送；WSL ~/cydrive/cydrive 已更新为修复版。run 仍受 WSL 网络拓扑限制：proxy_url 需指向 Windows 宿主 IP 且 Clash 开允许局域网。
+
+## 2026-09-04 davfs2 真机往返关闭（WSL 实测通过）+ Linux 挂载部署前提
+
+- **往返 PASS**：`ignored_davfs_mount_unmount_roundtrip`（wsgidav 8081 假服务 + `CYDRIVE_TEST_MOUNT_URL`）在 WSL Ubuntu-24.04 通过；此前「留待真实 Linux 主机」的判断不成立。
+- **根因与前提**：davfs2 默认交互式认证（无 tty 即静默失败，即此前手动 mount「exit 0 但未生效」的假象来源）；无认证 WebDAV 服务端场景需 `/etc/davfs2/davfs2.conf` 写 `ask_auth 0`（或 secrets 文件配凭据）。已实测：`cydrive mount`（WSL）经 davfs2 挂载 `/root/CyDrive`，写/读/删全通。
+- **真机确认**：Linux `run` 不自动挂载（按设计），`cydrive mount`（默认 `$HOME/CyDrive`，`--path` 覆盖）即挂载命令；后端探测选了 davfs2（gio 在无 gvfs 守护的 WSL 未被误选——此前担忧未成真，但「gio 探测只验二进制存在」的强化仍列为可选后续）。
