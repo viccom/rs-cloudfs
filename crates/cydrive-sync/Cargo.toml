@@ -1,0 +1,56 @@
+[package]
+name = "cydrive-sync"
+description = "CyDrive lite metadata sync server: LWW rows over JSON push/pull endpoints"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[lib]
+name = "cydrive_sync"
+path = "src/lib.rs"
+
+# Not part of the release set on purpose (sync-lite Batch A): the sync
+# server deploys separately behind a reverse proxy.
+[[bin]]
+name = "cydrive-sync-server"
+path = "src/main.rs"
+
+[dependencies]
+anyhow = "1"
+# Exact pin, mirroring the cydrive-web precedent for HTTP frameworks.
+axum = { version = "=0.8.9", default-features = false, features = [
+    "http1",
+    "json",
+    "tokio",
+] }
+# Same version/features as cydrive-core: one bundled SQLite across the
+# whole workspace (the vendored grammers-session relies on that).
+rusqlite = { version = "0.40.2", features = ["bundled"] }
+serde = { version = "1.0.229", features = ["derive"] }
+serde_json = "1.0.151"
+thiserror = "2"
+# rt-multi-thread/macros/net: the `cydrive-sync-server` bin (serve
+# loop); the lib itself only needs what axum pulls transitively.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "net"] }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt"] }
+
+[dev-dependencies]
+bytes = "1"
+# Real-HTTP e2e client (already in the lock tree via the axum/hyper
+# graph — zero new packages for Cargo.lock).
+hyper = { version = "1", default-features = false, features = [
+    "http1",
+    "client",
+] }
+hyper-util = { version = "0.1", default-features = false, features = [
+    "client",
+    "client-legacy",
+    "http1",
+    "tokio",
+] }
+http-body-util = "0.1"
+tempfile = "3"
