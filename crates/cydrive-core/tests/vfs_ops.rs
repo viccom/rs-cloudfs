@@ -251,7 +251,7 @@ async fn remove_file_deletes_row_and_cache_copy() {
     // copy is its only copy, so remove_file now refuses to delete it —
     // this test targets the deletable (uploaded) path: drain, then
     // re-hydrate so the copy remove_file deletes is its own doing again.
-    wait_for_drained_uploads(&vfs, 1).await;
+    wait_for_drained_uploads(&vfs, &paths, &rel, 1).await;
     vfs.hydrate(&rel).await.expect("hydrate restores the copy");
     assert!(local.exists(), "the hydrated copy exists before remove");
 
