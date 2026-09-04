@@ -31,7 +31,10 @@ fn explicit_values_override_defaults() {
     )
     .unwrap();
     assert_eq!(config.listen.to_string(), "0.0.0.0:9000");
-    assert_eq!(config.db_path, PathBuf::from("/var/lib/cydrive-sync/sync.db"));
+    assert_eq!(
+        config.db_path,
+        PathBuf::from("/var/lib/cydrive-sync/sync.db")
+    );
     assert_eq!(config.secret.as_deref(), Some("topsecret"));
 }
 

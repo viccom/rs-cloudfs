@@ -77,7 +77,12 @@ fn push_row(rel_path: &str, deleted: bool, payload: &str) -> PushRow {
     }
 }
 
-async fn push(addr: SocketAddr, key: &str, secret: Option<&str>, rows: Vec<PushRow>) -> (StatusCode, Bytes) {
+async fn push(
+    addr: SocketAddr,
+    key: &str,
+    secret: Option<&str>,
+    rows: Vec<PushRow>,
+) -> (StatusCode, Bytes) {
     post(addr, "/v1/push", push_request(key, secret, rows)).await
 }
 
@@ -114,7 +119,11 @@ async fn push_then_pull_roundtrip_over_http() {
     assert_eq!(response.max_version, 2);
     assert_eq!(response.rows.len(), 2);
 
-    let a = response.rows.iter().find(|r| r.rel_path == "/a.txt").unwrap();
+    let a = response
+        .rows
+        .iter()
+        .find(|r| r.rel_path == "/a.txt")
+        .unwrap();
     assert_eq!(a.version, 1);
     assert!(!a.deleted);
     assert_eq!(a.payload, "{\"size\":1}");
@@ -142,7 +151,10 @@ async fn push_max_version_grows_and_incremental_pull_filters() {
     .await;
     assert_eq!(status, StatusCode::OK);
     let second: PushResponse = serde_json::from_slice(&body).unwrap();
-    assert_eq!(second.max_version, 3, "a batch of N rows raises the counter by N");
+    assert_eq!(
+        second.max_version, 3,
+        "a batch of N rows raises the counter by N"
+    );
 
     // only rows newer than the cursor come back
     let (status, body) = pull(addr, "ns", first.max_version).await;

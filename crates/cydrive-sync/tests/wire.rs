@@ -2,7 +2,9 @@
 //! module (Batch B) will both produce and consume — frozen here so
 //! client and server cannot drift.
 
-use cydrive_sync::wire::{PulledRow, PullRequest, PullResponse, PushRequest, PushResponse, PushRow};
+use cydrive_sync::wire::{
+    PullRequest, PullResponse, PulledRow, PushRequest, PushResponse, PushRow,
+};
 
 #[test]
 fn push_request_parses_the_full_shape() {
@@ -68,8 +70,7 @@ fn wire_rows_roundtrip_through_json() {
         deleted: false,
         payload: "{\"size\":314}".to_string(),
     };
-    let back: PushRow =
-        serde_json::from_str(&serde_json::to_string(&push_row).unwrap()).unwrap();
+    let back: PushRow = serde_json::from_str(&serde_json::to_string(&push_row).unwrap()).unwrap();
     assert_eq!(back, push_row);
 
     let pulled = PulledRow {
@@ -78,7 +79,6 @@ fn wire_rows_roundtrip_through_json() {
         deleted: false,
         payload: "{\"size\":271}".to_string(),
     };
-    let back: PulledRow =
-        serde_json::from_str(&serde_json::to_string(&pulled).unwrap()).unwrap();
+    let back: PulledRow = serde_json::from_str(&serde_json::to_string(&pulled).unwrap()).unwrap();
     assert_eq!(back, pulled);
 }

@@ -17,8 +17,14 @@
 //! `SYNC_SECRET` env) keeps strangers out — family-grade trust, with
 //! TLS left to a reverse proxy (see `deploy/cydrive-sync.service`).
 
+pub mod config;
+pub mod router;
 pub mod store;
 pub mod wire;
 
+pub use config::{
+    parse_config, ConfigError, SyncServerConfig, DEFAULT_DB_FILENAME, DEFAULT_LISTEN,
+};
+pub use router::router;
 pub use store::{SyncStore, SyncStoreError};
-pub use wire::{PulledRow, PullRequest, PullResponse, PushRequest, PushResponse, PushRow};
+pub use wire::{PullRequest, PullResponse, PulledRow, PushRequest, PushResponse, PushRow};

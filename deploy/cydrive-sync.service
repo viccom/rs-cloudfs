@@ -1,0 +1,56 @@
+# cydrive-sync-server systemd unit (sync-lite Batch A).
+#
+# Deployment shape: one binary + one SQLite file + this unit. The sync
+# server is a family-grade metadata sync API (push/pull JSON) meant to
+# sit behind a reverse proxy that terminates TLS (caddy/nginx) — it
+# deliberately ships no built-in TLS and no user system. Example:
+#
+#     sync.example.com {
+#         reverse_proxy 127.0.0.1:8290
+#     }
+#
+# Deployment steps (as root / with sudo):
+#   1. Install the binary:
+#        cp target/release/cydrive-sync-server /usr/local/bin/
+#   2. Optional shared secret — /etc/cydrive-sync.env (chmod 600):
+#        SYNC_SECRET=pick-something-long
+#      With no secret configured, anyone who can reach the port can
+#      push/pull; bind loopback or a trusted LAN accordingly
+#      (SYNC_LISTEN below, or drop the Environment= line to keep the
+#      127.0.0.1:8290 default).
+#   3. Install and start:
+#        cp deploy/cydrive-sync.service /etc/systemd/system/
+#        systemctl daemon-reload
+#        systemctl enable --now cydrive-sync
+#   4. Operate:
+#        journalctl -u cydrive-sync -f     # follow logs (RUST_LOG=debug
+#                                          # for per-request traces)
+#
+# No KillSignal= override and no long TimeoutStopSec needed (unlike
+# the main cydrive.service): every request is a single SQLite
+# transaction, so systemd's default SIGTERM terminate cannot leave
+# torn state behind.
+
+[Unit]
+Description=CyDrive sync server - lite metadata sync (JSON push/pull API)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+ExecStart=/usr/local/bin/cydrive-sync-server
+# StateDirectory gives the database a private, persistent home;
+# SYNC_DB points the server at it explicitly (either line alone would
+# also work — the server would default to a cwd-relative file).
+StateDirectory=cydrive-sync
+Environment=SYNC_DB=/var/lib/cydrive-sync/cydrive_sync.db
+Environment=SYNC_LISTEN=127.0.0.1:8290
+# Leading '-': the env file is optional (no secret = open server).
+EnvironmentFile=-/etc/cydrive-sync.env
+Restart=on-failure
+# Avoid a tight restart loop while the port or proxy is misconfigured
+# (on-failure alone would retry every 100ms).
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target

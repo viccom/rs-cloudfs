@@ -34,8 +34,10 @@ fn push_registers_namespace_and_versions_from_one() {
 
     let (rows, max_version) = store.pull("ns", 0).unwrap();
     assert_eq!(max_version, 2);
-    let mut by_path: Vec<(String, i64)> =
-        rows.iter().map(|r| (r.rel_path.clone(), r.version)).collect();
+    let mut by_path: Vec<(String, i64)> = rows
+        .iter()
+        .map(|r| (r.rel_path.clone(), r.version))
+        .collect();
     by_path.sort();
     assert_eq!(by_path, vec![("/a".to_string(), 1), ("/b".to_string(), 2)]);
 
@@ -133,7 +135,11 @@ fn batch_raises_counter_by_exactly_row_count() {
         store
             .push(
                 "ns",
-                &[row("/a", false, "1"), row("/b", false, "2"), row("/c", false, "3")]
+                &[
+                    row("/a", false, "1"),
+                    row("/b", false, "2"),
+                    row("/c", false, "3")
+                ]
             )
             .unwrap(),
         3
