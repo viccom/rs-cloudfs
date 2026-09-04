@@ -247,6 +247,14 @@ async fn remove_file_deletes_row_and_cache_copy() {
     let local = paths.local_path(&rel);
     assert!(local.exists(), "the cache copy exists right after put");
 
+    // Baseline update (review H2, 2026-09-04): a pending upload's local
+    // copy is its only copy, so remove_file now refuses to delete it —
+    // this test targets the deletable (uploaded) path: drain, then
+    // re-hydrate so the copy remove_file deletes is its own doing again.
+    wait_for_drained_uploads(&vfs, 1).await;
+    vfs.hydrate(&rel).await.expect("hydrate restores the copy");
+    assert!(local.exists(), "the hydrated copy exists before remove");
+
     vfs.remove_file(&rel).await.expect("remove_file accepted");
 
     assert!(
