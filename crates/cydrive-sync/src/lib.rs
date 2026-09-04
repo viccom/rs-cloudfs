@@ -16,3 +16,9 @@
 //! An optional shared `secret` (request field checked against the
 //! `SYNC_SECRET` env) keeps strangers out — family-grade trust, with
 //! TLS left to a reverse proxy (see `deploy/cydrive-sync.service`).
+
+pub mod store;
+pub mod wire;
+
+pub use store::{SyncStore, SyncStoreError};
+pub use wire::{PulledRow, PullRequest, PullResponse, PushRequest, PushResponse, PushRow};
