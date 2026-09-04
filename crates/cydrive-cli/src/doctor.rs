@@ -229,7 +229,12 @@ fn check_port(name: &str, port: u16) -> CheckResult {
 /// [`run_doctor`].
 pub fn platform_checks() -> Vec<CheckResult> {
     let mut results = Vec::new();
-    if cfg!(windows) {
+    // Attribute gating (not `if cfg!`): both calls are Windows-only items
+    // (`webclient_service_check` has no non-Windows stub), so the block must
+    // not even compile elsewhere — the `if cfg!(windows)` form used before
+    // still type-checked the Windows symbols on unix.
+    #[cfg(windows)]
+    {
         results.push(evaluate_webclient_params(
             cydrive_platform::windows::read_webclient_params(),
         ));
