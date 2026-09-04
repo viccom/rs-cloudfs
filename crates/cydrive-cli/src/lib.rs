@@ -94,6 +94,12 @@ pub fn connect_failure_hint() -> String {
         .to_string()
 }
 
+/// The default connect budget shared by the `run` flow's connect guard
+/// and [`connect_stack`]: 90s — long enough for a slow first sign-in,
+/// short enough that a dead network surfaces [`connect_failure_hint`]
+/// instead of a silent hang.
+pub const CONNECT_DEADLINE: Duration = Duration::from_secs(90);
+
 /// Bytes per GB — cache capacity conversion (`cache_limit_gb`).
 const BYTES_PER_GB: u64 = 1024 * 1024 * 1024;
 
@@ -373,26 +379,48 @@ impl Stack {
     }
 }
 
-/// Boots the [`Stack`] for the `push` / `pull` subcommands: mirror of
-/// the `run` assembly (connect → db → cache → Vfs) minus everything a
-/// one-shot transfer does not need (WebDAV, dashboard, inbound worker,
-/// mount, pending requeue). The transport connect needs real Telegram
-/// credentials, so tests exercise the library bodies
-/// ([`push_file`] / [`pull_file`]) against a hand-assembled Vfs instead.
-pub async fn connect_stack(cfg: &CyDriveConfig) -> Result<Stack> {
-    let cwd = std::env::current_dir().context("resolving the working directory")?;
-    let transport_config = TransportConfig {
+/// Assembles the [`TransportConfig`] from the application config: the
+/// built-in API constants (compat contract 1), the session file
+/// `{DEFAULT_SESSION_STEM}.session` under `cwd`, and the bot / chat /
+/// proxy credentials (review M2 DRY). Shared by the `run` flow and the
+/// `push` / `pull` data channel so the two assembly sites cannot drift.
+pub fn transport_config_from(cfg: &CyDriveConfig, cwd: &Path) -> TransportConfig {
+    TransportConfig {
         api_id: DEFAULT_API_ID,
         api_hash: DEFAULT_API_HASH.to_owned(),
         bot_token: cfg.bot_token.clone(),
         chat_id: cfg.chat_id,
         session_path: cwd.join(format!("{DEFAULT_SESSION_STEM}.session")),
         proxy_url: cfg.proxy_url.clone(),
-    };
+    }
+}
+
+/// Boots the [`Stack`] for the `push` / `pull` subcommands: mirror of
+/// the `run` assembly (connect → db → cache → Vfs) minus everything a
+/// one-shot transfer does not need (WebDAV, dashboard, inbound worker,
+/// mount, pending requeue). The transport connect needs real Telegram
+/// credentials, so tests exercise the library bodies
+/// ([`push_file`] / [`pull_file`]) against a hand-assembled Vfs instead.
+///
+/// The connect segment is deadline-bounded by [`CONNECT_DEADLINE`]
+/// (review H1): a silent proxy surfaces "connect did not finish
+/// within ..." plus the [`connect_failure_hint`] diagnosis instead of
+/// hanging the subcommand without output.
+pub async fn connect_stack(cfg: &CyDriveConfig) -> Result<Stack> {
+    connect_stack_with_deadline(cfg, CONNECT_DEADLINE).await
+}
+
+/// [`connect_stack`] with the connect deadline injected — the tests
+/// shrink the budget to prove the guard wins; everything else about the
+/// assembly is identical.
+pub async fn connect_stack_with_deadline(cfg: &CyDriveConfig, deadline: Duration) -> Result<Stack> {
+    let cwd = std::env::current_dir().context("resolving the working directory")?;
+    let transport_config = transport_config_from(cfg, &cwd);
     let transport: Arc<dyn CloudTransport> = Arc::new(
-        GrammersTransport::connect(transport_config)
+        connect_with_deadline(GrammersTransport::connect(transport_config), deadline)
             .await
-            .context("connecting the Telegram transport")?,
+            .context("connecting the Telegram transport")
+            .context(connect_failure_hint())?,
     );
 
     let db = Arc::new(

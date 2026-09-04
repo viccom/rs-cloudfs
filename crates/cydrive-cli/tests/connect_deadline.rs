@@ -65,12 +65,14 @@ async fn connect_stack_deadline_beats_silent_proxy() {
     // paths live under a temp dir so nothing leaks into the cwd even if
     // a future implementation reorders the boot steps.
     let dir = tempfile::tempdir().expect("create temp dir");
-    let mut cfg = CyDriveConfig::default();
-    cfg.bot_token = "1:AAAAfake_token_for_shape".to_string();
-    cfg.chat_id = 1;
-    cfg.proxy_url = Some(format!("socks5://127.0.0.1:{port}"));
-    cfg.db_path = dir.path().join("meta.db").display().to_string();
-    cfg.cache_path = dir.path().join("cache").display().to_string();
+    let cfg = CyDriveConfig {
+        bot_token: "1:AAAAfake_token_for_shape".to_string(),
+        chat_id: 1,
+        proxy_url: Some(format!("socks5://127.0.0.1:{port}")),
+        db_path: dir.path().join("meta.db").display().to_string(),
+        cache_path: dir.path().join("cache").display().to_string(),
+        ..CyDriveConfig::default()
+    };
 
     let started = std::time::Instant::now();
     let result = tokio::time::timeout(

@@ -20,9 +20,6 @@ use cydrive_cli::{discover_config, run_with_transport};
 use cydrive_core::config::CyDriveConfig;
 use cydrive_core::logging::LogConfig;
 use cydrive_core::rel_path::RelPath;
-use cydrive_telegram::config::{
-    TransportConfig, DEFAULT_API_HASH, DEFAULT_API_ID, DEFAULT_SESSION_STEM,
-};
 use cydrive_telegram::transport::GrammersTransport;
 
 /// CyDrive — Telegram as an unlimited cloud drive, served over WebDAV.
@@ -339,22 +336,14 @@ async fn run() -> Result<()> {
     // Pretty/INFO on stdout; a parseable RUST_LOG overrides the level.
     cydrive_core::logging::init(&LogConfig::default()).context("initializing logging")?;
 
-    let session_path = cwd.join(format!("{DEFAULT_SESSION_STEM}.session"));
-    let transport_config = TransportConfig {
-        api_id: DEFAULT_API_ID,
-        api_hash: DEFAULT_API_HASH.to_owned(),
-        bot_token: cfg.bot_token.clone(),
-        chat_id: cfg.chat_id,
-        session_path: session_path.clone(),
-        proxy_url: cfg.proxy_url.clone(),
-    };
+    let transport_config = cydrive_cli::transport_config_from(&cfg, &cwd);
     println!(
         "Connecting to Telegram (session: {}) ...",
-        session_path.display()
+        transport_config.session_path.display()
     );
     let connect = cydrive_cli::connect_with_deadline(
         GrammersTransport::connect(transport_config),
-        std::time::Duration::from_secs(90),
+        cydrive_cli::CONNECT_DEADLINE,
     );
     let transport = tokio::select! {
         result = connect => match result {
