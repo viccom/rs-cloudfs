@@ -547,3 +547,51 @@ fn ignored_unix_automount_roundtrip() {
     // nor hang (it returns (), so not-panicking is the whole assertion).
     linux::unmount_stale_for(&url);
 }
+
+/// davfs2 PID-file handling (2026-09-04 WSL hang fix): mount.davfs
+/// leaves `/var/run/mount.davfs/<point-with-slashes-dashed>.pid` behind
+/// when it dies irregularly, and every later mount fails (or hangs)
+/// on that leftover — the path derivation and the stderr hint parse
+/// are pure and pinned here; the retry lives in the linux layer.
+#[test]
+fn davfs_pid_file_path_derivation() {
+    assert_eq!(
+        cydrive_platform::davfs_pid_file_path("/root/CyDrive"),
+        "/var/run/mount.davfs/root-CyDrive.pid"
+    );
+    assert_eq!(
+        cydrive_platform::davfs_pid_file_path("/mnt/cydrive"),
+        "/var/run/mount.davfs/mnt-cydrive.pid"
+    );
+}
+
+#[test]
+fn parse_davfs_pid_file_hint_extracts_path() {
+    let stderr = "found PID file /var/run/mount.davfs/root-CyDrive.pid.\n\
+                  Either /root/CyDrive is used by another process,\n\
+                  or another mount process ended irregular";
+    assert_eq!(
+        cydrive_platform::parse_davfs_pid_file_hint(stderr).as_deref(),
+        Some("/var/run/mount.davfs/root-CyDrive.pid")
+    );
+    assert_eq!(cydrive_platform::parse_davfs_pid_file_hint("some other error"), None);
+}
+
+/// The command runner must never wait forever: a hanging child (here
+/// `sleep 30`) is killed at the timeout and reported as a Command
+/// error mentioning the timeout.
+#[cfg(target_os = "linux")]
+#[test]
+fn run_with_timeout_kills_hanging_child() {
+    let start = std::time::Instant::now();
+    let argv = vec![
+        "sleep".to_string(),
+        "30".to_string(),
+    ];
+    let result = cydrive_platform::linux::run_with_timeout(&argv, std::time::Duration::from_secs(1));
+    let elapsed = start.elapsed();
+    assert!(result.is_err(), "the hanging child must fail, got: {result:?}");
+    let message = format!("{result:?}");
+    assert!(message.contains("timed out"), "error must say timed out: {message}");
+    assert!(elapsed < std::time::Duration::from_secs(5), "killed fast, took {elapsed:?}");
+}
