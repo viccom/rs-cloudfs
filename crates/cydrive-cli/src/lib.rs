@@ -46,6 +46,7 @@ use cydrive_webdav::{CyDriveFs, WebDavServer};
 
 mod keyring_store;
 
+pub mod control;
 pub mod doctor;
 pub mod setup;
 

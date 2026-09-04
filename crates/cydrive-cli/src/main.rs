@@ -4,12 +4,13 @@
 //! guidance instead of a wizard) → tracing init (Pretty/INFO on stdout,
 //! a parseable `RUST_LOG` wins) → connect the `GrammersTransport` → boot
 //! the stack → wait for Ctrl+C → graceful shutdown → exit 0. The
-//! operational subcommands: push/pull (direct upload/download data
-//! channel, no WebDAV size limits), cache (local disk cache stats /
-//! clear), mount/unmount (drive mapping), fix-reg (WebClient tuning,
-//! elevated), migrate (legacy Python import), stats (drive statistics
-//! table), doctor (offline diagnosis + platform checks) and setup
-//! (interactive first-time wizard).
+//! operational subcommands: stop (gracefully stop a background `run`
+//! instance via its loopback control channel), push/pull (direct
+//! upload/download data channel, no WebDAV size limits), cache (local
+//! disk cache stats / clear), mount/unmount (drive mapping), fix-reg
+//! (WebClient tuning, elevated), migrate (legacy Python import), stats
+//! (drive statistics table), doctor (offline diagnosis + platform
+//! checks) and setup (interactive first-time wizard).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -34,6 +35,10 @@ struct Cli {
 enum Command {
     /// Start the full stack: metadata DB, upload queue, WebDAV server.
     Run,
+    /// Gracefully stop a background `cydrive run` instance through its
+    /// loopback control channel (must run in the same working directory
+    /// as the instance).
+    Stop,
     /// Upload a local file into the drive (bypasses the 4 GB WebClient and
     /// 1900 MB Web UI limits; uploads are chunked automatically).
     Push {
@@ -104,6 +109,7 @@ async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
         Command::Run => run().await,
+        Command::Stop => stop_cmd().await,
         Command::Push { path, dest } => push_cmd(path, dest).await,
         Command::Pull { path, out } => pull_cmd(path, out).await,
         Command::Cache { action } => cache_cmd(action),
@@ -130,6 +136,14 @@ fn require_configured(cfg: &CyDriveConfig) -> Result<()> {
         );
     }
     Ok(())
+}
+
+/// `cydrive stop`: discover the config (same cwd rule as `run` — the
+/// port file resolves from the discovered `db_path`) and ask the running
+/// instance to shut down gracefully via the loopback control channel.
+async fn stop_cmd() -> Result<()> {
+    let cfg = discover_config().context("config discovery failed")?;
+    cydrive_cli::control::stop_cmd(&cfg).await
 }
 
 /// `cydrive push`: upload a local file straight through the data channel

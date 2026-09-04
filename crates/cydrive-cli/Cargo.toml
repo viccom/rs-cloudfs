@@ -32,7 +32,19 @@ dialoguer = "0.12.0"
 # real store in the target sections).
 keyring = "3"
 thiserror = "2"
-tokio = { version = "1", features = ["rt-multi-thread", "macros", "signal"] }
+# net/io-util/time/sync: the control channel's loopback listener, line
+# protocol, 3s connect deadline and STOP notification channel
+# (control.rs) — previously arrived only transitively through the
+# workspace graph.
+tokio = { version = "1", features = [
+    "rt-multi-thread",
+    "macros",
+    "signal",
+    "net",
+    "io-util",
+    "time",
+    "sync",
+] }
 tracing = "0.1"
 
 # Platform credential stores: Windows Credential Manager, macOS Keychain,
@@ -49,6 +61,8 @@ keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
 tempfile = "3"
-# lib deps already union in rt-multi-thread/macros/signal; the e2e tests
-# additionally drive raw TCP (net) with async read/write (io-util).
+# lib deps already union in rt-multi-thread/macros/signal plus the
+# control channel's net/io-util/time; the e2e tests' explicit rt/macros
+# entry stays as the test-side base (net/io-util below are now redundant
+# but kept as the historical feature list of the raw-TCP tests).
 tokio = { version = "1", features = ["rt", "macros", "net", "io-util"] }
