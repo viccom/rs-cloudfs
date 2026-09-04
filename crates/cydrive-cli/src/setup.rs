@@ -82,37 +82,59 @@ pub fn apply_wizard(mut cfg: CyDriveConfig, answers: &WizardAnswers) -> CyDriveC
     cfg
 }
 
-/// Persists a wizard-produced config: the token goes into `store` first,
-/// then the scrubbed `config.toml` lands in the cwd (secrets never touch
-/// the file; they return at startup via
+/// Persists a wizard-produced config.
+///
+/// `Some(store)` is the credential-vault flow (M5): the token goes into
+/// `store` first, then the scrubbed `config.toml` lands in the cwd
+/// (secrets never touch the file; they return at startup via
 /// [`CyDriveConfig::with_credential_backfill`]).
-pub fn persist_setup(cfg: &CyDriveConfig, store: &dyn CredentialStore) -> Result<()> {
-    store
-        .set(BOT_TOKEN, &cfg.bot_token)
-        .context("storing bot_token in the OS credential store")?;
-    if cfg.enable_encryption {
-        if let Some(password) = cfg.encryption_password.as_deref() {
+///
+/// `None` is the headless flow (WSL / servers without Secret Service,
+/// 2026-09-04 fix): the secrets are written INTO `config.toml` via
+/// [`CyDriveConfig::save_toml`] — the previous behavior stored them in a
+/// volatile in-memory fallback that evaporated on exit while the wizard
+/// claimed success, silently losing the entered token.
+pub fn persist_setup(cfg: &CyDriveConfig, store: Option<&dyn CredentialStore>) -> Result<()> {
+    match store {
+        Some(store) => {
             store
-                .set(ENCRYPTION_PASSWORD, password)
-                .context("storing encryption_password in the OS credential store")?;
+                .set(BOT_TOKEN, &cfg.bot_token)
+                .context("storing bot_token in the OS credential store")?;
+            if cfg.enable_encryption {
+                if let Some(password) = cfg.encryption_password.as_deref() {
+                    store
+                        .set(ENCRYPTION_PASSWORD, password)
+                        .context("storing encryption_password in the OS credential store")?;
+                }
+            }
+            cfg.save_toml_scrubbed(Path::new("config.toml"))
+                .context("writing the scrubbed config.toml")?;
+        }
+        None => {
+            cfg.save_toml(Path::new("config.toml"))
+                .context("writing config.toml with the secrets in-file (headless mode)")?;
         }
     }
-    cfg.save_toml_scrubbed(Path::new("config.toml"))
-        .context("writing the scrubbed config.toml")?;
     Ok(())
 }
 
-/// The interactive wizard against the injected credential store. Prompts:
+/// The interactive wizard against the injected credential store.
+/// `Some(store)` = credential-vault mode; `None` = headless mode (the
+/// secrets land in `config.toml`, banner and final message say so).
+/// Prompts:
 /// bot token (validated in a red-on-error loop), chat ID (numeric loop —
 /// dialoguer re-asks on a parse failure), drive letter (Windows only,
 /// defaulting to the platform's best pick; off Windows the question is
 /// skipped and the config default `"Y:"` applies, per the frozen spec).
 /// Then apply + persist + the run guidance.
-pub fn run_setup_interactive(store: &dyn CredentialStore) -> Result<()> {
+pub fn run_setup_interactive(store: Option<&dyn CredentialStore>) -> Result<()> {
     use dialoguer::Input;
 
     println!("CyDrive first-time setup");
-    println!("Secrets are stored in the OS credential manager, never in the config file.");
+    match store {
+        Some(_) => println!("Secrets are stored in the OS credential manager, never in the config file."),
+        None => println!("No OS credential store is available (headless); secrets will be written into config.toml."),
+    }
 
     let bot_token: String = Input::new()
         .with_prompt("Telegram Bot Token (from @BotFather)")
@@ -151,7 +173,10 @@ pub fn run_setup_interactive(store: &dyn CredentialStore) -> Result<()> {
     let cfg = apply_wizard(CyDriveConfig::default(), &answers);
     persist_setup(&cfg, store)?;
 
-    println!("Configuration saved to ./config.toml (secrets live in the credential store).");
+    match store {
+        Some(_) => println!("Configuration saved to ./config.toml (secrets live in the credential store)."),
+        None => println!("Configuration saved to ./config.toml (secrets are IN the file — headless mode; keep it private)."),
+    }
     println!("Run `cydrive run` to start CyDrive, or `cydrive doctor` to verify the setup.");
     Ok(())
 }

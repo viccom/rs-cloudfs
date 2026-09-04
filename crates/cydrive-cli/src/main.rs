@@ -382,26 +382,40 @@ fn doctor_cmd() -> Result<()> {
     Ok(())
 }
 
-/// `cydrive setup`: the interactive wizard against the production OS
-/// credential store. Unlike `migrate`, an unusable store degrades to the
-/// in-memory fallback with a warning (same as config discovery): the
-/// scrubbed `config.toml` still lands on disk, and the warning tells the
-/// user the token did not persist beyond this process.
+/// `cydrive setup`: the interactive wizard. With a working OS credential
+/// store the secrets go to the vault and the config stays scrubbed (M5).
+/// Without one (WSL / servers without Secret Service) the user chooses:
+/// write the secrets into `config.toml` (headless mode) or abort — the
+/// pre-2026-09-04 behavior of silently storing them in a volatile
+/// in-memory fallback reported success while losing the token.
 fn setup_cmd() -> Result<()> {
-    let store: Box<dyn cydrive_core::credentials::CredentialStore> =
-        match cydrive_cli::KeyringStore::new() {
-            Ok(store) => Box::new(store),
-            Err(error) => {
-                tracing::warn!(
-                    %error,
-                    "OS credential store unavailable; the wizard's scrubbed config.toml is \
-                     still written, but the bot token will not survive this process — bring \
-                     the platform keyring up and re-run cydrive setup"
+    let store: Option<cydrive_cli::KeyringStore> = match cydrive_cli::KeyringStore::new() {
+        Ok(store) => Some(store),
+        Err(error) => {
+            println!(
+                "Warning: the OS credential store is unavailable ({error}).\n\
+                 On a headless system the secrets can be written into config.toml instead."
+            );
+            let proceed = dialoguer::Confirm::new()
+                .with_prompt("Write the bot token into config.toml?")
+                .default(false)
+                .interact()
+                .context("asking about headless secret storage")?;
+            if !proceed {
+                anyhow::bail!(
+                    "setup aborted without persisting secrets: bring the platform keyring \
+                     up (Windows Credential Manager / macOS Keychain / Secret Service) and \
+                     re-run `cydrive setup`, or write bot_token into config.toml by hand"
                 );
-                Box::new(cydrive_core::credentials::InMemoryStore::new())
             }
-        };
-    cydrive_cli::setup::run_setup_interactive(store.as_ref())
+            None
+        }
+    };
+    cydrive_cli::setup::run_setup_interactive(
+        store
+            .as_ref()
+            .map(|s| s as &dyn cydrive_core::credentials::CredentialStore),
+    )
 }
 
 /// The production run flow; every step here is covered by the library
