@@ -62,20 +62,30 @@ enum Command {
         #[command(subcommand)]
         action: CacheAction,
     },
-    /// Map a drive letter to the WebDAV server (`net use`).
+    /// Mount the WebDAV server: a drive letter on Windows (`net use`),
+    /// a directory on Linux (gio → davfs2).
     Mount {
         /// WebDAV URL (default: glued from the config's host/port).
         #[arg(long)]
         url: Option<String>,
-        /// Drive letter (default: the config's `drive_letter`, e.g. "Y:").
+        /// Drive letter (default: the config's `drive_letter`, e.g. "Y:")
+        /// — Windows only.
         #[arg(long)]
         letter: Option<String>,
+        /// Mount point directory (default: ~/CyDrive) — Unix only.
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
-    /// Remove a mapped drive letter.
+    /// Unmount: release the drive letter (Windows) or the mount point
+    /// directory (Unix).
     Unmount {
-        /// Drive letter (default: the config's `drive_letter`).
+        /// Drive letter (default: the config's `drive_letter`) —
+        /// Windows only.
         #[arg(long)]
         letter: Option<String>,
+        /// Mount point directory (default: ~/CyDrive) — Unix only.
+        #[arg(long)]
+        path: Option<PathBuf>,
     },
     /// Tune the WebClient registry (4 GB limit + Basic auth) and restart
     /// the service. Needs an elevated shell.
@@ -114,8 +124,8 @@ async fn main() -> Result<()> {
         Command::Push { path, dest } => push_cmd(path, dest).await,
         Command::Pull { path, out } => pull_cmd(path, out).await,
         Command::Cache { action } => cache_cmd(action),
-        Command::Mount { url, letter } => mount_cmd(url, letter).await,
-        Command::Unmount { letter } => unmount_cmd(letter).await,
+        Command::Mount { url, letter, path } => mount_cmd(url, letter, path).await,
+        Command::Unmount { letter, path } => unmount_cmd(letter, path).await,
         Command::FixReg => fix_reg_cmd().await,
         Command::Migrate => migrate_cmd(),
         Command::Stats => stats_cmd(),
@@ -217,24 +227,82 @@ fn cache_cmd(action: CacheAction) -> Result<()> {
 }
 
 /// `cydrive mount`: resolve flags against the config, then map the best
-/// available letter. Windows-only (the platform stub reports otherwise).
-async fn mount_cmd(url: Option<String>, letter: Option<String>) -> Result<()> {
+/// available letter (Windows) or mount the directory via the Linux
+/// gio→davfs2 chain (other Unixes get the platform stub's Unsupported).
+async fn mount_cmd(
+    url: Option<String>,
+    letter: Option<String>,
+    path: Option<PathBuf>,
+) -> Result<()> {
     let cfg = discover_config().context("config discovery failed")?;
-    let (letter, url) = cydrive_cli::resolve_mount_params(&cfg, url, letter);
-    let mounted = cydrive_platform::windows::mount_drive(&letter, &url)
-        .with_context(|| format!("mounting {url} at {letter}"))?;
-    println!("CyDrive mounted at {mounted} -> {url}");
-    Ok(())
+
+    #[cfg(unix)]
+    {
+        let _ = letter; // Windows-only flag
+        let url = url.unwrap_or_else(|| cydrive_cli::default_mount_url(&cfg));
+        let mount_point = unix_mount_point(path)?;
+        let report = cydrive_platform::linux::mount_drive(&mount_point, &url)
+            .with_context(|| format!("mounting {url} at {}", mount_point.display()))?;
+        println!("{report}");
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        if path.is_some() {
+            anyhow::bail!("--path applies to Unix mounts only; Windows uses drive letters");
+        }
+        let (letter, url) = cydrive_cli::resolve_mount_params(&cfg, url, letter);
+        let mounted = cydrive_platform::windows::mount_drive(&letter, &url)
+            .with_context(|| format!("mounting {url} at {letter}"))?;
+        println!("CyDrive mounted at {mounted} -> {url}");
+        Ok(())
+    }
 }
 
-/// `cydrive unmount`: remove the mapping for the resolved letter.
-async fn unmount_cmd(letter: Option<String>) -> Result<()> {
+/// `cydrive unmount`: release the mapping for the resolved letter
+/// (Windows) or the mount point directory (Unix).
+async fn unmount_cmd(letter: Option<String>, path: Option<PathBuf>) -> Result<()> {
     let cfg = discover_config().context("config discovery failed")?;
-    let letter = cydrive_cli::resolve_unmount_letter(&cfg, letter);
-    cydrive_platform::windows::unmount_drive(&letter)
-        .with_context(|| format!("unmounting {letter}"))?;
-    println!("CyDrive unmounted from {letter}");
-    Ok(())
+
+    #[cfg(unix)]
+    {
+        let _ = (&cfg, letter); // unmount takes no config defaults on Unix
+        let mount_point = unix_mount_point(path)?;
+        let report = cydrive_platform::linux::unmount_drive(&mount_point)
+            .with_context(|| format!("unmounting {}", mount_point.display()))?;
+        println!("{report}");
+        Ok(())
+    }
+
+    #[cfg(not(unix))]
+    {
+        if path.is_some() {
+            anyhow::bail!("--path applies to Unix mounts only; Windows uses drive letters");
+        }
+        let letter = cydrive_cli::resolve_unmount_letter(&cfg, letter);
+        cydrive_platform::windows::unmount_drive(&letter)
+            .with_context(|| format!("unmounting {letter}"))?;
+        println!("CyDrive unmounted from {letter}");
+        Ok(())
+    }
+}
+
+/// Resolves the Unix mount point for `mount`/`unmount`: an explicit
+/// `--path` wins, otherwise the Python baseline's default `~/CyDrive`
+/// (derived from `$HOME`).
+#[cfg(unix)]
+fn unix_mount_point(path: Option<PathBuf>) -> Result<PathBuf> {
+    match path {
+        Some(point) => Ok(point),
+        None => {
+            let home = std::env::var("HOME")
+                .context("no --path given and $HOME is unset; pass --path <dir>")?;
+            Ok(cydrive_platform::default_mount_point(std::path::Path::new(
+                &home,
+            )))
+        }
+    }
 }
 
 /// `cydrive fix-reg`: write the WebClient tuning values and restart the

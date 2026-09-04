@@ -176,7 +176,7 @@ fn unsupported_stub_shape() {
 // chain is `fusermount -u` followed by `umount` (lines 85–86).
 
 /// 9. `detect_mount_backend` — gio outranks davfs2 when both are on PATH
-///     (design doc :161 order, the baseline's gio-first probing).
+///    (design doc :161 order, the baseline's gio-first probing).
 #[test]
 fn detect_backend_prefers_gio() {
     assert_eq!(detect_mount_backend(true, true), Some("gio"));
@@ -204,7 +204,13 @@ fn davfs_mount_command_shape() {
             .iter()
             .map(String::as_str)
             .collect::<Vec<_>>(),
-        ["mount", "-t", "davfs", "http://127.0.0.1:8080", "/mnt/cydrive"]
+        [
+            "mount",
+            "-t",
+            "davfs",
+            "http://127.0.0.1:8080",
+            "/mnt/cydrive"
+        ]
     );
 }
 

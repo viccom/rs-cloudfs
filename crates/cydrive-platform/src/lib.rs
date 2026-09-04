@@ -1,7 +1,9 @@
 //! CyDrive platform layer (unit D): Windows WebDAV drive mapping and
 //! WebClient registry tuning, mirroring the Python baseline
 //! (`cydrive/platform/windows.py`, class `WindowsMounter`) behaviour for
-//! behaviour by behaviour.
+//! behaviour by behaviour — plus the Linux mount chain (gio → davfs2,
+//! `cydrive/platform/linux_mac.py`, class `UnixMounter`) added in the
+//! service-lifecycle batch (contract C4).
 //!
 //! The layout follows the repo rule inherited from the Python side
 //! (precedent `feaac0b`: `platform/windows.py` must stay importable on
@@ -32,6 +34,10 @@ pub enum PlatformError {
     /// The operation only exists on another platform (non-Windows stubs).
     #[error("not supported on this platform: {0}")]
     Unsupported(&'static str),
+    /// No Linux mount backend (neither `gio` nor `mount.davfs`) was
+    /// found on `PATH`.
+    #[error("no Linux mount backend available: {0}")]
+    MissingBackend(String),
     /// An external command (`net use`, `sc`, …) exited non-zero.
     #[error("command failed ({command}): {message}")]
     Command {
@@ -131,6 +137,74 @@ pub fn unmount_command(letter: &str) -> Vec<String> {
     ]
 }
 
+// ---------------------------------------------------- Linux mount chain ---
+//
+// Everything below mirrors the Python baseline's Unix mounter
+// (`cydrive/platform/linux_mac.py`, class `UnixMounter`). The plan's
+// drafted shapes (a `gio mount -d` form, `sudo`-prefixed davfs2/umount)
+// were placeholders: the baseline runs gio without a mount point and
+// davfs2/umount without sudo, and sudo/credentials semantics are
+// explicitly deferred to the next batch by the plan's C4 scope ruling.
+
+/// Pick the Linux mount backend by availability: gio wins when both are
+/// installed, davfs2 alone carries the mount, neither → `None`
+/// (design doc :161 order; the baseline probes `gio` first and only
+/// consults davfs2 when gio is missing or fails).
+pub fn detect_mount_backend(gio: bool, davfs2: bool) -> Option<&'static str> {
+    if gio {
+        Some("gio")
+    } else if davfs2 {
+        Some("davfs2")
+    } else {
+        None
+    }
+}
+
+/// Argv mounting `url` through GNOME's gio — the baseline's
+/// `["gio", "mount", webdav_url]`: no mount point and no `-d` flag (gio
+/// chooses where the mount lands).
+pub fn gio_mount_command(url: &str) -> Vec<String> {
+    vec!["gio".to_string(), "mount".to_string(), url.to_string()]
+}
+
+/// Argv mounting `url` at `mount_point` via davfs2 — the baseline's
+/// `["mount", "-t", "davfs", webdav_url, mount_path]`, run without sudo
+/// (root or a configured davfs2 group membership is assumed, exactly
+/// like the baseline).
+pub fn davfs_mount_command(url: &str, mount_point: &str) -> Vec<String> {
+    vec![
+        "mount".to_string(),
+        "-t".to_string(),
+        "davfs".to_string(),
+        url.to_string(),
+        mount_point.to_string(),
+    ]
+}
+
+/// Argv releasing `mount_point` with plain `umount` — the baseline's
+/// second Linux unmount attempt.
+pub fn davfs_unmount_command(mount_point: &str) -> Vec<String> {
+    vec!["umount".to_string(), mount_point.to_string()]
+}
+
+/// Argv releasing a FUSE mount at `mount_point` — the baseline's *first*
+/// Linux unmount attempt (`["fusermount", "-u", mount_path]`); its
+/// failure is ignored when the mount is not FUSE-backed.
+pub fn fusermount_unmount_command(mount_point: &str) -> Vec<String> {
+    vec![
+        "fusermount".to_string(),
+        "-u".to_string(),
+        mount_point.to_string(),
+    ]
+}
+
+/// Default Linux mount point: `~/CyDrive` (the baseline's
+/// `get_default_mount_point`, minus the directory creation, which is the
+/// side-effecting [`linux`] layer's job).
+pub fn default_mount_point(home: &std::path::Path) -> std::path::PathBuf {
+    home.join("CyDrive")
+}
+
 /// Windows implementation of the side-effecting mount/registry surface.
 #[cfg(windows)]
 pub mod windows;
@@ -140,3 +214,15 @@ pub mod windows;
 #[cfg(not(windows))]
 #[path = "windows_stub.rs"]
 pub mod windows;
+
+/// Linux implementation of the side-effecting mount chain (gio →
+/// davfs2), compiled only on `cfg(target_os = "linux")`. macOS stays
+/// stubbed — `mount_webdav` is out of scope per the plan's YAGNI list.
+#[cfg(target_os = "linux")]
+pub mod linux;
+
+/// Compile-only stubs so the workspace builds on non-Linux targets
+/// (same cfg discipline as [`windows`]'s stubs).
+#[cfg(not(target_os = "linux"))]
+#[path = "linux_stub.rs"]
+pub mod linux;
