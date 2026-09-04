@@ -143,3 +143,10 @@
 - **Linux run 自动挂载**（C5，此前延后项落地）：`auto_mount_target` 决策纯函数（platform 新增对 core 的 path dep，仅此用途）；启动链 = stale 清理（unmount_stale_for 幂等）→ mount_drive（非交互：root/setuid 直接工作，普通用户失败仅 warn + 提示手动，绝不出 sudo 密码提示）；停机链卸载挂载点（EBUSY/not-mounted warn 静默）；RunHandle 新增 `mounted_point` 字段（mounted_letter 的 Unix 对偶，不复用避免语义漂移）。
 - **真机验证（WSL）**：`ignored_unix_automount_roundtrip` PASS（wsgidav 8081 + davfs2 ask_auth 0 前提）；win workspace 352 / wsl cli+platform 全绿。
 - 后续可选：gio 探测强化（验 gvfs 可用而非仅二进制存在）、status 显示 pid/uptime、JSON 输出——均记 YAGNI 未做。
+
+## 2026-09-04 WSL 自动挂载挂死与 stop 失灵根因修复（fix/davfs-timeout-pidfile）
+
+- **根因（真机取证）**：davfs2 的 mount.davfs 在 `/var/run/mount.davfs/<挂载点>.pid` 留 PID 文件；服务异常退出/SIGKILL 后残留 → 后续挂载撞「found PID file ... ended irregular」（快速失败形态），或 mount.davfs 挂起（挂死形态——孤儿进程实测卡了数小时）。我们的 mount/unmount Command 调用**无超时** → 挂死形态直接卡死 run 启动（无 banner）与 stop 停机链（二次 stop 仍 OK 的原因：停机任务阻塞在序列中）。
+- **修复**：①`run_with_timeout`（15s 预算，100ms 轮询 try_wait，超时 kill——错误明示 timed out；mount/unmount/unmount_stale_for 全部走此通道）；②mount 失败信息含 PID 残留时：PID 已死 → 删文件自动重试一次，成功回报「(after clearing a stale pid file)」；PID 活着不动（真挂载进程）。
+- **测试**：`davfs_pid_file_path`/`parse_davfs_pid_file_hint` 纯函数（跨平台；parse 首版踩了路径含点的坑，改空白定界+去尾点）+ `run_with_timeout_kills_hanging_child`（cfg linux，WSL PASS：sleep 30 于 1s 被杀）。
+- **WSL 真机全链**：天然残留 PID（6304 死进程）存在时 `run` → 自动清理 → 挂载成功 → banner 打印 → `status` 显示 mount → `stop` → 日志 stop command received → 卸载（findmnt 空）→ 进程退出、控制文件清理。工作区 354 全绿。
