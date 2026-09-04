@@ -156,3 +156,9 @@
 - **bug**：`parse_net_use_mapping` 找 `http://` 字面量，但 `net use` 实际渲染 UNC 形式（`\127.0.0.1@8289\DavWWWRoot`，80 端口省 @port）→ 挂载存在也恒报 not mounted。当初纯函数测试样本凭空构造未对真机。修复 = http→UNC 换算后匹配；测试基线改用真机输出（zh-CN locale）。
 - **复用教训（与 davfs 同日第二次）**：外部命令输出解析的测试样本必须来自真机抓取，不得手写想象格式——已两例（mount.davfs stderr、net use UNC）。
 - **验收**：Windows stop/status/mount 显示用户亲测闭环；WSL automount/status/stop 此前已验。main @ 79f97a1，workspace 354。
+
+## 2026-09-04 rescan 可行性 spike 负结果：bot 读历史被服务端拒绝（BOT_METHOD_INVALID）
+
+- **实测（examples/history_spike.rs，真机 bot session 副本）**：`messages.getHistory`（iter_messages）与 `messages.search`（search_messages）均返回 400 BOT_METHOD_INVALID——Telegram 平台级限制，与文档一致；正常应用层错误，无封禁风险（spike 本身即证明：连发两次被拒调用，bot 与会话毫发无损）。
+- **保留的不对称**：`messages.getMessages`（按 ID 批量取，get_messages_by_id）对 bot 放行且生产长期使用——bot 拿得到「已知 ID 的消息」，拿不到「历史列表」。
+- **架构推论**：rescan（扫历史重建索引）**出局**；多实例/换机视图同步的阶梯变为：① 手动重发文件重建索引（零代码，现状可用）；② `cydrive export-meta / import-meta`（~200 行，索引文件拷贝导入，无基础设施）；③ 云端元数据同步（负责人提案：服务器以派生键聚合各实例推送，绕开本闸门，~2000-3500 行，LWW+墓碑一致性）。②③ 待负责人按需求频率裁决。
