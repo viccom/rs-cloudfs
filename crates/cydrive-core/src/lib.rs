@@ -16,6 +16,7 @@ pub mod database;
 pub mod inbound;
 pub mod logging;
 pub mod rel_path;
+pub mod sync;
 pub mod transport;
 pub mod upload_queue;
 pub mod vfs;

@@ -44,7 +44,10 @@ fn fresh_env(tag: &str) -> (tempfile::TempDir, MetaDatabase, CacheManager) {
 /// A fully populated `files` row for `rel_path` (caller mutates fields as
 /// needed). Timestamps are fixed constants so hashes are reproducible.
 fn record(rel_path: &str, size: i64, is_uploaded: bool) -> FileRecord {
-    let name = rel_path.rsplit_once('/').map_or(rel_path, |(_, n)| n).to_string();
+    let name = rel_path
+        .rsplit_once('/')
+        .map_or(rel_path, |(_, n)| n)
+        .to_string();
     let parent_dir = match rel_path.rfind('/') {
         Some(0) | None => "/".to_string(),
         Some(i) => rel_path[..i].to_string(),
@@ -143,7 +146,11 @@ fn serialize(rec: &FileRecord, chunks: &[ChunkRecord]) -> String {
 fn serialize_row_carries_all_data_fields_and_roundtrips() {
     let mut rec = record("/docs/big.bin", 1_048_576, true);
     rec.chunk_count = 3;
-    let chunks = vec![chunk(0, 101, 524_288), chunk(1, 102, 524_288), chunk(2, 103, 10)];
+    let chunks = vec![
+        chunk(0, 101, 524_288),
+        chunk(1, 102, 524_288),
+        chunk(2, 103, 10),
+    ];
     let payload = serialize(&rec, &chunks);
 
     let parsed = deserialize_row(&payload).expect("payload must roundtrip");
@@ -180,7 +187,7 @@ fn serialize_row_carries_all_data_fields_and_roundtrips() {
                 },
             ],
         },
-        "every data field (and only the {index,msg_id,size} chunk triple) survives the roundtrip"
+        "every data field (and only the {{index,msg_id,size}} chunk triple) survives the roundtrip"
     );
 }
 
@@ -200,7 +207,12 @@ fn serialize_row_omits_local_only_fields() {
     rec.created_at = Some(1.0);
     rec.updated_at = Some(2.0);
     let payload = serialize(&rec, &[chunk(0, 7, 5)]);
-    for key in ["\"is_cached\"", "\"created_at\"", "\"updated_at\"", "\"id\""] {
+    for key in [
+        "\"is_cached\"",
+        "\"created_at\"",
+        "\"updated_at\"",
+        "\"id\"",
+    ] {
         assert!(
             !payload.contains(key),
             "payload must not carry local-only field {key}: {payload}"
@@ -215,7 +227,12 @@ fn serialize_row_chunk_objects_carry_exactly_three_keys() {
     let value: serde_json::Value = serde_json::from_str(&payload).expect("valid JSON");
     let chunks = value["chunks"].as_array().expect("chunks array");
     assert_eq!(chunks.len(), 1);
-    let mut keys: Vec<&str> = chunks[0].as_object().expect("chunk object").keys().map(String::as_str).collect();
+    let mut keys: Vec<&str> = chunks[0]
+        .as_object()
+        .expect("chunk object")
+        .keys()
+        .map(String::as_str)
+        .collect();
     keys.sort_unstable();
     assert_eq!(keys, vec!["index", "msg_id", "size"]);
 }
@@ -333,11 +350,7 @@ fn push_diff_sends_only_rows_whose_hash_changed() {
         ("/b.txt".to_string(), changed_payload.clone()),
         ("/c.txt".to_string(), "payload-c".to_string()),
     ];
-    let mirror = vec![(
-        "/a.txt".to_string(),
-        row_hash(&unchanged_payload),
-        7,
-    )];
+    let mirror = vec![("/a.txt".to_string(), row_hash(&unchanged_payload), 7)];
     let diff = push_diff(&local, &mirror);
     assert_eq!(
         diff,
@@ -383,7 +396,8 @@ fn apply_skips_rows_at_or_below_mirror_version() {
     let (_dir, db, cache) = fresh_env("gate");
     let rec = record("/gate.txt", 10, true);
     let id = insert(&db, &upsert_from(&rec, false), &[chunk(0, 5, 10)]);
-    db.sync_mirror_set("/gate.txt", "stale-hash", 5).expect("mirror set");
+    db.sync_mirror_set("/gate.txt", "stale-hash", 5)
+        .expect("mirror set");
 
     // Row version == mirror server_version -> skipped by the idempotency
     // gate (a fresh row with no mirror reads as version 0, so a version-0
@@ -411,9 +425,7 @@ fn apply_skips_rows_at_or_below_mirror_version() {
         Some(("stale-hash".to_string(), 5))
     );
     assert!(
-        db.get_file("/never-mirrored.txt")
-            .expect("get")
-            .is_none(),
+        db.get_file("/never-mirrored.txt").expect("get").is_none(),
         "a gated row must not create local state"
     );
 }
@@ -424,7 +436,8 @@ fn apply_tombstone_deletes_files_chunks_and_mirror() {
     let rec = record("/tomb.txt", 10, true);
     let chunks = vec![chunk(0, 5, 6), chunk(1, 6, 4)];
     insert(&db, &upsert_from(&rec, false), &chunks);
-    db.sync_mirror_set("/tomb.txt", "hash", 1).expect("mirror set");
+    db.sync_mirror_set("/tomb.txt", "hash", 1)
+        .expect("mirror set");
 
     let rows = vec![pulled("/tomb.txt", 2, true, "")];
     let outcome = apply_pulled_rows(&db, &cache, &rows, 2).expect("apply");
@@ -512,20 +525,30 @@ fn apply_hash_equal_row_updates_mirror_only() {
     let chunks = vec![chunk(0, 5, 42)];
     let id = insert(&db, &upsert_from(&rec, false), &chunks);
     let before = db.get_file("/same.txt").expect("get").expect("row");
-    db.sync_mirror_set("/same.txt", "old-hash", 1).expect("mirror set");
+    db.sync_mirror_set("/same.txt", "old-hash", 1)
+        .expect("mirror set");
 
     let payload = serialize(&rec, &chunks);
     let rows = vec![pulled("/same.txt", 9, false, &payload)];
     let outcome = apply_pulled_rows(&db, &cache, &rows, 9).expect("apply");
-    assert_eq!(outcome.applied, 1, "the mirror advanced — row counts as applied");
+    assert_eq!(
+        outcome.applied, 1,
+        "the mirror advanced — row counts as applied"
+    );
 
     // The files row must not be rewritten: id and both DB timestamps are
     // unchanged (a write would bump updated_at and, on a delete+insert
     // implementation, change the id).
     let after = db.get_file("/same.txt").expect("get").expect("row");
     assert_eq!(after.id, id);
-    assert_eq!(after.created_at, before.created_at, "no files write: created_at untouched");
-    assert_eq!(after.updated_at, before.updated_at, "no files write: updated_at untouched");
+    assert_eq!(
+        after.created_at, before.created_at,
+        "no files write: created_at untouched"
+    );
+    assert_eq!(
+        after.updated_at, before.updated_at,
+        "no files write: updated_at untouched"
+    );
 
     // Mirror advanced to (payload hash, row version).
     assert_eq!(
@@ -540,7 +563,8 @@ fn apply_remote_wins_overwrites_row_and_chunks() {
     let local = record("/big.bin", 100, true);
     let local_chunks = vec![chunk(0, 11, 60), chunk(1, 12, 40)];
     insert(&db, &upsert_from(&local, true), &local_chunks);
-    db.sync_mirror_set("/big.bin", "old-hash", 1).expect("mirror set");
+    db.sync_mirror_set("/big.bin", "old-hash", 1)
+        .expect("mirror set");
 
     let mut remote = record("/big.bin", 200, true);
     remote.mtime = local.mtime + 500.0;
@@ -558,7 +582,11 @@ fn apply_remote_wins_overwrites_row_and_chunks() {
     assert!(!row.is_cached, "overwrite always stores is_cached = false");
 
     let after = db.get_chunks_by_file_id(row.id).expect("chunks");
-    assert_eq!(after.len(), 1, "the old chunk list is replaced by the payload chunks");
+    assert_eq!(
+        after.len(),
+        1,
+        "the old chunk list is replaced by the payload chunks"
+    );
     assert_eq!(after[0].chunk_index, 0);
     assert_eq!(after[0].telegram_msg_id, Some(77));
     assert_eq!(after[0].size, 200);
@@ -586,7 +614,10 @@ fn apply_overwrite_clears_stale_cached_copy() {
         "a stale cache copy of changed content is a correctness hazard — it must be removed"
     );
     let row = db.get_file("/stale.bin").expect("get").expect("row");
-    assert!(!row.is_cached, "the is_cached flag is cleared with the copy");
+    assert!(
+        !row.is_cached,
+        "the is_cached flag is cleared with the copy"
+    );
 }
 
 #[test]
