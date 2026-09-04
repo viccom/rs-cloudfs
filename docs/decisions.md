@@ -150,3 +150,9 @@
 - **修复**：①`run_with_timeout`（15s 预算，100ms 轮询 try_wait，超时 kill——错误明示 timed out；mount/unmount/unmount_stale_for 全部走此通道）；②mount 失败信息含 PID 残留时：PID 已死 → 删文件自动重试一次，成功回报「(after clearing a stale pid file)」；PID 活着不动（真挂载进程）。
 - **测试**：`davfs_pid_file_path`/`parse_davfs_pid_file_hint` 纯函数（跨平台；parse 首版踩了路径含点的坑，改空白定界+去尾点）+ `run_with_timeout_kills_hanging_child`（cfg linux，WSL PASS：sleep 30 于 1s 被杀）。
 - **WSL 真机全链**：天然残留 PID（6304 死进程）存在时 `run` → 自动清理 → 挂载成功 → banner 打印 → `status` 显示 mount → `stop` → 日志 stop command received → 卸载（findmnt 空）→ 进程退出、控制文件清理。工作区 354 全绿。
+
+## 2026-09-04 status mount 检测 Windows 解析修复 + 双平台验收闭环
+
+- **bug**：`parse_net_use_mapping` 找 `http://` 字面量，但 `net use` 实际渲染 UNC 形式（`\127.0.0.1@8289\DavWWWRoot`，80 端口省 @port）→ 挂载存在也恒报 not mounted。当初纯函数测试样本凭空构造未对真机。修复 = http→UNC 换算后匹配；测试基线改用真机输出（zh-CN locale）。
+- **复用教训（与 davfs 同日第二次）**：外部命令输出解析的测试样本必须来自真机抓取，不得手写想象格式——已两例（mount.davfs stderr、net use UNC）。
+- **验收**：Windows stop/status/mount 显示用户亲测闭环；WSL automount/status/stop 此前已验。main @ 79f97a1，workspace 354。
