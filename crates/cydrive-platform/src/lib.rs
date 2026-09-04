@@ -247,9 +247,7 @@ pub fn auto_mount_target(
 /// surrounding status words localize — an accepted risk documented on
 /// the test's real-machine sample.
 pub fn parse_net_use_mapping(output: &str, url: &str) -> Option<String> {
-    let Some(unc) = http_url_to_net_use_unc(url) else {
-        return None;
-    };
+    let unc = http_url_to_net_use_unc(url)?;
     for line in output.lines() {
         if !line.contains(&unc) {
             continue;
