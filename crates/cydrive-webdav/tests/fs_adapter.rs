@@ -782,3 +782,60 @@ async fn copy_is_not_implemented() {
         .expect_err("copy not implemented");
     assert_eq!(err, FsError::NotImplemented);
 }
+
+/// 16 (plan F2 / review H2): DELETE of a pending upload whose local
+///     cache copy still exists is refused — that copy is the only copy
+///     of the bytes (nothing is on the remote yet) — surfacing as
+///     `FsError::Forbidden` with both the row and the copy intact; a
+///     ghost pending row (copy already vanished, bytes nowhere) stays
+///     deletable, otherwise it could never be cleaned up. Same
+///     adjudication as core `VfsError::UploadPending`, mapped onto the
+///     adapter's own error surface.
+#[tokio::test]
+async fn remove_file_pending_upload_forbidden() {
+    let (_dir, db, cache_root, _mock, _vfs, fs) = test_env(u64::MAX).await;
+
+    // Pending row (is_uploaded = 0, cached) + its local copy in the
+    // cache tree: the only copy of the bytes.
+    let pending = RelPath::new("/uploading.bin").expect("valid rel path");
+    db.upsert_file(&FileUpsert {
+        is_uploaded: false,
+        is_cached: true,
+        ..shape_upsert(&pending, false, 6, 1_700_000_123.0)
+    })
+    .expect("seed pending row");
+    let local = seed_local(&cache_root, "/uploading.bin", b"bytes");
+
+    let err = fs
+        .remove_file(&DavPath::new("/uploading.bin").expect("path"))
+        .await
+        .expect_err("pending upload with its only copy must be refused");
+    assert_eq!(err, FsError::Forbidden);
+    assert!(
+        db.get_file("/uploading.bin")
+            .expect("db read")
+            .is_some_and(|row| !row.is_uploaded),
+        "the pending row survives the refused delete"
+    );
+    assert!(
+        local.exists(),
+        "the only copy of the bytes survives the refused delete"
+    );
+
+    // Ghost pending row: the copy vanished — the row must be deletable.
+    let ghost = RelPath::new("/ghost.bin").expect("valid rel path");
+    db.upsert_file(&FileUpsert {
+        is_uploaded: false,
+        is_cached: true,
+        ..shape_upsert(&ghost, false, 6, 1_700_000_123.0)
+    })
+    .expect("seed ghost row");
+    // No local copy seeded for /ghost.bin.
+    fs.remove_file(&DavPath::new("/ghost.bin").expect("path"))
+        .await
+        .expect("a ghost pending row is deletable");
+    assert!(
+        db.get_file("/ghost.bin").expect("db read").is_none(),
+        "the ghost row is gone"
+    );
+}

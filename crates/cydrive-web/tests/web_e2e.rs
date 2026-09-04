@@ -1029,3 +1029,75 @@ async fn queue_endpoint_counters() {
     );
     assert_eq!(db_pending, 0, "drained upload is no longer pending");
 }
+
+/// 17 (plan F2 / review H2): deleting a pending upload whose local
+///     cache copy still exists is the dashboard's face of the three-
+///     surface guard (core `VfsError::UploadPending`, WebDAV
+///     `FsError::Forbidden`): the route answers 409 Conflict with the
+///     uniform `{"error": ...}` body and the row — whose cache copy is
+///     the only copy of the bytes — survives; a ghost pending row (copy
+///     already vanished, bytes nowhere) deletes normally.
+#[tokio::test]
+async fn delete_pending_upload_conflict() {
+    let env = test_env().await;
+    let addr = env.server.local_addr();
+
+    // Pending row + its local copy in the mirrored cache tree (the same
+    // tree `env_with` hands the Vfs): the only copy of the bytes.
+    seed_row(&env.db, "/conflict.bin", false, 7, false);
+    let paths = CacheManager::new(env._dir.path().join("cache"), u64::MAX);
+    let rel = RelPath::new("/conflict.bin").expect("valid rel path");
+    let local = paths.local_path(&rel);
+    std::fs::create_dir_all(local.parent().expect("cache parent dir"))
+        .expect("create cache dirs");
+    std::fs::write(&local, b"only local copy").expect("write the only local copy");
+
+    let resp = send(
+        addr,
+        &request(
+            "POST",
+            "/api/delete",
+            addr,
+            &[("Content-Type", "application/json")],
+            r#"{"filename":"conflict.bin"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 409, "pending upload conflicts: {resp}");
+    let body: serde_json::Value =
+        serde_json::from_str(&body_of(&resp)).expect("parse error body");
+    assert!(
+        body["error"].as_str().is_some_and(|msg| !msg.is_empty()),
+        "uniform error body explains the refusal: {body}"
+    );
+    assert!(
+        env.db
+            .get_file("/conflict.bin")
+            .expect("db read")
+            .is_some_and(|row| !row.is_uploaded),
+        "the pending row survives the refused delete"
+    );
+    assert!(
+        local.exists(),
+        "the only copy of the bytes survives the refused delete"
+    );
+
+    // Ghost pending row: no local copy — deletes normally.
+    seed_row(&env.db, "/ghost.bin", false, 7, false);
+    let resp = send(
+        addr,
+        &request(
+            "POST",
+            "/api/delete",
+            addr,
+            &[("Content-Type", "application/json")],
+            r#"{"filename":"ghost.bin"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 200, "ghost row deletes: {resp}");
+    assert!(
+        env.db.get_file("/ghost.bin").expect("db read").is_none(),
+        "the ghost row is gone"
+    );
+}

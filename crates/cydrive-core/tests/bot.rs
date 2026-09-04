@@ -707,3 +707,46 @@ async fn queue_reports_counters() {
     );
     vfs.shutdown().await;
 }
+
+/// `/rm` of a pending upload (plan F2 / review H2): the delete is
+/// refused with a "still uploading" reply and the row survives — for a
+/// pending row the local cache copy is the only copy of the bytes.
+///
+/// Determinism: the mock stays **disconnected** on purpose — its
+/// `connected` gate makes every upload attempt fail with `NotConnected`
+/// (retry, then degrade), so the row can never flip to uploaded no
+/// matter when the worker is polled relative to `handle_command`'s
+/// internal awaits; `send_text` is not gated, so the reply still
+/// records. The cache copy can therefore never be dropped by a
+/// successful upload either.
+#[tokio::test]
+async fn rm_pending_upload_replies_still_uploading() {
+    let (_dir, db, vfs, mock) = bot_env().await;
+    let rel = RelPath::new("/uploading.bin").expect("valid path");
+    vfs.put(&rel, b"uploading payload", 0.0)
+        .await
+        .expect("put the file (stays pending: the mock is not connected)");
+
+    handle_command(&db, &vfs, &*mock, "Y:", "/rm /uploading.bin")
+        .await
+        .expect("handle /rm on a pending upload");
+
+    let texts = mock.sent_texts();
+    assert_eq!(texts.len(), 1);
+    assert!(
+        texts[0].contains("still uploading"),
+        "the refusal tells the user the upload is still in flight: {}",
+        texts[0]
+    );
+    let row = db
+        .get_file("/uploading.bin")
+        .expect("db read")
+        .expect("the row survives the refused /rm");
+    assert!(!row.is_uploaded, "the row is still a pending upload");
+    let copy = CacheManager::new(_dir.path().join("cache"), u64::MAX).local_path(&rel);
+    assert!(
+        copy.exists(),
+        "the only copy of the bytes survives the refused /rm"
+    );
+    vfs.shutdown().await;
+}

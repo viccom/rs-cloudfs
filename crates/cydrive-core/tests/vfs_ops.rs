@@ -491,3 +491,81 @@ async fn ingest_file_missing_source_errors_and_leaves_no_staging() {
 
     vfs.shutdown().await;
 }
+
+// ----------------------------------------------- pending-upload guard ---
+
+/// 9 (plan F2, review H2): `remove_file` refuses to delete a pending
+/// upload whose local cache copy still exists — for such a row the copy
+/// is the **only** copy of the bytes (nothing is on the remote yet), so
+/// deleting the row would orphan the upload's data. The refusal is the
+/// `VfsError::UploadPending` variant carrying the virtual path, and
+/// both the row and the local copy survive it untouched.
+///
+/// Determinism mirrors test 6's file B: the put is never followed by an
+/// await before the guard runs (current-thread runtime, immediately-
+/// ready enqueue, and the guard is a synchronous prefix of
+/// `remove_file`), so the row is deterministically still pending when
+/// the guard reads it.
+#[tokio::test]
+async fn remove_file_refuses_pending_upload_with_local_copy() {
+    let (_dir, db, cache, cache_root, mock) = test_env(1 << 20).await;
+    let paths = CacheManager::new(cache_root.clone(), u64::MAX);
+    let vfs = build_vfs(&db, cache, &mock, 64);
+    let rel = RelPath::new("/uploading.txt").expect("valid rel path");
+
+    // put without draining: the row is pending and the cache tree holds
+    // the only copy of the bytes.
+    vfs.put(&rel, b"only local copy", 1_700_000_000.0)
+        .await
+        .expect("put accepted");
+    let local = paths.local_path(&rel);
+    assert!(local.exists(), "the pending copy is in the cache tree");
+
+    match vfs.remove_file(&rel).await {
+        Err(VfsError::UploadPending(path)) => assert_eq!(path, "/uploading.txt"),
+        other => panic!("expected UploadPending(/uploading.txt), got: {other:?}"),
+    }
+
+    let row = db
+        .get_file("/uploading.txt")
+        .expect("db read")
+        .expect("the row survives the refused delete");
+    assert!(!row.is_uploaded, "the row is still a pending upload");
+    assert!(
+        local.exists(),
+        "the only copy of the bytes survives the refused delete"
+    );
+
+    vfs.shutdown().await;
+}
+
+/// 10 (plan F2 ghost-row refinement): a pending row whose local copy
+/// has vanished is a ghost — the bytes are neither local nor remote —
+/// and MUST stay deletable, otherwise it could never be cleaned up.
+#[tokio::test]
+async fn remove_file_allows_ghost_pending_row() {
+    let (_dir, db, cache, cache_root, mock) = test_env(1 << 20).await;
+    let paths = CacheManager::new(cache_root.clone(), u64::MAX);
+    let vfs = build_vfs(&db, cache, &mock, 64);
+    let rel = RelPath::new("/ghost.bin").expect("valid rel path");
+
+    vfs.put(&rel, b"ghost bytes", 1_700_000_000.0)
+        .await
+        .expect("put accepted");
+    let local = paths.local_path(&rel);
+    assert!(local.exists(), "the pending copy is in the cache tree");
+
+    // Vanish the copy out from under the pending row (a sync std call —
+    // no await, the worker stays unpolled and the row stays pending).
+    fs::remove_file(&local).expect("delete the local copy");
+
+    vfs.remove_file(&rel)
+        .await
+        .expect("a ghost pending row is deletable");
+    assert!(
+        db.get_file("/ghost.bin").expect("db read").is_none(),
+        "the ghost row is gone"
+    );
+
+    vfs.shutdown().await;
+}
