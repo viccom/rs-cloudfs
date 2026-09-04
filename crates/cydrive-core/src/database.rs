@@ -13,6 +13,11 @@
 //! - `upsert_file` returns the row id via `INSERT ... RETURNING id`, fixing
 //!   the Python `lastrowid` bug where a conflict-update returned the id of
 //!   the *previous* insert instead of the surviving row.
+//!
+//! Outside the frozen contract: the sync-lite mirror tables `sync_mirror`
+//! and `sync_state` (2026-09-04 plan, «客户端») are Rust-added, purely
+//! additive `IF NOT EXISTS` tables created in a separate batch — the
+//! contract DDL above stays byte-identical and untouched.
 
 use std::path::Path;
 use std::sync::Mutex;
@@ -175,8 +180,11 @@ impl MetaDatabase {
     /// Per connection: `journal_mode = WAL`, `synchronous = NORMAL`,
     /// `foreign_keys = ON`, `busy_timeout = 5000`. Creates `files`, `chunks`
     /// and `stats` plus the three indexes with `IF NOT EXISTS`, using DDL
-    /// byte-identical to the Python `_init_db`. Existing databases (e.g.
-    /// produced by the Python version) are adopted without data loss.
+    /// byte-identical to the Python `_init_db`; then, in a separate batch,
+    /// the Rust-added sync-lite tables `sync_mirror` / `sync_state` (also
+    /// `IF NOT EXISTS`, so pre-sync-lite databases gain them at open).
+    /// Existing databases (e.g. produced by the Python version) are adopted
+    /// without data loss.
     pub fn open(path: &Path) -> Result<Self, DbError> {
         // Python parity: `os.makedirs(os.path.dirname(db_path), exist_ok=True)`
         // (best effort — the constructor has no error channel).
@@ -231,6 +239,24 @@ impl MetaDatabase {
             CREATE INDEX IF NOT EXISTS idx_files_parent ON files(parent_dir);
             CREATE INDEX IF NOT EXISTS idx_files_msg_id ON files(telegram_msg_id);
             CREATE INDEX IF NOT EXISTS idx_files_uploaded ON files(is_uploaded);",
+        )?;
+        // Rust-added sync-lite tables (docs/plans/2026-09-04-sync-lite.md,
+        // client side) in a separate batch so the Python-contract DDL above
+        // stays byte-identical. Purely additive: `IF NOT EXISTS` means a
+        // database from before sync-lite gains these at open (adoption
+        // without data loss), and neither table is referenced by the
+        // contract tables.
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS sync_mirror (
+                rel_path TEXT PRIMARY KEY,
+                row_hash TEXT,
+                server_version INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS sync_state (
+                id INTEGER PRIMARY KEY CHECK(id=0),
+                max_pulled INTEGER NOT NULL DEFAULT 0
+            );",
         )?;
         Ok(Self {
             conn: Mutex::new(conn),
@@ -538,5 +564,114 @@ impl MetaDatabase {
             uploaded_files,
             pending_uploads: total_files - uploaded_files,
         })
+    }
+
+    // ----------------------------------------------- sync-lite tables ---
+    //
+    // Client-side state of the sync-lite metadata mirror (2026-09-04 plan,
+    // «客户端»): `sync_mirror` holds, per virtual path, the row hash and
+    // server version of the last synced logical row; `sync_state` holds the
+    // single `id = 0` row with the highest server version pulled. Purely
+    // additive schema — the sync engine itself lives in later units.
+
+    /// Reads the mirror row for `rel_path`: its `(row_hash, server_version)`
+    /// as of the last sync, or `None` when the path was never synced.
+    pub fn sync_mirror_get(&self, rel_path: &str) -> Result<Option<(String, i64)>, DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(conn
+            .query_row(
+                "SELECT row_hash, server_version FROM sync_mirror WHERE rel_path = ?1",
+                [rel_path],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?)
+    }
+
+    /// Upserts the mirror row for `rel_path` (both columns overwrite).
+    pub fn sync_mirror_set(
+        &self,
+        rel_path: &str,
+        row_hash: &str,
+        server_version: i64,
+    ) -> Result<(), DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "INSERT INTO sync_mirror (rel_path, row_hash, server_version)
+            VALUES (?1, ?2, ?3)
+            ON CONFLICT(rel_path) DO UPDATE SET
+                row_hash=excluded.row_hash,
+                server_version=excluded.server_version",
+            params![rel_path, row_hash, server_version],
+        )?;
+        Ok(())
+    }
+
+    /// Deletes the mirror row for `rel_path`. Deleting a path that was
+    /// never mirrored is a no-op, mirroring [`MetaDatabase::delete_file`].
+    pub fn sync_mirror_delete(&self, rel_path: &str) -> Result<(), DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute("DELETE FROM sync_mirror WHERE rel_path = ?1", [rel_path])?;
+        Ok(())
+    }
+
+    /// Every mirror row as `(rel_path, row_hash, server_version)`, ordered
+    /// by `rel_path ASC` — the deterministic input the diff phase walks.
+    pub fn sync_mirror_all(&self) -> Result<Vec<(String, String, i64)>, DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut stmt = conn.prepare(
+            "SELECT rel_path, row_hash, server_version FROM sync_mirror \
+             ORDER BY rel_path ASC",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            Ok((
+                row.get::<_, String>(0)?,
+                row.get::<_, String>(1)?,
+                row.get::<_, i64>(2)?,
+            ))
+        })?;
+        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+    }
+
+    /// The highest server version pulled so far; a database that never
+    /// synced has no row and reads as `0`.
+    pub fn sync_state_get(&self) -> Result<i64, DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(conn
+            .query_row(
+                "SELECT max_pulled FROM sync_state WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+            .unwrap_or(0))
+    }
+
+    /// Upserts `max_pulled` into the single `id = 0` row.
+    pub fn sync_state_set(&self, max_pulled: i64) -> Result<(), DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "INSERT INTO sync_state (id, max_pulled) VALUES (0, ?1)
+            ON CONFLICT(id) DO UPDATE SET max_pulled=excluded.max_pulled",
+            params![max_pulled],
+        )?;
+        Ok(())
     }
 }
