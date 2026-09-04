@@ -530,43 +530,24 @@ pub fn cache_stats(cfg: &CyDriveConfig) -> Result<()> {
 /// The `cache clear` body (contract C11 + plan revision A1): db + cache
 /// manager over the config paths alone, no transport. Deletes the
 /// cached copies of **uploaded** files and clears their `is_cached`
-/// flags — the same pending-preserving path as `Vfs::cache_clear`:
-/// pending uploads (`is_uploaded = 0`) keep both their local copy (for
-/// them it is the only copy of the bytes) and their flag. Prints the
-/// freed bytes and the number of cleared flags.
+/// flags via the shared pending-preserving path
+/// (`cydrive_core::vfs::clear_cache_preserving_pending`, the same one
+/// behind `Vfs::cache_clear`): pending uploads (`is_uploaded = 0`) keep
+/// both their local copy (for them it is the only copy of the bytes)
+/// and their flag. Prints the freed bytes and the number of cleared
+/// flags.
 pub fn cache_clear_cmd(cfg: &CyDriveConfig) -> Result<()> {
     let db = MetaDatabase::open(Path::new(&cfg.db_path))
         .with_context(|| format!("opening metadata db {:?}", cfg.db_path))?;
     let cache_limit = cfg.cache_limit_gb * BYTES_PER_GB;
     let cache = CacheManager::new(Path::new(&cfg.cache_path).to_path_buf(), cache_limit);
 
-    // Plan revision A1: pending uploads survive the clear.
-    let pending = db
-        .pending_file_paths()
-        .context("listing pending uploads for the cache clear")?;
-    let keep: Vec<RelPath> = pending
-        .iter()
-        .filter_map(|path| match RelPath::new(path) {
-            Ok(rel) => Some(rel),
-            Err(error) => {
-                tracing::warn!(
-                    %path,
-                    %error,
-                    "pending path failed to parse; cache clear cannot preserve its copy"
-                );
-                None
-            }
-        })
-        .collect();
-
+    // Plan revision A1: pending uploads survive the clear — the shared
+    // core helper owns that semantics (review M1 single source).
     let before = cache.total_size();
-    cache
-        .clear_except(&keep)
+    let cleared = cydrive_core::vfs::clear_cache_preserving_pending(&db, &cache)
         .context("clearing the local cache")?;
     let freed = before - cache.total_size();
-    let cleared = db
-        .clear_cached_flags()
-        .context("clearing is_cached flags")?;
     println!(
         "cache cleared: freed {}, cleared {} is_cached flag(s)",
         format_storage_size(freed as i64),

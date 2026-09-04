@@ -629,24 +629,11 @@ impl Vfs {
     /// bytes — and their flag (plan revision A1). Uploaded payloads stay
     /// in Telegram — this is a local disk operation only; I/O failures
     /// surface as [`VfsError::Io`].
+    ///
+    /// Thin delegate; the semantics live in
+    /// [`clear_cache_preserving_pending`].
     pub fn cache_clear(&self) -> Result<u64, VfsError> {
-        let pending = self.db.pending_file_paths()?;
-        let keep: Vec<RelPath> = pending
-            .iter()
-            .filter_map(|path| match RelPath::new(path) {
-                Ok(rel) => Some(rel),
-                Err(error) => {
-                    tracing::warn!(
-                        %path,
-                        %error,
-                        "pending path failed to parse; cache clear cannot preserve its copy"
-                    );
-                    None
-                }
-            })
-            .collect();
-        self.cache.clear_except(&keep)?;
-        Ok(self.db.clear_cached_flags()?)
+        clear_cache_preserving_pending(&self.db, &self.cache)
     }
 
     /// Upload path for an existing local file (CLI `push`): streams the
@@ -686,4 +673,40 @@ impl Vfs {
     pub async fn shutdown(&self) {
         self.queue.shutdown().await
     }
+}
+
+/// Empties the cache of **uploaded** files (the root itself survives)
+/// and clears the `is_cached` flag on those rows only, returning the
+/// number of flags cleared. Pending uploads (`is_uploaded = 0`) keep
+/// both their local cache copy — for them it is the only copy of the
+/// bytes — and their flag (plan revision A1). A pending row whose path
+/// fails to parse as a [`RelPath`] only warns — its copy cannot be
+/// preserved, and the clear proceeds without it. Uploaded payloads stay
+/// in Telegram — this is a local disk operation only; I/O failures
+/// surface as [`VfsError::Io`].
+///
+/// The single source of the pending-preserving cache-clear semantics;
+/// both [`Vfs::cache_clear`] and the CLI `cache clear` command go
+/// through it.
+pub fn clear_cache_preserving_pending(
+    db: &MetaDatabase,
+    cache: &CacheManager,
+) -> Result<u64, VfsError> {
+    let pending = db.pending_file_paths()?;
+    let keep: Vec<RelPath> = pending
+        .iter()
+        .filter_map(|path| match RelPath::new(path) {
+            Ok(rel) => Some(rel),
+            Err(error) => {
+                tracing::warn!(
+                    %path,
+                    %error,
+                    "pending path failed to parse; cache clear cannot preserve its copy"
+                );
+                None
+            }
+        })
+        .collect();
+    cache.clear_except(&keep)?;
+    Ok(db.clear_cached_flags()?)
 }
