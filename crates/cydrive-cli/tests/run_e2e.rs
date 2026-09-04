@@ -494,3 +494,30 @@ async fn run_instance_stops_via_control_channel() {
 
     drop(handle); // STOP is the whole exit; never call shutdown() here
 }
+
+// ---------------------------------------------- task 3 (plan C3): sigterm ---
+
+/// The unix SIGTERM helper resolves on a *real* signal (plan task 3's
+/// verification strategy: injecting signals into the test process is
+/// flaky as an always-on gate, so this lives behind `#[ignore]` and runs
+/// explicitly on unix — the WSL step of the plan). A `kill -TERM` aimed
+/// at this very process must make the `sigterm()` future resolve within
+/// the deadline; on Windows the helper compiles to a permanently pending
+/// stub and this test does not exist (`#[cfg(unix)]`).
+#[cfg(unix)]
+#[ignore = "sends a real SIGTERM to the test process; run explicitly on unix: cargo test -- --ignored"]
+#[tokio::test]
+async fn sigterm_future_resolves_on_real_signal() {
+    let waiter = tokio::spawn(async { cydrive_cli::sigterm().await });
+    sleep(Duration::from_millis(200)).await;
+    let status = std::process::Command::new("kill")
+        .args(["-TERM", &std::process::id().to_string()])
+        .status()
+        .expect("kill -TERM self");
+    assert!(status.success());
+    timeout(Duration::from_secs(5), waiter)
+        .await
+        .expect("sigterm future resolved within 5s")
+        .expect("join ok")
+        .expect("sigterm ok");
+}
