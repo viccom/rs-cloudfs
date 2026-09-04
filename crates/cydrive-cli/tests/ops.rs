@@ -494,7 +494,7 @@ fn persist_setup_scrubs_and_stores() {
     let cfg = apply_wizard(CyDriveConfig::default(), &answers);
 
     let store = InMemoryStore::new();
-    persist_setup(&cfg, &store).expect("persist setup");
+    persist_setup(&cfg, Some(&store)).expect("persist setup");
 
     // The token lives in the store, not in the file.
     assert_eq!(
@@ -524,7 +524,7 @@ fn persist_setup_roundtrips_discover() {
     let cfg = apply_wizard(CyDriveConfig::default(), &answers);
 
     let store = InMemoryStore::new();
-    persist_setup(&cfg, &store).expect("persist setup");
+    persist_setup(&cfg, Some(&store)).expect("persist setup");
 
     let discovered = discover_config_with_store(&store).expect("discover after setup");
     assert!(
@@ -534,4 +534,35 @@ fn persist_setup_roundtrips_discover() {
     assert_eq!(discovered.bot_token, "999:xyz");
     assert_eq!(discovered.chat_id, -100200);
     assert_eq!(discovered.drive_letter, "Z:");
+}
+
+/// Headless fix (2026-09-04): when no credential store exists (WSL /
+/// servers without Secret Service), `persist_setup(None)` must keep the
+/// secrets by writing them INTO config.toml — the old flow stored them
+/// in a volatile in-memory fallback and lost them while claiming success.
+#[test]
+fn persist_setup_headless_writes_secrets_into_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = chdir(dir.path());
+    let answers = WizardAnswers {
+        bot_token: "123456789:HEADLESS".to_string(),
+        chat_id: 42,
+        drive_letter: "y".to_string(),
+    };
+    let cfg = apply_wizard(CyDriveConfig::default(), &answers);
+
+    persist_setup(&cfg, None).expect("persist headless setup");
+
+    let on_disk = CyDriveConfig::load_toml(Path::new("config.toml")).expect("toml loads");
+    assert_eq!(
+        on_disk.bot_token, "123456789:HEADLESS",
+        "the token survives in the file"
+    );
+    assert!(on_disk.is_configured());
+    // Discovery against an empty (unreachable) keyring still works: the
+    // file value wins over an empty backfill.
+    let discovered =
+        discover_config_with_store(&InMemoryStore::new()).expect("discover headless setup");
+    assert_eq!(discovered.bot_token, "123456789:HEADLESS");
+    assert!(discovered.is_configured());
 }
