@@ -401,3 +401,71 @@ fn vfs_config_maps_new_tuning_keys() {
         "hydrate_timeout_secs reaches VfsConfig.hydrate_timeout"
     );
 }
+
+// ------------------------------------- tier-1 review additions (F4/L) ---
+
+/// 9. (review F4) Pushing a directory as the source is rejected up
+///    front: the error names the directory nature of the source, and
+///    neither the destination file row nor the missing-ancestor
+///    directory rows linger in the db afterwards. The dest name avoids
+///    the word "directory" so the message assertion can only pass on
+///    the real gate message, not on the echoed path.
+#[tokio::test]
+async fn push_file_rejects_directory_source() {
+    let (dir, db, _cache_root, _mock, vfs) = test_env(1 << 20, 64 * 1024).await;
+    let source_dir = dir.path().join("subdir");
+    fs::create_dir(&source_dir).expect("create source directory");
+    let dest = RelPath::new("/a/b/payload.bin").expect("valid dest");
+
+    let result = push_file(&vfs, &source_dir, &dest).await;
+    let err = result.expect_err("a directory source must be rejected");
+    assert!(
+        err.to_string().to_lowercase().contains("directory"),
+        "the error must name the directory nature of the source: {err:#}"
+    );
+
+    assert!(
+        db.get_file("/a/b/payload.bin").expect("db read").is_none(),
+        "no row for the rejected push"
+    );
+    let root = db.list_dir("/").expect("list /");
+    assert!(
+        !root.iter().any(|entry| entry.rel_path == "/a"),
+        "no ancestor directory row /a may linger: {root:?}"
+    );
+
+    vfs.shutdown().await;
+}
+
+/// 10. (review F4) Pulling onto an existing file overwrites it
+///     wholesale: a stale, longer file at the exact output path is
+///     replaced by the payload bytes (no merge, no leftovers).
+#[tokio::test]
+async fn pull_file_overwrites_existing_file() {
+    let (dir, _db, cache_root, _mock, vfs) = test_env(1 << 20, 64 * 1024).await;
+    let payload = b"fresh bytes".to_vec();
+    let source = dir.path().join("fresh.bin");
+    fs::write(&source, &payload).expect("write source file");
+    let rel = RelPath::new("/fresh.bin").expect("valid rel");
+
+    push_file(&vfs, &source, &rel).await.expect("push accepted");
+    wait_until_uploaded(&vfs, &rel, &cache_root, 1).await;
+    evict_copy(&cache_root, &rel); // force the pull through hydration
+
+    let out = dir.path().join("overwritten.bin");
+    fs::write(
+        &out,
+        b"stale contents that are longer than the fresh payload and must vanish",
+    )
+    .expect("pre-create a stale output file");
+
+    let pulled_to = pull_file(&vfs, &rel, &out).await.expect("pull accepted");
+    assert_eq!(pulled_to, out, "the exact file path is the target");
+    assert_eq!(
+        fs::read(&out).expect("read pulled file"),
+        payload,
+        "the stale file is overwritten with the source bytes"
+    );
+
+    vfs.shutdown().await;
+}
