@@ -19,14 +19,17 @@
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
 
-use cydrive_cli::{discover_config, run_with_transport, vfs_config, RunHandle};
+use cydrive_cli::control::{control_file_path, read_control_addr, send_stop};
+use cydrive_cli::{discover_config, run_with_transport, vfs_config, RunHandle, ShutdownWatch};
 use cydrive_core::config::CyDriveConfig;
 use cydrive_core::database::{FileUpsert, MetaDatabase};
 use cydrive_core::transport::mock::MockTransport;
 use cydrive_core::transport::CloudTransport;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
+use tokio::time::{sleep, timeout};
 
 // ------------------------------------------------------------- helpers ---
 
@@ -385,4 +388,109 @@ fn legacy_json_config_boots() {
     assert_eq!(cfg.bot_token, "123456:ABC-DEF");
     assert_eq!(cfg.chat_id, 123456789);
     assert!(cfg.is_configured(), "token + chat pair is configured");
+}
+
+// ------------------------------------------ task 2 (plan C3): shutdown wiring ---
+
+/// The unified shutdown latch (service-lifecycle plan, contract C3) is
+/// multi-trigger idempotent: untriggered it blocks, and once triggered —
+/// no matter how many times — every `wait()` resolves immediately. This
+/// is the seam the three shutdown sources (Ctrl+C / SIGTERM / the
+/// control-channel STOP) funnel through, so a second trigger arriving
+/// while the graceful drain is already running must never wedge the exit.
+#[tokio::test]
+async fn shutdown_watch_multi_trigger_idempotent() {
+    let watch = Arc::new(ShutdownWatch::new());
+
+    // Untriggered the latch must hold `wait` back (a short window, not a
+    // hang: 100ms is orders of magnitude above a spurious readiness).
+    let untriggered = timeout(Duration::from_millis(100), watch.wait()).await;
+    assert!(
+        untriggered.is_err(),
+        "wait() must block until the latch is triggered"
+    );
+
+    // A waiter racing the triggers must resolve under either ordering
+    // (wait-then-trigger and trigger-then-wait): the triggered state
+    // wakes every current and future waiter.
+    let waiter = {
+        let watch = Arc::clone(&watch);
+        tokio::spawn(async move { watch.wait().await })
+    };
+    watch.trigger();
+    watch.trigger(); // the second trigger must be a harmless no-op
+    timeout(Duration::from_secs(1), waiter)
+        .await
+        .expect("the waiting task resolves after the triggers")
+        .expect("the waiting task joins cleanly");
+
+    // And a *later* wait still returns at once — the latch stays set.
+    timeout(Duration::from_secs(1), watch.wait())
+        .await
+        .expect("wait() after a trigger resolves immediately (idempotent latch)");
+}
+
+/// A running instance stops via the control channel (contract C3):
+/// `run_with_transport` binds the loopback control server and writes the
+/// port file next to the db (observable the moment boot returns), a STOP
+/// answers `OK: shutting down`, and the STOP alone — this test never
+/// calls `handle.shutdown()` — drives the full graceful stop: within the
+/// deadline the WebDAV listener refuses new connections and the stop
+/// chain has removed the port file. `RunHandle` exposes no
+/// completion future, so those two observable terminal states are the
+/// verdict; the handle stays alive until both are seen (dropping it
+/// early could take the listener down and fake the refusal).
+#[tokio::test]
+async fn run_instance_stops_via_control_channel() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cfg = temp_config(dir.path(), 0);
+    let mock = mock_transport().await;
+    let handle = boot(&cfg, mock).await;
+    let addr = handle.local_addr();
+    assert_ne!(addr.port(), 0, ":0 must resolve to the real bound port");
+
+    // The control channel is part of the booted stack: the port file
+    // exists next to the db and parses back into an address.
+    let control_file = control_file_path(&cfg);
+    assert!(
+        control_file.exists(),
+        "run_with_transport must write the control file {} next to the db",
+        control_file.display()
+    );
+    let control_addr = read_control_addr(&cfg).expect("the control file parses into an address");
+
+    let reply = send_stop(control_addr)
+        .await
+        .expect("STOP over the control channel");
+    assert!(
+        reply.contains("OK: shutting down"),
+        "control reply: {reply}"
+    );
+
+    // Poll the two terminal states; 15s is generous against the graceful
+    // drain (this boot has no in-flight uploads to wait for).
+    let deadline = Instant::now() + Duration::from_secs(15);
+    loop {
+        let webdav_refused = TcpStream::connect(addr).await.is_err();
+        let control_file_removed = !control_file.exists();
+        if webdav_refused && control_file_removed {
+            break;
+        }
+        assert!(
+            Instant::now() < deadline,
+            "instance did not stop within 15s of STOP (webdav refused: {webdav_refused}, \
+             control file removed: {control_file_removed})"
+        );
+        sleep(Duration::from_millis(100)).await;
+    }
+
+    // The stop chain removes the port file (C3: the deletion sits in the
+    // RunHandle shutdown sequence, just before the drive unmount).
+    assert!(
+        !control_file.exists(),
+        "the shutdown must remove the control file {}",
+        control_file.display()
+    );
+
+    drop(handle); // STOP is the whole exit; never call shutdown() here
 }
