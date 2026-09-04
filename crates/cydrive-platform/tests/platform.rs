@@ -298,14 +298,21 @@ fn linux_stub_shape() {
 ///     `Y:` and the URL, are locale-independent).
 #[test]
 fn parse_net_use_finds_letter_for_url() {
+    // Real-machine `net use` output (captured on zh-CN Windows,
+    // 2026-09-04): the remote column is the UNC form
+    // `\\<host>@<port>\DavWWWRoot`, never the http URL; headers localize
+    // but the data tokens do not. Baseline correction: the pre-fix
+    // sample assumed an http literal `net use` never emits.
     let output = "\
-New connections will be remembered.
+不记录新的网络连接。
 
-Status       Local     Remote                    Network
+状态       本地        远程                      网络
 -------------------------------------------------------------------------------
-OK           X:        http://127.0.0.1:9000     Web Client Network
-OK           Y:        http://127.0.0.1:8289     Web Client Network
-The command completed successfully.
+             X:        \\\\127.0.0.1@9000\\DavWWWRoot
+                                                Web Client Network
+             Y:        \\\\127.0.0.1@8289\\DavWWWRoot
+                                                Web Client Network
+命令完成。
 ";
     // 正常: the URL's own line yields its letter.
     assert_eq!(
