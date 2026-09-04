@@ -123,3 +123,9 @@
 - **davfs2 真机往返留待**：WSL 环境 davfs2 挂载不生效（/dev/fuse 在、mount 无报错但 /proc/mounts 无记录——WSL FUSE 组合的环境限制）；wsgidav 测试服务方案已验证可行（PROPFIND 207）。`ignored_davfs_mount_unmount_roundtrip` 需真实 Linux 主机跑。
 - **systemd unit**（deploy/cydrive.service）：SIGTERM 原生处理后无需 KillSignal 覆盖；TimeoutStopSec=600（大文件排干）；RestartSec=5 防 100ms 紧密重启循环；EnvironmentFile 方案承载无头凭据（doctor 的 headless 提示与 run 流程各司其职）。未在真实 systemd 实跑（静态编写，键集按契约+惯例）。
 - 门禁：Windows workspace 341 通过；WSL cli+platform 67 通过（+2 真机 ignored）+ workspace check 干净。
+
+## 2026-09-04 setup 无头凭据缺陷修复（负责人裁决：修 bug、token 不换）
+
+- **缺陷**：WSL/服务器无 Secret Service 时，setup 降级 InMemoryStore + tracing::warn——但 setup 不初始化日志订阅（审查已记录的 L 级缺口），警告不可见；向导打印「secrets live in the credential store」成功假象，token 实际随进程消亡（真机 WSL 复现）。migrate 对同场景是硬失败（「迁进易失内存比失败更危险」），setup 漏掉了同等处理。
+- **修复**：`persist_setup(Option<&dyn CredentialStore>)`——None=headless 模式，secrets 经 `save_toml` 落 config.toml（文件值优先级链已支持）；main.rs setup_cmd 无 keyring 时 println 可见警告 + dialoguer Confirm 二选一（同意→文件模式；拒绝→带指引中止），删除静默 InMemory 路径。TDD：红= persist_setup_headless_writes_secrets_into_config（含空 keyring 下 discover 取文件值断言）。
+- 已合并 main（474512f）+ 推送；WSL ~/cydrive/cydrive 已更新为修复版。run 仍受 WSL 网络拓扑限制：proxy_url 需指向 Windows 宿主 IP 且 Clash 开允许局域网。
