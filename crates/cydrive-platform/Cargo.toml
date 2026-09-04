@@ -9,6 +9,9 @@ license.workspace = true
 workspace = true
 
 [dependencies]
+# Only for `auto_mount_target`'s `&CyDriveConfig` decision input
+# (status plan C5); the rest of this crate stays a pure platform leaf.
+cydrive-core = { path = "../cydrive-core" }
 thiserror = "2"
 
 [target.'cfg(windows)'.dependencies]

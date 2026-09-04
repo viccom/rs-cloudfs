@@ -14,6 +14,7 @@
 //! | `ignored_mount_unmount_roundtrip` | admin shell **and** a reachable WebDAV server at `http://127.0.0.1:8080` (start `cydrive run` first, or point `CYDRIVE_TEST_MOUNT_URL` at another server) | `mount_drive` on `"Y:"` (fallback-picked if occupied), assert a `X:`-shaped letter came back, then `unmount_drive` it |
 //! | `ignored_optimize_webdav_registry` | admin shell | writes `FileSizeLimitInBytes` / `BasicAuthLevel` under the WebClient `Parameters` key and restarts the service |
 //! | `ignored_davfs_mount_unmount_roundtrip` | Linux, `mount.davfs` on PATH (usually root), a reachable WebDAV server (`CYDRIVE_TEST_MOUNT_URL`, default `http://127.0.0.1:8080`) | `mount_drive` via davfs2 into a temp dir, assert the davfs2 description, then `unmount_drive` |
+//! | `ignored_unix_automount_roundtrip` | Linux, `mount.davfs` on PATH (usually root), a reachable WebDAV server (`CYDRIVE_TEST_MOUNT_URL`, default `http://127.0.0.1:8080`) | the C5 run-flow chain: `auto_mount_target` link, davfs2 mount/unmount round-trip, `unmount_stale_for` releasing the live mount + its idempotent second call |
 //!
 //! Run them by hand with:
 //!
@@ -23,12 +24,13 @@
 
 use std::path::Path;
 
+use cydrive_core::config::CyDriveConfig;
 use cydrive_platform::{
-    davfs_mount_command, davfs_unmount_command, default_mount_point, detect_mount_backend,
-    fusermount_unmount_command, gio_mount_command, mount_command, normalize_drive_letter,
-    parse_net_use_mapping, parse_proc_mounts_davfs, pick_drive_letter, unmount_command,
-    used_letters_from_bitmask, BASIC_AUTH_LEVEL, FALLBACK_DRIVE_LETTERS, FILE_SIZE_LIMIT_BYTES,
-    WEBCLIENT_REG_PATH,
+    auto_mount_target, davfs_mount_command, davfs_unmount_command, default_mount_point,
+    detect_mount_backend, fusermount_unmount_command, gio_mount_command, mount_command,
+    normalize_drive_letter, parse_net_use_mapping, parse_proc_mounts_davfs, pick_drive_letter,
+    unmount_command, used_letters_from_bitmask, BASIC_AUTH_LEVEL, FALLBACK_DRIVE_LETTERS,
+    FILE_SIZE_LIMIT_BYTES, WEBCLIENT_REG_PATH,
 };
 
 /// 1. `normalize_drive_letter` — the three accepted spellings canonicalise
@@ -419,4 +421,115 @@ fn ignored_davfs_mount_unmount_roundtrip() {
         unmounted.contains("Unmounted"),
         "expected an unmount report, got: {unmounted}"
     );
+}
+
+// --------------------------------------- auto-mount decision + cleanup (C5) ---
+
+/// 19. `auto_mount_target` (status plan C5, pure — runs on every
+///     platform): the `auto_mount_drive` flag gates the whole decision;
+///     with the flag on, an explicit absolute `mount_point` wins and an
+///     absent key falls back to the `~/CyDrive` default under the
+///     injected home. (A relative `mount_point` never reaches this
+///     function — config validation rejects it first, so it is not
+///     re-tested here.)
+#[test]
+fn auto_mount_target_respects_flag_and_key() {
+    let home = Path::new("/home/user");
+    let mut cfg = CyDriveConfig::default();
+    cfg.auto_mount_drive = false;
+    cfg.mount_point = Some("/mnt/cydrive".to_string());
+    assert_eq!(
+        auto_mount_target(&cfg, home),
+        None,
+        "flag off -> no auto-mount target even with a mount_point key"
+    );
+
+    cfg.auto_mount_drive = true;
+    assert_eq!(
+        auto_mount_target(&cfg, home).as_deref(),
+        Some(Path::new("/mnt/cydrive")),
+        "flag on + explicit key -> exactly the key's path"
+    );
+
+    cfg.mount_point = None;
+    assert_eq!(
+        auto_mount_target(&cfg, home).as_deref(),
+        Some(Path::new("/home/user/CyDrive")),
+        "flag on, no key -> the ~/CyDrive default under the injected home"
+    );
+}
+
+/// Real-machine Linux auto-mount round-trip (status plan C5; see the
+/// checklist in the module docs): the exact chain the run flow wires —
+/// the decision link (`auto_mount_target` picks this round-trip's
+/// target), the davfs2 mount/unmount round-trip, `unmount_stale_for`
+/// releasing the URL's live mount, and the idempotent second call over
+/// a clean `/proc/mounts`.
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "real-machine: needs mount.davfs on PATH (davfs2 package, usually root) and a reachable WebDAV server (CYDRIVE_TEST_MOUNT_URL, default http://127.0.0.1:8080)"]
+fn ignored_unix_automount_roundtrip() {
+    use cydrive_platform::linux;
+
+    let url = std::env::var("CYDRIVE_TEST_MOUNT_URL")
+        .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
+
+    // Service-alive gate: davfs2 against a dead URL hangs or fails with a
+    // confusing kernel error — refuse fast with the fix spelled out.
+    let host_port = url.strip_prefix("http://").unwrap_or(&url);
+    std::net::TcpStream::connect(host_port).unwrap_or_else(|error| {
+        panic!(
+            "no WebDAV server at {url} ({error}); start one first (e.g. wsgidav on the \
+             port, or `cydrive run`) or point CYDRIVE_TEST_MOUNT_URL at a live server"
+        )
+    });
+
+    let target = std::env::temp_dir().join("cydrive_automount_roundtrip");
+    let target_str = target.to_string_lossy().into_owned();
+
+    // Decision link: with mount_point = target the run flow's pure
+    // decision picks exactly this path.
+    let cfg = CyDriveConfig {
+        auto_mount_drive: true,
+        mount_point: Some(target_str.clone()),
+        ..CyDriveConfig::default()
+    };
+    assert_eq!(
+        auto_mount_target(&cfg, Path::new("/root")).as_deref(),
+        Some(Path::new(&target_str)),
+        "the round-trip target must be what auto_mount_target picks"
+    );
+
+    // Round-trip leg (same shape as the davfs2 test above).
+    let mounted = linux::mount_drive(&target, &url).expect("mount");
+    assert!(
+        mounted.contains("davfs2"),
+        "expected the davfs2 backend (headless WSL), got: {mounted}"
+    );
+    let unmounted = linux::unmount_drive(&target).expect("unmount");
+    assert!(
+        unmounted.contains("Unmounted"),
+        "expected an unmount report, got: {unmounted}"
+    );
+
+    // Stale-cleanup leg: a live mount is visible in /proc/mounts and
+    // unmount_stale_for releases exactly it; calling it again over a now
+    // clean /proc/mounts is the idempotent no-op the run flow relies on.
+    linux::mount_drive(&target, &url).expect("re-mount");
+    let mounts = std::fs::read_to_string("/proc/mounts").expect("read /proc/mounts");
+    assert_eq!(
+        parse_proc_mounts_davfs(&mounts, &url).as_deref(),
+        Some(target_str.as_str()),
+        "the live mount must be visible in /proc/mounts"
+    );
+    linux::unmount_stale_for(&url);
+    let after = std::fs::read_to_string("/proc/mounts").expect("re-read /proc/mounts");
+    assert_eq!(
+        parse_proc_mounts_davfs(&after, &url),
+        None,
+        "stale cleanup must release the URL's live mount"
+    );
+    // Idempotence: the second call finds nothing and must neither panic
+    // nor hang (it returns (), so not-panicking is the whole assertion).
+    linux::unmount_stale_for(&url);
 }
