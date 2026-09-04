@@ -85,6 +85,8 @@ const KNOWN_TOML_KEYS: &[&str] = &[
     "encryption_password",
     "enable_encryption",
     "proxy_url",
+    "sync_url",
+    "sync_interval_secs",
 ];
 
 /// Numeric fields for which legacy JSON additionally accepts a numeric
@@ -103,12 +105,14 @@ const NUMERIC_JSON_KEYS: &[&str] = &[
 /// (unlike the other unknown keys, which stay silently ignored per the
 /// Python filter semantics): accepting them would make the user believe a
 /// setting takes effect when the legacy loader cannot honour it. The
-/// canonical `config.toml` accepts all three.
+/// canonical `config.toml` accepts them all.
 const LEGACY_REJECTED_KEYS: &[&str] = &[
     "upload_workers",
     "queue_capacity",
     "hydrate_timeout_secs",
     "mount_point",
+    "sync_url",
+    "sync_interval_secs",
 ];
 
 /// Default `upload_workers` (tier-1 contract C6).
@@ -124,6 +128,11 @@ fn default_queue_capacity() -> u32 {
 /// Default `hydrate_timeout_secs` (tier-1 contract C6).
 fn default_hydrate_timeout_secs() -> u64 {
     180
+}
+
+/// Default `sync_interval_secs` (sync-lite plan, client side).
+fn default_sync_interval_secs() -> u64 {
+    300
 }
 
 /// Stringifies a path the way [`ConfigError`] variants expect ("as given").
@@ -223,6 +232,15 @@ pub struct CyDriveConfig {
     /// string (or `None`) is accepted here, the transport layer owns the
     /// scheme semantics.
     pub proxy_url: Option<String>,
+    /// Base URL of the sync-lite metadata server (e.g.
+    /// `"https://sync.example.org:8290"`); `None` disables syncing
+    /// entirely. When set, `validate` requires the `http://` or `https://`
+    /// scheme — the sync client itself speaks plain HTTP, TLS is a
+    /// reverse-proxy concern (sync-lite plan, client side).
+    pub sync_url: Option<String>,
+    /// Sync polling interval in seconds (valid range 1..=86 400).
+    #[serde(default = "default_sync_interval_secs")]
+    pub sync_interval_secs: u64,
 }
 
 impl Default for CyDriveConfig {
@@ -254,6 +272,8 @@ impl Default for CyDriveConfig {
             encryption_password: None,
             enable_encryption: false,
             proxy_url: None,
+            sync_url: None,
+            sync_interval_secs: default_sync_interval_secs(),
         }
     }
 }
@@ -426,6 +446,7 @@ impl CyDriveConfig {
     /// | `CYDRIVE_CHUNK_SIZE_MB` | `chunk_size_mb` | `u64`; unparseable → ignored |
     /// | `CYDRIVE_ENABLE_ENCRYPTION` | `enable_encryption` | `"1"` or `"true"` (case-sensitive) → `true`; any other value → `false` |
     /// | `CYDRIVE_PROXY_URL` | `proxy_url` | verbatim string; an empty value clears the proxy (`None`) |
+    /// | `CYDRIVE_SYNC_URL` | `sync_url` | verbatim string; an empty value clears the sync URL (`None`, feature off) |
     pub fn with_env_overrides(self) -> Self {
         let mut config = self;
         if let Some(value) = env_string("CYDRIVE_BOT_TOKEN") {
@@ -451,6 +472,9 @@ impl CyDriveConfig {
         }
         if let Some(value) = env_string("CYDRIVE_PROXY_URL") {
             config.proxy_url = (!value.is_empty()).then_some(value);
+        }
+        if let Some(value) = env_string("CYDRIVE_SYNC_URL") {
+            config.sync_url = (!value.is_empty()).then_some(value);
         }
         config
     }
@@ -521,6 +545,9 @@ impl CyDriveConfig {
     /// * `upload_workers`: must be in `1..=32`.
     /// * `queue_capacity`: must be `>= upload_workers` and at most `100_000`.
     /// * `hydrate_timeout_secs`: must be in `1..=86_400`.
+    /// * `sync_interval_secs`: must be in `1..=86_400`.
+    /// * `sync_url`: when `Some`, must start with `http://` or `https://`
+    ///   (`None` means the sync feature is off and skips the check).
     ///
     /// Returns `Ok(())` when every rule holds.
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -583,6 +610,19 @@ impl CyDriveConfig {
             if !point.starts_with('/') {
                 return Err(ConfigError::Invalid(format!(
                     "mount_point must be an absolute path starting with '/', got {point:?}"
+                )));
+            }
+        }
+        if !(1..=86_400).contains(&self.sync_interval_secs) {
+            return Err(ConfigError::Invalid(format!(
+                "sync_interval_secs must be in 1..=86400, got {}",
+                self.sync_interval_secs
+            )));
+        }
+        if let Some(url) = &self.sync_url {
+            if !url.starts_with("http://") && !url.starts_with("https://") {
+                return Err(ConfigError::Invalid(format!(
+                    "sync_url must start with http:// or https://, got {url:?}"
                 )));
             }
         }

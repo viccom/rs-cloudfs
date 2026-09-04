@@ -223,6 +223,8 @@ fn toml_roundtrip_preserves_full_config() {
         encryption_password: None,
         enable_encryption: false,
         proxy_url: None,
+        sync_url: None,
+        sync_interval_secs: 300,
     };
 
     cfg.save_toml(&path).expect("save_toml");
