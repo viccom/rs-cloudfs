@@ -357,12 +357,15 @@ fn doctor_cmd() -> Result<()> {
     let config_present = discovered.is_ok();
     let cfg = discovered.unwrap_or_default();
     // The keyring availability probe doubles as the credential store the
-    // doctor checks read; an unavailable keyring degrades like discovery
-    // (the config file alone still carries everything needed).
+    // doctor checks read: a failed constructor becomes an
+    // UnavailableKeyring so the credentials check sees the headless
+    // condition (C6) instead of a healthy-looking in-memory fallback.
     let credential_store: Arc<dyn cydrive_core::credentials::CredentialStore> =
         match cydrive_cli::KeyringStore::new() {
             Ok(store) => Arc::new(store),
-            Err(_error) => Arc::new(cydrive_core::credentials::InMemoryStore::new()),
+            Err(error) => Arc::new(cydrive_cli::doctor::UnavailableKeyring::new(
+                error.to_string(),
+            )),
         };
     let ctx = cydrive_cli::doctor::DoctorContext {
         config_present,

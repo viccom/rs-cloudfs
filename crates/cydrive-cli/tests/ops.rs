@@ -9,9 +9,9 @@
 //!   Python `/stats` rows (Total Files/Folders/Cloud Storage/Synced/Pending)
 //!   plus Drive/URL, sizes human-readable via the bot's `size_gb >= 1`
 //!   branch semantics;
-//! * `run_doctor` — offline checks (config/db/cache/ports) driven by an
-//!   injected [`DoctorContext`], and `render_report`'s per-line
-//!   `[OK]/[WARN]/[FAIL] name — detail` + summary counts;
+//! * `run_doctor` — offline checks (config/credentials/db/cache/ports)
+//!   driven by an injected [`DoctorContext`], and `render_report`'s
+//!   per-line `[OK]/[WARN]/[FAIL] name — detail` + summary counts;
 //! * `evaluate_webclient_params` — the pure three-state registry verdict;
 //! * the setup wizard's pure core — token validation mirroring the Python
 //!   wizard texts, `apply_wizard` field filling + letter normalisation,

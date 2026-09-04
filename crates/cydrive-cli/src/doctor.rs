@@ -22,7 +22,7 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cydrive_core::credentials::CredentialStore;
+use cydrive_core::credentials::{CredentialError, CredentialStore, BOT_TOKEN};
 use cydrive_core::database::MetaDatabase;
 use cydrive_platform::{BASIC_AUTH_LEVEL, FILE_SIZE_LIMIT_BYTES};
 
@@ -80,6 +80,7 @@ pub struct DoctorContext {
 pub fn run_doctor(ctx: &DoctorContext) -> Vec<CheckResult> {
     vec![
         check_config(ctx.config_present),
+        headless_credential_check(&ctx.bot_token, ctx.credential_store.as_ref()),
         check_database(ctx.db_path.as_ref()),
         check_cache(ctx.cache_path.as_ref()),
         check_port("webdav port", ctx.webdav_port),
@@ -137,6 +138,84 @@ fn check_config(present: bool) -> CheckResult {
                      create one (or `cydrive migrate` to import a Python config.json)"
                 .to_string(),
         }
+    }
+}
+
+/// Headless-credential check (service-lifecycle C6): in a terminal-less
+/// deployment the OS keyring is typically unreachable (no user session
+/// for the Secret Service / Credential Manager), so the bot token must
+/// come from the config file or the environment. Verdicts:
+///
+/// * token resolved (file/env/keyring) → Ok — headless boot has its
+///   credential whatever the keyring's state;
+/// * token empty, store reachable (a `get` answers, key present or
+///   absent) → Ok — `cydrive setup` can persist the token there;
+/// * token empty, store unusable → Warn with the headless guidance:
+///   write the token into `config.toml` or inject `CYDRIVE_BOT_TOKEN`
+///   (the shipped systemd unit has an `EnvironmentFile` for exactly
+///   this; see `deploy/cydrive.service`).
+fn headless_credential_check(bot_token: &str, store: &dyn CredentialStore) -> CheckResult {
+    let name = "credentials".to_string();
+    if !bot_token.is_empty() {
+        return CheckResult {
+            name,
+            status: CheckStatus::Ok,
+            detail: "bot token resolved (file, env or credential store)".to_string(),
+        };
+    }
+    // Probe with the token's own key: a reachable store answers Ok —
+    // `None` when nothing is stored yet — while an unusable one errs
+    // (keyring 3.x maps every non-NoEntry failure to `Unavailable`).
+    match store.get(BOT_TOKEN) {
+        Ok(_) => CheckResult {
+            name,
+            status: CheckStatus::Ok,
+            detail: "no bot token yet; the OS credential store is reachable, so \
+                     `cydrive setup` can persist one"
+                .to_string(),
+        },
+        Err(error) => CheckResult {
+            name,
+            status: CheckStatus::Warn,
+            detail: format!(
+                "no bot token and the OS credential store is unavailable ({error}); in a \
+                 headless environment (service/scheduled task) write the token into \
+                 config.toml or inject CYDRIVE_BOT_TOKEN via the service's EnvironmentFile \
+                 (see deploy/cydrive.service)"
+            ),
+        },
+    }
+}
+
+/// A [`CredentialStore`] that answers every operation with
+/// [`CredentialError::Unavailable`]: `doctor_cmd` wires it in when the
+/// keyring probe (`KeyringStore::new`) itself fails, so
+/// [`headless_credential_check`] observes the machine's real condition
+/// instead of a healthy-looking in-memory fallback.
+pub struct UnavailableKeyring {
+    reason: String,
+}
+
+impl UnavailableKeyring {
+    /// Captures the diagnosis from the failed keyring probe.
+    pub fn new(reason: impl Into<String>) -> Self {
+        Self {
+            reason: reason.into(),
+        }
+    }
+}
+
+impl CredentialStore for UnavailableKeyring {
+    fn get(&self, _key: &str) -> Result<Option<String>, CredentialError> {
+        Err(CredentialError::Unavailable(self.reason.clone()))
+    }
+
+    fn set(&self, _key: &str, _value: &str) -> Result<(), CredentialError> {
+        Err(CredentialError::Unavailable(self.reason.clone()))
+    }
+
+    fn delete(&self, _key: &str) -> Result<(), CredentialError> {
+        Err(CredentialError::Unavailable(self.reason.clone()))
     }
 }
 

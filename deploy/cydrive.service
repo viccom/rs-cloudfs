@@ -1,0 +1,60 @@
+# CyDrive systemd unit (service-lifecycle C5).
+#
+# CyDrive keeps all runtime state in its working directory (config.toml,
+# cydrive_meta.db, Telegram_Cache/, the bot session, cydrive.control),
+# so a deployment is one self-contained directory plus this unit.
+#
+# Deployment steps (as root / with sudo):
+#   1. Install the binary and create the data directory:
+#        mkdir -p /opt/cydrive
+#        cp target/release/cydrive /opt/cydrive/
+#   2. Provide credentials — either way below works (CYDRIVE_* env wins
+#      over config.toml; the OS keyring is NOT available to a service,
+#      which is exactly what `cydrive doctor` warns about there):
+#      a) /opt/cydrive/config.toml with bot_token + chat_id — run
+#         `cydrive setup` once interactively and copy the file over, or
+#      b) the EnvironmentFile referenced below, e.g.
+#         /opt/cydrive/cydrive.env (chmod 600 — it holds secrets):
+#            CYDRIVE_BOT_TOKEN=123456789:ABCdefGh...
+#            CYDRIVE_CHAT_ID=-1001234567890
+#            CYDRIVE_PROXY_URL=socks5://127.0.0.1:7897
+#   3. Install and start:
+#        cp deploy/cydrive.service /etc/systemd/system/
+#        systemctl daemon-reload
+#        systemctl enable --now cydrive
+#   4. Operate:
+#        journalctl -u cydrive -f        # follow logs
+#        systemctl stop cydrive          # SIGTERM -> graceful drain
+#        cd /opt/cydrive && ./cydrive doctor   # offline diagnosis
+#
+# No KillSignal= override is needed: systemd's stop signal is SIGTERM,
+# which cydrive handles natively (graceful shutdown drains in-flight
+# uploads before exiting). TimeoutStopSec=600 below gives large uploads
+# that headroom before systemd escalates to SIGKILL.
+
+[Unit]
+Description=CyDrive - Telegram-backed unlimited drive (WebDAV + web dashboard)
+# After= orders this unit behind network-online.target; Wants= is what
+# actually pulls that target into the transaction (After= alone would
+# order against a target that never starts).
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+# Config discovery looks in the cwd, so this is also where config.toml,
+# the metadata db, the cache and the session live.
+WorkingDirectory=/opt/cydrive
+ExecStart=/opt/cydrive/cydrive run
+# Leading '-': the env file is optional (credentials may instead live in
+# config.toml).
+EnvironmentFile=-/opt/cydrive/cydrive.env
+# Graceful SIGTERM shutdown may need to drain multi-gigabyte uploads.
+TimeoutStopSec=600
+Restart=on-failure
+# Avoid a tight restart loop while Telegram/the proxy is unreachable
+# (on-failure alone would retry every 100ms).
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
