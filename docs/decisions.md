@@ -99,3 +99,13 @@
 **发现②vendor session 无 WAL/busy_timeout**（storages/sqlite.rs 无 journal_mode 设置）→ **服务运行中不可并发跑 CLI 传输命令**（push/pull 同开 session 有锁冲突风险），运维约束已验证遵守（全程串行）。
 **发现③2GB 全量回拉留待人工**：多块重组链路已由 1MB×2 小文件等价验证（同一代码路径），全量拉取仅剩带宽时间问题（~80min），不再阻塞。
 **运维小注**：Git Bash 下 `--dest /path` 会被 MSYS 路径改写吃掉，须 `MSYS_NO_PATHCONV=1`。
+
+## 2026-09-04 代码审查修复批（H1/H2/M1/M2 + Low 三项；不修清单留档）
+
+- **H1 connect 死线**：`connect_stack_with_deadline`（push/pull 复用 run() 的 `connect_with_deadline` + 人话诊断，90s 常量上提 `CONNECT_DEADLINE`）；红测试 = 本地沉默 SOCKS 代理（accept 后 pending，不写不关）2s 死线胜出。
+- **H2 pending 删除保护（负责人授权「逐一修复」采纳）**：三面一致——core `Vfs::remove_file`（新 `VfsError::UploadPending`）、webdav DELETE（Forbidden）、web `/api/delete`（409）。**细化裁决：仅当「pending 且本地副本仍在」才拒绝**；副本已消失的幽灵 pending 行（字节两侧皆无）允许删除，否则永远清不掉。副作用 = Task1 旧用例 remove_file 基线更新（排干+水合后再删，1469c95）。bot /rm 回复 "still uploading, try again after it finishes"。
+- **M1**：`clear_cache_preserving_pending` 自由函数单点化（Vfs 方法与 CLI 命令委托），A1 语义与 warn 日志全仓单份。
+- **M2**：`transport_config_from` 收敛 run()/connect_stack 两处装配。
+- **Low**：push 目录源前置门禁（在写任何祖先行之前，杜绝孤儿行）+ dest 路径提示（drive paths start with "/"）+ pull 覆盖已存在文件用例补缺。
+- **不修（理由）**：M3 create_dir TOCTOU（webdav 既有同款模式、单服务并发面极小、需事务设计）；M4 持久化失败降级不通知（该路径上传已成功，"upload failed" 文案语义不符，需要独立文案时再加）；cache clear 遇锁文件中止（可恢复态，继续清需行为设计）；unix_now 第三份拷贝（已注释自认）；/ls startswith 前缀怪癖（基线忠实）；一次性命令无 tracing subscriber（println 补偿）。`connect_failure_hint` 文案过时（"no built-in proxy yet" 与已落地 SOCKS5 不符）记为待办小修。
+- 门禁：workspace 325 passed / 0 failed（修复批 +8 测试）。
