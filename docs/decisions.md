@@ -113,3 +113,13 @@
 ## 2026-09-04 二复审结论（独立子代理全量重审修复批）
 
 无 Critical/High。F1 错误链/死线覆盖、F2 三面判定逐字段等价性、基线更新、F3/F4 均以证据通过；脚本无泄密路径（token 只从凭据管理器读、输出前替换）。遗留登记：**M-1 ghost 行复活竞态**（remove_file 放行 ghost 行后 worker 成功 upsert 可复活该行为 uploaded 孤儿——不丢数据、非本批引入；后续方向：删行时同步取消队列 job 或 worker 成功 upsert 前校验行存在）；**M-2 connect_failure_hint 过时文案**已当日修复（改提 proxy_url，commit 见下）；L 级：getme.py 对非 UTF-16 blob 裸异常/token 校验弱于 ps1 版、local_copy_exists 同步 stat、grammers runner 超时后 detached（进程即退无泄漏）。
+
+## 2026-09-04 服务生命周期批（feat/service-lifecycle）：裁决与发现记录
+
+- **控制通道安全模型**：`cydrive.control` 端口文件 + 回环 TCP，仅绑 127.0.0.1、无认证——同机攻击者本可 taskkill，回环无认证不新增攻击面；文件为运行期产物（.gitignore）。`cydrive stop` 与 run 同 cwd 约定，报错文案指明。三停机源（Ctrl+C / SIGTERM / stop）经 ShutdownWatch 门闩汇流，停机序列由 run_with_transport 内 spawn 的唯一 stop 任务执行——任意源触发恰好执行一次，无双跑竞态。
+- **SIGTERM 测试策略**：不做进程内信号注入测试（不稳定），采用 `#[cfg(unix)] #[ignore]` 真信号用例（kill -TERM 自身 → sigterm future 限期解析），WSL Ubuntu-24.04 实跑 PASS（ff9390b）。`cydrive_cli::sigterm()` 非 unix 存根 pending()。
+- **发现：doctor 的 M5-2 遗留 cfg 缺口**（4f5a158 修复）：`platform_checks` 用 `cfg!(windows)` 运行期判断但块内调用 `#[cfg(windows)]` 函数 → unix 编译 E0425；本批 WSL 首次对 cli crate 做 unix 编译验证时暴露（此前 doctor 从未在 unix 编过）。改为 `#[cfg]` 属性门控，Windows 行为零变化。
+- **Linux 自动挂载接线延后**：本批交付 platform 纯函数（detect gio→davfs2 + 命令构造）+ cfg(target_os=linux) mount_drive/unmount_drive + CLI mount/unmount unix 分支（--path）；`run` 的 Linux 自动挂载与挂载点/davfs2 secrets 配置键**延后**（涉配置语义与 sudo 裁决，下一批）。
+- **davfs2 真机往返留待**：WSL 环境 davfs2 挂载不生效（/dev/fuse 在、mount 无报错但 /proc/mounts 无记录——WSL FUSE 组合的环境限制）；wsgidav 测试服务方案已验证可行（PROPFIND 207）。`ignored_davfs_mount_unmount_roundtrip` 需真实 Linux 主机跑。
+- **systemd unit**（deploy/cydrive.service）：SIGTERM 原生处理后无需 KillSignal 覆盖；TimeoutStopSec=600（大文件排干）；RestartSec=5 防 100ms 紧密重启循环；EnvironmentFile 方案承载无头凭据（doctor 的 headless 提示与 run 流程各司其职）。未在真实 systemd 实跑（静态编写，键集按契约+惯例）。
+- 门禁：Windows workspace 341 通过；WSL cli+platform 67 通过（+2 真机 ignored）+ workspace check 干净。
