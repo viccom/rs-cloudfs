@@ -126,7 +126,10 @@ fn instance(tag: &str) -> Instance {
 }
 
 fn dir_upsert(rel_path: &str, mtime: f64) -> FileUpsert {
-    let name = rel_path.rsplit_once('/').map_or(rel_path, |(_, n)| n).to_string();
+    let name = rel_path
+        .rsplit_once('/')
+        .map_or(rel_path, |(_, n)| n)
+        .to_string();
     FileUpsert {
         rel_path: rel_path.to_string(),
         name,
@@ -144,8 +147,18 @@ fn dir_upsert(rel_path: &str, mtime: f64) -> FileUpsert {
     }
 }
 
-fn file_upsert(rel_path: &str, size: i64, mtime: f64, msg_id: Option<i64>, chunk_count: i64, is_uploaded: bool) -> FileUpsert {
-    let name = rel_path.rsplit_once('/').map_or(rel_path, |(_, n)| n).to_string();
+fn file_upsert(
+    rel_path: &str,
+    size: i64,
+    mtime: f64,
+    msg_id: Option<i64>,
+    chunk_count: i64,
+    is_uploaded: bool,
+) -> FileUpsert {
+    let name = rel_path
+        .rsplit_once('/')
+        .map_or(rel_path, |(_, n)| n)
+        .to_string();
     let parent_dir = match rel_path.rfind('/') {
         Some(0) | None => "/".to_string(),
         Some(i) => rel_path[..i].to_string(),
@@ -225,7 +238,10 @@ async fn sync_once_on_fresh_instance_and_empty_server_is_all_zero() {
 
 #[tokio::test]
 async fn two_instances_converge_through_shared_server() {
-    let key = namespace_key("123456789:AAHfiqkKZ8W2fRzBn8Gh5jX7yLmNpQrStUvWxYz", "-1001234567890");
+    let key = namespace_key(
+        "123456789:AAHfiqkKZ8W2fRzBn8Gh5jX7yLmNpQrStUvWxYz",
+        "-1001234567890",
+    );
     let secret = Some("family-secret");
     let server = InMemorySyncServer::new();
     let a = instance("a");
@@ -233,20 +249,27 @@ async fn two_instances_converge_through_shared_server() {
 
     // --- A seeds: directory, multi-chunk file, single-chunk file, and a
     // pending row whose local cache copy does not exist (the ghost case).
-    a.db.upsert_file(&dir_upsert("/docs", 100.0)).expect("mkdir /docs");
+    a.db.upsert_file(&dir_upsert("/docs", 100.0))
+        .expect("mkdir /docs");
     let big = file_upsert("/docs/big.bin", 1_048_586, 101.0, Some(101), 3, true);
     let big_id = a.db.upsert_file(&big).expect("insert big");
-    a.db.upsert_chunk(big_id, 0, 101, 524_288, None).expect("chunk 0");
-    a.db.upsert_chunk(big_id, 1, 102, 524_288, None).expect("chunk 1");
-    a.db.upsert_chunk(big_id, 2, 103, 10, None).expect("chunk 2");
+    a.db.upsert_chunk(big_id, 0, 101, 524_288, None)
+        .expect("chunk 0");
+    a.db.upsert_chunk(big_id, 1, 102, 524_288, None)
+        .expect("chunk 1");
+    a.db.upsert_chunk(big_id, 2, 103, 10, None)
+        .expect("chunk 2");
     let small = file_upsert("/small.txt", 5, 102.0, Some(200), 1, true);
     let small_id = a.db.upsert_file(&small).expect("insert small");
-    a.db.upsert_chunk(small_id, 0, 200, 5, None).expect("small chunk");
+    a.db.upsert_chunk(small_id, 0, 200, 5, None)
+        .expect("small chunk");
     let pending = file_upsert("/pending.bin", 10, 103.0, None, 1, false);
     a.db.upsert_file(&pending).expect("insert pending");
 
     // --- A's first sync: pull is empty, everything is new → 4 pushes.
-    let out = sync_once(&a.db, &a.cache, &server, &key, secret).await.expect("sync A");
+    let out = sync_once(&a.db, &a.cache, &server, &key, secret)
+        .await
+        .expect("sync A");
     assert_eq!(
         out,
         SyncOutcome {
@@ -280,7 +303,9 @@ async fn two_instances_converge_through_shared_server() {
 
     // --- Empty B syncs: receives A's three live rows, skips the ghost
     // pending row (B has no bytes for it), pushes nothing back.
-    let out = sync_once(&b.db, &b.cache, &server, &key, secret).await.expect("sync B");
+    let out = sync_once(&b.db, &b.cache, &server, &key, secret)
+        .await
+        .expect("sync B");
     assert_eq!(
         out,
         SyncOutcome {
@@ -328,7 +353,8 @@ async fn two_instances_converge_through_shared_server() {
     b.db.upsert_file(&changed).expect("B changes small.txt");
     let from_b = file_upsert("/from-b.txt", 7, 104.0, Some(300), 1, true);
     let from_b_id = b.db.upsert_file(&from_b).expect("B adds from-b");
-    b.db.upsert_chunk(from_b_id, 0, 300, 7, None).expect("from-b chunk");
+    b.db.upsert_chunk(from_b_id, 0, 300, 7, None)
+        .expect("from-b chunk");
 
     let out = sync_once(&b.db, &b.cache, &server, &key, secret)
         .await
@@ -337,7 +363,9 @@ async fn two_instances_converge_through_shared_server() {
     assert_eq!(out.pushed_tombstones, 0);
 
     // --- A syncs: receives B's change (remote wins) and the new row.
-    let out = sync_once(&a.db, &a.cache, &server, &key, secret).await.expect("sync A after B");
+    let out = sync_once(&a.db, &a.cache, &server, &key, secret)
+        .await
+        .expect("sync A after B");
     assert_eq!(out.applied, 2, "A applies B's changed row and new row");
     assert_eq!(out.pushed, 0);
     assert_eq!(
@@ -347,8 +375,7 @@ async fn two_instances_converge_through_shared_server() {
     );
     let from_b_on_a = a.db.get_file("/from-b.txt").expect("get").expect("row");
     assert_eq!(
-        b.db
-            .get_chunks_by_file_id(from_b_on_a.id)
+        b.db.get_chunks_by_file_id(from_b_on_a.id)
             .expect("chunks")
             .len(),
         1,
@@ -356,14 +383,17 @@ async fn two_instances_converge_through_shared_server() {
     );
 
     // --- A deletes /docs/big.bin → tombstone; B applies it.
-    a.db.delete_file("/docs/big.bin").expect("A deletes big.bin");
+    a.db.delete_file("/docs/big.bin")
+        .expect("A deletes big.bin");
     let out = sync_once(&a.db, &a.cache, &server, &key, secret)
         .await
         .expect("sync A after delete");
     assert_eq!(out.pushed_tombstones, 1);
     assert_eq!(out.pushed, 0);
 
-    let out = sync_once(&b.db, &b.cache, &server, &key, secret).await.expect("sync B tombstone");
+    let out = sync_once(&b.db, &b.cache, &server, &key, secret)
+        .await
+        .expect("sync B tombstone");
     assert_eq!(out.tombstoned, 1);
     assert!(
         b.db.get_file("/docs/big.bin").expect("get").is_none(),
@@ -378,7 +408,8 @@ async fn two_instances_converge_through_shared_server() {
     // --- A's pending row completes (uploaded) → B now receives it.
     let flipped = file_upsert("/pending.bin", 10, 103.0, Some(555), 1, true);
     let flipped_id = a.db.upsert_file(&flipped).expect("A completes pending");
-    a.db.upsert_chunk(flipped_id, 0, 555, 10, None).expect("pending chunk");
+    a.db.upsert_chunk(flipped_id, 0, 555, 10, None)
+        .expect("pending chunk");
 
     let out = sync_once(&a.db, &a.cache, &server, &key, secret)
         .await
@@ -391,7 +422,10 @@ async fn two_instances_converge_through_shared_server() {
     let out = sync_once(&b.db, &b.cache, &server, &key, secret)
         .await
         .expect("sync B after pending completed");
-    assert_eq!(out.applied, 1, "completed row is live now — no longer a ghost");
+    assert_eq!(
+        out.applied, 1,
+        "completed row is live now — no longer a ghost"
+    );
     let pending_on_b = b.db.get_file("/pending.bin").expect("get").expect("row");
     assert!(pending_on_b.is_uploaded);
     assert!(!pending_on_b.is_cached);
@@ -409,8 +443,12 @@ async fn two_instances_converge_through_shared_server() {
     );
 
     // --- Idempotence: idle syncs push nothing.
-    let out = sync_once(&a.db, &a.cache, &server, &key, secret).await.expect("final sync A");
+    let out = sync_once(&a.db, &a.cache, &server, &key, secret)
+        .await
+        .expect("final sync A");
     assert_eq!((out.pushed, out.pushed_tombstones), (0, 0));
-    let out = sync_once(&b.db, &b.cache, &server, &key, secret).await.expect("final sync B");
+    let out = sync_once(&b.db, &b.cache, &server, &key, secret)
+        .await
+        .expect("final sync B");
     assert_eq!((out.pushed, out.pushed_tombstones), (0, 0));
 }

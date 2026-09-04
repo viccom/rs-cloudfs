@@ -211,6 +211,25 @@ pub struct SyncPullResult {
     pub max_version: i64,
 }
 
+/// Counters of one full [`sync_once`] pass, for CLI display.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SyncOutcome {
+    /// Rows in the pull response.
+    pub pulled: usize,
+    /// Live rows that moved local state (mirror-only updates included).
+    pub applied: usize,
+    /// Live pending rows skipped: no local cache copy (ghost).
+    pub skipped_ghost: usize,
+    /// Rows skipped by the version idempotency gate.
+    pub skipped_idempotent: usize,
+    /// Tombstones applied (local row and mirror deleted).
+    pub tombstoned: usize,
+    /// Live rows pushed to the server.
+    pub pushed: usize,
+    /// Tombstones pushed to the server.
+    pub pushed_tombstones: usize,
+}
+
 /// The server seam of the sync engine. The CLI layer provides the HTTP
 /// implementation over the `cydrive-sync` wire protocol; core must not
 /// depend on that crate, so both sides speak the types above and the CLI
@@ -404,4 +423,70 @@ fn replace_row(db: &MetaDatabase, rel_path: &str, payload: &RowPayload) -> Resul
         }
     }
     Ok(())
+}
+
+/// One full sync pass: pull → apply → diff → push.
+///
+/// - **Pull** with `since = max_pulled`, apply every row through
+///   [`apply_pulled_rows`] (which also advances `max_pulled` by the pull
+///   response's `max_version`, monotonically).
+/// - **Diff** the local table (directories included — they are plain
+///   `files` rows) against `sync_mirror` via [`push_diff`].
+/// - **Push** the updates (skipped entirely when the diff is empty), then
+///   reconcile the mirror: live rows get `(payload hash, push max_version)`
+///   — the batch's atomicity makes the whole-batch maximum safe, any
+///   later change necessarily carries a version above it — and tombstone
+///   paths get their mirror row *deleted* (a surviving mirror would make
+///   the next diff push the tombstone again, forever).
+///
+/// `max_pulled` is advanced by **pull responses only**. The plan sketch
+/// said «push → 更新 max_pulled»; this is a deliberate correction: the
+/// push response's `max_version` may already cover rows other instances
+/// pushed concurrently, so adopting it as the pull cursor would
+/// permanently skip those rows. The cost of the stricter rule is one
+/// extra pull of our own just-pushed rows, which die at the
+/// idempotency gate — harmless.
+pub async fn sync_once(
+    db: &MetaDatabase,
+    cache: &CacheManager,
+    client: &dyn SyncClient,
+    key: &str,
+    secret: Option<&str>,
+) -> Result<SyncOutcome, SyncError> {
+    let since = db.sync_state_get()?;
+    let pull = client.pull(key, since).await?;
+    let apply = apply_pulled_rows(db, cache, &pull.rows, pull.max_version)?;
+
+    let mut local_rows: Vec<(String, String)> = Vec::new();
+    for row in db.list_all_files()? {
+        let chunks = db.get_chunks_by_file_id(row.id)?;
+        local_rows.push((row.rel_path.clone(), serialize_row(&row, &chunks)?));
+    }
+    let mirror = db.sync_mirror_all()?;
+    let updates = push_diff(&local_rows, &mirror);
+
+    let mut outcome = SyncOutcome {
+        pulled: apply.pulled,
+        applied: apply.applied,
+        skipped_ghost: apply.skipped_ghost,
+        skipped_idempotent: apply.skipped_idempotent,
+        tombstoned: apply.tombstoned,
+        pushed: 0,
+        pushed_tombstones: 0,
+    };
+    if updates.is_empty() {
+        return Ok(outcome);
+    }
+
+    let push_max = client.push(key, secret, &updates).await?;
+    for update in &updates {
+        if update.deleted {
+            db.sync_mirror_delete(&update.rel_path)?;
+            outcome.pushed_tombstones += 1;
+        } else {
+            db.sync_mirror_set(&update.rel_path, &row_hash(&update.payload), push_max)?;
+            outcome.pushed += 1;
+        }
+    }
+    Ok(outcome)
 }
