@@ -76,6 +76,7 @@ const KNOWN_TOML_KEYS: &[&str] = &[
     "enable_web_ui",
     "drive_letter",
     "auto_mount_drive",
+    "mount_point",
     "chunk_size_mb",
     "cache_limit_gb",
     "upload_workers",
@@ -103,7 +104,12 @@ const NUMERIC_JSON_KEYS: &[&str] = &[
 /// Python filter semantics): accepting them would make the user believe a
 /// setting takes effect when the legacy loader cannot honour it. The
 /// canonical `config.toml` accepts all three.
-const LEGACY_REJECTED_KEYS: &[&str] = &["upload_workers", "queue_capacity", "hydrate_timeout_secs"];
+const LEGACY_REJECTED_KEYS: &[&str] = &[
+    "upload_workers",
+    "queue_capacity",
+    "hydrate_timeout_secs",
+    "mount_point",
+];
 
 /// Default `upload_workers` (tier-1 contract C6).
 fn default_upload_workers() -> u32 {
@@ -185,6 +191,10 @@ pub struct CyDriveConfig {
     pub drive_letter: String,
     /// Whether to auto-mount the drive on startup.
     pub auto_mount_drive: bool,
+    /// Linux mount point for `cydrive mount` / startup auto-mount
+    /// (absolute path; `None` = the `$HOME/CyDrive` default). Windows
+    /// ignores this key — drive letters are its mount surface.
+    pub mount_point: Option<String>,
     /// Upload chunk size in MB (Telegram per-message limit with margin,
     /// valid range 1..=2000).
     pub chunk_size_mb: u64,
@@ -235,6 +245,7 @@ impl Default for CyDriveConfig {
             enable_web_ui: true,
             drive_letter: "Y:".to_string(),
             auto_mount_drive: true,
+            mount_point: None,
             chunk_size_mb: 1900,
             cache_limit_gb: 20,
             upload_workers: default_upload_workers(),
@@ -567,6 +578,13 @@ impl CyDriveConfig {
                 "hydrate_timeout_secs must be in 1..=86400, got {}",
                 self.hydrate_timeout_secs
             )));
+        }
+        if let Some(point) = &self.mount_point {
+            if !point.starts_with('/') {
+                return Err(ConfigError::Invalid(format!(
+                    "mount_point must be an absolute path starting with '/', got {point:?}"
+                )));
+            }
         }
         Ok(())
     }

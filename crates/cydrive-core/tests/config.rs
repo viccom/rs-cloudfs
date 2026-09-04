@@ -214,6 +214,7 @@ fn toml_roundtrip_preserves_full_config() {
         enable_web_ui: false,
         drive_letter: "Z:".to_string(),
         auto_mount_drive: false,
+        mount_point: None,
         chunk_size_mb: 2000,
         cache_limit_gb: 7,
         upload_workers: 2,
@@ -609,8 +610,11 @@ fn toml_mount_point_parses_and_defaults() {
     assert_eq!(cfg.mount_point, None, "absent key means the default");
 
     let explicit = dir.path().join("explicit.toml");
-    std::fs::write(&explicit, "bot_token = \"1:a\"\nchat_id = 7\nmount_point = \"/mnt/cydrive\"\n")
-        .expect("write");
+    std::fs::write(
+        &explicit,
+        "bot_token = \"1:a\"\nchat_id = 7\nmount_point = \"/mnt/cydrive\"\n",
+    )
+    .expect("write");
     let cfg = CyDriveConfig::load_toml(&explicit).expect("explicit loads");
     assert_eq!(cfg.mount_point.as_deref(), Some("/mnt/cydrive"));
     cfg.validate().expect("absolute mount_point validates");
@@ -629,8 +633,11 @@ fn toml_mount_point_requires_absolute() {
 fn legacy_json_rejects_mount_point() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("config.json");
-    std::fs::write(&path, r#"{ "bot_token": "1:a", "chat_id": 7, "mount_point": "/mnt/x" }"#)
-        .expect("write");
+    std::fs::write(
+        &path,
+        r#"{ "bot_token": "1:a", "chat_id": 7, "mount_point": "/mnt/x" }"#,
+    )
+    .expect("write");
     let err = CyDriveConfig::load_legacy_json(&path).expect_err("legacy rejects mount_point");
     assert!(matches!(err, ConfigError::Parse { .. }), "got: {err:?}");
 }
