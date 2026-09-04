@@ -272,7 +272,8 @@ async fn pending_rows_requeued_at_boot() {
 
 /// 7. With `auto_mount_drive` off (every offline test config), the run
 ///    handle reports no mounted letter — the offline gate never maps a
-///    real network drive — and shutdown skips the unmount path.
+///    real network drive — and no mounted point (the Unix claim, status
+///    plan C5), and shutdown skips the unmount path.
 #[tokio::test]
 async fn auto_mount_disabled_leaves_mounted_letter_none() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -280,6 +281,7 @@ async fn auto_mount_disabled_leaves_mounted_letter_none() {
     let mock = mock_transport().await;
     let handle = boot(&cfg, mock).await;
     assert_eq!(handle.mounted_letter, None);
+    assert_eq!(handle.mounted_point, None);
     handle.shutdown().await;
 }
 

@@ -773,6 +773,7 @@ dependencies = [
 name = "cydrive-platform"
 version = "0.3.0"
 dependencies = [
+ "cydrive-core",
  "thiserror 2.0.20",
  "winreg",
 ]

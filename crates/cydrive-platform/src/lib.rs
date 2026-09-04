@@ -205,6 +205,26 @@ pub fn default_mount_point(home: &std::path::Path) -> std::path::PathBuf {
     home.join("CyDrive")
 }
 
+/// The run flow's auto-mount target decision (status plan C5): `None`
+/// when `auto_mount_drive` is off; otherwise the config's absolute
+/// `mount_point` when the key is set, or the `~/CyDrive` default
+/// ([`default_mount_point`]) under `home` when it is not. Config
+/// validation already rejects relative `mount_point`s, so the key arm
+/// needs no re-validation here; `home` is only consulted in the default
+/// arm (the caller passes `$HOME`).
+pub fn auto_mount_target(
+    cfg: &cydrive_core::config::CyDriveConfig,
+    home: &std::path::Path,
+) -> Option<std::path::PathBuf> {
+    if !cfg.auto_mount_drive {
+        return None;
+    }
+    Some(match cfg.mount_point.as_deref() {
+        Some(point) => std::path::PathBuf::from(point),
+        None => default_mount_point(home),
+    })
+}
+
 // ------------------------------------------ mount status parsers (status C2) ---
 //
 // Read-only mounts-state scans behind `cydrive status`: pure text

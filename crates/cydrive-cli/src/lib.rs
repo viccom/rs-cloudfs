@@ -12,8 +12,10 @@
 //! 5. bind the loopback control channel behind `cydrive stop` (an
 //!    optional component — a bind failure only warns and the stack runs
 //!    on without it);
-//! 6. on Windows with `auto_mount_drive`, map the configured drive letter
-//!    to the server (unit D; a failed mount warns and the server lives on).
+//! 6. with `auto_mount_drive`, Windows maps the configured drive letter
+//!    to the server (unit D) and Unix mounts the auto-mount target
+//!    through the gio→davfs2 chain (status plan C5; either way a failed
+//!    mount warns and the server lives on).
 //!
 //! The three shutdown sources — Ctrl+C, SIGTERM (unix) and the control
 //! channel's STOP — funnel into one [`ShutdownWatch`] gate, and a
@@ -218,13 +220,13 @@ impl ShutdownWatch {
 }
 
 /// A running CyDrive stack: the WebDAV server, the web dashboard, the
-/// VFS whose upload queue backs both, and the drive letter
-/// auto-mounted at boot (if any). The graceful stop sequence itself is
-/// owned by an internal stop task parked on the shared [`ShutdownWatch`]
-/// gate, so it runs exactly once no matter which shutdown source (or how
-/// many) fired. Dropping the handle without [`RunHandle::shutdown`]
-/// leaves the workers to die with the runtime; prefer an explicit
-/// shutdown.
+/// VFS whose upload queue backs both, and the drive letter / mount
+/// point auto-mounted at boot (if any). The graceful stop sequence
+/// itself is owned by an internal stop task parked on the shared
+/// [`ShutdownWatch`] gate, so it runs exactly once no matter which
+/// shutdown source (or how many) fired. Dropping the handle without
+/// [`RunHandle::shutdown`] leaves the workers to die with the runtime;
+/// prefer an explicit shutdown.
 pub struct RunHandle {
     webdav_addr: SocketAddr,
     web_ui_addr: Option<SocketAddr>,
@@ -239,6 +241,12 @@ pub struct RunHandle {
     /// failed mount that only warned). The stop sequence releases
     /// exactly this letter.
     pub mounted_letter: Option<String>,
+    /// The Unix mount point the boot-time auto-mount actually claimed
+    /// (`None` when unmounted: non-unix, `auto_mount_drive` off, or a
+    /// failed mount that only warned) — the Unix analog of
+    /// [`RunHandle::mounted_letter`] (status plan C5). The stop sequence
+    /// releases exactly this path.
+    pub mounted_point: Option<PathBuf>,
 }
 
 impl RunHandle {
@@ -269,8 +277,9 @@ impl RunHandle {
     /// stops the same way, then the upload queue drains — every job
     /// enqueued before this call reaches a terminal state before the
     /// future resolves — then the inbound worker joins, the control port
-    /// file is removed, and finally an auto-mounted drive is released;
-    /// an unmount failure only warns, it must never block the exit.
+    /// file is removed, and finally an auto-mounted drive (Windows letter
+    /// or Unix mount point) is released; an unmount failure only warns,
+    /// it must never block the exit.
     ///
     /// The sequence itself lives in the internal stop task; this method
     /// fires the gate (a no-op when a source already did) and waits for
@@ -437,10 +446,11 @@ pub async fn run_with_transport(
         }
     };
 
-    let mounted_letter = mount_if_configured(cfg);
+    let (mounted_letter, mounted_point) = mount_if_configured(cfg);
     let webdav_addr = server.local_addr();
     let web_ui_addr = web_ui.as_ref().map(WebUiServer::local_addr);
     let unmount_letter = mounted_letter.clone();
+    let unmount_point = mounted_point.clone();
     // The one runner of the graceful stop sequence: parked on the stop
     // gate, it executes the shutdown ordering exactly once for any
     // number of fires (control STOP, `RunHandle::shutdown`, or several
@@ -478,6 +488,20 @@ pub async fn run_with_transport(
                 );
             }
         }
+        // The Unix auto-mount's release (status plan C5): same warn-only
+        // semantics — a not-mounted or busy (EBUSY) mount point must never
+        // block the exit. Both platform calls above/below compile
+        // everywhere through the stubs, and each claim only ever exists
+        // on its own platform, so exactly one arm can run.
+        if let Some(point) = unmount_point {
+            if let Err(e) = cydrive_platform::linux::unmount_drive(&point) {
+                tracing::warn!(
+                    point = %point.display(),
+                    error = %e,
+                    "unmounting the auto-mounted directory failed; continuing the shutdown"
+                );
+            }
+        }
     });
     Ok(RunHandle {
         webdav_addr,
@@ -485,6 +509,7 @@ pub async fn run_with_transport(
         watch: gate,
         stop_task,
         mounted_letter,
+        mounted_point,
     })
 }
 
@@ -701,32 +726,93 @@ pub fn cache_clear_cmd(cfg: &CyDriveConfig) -> Result<()> {
     Ok(())
 }
 
-/// Auto-mount step (unit D): on Windows with `auto_mount_drive`, map the
-/// best available drive letter to the config's WebDAV URL. Non-Windows
-/// platforms and disabled configs skip with an info line; a failed mount
-/// only warns — the server stays reachable at its URL either way.
-fn mount_if_configured(cfg: &CyDriveConfig) -> Option<String> {
-    if !cfg.auto_mount_drive {
-        tracing::info!("auto_mount_drive is off; skipping the drive mapping");
-        return None;
-    }
-    if !cfg!(windows) {
-        tracing::info!("drive mapping is Windows-only; skipping");
-        return None;
-    }
-    let url = default_mount_url(cfg);
-    println!("Mounting drive letter {} -> {} ...", cfg.drive_letter, url);
-    match cydrive_platform::windows::mount_drive(&cfg.drive_letter, &url) {
-        Ok(letter) => {
-            println!("Drive mounted: {letter} -> {url}");
-            Some(letter)
+/// Auto-mount step (unit D; the Unix leg is status plan C5): with
+/// `auto_mount_drive`, Windows maps the best available drive letter to
+/// the config's WebDAV URL, while Unix mounts the auto-mount target
+/// (`mount_point` key or `$HOME/CyDrive`) through the gio→davfs2 chain,
+/// after releasing any stale davfs mounts still pointing at the URL. A
+/// disabled config (or unsupported platform) skips with an info line; a
+/// failed mount only warns — the server stays reachable at its URL
+/// either way.
+///
+/// Returns the stop sequence's claim pair: the Windows drive letter and
+/// the Unix mount point. Exactly one of them can ever be `Some` (each
+/// platform's branch fills only its own slot), and both platform calls
+/// the stop task makes compile everywhere through the platform stubs.
+fn mount_if_configured(cfg: &CyDriveConfig) -> (Option<String>, Option<PathBuf>) {
+    #[cfg(unix)]
+    {
+        if !cfg.auto_mount_drive {
+            tracing::info!("auto_mount_drive is off; skipping the drive mapping");
+            return (None, None);
         }
-        Err(error) => {
-            println!("Auto-mount FAILED ({error}); WebDAV stays reachable at {url}.");
-            println!(
-                "  Hints: run `cydrive fix-reg` in an elevated shell, ensure the WebClient                  service can start, and check that the letter is free (`cydrive doctor`)."
+        // auto_mount_target consults home only in its default arm, so a
+        // missing $HOME still lets an explicit mount_point key carry the
+        // auto-mount.
+        let target = match std::env::var("HOME") {
+            Ok(home) => cydrive_platform::auto_mount_target(cfg, Path::new(&home)),
+            Err(_no_home) => cfg.mount_point.as_deref().map(PathBuf::from),
+        };
+        let Some(target) = target else {
+            tracing::warn!(
+                "auto_mount_drive is on but no mount target resolved (no mount_point \
+                 key and $HOME is unset); skipping"
             );
-            None
+            return (None, None);
+        };
+        let url = default_mount_url(cfg);
+        println!("Mounting {} -> {} ...", target.display(), url);
+        // Stale cleanup first: a leftover davfs mount from a previous run
+        // (or a crashed session) must not keep serving a dead server
+        // under the fresh one.
+        cydrive_platform::linux::unmount_stale_for(&url);
+        match cydrive_platform::linux::mount_drive(&target, &url) {
+            Ok(report) => {
+                println!("{report}");
+                (None, Some(target))
+            }
+            Err(error) => {
+                tracing::warn!(
+                    %error,
+                    point = %target.display(),
+                    "unix auto-mount failed; continuing without it"
+                );
+                println!("Auto-mount FAILED ({error}); WebDAV stays reachable at {url}.");
+                println!(
+                    "  Hints: install davfs2 (e.g. `apt install davfs2`), mount with \
+                     permission (root or the davfs2 group), or mount manually: `cydrive \
+                     mount --path {}`.",
+                    target.display()
+                );
+                (None, None)
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        if !cfg.auto_mount_drive {
+            tracing::info!("auto_mount_drive is off; skipping the drive mapping");
+            return (None, None);
+        }
+        if !cfg!(windows) {
+            tracing::info!("drive mapping is Windows-only; skipping");
+            return (None, None);
+        }
+        let url = default_mount_url(cfg);
+        println!("Mounting drive letter {} -> {} ...", cfg.drive_letter, url);
+        match cydrive_platform::windows::mount_drive(&cfg.drive_letter, &url) {
+            Ok(letter) => {
+                println!("Drive mounted: {letter} -> {url}");
+                (Some(letter), None)
+            }
+            Err(error) => {
+                println!("Auto-mount FAILED ({error}); WebDAV stays reachable at {url}.");
+                println!(
+                    "  Hints: run `cydrive fix-reg` in an elevated shell, ensure the WebClient                  service can start, and check that the letter is free (`cydrive doctor`)."
+                );
+                (None, None)
+            }
         }
     }
 }

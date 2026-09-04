@@ -7,11 +7,10 @@
 //! strings. One deliberate divergence: when *neither* backend is
 //! installed the baseline's auto-mount path answered a headless "active
 //! on Linux server" success — here [`mount_drive`] returns
-//! [`PlatformError::MissingBackend`] instead, because this crate's only
-//! caller today is the explicit `cydrive mount` subcommand, for which a
-//! silent non-mount would be a lie. The run-time auto-mount wiring
-//! (deferred to the next batch by the plan's C4 scope ruling) can treat
-//! `MissingBackend` as its acceptable headless mode.
+//! [`PlatformError::MissingBackend`] instead, so an explicit `cydrive
+//! mount` never reports a mount that did not happen; the run flow's
+//! auto-mount wiring (status plan C5) treats that error as its
+//! warn-and-continue headless mode.
 //!
 //! macOS is not handled here: `mount_webdav` stays stubbed per the
 //! plan's YAGNI list.
@@ -20,7 +19,7 @@ use std::path::Path;
 
 use crate::{
     davfs_mount_command, davfs_unmount_command, detect_mount_backend, fusermount_unmount_command,
-    gio_mount_command, PlatformError,
+    gio_mount_command, parse_proc_mounts_davfs, PlatformError,
 };
 
 /// Mounts the WebDAV endpoint at `url`, creating `mount_point` first
@@ -103,6 +102,30 @@ fn which(bin: &str) -> bool {
         .output()
         .map(|output| output.status.success())
         .unwrap_or(false)
+}
+
+/// Releases every davfs mount the current `/proc/mounts` shows for
+/// `url` — the run flow's stale cleanup before a fresh auto-mount
+/// (status plan C5): a previous run's leftover mount must not keep
+/// serving a dead server under the new one. Best-effort by design:
+/// every `umount`'s output is swallowed and failures stay silent, which
+/// makes repeated calls idempotent — a machine with no matching mounts
+/// is a no-op, and a busy mount simply survives for [`unmount_drive`]
+/// (or the operator) to release later. Each mount point is attempted at
+/// most once per call, so an `umount` that does not stick cannot turn
+/// the cleanup into a spin.
+pub fn unmount_stale_for(url: &str) {
+    let mut attempted: Vec<String> = Vec::new();
+    while let Some(point) = std::fs::read_to_string("/proc/mounts")
+        .ok()
+        .and_then(|mounts| parse_proc_mounts_davfs(&mounts, url))
+    {
+        if attempted.iter().any(|p| p == &point) {
+            break;
+        }
+        let _ = run_argv(&davfs_unmount_command(&point));
+        attempted.push(point);
+    }
 }
 
 /// Runs one external command to completion. Non-zero exit maps to

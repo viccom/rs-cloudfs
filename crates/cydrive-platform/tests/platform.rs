@@ -435,25 +435,39 @@ fn ignored_davfs_mount_unmount_roundtrip() {
 #[test]
 fn auto_mount_target_respects_flag_and_key() {
     let home = Path::new("/home/user");
-    let mut cfg = CyDriveConfig::default();
-    cfg.auto_mount_drive = false;
-    cfg.mount_point = Some("/mnt/cydrive".to_string());
+
+    // 标志关: the flag gates the whole decision — even with a key set.
+    let off = CyDriveConfig {
+        auto_mount_drive: false,
+        mount_point: Some("/mnt/cydrive".to_string()),
+        ..CyDriveConfig::default()
+    };
     assert_eq!(
-        auto_mount_target(&cfg, home),
+        auto_mount_target(&off, home),
         None,
         "flag off -> no auto-mount target even with a mount_point key"
     );
 
-    cfg.auto_mount_drive = true;
+    // 标志开 + 键: the explicit absolute key wins.
+    let keyed = CyDriveConfig {
+        auto_mount_drive: true,
+        mount_point: Some("/mnt/cydrive".to_string()),
+        ..CyDriveConfig::default()
+    };
     assert_eq!(
-        auto_mount_target(&cfg, home).as_deref(),
+        auto_mount_target(&keyed, home).as_deref(),
         Some(Path::new("/mnt/cydrive")),
         "flag on + explicit key -> exactly the key's path"
     );
 
-    cfg.mount_point = None;
+    // 标志开无键: the ~/CyDrive default under the injected home.
+    let unkeyed = CyDriveConfig {
+        auto_mount_drive: true,
+        mount_point: None,
+        ..CyDriveConfig::default()
+    };
     assert_eq!(
-        auto_mount_target(&cfg, home).as_deref(),
+        auto_mount_target(&unkeyed, home).as_deref(),
         Some(Path::new("/home/user/CyDrive")),
         "flag on, no key -> the ~/CyDrive default under the injected home"
     );

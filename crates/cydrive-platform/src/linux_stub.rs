@@ -27,3 +27,8 @@ pub fn mount_drive(_mount_point: &Path, _url: &str) -> Result<String, PlatformEr
 pub fn unmount_drive(_mount_point: &Path) -> Result<String, PlatformError> {
     unsupported()
 }
+
+/// Stub: silent no-op — there are no davfs mounts to clean on non-Linux
+/// targets, and cleanup must never fail a boot (the real
+/// implementation's failures are silent too).
+pub fn unmount_stale_for(_url: &str) {}
