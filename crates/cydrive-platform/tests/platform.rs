@@ -26,8 +26,9 @@ use std::path::Path;
 use cydrive_platform::{
     davfs_mount_command, davfs_unmount_command, default_mount_point, detect_mount_backend,
     fusermount_unmount_command, gio_mount_command, mount_command, normalize_drive_letter,
-    pick_drive_letter, unmount_command, used_letters_from_bitmask, BASIC_AUTH_LEVEL,
-    FALLBACK_DRIVE_LETTERS, FILE_SIZE_LIMIT_BYTES, WEBCLIENT_REG_PATH,
+    parse_net_use_mapping, parse_proc_mounts_davfs, pick_drive_letter, unmount_command,
+    used_letters_from_bitmask, BASIC_AUTH_LEVEL, FALLBACK_DRIVE_LETTERS, FILE_SIZE_LIMIT_BYTES,
+    WEBCLIENT_REG_PATH,
 };
 
 /// 1. `normalize_drive_letter` — the three accepted spellings canonicalise
@@ -281,6 +282,96 @@ fn linux_stub_shape() {
         "http://127.0.0.1:8080",
     ));
     expect_unsupported(linux::unmount_drive(Path::new("/mnt/cydrive")));
+}
+
+// ------------------------------------------- mount status parsers (status C2) ---
+
+/// 17. `parse_net_use_mapping` (status plan C2, pure — runs on every
+///     platform): the `net use` line carrying the URL yields its
+///     single-letter drive token, among several mappings and none alike.
+///
+///     Sample text is the **English** `net use` rendering: the words
+///     around the columns are localized on non-English Windows installs
+///     (a known risk this parser accepts — the tokens it matches on,
+///     `Y:` and the URL, are locale-independent).
+#[test]
+fn parse_net_use_finds_letter_for_url() {
+    let output = "\
+New connections will be remembered.
+
+Status       Local     Remote                    Network
+-------------------------------------------------------------------------------
+OK           X:        http://127.0.0.1:9000     Web Client Network
+OK           Y:        http://127.0.0.1:8289     Web Client Network
+The command completed successfully.
+";
+    // 正常: the URL's own line yields its letter.
+    assert_eq!(
+        parse_net_use_mapping(output, "http://127.0.0.1:8289").as_deref(),
+        Some("Y:"),
+        "the mapping line carrying the URL must yield its drive letter"
+    );
+    // 多映射: with two mappings present, each URL resolves to its own
+    // letter — the other mapping must not win.
+    assert_eq!(
+        parse_net_use_mapping(output, "http://127.0.0.1:9000").as_deref(),
+        Some("X:"),
+        "a different mapped URL must resolve to its own letter"
+    );
+    // 无匹配: a URL no line carries yields None.
+    assert_eq!(
+        parse_net_use_mapping(output, "http://10.9.9.9:8289"),
+        None,
+        "an unmapped URL must yield None"
+    );
+}
+
+/// 18. `parse_proc_mounts_davfs` (status plan C2, pure — runs on every
+///     platform): the davfs line for the URL yields its mount point, in
+///     both the `/proc/mounts` field order and mount(8)'s `on ... type`
+///     rendering, with plain `fuse` and `fuse.<subtype>` fstypes; an
+///     unrelated FUSE mount and an absent URL yield None.
+#[test]
+fn parse_proc_mounts_finds_mountpoint() {
+    let mounts = "\
+devpts /dev/pts devpts rw,nosuid,noexec,relatime 0 0
+http://127.0.0.1:8289 /root/CyDrive fuse rw,user=root 0 0
+tmpfs /run tmpfs rw,nosuid,nodev 0 0
+";
+    assert_eq!(
+        parse_proc_mounts_davfs(mounts, "http://127.0.0.1:8289").as_deref(),
+        Some("/root/CyDrive"),
+        "the /proc/mounts davfs line must yield its mount point"
+    );
+    // mount(8) rendering of a davfs mount: `<url> on <point> type fuse (…)`.
+    let mount_style =
+        "http://127.0.0.1:8289 on /root/CyDrive type fuse (rw,nosuid,nodev,relatime)";
+    assert_eq!(
+        parse_proc_mounts_davfs(mount_style, "http://127.0.0.1:8289").as_deref(),
+        Some("/root/CyDrive"),
+        "the mount(8) rendering must parse the same"
+    );
+    // FUSE subtype spelling (davfs2 shows up as fuse.davfs2).
+    let davfs2_subtype =
+        "http://127.0.0.1:8289 /home/user/CyDrive fuse.davfs2 rw,user=fileuid=0 0 0";
+    assert_eq!(
+        parse_proc_mounts_davfs(davfs2_subtype, "http://127.0.0.1:8289").as_deref(),
+        Some("/home/user/CyDrive"),
+        "a fuse.<subtype> davfs line must parse the same"
+    );
+    // 无关 fuse 行不误配: a FUSE mount of something else is not ours.
+    let foreign_fuse = "user@host:/data /mnt/data fuse.sshfs rw 0 0";
+    assert_eq!(
+        parse_proc_mounts_davfs(foreign_fuse, "http://127.0.0.1:8289"),
+        None,
+        "an unrelated FUSE mount must not match"
+    );
+    // 无匹配: a URL no davfs line carries yields None.
+    assert_eq!(
+        parse_proc_mounts_davfs(mounts, "http://10.9.9.9:8289"),
+        None,
+        "an unmounted URL must yield None"
+    );
 }
 
 // --------------------------------------------------- real-machine (manual) ---

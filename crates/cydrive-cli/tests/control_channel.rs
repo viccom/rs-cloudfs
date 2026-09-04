@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cydrive_cli::control::{
-    control_file_path, read_control_addr, send_stop, stop_cmd, ControlServer,
+    control_file_path, read_control_addr, send_ping, send_stop, stop_cmd, ControlServer,
 };
 use cydrive_core::config::CyDriveConfig;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -209,4 +209,61 @@ async fn stop_against_stale_file_reports_and_cleans() {
         !control_file.exists(),
         "the stale control file must be removed after the failed stop"
     );
+}
+
+/// C1 (status plan, `2026-09-04-status-and-automount.md`): `PING` is the
+/// protocol's second command — it answers the version line
+/// (`OK: cydrive <version>`, exactly what `cydrive status` shows on its
+/// instance row) and, unlike STOP, leaves the shutdown callback
+/// untriggered; a STOP sent afterwards still fires it.
+#[tokio::test]
+async fn ping_replies_version_without_stopping() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cfg = temp_config(dir.path());
+
+    let server = ControlServer::bind(&cfg)
+        .await
+        .expect("bind control server");
+    let addr = server.local_addr();
+    let triggered = Arc::new(AtomicBool::new(false));
+    let flag = Arc::clone(&triggered);
+    spawn_run(server, move || flag.store(true, Ordering::SeqCst));
+
+    let resp = send_ping(addr)
+        .await
+        .expect("send PING to the live server");
+    assert!(
+        resp.contains("OK: cydrive"),
+        "PING must be acknowledged with the OK: cydrive line: {resp}"
+    );
+    assert!(
+        resp.contains(env!("CARGO_PKG_VERSION")),
+        "PING reply must carry this binary's version: {resp}"
+    );
+
+    // Give a (wrongly fired) stop request the chance to land before
+    // asserting it never did — same yield-now pattern as the STOP test.
+    for _ in 0..16 {
+        tokio::task::yield_now().await;
+    }
+    assert!(
+        !triggered.load(Ordering::SeqCst),
+        "PING must not fire the shutdown callback"
+    );
+
+    let resp = send_stop(addr)
+        .await
+        .expect("STOP must still work after a PING");
+    assert!(
+        resp.contains("OK: shutting down"),
+        "the follow-up STOP must be acknowledged: {resp}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !triggered.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "STOP after a PING must fire the shutdown callback within 1s"
+        );
+        tokio::task::yield_now().await;
+    }
 }
