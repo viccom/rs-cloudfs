@@ -56,7 +56,11 @@ async fn collect_status_full_picture() {
     let dir = tempfile::tempdir().expect("temp dir");
     let webdav = TcpListener::bind("127.0.0.1:0").expect("bind the WebDAV stand-in");
     let dashboard = TcpListener::bind("127.0.0.1:0").expect("bind the dashboard stand-in");
-    let cfg = temp_config(dir.path(), listener_port(&webdav), listener_port(&dashboard));
+    let cfg = temp_config(
+        dir.path(),
+        listener_port(&webdav),
+        listener_port(&dashboard),
+    );
 
     let server = ControlServer::bind(&cfg)
         .await

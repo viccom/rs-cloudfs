@@ -229,9 +229,7 @@ async fn ping_replies_version_without_stopping() {
     let flag = Arc::clone(&triggered);
     spawn_run(server, move || flag.store(true, Ordering::SeqCst));
 
-    let resp = send_ping(addr)
-        .await
-        .expect("send PING to the live server");
+    let resp = send_ping(addr).await.expect("send PING to the live server");
     assert!(
         resp.contains("OK: cydrive"),
         "PING must be acknowledged with the OK: cydrive line: {resp}"

@@ -52,6 +52,7 @@ use cydrive_telegram::config::{
 use cydrive_telegram::transport::GrammersTransport;
 use cydrive_web::WebUiServer;
 use cydrive_webdav::{CyDriveFs, WebDavServer};
+use tokio::net::TcpStream;
 
 mod keyring_store;
 mod signals;
@@ -733,6 +734,127 @@ fn mount_if_configured(cfg: &CyDriveConfig) -> Option<String> {
 /// Glues the canonical mount URL from the config's WebDAV host/port.
 pub fn default_mount_url(cfg: &CyDriveConfig) -> String {
     format!("http://{}:{}", cfg.webdav_host, cfg.webdav_port)
+}
+
+// ------------------------------------------------- status subcommand (C3) ---
+
+/// The dashboard's canonical URL when `enable_web_ui` is on, `None` when
+/// the UI is off — shared by [`collect_status`]'s probe decision and the
+/// renderer's `disabled` line, so the two cannot drift.
+pub fn dashboard_url(cfg: &CyDriveConfig) -> Option<String> {
+    cfg.enable_web_ui
+        .then(|| format!("http://{}:{}", cfg.web_ui_host, cfg.web_ui_port))
+}
+
+/// The `cydrive status` data model (status plan C3): every field carries
+/// only its healthy value — `instance` is a live instance's PING reply
+/// (the `OK: cydrive <version>` line), `control` the control file's
+/// address when one exists (rendering marks it stale when the PING
+/// failed), `webdav`/`dashboard` the glued URL when the port answered
+/// the 1s probe, `mount` the current machine's mapping for the drive
+/// URL. `None` everywhere means "down/absent", never "unknown".
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct StatusReport {
+    /// A running instance's PING reply (`Some` = running).
+    pub instance: Option<String>,
+    /// The control file's address (`None` = no control file at all).
+    pub control: Option<String>,
+    /// The WebDAV URL when its port answered (`Some` = listening).
+    pub webdav: Option<String>,
+    /// The dashboard URL when its port answered (`Some` = listening).
+    pub dashboard: Option<String>,
+    /// The current mount for the drive URL (`"Y:"` / `"/root/CyDrive"`).
+    pub mount: Option<String>,
+}
+
+/// The `cydrive status` collection body (status plan C3), run against
+/// the same config discovery as `run`/`stop` — the control file resolves
+/// relative to the discovered `db_path`, so `status` shares their
+/// working-directory rule. Never fails: every dead probe lands as a
+/// `None` field for [`render_status`] to phrase.
+///
+/// - control file + [`control::send_ping`]: a reply puts the version
+///   line on `instance`; a file whose address stays silent keeps
+///   `instance` empty and `control` carries the address (stale);
+/// - WebDAV / dashboard ports: 1s connect probes (the dashboard only
+///   when `enable_web_ui`);
+/// - mount: [`cydrive_platform::current_mount_for`] against the glued
+///   drive URL.
+pub async fn collect_status(cfg: &CyDriveConfig) -> StatusReport {
+    let (instance, control) = match control::read_control_addr(cfg) {
+        Ok(addr) => {
+            let control = Some(addr.to_string());
+            match control::send_ping(addr).await {
+                Ok(reply) => (Some(reply), control),
+                Err(_dead_address) => (None, control),
+            }
+        }
+        Err(_no_file) => (None, None),
+    };
+
+    let webdav_url = default_mount_url(cfg);
+    let webdav = probe_listening(&cfg.webdav_host, cfg.webdav_port, &webdav_url).await;
+    let dashboard = match dashboard_url(cfg) {
+        Some(url) => probe_listening(&cfg.web_ui_host, cfg.web_ui_port, &url).await,
+        None => None,
+    };
+    let mount = cydrive_platform::current_mount_for(&webdav_url);
+    StatusReport {
+        instance,
+        control,
+        webdav,
+        dashboard,
+        mount,
+    }
+}
+
+/// The 1s connect probe behind the status port lines: `Some(url)` exactly
+/// when the address answered — a refused or silent port (or an
+/// unparseable host) reads as down. The successful connection is dropped
+/// on the spot; connectability is all `status` asks of the port.
+async fn probe_listening(host: &str, port: u16, url: &str) -> Option<String> {
+    let addr = SocketAddr::new(host.parse::<IpAddr>().ok()?, port);
+    match tokio::time::timeout(Duration::from_secs(1), TcpStream::connect(addr)).await {
+        Ok(connected) => connected.is_ok().then(|| url.to_string()),
+        Err(_elapsed) => None,
+    }
+}
+
+/// The `cydrive status` renderer (status plan C3; format pinned verbatim
+/// by the status tests): labels left-aligned to column 12, the instance
+/// parenthetical is the PING reply verbatim, the control line is omitted
+/// when no control file exists and gains a ` (stale)` marker when its
+/// address no longer answers, and a disabled dashboard prints
+/// `disabled`. Lines are `'\n'`-joined without a trailing newline — the
+/// CLI `println!`s the whole report.
+pub fn render_status(r: &StatusReport, webdav_url: &str, dash_url: Option<String>) -> String {
+    let mut lines: Vec<String> = Vec::with_capacity(5);
+    match &r.instance {
+        Some(reply) => lines.push(format!("instance:   running ({reply})")),
+        None => lines.push("instance:   not running".to_string()),
+    }
+    if let Some(addr) = &r.control {
+        // instance down + file present = the file points at a dead run.
+        let stale = if r.instance.is_some() { "" } else { " (stale)" };
+        lines.push(format!("control:    {addr}{stale}"));
+    }
+    lines.push(if r.webdav.is_some() {
+        format!("webdav:     {webdav_url} listening")
+    } else {
+        format!("webdav:     {webdav_url} not reachable")
+    });
+    match dash_url {
+        Some(url) if r.dashboard.is_some() => {
+            lines.push(format!("dashboard:  {url} listening"));
+        }
+        Some(url) => lines.push(format!("dashboard:  {url} not reachable")),
+        None => lines.push("dashboard:  disabled".to_string()),
+    }
+    match &r.mount {
+        Some(mapping) => lines.push(format!("mount:      {mapping} -> {webdav_url}")),
+        None => lines.push("mount:      not mounted".to_string()),
+    }
+    lines.join("\n")
 }
 
 /// Resolves the `mount` subcommand's arguments: an explicit `--url` /

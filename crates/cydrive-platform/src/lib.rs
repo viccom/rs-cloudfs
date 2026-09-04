@@ -205,6 +205,97 @@ pub fn default_mount_point(home: &std::path::Path) -> std::path::PathBuf {
     home.join("CyDrive")
 }
 
+// ------------------------------------------ mount status parsers (status C2) ---
+//
+// Read-only mounts-state scans behind `cydrive status`: pure text
+// parsers any target can unit-test, plus one cfg-gated shell that asks
+// the current machine. Windows answers "which letter maps url" by
+// scanning `net use`'s listing; Linux answers "which mount point carries
+// url" by scanning `/proc/mounts`.
+
+/// Scan `net use`'s listing for the mapping line carrying `url` and
+/// return its single-letter drive token as `"Y:"` (canonicalised through
+/// [`normalize_drive_letter`], so `y`/`Y:`-shaped tokens both count); no
+/// such line → `None`.
+///
+/// `net use` renders whitespace-aligned columns, so tokens split on
+/// whitespace; the matched tokens (letter, URL) are locale-independent,
+/// but the surrounding status words come localized on non-English
+/// Windows installs — an accepted risk of this parser (documented on the
+/// red test's English-format sample).
+pub fn parse_net_use_mapping(output: &str, url: &str) -> Option<String> {
+    for line in output.lines() {
+        if !line.contains(url) {
+            continue;
+        }
+        // e.g. "OK    Y:    http://127.0.0.1:8289    Web Client Network"
+        // — the first single-letter token on the line is the mapping.
+        for token in line.split_whitespace() {
+            if let Some(letter) = normalize_drive_letter(token) {
+                return Some(letter);
+            }
+        }
+    }
+    None
+}
+
+/// Scan `/proc/mounts` (or mount(8)'s rendering of it) for the davfs
+/// line mounted from `url` and return its mount point; no such line →
+/// `None`.
+///
+/// Both text forms lead with the mounted URL as their first field —
+/// `/proc/mounts`: `<url> <mountpoint> fuse[.<subtype>] <opts> ...`;
+/// mount(8): `<url> on <mountpoint> type fuse[.<subtype>] (opts)` — and
+/// a FUSE-typed field (`fuse` plain, or `fuse.davfs2`/`fuse.sshfs`
+/// subtypes) tells the mount apart from everything else in the file.
+/// Anchoring the URL to the first field keeps unrelated FUSE mounts
+/// from matching by a coincidental URL substring.
+pub fn parse_proc_mounts_davfs(output: &str, url: &str) -> Option<String> {
+    for line in output.lines() {
+        let fields: Vec<&str> = line.split_whitespace().collect();
+        if fields.first() != Some(&url) {
+            continue;
+        }
+        if !fields.iter().any(|field| field.starts_with("fuse")) {
+            continue;
+        }
+        let mountpoint = if fields.get(1) == Some(&"on") {
+            fields.get(2) // mount(8): "<url> on <mountpoint> type ..."
+        } else {
+            fields.get(1) // /proc/mounts: "<url> <mountpoint> fuse ..."
+        };
+        if let Some(point) = mountpoint {
+            return Some((*point).to_string());
+        }
+    }
+    None
+}
+
+/// The status shell over the two parsers (status plan C2): what the
+/// current machine maps `url` to — a `"Y:"`-shaped letter on Windows
+/// (`net use` scan), the davfs mount point on Linux (`/proc/mounts`
+/// scan), nothing on other platforms. Read-only probes; a failed probe
+/// simply reads as "not mounted" (`None`), never as an error — `status`
+/// is a diagnosis, not a gate. cfg discipline as everywhere in this
+/// crate: exactly one branch survives per target, so all targets
+/// compile.
+pub fn current_mount_for(url: &str) -> Option<String> {
+    #[cfg(windows)]
+    {
+        let output = std::process::Command::new("net").arg("use").output().ok()?;
+        parse_net_use_mapping(&String::from_utf8_lossy(&output.stdout), url)
+    }
+    #[cfg(target_os = "linux")]
+    {
+        let mounts = std::fs::read_to_string("/proc/mounts").ok()?;
+        parse_proc_mounts_davfs(&mounts, url)
+    }
+    #[cfg(not(any(windows, target_os = "linux")))]
+    {
+        None
+    }
+}
+
 /// Windows implementation of the side-effecting mount/registry surface.
 #[cfg(windows)]
 pub mod windows;

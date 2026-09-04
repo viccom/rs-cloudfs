@@ -1,11 +1,13 @@
-//! The loopback control channel behind `cydrive stop` (service-lifecycle
-//! plan, contracts C1/C2).
+//! The loopback control channel behind `cydrive stop` and `cydrive
+//! status` (service-lifecycle plan contracts C1/C2; status plan C1).
 //!
 //! Every running instance binds a loopback-only listener on an ephemeral
 //! port and drops a one-line port file (`127.0.0.1:<port>`) next to its
-//! metadata db; the line protocol has exactly one command — `STOP`
-//! answers `OK: shutting down` and fires the shutdown callback, anything
-//! else answers `ERR: unknown command`.
+//! metadata db; the line protocol has exactly two commands — `STOP`
+//! answers `OK: shutting down` and fires the shutdown callback, `PING`
+//! answers `OK: cydrive <version>` and disturbs nothing (the payload
+//! `cydrive status` shows on its instance row), anything else answers
+//! `ERR: unknown command`.
 //!
 //! Security model (plan C1): the listener binds 127.0.0.1 only and
 //! carries no authentication — an attacker who can already talk to the
@@ -80,12 +82,14 @@ impl ControlServer {
 
     /// The accept loop (one spawned task per connection): a line reading
     /// `STOP` (trimmed) is answered `OK: shutting down`, the connection
-    /// is closed, and `shutdown` fires; any other line answers
-    /// `ERR: unknown command`. The loop keeps serving after a STOP, so
-    /// later `STOP`s fire the callback again — **the callback must be
-    /// idempotent** (the run wiring passes the unified shutdown trigger,
-    /// which is). Per-connection I/O errors only end that connection's
-    /// task with a warning; only a failed `accept` ends the loop.
+    /// is closed, and `shutdown` fires; a line reading `PING` is answered
+    /// with [`ping_reply`]'s version line and fires nothing; any other
+    /// line answers `ERR: unknown command`. The loop keeps serving after
+    /// a STOP, so later `STOP`s fire the callback again — **the callback
+    /// must be idempotent** (the run wiring passes the unified shutdown
+    /// trigger, which is). Per-connection I/O errors only end that
+    /// connection's task with a warning; only a failed `accept` ends the
+    /// loop.
     ///
     /// The callback itself runs on this loop's task — the connection
     /// tasks only request it over an internal channel — so a plain
@@ -114,7 +118,8 @@ impl ControlServer {
                             tracing::warn!(%peer, %error, "control connection: read failed");
                             return;
                         }
-                        if String::from_utf8_lossy(&request).trim() == "STOP" {
+                        let line = String::from_utf8_lossy(&request).trim().to_owned();
+                        if line == "STOP" {
                             if let Err(error) = stream.write_all(b"OK: shutting down\n").await {
                                 tracing::warn!(%peer, %error, "control connection: write failed");
                                 return;
@@ -127,6 +132,15 @@ impl ControlServer {
                             let _ = stream.flush().await;
                             drop(stream);
                             let _ = stop_tx.send(());
+                        } else if line == "PING" {
+                            // Status probe (status plan C1): answer and
+                            // let the task end — dropping the stream
+                            // closes the connection, ending the client's
+                            // read-to-EOF without touching the shutdown
+                            // callback.
+                            if let Err(error) = stream.write_all(ping_reply().as_bytes()).await {
+                                tracing::warn!(%peer, %error, "control connection: write failed");
+                            }
                         } else if let Err(error) = stream.write_all(b"ERR: unknown command\n").await {
                             tracing::warn!(%peer, %error, "control connection: write failed");
                         }
@@ -142,11 +156,19 @@ impl ControlServer {
     }
 }
 
-/// The `cydrive stop` client half (contract C1): connect bounded by
-/// [`CONNECT_TIMEOUT`], send `STOP`, read the reply to EOF and return it
-/// trimmed. The connect error propagates as-is so the caller can tell a
-/// refused/timeout (stale port file) from a protocol failure.
-pub async fn send_stop(addr: SocketAddr) -> io::Result<String> {
+/// The reply the control channel's `PING` command answers with: the
+/// binary name and version (`OK: cydrive 0.3.0`) — exactly the payload
+/// `cydrive status` reports on its instance row. Never fires the
+/// shutdown callback.
+fn ping_reply() -> String {
+    format!("OK: cydrive {}\n", env!("CARGO_PKG_VERSION"))
+}
+
+/// The connect-exchange skeleton shared by the control clients: connect
+/// bounded by [`CONNECT_TIMEOUT`], send `request`, read the reply to EOF
+/// and return it trimmed. The connect error propagates as-is so callers
+/// can tell a refused/timeout (stale port file) from a protocol failure.
+async fn exchange_line(addr: SocketAddr, request: &[u8]) -> io::Result<String> {
     let mut stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
         Ok(connected) => connected?,
         Err(_elapsed) => {
@@ -156,10 +178,25 @@ pub async fn send_stop(addr: SocketAddr) -> io::Result<String> {
             ));
         }
     };
-    stream.write_all(b"STOP\n").await?;
+    stream.write_all(request).await?;
     let mut response = Vec::new();
     stream.read_to_end(&mut response).await?;
     Ok(String::from_utf8_lossy(&response).trim().to_owned())
+}
+
+/// The `cydrive stop` client half (contract C1): send `STOP`, read the
+/// reply to EOF and return it trimmed (see [`exchange_line`] for the
+/// connect budget and error semantics).
+pub async fn send_stop(addr: SocketAddr) -> io::Result<String> {
+    exchange_line(addr, b"STOP\n").await
+}
+
+/// The `cydrive status` client half (status plan C1): send `PING` and
+/// return the version line a live instance answers with. Same skeleton
+/// and error semantics as [`send_stop`] — a refused/timeout address is
+/// the caller's "stale control file" signal.
+pub async fn send_ping(addr: SocketAddr) -> io::Result<String> {
+    exchange_line(addr, b"PING\n").await
 }
 
 /// Reads the running instance's control address off the port file (the

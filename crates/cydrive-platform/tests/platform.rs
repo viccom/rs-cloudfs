@@ -344,8 +344,7 @@ tmpfs /run tmpfs rw,nosuid,nodev 0 0
         "the /proc/mounts davfs line must yield its mount point"
     );
     // mount(8) rendering of a davfs mount: `<url> on <point> type fuse (…)`.
-    let mount_style =
-        "http://127.0.0.1:8289 on /root/CyDrive type fuse (rw,nosuid,nodev,relatime)";
+    let mount_style = "http://127.0.0.1:8289 on /root/CyDrive type fuse (rw,nosuid,nodev,relatime)";
     assert_eq!(
         parse_proc_mounts_davfs(mount_style, "http://127.0.0.1:8289").as_deref(),
         Some("/root/CyDrive"),
