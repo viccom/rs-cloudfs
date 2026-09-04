@@ -238,17 +238,23 @@ pub fn auto_mount_target(
 /// [`normalize_drive_letter`], so `y`/`Y:`-shaped tokens both count); no
 /// such line → `None`.
 ///
-/// `net use` renders whitespace-aligned columns, so tokens split on
-/// whitespace; the matched tokens (letter, URL) are locale-independent,
-/// but the surrounding status words come localized on non-English
-/// Windows installs — an accepted risk of this parser (documented on the
-/// red test's English-format sample).
+/// `net use` never prints the http URL — the remote column renders as
+/// the UNC form `\\<host>@<port>\DavWWWRoot` (port 80 mappings drop the
+/// `@port`), verified on a real zh-CN install (2026-09-04): the URL is
+/// translated to that form before matching. `net use` renders
+/// whitespace-aligned columns, so tokens split on whitespace; the
+/// matched tokens (letter, UNC) are locale-independent, but the
+/// surrounding status words localize — an accepted risk documented on
+/// the test's real-machine sample.
 pub fn parse_net_use_mapping(output: &str, url: &str) -> Option<String> {
+    let Some(unc) = http_url_to_net_use_unc(url) else {
+        return None;
+    };
     for line in output.lines() {
-        if !line.contains(url) {
+        if !line.contains(&unc) {
             continue;
         }
-        // e.g. "OK    Y:    http://127.0.0.1:8289    Web Client Network"
+        // e.g. "             Y:        \\127.0.0.1@8289\DavWWWRoot"
         // — the first single-letter token on the line is the mapping.
         for token in line.split_whitespace() {
             if let Some(letter) = normalize_drive_letter(token) {
@@ -257,6 +263,23 @@ pub fn parse_net_use_mapping(output: &str, url: &str) -> Option<String> {
         }
     }
     None
+}
+
+/// `http://127.0.0.1:8289` → `\\127.0.0.1@8289\` — the UNC prefix `net
+/// use` shows for a WebDAV mapping (default port 80 drops the `@port`).
+/// Anything that does not parse as an http(s) URL yields None.
+fn http_url_to_net_use_unc(url: &str) -> Option<String> {
+    let rest = url
+        .strip_prefix("http://")
+        .or_else(|| url.strip_prefix("https://"))?;
+    let authority = rest.split(['/', '?']).next()?;
+    let unc = match authority.rsplit_once(':') {
+        // A ":80" (or missing) port renders without the @port suffix.
+        Some((host, "80")) => format!("\\{host}\\"),
+        Some((host, port)) => format!("\\{host}@{port}\\"),
+        None => format!("\\{authority}\\"),
+    };
+    Some(unc)
 }
 
 /// Scan `/proc/mounts` (or mount(8)'s rendering of it) for the davfs
