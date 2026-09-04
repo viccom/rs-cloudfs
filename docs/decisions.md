@@ -135,3 +135,11 @@
 - **往返 PASS**：`ignored_davfs_mount_unmount_roundtrip`（wsgidav 8081 假服务 + `CYDRIVE_TEST_MOUNT_URL`）在 WSL Ubuntu-24.04 通过；此前「留待真实 Linux 主机」的判断不成立。
 - **根因与前提**：davfs2 默认交互式认证（无 tty 即静默失败，即此前手动 mount「exit 0 但未生效」的假象来源）；无认证 WebDAV 服务端场景需 `/etc/davfs2/davfs2.conf` 写 `ask_auth 0`（或 secrets 文件配凭据）。已实测：`cydrive mount`（WSL）经 davfs2 挂载 `/root/CyDrive`，写/读/删全通。
 - **真机确认**：Linux `run` 不自动挂载（按设计），`cydrive mount`（默认 `$HOME/CyDrive`，`--path` 覆盖）即挂载命令；后端探测选了 davfs2（gio 在无 gvfs 守护的 WSL 未被误选——此前担忧未成真，但「gio 探测只验二进制存在」的强化仍列为可选后续）。
+
+## 2026-09-04 status 子命令 + Linux 自动挂载批（feat/status-and-automount，负责人两项设计已批）
+
+- **`cydrive status`**（C1-C3）：控制协议增 PING→`OK: cydrive <version>`（不触停机）；`parse_net_use_mapping`/`parse_proc_mounts_davfs` 双平台挂载解析纯函数 + `current_mount_for` cfg 薄壳；`StatusReport`/`collect_status`/`render_status` 数据-渲染分离全测。语义边界：端口探测是机器级真相（谁监听都报 listening）、实例检测是 cwd 级（控制文件按 cwd 解析）——已在测试注释固化。
+- **`mount_point` 可选配置键**（C4）：绝对路径校验（`/` 开头），None=$HOME/CyDrive 默认；Windows 忽略不报错；legacy json 拒收。此前延后的「挂载点配置语义」就此落定。
+- **Linux run 自动挂载**（C5，此前延后项落地）：`auto_mount_target` 决策纯函数（platform 新增对 core 的 path dep，仅此用途）；启动链 = stale 清理（unmount_stale_for 幂等）→ mount_drive（非交互：root/setuid 直接工作，普通用户失败仅 warn + 提示手动，绝不出 sudo 密码提示）；停机链卸载挂载点（EBUSY/not-mounted warn 静默）；RunHandle 新增 `mounted_point` 字段（mounted_letter 的 Unix 对偶，不复用避免语义漂移）。
+- **真机验证（WSL）**：`ignored_unix_automount_roundtrip` PASS（wsgidav 8081 + davfs2 ask_auth 0 前提）；win workspace 352 / wsl cli+platform 全绿。
+- 后续可选：gio 探测强化（验 gvfs 可用而非仅二进制存在）、status 显示 pid/uptime、JSON 输出——均记 YAGNI 未做。
