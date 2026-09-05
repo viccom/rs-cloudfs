@@ -1,12 +1,12 @@
 # cydrive-sync-server 部署文档
 
-> 适用版本：0.5.x ｜ 对应客户端：cydrive ≥ 0.5.0（`sync_url` 配置键）
+> 适用版本：0.7.x ｜ 对应客户端：cydrive ≥ 0.7.0（`sync_url` 配置键）
 
 ## 1. 这是什么
 
 `cydrive-sync-server` 是家庭级**元数据同步服务端**：一个单二进制 + 一个 SQLite 文件，提供两个 JSON 端点（`POST /v1/push`、`POST /v1/pull`）。多台机器上的 cydrive 客户端经由它共享同一份盘索引（文件名/大小/分块消息号等**元数据**；文件字节本身始终在 Telegram，不经过本服务）。
 
-- **一致性模型**：每命名空间单调版本计数 + LWW（后推者胜）+ 墓碑删除，最终一致。
+- **一致性模型**：每命名空间单调版本计数 + LWW（后推者胜）+ 墓碑删除，最终一致；0.7.0 起支持 **SSE 准实时**（上传成功后秒级可见到其他机器），300s 轮询保留为兜底。
 - **命名空间**：`hex(SHA-256(bot_token + ":" + chat_id))`——**服务器永不接触、永不存储裸 bot token**，客户端只在请求体里携带派生键。同一 bot+chat 的所有机器共享同一个盘；不同 bot 各自独立。
 - **设计边界（家庭级，刻意不做）**：无用户系统、无配额、无内建 TLS（交反代）、拉取不鉴权（见 §5）。
 
@@ -28,7 +28,8 @@ cargo build --release -p cydrive-sync
 |---|---|---|
 | `SYNC_LISTEN` | `127.0.0.1:8290` | 监听地址。`0.0.0.0:8290` = 对局域网开放（配合防火墙/反代） |
 | `SYNC_DB` | `./cydrive_sync.db`（相对 cwd） | SQLite 数据库路径 |
-| `SYNC_SECRET` | 无 | 可选共享密钥。**设置后 push 与 pull 都必须在请求体携带匹配值**（客户端侧用 config.toml 的 `sync_secret` 或环境变量 `CYDRIVE_SYNC_SECRET`）。不设则两端点开放（仅限内网/隧道形态） |
+| `SYNC_SECRET` | 无 | 可选共享密钥。**设置后 push、pull、subscribe 都必须在请求体携带匹配值**（客户端侧用 config.toml 的 `sync_secret` 或环境变量 `CYDRIVE_SYNC_SECRET`）。不设则全端点开放（仅限内网/隧道形态） |
+| `SYNC_HEARTBEAT_SECS` | `20` | SSE 订阅连接的心跳间隔（秒，≥1）；反代 `proxy_read_timeout` 应大于此值 |
 
 命令行：无参数启动；`--version` / `-V` 打版本；`--help` / `-h` 打用法；**任何其他参数直接拒绝退出（exit 2），不会启动服务**。
 
@@ -90,6 +91,23 @@ server {
 **安全模型**（0.6.0 起）：`SYNC_SECRET` 同时拦截 **push 与 pull**——密钥未配或不对一律 403。不设密钥 = 两端点对任何能到达端口的人开放（仅建议内网/隧道形态）。公网部署务必设置密钥。
 
 > **升级顺序（0.6.0 是协议变更）**：新客户端对旧服务端（≤0.5.2）完全兼容（旧端忽略新字段）；**旧客户端（≤0.5.2）对新服务端的 pull 会被 403 拒**（旧 pull 请求不带密钥字段）。所以：先升级各客户端，再升级服务端并设置 `SYNC_SECRET`。
+
+## 6.5 SSE（准实时）与反代配置
+
+0.7.0 起服务端提供 `POST /v1/subscribe`（SSE 长连接，与 pull 同 secret 闸）：任一客户端 push 后，同 namespace 的其他订阅者立即收到门铃并增量拉取——**上传成功到对端可见约 1–3 秒**。
+
+反代（openresty/nginx/caddy）需要确认两件事：
+
+```nginx
+# ① 关闭对 SSE 响应的缓冲（服务端已发 X-Accel-Buffering: no 响应头，
+#    nginx/openresty 对该头默认生效；若自定义层仍缓冲，显式加：）
+proxy_buffering off;
+# ② 读超时大于心跳间隔（默认心跳 20s，nginx 默认 60s read timeout 已够；
+#    调过 SYNC_HEARTBEAT_SECS 的相应放大）：）
+proxy_read_timeout 120s;
+```
+
+caddy 反代默认不缓冲流式响应，无需额外配置。验证：客户端日志出现 `doorbell` 相关连接与 `metadata sync pass complete` 跟随另一端上传立即出现。
 
 ## 6. 客户端接线（各台机器）
 

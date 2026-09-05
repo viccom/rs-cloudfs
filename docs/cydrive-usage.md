@@ -86,7 +86,7 @@ your-dir/
 
 ### 4.6 多机/换机同步（元数据）
 
-配置 `sync_url` 指向自建的 cydrive-sync-server 后：`run` 自动周期同步（默认 300s），或 `cydrive sync` 手动同步一轮。空盘新机器 sync 一次即可看到整个盘的文件列表。部署与服务端运维见 **[sync-server-deployment.md](sync-server-deployment.md)**。不配 `sync_url` 则该功能完全关闭。
+配置 `sync_url` 指向自建的 cydrive-sync-server 后：`run` 内同步是**准实时**的——本机上传/删除/改名成功后立即推送，其他机器的变更经 SSE 门铃约 1–3 秒到达（300s 周期仅作兜底）；`cydrive sync` 手动触发一轮。空盘新机器 sync 一次即可看到整个盘的文件列表。部署与服务端运维见 **[sync-server-deployment.md](sync-server-deployment.md)**。不配 `sync_url` 则该功能完全关闭。
 
 ## 5. 配置参考（config.toml）
 
@@ -108,7 +108,7 @@ your-dir/
 | `enable_encryption` + `encryption_password` | `false` | 两者**同时**设置才启用上传加密（与 Python 版互操作） |
 | `sync_url` | 无 | 元数据同步服务端地址（http/https）；不设=关 |
 | `sync_secret` | 无 | 同步共享密钥（对应服务端 `SYNC_SECRET`，push/pull 都要）；也可用环境变量 `CYDRIVE_SYNC_SECRET`（优先级更高） |
-| `sync_interval_secs` | `300` | run 内自动同步周期（1..=86400） |
+| `sync_interval_secs` | `300` | 兜底同步周期（1..=86400）；0.7.0 起日常同步是准实时的（本地变更立即推、远端变更经 SSE 门铃秒级拉），此值仅作兜底 |
 
 **凭据优先级**：环境变量 > config.toml > 系统凭据管理器（service `cydrive`）。token/加密密码推荐放凭据管理器（setup 自动做），config 里留空。
 

@@ -205,3 +205,14 @@
 - **不设 secret 仍开放两端点**（保留内网/隧道形态，非破坏）；服务端 config.rs 零改动，--help 文案更正（顺带修掉「secret 只 gate push」的过时文案 Low 项）。
 - 门禁：win workspace 475 / wsl 三 crate 382 全绿；fmt/clippy 零警告。
 - 遗留 Low 项不变（P3、--help 余项、凭据门槛统一等）。
+
+## 2026-09-05 准实时同步批（feat/sync-realtime，0.7.0）：SSE 门铃 + client_id + 本地变更唤醒
+
+- **负责人裁决**：轮询（平均 5 分钟）不满足实用，要求准实时；批准「门铃模型」设计——SSE 只通知（max_version+origin），不推数据，数据语义仍单源于 push/pull；300s 轮询保留为兜底（SSE 全链路故障时退化为现状，最终一致不破）。
+- **client_id（每实例身份，与 namespace 数据身份分离）**：`sync_client_id(id CHECK(id=0), client_id)` 表 get-or-create 32hex（rand，不引 uuid crate）；push/pull/subscribe 携带（wire 可选字段，旧版双向兼容）；用途=origin 回声跳过+日志可见。namespace 仍回答「哪份数据」，client_id 回答「哪台机器」。
+- **服务端**：`POST /v1/subscribe`（与 pull 同 secret 闸；流式 text/event-stream + Cache-Control + **X-Accel-Buffering: no**）；EventHub=每 ns broadcast(16)（Lagged 记 warn——门铃丢一条无害，下条或兜底补）；心跳 `: keepalive` 默认 20s（`SYNC_HEARTBEAT_SECS` 旋钮）；订阅断开确定性清理（frame 管道 closed 感知 + receiver_count==0 同锁清理防泄漏）；push 事务提交后 publish。
+- **客户端**：Vfs 持 `Arc<Notify>`，`wake_sync()`=notify_one（permit 语义：pass 进行中的唤醒不丢、合并突发）；埋点=put/remove_file/create_dir/index_inbound/**上传 persist_success**（UploadQueueConfig.sync_wake 注入，queue 不感知 Vfs）+ WebDAV MOVE（43e0cf9 补的缺口——B 子代理申报 rename_path 漏埋点，主会话直修红→绿）；同步任务三源 select!（兜底 interval / 本地 notified / SSE 门铃）；SSE 断线退避 1s→60s、重连即补一轮 pass；帧解析跨 chunk 缓冲切帧、坏行 warn 不断连。
+- **端到端延迟**：上传成功→本端秒级 push→对端门铃→pull 应用 ≈ 1-3s（对比轮询平均 5min）。
+- **部署注意（openresty/nginx）**：SSE 经反代需确认 `proxy_read_timeout >= 60s`；服务端已发 X-Accel-Buffering: no + 20s 心跳，openresty 默认 proxy_buffering 对该头响应关闭缓冲，一般免改；若自建层仍缓冲则显式 `proxy_buffering off`。
+- **门禁**：win workspace 510 / wsl 三 crate 416 全绿（+35 测试）；fmt/clippy 零警告。
+- 已知边界留痕：`MetaDatabase::rename_path` 仅 WebDAV MOVE 路径调用（已埋点覆盖）；无 keepalive 的死流 reader 任务至进程退出回收（注释声明）；subscribe 长连接无上限（家庭规模）。
