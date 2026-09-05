@@ -197,3 +197,11 @@
 - **BUG⑤ push_diff O(n×m)→哈希 join**：mirror 建 HashMap<&str,&str> 一次，万行级库从分钟级 CPU 回到线性；行为等价测试（乱序输入/三类行/双墓碑/高版本同哈希，任意排列输出恒等）钉语义冻结，红由 BUG①② 承担（纯性能重构无法在行为层红，如实注明）。
 - **门禁**：win workspace 458 / wsl 三 crate 365 全绿（+9 测试）；fmt/clippy 零警告。
 - **遗留**：P3（hydrate 快照回写）待办未动；Low 余项（--help 文案、凭据门槛统一、sync_url host 校验、SyncClient trait 文档、模拟器排序、64MB 并发闸）仍挂账。
+
+## 2026-09-05 secret 全端点 + 服务端日志批（feat/sync-secret-and-logs，0.6.0）：协议变更
+
+- **负责人三项指令**：①SYNC_SECRET 覆盖 pull+push（此前 pull 无鉴权，公网部署元数据可被任意读取）；②服务端默认日志（用户实测手动跑二进制无任何输出——RUST_LOG 未设时 EnvFilter 缺省 ERROR；现未设时缺省 info + push/pull 请求日志：ns 前 8 字符/行数/max_version/耗时，403 warn 绝不记 secret 值）；③客户端 secret 便利配置——config.toml 新键 `sync_secret`（程序写入路径经 scrubbed 脱敏，手写允许；家庭级便利裁决）+ 优先级 env CYDRIVE_SYNC_SECRET > config > None。
+- **wire 协议变更（0.6.0 破坏面）**：PullRequest 增 `secret: Option<String>`（serde default + skip_serializing_if None——无 secret 时与旧格式字节一致）；服务端配 secret 时 pull 403 闸与 push 同型（文案可行动，指向 sync_secret/CYDRIVE_SYNC_SECRET）。兼容矩阵：新客户端→旧服务端 ✓（旧端忽略未知字段）；**旧客户端→新服务端（配 secret）pull 403**——升级顺序：先客户端后服务端再设 secret。core SyncClient::pull 签名 +secret 参数（trait 演进，实现×2/调用点×3 机械波及，断言零漂移；跨批活红灯 secret_gate_end_to_end 断言未动自然回绿）。
+- **不设 secret 仍开放两端点**（保留内网/隧道形态，非破坏）；服务端 config.rs 零改动，--help 文案更正（顺带修掉「secret 只 gate push」的过时文案 Low 项）。
+- 门禁：win workspace 475 / wsl 三 crate 382 全绿；fmt/clippy 零警告。
+- 遗留 Low 项不变（P3、--help 余项、凭据门槛统一等）。
