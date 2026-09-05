@@ -15,16 +15,21 @@
 //! - the server-side secret: a matching client secret passes and the
 //!   server stores the rows; a mismatching one fails the command with
 //!   the HTTP 403 surfacing in the error chain.
+//! - https (ignored, real-network): a live public-CA endpoint completes
+//!   the full TLS chain and answers with a real HTTP status.
 
 use std::net::SocketAddr;
 use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cydrive_cli::sync_client::HttpSyncClient;
 use cydrive_cli::{run_sync_command, run_with_transport, RunHandle};
 use cydrive_core::config::CyDriveConfig;
 use cydrive_core::database::{FileUpsert, MetaDatabase};
 use cydrive_core::sync::namespace_key;
+use cydrive_core::sync::SyncClient;
+use cydrive_core::sync::SyncError;
 use cydrive_core::transport::mock::MockTransport;
 use cydrive_core::transport::CloudTransport;
 use cydrive_sync::router::router;
@@ -410,4 +415,35 @@ async fn secret_gate_end_to_end() {
         .expect_err("mismatching secret must fail the command");
     let msg = format!("{err:#}");
     assert!(msg.contains("403"), "the HTTP status surfaces: {msg}");
+}
+
+/// Real-network https probe (ignored by default — needs outbound https
+/// to a live public-CA site): proves the whole TLS chain against an
+/// endpoint that is not a sync server. The probe namespace has no rows
+/// on the remote, so any answer maps to [`SyncError::Client`] carrying
+/// a real HTTP status — which can only exist if DNS, TCP, the rustls
+/// handshake with webpki root verification, and the HTTP/1.1
+/// request/response round trip all succeeded. An http-only connector
+/// dies before any HTTP status exists ("scheme is not http"), which is
+/// the failure this test pins.
+#[tokio::test]
+#[ignore = "real network: POSTs to a live public-CA https endpoint"]
+async fn https_real_endpoint_handshakes_and_gets_http_status() {
+    let client = HttpSyncClient::new("https://git.metme.top");
+    let error = client
+        .pull("rs-cydrive-https-probe", 0)
+        .await
+        .expect_err("the probe namespace has no rows on the remote");
+    let SyncError::Client(message) = &error else {
+        panic!("expected a transport-level Client error, got: {error:?}");
+    };
+    let status = message
+        .split("answered HTTP ")
+        .nth(1)
+        .and_then(|rest| rest.split_whitespace().next())
+        .unwrap_or_default();
+    assert!(
+        !status.is_empty() && status.chars().all(|c| c.is_ascii_digit()),
+        "expected a real HTTP status code in the error, got: {message}"
+    );
 }
