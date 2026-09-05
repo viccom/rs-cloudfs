@@ -782,17 +782,20 @@ pub fn sync_secret_from_env() -> Option<String> {
 }
 
 /// Renders one pass's counters for the `cydrive sync` output — the
-/// labels are pinned by the CLI tests.
+/// labels are pinned by the CLI tests. `skipped_invalid` covers rows
+/// dropped for an undecodable payload or an invalid row key (counted
+/// and logged, never fatal).
 pub fn render_sync_summary(outcome: &SyncOutcome) -> String {
     format!(
         "sync done: pulled {}, applied {}, pushed {}, tombstoned {}, skipped_ghost {}, \
-         skipped_idempotent {}, pushed_tombstones {}",
+         skipped_idempotent {}, skipped_invalid {}, pushed_tombstones {}",
         outcome.pulled,
         outcome.applied,
         outcome.pushed,
         outcome.tombstoned,
         outcome.skipped_ghost,
         outcome.skipped_idempotent,
+        outcome.skipped_invalid,
         outcome.pushed_tombstones
     )
 }

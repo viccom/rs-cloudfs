@@ -222,6 +222,9 @@ pub struct SyncOutcome {
     pub skipped_ghost: usize,
     /// Rows skipped by the version idempotency gate.
     pub skipped_idempotent: usize,
+    /// Rows skipped for an undecodable payload or an invalid row key
+    /// (counted and logged, never fatal — see [`apply_pulled_rows`]).
+    pub skipped_invalid: usize,
     /// Tombstones applied (local row and mirror deleted).
     pub tombstoned: usize,
     /// Live rows pushed to the server.
@@ -263,6 +266,9 @@ pub struct ApplyOutcome {
     pub skipped_ghost: usize,
     /// Rows skipped by the version idempotency gate.
     pub skipped_idempotent: usize,
+    /// Rows skipped for an undecodable payload or an invalid row key
+    /// (counted and logged, never fatal — see [`apply_pulled_rows`]).
+    pub skipped_invalid: usize,
     /// Tombstones applied (local row and mirror deleted).
     pub tombstoned: usize,
 }
@@ -311,17 +317,34 @@ pub fn push_diff(
 /// 1. `version <= mirror.server_version` (no mirror reads as 0) → skip
 ///    (idempotency gate — re-pulled own rows and stale duplicates die
 ///    here);
-/// 2. tombstone → delete the local `files` row (chunks go with it) and
-///    the mirror row (missing local state is fine);
-/// 3. ghost-pending: live row with `is_uploaded == false` and no local
+/// 2. an invalid row key (`RelPath` rejects it) or — for live rows — an
+///    undecodable payload → count `skipped_invalid`, `warn!`, `continue`.
+///    A poisoned row must never abort the whole pass: the old `?`
+///    returned before the cursor write below and permanently wedged the
+///    namespace (no later update could ever arrive past it);
+/// 3. tombstone → delete the local `files` row (chunks go with it) and
+///    the mirror row (missing local state is fine); the local cache copy
+///    is removed too — keyed on DISK presence, the same basis as the
+///    hydrate hit probe (which never consults the row), so a surviving
+///    copy of a deleted file would be served again after a same-path
+///    recreate. One carve-out: an in-flight upload (local row still
+///    pending AND its copy on disk) keeps its source file — the upload
+///    worker's success write-back revives the row («later action wins»
+///    LWW, decisions 2026-09-05);
+/// 4. ghost-pending: live row with `is_uploaded == false` and no local
 ///    cache copy → skip the whole row (no `files` row, no mirror row — a
 ///    pending row without bytes is a ghost on this machine);
-/// 4. local hash == payload hash → update the mirror only (no `files`
+/// 5. local hash == payload hash → update the mirror only (no `files`
 ///    write; saves write amplification);
-/// 5. otherwise remote wins: replace the row (is_cached forced `false`)
-///    and its chunks; when the old row was flagged cached, best-effort
-///    remove the stale cache copy (stale bytes served by a later hydrate
-///    hit would be a correctness hazard); write the mirror.
+/// 6. otherwise remote wins: replace the row (is_cached forced `false`)
+///    and its chunks; the stale cache copy is removed when one exists on
+///    disk and the old row is not an in-flight pending upload (the ghost
+///    gate guarantees a pulled pending row that gets this far has its
+///    copy on disk — that copy is the upload's source and must survive,
+///    same «later action wins» carve-out as tombstones; any other copy
+///    under changed content is stale bytes a later hydrate hit would
+///    serve — a correctness hazard); removal is best-effort; write the
+///    mirror.
 ///
 /// After all rows: `max_pulled = max(old, max_version)` — monotonic, so a
 /// rebuilt server database can never move the cursor backwards.
@@ -344,18 +367,58 @@ pub fn apply_pulled_rows(
             outcome.skipped_idempotent += 1;
             continue;
         }
+        // The key check covers live rows and tombstones alike (the
+        // tombstone's cache cleanup below needs a valid path too); a bad
+        // key is a poisoned row — count, log, skip past it.
+        let rel = match RelPath::new(&row.rel_path) {
+            Ok(rel) => rel,
+            Err(_) => {
+                let err = SyncError::InvalidPath(row.rel_path.clone());
+                tracing::warn!(
+                    rel_path = %row.rel_path,
+                    error = %err,
+                    "sync pull row key is not a valid virtual path — skipping"
+                );
+                outcome.skipped_invalid += 1;
+                continue;
+            }
+        };
         if row.deleted {
+            // In-flight protection («later action wins», decisions
+            // 2026-09-05): read the local row BEFORE deleting it — a
+            // pending row whose cache copy still sits on disk is an
+            // upload in progress, and its source file must survive so
+            // the upload worker's success write-back can revive the row.
+            let local = db.get_file(&row.rel_path)?;
+            let inflight_upload = local.as_ref().is_some_and(|rec| !rec.is_uploaded)
+                && cache.local_path(&rel).exists();
             // delete_file removes the chunks in the same transaction and
             // is a no-op for a missing path; same for the mirror delete.
             db.delete_file(&row.rel_path)?;
             db.sync_mirror_delete(&row.rel_path)?;
+            // Disk-based cleanup (hydrate's hit probe never consults the
+            // row): every non-in-flight tombstone drops the local copy
+            // too. Best-effort — directory rows and already-missing
+            // files are natural no-ops.
+            if !inflight_upload {
+                let _ = std::fs::remove_file(cache.local_path(&rel));
+            }
             outcome.tombstoned += 1;
             continue;
         }
 
-        let payload = deserialize_row(&row.payload)?;
-        let rel = RelPath::new(&row.rel_path)
-            .map_err(|_| SyncError::InvalidPath(row.rel_path.clone()))?;
+        let payload = match deserialize_row(&row.payload) {
+            Ok(payload) => payload,
+            Err(err) => {
+                tracing::warn!(
+                    rel_path = %row.rel_path,
+                    error = %err,
+                    "sync pull row payload is undecodable — skipping"
+                );
+                outcome.skipped_invalid += 1;
+                continue;
+            }
+        };
         if !payload.is_uploaded && !cache.local_path(&rel).exists() {
             outcome.skipped_ghost += 1;
             continue;
@@ -376,10 +439,15 @@ pub fn apply_pulled_rows(
             continue;
         }
 
-        // Remote wins. A stale cache copy of changed content must not
-        // survive under the same path (a later hydrate hit would serve
-        // wrong bytes); removal is best-effort.
-        if local.as_ref().is_some_and(|rec| rec.is_cached) {
+        // Remote wins. Cache cleanup keys on DISK presence — the same
+        // basis as the hydrate hit probe — with the in-flight carve-out:
+        // a local pending upload (the ghost gate guarantees its copy is
+        // on disk) keeps its source file so the worker's success
+        // write-back can revive the row («later action wins»). Any other
+        // on-disk copy under changed content is stale bytes and must not
+        // survive; removal is best-effort.
+        let inflight_upload = local.as_ref().is_some_and(|rec| !rec.is_uploaded);
+        if !inflight_upload && cache.local_path(&rel).exists() {
             let _ = std::fs::remove_file(cache.local_path(&rel));
         }
         replace_row(db, &row.rel_path, &payload)?;
@@ -470,6 +538,7 @@ pub async fn sync_once(
         applied: apply.applied,
         skipped_ghost: apply.skipped_ghost,
         skipped_idempotent: apply.skipped_idempotent,
+        skipped_invalid: apply.skipped_invalid,
         tombstoned: apply.tombstoned,
         pushed: 0,
         pushed_tombstones: 0,
