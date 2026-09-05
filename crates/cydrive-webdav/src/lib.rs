@@ -256,6 +256,9 @@ impl DavFileSystem for CyDriveFs {
                 return Err(FsError::Exists);
             }
             self.db.delete_file(rel.as_str()).map_err(db_err)?;
+            // The tombstone's origin: deletion is a files-row mutation
+            // — ring the realtime sync wake (same rationale as MOVE).
+            self.vfs.wake_sync();
             Ok(())
         })
     }
@@ -281,6 +284,9 @@ impl DavFileSystem for CyDriveFs {
                 return Err(FsError::Forbidden);
             }
             self.db.delete_file(rel.as_str()).map_err(db_err)?;
+            // The tombstone's origin: deletion is a files-row mutation
+            // — ring the realtime sync wake (same rationale as MOVE).
+            self.vfs.wake_sync();
             // Cached copy goes too; removal errors are ignored (Python
             // `handle_delete` swallows OSError). The remote message is
             // deliberately NOT deleted (Python parity).
