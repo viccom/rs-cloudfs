@@ -757,3 +757,114 @@ async fn encrypted_roundtrip_put_upload_hydrate() {
         "upload-encrypt + download-decrypt round-trips the plaintext"
     );
 }
+
+/// 18. Decryption failure leaves no cache residue (review follow-up BUG①,
+///     owner-authorized divergence from the Python baseline's same
+///     defect): the ciphertext must be decrypted in the staging sibling
+///     and only the plaintext promoted to the final cache path. A wrong
+///     password therefore surfaces `Crypto` with NOTHING at the final
+///     path — hydrate's hit probe is disk-based (`is_cached` stats the
+///     file, it never consults the row), so a surviving ciphertext would
+///     be served verbatim on every later read — and once the right
+///     password is configured the very same remote row hydrates
+///     successfully (no poisoned state).
+#[tokio::test]
+async fn hydrate_wrong_password_leaves_no_cache_residue_and_retries() {
+    let (_dir, db, cache, cache_root, mock) = test_env(1 << 20).await;
+    let plaintext = b"secret bytes";
+    let ciphertext = encrypt("right-pw", plaintext);
+    seed_remote_file(&db, &mock, "/enc-fail.bin", &ciphertext, 64, true).await;
+    let paths = CacheManager::new(cache_root.clone(), u64::MAX);
+    let rel = RelPath::new("/enc-fail.bin").expect("valid rel path");
+
+    // Wrong password: hydrate fails with Crypto...
+    {
+        let transport: Arc<dyn CloudTransport> = mock.clone();
+        let vfs = Vfs::new(db.clone(), cache, transport, test_cfg(64, Some("wrong-pw")));
+        let result = vfs.hydrate(&rel).await;
+        assert!(
+            matches!(result, Err(VfsError::Crypto(_))),
+            "wrong password must surface Crypto, got: {result:?}"
+        );
+        vfs.shutdown().await;
+    }
+
+    // ...and leaves no file anywhere in the cache tree — in particular
+    // not at the final path, where the next hydrate's disk-based hit
+    // probe would happily serve the raw ciphertext.
+    let local = paths.local_path(&rel);
+    assert!(
+        !local.exists(),
+        "no ciphertext residue at the final cache path"
+    );
+    let mut all_files = Vec::new();
+    collect_files(&cache_root, &mut all_files);
+    assert!(
+        all_files.is_empty(),
+        "the cache tree must be empty after a failed decryption: {all_files:?}"
+    );
+    let row = db
+        .get_file("/enc-fail.bin")
+        .expect("db read")
+        .expect("row exists");
+    assert!(!row.is_cached, "the row is not flagged cached");
+
+    // Retriability: the same remote row under the right password now
+    // hydrates to the plaintext.
+    let cache = CacheManager::new(cache_root.clone(), 1 << 20);
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let vfs = Vfs::new(db.clone(), cache, transport, test_cfg(64, Some("right-pw")));
+    let hydrated = vfs
+        .hydrate(&rel)
+        .await
+        .expect("retry with the right password succeeds");
+    assert_eq!(
+        fs::read(&hydrated).expect("read hydrated copy"),
+        plaintext,
+        "the failed attempt must not poison the retry"
+    );
+}
+
+/// 19. Same pin for corrupted payload bytes: a flipped ciphertext byte
+///     under the CORRECT password fails the same way — `Crypto`, no
+///     residue at the final path, row not flagged cached — and repeated
+///     attempts stay clean (no accumulating residue).
+#[tokio::test]
+async fn hydrate_corrupted_ciphertext_leaves_no_cache_residue() {
+    let (_dir, db, cache, cache_root, mock) = test_env(1 << 20).await;
+    let plaintext = b"secret bytes";
+    let mut ciphertext = encrypt("pw", plaintext);
+    let last = ciphertext.len() - 1;
+    ciphertext[last] ^= 0xff; // break the trailing GCM tag byte
+    seed_remote_file(&db, &mock, "/enc-bad.bin", &ciphertext, 64, true).await;
+    let paths = CacheManager::new(cache_root.clone(), u64::MAX);
+    let rel = RelPath::new("/enc-bad.bin").expect("valid rel path");
+
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let vfs = Vfs::new(db.clone(), cache, transport, test_cfg(64, Some("pw")));
+
+    for attempt in 1..=2 {
+        let result = vfs.hydrate(&rel).await;
+        assert!(
+            matches!(result, Err(VfsError::Crypto(_))),
+            "attempt {attempt}: corrupted ciphertext must surface Crypto, got: {result:?}"
+        );
+        let local = paths.local_path(&rel);
+        assert!(
+            !local.exists(),
+            "attempt {attempt}: no residue at the final cache path"
+        );
+        let mut all_files = Vec::new();
+        collect_files(&cache_root, &mut all_files);
+        assert!(
+            all_files.is_empty(),
+            "attempt {attempt}: cache tree must stay empty: {all_files:?}"
+        );
+    }
+    let row = db
+        .get_file("/enc-bad.bin")
+        .expect("db read")
+        .expect("row exists");
+    assert!(!row.is_cached, "the row is not flagged cached");
+    vfs.shutdown().await;
+}

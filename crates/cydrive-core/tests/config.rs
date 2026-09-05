@@ -485,9 +485,13 @@ fn validate_requires_non_empty_password_for_encryption() {
 // three new `config.toml` tuning keys — `upload_workers` (`u32`, default 2,
 // valid `1..=32`), `queue_capacity` (`u32`, default 256, must be
 // `>= upload_workers` and `<= 100_000`) and `hydrate_timeout_secs` (`u64`,
-// default 180, valid `1..=86_400`). Violations are
-// [`ConfigError::Invalid`] via [`CyDriveConfig::validate`], styled after
-// the existing rules. The legacy `config.json` key set stays frozen at the
+// default 1800 — raised from the original 180 by the review-followup BUG②
+// contract change: real-machine downstream bandwidth through a local proxy
+// measured ~0.45 MB/s (decisions.md 2026-09-03, Tier-1 真机端到端 发现①),
+// so the 180s default timed out every file above ~80 MB; valid range
+// `1..=86_400`, an explicit 180 stays legal). Violations are
+// [`ConfigError::Invalid`] via [`CyDriveConfig::validate`], styled after the
+// existing rules. The legacy `config.json` key set stays frozen at the
 // Python dataclass fields — it must not grow the new keys.
 
 #[test]
@@ -505,9 +509,54 @@ fn toml_new_tuning_keys_parse_with_defaults_when_absent() {
         "queue_capacity default must be 256"
     );
     assert_eq!(
-        cfg.hydrate_timeout_secs, 180,
-        "hydrate_timeout_secs default must be 180"
+        cfg.hydrate_timeout_secs, 1800,
+        "hydrate_timeout_secs default must be 1800 (BUG②: raised from 180 — real-machine bandwidth, decisions.md 2026-09-03)"
     );
+}
+
+#[test]
+fn hydrate_timeout_default_is_1800_across_the_chain() {
+    // BUG② pin: every definition point of the default must stay aligned
+    // at 1800 — the serde default function (key absent from a partial
+    // config.toml), the `CyDriveConfig::default` impl, and the
+    // `VfsConfig::default` fallback at the end of the
+    // config -> vfs_config conversion chain.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    fs::write(&path, "bot_token = \"1:a\"\nchat_id = 1\n").expect("write config.toml");
+
+    let loaded = CyDriveConfig::load_toml(&path).expect("toml without the key loads");
+    assert_eq!(
+        loaded.hydrate_timeout_secs, 1800,
+        "key absent -> serde default 1800"
+    );
+    assert_eq!(
+        CyDriveConfig::default().hydrate_timeout_secs,
+        1800,
+        "Default impl aligned with the serde default"
+    );
+    assert_eq!(
+        cydrive_core::vfs::VfsConfig::default().hydrate_timeout,
+        std::time::Duration::from_secs(1800),
+        "VfsConfig::default (the chain's fallback when no config maps over) aligned"
+    );
+}
+
+#[test]
+fn hydrate_timeout_explicit_180_is_still_valid() {
+    // The default change must not over-reach: an explicit 180 remains a
+    // legal, load-bearing value (loads verbatim and passes validate).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        "bot_token = \"1:a\"\nchat_id = 1\nhydrate_timeout_secs = 180\n",
+    )
+    .expect("write config.toml");
+
+    let cfg = CyDriveConfig::load_toml(&path).expect("explicit 180 loads");
+    assert_eq!(cfg.hydrate_timeout_secs, 180);
+    cfg.validate().expect("explicit 180 passes validation");
 }
 
 #[test]

@@ -395,6 +395,79 @@ fn push_diff_emits_tombstones_for_mirror_only_paths() {
     );
 }
 
+#[test]
+fn push_diff_output_is_order_independent() {
+    // BUG⑤ fix pin (review follow-up): the nested `any` scans became a
+    // hash join — a pure performance refactor with FROZEN semantics. This
+    // pin feeds both sides in deliberately different, non-alphabetical
+    // orders with all three row classes at once (new / changed /
+    // tombstone — two tombstones to exercise multi-tombstone ordering —
+    // plus a hash-equal row whose mirror version is higher, proving the
+    // version never enters the diff) and requires the exact sorted
+    // output, whatever permutation of either input arrives.
+    let keep = "payload-keep".to_string();
+    let changed_v2 = "payload-changed-v2".to_string();
+    let fresh = "payload-new".to_string();
+    let same_hash = "payload-same".to_string();
+    let local = vec![
+        ("/z-changed.txt".to_string(), changed_v2.clone()),
+        ("/a-keep.txt".to_string(), keep.clone()),
+        ("/m-new.txt".to_string(), fresh.clone()),
+        ("/d-same-hash.txt".to_string(), same_hash.clone()),
+    ];
+    let mirror = vec![
+        ("/gone-b.txt".to_string(), row_hash("payload-gone-b"), 5),
+        (
+            "/z-changed.txt".to_string(),
+            row_hash("payload-changed-v1"),
+            2,
+        ),
+        ("/a-keep.txt".to_string(), row_hash(&keep), 1),
+        ("/gone-a.txt".to_string(), row_hash("payload-gone-a"), 9),
+        // Same hash as local, but a much higher server version: version
+        // must not affect the diff — the row is unchanged either way.
+        ("/d-same-hash.txt".to_string(), row_hash(&same_hash), 99),
+    ];
+    let expected = vec![
+        SyncRowUpdate {
+            rel_path: "/gone-a.txt".to_string(),
+            deleted: true,
+            payload: String::new(),
+        },
+        SyncRowUpdate {
+            rel_path: "/gone-b.txt".to_string(),
+            deleted: true,
+            payload: String::new(),
+        },
+        SyncRowUpdate {
+            rel_path: "/m-new.txt".to_string(),
+            deleted: false,
+            payload: fresh.clone(),
+        },
+        SyncRowUpdate {
+            rel_path: "/z-changed.txt".to_string(),
+            deleted: false,
+            payload: changed_v2.clone(),
+        },
+    ];
+
+    assert_eq!(
+        push_diff(&local, &mirror),
+        expected,
+        "all three classes at once, sorted by rel_path"
+    );
+
+    // The diff depends only on the path->hash content, never on row
+    // order: every permutation of either side yields the identical
+    // output. (A behavioral pin for the hash-join rewrite; the old
+    // O(local x mirror) scan honored the same contract.)
+    let local_rev: Vec<(String, String)> = local.iter().rev().cloned().collect();
+    let mirror_rev: Vec<(String, String, i64)> = mirror.iter().rev().cloned().collect();
+    assert_eq!(push_diff(&local_rev, &mirror_rev), expected);
+    assert_eq!(push_diff(&local, &mirror_rev), expected);
+    assert_eq!(push_diff(&local_rev, &mirror), expected);
+}
+
 // ----------------------------------------------------- apply_pulled_rows ---
 
 #[test]
