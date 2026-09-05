@@ -39,7 +39,14 @@ Options:
 
 #[tokio::main]
 async fn main() -> Result<()> {
-    let args: Vec<String> = std::env::args().skip(1).collect();
+    // args_os + lossy decode: std::env::args() panics outright on a
+    // non-Unicode argument (a stray filename should be a usage error,
+    // not a crash); decide_startup sees the replacement characters and
+    // refuses the argument like any other unknown one.
+    let args: Vec<String> = std::env::args_os()
+        .skip(1)
+        .map(|arg| arg.to_string_lossy().into_owned())
+        .collect();
     match decide_startup(&args) {
         StartupDecision::Run => run().await,
         StartupDecision::PrintVersion => {
@@ -86,7 +93,18 @@ async fn run() -> Result<()> {
                 "cannot listen on {listen} (is another cydrive-sync-server already bound there?)"
             )
         })?;
-    tracing::info!("cydrive-sync-server listening on http://{listen}");
+    // Log the *actual* bound address: with SYNC_LISTEN=…:0 the kernel
+    // picked an ephemeral port, and logging the configured :0 points
+    // the journal at a port nothing listens on. local_addr() failing
+    // on a bound socket is practically unreachable; fall back to the
+    // configured value with a note rather than guessing.
+    match listener.local_addr() {
+        Ok(bound) => tracing::info!("cydrive-sync-server listening on http://{bound}"),
+        Err(error) => tracing::info!(
+            "cydrive-sync-server listening on http://{listen} \
+             (actual bound address unavailable: {error})"
+        ),
+    }
     axum::serve(listener, app)
         .await
         .context("sync server accept loop failed")?;

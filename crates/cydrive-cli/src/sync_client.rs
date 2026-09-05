@@ -34,11 +34,13 @@ use hyper_util::rt::TokioExecutor;
 /// `SYNC_SECRET` requires one).
 pub const SYNC_SECRET_ENV: &str = "CYDRIVE_SYNC_SECRET";
 
-/// Per-request budget: 300s. Wide on purpose — the first full push of a
-/// large drive is one big request (tens of thousands of rows), and a
-/// pull of the whole namespace likewise; family-scale sync favors
-/// completing over failing fast. Anything slower than this is a dead
-/// peer, not a big drive.
+/// Per-request budget: 300s, covering the whole exchange — sending the
+/// request, receiving the response headers and collecting the complete
+/// response body (see [`HttpSyncClient::post_json`]). Wide on purpose —
+/// the first full push of a large drive is one big request (tens of
+/// thousands of rows), and a pull of the whole namespace likewise;
+/// family-scale sync favors completing over failing fast. Anything
+/// slower than this is a dead peer, not a big drive.
 pub const SYNC_HTTP_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// Cap (characters) for response bodies quoted into error messages —
@@ -162,6 +164,13 @@ impl HttpSyncClient {
 
     /// POSTs `body` (JSON) to `endpoint`, enforcing the wide request
     /// budget and returning the raw response bytes of a 2xx answer.
+    ///
+    /// The budget covers the *whole* exchange — sending the request,
+    /// receiving the response headers, and collecting the complete
+    /// response body. `client.request` resolves at the response
+    /// headers; wrapping only that call left the body read unbounded,
+    /// so a peer that answered headers and then trickled its body
+    /// stalled a manual `cydrive sync` forever (review Low L1).
     async fn post_json(&self, endpoint: &str, body: Vec<u8>) -> Result<Bytes, SyncError> {
         let url = endpoint_url(&self.base_url, endpoint);
         let request = http::Request::builder()
@@ -174,31 +183,35 @@ impl HttpSyncClient {
                     "building the {endpoint} request for {url}: {error}"
                 ))
             })?;
-        let response = tokio::time::timeout(self.request_timeout, self.client.request(request))
-            .await
-            .map_err(|_elapsed| {
-                SyncError::Client(format!(
-                    "{endpoint} to {url} did not answer within {}s",
-                    self.request_timeout.as_secs()
-                ))
-            })?
-            .map_err(|error| {
+        let exchange = async {
+            let response = self.client.request(request).await.map_err(|error| {
                 SyncError::Client(format!(
                     "reaching the sync server failed ({endpoint} to {url}): {}",
                     error_chain(&error)
                 ))
             })?;
-        let status = response.status();
-        let bytes = response
-            .into_body()
-            .collect()
+            let status = response.status();
+            let bytes = response
+                .into_body()
+                .collect()
+                .await
+                .map_err(|error| {
+                    SyncError::Client(format!(
+                        "reading the {endpoint} response from {url}: {error}"
+                    ))
+                })?
+                .to_bytes();
+            Ok::<_, SyncError>((status, bytes))
+        };
+        let (status, bytes) = tokio::time::timeout(self.request_timeout, exchange)
             .await
-            .map_err(|error| {
+            .map_err(|_elapsed| {
                 SyncError::Client(format!(
-                    "reading the {endpoint} response from {url}: {error}"
+                    "{endpoint} to {url} did not answer within {}s (the budget covers \
+                     sending, the response headers and the complete response body)",
+                    self.request_timeout.as_secs()
                 ))
-            })?
-            .to_bytes();
+            })??;
         if !status.is_success() {
             return Err(SyncError::Client(format!(
                 "{endpoint} to {url} answered HTTP {status}: {}",

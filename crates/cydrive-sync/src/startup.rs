@@ -22,7 +22,9 @@ pub enum StartupDecision {
 }
 
 /// Decides what the bin should do. `args` is the argument vector *after*
-/// `argv[0]` (i.e. `std::env::args().skip(1)`): exactly no arguments runs
+/// `argv[0]` (i.e. `std::env::args_os().skip(1)` lossy-decoded to
+/// `String`s — a non-Unicode argument arrives with U+FFFD replacement
+/// characters and is refused, never a panic): exactly no arguments runs
 /// the server, exactly one known flag prints and exits, every other
 /// shape is rejected so no stray argument can ever start a service.
 pub fn decide_startup(args: &[String]) -> StartupDecision {

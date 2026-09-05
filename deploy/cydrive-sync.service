@@ -45,6 +45,12 @@ ExecStart=/usr/local/bin/cydrive-sync-server
 StateDirectory=cydrive-sync
 Environment=SYNC_DB=/var/lib/cydrive-sync/cydrive_sync.db
 Environment=SYNC_LISTEN=127.0.0.1:8290
+# tracing's EnvFilter defaults to ERROR when RUST_LOG is unset, which
+# hides the info-level "listening on ..." line and makes a healthy
+# service look dead in the journal — info is the right service default
+# (debug stays opt-in for per-request traces, see the journalctl note
+# above).
+Environment=RUST_LOG=info
 # Leading '-': the env file is optional (no secret = open server).
 EnvironmentFile=-/etc/cydrive-sync.env
 Restart=on-failure

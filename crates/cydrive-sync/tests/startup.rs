@@ -76,7 +76,7 @@ fn multiple_arguments_are_invalid_even_when_each_is_a_known_flag() {
 #[test]
 fn lossy_decoded_non_unicode_argument_is_still_invalid() {
     let lossy = format!("--bogus{}", char::REPLACEMENT_CHARACTER);
-    let StartupDecision::Invalid(message) = decide_startup(&[lossy.clone()]) else {
+    let StartupDecision::Invalid(message) = decide_startup(std::slice::from_ref(&lossy)) else {
         panic!("a lossy-decoded non-Unicode argument must be refused, not accepted");
     };
     assert!(
