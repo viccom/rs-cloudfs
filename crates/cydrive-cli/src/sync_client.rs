@@ -250,16 +250,16 @@ impl SyncClient for HttpSyncClient {
     async fn pull(
         &self,
         key: &str,
-        _secret: Option<&str>,
+        secret: Option<&str>,
         since: i64,
     ) -> Result<SyncPullResult, SyncError> {
         let request = PullRequest {
             key: key.to_string(),
             since,
-            // RED shim: the server gates pull behind its shared secret;
-            // threading the caller's secret in here is the green commit
-            // (`secret: None` keeps this request byte-identical to before).
-            secret: None,
+            // The server gates pull behind the same shared secret as
+            // push; `None` serializes the field away entirely, keeping a
+            // secretless pull byte-identical to the pre-secret wire form.
+            secret: secret.map(str::to_string),
         };
         let body = serde_json::to_vec(&request)
             .map_err(|error| SyncError::Client(format!("serializing the pull request: {error}")))?;

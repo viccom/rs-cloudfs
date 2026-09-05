@@ -72,7 +72,8 @@ enum Command {
     /// Run one metadata sync pass against the configured sync server
     /// (`run` also syncs periodically on its own). The shared secret,
     /// when the server requires one, comes from the CYDRIVE_SYNC_SECRET
-    /// environment variable.
+    /// environment variable or the config.toml sync_secret key (the
+    /// variable wins).
     Sync,
     /// Mount the WebDAV server: a drive letter on Windows (`net use`),
     /// a directory on Linux (gio → davfs2).
@@ -261,10 +262,12 @@ fn cache_cmd(action: CacheAction) -> Result<()> {
 /// `cydrive sync`: discover the config (same env > file > keyring chain
 /// as `run`), then run exactly one sync pass and print the counters.
 /// No tracing subscriber and no transport — a one-shot command prints
-/// its own output (the stats/doctor convention).
+/// its own output (the stats/doctor convention). The shared secret, when
+/// the server requires one, resolves exactly like the periodic task's:
+/// `CYDRIVE_SYNC_SECRET` over the config.toml `sync_secret` key.
 async fn sync_cmd() -> Result<()> {
     let cfg = discover_config().context("config discovery failed")?;
-    let secret = cydrive_cli::sync_secret_from_env();
+    let secret = cydrive_cli::resolve_sync_secret(&cfg);
     let outcome = cydrive_cli::run_sync_command(&cfg, secret.as_deref()).await?;
     println!("{}", cydrive_cli::render_sync_summary(&outcome));
     Ok(())

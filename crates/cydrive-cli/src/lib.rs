@@ -769,10 +769,12 @@ pub fn cache_clear_cmd(cfg: &CyDriveConfig) -> Result<()> {
 
 // ------------------------------------------------- sync (sync-lite B4) ---
 
-/// Parses a candidate sync secret: unset and empty both mean "send
-/// none"; only a non-empty value travels to the server.
+/// Parses a candidate sync secret: unset, empty and whitespace-only all
+/// mean "send none" (a value that trims to empty is no secret); a
+/// non-empty value travels **verbatim** — a secret is byte-exact, never
+/// trimmed or logged.
 pub fn parse_sync_secret(value: Option<String>) -> Option<String> {
-    value.filter(|secret| !secret.is_empty())
+    value.filter(|secret| !secret.trim().is_empty())
 }
 
 /// Reads the optional family-level shared secret from the
@@ -787,12 +789,26 @@ pub fn sync_secret_from_env() -> Option<String> {
 /// whitespace-only) env value explicitly clears the config value — the
 /// `CYDRIVE_SYNC_URL` precedent — and an empty/whitespace-only config
 /// value reads as unset. Non-empty values pass through verbatim (a
-/// secret is byte-exact, never trimmed or logged).
+/// secret is byte-exact, never trimmed) and are never logged; when a
+/// secret is in play a `debug!` line names its *source* only.
 pub fn resolve_sync_secret(cfg: &CyDriveConfig) -> Option<String> {
-    // RED shim: the env leg only; the config.toml `sync_secret` leg is
-    // the green commit (pinned by the resolution tests).
-    let _config_leg = &cfg.sync_secret;
-    sync_secret_from_env()
+    // A set variable (even a clearing empty one) wins outright; only an
+    // unset/unreadable variable falls through to the file value — the
+    // same shape `with_env_overrides` gives every CYDRIVE_* key.
+    if let Ok(value) = std::env::var(sync_client::SYNC_SECRET_ENV) {
+        let secret = parse_sync_secret(Some(value));
+        if secret.is_some() {
+            tracing::debug!(
+                "using the sync secret from the CYDRIVE_SYNC_SECRET environment variable"
+            );
+        }
+        return secret;
+    }
+    let secret = parse_sync_secret(cfg.sync_secret.clone());
+    if secret.is_some() {
+        tracing::debug!("using the sync secret from config.toml (sync_secret key)");
+    }
+    secret
 }
 
 /// Renders one pass's counters for the `cydrive sync` output — the
@@ -826,8 +842,10 @@ pub fn render_sync_summary(outcome: &SyncOutcome) -> String {
 /// The db/cache assembly mirrors the `run` flow's opening segment
 /// verbatim (same paths, same capacity math).
 ///
-/// `secret` is the caller-resolved optional shared secret (production
-/// reads [`sync_secret_from_env`]; tests inject).
+/// `secret` is the caller-resolved optional shared secret — production
+/// (`cydrive sync` and the periodic task alike) reads
+/// [`resolve_sync_secret`], the single env > config.toml chain; tests
+/// inject.
 pub async fn run_sync_command(cfg: &CyDriveConfig, secret: Option<&str>) -> Result<SyncOutcome> {
     let Some(sync_url) = cfg.sync_url.clone() else {
         anyhow::bail!(
@@ -879,7 +897,7 @@ fn spawn_periodic_sync(
         return None;
     }
     let key = namespace_key(&cfg.bot_token, &cfg.chat_id.to_string());
-    let secret = sync_secret_from_env();
+    let secret = resolve_sync_secret(cfg);
     let client = sync_client::HttpSyncClient::new(&url);
     let cache = CacheManager::new(cache_root, cache_limit);
     let period = Duration::from_secs(cfg.sync_interval_secs);

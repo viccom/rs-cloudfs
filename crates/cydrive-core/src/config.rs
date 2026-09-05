@@ -86,6 +86,7 @@ const KNOWN_TOML_KEYS: &[&str] = &[
     "enable_encryption",
     "proxy_url",
     "sync_url",
+    "sync_secret",
     "sync_interval_secs",
 ];
 
@@ -112,6 +113,7 @@ const LEGACY_REJECTED_KEYS: &[&str] = &[
     "hydrate_timeout_secs",
     "mount_point",
     "sync_url",
+    "sync_secret",
     "sync_interval_secs",
 ];
 
@@ -354,21 +356,27 @@ impl CyDriveConfig {
         Ok(())
     }
 
-    /// Serializes `self` with the two secret fields scrubbed and writes it
+    /// Serializes `self` with the secret fields scrubbed and writes it
     /// to `path`: `bot_token` becomes an empty string, the optional
-    /// `encryption_password` is omitted entirely, and a header comment
-    /// points readers at the OS credential store (keyring service
-    /// `"cydrive"`); the secrets re-enter the config at load time via
-    /// [`CyDriveConfig::with_credential_backfill`].
+    /// `encryption_password` and `sync_secret` are omitted entirely, and
+    /// a header comment points readers at the OS credential store
+    /// (keyring service `"cydrive"`); the secrets re-enter the config at
+    /// load time via [`CyDriveConfig::with_credential_backfill`]
+    /// (the sync secret re-enters through its env variable or a
+    /// hand-written file value — see the CLI resolution chain).
     ///
     /// This is the write side of the credential vault (M5): on-disk config
     /// files stay non-sensitive while `enable_encryption` and every other
     /// field round-trip unchanged. Directory creation matches
-    /// [`CyDriveConfig::save_toml`].
+    /// [`CyDriveConfig::save_toml`]. Hand-writing `sync_secret` into the
+    /// file stays legal (the ruling: family-level convenience beats file
+    /// secrecy — the file may already hold the bot token); only
+    /// programmatic writes go through this scrubbed path.
     pub fn save_toml_scrubbed(&self, path: &Path) -> Result<(), ConfigError> {
         let mut scrubbed = self.clone();
         scrubbed.bot_token = String::new();
         scrubbed.encryption_password = None;
+        scrubbed.sync_secret = None;
         let body = toml::to_string_pretty(&scrubbed).map_err(|err| ConfigError::Parse {
             path: path_as_str(path),
             message: err.to_string(),
@@ -376,7 +384,9 @@ impl CyDriveConfig {
         let text = format!(
             "# Secrets live in the OS credential manager (keyring service \"{SERVICE}\"), \
              not in this file:\n# the bot token and the encryption password are \
-             intentionally empty here and return via the credential store.\n{body}"
+             intentionally empty here and return via the credential store.\n# The sync \
+             shared secret is omitted here too; it returns via CYDRIVE_SYNC_SECRET or a \
+             hand-written sync_secret value.\n{body}"
         );
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
@@ -568,6 +578,9 @@ impl CyDriveConfig {
     /// * `sync_interval_secs`: must be in `1..=86_400`.
     /// * `sync_url`: when `Some`, must start with `http://` or `https://`
     ///   (`None` means the sync feature is off and skips the check).
+    /// * `sync_secret`: no format constraint — any non-empty string is a
+    ///   legal secret, and a value that trims to empty reads as unset at
+    ///   the CLI resolution layer (never a validation error).
     ///
     /// Returns `Ok(())` when every rule holds.
     pub fn validate(&self) -> Result<(), ConfigError> {

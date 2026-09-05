@@ -518,7 +518,9 @@ fn replace_row(db: &MetaDatabase, rel_path: &str, payload: &RowPayload) -> Resul
 
 /// One full sync pass: pull → apply → diff → push.
 ///
-/// - **Pull** with `since = max_pulled`, apply every row through
+/// - **Pull** with `since = max_pulled` and the same `secret` the push
+///   carries (a secret-gated server rejects a secretless pull with 403
+///   before anything else happens), apply every row through
 ///   [`apply_pulled_rows`] (which also advances `max_pulled` by the pull
 ///   response's `max_version`, monotonically).
 /// - **Diff** the local table (directories included — they are plain
@@ -545,9 +547,7 @@ pub async fn sync_once(
     secret: Option<&str>,
 ) -> Result<SyncOutcome, SyncError> {
     let since = db.sync_state_get()?;
-    // RED shim: the pass-through of `secret` into pull is the green
-    // commit — pinned by `sync_once_threads_the_secret_into_pull`.
-    let pull = client.pull(key, None, since).await?;
+    let pull = client.pull(key, secret, since).await?;
     let apply = apply_pulled_rows(db, cache, &pull.rows, pull.max_version)?;
 
     let mut local_rows: Vec<(String, String)> = Vec::new();
