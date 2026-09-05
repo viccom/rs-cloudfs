@@ -187,3 +187,13 @@
 - **P2（High④，负责人授权修复，A/B 选项由本批选 A=真 https）**：sync 客户端加 hyper-rustls 0.27.9（default-features=false 排除 aws-lc-rs，features native-tokio/http1/tls12/ring/webpki-roots）——https 走 rustls+Mozilla 根（公网 CA 受信、自签不支持→文档指隧道），http 行为零变化（既有 e2e 零改动全过）。真网络红→绿实证（对 git.metme.top TLS 握手+证书验证+HTTP 往返 0.07s，红=旧 build_http 的 scheme 错误）。实现陷阱留痕：hyper-rustls 公有 `wrap_connector` 不动内层 `enforce_http`（默认 true 会先拒 https），须镜像上游 build() 的 `enforce_http(false)`。新依赖 9 包全宽松许可；deny.toml 白名单补 `ISC` 与 `CDLA-Permissive-2.0`（webpki-roots 根证书数据许可），licenses/bans/sources 实跑 ok（advisories 离线惯例未跑）。
 - **门禁**：win workspace 449 / wsl 三 crate 356 全绿（各 +13）；fmt/clippy 零警告；ring 于 WSL 构建无碍。
 - **遗留（Low 项未修，待批）**：--help secret 文案、超时不覆盖 body 读取、RUST_LOG 缺省、日志实际绑定地址、args_os、凭据门槛统一、模拟器排序、O(n×m) diff、64MB 并发闸；P3（hydrate 快照回写）另列待办。
+
+## 2026-09-05 五 BUG 修复批（fix/review-followup-batch，0.5.2）：解密残留/超时默认/运维盲区/body 超时/diff 性能
+
+- **BUG① 解密失败密文残留最终缓存路径（正确性，授权偏离 Python 同款缺陷）**：原实现密文先 rename 进最终路径再解密，失败后密文占位、磁盘探测命中永远返回密文。修复=结构反转：密文留 .tmp staging 解密、成功后 write_atomic 原子晋级明文，最终路径在解密成功前从不被触碰；失败兜底删 staging 覆盖全部失败类。错密码（可重试：修好条件后同远端行重新水合成功）与损坏密文（GCM tag 翻转）双路径测试钉死。
+- **BUG② hydrate_timeout 默认 180→1800**：真机带宽 ~0.45MB/s 下 80MB+ 必超时（2026-09-03 发现①裁决落地）；显式 180 仍合法，VfsConfig 默认链同步对齐。默认值契约变更，既有断言随授权更新。
+- **BUG③ 服务端运维盲区三件**：a) 日志改打实际绑定地址（local_addr，:0 时不再误导；bin 级 e2e 读子进程 stdout 断言实际端口且可连接）；b) systemd unit 补 Environment=RUST_LOG=info（EnvFilter 缺省 ERROR 导致 journal 无感的修复）；c) args_os+lossy 防非 Unicode 参数 panic（进程级真红：旧二进制 panic 复现）。
+- **BUG④ 客户端超时纳入完整 body 读取**：原 300s 只罩到响应头，慢速滴流 body 可挂死手动 sync；修复=发送+响应头+collect 全程单一超时窗口（push/pull 双路径），注入 seam `with_request_timeout` 供测试；滴流端点回归测试（裸 TCP 逐块写，红=15s 防护超时挂死）。
+- **BUG⑤ push_diff O(n×m)→哈希 join**：mirror 建 HashMap<&str,&str> 一次，万行级库从分钟级 CPU 回到线性；行为等价测试（乱序输入/三类行/双墓碑/高版本同哈希，任意排列输出恒等）钉语义冻结，红由 BUG①② 承担（纯性能重构无法在行为层红，如实注明）。
+- **门禁**：win workspace 458 / wsl 三 crate 365 全绿（+9 测试）；fmt/clippy 零警告。
+- **遗留**：P3（hydrate 快照回写）待办未动；Low 余项（--help 文案、凭据门槛统一、sync_url host 校验、SyncClient trait 文档、模拟器排序、64MB 并发闸）仍挂账。
