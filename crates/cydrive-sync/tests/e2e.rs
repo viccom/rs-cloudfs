@@ -91,6 +91,7 @@ async fn pull(addr: SocketAddr, key: &str, since: i64) -> (StatusCode, Bytes) {
     let request = serde_json::to_string(&PullRequest {
         key: key.to_string(),
         since,
+        secret: None,
     })
     .expect("serialize pull request");
     post(addr, "/v1/pull", request).await

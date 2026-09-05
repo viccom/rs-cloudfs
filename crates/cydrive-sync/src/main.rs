@@ -30,7 +30,9 @@ Usage:
 Configuration (environment variables):
   SYNC_LISTEN    listen address (default: 127.0.0.1:8290)
   SYNC_DB        SQLite database path (default: ./cydrive_sync.db)
-  SYNC_SECRET    optional shared secret; when set, pushes/pulls must match it
+  SYNC_SECRET    optional shared secret; when set, every push AND pull
+                 must carry it (client: sync_secret / CYDRIVE_SYNC_SECRET)
+  RUST_LOG       tracing log filter; unset defaults to info
 
 Options:
   -V, --version  print the version and exit
@@ -67,9 +69,15 @@ async fn main() -> Result<()> {
 }
 
 async fn run() -> Result<()> {
-    tracing_subscriber::fmt()
-        .with_env_filter(tracing_subscriber::EnvFilter::from_default_env())
-        .init();
+    // Ops feedback (2026-09, public deployment): manual runs without
+    // RUST_LOG produced zero output — EnvFilter's built-in default is
+    // ERROR, so not even the listening line appeared. Default to info
+    // when RUST_LOG is unset (or unparseable — falling back to info
+    // beats silently degrading to ERROR); an explicit RUST_LOG keeps
+    // its meaning.
+    let filter = tracing_subscriber::EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
+    tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let config = SyncServerConfig::from_env().context(
         "invalid cydrive-sync-server configuration (check SYNC_LISTEN / SYNC_DB / SYNC_SECRET)",

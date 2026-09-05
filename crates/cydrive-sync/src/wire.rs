@@ -4,6 +4,18 @@
 //! and the client (cydrive-cli's sync module, Batch B): field names
 //! are `snake_case`, `secret` is optional, and deletions travel as
 //! tombstone rows (`deleted: true` with an empty payload).
+//!
+//! Compatibility matrix (pull gaining its optional `secret` field):
+//!
+//! | direction | outcome |
+//! |---|---|
+//! | new client -> old server | pull carries `secret`; the old
+//!   server's serde ignores unknown fields, so `{key, since}` parsing
+//!   is unaffected — works |
+//! | old client -> new server (secret configured) | pull 403s until
+//!   the client upgrades — expected; the 403 body names the fix |
+//! | server without a configured secret | both endpoints stay open —
+//!   pure loopback / tunnel deployments keep the old behavior |
 
 use serde::{Deserialize, Serialize};
 
@@ -49,6 +61,16 @@ pub struct PullRequest {
     pub key: String,
     /// Return only rows with `version > since` (0 = everything).
     pub since: i64,
+    /// Shared secret; required only when the server configured one.
+    ///
+    /// Serialization form: the field is *omitted* when `None`
+    /// (`skip_serializing_if`) rather than emitted as `null` — a
+    /// secretless pull then stays byte-identical to the pre-secret
+    /// wire form, the most compatible shape for every intermediary.
+    /// (A `null` would also be harmless: old servers ignore unknown
+    /// fields regardless of value — see the module matrix.)
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
 }
 
 /// `POST /v1/pull` response body.

@@ -251,6 +251,11 @@ impl SyncClient for HttpSyncClient {
         let request = PullRequest {
             key: key.to_string(),
             since,
+            // The server may now gate pull behind its shared secret; the
+            // client-side wiring (threading the configured secret through
+            // the SyncClient::pull signature) is the sync client batch —
+            // `None` keeps this request byte-identical to before.
+            secret: None,
         };
         let body = serde_json::to_vec(&request)
             .map_err(|error| SyncError::Client(format!("serializing the pull request: {error}")))?;
