@@ -17,12 +17,18 @@
 //! - heartbeat: `: keepalive` comment frames at the injected interval
 //! - disconnect: dropping the connection reaps the per-namespace
 //!   broadcast registry entry (no leak)
+//! - dual-active client_id (the copied-db accident, review Med-2):
+//!   two subscribers sharing one id BOTH receive a push with that
+//!   shared origin (delivered with `origin: null` so the client-side
+//!   skip cannot re-silence it), the subscription that creates the
+//!   duplicate logs a warn, and the self-origin skip returns the
+//!   moment one of the two disconnects
 //! - response headers: text/event-stream + no-cache +
 //!   X-Accel-Buffering: no (nginx/openresty must not buffer SSE)
 
 use std::net::SocketAddr;
 use std::pin::Pin;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, OnceLock};
 use std::time::Duration;
 
 use axum::http::{HeaderMap, HeaderValue, Request, StatusCode};
@@ -374,5 +380,176 @@ async fn dropping_the_connection_reaps_the_registry_entry() {
         hub.channel_count(),
         0,
         "publishing must not resurrect a reaped entry"
+    );
+}
+
+// === Dual-active client_id (review P3, Med-2) =========================
+//
+// A client_id lives in the client's db; copying that db to a second
+// machine makes BOTH machines subscribe with the same id, and the
+// plain origin skip — server pump AND client — then silences the
+// doorbell in both directions (every push carries the shared id as
+// its origin, so each side skips). The tests below pin the
+// server-side ruling: while two live subscriptions share an id, its
+// self-origin events ARE delivered (origin rewritten to `null` so
+// the client-side skip cannot re-silence them), the anomaly is
+// warned about, and the single-active skip returns as soon as one of
+// the two disconnects.
+
+/// Shared buffer the warn-capture subscriber writes into (installed
+/// at most once per test process — `set_global_default` is
+/// process-global).
+static CAPTURED_LOGS: OnceLock<Arc<Mutex<String>>> = OnceLock::new();
+
+/// A `MakeWriter` that appends into [`CAPTURED_LOGS`].
+struct LogWriter(Arc<Mutex<String>>);
+
+impl std::io::Write for LogWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("log capture buffer")
+            .push_str(&String::from_utf8_lossy(buf));
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// Installs (once) a WARN-and-above capturing subscriber and returns
+/// its buffer — the dual-active warn assertion reads it. In-process
+/// capture instead of spawning the real binary (the `logging.rs`
+/// form) because these tests must drive several long-lived SSE
+/// streams against one hub; the other tests never assert on logs, so
+/// a process-global default is harmless to them.
+fn captured_warns() -> Arc<Mutex<String>> {
+    CAPTURED_LOGS
+        .get_or_init(|| {
+            let buffer: Arc<Mutex<String>> = Arc::new(Mutex::new(String::new()));
+            let writer_buffer = Arc::clone(&buffer);
+            tracing_subscriber::fmt()
+                .with_ansi(false)
+                .with_max_level(tracing::Level::WARN)
+                .with_writer(move || LogWriter(writer_buffer.clone()))
+                .try_init()
+                .expect("install the warn-capture subscriber once per test process");
+            buffer
+        })
+        .clone()
+}
+
+/// Med-2: two subscribers share one client_id (the copied-db
+/// accident); a push with that shared id as origin must reach BOTH —
+/// with `origin` rewritten to `null`, because the client-side skip
+/// compares the origin against its own id and would otherwise
+/// re-silence exactly this delivery.
+#[tokio::test]
+async fn duplicate_client_id_subscribers_both_receive_doorbell() {
+    let (addr, _hub) = spawn(None, QUIET_HEARTBEAT).await;
+
+    let (status, _, mut first) = subscribe(addr, r#"{"key":"ns","client_id":"laptop-1"}"#).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, mut second) = subscribe(addr, r#"{"key":"ns","client_id":"laptop-1"}"#).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // either machine pushing carries the shared id as the origin
+    push_ok(
+        addr,
+        r#"{"key":"ns","client_id":"laptop-1","rows":[
+            {"rel_path":"/a","deleted":false,"payload":"x"}]}"#,
+    )
+    .await;
+
+    for (who, reader) in [("first", &mut first), ("second", &mut second)] {
+        let frame = tokio::time::timeout(Duration::from_secs(2), reader.next_frame())
+            .await
+            .unwrap_or_else(|_| {
+                panic!("dual-active subscriber ({who}) must receive the shared-origin doorbell")
+            })
+            .expect("stream stays open");
+        assert_eq!(
+            frame, "data: {\"max_version\":1,\"origin\":null}\n\n",
+            "the origin must be rewritten to null so the client-side skip \
+             cannot re-silence a dual-active id"
+        );
+    }
+}
+
+/// The dual-active accident must be diagnosable: the subscription
+/// that brings one (namespace, client_id) to two live subscribers
+/// logs a WARN naming the likely cause — correlation fields are 8-char
+/// prefixes, never whole identifiers.
+#[tokio::test]
+async fn duplicate_client_id_subscription_warns() {
+    let captured = captured_warns();
+    let (addr, _hub) = spawn(None, QUIET_HEARTBEAT).await;
+
+    let (status, _, _first) =
+        subscribe(addr, r#"{"key":"namespace-one","client_id":"laptop-one"}"#).await;
+    assert_eq!(status, StatusCode::OK);
+    let before = captured.lock().expect("capture buffer").len();
+    let (status, _, _second) =
+        subscribe(addr, r#"{"key":"namespace-one","client_id":"laptop-one"}"#).await;
+    assert_eq!(status, StatusCode::OK);
+
+    // the warn is emitted synchronously while registering the second
+    // subscription, i.e. before its response headers — no polling
+    let logs = captured.lock().expect("capture buffer").clone();
+    let fresh = &logs[before..];
+    assert!(
+        fresh.contains("duplicate client_id detected"),
+        "the second same-id subscribe must warn; captured since the first: {fresh:?}"
+    );
+    assert!(
+        fresh.contains("doorbell self-skip disabled"),
+        "the warn must say what changed for this id: {fresh:?}"
+    );
+    assert!(
+        fresh.contains("ns=namespac") && fresh.contains("client=laptop-o"),
+        "correlation fields are 8-char prefixes of ns and client_id: {fresh:?}"
+    );
+}
+
+/// The dual-active delivery is only as wide as the anomaly: once one
+/// of the two same-id subscribers disconnects (active count back to
+/// one) the self-origin skip returns for the survivor — the
+/// single-active optimization is untouched by the fix.
+#[tokio::test]
+async fn duplicate_client_id_back_to_single_resumes_self_skip() {
+    let (addr, hub) = spawn(None, QUIET_HEARTBEAT).await;
+
+    let (status, _, mut survivor) = subscribe(addr, r#"{"key":"ns","client_id":"laptop-1"}"#).await;
+    assert_eq!(status, StatusCode::OK);
+    let (status, _, departing) = subscribe(addr, r#"{"key":"ns","client_id":"laptop-1"}"#).await;
+    assert_eq!(status, StatusCode::OK);
+    assert_eq!(hub.receiver_count("ns"), 2, "both same-id streams are live");
+
+    // dropping the body closes the connection; the pump teardown then
+    // releases its registration. Polling the (existing)
+    // receiver-count observability until the survivor is alone —
+    // the dual-active release happens before this is observable.
+    drop(departing);
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+    while hub.receiver_count("ns") != 1 {
+        assert!(
+            tokio::time::Instant::now() < deadline,
+            "the departing subscription was not released after the disconnect"
+        );
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+
+    // single-active again: the survivor must NOT hear its own id's push
+    push_ok(
+        addr,
+        r#"{"key":"ns","client_id":"laptop-1","rows":[
+            {"rel_path":"/a","deleted":false,"payload":"x"}]}"#,
+    )
+    .await;
+    let nothing = tokio::time::timeout(Duration::from_millis(500), survivor.next_frame()).await;
+    assert!(
+        nothing.is_err(),
+        "back to single-active, a self-origin push must be skipped again, got: {nothing:?}"
     );
 }
