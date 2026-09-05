@@ -23,6 +23,7 @@ use std::sync::Mutex;
 use async_trait::async_trait;
 use cydrive_core::cache::CacheManager;
 use cydrive_core::database::{FileUpsert, MetaDatabase};
+use cydrive_core::rel_path::RelPath;
 use cydrive_core::sync::{
     namespace_key, row_hash, serialize_row, sync_once, SyncClient, SyncError, SyncOutcome,
     SyncPullResult, SyncPulledRow, SyncRowUpdate,
@@ -454,4 +455,62 @@ async fn two_instances_converge_through_shared_server() {
         .await
         .expect("final sync B");
     assert_eq!((out.pushed, out.pushed_tombstones), (0, 0));
+}
+
+// ------------------------------------------------- review-fix pins ---
+
+#[tokio::test]
+async fn tombstone_removes_a_hydrated_cache_copy_on_the_peer() {
+    // End-to-end pin of the High-1 fix (decisions.md 2026-09-05): B
+    // hydrated A's uploaded file (a disk cache copy exists); A then
+    // deletes it. One sync round later, the tombstone must have removed
+    // not only B's row and mirror but also B's CACHE COPY — hydrate's
+    // hit probe is disk-based, so a surviving copy would serve deleted
+    // bytes after a same-path recreate.
+    let key = namespace_key("bot", "42");
+    let server = InMemorySyncServer::new();
+    let a = instance("a-hy");
+    let b = instance("b-hy");
+
+    // A seeds one uploaded file and pushes it.
+    let victim = file_upsert("/victim.bin", 10, 100.0, Some(500), 1, true);
+    let victim_id = a.db.upsert_file(&victim).expect("insert victim");
+    a.db.upsert_chunk(victim_id, 0, 500, 10, None)
+        .expect("victim chunk");
+    sync_once(&a.db, &a.cache, &server, &key, None)
+        .await
+        .expect("sync A seed");
+
+    // B pulls it and "hydrates" it: a cache copy lands on B's disk.
+    sync_once(&b.db, &b.cache, &server, &key, None)
+        .await
+        .expect("sync B pull");
+    let rel = RelPath::new("/victim.bin").expect("valid rel path");
+    let b_copy = b.cache.local_path(&rel);
+    std::fs::create_dir_all(b_copy.parent().expect("cache parent")).expect("create cache parent");
+    std::fs::write(&b_copy, b"hydrated bytes").expect("write hydrated copy");
+    assert!(b_copy.exists(), "precondition: B holds a hydrated copy");
+
+    // A deletes the file; B syncs the tombstone down.
+    a.db.delete_file("/victim.bin").expect("A deletes victim");
+    sync_once(&a.db, &a.cache, &server, &key, None)
+        .await
+        .expect("sync A tombstone");
+    let out = sync_once(&b.db, &b.cache, &server, &key, None)
+        .await
+        .expect("sync B tombstone");
+    assert_eq!(out.tombstoned, 1, "B applied the tombstone");
+    assert!(
+        b.db.get_file("/victim.bin").expect("get").is_none(),
+        "the row went with the tombstone"
+    );
+    assert_eq!(
+        b.db.sync_mirror_get("/victim.bin").expect("mirror"),
+        None,
+        "the mirror entry went with the row"
+    );
+    assert!(
+        !b_copy.exists(),
+        "the hydrated cache copy must not survive the tombstone — hydrate's disk-based hit probe would serve the deleted bytes"
+    );
 }
