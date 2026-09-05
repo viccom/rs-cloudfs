@@ -20,9 +20,15 @@
 //! - `push_diff`: no mirror → push as new; hash differs → push as changed;
 //!   mirror-only path → push as tombstone (`deleted: true`, empty payload).
 //! - `apply_pulled_rows`: per-row version idempotency gate, tombstone
-//!   delete, ghost-pending skip (no local cache copy), hash-equal updates
-//!   the mirror only, remote-wins overwrite replaces the row + chunks and
-//!   clears a stale cached copy; `max_pulled` advances monotonically.
+//!   delete (row + mirror + local cache copy; an in-flight pending
+//!   upload keeps its source file — "later action wins" LWW, decisions
+//!   2026-09-05), ghost-pending skip (no local cache copy), hash-equal
+//!   updates the mirror only, remote-wins overwrite replaces the row +
+//!   chunks and clears a stale cached copy **keyed on disk presence**
+//!   (hydrate's hit probe is disk-based; the row flag can drift);
+//!   undecodable payloads and invalid row keys are counted
+//!   `skipped_invalid` and skipped without wedging the cursor;
+//!   `max_pulled` advances monotonically.
 
 use cydrive_core::cache::CacheManager;
 use cydrive_core::database::{ChunkRecord, FileRecord, FileUpsert, MetaDatabase};
@@ -414,6 +420,7 @@ fn apply_skips_rows_at_or_below_mirror_version() {
             applied: 0,
             skipped_ghost: 0,
             skipped_idempotent: 2,
+            skipped_invalid: 0,
             tombstoned: 0,
         }
     );
@@ -448,6 +455,7 @@ fn apply_tombstone_deletes_files_chunks_and_mirror() {
             applied: 0,
             skipped_ghost: 0,
             skipped_idempotent: 0,
+            skipped_invalid: 0,
             tombstoned: 1,
         }
     );
@@ -460,6 +468,56 @@ fn apply_tombstone_deletes_files_chunks_and_mirror() {
             .expect("count chunks")
     };
     assert_eq!(remaining, 0, "chunk rows must be deleted with the file row");
+}
+
+#[test]
+fn tombstone_apply_removes_local_cache_copy() {
+    // High① fix pin (decisions.md 2026-09-05): an uploaded row whose
+    // bytes sit in the local cache. The tombstone must remove the row,
+    // the mirror AND the cache copy — hydrate's hit probe is disk-based
+    // (it never consults the row), so a surviving copy of a deleted file
+    // would be served again after a same-path recreate.
+    let (_dir, db, cache) = fresh_env("tomb-cache");
+    let rec = record("/gone.bin", 10, true);
+    insert(&db, &upsert_from(&rec, true), &[chunk(0, 5, 10)]);
+    db.sync_mirror_set("/gone.bin", "hash", 1)
+        .expect("mirror set");
+    let cache_path = write_cache_copy(&cache, "/gone.bin", b"stale bytes");
+
+    let rows = vec![pulled("/gone.bin", 2, true, "")];
+    let outcome = apply_pulled_rows(&db, &cache, &rows, 2).expect("apply");
+    assert_eq!(outcome.tombstoned, 1);
+    assert!(db.get_file("/gone.bin").expect("get").is_none());
+    assert_eq!(db.sync_mirror_get("/gone.bin").expect("mirror"), None);
+    assert!(
+        !cache_path.exists(),
+        "the local cache copy must not survive a tombstone — hydrate's disk-based hit probe would serve the deleted bytes"
+    );
+}
+
+#[test]
+fn tombstone_preserves_inflight_pending_upload_source() {
+    // In-flight upload protection (decisions 2026-09-05, "later action
+    // wins" LWW): a local PENDING row whose cache copy still sits on
+    // disk is an upload in progress. The tombstone removes the db row
+    // and mirror but must keep the source file — the upload worker's
+    // success write-back revives the row.
+    let (_dir, db, cache) = fresh_env("tomb-inflight");
+    let pending = record("/inflight.bin", 10, false);
+    insert(&db, &upsert_from(&pending, false), &[chunk(0, 5, 10)]);
+    db.sync_mirror_set("/inflight.bin", "hash", 1)
+        .expect("mirror set");
+    let src = write_cache_copy(&cache, "/inflight.bin", b"uploading bytes");
+
+    let rows = vec![pulled("/inflight.bin", 2, true, "")];
+    let outcome = apply_pulled_rows(&db, &cache, &rows, 2).expect("apply");
+    assert_eq!(outcome.tombstoned, 1);
+    assert!(db.get_file("/inflight.bin").expect("get").is_none());
+    assert_eq!(db.sync_mirror_get("/inflight.bin").expect("mirror"), None);
+    assert!(
+        src.exists(),
+        "an in-flight upload's source file must survive the tombstone — the worker's write-back revives the row"
+    );
 }
 
 #[test]
@@ -489,6 +547,7 @@ fn apply_skips_ghost_pending_row_without_local_copy() {
             applied: 0,
             skipped_ghost: 1,
             skipped_idempotent: 0,
+            skipped_invalid: 0,
             tombstoned: 0,
         }
     );
@@ -621,11 +680,18 @@ fn apply_overwrite_clears_stale_cached_copy() {
 }
 
 #[test]
-fn apply_overwrite_keeps_unflagged_cache_file() {
-    let (_dir, db, cache) = fresh_env("unflagged");
+fn apply_overwrite_removes_stale_cache_file_on_disk() {
+    // CONTRACT CORRECTION (decisions.md 2026-09-05 High②, owner-approved
+    // fix batch): cache cleanup keys on DISK presence — the same basis as
+    // hydrate's hit probe — not on the row's is_cached flag. The flag and
+    // the disk drift (e.g. an upload-succeeded-then-cache-delete-failed
+    // residue leaves the flag cleared with bytes on disk); a flag-gated
+    // cleanup would keep serving those stale bytes. Replaces the old
+    // apply_overwrite_keeps_unflagged_cache_file contract test, which
+    // pinned the flag-gated semantics the review found wrong.
+    let (_dir, db, cache) = fresh_env("stale-disk");
     let local = record("/drift.bin", 10, true);
-    // Row flag says not cached (drifted state), but a file sits on disk:
-    // only rows whose flag was set get their cache copy removed.
+    // Row flag says not cached (drifted state), but a file sits on disk.
     insert(&db, &upsert_from(&local, false), &[chunk(0, 11, 10)]);
     let disk_path = write_cache_copy(&cache, "/drift.bin", b"drifted bytes");
 
@@ -636,8 +702,36 @@ fn apply_overwrite_keeps_unflagged_cache_file() {
 
     apply_pulled_rows(&db, &cache, &rows, 1).expect("apply");
     assert!(
-        disk_path.exists(),
-        "cache removal is tied to the original is_cached flag, not bare disk state"
+        !disk_path.exists(),
+        "cleanup keys on disk presence, not the row flag — hydrate's hit probe is disk-based and would serve the stale bytes"
+    );
+}
+
+#[test]
+fn apply_overwrite_preserves_inflight_pending_upload_source() {
+    // In-flight upload protection on the overwrite path (decisions
+    // 2026-09-05, "later action wins" LWW): a local PENDING row (the
+    // ghost gate guarantees its cache copy is on disk when a pulled
+    // pending row gets this far) hit by a remote overwrite keeps its
+    // source file — the upload worker's success write-back revives the
+    // row.
+    let (_dir, db, cache) = fresh_env("ow-inflight");
+    let local = record("/inflight.bin", 10, false);
+    insert(&db, &upsert_from(&local, false), &[chunk(0, 11, 10)]);
+    let src = write_cache_copy(&cache, "/inflight.bin", b"uploading bytes");
+
+    let mut remote = record("/inflight.bin", 20, true);
+    remote.mtime = local.mtime + 1.0;
+    let payload = serialize(&remote, &[chunk(0, 12, 20)]);
+    let rows = vec![pulled("/inflight.bin", 2, false, &payload)];
+
+    let outcome = apply_pulled_rows(&db, &cache, &rows, 2).expect("apply");
+    assert_eq!(outcome.applied, 1);
+    let row = db.get_file("/inflight.bin").expect("get").expect("row");
+    assert_eq!(row.size, 20, "remote content wins the row itself");
+    assert!(
+        src.exists(),
+        "the in-flight upload's source file must survive the overwrite — the worker's write-back revives the row"
     );
 }
 
@@ -653,4 +747,45 @@ fn apply_advances_max_pulled_monotonically() {
 
     apply_pulled_rows(&db, &cache, &[], 12).expect("apply newer");
     assert_eq!(db.sync_state_get().expect("state"), 12);
+}
+
+#[test]
+fn invalid_row_is_skipped_and_cursor_advances() {
+    // Poisoned-row fix pin (decisions 2026-09-05 Medium): one bad payload
+    // row must not abort the whole pass — the old `?` returned before
+    // `sync_state_set`, permanently wedging the namespace cursor so no
+    // later update could ever arrive. Now the bad row is counted and
+    // skipped, the good row behind it applies, and the cursor advances
+    // past both.
+    let (_dir, db, cache) = fresh_env("poison");
+    let good = record("/good.txt", 7, true);
+    let good_payload = serialize(&good, &[chunk(0, 9, 7)]);
+    let rows = vec![
+        pulled("/bad.txt", 1, false, "{ this is not json"),
+        pulled("/good.txt", 2, false, &good_payload),
+    ];
+
+    let outcome = apply_pulled_rows(&db, &cache, &rows, 2).expect("apply");
+    assert_eq!(outcome.skipped_invalid, 1);
+    assert_eq!(outcome.applied, 1);
+    assert!(
+        db.get_file("/good.txt").expect("get").is_some(),
+        "the good row after the poisoned one must still apply"
+    );
+    assert!(
+        db.get_file("/bad.txt").expect("get").is_none(),
+        "an invalid row must not create local state"
+    );
+    assert_eq!(
+        db.sync_state_get().expect("state"),
+        2,
+        "the cursor must advance past the poisoned row"
+    );
+
+    // A re-pull of the same batch neither fails nor wedges: the good row
+    // dies at the idempotency gate, the bad row is skipped again.
+    let outcome = apply_pulled_rows(&db, &cache, &rows, 2).expect("apply 2");
+    assert_eq!(outcome.skipped_invalid, 1);
+    assert_eq!(outcome.skipped_idempotent, 1);
+    assert_eq!(db.sync_state_get().expect("state"), 2);
 }

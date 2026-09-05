@@ -221,7 +221,9 @@ fn sync_secret_from_env_reads_the_pinned_variable() {
 }
 
 /// The human summary prints every counter with the labels the task
-/// phrasing uses (applied/pushed/tombstoned/skipped_ghost included).
+/// phrasing uses (applied/pushed/tombstoned/skipped_ghost included);
+/// `skipped_invalid` covers rows skipped for undecodable payloads or
+/// invalid row keys (decisions.md 2026-09-05 poison-row fix).
 #[test]
 fn render_sync_summary_lists_all_counters() {
     let outcome = SyncOutcome {
@@ -229,6 +231,7 @@ fn render_sync_summary_lists_all_counters() {
         applied: 2,
         skipped_ghost: 1,
         skipped_idempotent: 4,
+        skipped_invalid: 8,
         tombstoned: 5,
         pushed: 6,
         pushed_tombstones: 7,
@@ -240,6 +243,7 @@ fn render_sync_summary_lists_all_counters() {
     assert!(summary.contains("tombstoned 5"), "{summary}");
     assert!(summary.contains("skipped_ghost 1"), "{summary}");
     assert!(summary.contains("skipped_idempotent 4"), "{summary}");
+    assert!(summary.contains("skipped_invalid 8"), "{summary}");
     assert!(summary.contains("pushed_tombstones 7"), "{summary}");
 }
 
