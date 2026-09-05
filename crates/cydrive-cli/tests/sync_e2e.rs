@@ -557,7 +557,7 @@ async fn config_toml_sync_secret_powers_a_gated_pass() {
 #[tokio::test]
 #[ignore = "real network: POSTs to a live public-CA https endpoint"]
 async fn https_real_endpoint_handshakes_and_gets_http_status() {
-    let client = HttpSyncClient::new("https://git.metme.top");
+    let client = HttpSyncClient::new("https://git.metme.top", "https-probe".to_string());
     let error = client
         .pull("rs-cydrive-https-probe", None, 0)
         .await
@@ -587,7 +587,7 @@ async fn https_real_endpoint_handshakes_and_gets_http_status() {
 async fn slow_body_drip_is_bounded_by_the_request_timeout() {
     let port = spawn_drip_body_endpoint().await;
     let url = format!("http://127.0.0.1:{port}");
-    let client = HttpSyncClient::with_request_timeout(&url, Duration::from_secs(2));
+    let client = HttpSyncClient::with_request_timeout(&url, Duration::from_secs(2), "drip-probe".to_string());
 
     let guard = Duration::from_secs(15);
     let error = tokio::time::timeout(guard, client.pull("ns", None, 0))

@@ -868,7 +868,10 @@ pub async fn run_sync_command(cfg: &CyDriveConfig, secret: Option<&str>) -> Resu
     let cache_limit = cfg.cache_limit_gb * BYTES_PER_GB;
     let cache = CacheManager::new(Path::new(&cfg.cache_path).to_path_buf(), cache_limit);
 
-    let client = sync_client::HttpSyncClient::new(&sync_url);
+    let client_id = db
+        .sync_client_id()
+        .context("reading this instance's sync client id")?;
+    let client = sync_client::HttpSyncClient::new(&sync_url, client_id);
     sync_once(&db, &cache, &client, &key, secret)
         .await
         .with_context(|| format!("sync pass against {sync_url} failed"))
@@ -898,7 +901,22 @@ fn spawn_periodic_sync(
     }
     let key = namespace_key(&cfg.bot_token, &cfg.chat_id.to_string());
     let secret = resolve_sync_secret(cfg);
-    let client = sync_client::HttpSyncClient::new(&url);
+    // The per-database stable identity: the doorbell's origin-skip (and
+    // the access log's client tag) key on it. A read failure only warns
+    // and falls back to the empty string — which serializes away (no
+    // client_id on the wire), so a broken identity degrades to the
+    // anonymous pre-doorbell behavior instead of disabling sync.
+    let client_id = match db.sync_client_id() {
+        Ok(id) => id,
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "reading this instance's sync client id failed; pushing anonymously"
+            );
+            String::new()
+        }
+    };
+    let client = sync_client::HttpSyncClient::new(&url, client_id);
     let cache = CacheManager::new(cache_root, cache_limit);
     let period = Duration::from_secs(cfg.sync_interval_secs);
     tracing::info!(
