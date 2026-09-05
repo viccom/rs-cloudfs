@@ -125,9 +125,16 @@ fn default_queue_capacity() -> u32 {
     256
 }
 
-/// Default `hydrate_timeout_secs` (tier-1 contract C6).
+/// Default `hydrate_timeout_secs` (tier-1 contract C6). Raised from 180
+/// to 1800 (review follow-up BUG②, owner-approved default contract
+/// change): real-machine downstream bandwidth through a local proxy
+/// measured ~0.45 MB/s (decisions.md 2026-09-03, Tier-1 真机端到端
+/// 发现①), so the original 180s — a mirror of the Python WebDAV
+/// thread's `future.result(timeout=180)` cap — timed out every file
+/// above ~80 MB on a fresh deployment. An explicit `hydrate_timeout_secs`
+/// still overrides the default.
 fn default_hydrate_timeout_secs() -> u64 {
-    180
+    1800
 }
 
 /// Default `sync_interval_secs` (sync-lite plan, client side).

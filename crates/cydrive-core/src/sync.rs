@@ -280,17 +280,27 @@ pub struct ApplyOutcome {
 ///
 /// `local_rows` are `(rel_path, payload)` pairs — the caller serializes
 /// the full `files` table (directories included, they are plain rows);
-/// `mirror` is the `sync_mirror_all()` triple shape.
+/// `mirror` is the `sync_mirror_all()` triple shape. Both sides are
+/// joined through hash indexes (`sync_mirror` rows are unique by
+/// `rel_path`, so a path-keyed map is equivalent to the old per-row
+/// scan) instead of the original nested `any` loops — with 10k+ row
+/// libraries those O(local × mirror) scans dominated every sync pass
+/// with pure CPU (review follow-up BUG⑤); the semantics are unchanged.
 pub fn push_diff(
     local_rows: &[(String, String)],
     mirror: &[(String, String, i64)],
 ) -> Vec<SyncRowUpdate> {
+    // Mirror hash by path; the server version never enters the diff.
+    let mirror_hash_by_path: std::collections::HashMap<&str, &str> = mirror
+        .iter()
+        .map(|(path, hash, _version)| (path.as_str(), hash.as_str()))
+        .collect();
     let mut updates = Vec::new();
     for (rel_path, payload) in local_rows {
         let hash = row_hash(payload);
-        let unchanged = mirror
-            .iter()
-            .any(|(m_path, m_hash, _)| m_path == rel_path && *m_hash == hash);
+        let unchanged = mirror_hash_by_path
+            .get(rel_path.as_str())
+            .is_some_and(|m_hash| *m_hash == hash);
         if !unchanged {
             updates.push(SyncRowUpdate {
                 rel_path: rel_path.clone(),
@@ -299,8 +309,13 @@ pub fn push_diff(
             });
         }
     }
+    // Tombstones: mirrored paths with no local row (local paths into a
+    // set for O(1) membership). Deterministic output order is preserved
+    // by the whole-vec `rel_path` sort below, exactly as before.
+    let local_paths: std::collections::HashSet<&str> =
+        local_rows.iter().map(|(path, _)| path.as_str()).collect();
     for (m_path, _, _) in mirror {
-        if !local_rows.iter().any(|(path, _)| path == m_path) {
+        if !local_paths.contains(m_path.as_str()) {
             updates.push(SyncRowUpdate {
                 rel_path: m_path.clone(),
                 deleted: true,

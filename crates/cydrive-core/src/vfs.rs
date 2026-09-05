@@ -39,9 +39,14 @@ pub struct VfsConfig {
     /// Password enabling client-side encryption; default `None`.
     pub encryption_password: Option<String>,
     /// Upper bound on the remote-dependent span of a hydration
-    /// (transport open through the final cache copy); default 180s,
-    /// mirroring the Python WebDAV thread's `future.result(timeout=180)`
-    /// download deadline. Cache hits are local reads and never bounded.
+    /// (transport open through the final cache copy); default 1800s.
+    /// The Python baseline mirrored the WebDAV thread's
+    /// `future.result(timeout=180)` cap, but real-machine downstream
+    /// bandwidth measured ~0.45 MB/s through a local proxy
+    /// (decisions.md 2026-09-03, Tier-1 真机端到端 发现①), so 180s timed
+    /// out every file above ~80 MB — the Rust default is 1800s, and an
+    /// explicit `hydrate_timeout_secs` still wins. Cache hits are local
+    /// reads and never bounded.
     pub hydrate_timeout: std::time::Duration,
 }
 
@@ -54,7 +59,12 @@ impl Default for VfsConfig {
             queue_capacity: 256,
             retry: RetryPolicy::default(),
             encryption_password: None,
-            hydrate_timeout: std::time::Duration::from_secs(180),
+            hydrate_timeout: std::time::Duration::from_secs(
+                // Keep aligned with `config::default_hydrate_timeout_secs`
+                // (BUG②): this is the conversion chain's fallback when no
+                // `CyDriveConfig` maps over.
+                1800,
+            ),
         }
     }
 }
@@ -86,9 +96,10 @@ pub enum VfsError {
     /// Local file I/O failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
-    /// Hydration exceeded `hydrate_timeout` (Python parity: the WebDAV
-    /// thread's 180s `future.result` cap; the remote-dependent span
-    /// never hangs a GET forever).
+    /// Hydration exceeded `hydrate_timeout` (the remote-dependent span
+    /// never hangs a GET forever; the Python baseline capped the WebDAV
+    /// thread's `future.result` — see `VfsConfig::hydrate_timeout` for
+    /// the default's history).
     #[error("hydration timed out after {0:?}")]
     Timeout(std::time::Duration),
     /// The virtual path already holds a row (file or directory).
@@ -411,18 +422,28 @@ impl Vfs {
                 }
                 file.flush()?;
             }
-            std::fs::rename(&staged, &local)?;
 
-            // Python behavior: the cache copy is plaintext, so decrypt
-            // after the ciphertext landed locally.
+            // Decrypt in the staging sibling and only then touch the
+            // final cache path: the cache copy is plaintext by contract,
+            // and a failed decryption (wrong password, corrupted
+            // payload) must leave NO file at `local` — hydrate's hit
+            // probe is disk-based, so ciphertext parked there would be
+            // served verbatim on every later read (a Python-baseline
+            // defect deliberately fixed here; review follow-up BUG①).
+            // `write_atomic` stages at the same `.tmp` sibling, so it
+            // overwrites the now-consumed ciphertext staging file and
+            // renames the plaintext onto the final path in one atomic
+            // promotion.
             if row.is_encrypted {
                 let password = self
                     .cfg
                     .encryption_password
                     .as_deref()
                     .ok_or(VfsError::MissingPassword)?;
-                let plaintext = crypto::decrypt(password, &std::fs::read(&local)?)?;
+                let plaintext = crypto::decrypt(password, &std::fs::read(&staged)?)?;
                 write_atomic(&local, &plaintext)?;
+            } else {
+                std::fs::rename(&staged, &local)?;
             }
 
             self.db.upsert_file(&cached_upsert(&row, true))?;
@@ -435,9 +456,11 @@ impl Vfs {
         };
         if let Some(error) = failed {
             // No staging file survives a failed hydration (timeout,
-            // transport or I/O): a half-written `.tmp` copy is never
-            // left in the cache tree. Removal of a not-yet-created
-            // staging file is a benign no-op.
+            // transport, I/O or decryption): a half-written `.tmp` copy
+            // — or, after a failed decrypt, the ciphertext itself — is
+            // never left in the cache tree, and `local` was never
+            // touched (promotion is the last step). Removal of a
+            // not-yet-created staging file is a benign no-op.
             let _ = std::fs::remove_file(&staged);
             return Err(error);
         }
