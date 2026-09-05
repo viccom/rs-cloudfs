@@ -320,6 +320,9 @@ impl DavFileSystem for CyDriveFs {
             self.db
                 .rename_path(from.as_str(), to.as_str())
                 .map_err(db_err)?;
+            // Overwrite deletions above and the rename itself are both
+            // files-row mutations — ring the realtime sync wake.
+            self.vfs.wake_sync();
             let from_local = self.cache.local_path(&from);
             let to_local = self.cache.local_path(&to);
             if row.is_dir {

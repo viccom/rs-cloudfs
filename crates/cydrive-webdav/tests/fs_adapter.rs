@@ -587,6 +587,32 @@ async fn create_dir_visible_and_duplicate_exists() {
     assert_eq!(err, FsError::NotFound);
 }
 
+/// MOVE rings the sync wake: every files-row mutation must ring so the
+/// realtime sync pass runs promptly instead of waiting for the interval.
+#[tokio::test]
+async fn rename_rings_the_sync_wake() {
+    use std::time::Duration;
+
+    let (_dir, db, _cache_root, mock, vfs, fs) = test_env(u64::MAX).await;
+    seed_remote_file(&db, &mock, "/wake-old.bin", b"payload", 2).await;
+
+    let notifier = vfs.sync_notifier();
+    let wake = notifier.notified();
+    tokio::pin!(wake);
+    wake.as_mut().enable();
+
+    fs.rename(
+        &DavPath::new("/wake-old.bin").expect("path"),
+        &DavPath::new("/wake-new.bin").expect("path"),
+    )
+    .await
+    .expect("rename file");
+
+    tokio::time::timeout(Duration::from_secs(1), wake.as_mut())
+        .await
+        .expect("rename must ring the sync wake");
+}
+
 /// 10. remove_file: row and cached copy deleted; the remote is never
 ///     touched (Python `handle_delete` parity — no telegram delete).
 #[tokio::test]
