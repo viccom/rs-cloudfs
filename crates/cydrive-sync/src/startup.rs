@@ -25,8 +25,15 @@ pub enum StartupDecision {
 /// `argv[0]` (i.e. `std::env::args().skip(1)`): exactly no arguments runs
 /// the server, exactly one known flag prints and exits, every other
 /// shape is rejected so no stray argument can ever start a service.
-// TODO(green): drop the allow once the parameter is read by the real body.
-#[allow(unused_variables)]
 pub fn decide_startup(args: &[String]) -> StartupDecision {
-    todo!()
+    match args {
+        [] => StartupDecision::Run,
+        [only] if matches!(only.as_str(), "--version" | "-V") => StartupDecision::PrintVersion,
+        [only] if matches!(only.as_str(), "--help" | "-h") => StartupDecision::PrintHelp,
+        _ => StartupDecision::Invalid(format!(
+            "unexpected argument(s): {}. This server takes no command-line \
+             arguments; run it with none to start, or pass --help for usage.",
+            args.join(" ")
+        )),
+    }
 }

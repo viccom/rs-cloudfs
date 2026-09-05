@@ -97,7 +97,13 @@ fn help_flag_prints_usage_and_exits_zero() {
         EXIT_TIMEOUT
     );
     assert_eq!(out.code, Some(0), "exit code — stdout:\n{}", out.stdout);
-    for needle in ["SYNC_LISTEN", "SYNC_DB", "SYNC_SECRET", "--version", "--help"] {
+    for needle in [
+        "SYNC_LISTEN",
+        "SYNC_DB",
+        "SYNC_SECRET",
+        "--version",
+        "--help",
+    ] {
         assert!(
             out.stdout.contains(needle),
             "--help output should mention {needle} — stdout:\n{}",
