@@ -44,6 +44,21 @@ hyper-util = { version = "0.1", default-features = false, features = [
     "http1",
     "tokio",
 ] }
+# https for the sync client (sync review High④): rustls TLS wrapped
+# around the hyper-util connector. aws-lc-rs default excluded on
+# purpose — the ring provider's Windows build chain is lighter; the
+# Mozilla (webpki) root store means public-CA certificates are
+# trusted and self-signed ones are not (documented: tunnel for
+# those). Licenses Apache-2.0/ISC/MIT across the rustls stack, plus
+# the permissive CDLA-Permissive-2.0 data license of webpki-roots
+# (see deny.toml) — cargo-deny re-checks.
+hyper-rustls = { version = "0.27", default-features = false, features = [
+    "native-tokio",
+    "http1",
+    "tls12",
+    "ring",
+    "webpki-roots",
+] }
 serde_json = "1"
 # OS credential vault (M5). keyring 3.x has no default features: the
 # platform store must be picked per target below (the base dep keeps the

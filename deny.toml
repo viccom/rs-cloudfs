@@ -27,6 +27,14 @@ allow = [
     "0BSD",
     "Zlib",
     "MPL-2.0",
+    # webpki-roots (sync client https, via hyper-rustls): the Mozilla
+    # root certificate bundle ships under this single permissive data
+    # license — not copyleft, no obligations on MIT binaries.
+    "CDLA-Permissive-2.0",
+    # rustls stack (sync client https): ring is "Apache-2.0 AND ISC",
+    # rustls-webpki and untrusted are ISC-only — a permissive OSI
+    # license, MIT-equivalent.
+    "ISC",
 ]
 
 # Vendored grammers-session is consumed as a path dependency; its

@@ -12,6 +12,10 @@
 //! `{"error": ...}` JSON stays readable); a failed connect/send
 //! becomes [`SyncError::Client`] with the URL and the underlying
 //! error chain spelled out in plain text.
+//!
+//! Transport security: `https://` sync URLs terminate TLS in rustls
+//! against the Mozilla root store (public-CA certificates trusted,
+//! self-signed not — tunnel for those); `http://` is unchanged.
 
 use std::time::Duration;
 
@@ -20,6 +24,7 @@ use bytes::Bytes;
 use cydrive_core::sync::{SyncClient, SyncError, SyncPullResult, SyncPulledRow, SyncRowUpdate};
 use cydrive_sync::wire::{PullRequest, PullResponse, PushRequest, PushResponse, PushRow};
 use http_body_util::{BodyExt, Full};
+use hyper_rustls::{HttpsConnector, HttpsConnectorBuilder};
 use hyper_util::client::legacy::connect::HttpConnector;
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
@@ -107,22 +112,39 @@ fn error_chain(error: &dyn std::error::Error) -> String {
     text
 }
 
-/// The CLI's [`SyncClient`] over real HTTP: one reusable hyper-util
-/// legacy client pointed at the configured sync base URL.
+/// The CLI's [`SyncClient`] over real HTTP(S): one reusable hyper-util
+/// legacy client pointed at the configured sync base URL. `https://`
+/// URLs go through rustls with the Mozilla (webpki) root store — a
+/// certificate from a public CA is verified and trusted; a self-signed
+/// certificate is rejected (the documented answer for that shape is a
+/// tunnel), and plain `http://` behaves exactly as before.
 pub struct HttpSyncClient {
     /// Base URL with any trailing slash trimmed (see [`endpoint_url`]).
     base_url: String,
     /// The legacy client (cheap to keep for the process lifetime).
-    client: Client<HttpConnector, Full<Bytes>>,
+    client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
 }
 
 impl HttpSyncClient {
     /// Builds the client for `sync_url` (the config layer has already
-    /// validated the `http://`/`https://` scheme).
+    /// required the `http://`/`https://` prefix). The connector is the
+    /// same plain hyper-util `HttpConnector` the http-only client used,
+    /// wrapped for TLS so `https` handshakes via rustls/webpki-roots
+    /// while `http` keeps the previous behavior. The inner connector
+    /// drops its own scheme check (`enforce_http(false)`, mirroring
+    /// hyper-rustls' `build()`) — the scheme gate lives in the wrapper,
+    /// which routes https to TLS and everything else straight through.
     pub fn new(sync_url: &str) -> Self {
+        let mut http = HttpConnector::new();
+        http.enforce_http(false);
+        let connector = HttpsConnectorBuilder::new()
+            .with_webpki_roots()
+            .https_or_http()
+            .enable_http1()
+            .wrap_connector(http);
         Self {
             base_url: sync_url.trim_end_matches('/').to_string(),
-            client: Client::builder(TokioExecutor::new()).build_http(),
+            client: Client::builder(TokioExecutor::new()).build(connector),
         }
     }
 
