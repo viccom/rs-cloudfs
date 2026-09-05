@@ -28,7 +28,7 @@ cargo build --release -p cydrive-sync
 |---|---|---|
 | `SYNC_LISTEN` | `127.0.0.1:8290` | 监听地址。`0.0.0.0:8290` = 对局域网开放（配合防火墙/反代） |
 | `SYNC_DB` | `./cydrive_sync.db`（相对 cwd） | SQLite 数据库路径 |
-| `SYNC_SECRET` | 无 | 可选共享密钥。**设置后仅 push 需要在请求中携带匹配值**（客户端侧用 `CYDRIVE_SYNC_SECRET`）；pull 不鉴权 |
+| `SYNC_SECRET` | 无 | 可选共享密钥。**设置后 push 与 pull 都必须在请求体携带匹配值**（客户端侧用 config.toml 的 `sync_secret` 或环境变量 `CYDRIVE_SYNC_SECRET`）。不设则两端点开放（仅限内网/隧道形态） |
 
 命令行：无参数启动；`--version` / `-V` 打版本；`--help` / `-h` 打用法；**任何其他参数直接拒绝退出（exit 2），不会启动服务**。
 
@@ -87,7 +87,9 @@ server {
 - ✅ 公网 CA 签发的证书（Let's Encrypt 等）直接可用；
 - ❌ **自签证书不受信**——需要加密通道但无公网域名时，改用隧道（WireGuard / SSH 隧道 / Tailscale）跑内网 http，或仅 LAN 直连 `SYNC_LISTEN`。
 
-**安全模型如实说明**：`SYNC_SECRET` 只拦截 push（防陌生人写入）；**pull 对任何能到达端口的人开放**（读取的是元数据：文件名、大小、消息号）。公网部署时请用反代/防火墙把 `/v1/pull` 一并保护起来（例如反代层对两个端点都加同一 Basic/Auth 头，或只允许已知 IP）。监听回环 + 隧道是最省心的形态。
+**安全模型**（0.6.0 起）：`SYNC_SECRET` 同时拦截 **push 与 pull**——密钥未配或不对一律 403。不设密钥 = 两端点对任何能到达端口的人开放（仅建议内网/隧道形态）。公网部署务必设置密钥。
+
+> **升级顺序（0.6.0 是协议变更）**：新客户端对旧服务端（≤0.5.2）完全兼容（旧端忽略新字段）；**旧客户端（≤0.5.2）对新服务端的 pull 会被 403 拒**（旧 pull 请求不带密钥字段）。所以：先升级各客户端，再升级服务端并设置 `SYNC_SECRET`。
 
 ## 6. 客户端接线（各台机器）
 
@@ -97,9 +99,15 @@ sync_url = "https://sync.example.com"   # 不写或留空 = 同步功能关闭
 sync_interval_secs = 300                 # 可选，默认 300，范围 1..=86400
 ```
 
-共享密钥经环境变量提供（**不进 config 文件**）：
+共享密钥两种给法（优先级：环境变量 > config.toml）：
+
+```toml
+# config.toml（推荐，最省事）
+sync_secret = "与服务端一致的密钥"
+```
 
 ```bash
+# 或环境变量（适合 systemd/容器场景）
 export CYDRIVE_SYNC_SECRET='与服务端一致的密钥'
 ```
 

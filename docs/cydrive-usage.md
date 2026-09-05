@@ -107,11 +107,12 @@ your-dir/
 | `hydrate_timeout_secs` | `1800` | 单次下载水合的超时（大文件+慢带宽环境调大） |
 | `enable_encryption` + `encryption_password` | `false` | 两者**同时**设置才启用上传加密（与 Python 版互操作） |
 | `sync_url` | 无 | 元数据同步服务端地址（http/https）；不设=关 |
+| `sync_secret` | 无 | 同步共享密钥（对应服务端 `SYNC_SECRET`，push/pull 都要）；也可用环境变量 `CYDRIVE_SYNC_SECRET`（优先级更高） |
 | `sync_interval_secs` | `300` | run 内自动同步周期（1..=86400） |
 
 **凭据优先级**：环境变量 > config.toml > 系统凭据管理器（service `cydrive`）。token/加密密码推荐放凭据管理器（setup 自动做），config 里留空。
 
-**常用环境变量**：`CYDRIVE_BOT_TOKEN` `CYDRIVE_CHAT_ID` `CYDRIVE_PROXY_URL` `CYDRIVE_SYNC_URL` `CYDRIVE_SYNC_SECRET`（同步密钥，**只走环境变量不进 config**）`CYDRIVE_CHUNK_SIZE_MB` `CYDRIVE_DRIVE_LETTER` `CYDRIVE_WEBDAV_PORT` `CYDRIVE_WEB_UI_PORT` `CYDRIVE_ENABLE_ENCRYPTION` `RUST_LOG`（日志级别，如 `info`/`debug`）。
+**常用环境变量**：`CYDRIVE_BOT_TOKEN` `CYDRIVE_CHAT_ID` `CYDRIVE_PROXY_URL` `CYDRIVE_SYNC_URL` `CYDRIVE_SYNC_SECRET`（同步密钥，覆盖 config 的 `sync_secret`）`CYDRIVE_CHUNK_SIZE_MB` `CYDRIVE_DRIVE_LETTER` `CYDRIVE_WEBDAV_PORT` `CYDRIVE_WEB_UI_PORT` `CYDRIVE_ENABLE_ENCRYPTION` `RUST_LOG`（日志级别，如 `info`/`debug`）。
 
 旧版 `config.json` 仍可被发现并提示迁移（`cydrive migrate`）；新调优键写在 json 里会被拒收——请用 toml。
 
