@@ -352,3 +352,72 @@ async fn subscribe_stream_survives_healthy_keepalives_under_the_idle_budget() {
         .expect("the stream stayed open");
     assert_eq!(event.max_version, 1);
 }
+
+// ------------------------------------------- frame splitting (Med-1) ---
+
+/// The stream-level CRLF face of Med-1: the SSE spec allows CRLF line
+/// endings, so a compliant stream terminates frames with `\r\n\r\n`.
+/// The reader must SPLIT on that terminator and deliver the event —
+/// the `\n\n`-only splitter never fires, so the frame (and everything
+/// after it) buffers forever and no doorbell ever arrives. The
+/// existing CRLF test below only exercises content parsing
+/// ([`sse_frame_data`]), never the framing — exactly the false
+/// confidence the review flagged.
+#[tokio::test]
+async fn subscribe_stream_splits_crlf_terminated_frames() {
+    let addr = spawn_raw_sse_endpoint(b"data: {\"max_version\":5,\"origin\":null}\r\n\r\n").await;
+    let client = HttpSyncClient::new(&format!("http://{addr}"), "crlf-probe".to_string());
+    let mut doorbell = client
+        .subscribe_stream("ns", None)
+        .await
+        .expect("subscription opens against the raw endpoint");
+
+    let event = tokio::time::timeout(Duration::from_secs(2), doorbell.recv())
+        .await
+        .expect("a CRLF-terminated frame must be split and delivered")
+        .expect("the stream stays open");
+    assert_eq!(event.max_version, 5);
+}
+
+/// CR-only line endings (`\r\r`) are the third legal SSE frame
+/// terminator — same splitting requirement, same delivery.
+#[tokio::test]
+async fn subscribe_stream_splits_cr_only_terminated_frames() {
+    let addr = spawn_raw_sse_endpoint(b"data: {\"max_version\":6,\"origin\":null}\r\r").await;
+    let client = HttpSyncClient::new(&format!("http://{addr}"), "cr-probe".to_string());
+    let mut doorbell = client
+        .subscribe_stream("ns", None)
+        .await
+        .expect("subscription opens against the raw endpoint");
+
+    let event = tokio::time::timeout(Duration::from_secs(2), doorbell.recv())
+        .await
+        .expect("a CR-terminated frame must be split and delivered")
+        .expect("the stream stays open");
+    assert_eq!(event.max_version, 6);
+}
+
+/// The buffer-cap face of Med-1: a stream that never reaches ANY
+/// terminator (a malicious slow drip — or, pre-fix, a compliant CRLF
+/// stream fed to an LF-only splitter) grows the assembly buffer
+/// without bound. Past 64 KiB the reader must warn, drop the stream
+/// and close the channel — the same self-healing exit the idle
+/// budget (High-3) uses — instead of swallowing the data and parking.
+#[tokio::test]
+async fn subscribe_stream_closes_a_stream_that_never_terminates_a_frame() {
+    /// 70 KiB of terminator-free bytes in one write: comfortably past
+    /// the 64 KiB cap.
+    const UNFRAMED_FLOOD: &[u8] = &[b'x'; 70 * 1024];
+    let addr = spawn_raw_sse_endpoint(UNFRAMED_FLOOD).await;
+    let client = HttpSyncClient::new(&format!("http://{addr}"), "flood-probe".to_string());
+    let mut doorbell = client
+        .subscribe_stream("ns", None)
+        .await
+        .expect("subscription opens against the raw endpoint");
+
+    let next = tokio::time::timeout(Duration::from_secs(5), doorbell.recv()).await;
+    assert!(
+        matches!(next, Ok(None)),
+        "an unterminated frame past the 64 KiB cap must close the channel, not buffer it forever"
+    );
+}
