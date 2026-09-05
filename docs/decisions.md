@@ -232,3 +232,15 @@
 - **Low 若干**：SYNC_HEARTBEAT_SECS 巨值 panic 循环（加上界 1..=86400）、serde 400 回显理论渗漏面、客户端 connect await 无停机门、debug 日志全量 origin（应对齐前 8 字符）、setup 重跑静默抹手写 sync_secret、enqueue 失败路径不 ring、测试缺口（Lagged/双订阅断一/陈旧 reap/双活）。
 - **审查排除的疑点（附依据）**：三源 select! 无丢唤醒（tokio 文档舞步逐路径推演）；重连无风暴；hydrate/LRU/cache-clear/sync-apply 不 ring 的正确性（payload 字段集+测试钉死）；Bot /mkdir /rm 与 web upload 走 Vfs 已覆盖；唤醒热路径原子级无误唤醒；服务端 publish 在 store 锁外、锁序单一。
 - 修复批建议待负责人裁决：P1=High-1/2/3（三处均小修）；P2=Med-1 帧切分；P3=Med-2 client_id 双活（含语义裁决）；Low 捎带。
+
+## 2026-09-05 准实时复审修复批 P1+P2+P3（fix/realtime-review-fixes，0.7.1）
+
+- **P1 三 High**：①WebDAV DELETE（remove_file/remove_dir）补唤醒（Explorer 删除的墓碑即时推送）；②web /api/delete 改走 `Vfs::remove_file`（消灭路由内复制的 pending 保护逻辑、顺带清缓存副本；**IsDirectory 分支保留直删+补唤醒**——Vfs 无 remove_dir、UI/基线支持目录删除，裁决为纯文件路径走 Vfs）；③SSE reader 的 frame 读套 90s 空闲死线（半开连接自杀式断流→既有重连链自愈；服务端 20s 心跳为活性探针；注入 seam `with_frame_idle_timeout`）。
+- **P2（Med-1）**：帧切分识别 `
+
+`/`
+
+`/`` 三合法界（新签名返回 (content_len, term_len)，纯 LF 流切点逐字节不变、单测钉死）；`pending` 缓冲 64KB 上限（超限 warn+断流重连）。审查指出的「CRLF 测试只测内容解析」误信源已补流级三测。
+- **P3（Med-2）**：EventHub 增 per-(ns,client_id) 活跃订阅计数（与 receiver 创建同临界区；pump 退出唯一清理点递减、先于 receiver drop）；双活（≥2）时**不跳过且事件 origin 置 None 下发**（客户端二次跳过自然放行、回声走幂等闸；单活保持省一轮 pass 优化不变）；双活出现即 warn（ns/client 各前 8 字符，提示 db 拷贝嫌疑）——静默退化变可诊断。客户端零改动。
+- **门禁**：win workspace 524 / wsl 三 crate 427 全绿（+14）；fmt/clippy 零警告；三单元红→绿断言零漂移（P1 单元 3 绿 commit 的新增对照测试为增量非改动）。
+- **遗留**：Low 项未动（SYNC_HEARTBEAT 上界 panic 循环、serde 400 回显、connect 停机门、debug 全量 origin、setup 抹 secret、enqueue 失败唤醒、测试缺口四项）——decisions 上一条挂账。

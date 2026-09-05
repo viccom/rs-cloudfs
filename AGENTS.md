@@ -47,7 +47,7 @@ M2 已完成第二单元（34e2476 红 + 356009c 绿，10 测试）：纯适配�
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 全部 510 测试（core 276 + sync 58 + cli 83 + telegram 29 + webdav 28 + web 17 + platform 20；#[ignore] 真机/真网项照旧）
+cargo test --workspace --no-fail-fast            # 全部 524 测试（core 276 + sync 61 + cli 90 + telegram 29 + webdav 30 + web 18 + platform 20；#[ignore] 真机/真网项照旧）
 
 ## 待人工总清单（自动交付完成后剩余项）
 1. **真机 bot token 冒烟**：config（setup/migrate 产物）→ `cydrive run` → Explorer Y: 盘拖入/下载/播放；三档文件（100MB/2GB/3GB 分块）+ FloodWait 实测
