@@ -613,6 +613,55 @@ async fn rename_rings_the_sync_wake() {
         .expect("rename must ring the sync wake");
 }
 
+/// DELETE rings the sync wake too (review High-1): a deletion is the
+/// tombstone's origin — Explorer's remove_file is the main delete
+/// path, and without a ring the tombstone waits for the sync interval.
+/// The row is uploaded (pending rows are refused by the guard — the
+/// wake is asserted on the deletable shape, not the guarded one).
+#[tokio::test]
+async fn remove_file_rings_the_sync_wake() {
+    use std::time::Duration;
+
+    let (_dir, db, _cache_root, mock, vfs, fs) = test_env(u64::MAX).await;
+    seed_remote_file(&db, &mock, "/wake-doomed.bin", b"payload", 2).await;
+
+    let notifier = vfs.sync_notifier();
+    let wake = notifier.notified();
+    tokio::pin!(wake);
+    wake.as_mut().enable();
+
+    fs.remove_file(&DavPath::new("/wake-doomed.bin").expect("path"))
+        .await
+        .expect("remove file");
+
+    tokio::time::timeout(Duration::from_secs(1), wake.as_mut())
+        .await
+        .expect("remove_file must ring the sync wake");
+}
+
+/// The directory face of the same contract (review High-1): an
+/// Explorer folder delete is a files-row mutation like any other.
+#[tokio::test]
+async fn remove_dir_rings_the_sync_wake() {
+    use std::time::Duration;
+
+    let (_dir, db, _cache_root, _mock, vfs, fs) = test_env(u64::MAX).await;
+    seed_row(&db, "/wake-empty-dir", true, 0);
+
+    let notifier = vfs.sync_notifier();
+    let wake = notifier.notified();
+    tokio::pin!(wake);
+    wake.as_mut().enable();
+
+    fs.remove_dir(&DavPath::new("/wake-empty-dir").expect("path"))
+        .await
+        .expect("remove empty dir");
+
+    tokio::time::timeout(Duration::from_secs(1), wake.as_mut())
+        .await
+        .expect("remove_dir must ring the sync wake");
+}
+
 /// 10. remove_file: row and cached copy deleted; the remote is never
 ///     touched (Python `handle_delete` parity — no telegram delete).
 #[tokio::test]
