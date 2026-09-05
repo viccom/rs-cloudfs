@@ -47,7 +47,7 @@ M2 已完成第二单元（34e2476 红 + 356009c 绿，10 测试）：纯适配�
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 全部 436 测试（core 248+1ignored基准 + sync 25 + telegram 29 + webdav 27 + web 17 + cli 70+1ignored + platform 20；#[ignore] 共 4 = 3 真机项 + keyring 往返）
+cargo test --workspace --no-fail-fast            # 全部 449 测试（core 254+1ignored基准 + sync 33 + telegram 29 + webdav 27 + web 17 + cli 75+1ignored+1ignored真网络https + platform 20；#[ignore] 共 5 = 3 真机项 + keyring 往返 + https 真网络）
 
 ## 待人工总清单（自动交付完成后剩余项）
 1. **真机 bot token 冒烟**：config（setup/migrate 产物）→ `cydrive run` → Explorer Y: 盘拖入/下载/播放；三档文件（100MB/2GB/3GB 分块）+ FloodWait 实测
@@ -56,7 +56,8 @@ cargo test --workspace --no-fail-fast            # 全部 436 测试（core 248+
 4. **#[ignore] 真机测试 ×3**：mount/unmount 往返、注册表调优、keyring 往返（管理员）
 5. **push 激活 CI**（本地三步门禁已等效预验）；cargo deny advisories（需 github.com 连通）；cargo-dist 实跑（发布时刻）
 6. **性能真机对照**：PROPFIND XML 层与 2GB 吞吐（离线 DB 层基准已 0.32/2.7ms）
-8. **sync server 生产部署（人工）**：cydrive-sync-server.exe（Windows 构建产物已放 D:\Toolss-CyDrive；Linux 服务器需自建 release）部署到负责人服务器 + deploy/cydrive-sync.service + SYNC_SECRET + 反代 TLS；随后各机 config.toml 配 sync_url
+8. **sync server 生产部署（人工）**：cydrive-sync-server.exe（Windows 构建产物已放 D:\Tools
+s-CyDrive；Linux 服务器需自建 release）部署到负责人服务器 + deploy/cydrive-sync.service + SYNC_SECRET + 反代 TLS；随后各机 config.toml 配 sync_url
 7. 可选后续：rs-CyDrive README 刷新（M0 时代内容已过时）、分支合并策略（feat/m2-telegram 含全部工作，main 落后）
 cargo clippy -p cydrive-core --all-targets -- -D warnings
 cargo fmt --all -- --check
