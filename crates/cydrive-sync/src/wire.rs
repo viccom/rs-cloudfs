@@ -16,6 +16,12 @@
 //!   the client upgrades — expected; the 403 body names the fix |
 //! | server without a configured secret | both endpoints stay open —
 //!   pure loopback / tunnel deployments keep the old behavior |
+//!
+//! The SSE doorbell batch adds the same-shaped optional `client_id`
+//! to push/pull plus a `SubscribeRequest`/`SubscribeEvent` pair: all
+//! optional fields follow the `secret` pattern (`default` +
+//! skip-when-`None`), so old clients and old servers interoperate
+//! exactly as before — subscribing is a purely additive endpoint.
 
 use serde::{Deserialize, Serialize};
 
@@ -29,6 +35,11 @@ pub struct PushRequest {
     pub secret: Option<String>,
     /// Rows to upsert in batch order (each consumes one version).
     pub rows: Vec<PushRow>,
+    /// Who is pushing (the SSE doorbell's `origin`). Serialized away
+    /// when `None` (the `secret`-field pattern), so an old client's
+    /// push bytes are unchanged and old servers ignore the field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
 }
 
 /// One row inside a [`PushRequest`].
@@ -71,6 +82,45 @@ pub struct PullRequest {
     /// fields regardless of value — see the module matrix.)
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
+    /// Who is pulling — access-log correlation only, same optional
+    /// shape rules as `secret` (omitted when `None`, so old wire bytes
+    /// are unchanged in both directions).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+}
+
+/// `POST /v1/subscribe` request body (the SSE doorbell). Same gate as
+/// pull: a configured secret must arrive here too — a stranger must
+/// not watch the doorbell any more than read the index.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SubscribeRequest {
+    /// Namespace key to watch.
+    pub key: String,
+    /// Shared secret; required only when the server configured one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub secret: Option<String>,
+    /// This subscriber's identity: events whose `origin` equals it
+    /// (the subscriber's own pushes) are NOT delivered to this stream.
+    /// An anonymous subscriber (`None`) receives everything — pulling
+    /// is idempotent, so a foreign-origin doorbell is harmless.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub client_id: Option<String>,
+}
+
+/// One SSE doorbell frame's data payload: *that* something changed
+/// (`max_version`) and who pushed it (`origin` — `null` when the
+/// pusher sent no client_id). The field set is fixed and `origin` is
+/// always serialized (never omitted), so the client-side parser can
+/// stay dumb.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub struct SubscribeEvent {
+    /// The namespace counter after the triggering push — the client's
+    /// next pull cursor hint.
+    pub max_version: i64,
+    /// The pusher's `client_id`, or `null` if it sent none.
+    pub origin: Option<String>,
 }
 
 /// `POST /v1/pull` response body.

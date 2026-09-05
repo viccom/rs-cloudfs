@@ -65,6 +65,7 @@ fn push_request(key: &str, secret: Option<&str>, rows: Vec<PushRow>) -> String {
     serde_json::to_string(&PushRequest {
         key: key.to_string(),
         secret: secret.map(str::to_string),
+        client_id: None,
         rows,
     })
     .expect("serialize push request")
@@ -92,6 +93,7 @@ async fn pull(addr: SocketAddr, key: &str, since: i64) -> (StatusCode, Bytes) {
         key: key.to_string(),
         since,
         secret: None,
+        client_id: None,
     })
     .expect("serialize pull request");
     post(addr, "/v1/pull", request).await

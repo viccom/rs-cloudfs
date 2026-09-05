@@ -194,8 +194,8 @@ fn pull_request_client_id_shape_and_old_json_compat() {
         "a client_id-less pull stays byte-identical to the old wire form"
     );
 
-    let old: PullRequest = serde_json::from_str(r#"{"key":"k","since":7,"secret":"s3cret"}"#)
-        .unwrap();
+    let old: PullRequest =
+        serde_json::from_str(r#"{"key":"k","since":7,"secret":"s3cret"}"#).unwrap();
     assert_eq!(
         old.client_id, None,
         "old pull JSON (no client_id) must keep parsing"
@@ -238,12 +238,11 @@ fn subscribe_request_parses_full_and_minimal_shapes() {
 /// any other way, and the doorbell contract fixes the bytes).
 #[test]
 fn subscribe_event_serializes_origin_as_null_when_absent() {
-    let some =
-        serde_json::to_string(&SubscribeEvent {
-            max_version: 5,
-            origin: Some("laptop-01".to_string()),
-        })
-        .unwrap();
+    let some = serde_json::to_string(&SubscribeEvent {
+        max_version: 5,
+        origin: Some("laptop-01".to_string()),
+    })
+    .unwrap();
     assert_eq!(some, r#"{"max_version":5,"origin":"laptop-01"}"#);
 
     let none = serde_json::to_string(&SubscribeEvent {

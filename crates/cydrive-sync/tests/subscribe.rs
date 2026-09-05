@@ -172,7 +172,10 @@ async fn subscribe_receives_doorbell_events_after_push() {
             {"rel_path":"/a","deleted":false,"payload":"x"}]}"#,
     )
     .await;
-    let frame = reader.next_frame().await.expect("doorbell frame after push");
+    let frame = reader
+        .next_frame()
+        .await
+        .expect("doorbell frame after push");
     assert_eq!(frame, "data: {\"max_version\":1,\"origin\":\"pusher\"}\n\n");
 
     // a push without a client_id doorbells with origin: null
@@ -223,11 +226,8 @@ async fn origin_skip_same_client_id_hears_nothing() {
     );
 
     // the same-client_id subscriber must hear nothing in the window
-    let nothing = tokio::time::timeout(
-        Duration::from_millis(500),
-        echo_subscriber.next_frame(),
-    )
-    .await;
+    let nothing =
+        tokio::time::timeout(Duration::from_millis(500), echo_subscriber.next_frame()).await;
     assert!(
         nothing.is_err(),
         "a subscriber with the pusher's own client_id must not receive its own \
@@ -323,7 +323,10 @@ async fn dropping_the_connection_reaps_the_registry_entry() {
          Content-Length: {}\r\n\r\n{body}",
         body.len()
     );
-    socket.write_all(request.as_bytes()).await.expect("write subscribe request");
+    socket
+        .write_all(request.as_bytes())
+        .await
+        .expect("write subscribe request");
     let mut head = Vec::new();
     let mut chunk = [0u8; 512];
     loop {
@@ -339,10 +342,7 @@ async fn dropping_the_connection_reaps_the_registry_entry() {
         head.starts_with("HTTP/1.1 200"),
         "expected the subscribe stream to open, head: {head}"
     );
-    assert!(
-        head.contains("text/event-stream"),
-        "head: {head}"
-    );
+    assert!(head.contains("text/event-stream"), "head: {head}");
 
     // headers received => the receiver is registered
     assert_eq!(hub.receiver_count("ns"), 1);

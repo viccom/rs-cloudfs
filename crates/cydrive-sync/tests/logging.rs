@@ -270,8 +270,8 @@ fn push_and_pull_log_client_id_prefix_only() {
             format!("info {endpoint} completion line with client prefix").as_str(),
             |seen| {
                 seen.lines().any(|line| {
-                    line.contains(endpoint)
-                        && line.contains(&format!("client={client_prefix}"))
+                    strip_ansi(line).contains(&format!("client={client_prefix}"))
+                        && line.contains(endpoint)
                         && line.contains(NS_PREFIX)
                 })
             },
@@ -284,4 +284,24 @@ fn push_and_pull_log_client_id_prefix_only() {
         !seen.contains(client_id),
         "logs must truncate the client_id to its first 8 chars — stdout:\n{seen}"
     );
+}
+
+/// Removes tracing's ANSI color sequences so field=value assertions
+/// can match the plain text (`client=` is interrupted by the `=`
+/// styling otherwise).
+fn strip_ansi(line: &str) -> String {
+    let mut plain = String::with_capacity(line.len());
+    let mut chars = line.chars();
+    while let Some(c) = chars.next() {
+        if c == '\u{1b}' {
+            for c in chars.by_ref() {
+                if c == 'm' {
+                    break;
+                }
+            }
+        } else {
+            plain.push(c);
+        }
+    }
+    plain
 }

@@ -794,6 +794,7 @@ dependencies = [
  "anyhow",
  "axum",
  "bytes",
+ "futures-core",
  "futures-util",
  "http-body-util",
  "hyper",

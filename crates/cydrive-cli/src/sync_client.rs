@@ -233,6 +233,10 @@ impl SyncClient for HttpSyncClient {
         let request = PushRequest {
             key: key.to_string(),
             secret: secret.map(str::to_string),
+            // The SSE doorbell batch made client_id optional on the
+            // wire; this client does not send one yet (client-side
+            // subscribing is a later batch).
+            client_id: None,
             rows: push_wire_rows(rows),
         };
         let body = serde_json::to_vec(&request)
@@ -260,6 +264,8 @@ impl SyncClient for HttpSyncClient {
             // push; `None` serializes the field away entirely, keeping a
             // secretless pull byte-identical to the pre-secret wire form.
             secret: secret.map(str::to_string),
+            // Same doorbell-batch optional field as push; not sent yet.
+            client_id: None,
         };
         let body = serde_json::to_vec(&request)
             .map_err(|error| SyncError::Client(format!("serializing the pull request: {error}")))?;

@@ -14,7 +14,7 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use cydrive_sync::config::SyncServerConfig;
-use cydrive_sync::router::router;
+use cydrive_sync::router::router_with_heartbeat;
 use cydrive_sync::startup::{decide_startup, StartupDecision};
 use cydrive_sync::store::SyncStore;
 
@@ -22,7 +22,8 @@ use cydrive_sync::store::SyncStore;
 /// refusal and the usage travel together on stderr.
 const HELP_TEXT: &str = "\
 cydrive-sync-server - CyDrive lite metadata sync server: one SQLite file,
-two JSON endpoints (POST /v1/push, POST /v1/pull) behind your reverse proxy.
+JSON endpoints (POST /v1/push, POST /v1/pull) plus an SSE doorbell
+(POST /v1/subscribe) behind your reverse proxy.
 
 Usage:
   cydrive-sync-server            start the server (takes no arguments)
@@ -30,8 +31,11 @@ Usage:
 Configuration (environment variables):
   SYNC_LISTEN    listen address (default: 127.0.0.1:8290)
   SYNC_DB        SQLite database path (default: ./cydrive_sync.db)
-  SYNC_SECRET    optional shared secret; when set, every push AND pull
-                 must carry it (client: sync_secret / CYDRIVE_SYNC_SECRET)
+  SYNC_SECRET    optional shared secret; when set, every push, pull AND
+                 subscribe must carry it (client: sync_secret / CYDRIVE_SYNC_SECRET)
+  SYNC_HEARTBEAT_SECS  subscribe keepalive interval in seconds
+                 (default: 20; keep it comfortably below your proxy's
+                 read timeout)
   RUST_LOG       tracing log filter; unset defaults to info
 
 Options:
@@ -80,19 +84,20 @@ async fn run() -> Result<()> {
     tracing_subscriber::fmt().with_env_filter(filter).init();
 
     let config = SyncServerConfig::from_env().context(
-        "invalid cydrive-sync-server configuration (check SYNC_LISTEN / SYNC_DB / SYNC_SECRET)",
+        "invalid cydrive-sync-server configuration (check SYNC_LISTEN / SYNC_DB / SYNC_SECRET / SYNC_HEARTBEAT_SECS)",
     )?;
     let SyncServerConfig {
         listen,
         db_path,
         secret,
+        heartbeat,
     } = config;
 
     let store = Arc::new(
         SyncStore::open(&db_path)
             .with_context(|| format!("cannot open sync database at {}", db_path.display()))?,
     );
-    let app = router(store, secret);
+    let app = router_with_heartbeat(store, secret, heartbeat);
 
     let listener = tokio::net::TcpListener::bind(listen)
         .await
