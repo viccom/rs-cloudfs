@@ -56,6 +56,7 @@ use cydrive_telegram::transport::GrammersTransport;
 use cydrive_web::WebUiServer;
 use cydrive_webdav::{CyDriveFs, WebDavServer};
 use tokio::net::TcpStream;
+use tokio::sync::Notify;
 
 mod keyring_store;
 mod signals;
@@ -474,16 +475,19 @@ pub async fn run_with_transport(
         }
     };
 
-    // Periodic metadata sync (sync-lite Batch B4): with sync_url set, a
-    // background task runs one pass immediately at boot and then every
-    // sync_interval_secs. Any failure only warns — the served stack is
-    // never affected; shutdown aborts the task (RunHandle::shutdown).
+    // Quasi-realtime metadata sync (sync-lite B4 + doorbell batch): with
+    // sync_url set, a background task runs one pass immediately at boot,
+    // then every sync_interval_secs (fallback) — and within seconds of
+    // every local files-table change (the VFS doorbell) and every remote
+    // push (the SSE doorbell). Any failure only warns — the served stack
+    // is never affected; shutdown aborts the task (RunHandle::shutdown).
     let sync_task = spawn_periodic_sync(
         cfg,
         Arc::clone(&db),
         cache_root,
         cache_limit,
         Arc::clone(&watch),
+        vfs.sync_notifier(),
     );
 
     let (mounted_letter, mounted_point) = mount_if_configured(cfg);
@@ -877,20 +881,128 @@ pub async fn run_sync_command(cfg: &CyDriveConfig, secret: Option<&str>) -> Resu
         .with_context(|| format!("sync pass against {sync_url} failed"))
 }
 
-/// Spawns the `run` flow's periodic sync task (sync-lite Batch B4):
-/// one [`sync_once`] pass immediately at boot, then one every
-/// `sync_interval_secs`. Returns `None` when `sync_url` is unset (the
-/// feature is off) or the namespace identity is missing (a warn, never
-/// a boot failure). Every pass failure only warns — the served stack is
-/// unaffected. The task exits on its own when the shared stop gate
-/// fires; [`RunHandle::shutdown`] additionally aborts it so a pass in
-/// flight cannot delay the exit.
+/// Tuning of [`spawn_sync_doorbell`]'s reconnect loop (quasi-realtime
+/// batch). The default is [`DOORBELL_BACKOFF`]: 1s doubling to a 60s cap
+/// — a family-scale server outage heals within a minute of its end,
+/// while the fallback interval keeps freshness meanwhile.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DoorbellBackoff {
+    /// First delay after a disconnect (doubles on every further one).
+    pub initial: Duration,
+    /// Exponential cap of the delays.
+    pub max: Duration,
+}
+
+/// Production doorbell backoff: 1s doubling, capped at 60s.
+pub const DOORBELL_BACKOFF: DoorbellBackoff = DoorbellBackoff {
+    initial: Duration::from_secs(1),
+    max: Duration::from_secs(60),
+};
+
+/// The SSE doorbell task of the `run` flow (quasi-realtime batch): one
+/// long-lived subscription whose foreign-origin events ring `wake` — the
+/// SAME [`Notify`] the VFS's local-change hooks ring — so the periodic
+/// sync task runs a pass within seconds of a remote change.
+///
+/// Reconnect policy: any disconnect (stream end, read failure, rejected
+/// or timed-out handshake) warns and retries after an exponential
+/// `backoff_initial` → `backoff_max` delay; a successful (re)connection
+/// resets the backoff and rings `wake` once immediately — covering the
+/// doorbells that rang while this side was offline (pull is idempotent,
+/// so one catch-up pass is all the missed rings deserve). The whole task
+/// is best-effort: a dead or gated server only warns, and the periodic
+/// fallback keeps the drive converging.
+///
+/// Every wait is selected against the shared [`ShutdownWatch`], so the
+/// task exits promptly on shutdown (the reader task inside
+/// [`HttpSyncClient::subscribe_stream`] ends on its own once the
+/// receiver drops or the next send fails — the server's keepalive
+/// cadence bounds that lag).
+///
+/// Public as the unit-test seam of the reconnect policy (the e2e wiring
+/// is covered through [`run_with_transport`]).
+pub fn spawn_sync_doorbell(
+    client: Arc<sync_client::HttpSyncClient>,
+    key: String,
+    secret: Option<String>,
+    client_id: String,
+    wake: Arc<Notify>,
+    watch: Arc<ShutdownWatch>,
+    backoff: DoorbellBackoff,
+) -> tokio::task::JoinHandle<()> {
+    tokio::spawn(async move {
+        let mut delay = backoff.initial;
+        loop {
+            match client.subscribe_stream(&key, secret.as_deref()).await {
+                Ok(mut events) => {
+                    tracing::info!(
+                        url = client.url(),
+                        "sync doorbell connected; remote changes now trigger immediate passes"
+                    );
+                    // A fresh connection covers everything that rang
+                    // while we were offline — one catch-up pass now.
+                    wake.notify_one();
+                    delay = backoff.initial;
+                    loop {
+                        tokio::select! {
+                            event = events.recv() => match event {
+                                Some(event) => {
+                                    // Never ring our own bell: the
+                                    // server skips our pushes too, but a
+                                    // proxy forwarding frames (or an
+                                    // anonymous fallback id) must not
+                                    // echo us into a pass loop.
+                                    if event.origin.as_deref() != Some(client_id.as_str()) {
+                                        tracing::debug!(
+                                            max_version = event.max_version,
+                                            origin = ?event.origin,
+                                            "sync doorbell rang; running a pass"
+                                        );
+                                        wake.notify_one();
+                                    }
+                                }
+                                None => break, // stream ended: reconnect
+                            },
+                            _ = watch.wait() => return,
+                        }
+                    }
+                    tracing::info!("sync doorbell stream ended; reconnecting");
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "subscribing the sync doorbell failed; retrying with backoff \
+                         (the periodic fallback sync stays active)"
+                    );
+                }
+            }
+            tokio::select! {
+                _ = tokio::time::sleep(delay) => {}
+                _ = watch.wait() => return,
+            }
+            delay = delay.saturating_mul(2).min(backoff.max);
+        }
+    })
+}
+
+/// Spawns the `run` flow's periodic sync task (sync-lite Batch B4 +
+/// quasi-realtime batch): one [`sync_once`] pass immediately at boot,
+/// then one every `sync_interval_secs` — PLUS a pass within seconds of
+/// every local files-table change (the VFS doorbell `wake`, rung by the
+/// put/remove/create/inbound hooks and the upload queue's success
+/// persist) and of every remote change (the SSE doorbell task). Returns
+/// `None` when `sync_url` is unset (the feature is off) or the namespace
+/// identity is missing (a warn, never a boot failure). Every pass
+/// failure only warns — the served stack is unaffected. The task exits
+/// on its own when the shared stop gate fires; [`RunHandle::shutdown`]
+/// additionally aborts it so a pass in flight cannot delay the exit.
 fn spawn_periodic_sync(
     cfg: &CyDriveConfig,
     db: Arc<MetaDatabase>,
     cache_root: PathBuf,
     cache_limit: u64,
     watch: Arc<ShutdownWatch>,
+    wake: Arc<Notify>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let url = cfg.sync_url.clone()?;
     if !cfg.is_configured() {
@@ -916,24 +1028,51 @@ fn spawn_periodic_sync(
             String::new()
         }
     };
-    let client = sync_client::HttpSyncClient::new(&url, client_id);
+    let client = Arc::new(sync_client::HttpSyncClient::new(&url, client_id.clone()));
     let cache = CacheManager::new(cache_root, cache_limit);
     let period = Duration::from_secs(cfg.sync_interval_secs);
     tracing::info!(
         url = %url,
         interval_secs = cfg.sync_interval_secs,
-        "periodic metadata sync enabled"
+        "quasi-realtime metadata sync enabled (doorbell + fallback interval)"
     );
     Some(tokio::spawn(async move {
+        // The SSE doorbell task starts BEFORE the first pass: ordering
+        // is not load-bearing (a ring during the boot pass merely
+        // coalesces into one permit → one follow-up pass), but starting
+        // it first minimizes the window in which an early remote change
+        // would wait for the fallback tick.
+        let _doorbell = spawn_sync_doorbell(
+            Arc::clone(&client),
+            key.clone(),
+            secret.clone(),
+            client_id,
+            Arc::clone(&wake),
+            Arc::clone(&watch),
+            DOORBELL_BACKOFF,
+        );
+        // Anti-lost-wakeup pattern for select! over a Notify (tokio's
+        // documented `enable` + reset dance): the long-lived Notified is
+        // enabled at the top of every iteration, so a wake stored while
+        // another branch fired stays assigned to THIS future instead of
+        // being dropped — a local change made mid-pass still triggers
+        // the follow-up pass.
+        let wakeup = wake.notified();
+        tokio::pin!(wakeup);
         // The interval's first tick completes immediately, which is
         // exactly the desired boot-time first pass.
         let mut ticker = tokio::time::interval(period);
         loop {
+            wakeup.as_mut().enable();
             tokio::select! {
                 _ = ticker.tick() => {}
+                _ = wakeup.as_mut() => {
+                    // consumed: re-arm for the next wake
+                    wakeup.set(wake.notified());
+                }
                 _ = watch.wait() => break,
             }
-            match sync_once(&db, &cache, &client, &key, secret.as_deref()).await {
+            match sync_once(&db, &cache, client.as_ref(), &key, secret.as_deref()).await {
                 Ok(outcome) => tracing::info!(
                     applied = outcome.applied,
                     pushed = outcome.pushed,
@@ -947,6 +1086,11 @@ fn spawn_periodic_sync(
                 ),
             }
         }
+        // The doorbell child exits through the same watch; aborting here
+        // merely shortens its final sleep for the cooperative exit path
+        // (RunHandle::shutdown aborts THIS task, and the child still
+        // exits on its own watch arm).
+        _doorbell.abort();
     }))
 }
 

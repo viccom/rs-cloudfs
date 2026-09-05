@@ -216,6 +216,12 @@ impl HttpSyncClient {
         (!self.client_id.is_empty()).then(|| self.client_id.clone())
     }
 
+    /// The configured base URL (trailing slash trimmed) — the doorbell
+    /// task's log lines name the server they are talking to.
+    pub fn url(&self) -> &str {
+        &self.base_url
+    }
+
     /// POSTs `body` (JSON) to `endpoint`, enforcing the wide request
     /// budget and returning the raw response bytes of a 2xx answer.
     ///

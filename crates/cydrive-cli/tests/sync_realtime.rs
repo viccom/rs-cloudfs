@@ -29,7 +29,7 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use cydrive_cli::sync_client::HttpSyncClient;
-use cydrive_cli::{spawn_sync_doorbell, run_with_transport, RunHandle, ShutdownWatch};
+use cydrive_cli::{run_with_transport, spawn_sync_doorbell, RunHandle, ShutdownWatch};
 use cydrive_core::config::CyDriveConfig;
 use cydrive_core::database::{FileRecord, FileUpsert, MetaDatabase};
 use cydrive_core::sync::namespace_key;
@@ -140,7 +140,13 @@ async fn send(addr: SocketAddr, request: &str) -> String {
 
 /// Builds a minimal HTTP/1.1 request with Host, Connection: close and an
 /// exact Content-Length for `body`.
-fn request(method: &str, target: &str, addr: SocketAddr, extra: &[(&str, &str)], body: &str) -> String {
+fn request(
+    method: &str,
+    target: &str,
+    addr: SocketAddr,
+    extra: &[(&str, &str)],
+    body: &str,
+) -> String {
     let mut req = format!(
         "{method} {target} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n",
         addr.port()
@@ -474,8 +480,10 @@ async fn doorbell_task_skips_self_rings_foreign_and_reconnects() {
         "laptop-1".to_string(),
         Arc::clone(&wake),
         Arc::clone(&watch),
-        Duration::from_millis(50),  // initial backoff
-        Duration::from_millis(200), // backoff cap
+        cydrive_cli::DoorbellBackoff {
+            initial: Duration::from_millis(50),
+            max: Duration::from_millis(200),
+        },
     );
 
     let deadline = Instant::now() + Duration::from_secs(5);
