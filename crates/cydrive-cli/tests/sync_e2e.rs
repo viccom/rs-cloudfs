@@ -231,6 +231,45 @@ async fn wait_for_push(store: &SyncStore, key: &str) {
     }
 }
 
+/// Spawns a slow-drip HTTP endpoint: every connection gets a complete
+/// response header block plus one body byte of the promised 256, and
+/// then the connection just hangs — the "headers arrived, body
+/// trickles forever" failure mode. Raw TCP like the silent SOCKS5
+/// proxy in `connect_deadline.rs`: no HTTP machinery is needed to
+/// betray the client. Returns the bound port.
+async fn spawn_drip_body_endpoint() -> u16 {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the drip endpoint");
+    let port = listener
+        .local_addr()
+        .expect("read the drip endpoint port")
+        .port();
+    tokio::spawn(async move {
+        while let Ok((mut socket, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                // Swallow the request (a small POST) so its bytes never
+                // fill the socket buffer and stall the response side.
+                let mut sink = [0u8; 4096];
+                let _ = tokio::time::timeout(Duration::from_secs(1), socket.read(&mut sink)).await;
+                let head = "HTTP/1.1 200 OK\r\n\
+                            content-type: application/json\r\n\
+                            content-length: 256\r\n\r\n";
+                if socket.write_all(head.as_bytes()).await.is_ok() {
+                    let _ = socket.write_all(b"{").await;
+                }
+                // Never deliver the remaining 255 bytes and never
+                // close: anything waiting for the complete body blocks
+                // forever. Closing would let the reader error out
+                // immediately instead of hanging, defeating the point;
+                // the task dies with the test runtime.
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+    port
+}
+
 // ------------------------------------------------------------- scenarios ---
 
 /// Dual instances converge through the real server: A's seeded drive
@@ -445,5 +484,49 @@ async fn https_real_endpoint_handshakes_and_gets_http_status() {
     assert!(
         !status.is_empty() && status.chars().all(|c| c.is_ascii_digit()),
         "expected a real HTTP status code in the error, got: {message}"
+    );
+}
+
+/// Regression (review Low, L1): the per-request budget must cover
+/// collecting the response *body*, not only the response headers.
+/// Against an endpoint that answers headers promptly and then drips
+/// the body forever, both `pull` and `push` must return the timeout
+/// error within the injected 2s budget instead of hanging on the body
+/// read. The 15s outer guard turns a regression back into a test
+/// failure rather than a hung suite.
+#[tokio::test]
+async fn slow_body_drip_is_bounded_by_the_request_timeout() {
+    let port = spawn_drip_body_endpoint().await;
+    let url = format!("http://127.0.0.1:{port}");
+    let client = HttpSyncClient::with_request_timeout(&url, Duration::from_secs(2));
+
+    let guard = Duration::from_secs(15);
+    let error = tokio::time::timeout(guard, client.pull("ns", 0))
+        .await
+        .expect(
+            "pull must return within the request budget instead of hanging on the trickling body",
+        )
+        .expect_err("the drip endpoint never completes a body; pull must fail");
+    let SyncError::Client(message) = &error else {
+        panic!("expected a transport-level Client error, got: {error:?}");
+    };
+    assert!(
+        message.contains("/v1/pull") && message.contains("did not answer within"),
+        "the error must carry the timeout semantics: {message}"
+    );
+
+    // Same contract on the push path (both endpoints share post_json).
+    let error = tokio::time::timeout(guard, client.push("ns", None, &[]))
+        .await
+        .expect(
+            "push must return within the request budget instead of hanging on the trickling body",
+        )
+        .expect_err("the drip endpoint never completes a body; push must fail");
+    let SyncError::Client(message) = &error else {
+        panic!("expected a transport-level Client error, got: {error:?}");
+    };
+    assert!(
+        message.contains("/v1/push") && message.contains("did not answer within"),
+        "the error must carry the timeout semantics: {message}"
     );
 }

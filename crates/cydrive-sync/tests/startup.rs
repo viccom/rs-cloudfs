@@ -67,3 +67,24 @@ fn multiple_arguments_are_invalid_even_when_each_is_a_known_flag() {
         );
     }
 }
+
+/// A non-Unicode argument reaches the decision core only after the bin
+/// lossy-decodes argv (`args_os` + `to_string_lossy`, so no decode can
+/// panic), leaving U+FFFD replacement characters in the string. Such a
+/// lossy string is still an unknown argument: it must be refused with
+/// the offending (lossy) text quoted — never accepted, never a crash.
+#[test]
+fn lossy_decoded_non_unicode_argument_is_still_invalid() {
+    let lossy = format!("--bogus{}", char::REPLACEMENT_CHARACTER);
+    let StartupDecision::Invalid(message) = decide_startup(&[lossy.clone()]) else {
+        panic!("a lossy-decoded non-Unicode argument must be refused, not accepted");
+    };
+    assert!(
+        message.contains(&lossy),
+        "message should quote the lossy argument: {message}"
+    );
+    assert!(
+        message.contains("--help"),
+        "message should point at --help for usage: {message}"
+    );
+}

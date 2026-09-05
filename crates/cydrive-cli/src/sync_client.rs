@@ -123,11 +123,14 @@ pub struct HttpSyncClient {
     base_url: String,
     /// The legacy client (cheap to keep for the process lifetime).
     client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
+    /// Per-request budget (see [`HttpSyncClient::with_request_timeout`]).
+    request_timeout: Duration,
 }
 
 impl HttpSyncClient {
     /// Builds the client for `sync_url` (the config layer has already
-    /// required the `http://`/`https://` prefix). The connector is the
+    /// required the `http://`/`https://` prefix) with the default
+    /// [`SYNC_HTTP_TIMEOUT`] budget. The connector is the
     /// same plain hyper-util `HttpConnector` the http-only client used,
     /// wrapped for TLS so `https` handshakes via rustls/webpki-roots
     /// while `http` keeps the previous behavior. The inner connector
@@ -135,6 +138,14 @@ impl HttpSyncClient {
     /// hyper-rustls' `build()`) — the scheme gate lives in the wrapper,
     /// which routes https to TLS and everything else straight through.
     pub fn new(sync_url: &str) -> Self {
+        Self::with_request_timeout(sync_url, SYNC_HTTP_TIMEOUT)
+    }
+
+    /// [`HttpSyncClient::new`] with an explicit per-request budget —
+    /// the seam the slow-endpoint regression tests use to keep their
+    /// drip windows seconds instead of minutes; production callers use
+    /// [`HttpSyncClient::new`] and keep the wide 300s default.
+    pub fn with_request_timeout(sync_url: &str, request_timeout: Duration) -> Self {
         let mut http = HttpConnector::new();
         http.enforce_http(false);
         let connector = HttpsConnectorBuilder::new()
@@ -145,6 +156,7 @@ impl HttpSyncClient {
         Self {
             base_url: sync_url.trim_end_matches('/').to_string(),
             client: Client::builder(TokioExecutor::new()).build(connector),
+            request_timeout,
         }
     }
 
@@ -162,12 +174,12 @@ impl HttpSyncClient {
                     "building the {endpoint} request for {url}: {error}"
                 ))
             })?;
-        let response = tokio::time::timeout(SYNC_HTTP_TIMEOUT, self.client.request(request))
+        let response = tokio::time::timeout(self.request_timeout, self.client.request(request))
             .await
             .map_err(|_elapsed| {
                 SyncError::Client(format!(
                     "{endpoint} to {url} did not answer within {}s",
-                    SYNC_HTTP_TIMEOUT.as_secs()
+                    self.request_timeout.as_secs()
                 ))
             })?
             .map_err(|error| {
