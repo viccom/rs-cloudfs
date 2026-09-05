@@ -314,3 +314,41 @@ async fn subscribe_stream_recovers_from_a_silent_half_open_stream() {
         "the reader must close the channel on a silent stream instead of parking forever"
     );
 }
+
+/// The contrast face of High-3: the idle budget must measure the gap
+/// BETWEEN frames, not the stream's total age. Keepalives flowing well
+/// inside a scaled-down budget (100ms heartbeat vs a 2s budget) keep
+/// the stream alive far past the budget (3s of pure keepalives), and
+/// the doorbell still delivers when a push lands.
+#[tokio::test]
+async fn subscribe_stream_survives_healthy_keepalives_under_the_idle_budget() {
+    let (addr, _hub) = spawn_router(None, Duration::from_millis(100)).await;
+    let url = format!("http://{addr}");
+    let ns = "healthy-ns";
+
+    let client = HttpSyncClient::with_request_timeout(
+        &url,
+        Duration::from_secs(10),
+        "healthy-probe".to_string(),
+    )
+    .with_frame_idle_timeout(Duration::from_secs(2));
+    let mut doorbell = client
+        .subscribe_stream(ns, None)
+        .await
+        .expect("subscription opens");
+
+    // Longer than the injected idle budget, covered only by keepalives:
+    // each comment frame resets the clock, the stream must stay open.
+    sleep(Duration::from_millis(3_000)).await;
+
+    let pusher = HttpSyncClient::new(&url, "pusher".to_string());
+    pusher
+        .push(ns, None, &[row_update("/alive.txt")])
+        .await
+        .expect("push accepted");
+    let event = tokio::time::timeout(Duration::from_secs(2), doorbell.recv())
+        .await
+        .expect("the doorbell must still be alive after the keepalive window")
+        .expect("the stream stayed open");
+    assert_eq!(event.max_version, 1);
+}

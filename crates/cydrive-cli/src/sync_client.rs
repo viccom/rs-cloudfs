@@ -324,10 +324,14 @@ impl HttpSyncClient {
     /// terminator (buffering across TCP chunk boundaries), `data:`
     /// payloads are JSON-parsed onto the channel, comment/keepalive
     /// frames are ignored, and a malformed data line warns and is
-    /// SKIPPED — a bad frame must never drop the connection. The
-    /// receiver closes when the stream ends or errors (body EOF, read
-    /// error) or when this side drops it (the next send then ends the
-    /// reader task); the caller treats a closed channel as "reconnect".
+    /// SKIPPED — a bad frame must never drop the connection. Each
+    /// read is bounded by the idle budget ([`FRAME_IDLE_TIMEOUT`]): a
+    /// stream silent past it — the half-open shape TCP never notices —
+    /// is declared dead and the reader exits like any stream error.
+    /// The receiver closes when the stream ends or errors (body EOF,
+    /// read error, idle budget) or when this side drops it (the next
+    /// send then ends the reader task); the caller treats a closed
+    /// channel as "reconnect".
     pub async fn subscribe_stream(
         &self,
         key: &str,
@@ -392,6 +396,7 @@ impl HttpSyncClient {
         }
 
         let mut stream = response.into_body();
+        let idle = self.frame_idle_timeout;
         let (tx, rx) = tokio::sync::mpsc::channel(SUBSCRIBE_EVENT_CAPACITY);
         tokio::spawn(async move {
             // Frame assembly buffer: TCP may split or coalesce SSE frames
@@ -399,17 +404,31 @@ impl HttpSyncClient {
             // terminator completes a frame.
             let mut pending: Vec<u8> = Vec::new();
             loop {
-                let frame = match stream.frame().await {
-                    Some(Ok(frame)) => frame,
-                    Some(Err(error)) => {
+                // Liveness deadline (review High-3): a half-open
+                // connection never errors and never EOFs — without this
+                // budget the read below parks forever and the reconnect
+                // chain never runs. Any frame (data or keepalive
+                // comment) resets the clock, so a heartbeat stream never
+                // trips it; the deadline only ends streams that have
+                // gone silent well past their heartbeat.
+                let frame = match tokio::time::timeout(idle, stream.frame()).await {
+                    Ok(Some(Ok(frame))) => frame,
+                    Ok(Some(Err(error))) => {
                         tracing::warn!(
                             %error,
                             "the sync doorbell stream failed; the subscriber will reconnect"
                         );
                         break;
                     }
-                    None => {
+                    Ok(None) => {
                         tracing::debug!("the sync doorbell stream ended; reconnecting");
+                        break;
+                    }
+                    Err(_elapsed) => {
+                        tracing::warn!(
+                            "no SSE frame within {}s (idle/dead stream), reconnecting",
+                            idle.as_secs_f64()
+                        );
                         break;
                     }
                 };
