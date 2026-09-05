@@ -3,6 +3,7 @@
 //! repo-wide "empty string = unset" convention.
 
 use std::path::PathBuf;
+use std::time::Duration;
 
 use cydrive_sync::config::{parse_config, ConfigError, DEFAULT_DB_FILENAME, DEFAULT_LISTEN};
 
@@ -54,4 +55,40 @@ fn invalid_listen_address_is_rejected_with_the_offending_value() {
     );
     // the error type is address-specific (drives the bin's exit path)
     assert!(matches!(error, ConfigError::InvalidListen { .. }));
+}
+
+// ---- SSE doorbell batch: SYNC_HEARTBEAT_SECS ----
+
+/// Unset/empty heartbeat falls back to the 20 s default (the SSE
+/// keepalive cadence, sized to outlive nginx's default 60 s
+/// proxy_read_timeout several times over).
+#[test]
+fn default_heartbeat_is_20s() {
+    let config = parse_config(DEFAULT_LISTEN, DEFAULT_DB_FILENAME, None, "").unwrap();
+    assert_eq!(config.heartbeat, Duration::from_secs(20));
+}
+
+/// An explicit heartbeat wins — this is the knob the short-heartbeat
+/// binary smoke and unusual proxy timeouts tune.
+#[test]
+fn heartbeat_secs_override() {
+    let config = parse_config(DEFAULT_LISTEN, DEFAULT_DB_FILENAME, None, "1").unwrap();
+    assert_eq!(config.heartbeat, Duration::from_secs(1));
+}
+
+/// Zero (a spinning keepalive) and garbage are hard errors naming the
+/// offending value.
+#[test]
+fn heartbeat_zero_and_garbage_are_rejected() {
+    for bad in ["0", "abc"] {
+        let error = parse_config(DEFAULT_LISTEN, DEFAULT_DB_FILENAME, None, bad).unwrap_err();
+        assert!(
+            matches!(error, ConfigError::InvalidHeartbeat { .. }),
+            "{bad}: {error}"
+        );
+        assert!(
+            error.to_string().contains(bad),
+            "error should name the bad value: {error}"
+        );
+    }
 }

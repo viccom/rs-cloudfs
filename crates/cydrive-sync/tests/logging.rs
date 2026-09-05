@@ -247,3 +247,41 @@ fn requests_log_ns_prefix_elapsed_and_never_the_secret() {
         "logs must truncate the namespace key to its first 8 chars — stdout:\n{seen}"
     );
 }
+
+/// A request carrying a `client_id` (SSE doorbell batch) must log it
+/// the same way as the namespace key: first 8 chars only, on push and
+/// pull alike — the full identifier never lands in the logs.
+#[test]
+fn push_and_pull_log_client_id_prefix_only() {
+    let child = spawn(Some("info"), Some(SECRET));
+
+    let client_id = "client-abcdefgh1234";
+    let client_prefix = "client-a";
+    let push_body = format!(
+        r#"{{"key":"{NS}","secret":"{SECRET}","client_id":"{client_id}","rows":[{{"rel_path":"/a","deleted":false,"payload":"x"}}]}}"#
+    );
+    assert_eq!(post(&child.addr, "/v1/push", &push_body), 200);
+    let pull_body =
+        format!(r#"{{"key":"{NS}","since":0,"secret":"{SECRET}","client_id":"{client_id}"}}"#);
+    assert_eq!(post(&child.addr, "/v1/pull", &pull_body), 200);
+
+    for endpoint in ["push", "pull"] {
+        child.wait_for_stdout(
+            format!("info {endpoint} completion line with client prefix").as_str(),
+            |seen| {
+                seen.lines().any(|line| {
+                    line.contains(endpoint)
+                        && line.contains(&format!("client={client_prefix}"))
+                        && line.contains(NS_PREFIX)
+                })
+            },
+        );
+    }
+
+    // confidentiality: the full client_id must never appear
+    let seen = child.drain_stdout();
+    assert!(
+        !seen.contains(client_id),
+        "logs must truncate the client_id to its first 8 chars — stdout:\n{seen}"
+    );
+}

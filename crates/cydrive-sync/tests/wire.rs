@@ -3,7 +3,8 @@
 //! client and server cannot drift.
 
 use cydrive_sync::wire::{
-    PullRequest, PullResponse, PulledRow, PushRequest, PushResponse, PushRow,
+    PullRequest, PullResponse, PulledRow, PushRequest, PushResponse, PushRow, SubscribeEvent,
+    SubscribeRequest,
 };
 
 #[test]
@@ -118,4 +119,146 @@ fn wire_rows_roundtrip_through_json() {
     };
     let back: PulledRow = serde_json::from_str(&serde_json::to_string(&pulled).unwrap()).unwrap();
     assert_eq!(back, pulled);
+}
+
+// ---- SSE doorbell batch: optional `client_id`, SubscribeRequest,
+// SubscribeEvent ----
+
+/// PushRequest's `client_id`: `Some` serializes the field, `None`
+/// omits it entirely (the secret-field pattern), and the
+/// pre-client_id push JSON of old clients keeps parsing with
+/// `client_id: None`.
+#[test]
+fn push_request_client_id_shape_and_old_json_compat() {
+    let with = serde_json::to_value(PushRequest {
+        key: "k".to_string(),
+        secret: None,
+        client_id: Some("laptop-01".to_string()),
+        rows: Vec::new(),
+    })
+    .unwrap();
+    assert_eq!(
+        with.get("client_id").and_then(|v| v.as_str()),
+        Some("laptop-01"),
+        "client_id=Some must serialize the field: {with}"
+    );
+
+    let without = serde_json::to_value(PushRequest {
+        key: "k".to_string(),
+        secret: None,
+        client_id: None,
+        rows: Vec::new(),
+    })
+    .unwrap();
+    assert!(
+        without.get("client_id").is_none(),
+        "client_id=None must not serialize a key: {without}"
+    );
+
+    let old: PushRequest =
+        serde_json::from_str(r#"{"key":"deadbeef","secret":"s3cret","rows":[]}"#).unwrap();
+    assert_eq!(
+        old.client_id, None,
+        "old push JSON (no client_id) must keep parsing"
+    );
+}
+
+/// PullRequest's `client_id`: same shape rules, and the whole
+/// client_id-less pull stays byte-identical to the pre-doorbell wire
+/// form (both optional fields vanish when `None`).
+#[test]
+fn pull_request_client_id_shape_and_old_json_compat() {
+    let with = serde_json::to_value(PullRequest {
+        key: "k".to_string(),
+        since: 7,
+        secret: None,
+        client_id: Some("desktop-9".to_string()),
+    })
+    .unwrap();
+    assert_eq!(
+        with.get("client_id").and_then(|v| v.as_str()),
+        Some("desktop-9"),
+        "client_id=Some must serialize the field: {with}"
+    );
+
+    let without = serde_json::to_value(PullRequest {
+        key: "k".to_string(),
+        since: 7,
+        secret: None,
+        client_id: None,
+    })
+    .unwrap();
+    assert_eq!(
+        without,
+        serde_json::json!({"key": "k", "since": 7}),
+        "a client_id-less pull stays byte-identical to the old wire form"
+    );
+
+    let old: PullRequest = serde_json::from_str(r#"{"key":"k","since":7,"secret":"s3cret"}"#)
+        .unwrap();
+    assert_eq!(
+        old.client_id, None,
+        "old pull JSON (no client_id) must keep parsing"
+    );
+}
+
+/// SubscribeRequest: the minimal `{"key"}` form is the old-shape byte
+/// form (both optional fields omitted when `None`), the full shape
+/// parses field by field.
+#[test]
+fn subscribe_request_parses_full_and_minimal_shapes() {
+    let full: SubscribeRequest =
+        serde_json::from_str(r#"{"key":"deadbeef","secret":"s3cret","client_id":"laptop-01"}"#)
+            .unwrap();
+    assert_eq!(full.key, "deadbeef");
+    assert_eq!(full.secret.as_deref(), Some("s3cret"));
+    assert_eq!(full.client_id.as_deref(), Some("laptop-01"));
+
+    let minimal: SubscribeRequest = serde_json::from_str(r#"{"key":"k"}"#).unwrap();
+    assert_eq!(minimal.secret, None);
+    assert_eq!(minimal.client_id, None);
+    let back = serde_json::to_value(&minimal).unwrap();
+    assert_eq!(back, serde_json::json!({"key": "k"}));
+
+    let with_client = serde_json::to_value(SubscribeRequest {
+        key: "k".to_string(),
+        secret: None,
+        client_id: Some("laptop-01".to_string()),
+    })
+    .unwrap();
+    assert_eq!(
+        with_client,
+        serde_json::json!({"key": "k", "client_id": "laptop-01"})
+    );
+}
+
+/// The SSE event payload is a fixed two-field shape; `origin` is
+/// ALWAYS present — `null` when the pusher sent no client_id (the
+/// subscriber cannot distinguish "no origin" from "origin unknown"
+/// any other way, and the doorbell contract fixes the bytes).
+#[test]
+fn subscribe_event_serializes_origin_as_null_when_absent() {
+    let some =
+        serde_json::to_string(&SubscribeEvent {
+            max_version: 5,
+            origin: Some("laptop-01".to_string()),
+        })
+        .unwrap();
+    assert_eq!(some, r#"{"max_version":5,"origin":"laptop-01"}"#);
+
+    let none = serde_json::to_string(&SubscribeEvent {
+        max_version: 5,
+        origin: None,
+    })
+    .unwrap();
+    assert_eq!(none, r#"{"max_version":5,"origin":null}"#);
+
+    let back: SubscribeEvent = serde_json::from_str(&none).unwrap();
+    assert_eq!(
+        back,
+        SubscribeEvent {
+            max_version: 5,
+            origin: None,
+        }
+    );
 }

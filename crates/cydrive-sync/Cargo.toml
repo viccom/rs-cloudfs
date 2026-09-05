@@ -53,4 +53,11 @@ hyper-util = { version = "0.1", default-features = false, features = [
     "tokio",
 ] }
 http-body-util = "0.1"
+# SSE e2e: chunk-wise reading of a streaming response body
+# (BodyExt::into_data_stream + StreamExt) — same lock-tree version as
+# the axum graph.
+futures-util = "0.3"
+# SSE e2e: raw-socket subscribe (deterministic disconnect) needs the
+# async io extension traits.
+tokio = { version = "1", features = ["io-util"] }
 tempfile = "3"
