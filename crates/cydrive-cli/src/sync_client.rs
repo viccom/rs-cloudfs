@@ -70,6 +70,17 @@ pub const ERROR_BODY_MAX_CHARS: usize = 512;
 /// A handful of frames of slack is all the merging the model needs.
 const SUBSCRIBE_EVENT_CAPACITY: usize = 16;
 
+/// Hard cap on the doorbell reader's frame-assembly buffer (review
+/// Med-1): a stream that never reaches ANY terminator — a malicious
+/// slow drip, or (before this fix) a compliant CRLF stream fed to the
+/// LF-only splitter — would grow `pending` without bound. Past the
+/// cap the reader warns, drops the stream and lets the caller's
+/// reconnect chain heal, the same self-healing exit the idle budget
+/// uses. 64 KiB leaves several hundred times the headroom a doorbell
+/// frame needs (a hundred-odd bytes of JSON), so the cap can only
+/// trip on a broken or hostile stream, never on a healthy one.
+const MAX_PENDING_FRAME_BYTES: usize = 64 * 1024;
+
 /// Parses one complete SSE frame (its lines, without the blank-line
 /// terminator) into the joined `data:` payload, per the SSE
 /// field-processing rules the doorbell server speaks:
@@ -328,6 +339,9 @@ impl HttpSyncClient {
     /// read is bounded by the idle budget ([`FRAME_IDLE_TIMEOUT`]): a
     /// stream silent past it — the half-open shape TCP never notices —
     /// is declared dead and the reader exits like any stream error.
+    /// The assembly buffer is likewise bounded (64 KiB, review Med-1):
+    /// a stream with no frame terminator in sight is dropped the same
+    /// way instead of growing the buffer without bound.
     /// The receiver closes when the stream ends or errors (body EOF,
     /// read error, idle budget) or when this side drops it (the next
     /// send then ends the reader task); the caller treats a closed
@@ -436,9 +450,23 @@ impl HttpSyncClient {
                     continue; // trailers and other non-data frames
                 };
                 pending.extend_from_slice(chunk);
-                while let Some(split) = find_frame_terminator(&pending) {
-                    let frame_bytes: Vec<u8> = pending.drain(..split + 2).collect();
-                    let frame_text = String::from_utf8_lossy(&frame_bytes[..frame_bytes.len() - 2]);
+                // Bound the assembly buffer (Med-1): without a cap a
+                // stream that never reaches a terminator grows
+                // `pending` forever; past the cap the stream is broken
+                // or hostile — drop it and let the reconnect chain
+                // heal, the same exit the idle budget above uses.
+                if pending.len() > MAX_PENDING_FRAME_BYTES {
+                    tracing::warn!(
+                        bytes = pending.len(),
+                        "no complete SSE frame within {} KiB, dropping the doorbell stream \
+                         (the subscriber will reconnect)",
+                        MAX_PENDING_FRAME_BYTES / 1024
+                    );
+                    break;
+                }
+                while let Some((content_len, term_len)) = find_frame_terminator(&pending) {
+                    let frame_bytes: Vec<u8> = pending.drain(..content_len + term_len).collect();
+                    let frame_text = String::from_utf8_lossy(&frame_bytes[..content_len]);
                     let Some(data) = sse_frame_data(&frame_text) else {
                         continue; // comment / non-data frame (keepalive)
                     };
@@ -467,10 +495,48 @@ impl HttpSyncClient {
     }
 }
 
-/// Index of the `\n\n` frame terminator in `buf`, pointing at the first
-/// `\n` (the frame is `buf[..=index+1]`); `None` while incomplete.
-fn find_frame_terminator(buf: &[u8]) -> Option<usize> {
-    buf.windows(2).position(|window| window == b"\n\n")
+/// The first complete frame terminator in `buf`, as
+/// `(content_len, term_len)`: the frame's lines are
+/// `buf[..content_len]` and the blank-line terminator itself spans
+/// `term_len` more bytes (consume `content_len + term_len` in total).
+/// Per the SSE spec a line may end in CRLF, LF or CR, so a blank
+/// line — the frame terminator — is any of `\r\n\r\n`, `\n\n` or
+/// `\r\r` (review Med-1: an LF-only window never fires on the other
+/// two, so a compliant CRLF stream buffered forever); the FIRST
+/// complete one wins. `None` while no full frame has arrived.
+/// Mixed terminators across the two lines (`\r\n\n`, `\n\r\n`) are
+/// not recognized: the doorbell server — like every SSE stack in the
+/// chain — emits one consistent line ending.
+fn find_frame_terminator(buf: &[u8]) -> Option<(usize, usize)> {
+    let mut i = 0;
+    while i + 1 < buf.len() {
+        match buf[i] {
+            // LF line ending: the frame completes when the next line
+            // is empty too (another bare LF).
+            b'\n' => {
+                if buf[i + 1] == b'\n' {
+                    return Some((i, 2));
+                }
+                i += 1;
+            }
+            // A CR opening a CRLF line ending.
+            b'\r' if buf[i + 1] == b'\n' => {
+                if buf[i..].starts_with(b"\r\n\r\n") {
+                    return Some((i, 4));
+                }
+                i += 2; // an in-frame CRLF line ending
+            }
+            // A bare-CR line ending: two in a row terminate a frame.
+            b'\r' => {
+                if buf[i + 1] == b'\r' {
+                    return Some((i, 2));
+                }
+                i += 1; // an in-frame bare-CR line ending
+            }
+            _ => i += 1,
+        }
+    }
+    None
 }
 
 #[async_trait]
@@ -530,5 +596,42 @@ impl SyncClient for HttpSyncClient {
             ))
         })?;
         Ok(pull_core_result(response))
+    }
+}
+
+#[cfg(test)]
+mod terminator_tests {
+    use super::find_frame_terminator;
+
+    #[test]
+    fn lf_frames_keep_the_previous_cut() {
+        // The pre-Med-1 splitter cut at the first `\n` of a `\n\n`
+        // window; (content_len, 2) keeps byte-identical behavior for
+        // pure-LF streams.
+        assert_eq!(find_frame_terminator(b"data: x\n\n"), Some((7, 2)));
+        assert_eq!(find_frame_terminator(b"a\n\nb\n\n"), Some((1, 2)));
+        assert_eq!(find_frame_terminator(b""), None);
+        assert_eq!(find_frame_terminator(b"\n"), None);
+        assert_eq!(find_frame_terminator(b"no terminator"), None);
+        // a trailing lone LF waits for more bytes
+        assert_eq!(find_frame_terminator(b"data: x\n"), None);
+    }
+
+    #[test]
+    fn crlf_frames_terminate() {
+        assert_eq!(find_frame_terminator(b"data: x\r\n\r\n"), Some((7, 4)));
+        // in-frame CRLF line endings do not terminate
+        assert_eq!(find_frame_terminator(b"data: a\r\ndata: b\r\n"), None);
+        // a trailing CRLF waits for the blank second line
+        assert_eq!(find_frame_terminator(b"data: x\r\n\r"), None);
+        // the first complete terminator wins
+        assert_eq!(find_frame_terminator(b"a\r\n\r\nb\r\n\r\n"), Some((1, 4)));
+    }
+
+    #[test]
+    fn cr_only_frames_terminate() {
+        assert_eq!(find_frame_terminator(b"data: x\r\r"), Some((7, 2)));
+        // a single bare CR is an in-frame line ending
+        assert_eq!(find_frame_terminator(b"data: a\rdata: b\r"), None);
     }
 }
