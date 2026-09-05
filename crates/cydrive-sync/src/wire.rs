@@ -101,9 +101,13 @@ pub struct SubscribeRequest {
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub secret: Option<String>,
     /// This subscriber's identity: events whose `origin` equals it
-    /// (the subscriber's own pushes) are NOT delivered to this stream.
-    /// An anonymous subscriber (`None`) receives everything — pulling
-    /// is idempotent, so a foreign-origin doorbell is harmless.
+    /// (the subscriber's own pushes) are NOT delivered to this stream
+    /// — except while the id is dual-active (two live subscriptions
+    /// share it, the copied-db accident; see `events`' ruling), in
+    /// which case they ARE delivered, with the origin rewritten to
+    /// `null`. An anonymous subscriber (`None`) receives everything —
+    /// pulling is idempotent, so a foreign-origin doorbell is
+    /// harmless.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub client_id: Option<String>,
 }
@@ -119,7 +123,13 @@ pub struct SubscribeEvent {
     /// The namespace counter after the triggering push — the client's
     /// next pull cursor hint.
     pub max_version: i64,
-    /// The pusher's `client_id`, or `null` if it sent none.
+    /// The pusher's `client_id`, or `null` if it sent none — or if the
+    /// server rewrote it: the one subscriber-side rewrite is the
+    /// dual-active case (two live subscriptions share the origin id,
+    /// the copied-db accident), where the pump delivers the
+    /// self-origin event with a `null` origin so the CLIENT's own skip
+    /// (origin equals its id) cannot re-silence the very doorbell this
+    /// delivery exists to restore. See `events`' dual-active ruling.
     pub origin: Option<String>,
 }
 
