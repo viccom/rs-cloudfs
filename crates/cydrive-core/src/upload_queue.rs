@@ -26,7 +26,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
-use tokio::sync::{mpsc, Mutex as AsyncMutex};
+use tokio::sync::{mpsc, Mutex as AsyncMutex, Notify};
 use tokio::task::JoinHandle;
 
 use crate::cache::CacheManager;
@@ -145,11 +145,18 @@ pub struct UploadQueueConfig {
     /// `is_encrypted` flag is set *and* this is `Some`); default `None`
     /// keeps every upload byte-identical to the plaintext path.
     pub encryption_password: Option<String>,
+    /// Sync doorbell handle rung by the workers after a successful
+    /// post-upload persist (the quasi-realtime batch's "upload success
+    /// pushes" key point). `None` (default) keeps a standalone queue
+    /// silent — the [`crate::vfs::Vfs`] constructor injects its own
+    /// `Notify` so local-change hooks and upload successes share one
+    /// doorbell.
+    pub sync_wake: Option<Arc<Notify>>,
 }
 
 impl Default for UploadQueueConfig {
     /// 2 workers, capacity 256, default retry, 1900 MB chunks, no
-    /// encryption.
+    /// encryption, no sync doorbell.
     fn default() -> Self {
         Self {
             workers: 2,
@@ -157,6 +164,7 @@ impl Default for UploadQueueConfig {
             retry: RetryPolicy::default(),
             chunk_size_bytes: DEFAULT_CHUNK_SIZE_MB * 1024 * 1024,
             encryption_password: None,
+            sync_wake: None,
         }
     }
 }
@@ -447,6 +455,7 @@ async fn process_job(
         match persist_zero_byte(db, &row, sha256) {
             Ok(()) => {
                 delete_local_copy(&job.local_path);
+                ring_upload_success(cfg);
                 bump(&stats.succeeded);
             }
             Err(error) => {
@@ -531,6 +540,11 @@ async fn process_job(
                 match persist_success(db, &row, target, &receipt, file_size, sha256) {
                     Ok(()) => {
                         delete_local_copy(&job.local_path);
+                        // Upload-success sync doorbell: the row is now the
+                        // uploaded state in the db — a pass from here on
+                        // pushes the real (uploaded) payload instead of a
+                        // pending one.
+                        ring_upload_success(cfg);
                         bump(&stats.succeeded);
                     }
                     Err(error) => {
@@ -736,6 +750,16 @@ fn delete_local_copy(local_path: &Path) {
                 "failed to delete the local copy after upload"
             );
         }
+    }
+}
+
+/// Rings the injected sync doorbell after a successful post-upload
+/// persist (receipt and 0-byte paths alike — both flip the row to its
+/// uploaded state). `notify_one` merges any concurrent wakes into one
+/// pass, exactly the doorbell semantics the VFS hook uses.
+fn ring_upload_success(cfg: &UploadQueueConfig) {
+    if let Some(wake) = &cfg.sync_wake {
+        wake.notify_one();
     }
 }
 

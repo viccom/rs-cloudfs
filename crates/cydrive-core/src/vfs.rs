@@ -11,6 +11,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
 use futures_util::stream::StreamExt;
+use tokio::sync::Notify;
 
 use crate::cache::CacheManager;
 use crate::crypto::{self, CryptoError};
@@ -199,18 +200,27 @@ pub struct Vfs {
     transport: Arc<dyn CloudTransport>,
     cfg: VfsConfig,
     queue: UploadQueueHandle,
+    /// The quasi-realtime sync doorbell (doorbell model, approved design):
+    /// every local `files` table change rings it once so the CLI sync task
+    /// can run a pass immediately instead of waiting for the fallback tick.
+    /// The upload queue's success persist rings the same `Notify` through
+    /// the handle injected at construction ([`UploadQueueConfig::sync_wake`]).
+    sync_wake: Arc<Notify>,
 }
 
 impl Vfs {
     /// Assembles the VFS and spawns its upload queue; the
     /// `UploadQueueConfig` is derived from `cfg` (`chunk_size_bytes`
-    /// carried over unchanged).
+    /// carried over unchanged). The queue receives this VFS's sync wake
+    /// handle, so an upload's success persist rings the same doorbell as
+    /// the local change hooks.
     pub fn new(
         db: Arc<MetaDatabase>,
         cache: CacheManager,
         transport: Arc<dyn CloudTransport>,
         cfg: VfsConfig,
     ) -> Self {
+        let sync_wake = Arc::new(Notify::new());
         let queue = spawn_queue(
             Arc::clone(&db),
             Arc::clone(&transport),
@@ -220,6 +230,7 @@ impl Vfs {
                 retry: cfg.retry.clone(),
                 chunk_size_bytes: cfg.chunk_size_bytes,
                 encryption_password: cfg.encryption_password.clone(),
+                sync_wake: Some(Arc::clone(&sync_wake)),
             },
         );
         Self {
@@ -228,7 +239,26 @@ impl Vfs {
             transport,
             cfg,
             queue,
+            sync_wake,
         }
+    }
+
+    /// Rings the sync doorbell. `notify_one` (not `notify_waiters`) is the
+    /// semantically correct choice for the doorbell model: a wake that
+    /// arrives while a pass is in flight parks a permit and fires a
+    /// follow-up pass, and several wakes coalesce into one permit — one
+    /// pass — which is exactly the desired "many events, one pass"
+    /// merging. (`notify_waiters` would drop any wake arriving while
+    /// nobody waits, delaying the change to the next fallback tick.)
+    pub fn wake_sync(&self) {
+        self.sync_wake.notify_one();
+    }
+
+    /// The shared sync doorbell — the CLI's periodic sync task holds this
+    /// and waits on `notified()` alongside its interval tick, turning
+    /// local changes into immediate passes.
+    pub fn sync_notifier(&self) -> Arc<Notify> {
+        Arc::clone(&self.sync_wake)
     }
 
     /// Upload path (fire-and-forget, Python parity). Stages the bytes to
@@ -324,6 +354,10 @@ impl Vfs {
             })
             .await
             .map_err(map_queue_error)?;
+        // Sync doorbell: the pending row is durable and the job accepted —
+        // a sync pass from here on sees the change. Synchronous by design,
+        // preserving the no-await-after-enqueue contract above.
+        self.wake_sync();
         Ok(())
     }
 
@@ -543,6 +577,8 @@ impl Vfs {
             size = file.handle.total_size,
             "indexed inbound remote file (metadata only)"
         );
+        // Sync doorbell: the inbound row landed — a pass can push it.
+        self.wake_sync();
         Ok(rel)
     }
 
@@ -600,6 +636,9 @@ impl Vfs {
             chunk_count: 0,
             mime_type: None,
         })?;
+        // Sync doorbell: a directory row is a syncable change like any
+        // other.
+        self.wake_sync();
         Ok(())
     }
 
@@ -633,6 +672,8 @@ impl Vfs {
                 tracing::warn!(%error, rel_path = %rel, "failed to remove cache copy");
             }
         }
+        // Sync doorbell: the row is gone — a pass pushes the tombstone.
+        self.wake_sync();
         Ok(())
     }
 

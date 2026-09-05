@@ -256,6 +256,11 @@ impl MetaDatabase {
             CREATE TABLE IF NOT EXISTS sync_state (
                 id INTEGER PRIMARY KEY CHECK(id=0),
                 max_pulled INTEGER NOT NULL DEFAULT 0
+            );
+
+            CREATE TABLE IF NOT EXISTS sync_client_id (
+                id INTEGER PRIMARY KEY CHECK(id=0),
+                client_id TEXT NOT NULL
             );",
         )?;
         Ok(Self {
@@ -674,4 +679,46 @@ impl MetaDatabase {
         )?;
         Ok(())
     }
+
+    /// This instance's stable sync identity (quasi-realtime doorbell
+    /// batch): the single `sync_client_id` row's value. Get-or-create —
+    /// the first call generates 16 random bytes as 32 lowercase hex
+    /// characters (`rand`, already a dependency; no uuid crate) and
+    /// writes them; every later call returns the stored value. The whole
+    /// get-or-create runs under the connection mutex, so concurrent first
+    /// callers cannot race two identities into the table.
+    pub fn sync_client_id(&self) -> Result<String, DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = conn
+            .query_row(
+                "SELECT client_id FROM sync_client_id WHERE id = 0",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?
+        {
+            return Ok(existing);
+        }
+        let id = hex_lower(&rand::random::<[u8; 16]>());
+        conn.execute(
+            "INSERT INTO sync_client_id (id, client_id) VALUES (0, ?1)",
+            [&id],
+        )?;
+        Ok(id)
+    }
+}
+
+/// Lowercase hex of `bytes` (the same shape the `sync` and `chunker`
+/// helpers use; local copy keeps `database` self-contained).
+fn hex_lower(bytes: &[u8]) -> String {
+    const HEX: &[u8; 16] = b"0123456789abcdef";
+    let mut out = String::with_capacity(bytes.len() * 2);
+    for byte in bytes {
+        out.push(HEX[(byte >> 4) as usize] as char);
+        out.push(HEX[(byte & 0x0f) as usize] as char);
+    }
+    out
 }

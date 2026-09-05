@@ -29,7 +29,8 @@ fn first_call_generates_32_hex_chars() {
     let id = db.sync_client_id().expect("sync_client_id");
     assert_eq!(id.len(), 32, "32 hex characters (16 random bytes): {id}");
     assert!(
-        id.chars().all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
+        id.chars()
+            .all(|c| c.is_ascii_hexdigit() && !c.is_ascii_uppercase()),
         "lowercase hex only: {id}"
     );
 }

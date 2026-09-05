@@ -56,13 +56,7 @@ fn test_cfg() -> VfsConfig {
 
 /// Real temp environment: SQLite db + cache tree + pre-connected mock
 /// transport, assembled into a Vfs. Returns the tempdir keeper too.
-async fn test_vfs(
-    mock: MockTransport,
-) -> (
-    tempfile::TempDir,
-    Vfs,
-    Arc<MetaDatabase>,
-) {
+async fn test_vfs(mock: MockTransport) -> (tempfile::TempDir, Vfs, Arc<MetaDatabase>) {
     let dir = tempfile::tempdir().expect("create temp dir");
     let db = Arc::new(MetaDatabase::open(&dir.path().join("meta.db")).expect("open temp db"));
     let cache = CacheManager::new(dir.path().join("cache"), 1 << 20);
@@ -118,12 +112,15 @@ fn seed_uploaded_row(db: &MetaDatabase, path: &str, msg_id: i64) {
 async fn put_wakes_sync_after_enqueue() {
     let (_dir, vfs, _db) = ok_vfs().await;
 
-    let mut wake = vfs.sync_notifier().notified();
-    wake.enable();
+    let notifier = vfs.sync_notifier();
+
+    let wake = notifier.notified();
+    tokio::pin!(wake);
+    wake.as_mut().enable();
     vfs.put(&rel("/hello.txt"), b"hello", 1_700_000_000.0)
         .await
         .expect("put accepted");
-    tokio::time::timeout(Duration::from_secs(1), &mut wake)
+    tokio::time::timeout(Duration::from_secs(1), wake.as_mut())
         .await
         .expect("put must ring the sync wake");
 }
@@ -134,12 +131,15 @@ async fn remove_file_wakes_after_success() {
     let (_dir, vfs, db) = ok_vfs().await;
     seed_uploaded_row(&db, "/bye.txt", 9);
 
-    let mut wake = vfs.sync_notifier().notified();
-    wake.enable();
+    let notifier = vfs.sync_notifier();
+
+    let wake = notifier.notified();
+    tokio::pin!(wake);
+    wake.as_mut().enable();
     vfs.remove_file(&rel("/bye.txt"))
         .await
         .expect("remove succeeds");
-    tokio::time::timeout(Duration::from_secs(1), &mut wake)
+    tokio::time::timeout(Duration::from_secs(1), wake.as_mut())
         .await
         .expect("remove_file must ring the sync wake");
 }
@@ -149,10 +149,13 @@ async fn remove_file_wakes_after_success() {
 async fn create_dir_wakes_after_row_write() {
     let (_dir, vfs, _db) = ok_vfs().await;
 
-    let mut wake = vfs.sync_notifier().notified();
-    wake.enable();
+    let notifier = vfs.sync_notifier();
+
+    let wake = notifier.notified();
+    tokio::pin!(wake);
+    wake.as_mut().enable();
     vfs.create_dir(&rel("/docs")).expect("create_dir succeeds");
-    tokio::time::timeout(Duration::from_secs(1), &mut wake)
+    tokio::time::timeout(Duration::from_secs(1), wake.as_mut())
         .await
         .expect("create_dir must ring the sync wake");
 }
@@ -162,8 +165,11 @@ async fn create_dir_wakes_after_row_write() {
 async fn index_inbound_wakes_after_row_write() {
     let (_dir, vfs, _db) = ok_vfs().await;
 
-    let mut wake = vfs.sync_notifier().notified();
-    wake.enable();
+    let notifier = vfs.sync_notifier();
+
+    let wake = notifier.notified();
+    tokio::pin!(wake);
+    wake.as_mut().enable();
     vfs.index_inbound(InboundFile {
         filename: "photo.jpg".to_string(),
         handle: RemoteHandle {
@@ -174,7 +180,7 @@ async fn index_inbound_wakes_after_row_write() {
     })
     .await
     .expect("index_inbound succeeds");
-    tokio::time::timeout(Duration::from_secs(1), &mut wake)
+    tokio::time::timeout(Duration::from_secs(1), wake.as_mut())
         .await
         .expect("index_inbound must ring the sync wake");
 }
@@ -191,32 +197,41 @@ async fn upload_success_wakes_twice_and_hydrate_never_wakes() {
     let path = rel("/twice.txt");
 
     // wake 1: enqueue acceptance (fires synchronously inside put)
-    let mut enqueue_wake = vfs.sync_notifier().notified();
-    enqueue_wake.enable();
+    let notifier = vfs.sync_notifier();
+
+    let enqueue_wake = notifier.notified();
+    tokio::pin!(enqueue_wake);
+    enqueue_wake.as_mut().enable();
     vfs.put(&path, b"payload", 1_700_000_000.0)
         .await
         .expect("put accepted");
-    tokio::time::timeout(Duration::from_secs(1), &mut enqueue_wake)
+    tokio::time::timeout(Duration::from_secs(1), enqueue_wake.as_mut())
         .await
         .expect("put must ring the enqueue wake");
 
     // wake 2: the worker's success persist (the drain waits for it)
-    let mut persist_wake = vfs.sync_notifier().notified();
-    persist_wake.enable();
+    let notifier = vfs.sync_notifier();
+
+    let persist_wake = notifier.notified();
+    tokio::pin!(persist_wake);
+    persist_wake.as_mut().enable();
     vfs.shutdown().await; // drain: upload -> persist_success -> ring
-    tokio::time::timeout(Duration::from_secs(1), &mut persist_wake)
+    tokio::time::timeout(Duration::from_secs(1), persist_wake.as_mut())
         .await
         .expect("upload success must ring its own sync wake");
 
     // hydrate (cache copy was deleted by the successful upload, so this
     // is the cold path with a real db write) must NOT ring.
-    let mut hydrate_wake = vfs.sync_notifier().notified();
-    hydrate_wake.enable();
+    let notifier = vfs.sync_notifier();
+
+    let hydrate_wake = notifier.notified();
+    tokio::pin!(hydrate_wake);
+    hydrate_wake.as_mut().enable();
     vfs.hydrate(&path)
         .await
         .expect("hydrate re-downloads the uploaded payload");
     assert!(
-        tokio::time::timeout(Duration::from_millis(300), &mut hydrate_wake)
+        tokio::time::timeout(Duration::from_millis(300), hydrate_wake.as_mut())
             .await
             .is_err(),
         "hydrate must not ring the sync wake (is_cached is local-only)"
@@ -230,15 +245,18 @@ async fn upload_success_wakes_twice_and_hydrate_never_wakes() {
 async fn failed_remove_does_not_wake() {
     let (_dir, vfs, _db) = ok_vfs().await;
 
-    let mut wake = vfs.sync_notifier().notified();
-    wake.enable();
+    let notifier = vfs.sync_notifier();
+
+    let wake = notifier.notified();
+    tokio::pin!(wake);
+    wake.as_mut().enable();
     let error = vfs
         .remove_file(&rel("/missing.txt"))
         .await
         .expect_err("no row at the path");
     assert!(matches!(error, VfsError::NotFound(_)), "{error:?}");
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), &mut wake)
+        tokio::time::timeout(Duration::from_millis(200), wake.as_mut())
             .await
             .is_err(),
         "a failed remove must not ring the sync wake"
@@ -247,33 +265,44 @@ async fn failed_remove_does_not_wake() {
 
 /// A degraded upload (mock scripted failure, retries exhausted) reaches a
 /// terminal state without ever ringing the success hook — only put's
-/// enqueue wake fires.
+/// enqueue wake fires. The mock consumes its script in order and an
+/// exhausted script behaves as Ok, so the failure is scripted once per
+/// attempt (`max_attempts = 3` in [`test_cfg`]).
 #[tokio::test]
 async fn degraded_upload_never_rings_the_success_hook() {
+    let fail = || UploadAction::Fail {
+        error: TransportError::Remote("injected upload failure".to_string()),
+    };
     let (_dir, vfs, _db) = test_vfs(
         MockTransport::builder()
-            .upload_action(UploadAction::Fail {
-                error: TransportError::Remote("injected upload failure".to_string()),
-            })
+            .upload_action(fail())
+            .upload_action(fail())
+            .upload_action(fail())
             .build(),
     )
     .await;
 
-    let mut enqueue_wake = vfs.sync_notifier().notified();
-    enqueue_wake.enable();
+    let notifier = vfs.sync_notifier();
+
+    let enqueue_wake = notifier.notified();
+    tokio::pin!(enqueue_wake);
+    enqueue_wake.as_mut().enable();
     vfs.put(&rel("/doomed.txt"), b"payload", 1_700_000_000.0)
         .await
         .expect("put accepted");
-    tokio::time::timeout(Duration::from_secs(1), &mut enqueue_wake)
+    tokio::time::timeout(Duration::from_secs(1), enqueue_wake.as_mut())
         .await
         .expect("put must ring the enqueue wake");
 
     vfs.shutdown().await; // drain: retries -> degrade, no success persist
 
-    let mut success_wake = vfs.sync_notifier().notified();
-    success_wake.enable();
+    let notifier = vfs.sync_notifier();
+
+    let success_wake = notifier.notified();
+    tokio::pin!(success_wake);
+    success_wake.as_mut().enable();
     assert!(
-        tokio::time::timeout(Duration::from_millis(200), &mut success_wake)
+        tokio::time::timeout(Duration::from_millis(200), success_wake.as_mut())
             .await
             .is_err(),
         "a degraded upload must not ring the success hook"
