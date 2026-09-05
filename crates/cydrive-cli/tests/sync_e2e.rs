@@ -14,17 +14,20 @@
 //!   down cleanly;
 //! - the server-side secret: a matching client secret passes and the
 //!   server stores the rows; a mismatching one fails the command with
-//!   the HTTP 403 surfacing in the error chain.
+//!   the HTTP 403 surfacing in the error chain;
+//! - the config-sourced secret: a `config.toml` carrying `sync_secret`
+//!   (env unset) powers a full gated pass through the same chain
+//!   `cydrive sync` runs — pull and push both clear the 403 gate.
 //! - https (ignored, real-network): a live public-CA endpoint completes
 //!   the full TLS chain and answers with a real HTTP status.
 
 use std::net::SocketAddr;
 use std::path::Path;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
-use cydrive_cli::sync_client::HttpSyncClient;
-use cydrive_cli::{run_sync_command, run_with_transport, RunHandle};
+use cydrive_cli::sync_client::{HttpSyncClient, SYNC_SECRET_ENV};
+use cydrive_cli::{resolve_sync_secret, run_sync_command, run_with_transport, RunHandle};
 use cydrive_core::config::CyDriveConfig;
 use cydrive_core::database::{FileUpsert, MetaDatabase};
 use cydrive_core::sync::namespace_key;
@@ -39,6 +42,31 @@ use tokio::net::TcpStream;
 use tokio::time::sleep;
 
 // ------------------------------------------------------------- helpers ---
+
+/// Serialises every test that touches the process-wide `CYDRIVE_SYNC_SECRET`
+/// variable (tests in one binary share one process; env vars race).
+static SECRET_ENV_MUTEX: Mutex<()> = Mutex::new(());
+
+/// Holds [`SECRET_ENV_MUTEX`] and removes the secret env var on drop —
+/// including on panic, so a failing assertion cannot poison later runs.
+struct SecretEnvGuard {
+    _lock: MutexGuard<'static, ()>,
+}
+
+impl Drop for SecretEnvGuard {
+    fn drop(&mut self) {
+        std::env::remove_var(SYNC_SECRET_ENV);
+    }
+}
+
+/// Locks [`SECRET_ENV_MUTEX`] and starts with the secret env var unset.
+fn lock_secret_env() -> SecretEnvGuard {
+    let lock = SECRET_ENV_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    std::env::remove_var(SYNC_SECRET_ENV);
+    SecretEnvGuard { _lock: lock }
+}
 
 /// The shared token/chat pair: same values on both instances = the same
 /// namespace key = the same drive.
@@ -456,6 +484,67 @@ async fn secret_gate_end_to_end() {
     assert!(msg.contains("403"), "the HTTP status surfaces: {msg}");
 }
 
+/// The config-sourced secret reaches a gated server end to end: a
+/// `config.toml` carrying `sync_secret` (the hand-written-file route the
+/// batch's ruling allows) powers a full `cydrive sync` pass — pull AND
+/// push — against a server that 403s secretless traffic, with the env
+/// variable unset so the config leg of the resolution chain is the one
+/// under test. This mirrors exactly what `sync_cmd` does: load the file,
+/// resolve the secret, run the pass.
+#[tokio::test]
+async fn config_toml_sync_secret_powers_a_gated_pass() {
+    let (addr, store) = spawn_sync_server(Some("cfg-secret")).await;
+
+    let dir = tempfile::tempdir().expect("config-holding instance dir");
+    let toml_path = dir.path().join("config.toml");
+    std::fs::write(
+        &toml_path,
+        format!(
+            concat!(
+                "bot_token = \"{}\"\n",
+                "chat_id = {}\n",
+                "db_path = {:?}\n",
+                "cache_path = {:?}\n",
+                "sync_url = \"http://{}\"\n",
+                "sync_secret = \"cfg-secret\"\n",
+            ),
+            TOKEN,
+            CHAT,
+            dir.path().join("meta.db").to_string_lossy(),
+            dir.path().join("cache").to_string_lossy(),
+            addr,
+        ),
+    )
+    .expect("write config.toml");
+
+    // Seed the db the config points at, then run the real chain the
+    // `cydrive sync` command runs (env unset → the config key governs).
+    {
+        let db = MetaDatabase::open(&dir.path().join("meta.db")).expect("seed db");
+        seed_file(&db, "/from-config.txt", true, &[31]);
+    }
+    let _guard = lock_secret_env();
+    let cfg = CyDriveConfig::load_toml(&toml_path).expect("config.toml with sync_secret loads");
+    let secret = resolve_sync_secret(&cfg);
+    assert_eq!(
+        secret.as_deref(),
+        Some("cfg-secret"),
+        "with the env var unset, the config.toml value must supply the secret"
+    );
+
+    let outcome = run_sync_command(&cfg, secret.as_deref())
+        .await
+        .expect("the config-sourced secret must pass the pull gate");
+    assert_eq!(outcome.pushed, 1, "the seeded row uploads: {outcome:?}");
+    assert!(
+        store
+            .namespace_version(&test_namespace())
+            .expect("server store read")
+            .is_some_and(|version| version > 0),
+        "the gated server stored the push"
+    );
+}
+
 /// Real-network https probe (ignored by default — needs outbound https
 /// to a live public-CA site): proves the whole TLS chain against an
 /// endpoint that is not a sync server. The probe namespace has no rows
@@ -470,7 +559,7 @@ async fn secret_gate_end_to_end() {
 async fn https_real_endpoint_handshakes_and_gets_http_status() {
     let client = HttpSyncClient::new("https://git.metme.top");
     let error = client
-        .pull("rs-cydrive-https-probe", 0)
+        .pull("rs-cydrive-https-probe", None, 0)
         .await
         .expect_err("the probe namespace has no rows on the remote");
     let SyncError::Client(message) = &error else {
@@ -501,7 +590,7 @@ async fn slow_body_drip_is_bounded_by_the_request_timeout() {
     let client = HttpSyncClient::with_request_timeout(&url, Duration::from_secs(2));
 
     let guard = Duration::from_secs(15);
-    let error = tokio::time::timeout(guard, client.pull("ns", 0))
+    let error = tokio::time::timeout(guard, client.pull("ns", None, 0))
         .await
         .expect(
             "pull must return within the request budget instead of hanging on the trickling body",

@@ -245,6 +245,18 @@ pub struct CyDriveConfig {
     /// scheme — the sync client itself speaks plain HTTP, TLS is a
     /// reverse-proxy concern (sync-lite plan, client side).
     pub sync_url: Option<String>,
+    /// Optional family-level shared secret the sync server may require
+    /// (the server-side `SYNC_SECRET` gate); `None` = send none. The key
+    /// is deliberately **not** part of the core env-override set: the
+    /// secret's env route is the CLI-layer `CYDRIVE_SYNC_SECRET`
+    /// (`resolve_sync_secret`), which outranks this file value. Unlike
+    /// `sync_url` there is no format constraint — any non-empty string is
+    /// a legal secret, and a value that trims to empty reads as unset at
+    /// the CLI resolution layer. Hand-writing the key into config.toml is
+    /// allowed (the file may already hold the bot token); programmatic
+    /// writes go through [`CyDriveConfig::save_toml_scrubbed`], which
+    /// keeps it out of the file.
+    pub sync_secret: Option<String>,
     /// Sync polling interval in seconds (valid range 1..=86 400).
     #[serde(default = "default_sync_interval_secs")]
     pub sync_interval_secs: u64,
@@ -280,6 +292,7 @@ impl Default for CyDriveConfig {
             enable_encryption: false,
             proxy_url: None,
             sync_url: None,
+            sync_secret: None,
             sync_interval_secs: default_sync_interval_secs(),
         }
     }

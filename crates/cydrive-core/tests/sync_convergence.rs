@@ -86,7 +86,12 @@ impl SyncClient for InMemorySyncServer {
         Ok(inner.counter)
     }
 
-    async fn pull(&self, _key: &str, since: i64) -> Result<SyncPullResult, SyncError> {
+    async fn pull(
+        &self,
+        _key: &str,
+        _secret: Option<&str>,
+        since: i64,
+    ) -> Result<SyncPullResult, SyncError> {
         let inner = self.inner.lock().expect("server mutex");
         let mut rows: Vec<SyncPulledRow> = inner
             .rows
@@ -512,5 +517,83 @@ async fn tombstone_removes_a_hydrated_cache_copy_on_the_peer() {
     assert!(
         !b_copy.exists(),
         "the hydrated cache copy must not survive the tombstone — hydrate's disk-based hit probe would serve the deleted bytes"
+    );
+}
+
+// ------------------------------------------------------ secret threading ---
+
+/// A [`SyncClient`] stand-in that records every `pull` invocation's
+/// `(key, secret, since)` triple and answers empty — the seam that pins
+/// [`sync_once`]'s secret threading into pull (push already carried it;
+/// pull must too, since the server gates both directions).
+struct RecordingPullClient {
+    pulls: Mutex<Vec<(String, Option<String>, i64)>>,
+}
+
+impl RecordingPullClient {
+    fn new() -> Self {
+        Self {
+            pulls: Mutex::new(Vec::new()),
+        }
+    }
+
+    fn recorded(&self) -> Vec<(String, Option<String>, i64)> {
+        self.pulls.lock().expect("pulls mutex").clone()
+    }
+}
+
+#[async_trait]
+impl SyncClient for RecordingPullClient {
+    async fn push(
+        &self,
+        _key: &str,
+        _secret: Option<&str>,
+        _rows: &[SyncRowUpdate],
+    ) -> Result<i64, SyncError> {
+        Ok(0)
+    }
+
+    async fn pull(
+        &self,
+        key: &str,
+        secret: Option<&str>,
+        since: i64,
+    ) -> Result<SyncPullResult, SyncError> {
+        self.pulls.lock().expect("pulls mutex").push((
+            key.to_string(),
+            secret.map(str::to_string),
+            since,
+        ));
+        Ok(SyncPullResult::default())
+    }
+}
+
+/// `sync_once` must thread its `secret` argument into **pull** exactly
+/// like into push: a secret-gated server rejects a secretless pull with
+/// 403 before any push happens, so a pass against one only succeeds if
+/// the pull carried the secret.
+#[tokio::test]
+async fn sync_once_threads_the_secret_into_pull() {
+    let inst = instance("pull-secret");
+    let client = RecordingPullClient::new();
+    sync_once(&inst.db, &inst.cache, &client, "ns", Some("family-secret"))
+        .await
+        .expect("sync_once with a secret");
+    assert_eq!(
+        client.recorded(),
+        vec![("ns".to_string(), Some("family-secret".to_string()), 0)],
+        "pull must receive the pass's secret verbatim"
+    );
+
+    // The secretless pass sends none — `None` means "send none", never a
+    // defaulted value.
+    let bare = RecordingPullClient::new();
+    sync_once(&inst.db, &inst.cache, &bare, "ns", None)
+        .await
+        .expect("sync_once without a secret");
+    assert_eq!(
+        bare.recorded(),
+        vec![("ns".to_string(), None, 0)],
+        "no configured secret must arrive as None"
     );
 }

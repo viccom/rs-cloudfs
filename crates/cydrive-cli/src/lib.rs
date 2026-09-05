@@ -781,6 +781,20 @@ pub fn sync_secret_from_env() -> Option<String> {
     parse_sync_secret(std::env::var(sync_client::SYNC_SECRET_ENV).ok())
 }
 
+/// Resolves the sync shared secret for **both** entry points (`cydrive
+/// sync` and the `run` periodic task): env `CYDRIVE_SYNC_SECRET` >
+/// config.toml `sync_secret` > `None`. A set-but-empty (or
+/// whitespace-only) env value explicitly clears the config value — the
+/// `CYDRIVE_SYNC_URL` precedent — and an empty/whitespace-only config
+/// value reads as unset. Non-empty values pass through verbatim (a
+/// secret is byte-exact, never trimmed or logged).
+pub fn resolve_sync_secret(cfg: &CyDriveConfig) -> Option<String> {
+    // RED shim: the env leg only; the config.toml `sync_secret` leg is
+    // the green commit (pinned by the resolution tests).
+    let _config_leg = &cfg.sync_secret;
+    sync_secret_from_env()
+}
+
 /// Renders one pass's counters for the `cydrive sync` output — the
 /// labels are pinned by the CLI tests. `skipped_invalid` covers rows
 /// dropped for an undecodable payload or an invalid row key (counted

@@ -251,8 +251,16 @@ pub trait SyncClient: Send + Sync {
     ) -> Result<i64, SyncError>;
 
     /// Returns every row of the namespace with `version > since`, plus
-    /// the server's current maximum version.
-    async fn pull(&self, key: &str, since: i64) -> Result<SyncPullResult, SyncError>;
+    /// the server's current maximum version. `secret` is the optional
+    /// family-level gate — servers configured with a shared secret
+    /// reject a pull that does not carry it, so it must ride along on
+    /// the pull exactly like on the push.
+    async fn pull(
+        &self,
+        key: &str,
+        secret: Option<&str>,
+        since: i64,
+    ) -> Result<SyncPullResult, SyncError>;
 }
 
 /// Counters of a pull-apply pass (see [`apply_pulled_rows`]).
@@ -537,7 +545,9 @@ pub async fn sync_once(
     secret: Option<&str>,
 ) -> Result<SyncOutcome, SyncError> {
     let since = db.sync_state_get()?;
-    let pull = client.pull(key, since).await?;
+    // RED shim: the pass-through of `secret` into pull is the green
+    // commit — pinned by `sync_once_threads_the_secret_into_pull`.
+    let pull = client.pull(key, None, since).await?;
     let apply = apply_pulled_rows(db, cache, &pull.rows, pull.max_version)?;
 
     let mut local_rows: Vec<(String, String)> = Vec::new();

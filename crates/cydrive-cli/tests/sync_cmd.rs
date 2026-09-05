@@ -8,7 +8,10 @@ use std::sync::{Mutex, MutexGuard};
 use cydrive_cli::sync_client::{
     endpoint_url, pull_core_result, push_wire_rows, truncate_for_log, SYNC_SECRET_ENV,
 };
-use cydrive_cli::{parse_sync_secret, render_sync_summary, run_sync_command, sync_secret_from_env};
+use cydrive_cli::{
+    parse_sync_secret, render_sync_summary, resolve_sync_secret, run_sync_command,
+    sync_secret_from_env,
+};
 use cydrive_core::config::CyDriveConfig;
 use cydrive_core::sync::{SyncOutcome, SyncPulledRow, SyncRowUpdate};
 use cydrive_sync::wire::{PullResponse, PulledRow, PushRow};
@@ -218,6 +221,82 @@ fn sync_secret_from_env_reads_the_pinned_variable() {
 
     std::env::remove_var(SYNC_SECRET_ENV);
     assert_eq!(sync_secret_from_env(), None, "unset reads as no secret");
+}
+
+/// The single resolution chain both sync entry points use (`cydrive sync`
+/// and the `run` periodic task): env `CYDRIVE_SYNC_SECRET` > config.toml
+/// `sync_secret` > `None`. A set-but-empty env value explicitly CLEARS the
+/// config value (the `CYDRIVE_SYNC_URL` precedent), and whitespace-only
+/// values read as unset on either leg; non-empty values pass verbatim.
+#[test]
+fn resolve_sync_secret_env_beats_config_beats_none() {
+    let _guard = lock_secret_env();
+    std::env::remove_var(SYNC_SECRET_ENV);
+
+    let cfg_file = CyDriveConfig {
+        sync_secret: Some("cfg-secret".to_string()),
+        ..sync_test_config(Some("http://127.0.0.1:8290".to_string()))
+    };
+
+    // Third state: neither source set → None.
+    assert_eq!(
+        resolve_sync_secret(&sync_test_config(None)),
+        None,
+        "no env, no config key → send none"
+    );
+
+    // Second state: env unset → the config.toml value governs.
+    assert_eq!(
+        resolve_sync_secret(&cfg_file),
+        Some("cfg-secret".to_string()),
+        "with the env var unset, the config.toml sync_secret must win"
+    );
+
+    // First state: a set env var outranks the file value.
+    std::env::set_var(SYNC_SECRET_ENV, "env-secret");
+    assert_eq!(
+        resolve_sync_secret(&cfg_file),
+        Some("env-secret".to_string()),
+        "CYDRIVE_SYNC_SECRET must outrank the config.toml value"
+    );
+
+    // A set-but-empty env value explicitly clears (CYDRIVE_SYNC_URL
+    // precedent), and whitespace-only reads as unset on either leg.
+    std::env::set_var(SYNC_SECRET_ENV, "");
+    assert_eq!(
+        resolve_sync_secret(&cfg_file),
+        None,
+        "empty CYDRIVE_SYNC_SECRET clears the config value"
+    );
+    std::env::set_var(SYNC_SECRET_ENV, "   ");
+    assert_eq!(
+        resolve_sync_secret(&cfg_file),
+        None,
+        "whitespace-only env value reads as unset"
+    );
+
+    std::env::remove_var(SYNC_SECRET_ENV);
+    let cfg_blank = CyDriveConfig {
+        sync_secret: Some("   ".to_string()),
+        ..sync_test_config(None)
+    };
+    assert_eq!(
+        resolve_sync_secret(&cfg_blank),
+        None,
+        "whitespace-only config value reads as unset"
+    );
+
+    // Non-empty values pass through verbatim — a secret is byte-exact,
+    // never trimmed.
+    let cfg_exact = CyDriveConfig {
+        sync_secret: Some(" padded secret ".to_string()),
+        ..sync_test_config(None)
+    };
+    assert_eq!(
+        resolve_sync_secret(&cfg_exact),
+        Some(" padded secret ".to_string()),
+        "the secret value itself is never trimmed"
+    );
 }
 
 /// The human summary prints every counter with the labels the task

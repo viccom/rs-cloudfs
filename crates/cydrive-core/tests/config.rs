@@ -224,6 +224,7 @@ fn toml_roundtrip_preserves_full_config() {
         enable_encryption: false,
         proxy_url: None,
         sync_url: None,
+        sync_secret: None,
         sync_interval_secs: 300,
     };
 

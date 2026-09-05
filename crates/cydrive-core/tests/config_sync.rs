@@ -11,6 +11,13 @@
 //! (proxy_url precedent). When set, `sync_url` must start with `http://`
 //! or `https://` (actionable [`ConfigError::Invalid`] message); `None`
 //! skips the check.
+//!
+//! The companion `sync_secret` key (`Option<String>`, default `None`)
+//! carries the optional family-level shared secret: accepted by the
+//! canonical TOML (no format constraint), rejected by the legacy JSON
+//! (same precedent) and scrubbed from programmatic writes. Its env route
+//! is the CLI-layer `CYDRIVE_SYNC_SECRET`, deliberately outside the core
+//! env-override set — covered by the CLI tests, not here.
 
 use std::fs;
 use std::sync::{Mutex, MutexGuard};
@@ -240,4 +247,129 @@ fn legacy_json_rejects_both_sync_keys() {
             "expected Parse error for {key}, got: {err:?}"
         );
     }
+}
+
+// ---------------------------------------------------- sync_secret key ---
+
+/// The `sync_secret` contract (secret-batch): `Option<String>`, default
+/// `None` (send none), no format constraint in `validate` (any non-empty
+/// string is a legal secret — a value that trims to empty is treated as
+/// unset at the CLI resolution layer, not a validation error). The key
+/// rides the canonical `config.toml` (user hand-writing allowed) but is
+/// rejected by the legacy JSON and scrubbed from programmatic writes.
+#[test]
+fn default_sync_secret_is_none() {
+    let cfg = CyDriveConfig::default();
+    assert_eq!(cfg.sync_secret, None, "default config sends no secret");
+}
+
+#[test]
+fn load_toml_reads_sync_secret() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        concat!(
+            "bot_token = \"123456:ABC-DEF\"\n",
+            "chat_id = 123456789\n",
+            "sync_url = \"https://sync.example.internal:8290\"\n",
+            "sync_secret = \"family-secret\"\n",
+        ),
+    )
+    .expect("write config.toml");
+
+    let cfg = CyDriveConfig::load_toml(&path).expect("config with sync_secret loads");
+    assert_eq!(
+        cfg.sync_secret.as_deref(),
+        Some("family-secret"),
+        "load_toml must pick up the sync_secret key"
+    );
+    cfg.validate().expect("a plain secret needs no format");
+}
+
+#[test]
+fn sync_secret_has_no_format_constraint() {
+    // Any non-empty string is legal — spaces, punctuation, anything; and
+    // an empty string is no validation error either (it reads as unset
+    // at the resolution layer, matching the sync_url empty-clears rule).
+    for value in ["with spaces and !@#", "ünïcödé", ""] {
+        let cfg = CyDriveConfig {
+            sync_secret: Some(value.to_string()),
+            ..CyDriveConfig::default()
+        };
+        cfg.validate()
+            .unwrap_or_else(|e| panic!("sync_secret={value:?} must be valid: {e}"));
+    }
+    CyDriveConfig {
+        sync_secret: None,
+        ..CyDriveConfig::default()
+    }
+    .validate()
+    .expect("None (feature off) validates");
+}
+
+#[test]
+fn toml_roundtrip_preserves_sync_secret() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+
+    let cfg = CyDriveConfig {
+        sync_url: Some("http://127.0.0.1:8290".to_string()),
+        sync_secret: Some("family-secret".to_string()),
+        ..default_with("sync:secret:rt", 42)
+    };
+
+    cfg.save_toml(&path).expect("save_toml");
+    let loaded = CyDriveConfig::load_toml(&path).expect("load_toml");
+    assert_eq!(loaded, cfg, "sync_secret must survive the TOML round-trip");
+}
+
+#[test]
+fn legacy_json_rejects_sync_secret() {
+    // Same tier-1 precedent as sync_url: a legacy config.json cannot
+    // honour the key, so it must fail loudly instead of being silently
+    // filtered away.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.json");
+    fs::write(
+        &path,
+        r#"{ "bot_token": "111:AA", "chat_id": 5, "sync_secret": "x" }"#,
+    )
+    .expect("write config.json");
+
+    let err =
+        CyDriveConfig::load_legacy_json(&path).expect_err("legacy json must reject sync_secret");
+    assert!(
+        matches!(err, ConfigError::Parse { ref message, .. } if message.contains("sync_secret")),
+        "expected Parse error naming sync_secret, got: {err:?}"
+    );
+}
+
+#[test]
+fn scrubbed_write_omits_sync_secret() {
+    // Programmatic writes (setup/migrate) go through save_toml_scrubbed:
+    // the secret must stay out of the file — neither parsed back nor
+    // present in the raw bytes — while every other field round-trips.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+
+    let cfg = CyDriveConfig {
+        sync_url: Some("http://127.0.0.1:8290".to_string()),
+        sync_secret: Some("family-secret".to_string()),
+        ..default_with("sync:scrub", 7)
+    };
+    cfg.save_toml_scrubbed(&path).expect("scrubbed save");
+
+    let raw = fs::read_to_string(&path).expect("read the scrubbed file");
+    assert!(
+        !raw.contains("family-secret"),
+        "the secret must not appear in the written file: {raw}"
+    );
+    let loaded = CyDriveConfig::load_toml(&path).expect("scrubbed config loads");
+    assert_eq!(loaded.sync_secret, None, "the secret is scrubbed to None");
+    assert_eq!(
+        loaded.sync_url,
+        Some("http://127.0.0.1:8290".to_string()),
+        "non-secret fields survive the scrubbed write"
+    );
 }
