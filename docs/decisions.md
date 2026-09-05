@@ -216,3 +216,19 @@
 - **部署注意（openresty/nginx）**：SSE 经反代需确认 `proxy_read_timeout >= 60s`；服务端已发 X-Accel-Buffering: no + 20s 心跳，openresty 默认 proxy_buffering 对该头响应关闭缓冲，一般免改；若自建层仍缓冲则显式 `proxy_buffering off`。
 - **门禁**：win workspace 510 / wsl 三 crate 416 全绿（+35 测试）；fmt/clippy 零警告。
 - 已知边界留痕：`MetaDatabase::rename_path` 仅 WebDAV MOVE 路径调用（已埋点覆盖）；无 keepalive 的死流 reader 任务至进程退出回收（注释声明）；subscribe 长连接无上限（家庭规模）。
+
+## 2026-09-05 准实时批二复审（独立双审查员，54c8a0f..3eb56ce）：High×3 + Medium×2
+
+- **结论**：服务端侧可发布（EventHub 锁序/same_channel 清理/pump 退出路径经交错推演+真连接测试双重验证无竞态无泄漏；secret 三端点闸/403 前置/日志脱敏/心跳承诺与代码一致；wire 兼容矩阵实测成立；src 零 unwrap）；客户端侧**需修后发布**——三条 High 都在主用户路径上静默掏空准实时卖点（均不破最终一致，300s 兜底仍在）。
+- **High-1 WebDAV DELETE 漏唤醒**：`webdav remove_file/remove_dir` 直写 db（Explorer 删除主路径）——删除墓碑最长 300s 才推。**High-2 Web UI /api/delete 漏唤醒**：`vfs.db().delete_file` 直写（自称复用 Vfs::remove_file 裁决却绕过了 Vfs 层与 wake）。修法各一行 + enable 模式测试（43e0cf9 MOVE 先例）。
+- **High-3 SSE 读无活性检测**：reader `frame().await` 无超时、TCP 无 keepalive——半开连接（NAT 过期/睡眠唤醒/切换 Wi-Fi）下门铃永挂、退避重连一次都不触发，功能死亡至进程重启。修法：frame 读套 timeout（≥3× 心跳，60-90s 无帧断流走既有重连链）。服务端 20s 心跳本可作活性探针而未用。
+- **Medium×2**：①SSE 帧切分只认 `
+
+` 且 pending 缓冲无上限——CRLF 合规流永不切帧 + 恶意慢速流内存放大（既有 CRLF 测试只测帧内容解析给了虚假覆盖信心）；修法=识别 `
+
+`/`
+
+`/`` + 64KB 上限。②**db 整库拷贝到第二台机器 → 两机同 client_id → 门铃双向互静默**（两层 origin 跳过都命中；db 拷贝是本项目文档化/验收用过的操作）——正确性无损、实时性静默退化且不可诊断；候选缓解：服务端同 (ns,client_id) 双活检测踢旧连接（~20 行）/至少 warn 日志，客户端 doctor 检查或 client_id 重置途径。
+- **Low 若干**：SYNC_HEARTBEAT_SECS 巨值 panic 循环（加上界 1..=86400）、serde 400 回显理论渗漏面、客户端 connect await 无停机门、debug 日志全量 origin（应对齐前 8 字符）、setup 重跑静默抹手写 sync_secret、enqueue 失败路径不 ring、测试缺口（Lagged/双订阅断一/陈旧 reap/双活）。
+- **审查排除的疑点（附依据）**：三源 select! 无丢唤醒（tokio 文档舞步逐路径推演）；重连无风暴；hydrate/LRU/cache-clear/sync-apply 不 ring 的正确性（payload 字段集+测试钉死）；Bot /mkdir /rm 与 web upload 走 Vfs 已覆盖；唤醒热路径原子级无误唤醒；服务端 publish 在 store 锁外、锁序单一。
+- 修复批建议待负责人裁决：P1=High-1/2/3（三处均小修）；P2=Med-1 帧切分；P3=Med-2 client_id 双活（含语义裁决）；Low 捎带。
