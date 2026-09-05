@@ -42,6 +42,43 @@ fn pull_request_parses_the_full_shape() {
     assert_eq!(req.since, 7);
 }
 
+/// The pre-secret pull form `{"key","since"}` must keep parsing (the
+/// secret defaults to absent) and re-serialize byte-stably: no
+/// `"secret": null` key may appear, so a secretless new client sends
+/// exactly the bytes an old server always accepted.
+#[test]
+fn pull_request_without_secret_keeps_the_old_wire_shape() {
+    let req: PullRequest = serde_json::from_str(r#"{"key":"k","since":7}"#).unwrap();
+    assert_eq!(req.key, "k");
+    assert_eq!(req.since, 7);
+    let back = serde_json::to_value(&req).unwrap();
+    assert_eq!(back, serde_json::json!({"key": "k", "since": 7}));
+}
+
+/// A pull carrying a secret must survive a parse -> serialize ->
+/// parse roundtrip without the field being dropped (the gate lives on
+/// the server, but the client serializes these same structs).
+#[test]
+fn pull_request_with_secret_survives_roundtrip() {
+    let json = r#"{"key":"k","since":7,"secret":"s3cret"}"#;
+    let req: PullRequest = serde_json::from_str(json).unwrap();
+    assert_eq!(req.key, "k");
+    assert_eq!(req.since, 7);
+    let back = serde_json::to_value(&req).unwrap();
+    assert_eq!(
+        back.get("secret").and_then(|v| v.as_str()),
+        Some("s3cret"),
+        "secret must survive a parse->serialize roundtrip: {back}"
+    );
+    let again: PullRequest = serde_json::from_value(back).unwrap();
+    let out = serde_json::to_value(&again).unwrap();
+    assert_eq!(
+        out.get("secret").and_then(|v| v.as_str()),
+        Some("s3cret"),
+        "roundtripped shape must parse back with the secret: {out}"
+    );
+}
+
 #[test]
 fn pull_response_serializes_to_exact_shape() {
     let body = serde_json::to_value(PullResponse {

@@ -7,7 +7,8 @@
 //! - push answers {max_version}; it grows batch over batch
 //! - incremental pull over HTTP (since filtering)
 //! - configured secret: missing/wrong -> 403 {"error": ...}, right -> 200;
-//!   no configured secret -> everyone passes
+//!   no configured secret -> everyone passes. The gate covers pull as
+//!   well as push (public deployments must not leak the drive index).
 //! - malformed JSON -> 400 {"error": ...} on both endpoints
 //! - unknown namespace pull -> 200 with empty rows and max_version 0
 
@@ -93,6 +94,13 @@ async fn pull(addr: SocketAddr, key: &str, since: i64) -> (StatusCode, Bytes) {
     })
     .expect("serialize pull request");
     post(addr, "/v1/pull", request).await
+}
+
+/// POSTs a raw JSON body to `/v1/pull` — pins the exact wire bytes
+/// (including the optional `secret` field) instead of going through
+/// the typed struct, so the contract cannot drift via struct changes.
+async fn pull_body(addr: SocketAddr, body: &str) -> (StatusCode, Bytes) {
+    post(addr, "/v1/pull", body.to_string()).await
 }
 
 #[tokio::test]
@@ -189,8 +197,10 @@ async fn secret_gate_rejects_missing_and_wrong_but_accepts_right() {
     let (status, body) = push(addr, "ns", Some("nope"), vec![push_row("/a", false, "a")]).await;
     assert_eq!(status, StatusCode::FORBIDDEN, "body: {body:?}");
 
-    // the rejected pushes must not have written anything
-    let (status, body) = pull(addr, "ns", 0).await;
+    // the rejected pushes must not have written anything — pull itself
+    // needs the secret on this server now, so carry it (raw body pins
+    // the wire shape of a secret-carrying pull)
+    let (status, body) = pull_body(addr, r#"{"key":"ns","since":0,"secret":"s3cret"}"#).await;
     assert_eq!(status, StatusCode::OK);
     let response: PullResponse = serde_json::from_slice(&body).unwrap();
     assert!(response.rows.is_empty());
@@ -213,6 +223,90 @@ async fn no_configured_secret_allows_everyone() {
     assert_eq!(status, StatusCode::OK, "body: {body:?}");
     let response: PullResponse = serde_json::from_slice(&body).unwrap();
     assert_eq!(response.rows.len(), 1);
+}
+
+/// The server is deployed on the public internet: with a configured
+/// secret, pull must sit behind the same gate as push — missing or
+/// wrong secret -> 403, the right secret -> 200.
+#[tokio::test]
+async fn configured_secret_gates_pull_missing_wrong_and_right() {
+    let addr = spawn_server(Some("s3cret")).await;
+
+    // missing secret -> 403 with a JSON {"error": ...} body
+    let (status, body) = pull_body(addr, r#"{"key":"ns","since":0}"#).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body:?}");
+    let error: serde_json::Value = serde_json::from_slice(&body).expect("403 body is JSON");
+    assert!(
+        error.get("error").is_some_and(|v| v.is_string()),
+        "body: {body:?}"
+    );
+
+    // wrong secret -> 403
+    let (status, body) = pull_body(addr, r#"{"key":"ns","since":0,"secret":"nope"}"#).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body:?}");
+
+    // right secret -> 200 (unknown namespace: empty rows, counter 0)
+    let (status, body) = pull_body(addr, r#"{"key":"ns","since":0,"secret":"s3cret"}"#).await;
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
+    let response: PullResponse = serde_json::from_slice(&body).unwrap();
+    assert!(response.rows.is_empty());
+    assert_eq!(response.max_version, 0);
+}
+
+/// The 403 body must be actionable: it names the shared-secret
+/// requirement and tells the client where its secret is configured
+/// (`sync_secret` in config.toml / `CYDRIVE_SYNC_SECRET`).
+#[tokio::test]
+async fn pull_secret_rejection_is_actionable() {
+    let addr = spawn_server(Some("s3cret")).await;
+
+    let (status, body) = pull_body(addr, r#"{"key":"ns","since":0}"#).await;
+    assert_eq!(status, StatusCode::FORBIDDEN, "body: {body:?}");
+    let error: serde_json::Value = serde_json::from_slice(&body).expect("403 body is JSON");
+    let text = error
+        .get("error")
+        .and_then(|v| v.as_str())
+        .unwrap_or_default();
+    assert!(
+        text.contains("sync_secret") || text.contains("CYDRIVE_SYNC_SECRET"),
+        "403 text should tell the client where to configure the secret: {text}"
+    );
+}
+
+/// Rejected pulls must leave the store untouched: the namespace of the
+/// refused request is not even registered (pull is read-only and the
+/// gate fires before any store call).
+#[tokio::test]
+async fn pull_rejections_leave_the_store_untouched() {
+    let store = Arc::new(SyncStore::open_in_memory().expect("in-memory store"));
+    let app = router(store.clone(), Some("s3cret".to_string()));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind random loopback port");
+    let addr = listener.local_addr().expect("local addr");
+    tokio::spawn(async move {
+        axum::serve(listener, app).await.expect("accept loop");
+    });
+
+    for body in [
+        r#"{"key":"ns","since":0}"#,
+        r#"{"key":"ns","since":0,"secret":"nope"}"#,
+    ] {
+        let (status, body) = pull_body(addr, body).await;
+        assert_eq!(status, StatusCode::FORBIDDEN, "body: {body:?}");
+    }
+    // unknown, not merely at version 0: nothing registered the namespace
+    assert_eq!(store.namespace_version("ns").unwrap(), None);
+}
+
+/// No configured secret keeps pull open — loopback / tunnel
+/// deployments keep the old behavior by design.
+#[tokio::test]
+async fn no_configured_secret_keeps_pull_open() {
+    let addr = spawn_server(None).await;
+
+    let (status, body) = pull_body(addr, r#"{"key":"ns","since":0}"#).await;
+    assert_eq!(status, StatusCode::OK, "body: {body:?}");
 }
 
 #[tokio::test]
