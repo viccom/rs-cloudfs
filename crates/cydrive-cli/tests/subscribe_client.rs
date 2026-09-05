@@ -22,7 +22,7 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use cydrive_cli::sync_client::{sse_frame_data, HttpSyncClient};
-use cydrive_core::sync::{SyncClient, SyncRowUpdate, SyncError};
+use cydrive_core::sync::{SyncClient, SyncError, SyncRowUpdate};
 use cydrive_sync::events::EventHub;
 use cydrive_sync::router::router_with_hub;
 use cydrive_sync::store::SyncStore;
@@ -38,13 +38,15 @@ const QUIET_HEARTBEAT: Duration = Duration::from_secs(60);
 
 /// Spawns the real sync router on `127.0.0.1:0` with an observable
 /// broadcast hub; returns (address, hub).
-async fn spawn_router(
-    secret: Option<&str>,
-    heartbeat: Duration,
-) -> (SocketAddr, Arc<EventHub>) {
+async fn spawn_router(secret: Option<&str>, heartbeat: Duration) -> (SocketAddr, Arc<EventHub>) {
     let store = Arc::new(SyncStore::open_in_memory().expect("in-memory store"));
     let hub = Arc::new(EventHub::new());
-    let app = router_with_hub(store, secret.map(str::to_string), Arc::clone(&hub), heartbeat);
+    let app = router_with_hub(
+        store,
+        secret.map(str::to_string),
+        Arc::clone(&hub),
+        heartbeat,
+    );
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind ephemeral loopback port");
@@ -68,10 +70,7 @@ fn row_update(rel_path: &str) -> SyncRowUpdate {
 async fn wait_until<F: Fn() -> bool>(what: &str, cond: F) {
     let deadline = Instant::now() + Duration::from_secs(5);
     while !cond() {
-        assert!(
-            Instant::now() < deadline,
-            "timed out waiting for {what}"
-        );
+        assert!(Instant::now() < deadline, "timed out waiting for {what}");
         sleep(Duration::from_millis(25)).await;
     }
 }
@@ -81,7 +80,7 @@ async fn wait_until<F: Fn() -> bool>(what: &str, cond: F) {
 /// keeps the connection open (silently). Raw TCP so the emitted frames
 /// are exactly the (malformed) bytes the test wants — the real router
 /// never sends a bad line.
-async fn spawn_raw_sse_endpoint(frames: &[u8]) -> SocketAddr {
+async fn spawn_raw_sse_endpoint(frames: &'static [u8]) -> SocketAddr {
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
         .await
         .expect("bind raw sse endpoint");
@@ -196,10 +195,7 @@ fn sse_frame_data_extracts_the_data_payload() {
         Some("{\"max_version\":1,\"origin\":null}".to_string())
     );
     // no space after the colon is legal SSE
-    assert_eq!(
-        sse_frame_data("data:x\n"),
-        Some("x".to_string())
-    );
+    assert_eq!(sse_frame_data("data:x\n"), Some("x".to_string()));
     // comment-only frame (the keepalive) carries no data
     assert_eq!(sse_frame_data(": keepalive\n"), None);
     // unrelated field names are ignored

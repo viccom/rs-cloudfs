@@ -587,7 +587,11 @@ async fn https_real_endpoint_handshakes_and_gets_http_status() {
 async fn slow_body_drip_is_bounded_by_the_request_timeout() {
     let port = spawn_drip_body_endpoint().await;
     let url = format!("http://127.0.0.1:{port}");
-    let client = HttpSyncClient::with_request_timeout(&url, Duration::from_secs(2), "drip-probe".to_string());
+    let client = HttpSyncClient::with_request_timeout(
+        &url,
+        Duration::from_secs(2),
+        "drip-probe".to_string(),
+    );
 
     let guard = Duration::from_secs(15);
     let error = tokio::time::timeout(guard, client.pull("ns", None, 0))
