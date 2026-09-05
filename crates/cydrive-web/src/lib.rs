@@ -17,8 +17,10 @@
 //!   dashboard fields.
 //! - `POST /api/upload` — multipart field `file` staged through
 //!   [`Vfs::put`] (accepted ≠ uploaded; the queue uploads async).
-//! - `POST /api/delete` — `{"filename": ...}`, a single `delete_file`
-//!   call (fixing the Python double-call defect per the design doc).
+//! - `POST /api/delete` — `{"filename": ...}`, a single delete call
+//!   through the VFS (fixing the Python double-call defect per the
+//!   design doc; review High-2 routes files through
+//!   [`Vfs::remove_file`]).
 //! - `GET /api/download/{filename}` — hydrate through the VFS and
 //!   answer the bytes with Python's inline disposition; unknown files
 //!   get Python's verbatim 404 body.
@@ -363,16 +365,21 @@ async fn api_upload(State(state): State<AppState>, mut multipart: Multipart) -> 
 
 /// `POST /api/delete` with body `{"filename": ...}`: normalizes the
 /// name the way the Python handler did (`/`-prefixed, backslashes
-/// folded) but issues exactly **one** `delete_file` call — the Python
-/// double call (`delete_file(clean_rel); delete_file(filename)`) was a
-/// defect the design doc explicitly fixes here. The remote is never
-/// touched (baseline mirror). Python also best-effort removed the
-/// cached copy; the frozen [`WebUiConfig`] carries no cache path, so
-/// that cleanup is left to the cache LRU (a stale orphan is inert: the
-/// row is gone, and a re-upload overwrites it). A pending upload whose
+/// folded) and issues exactly **one** delete — the Python double call
+/// (`delete_file(clean_rel); delete_file(filename)`) was a defect the
+/// design doc explicitly fixes here. Files go through
+/// [`Vfs::remove_file`] (review High-2 — the route's former direct db
+/// write bypassed the VFS layer: no pending-guard sharing, no
+/// cache-copy cleanup, no sync-doorbell ring), so the row, its cached
+/// copy and the realtime wake are all handled by the one call; the
+/// remote is never touched (baseline mirror). A pending upload whose
 /// local cache copy still exists is refused with 409 (review H2 / plan
-/// F2, the same adjudication as core `Vfs::remove_file` and the WebDAV
-/// DELETE): that copy is the only copy of the bytes.
+/// F2, the same adjudication as the WebDAV DELETE): that copy is the
+/// only copy of the bytes. Directory rows keep the baseline's
+/// unconditional row delete — the dashboard renders the delete button
+/// on folders too and [`Vfs::remove_file`] refuses directories —
+/// plus the doorbell ring the direct write used to skip; a missing row
+/// answers the baseline's idempotent no-op success.
 async fn api_delete(State(state): State<AppState>, body: Json<serde_json::Value>) -> Response {
     let filename = body
         .0
@@ -383,29 +390,44 @@ async fn api_delete(State(state): State<AppState>, body: Json<serde_json::Value>
         return error_json(StatusCode::BAD_REQUEST, "No filename provided");
     }
     let clean_rel = format!("/{}", filename.trim_matches('/').replace('\\', "/"));
-    // Pending-upload guard: refuse while the row's local cache copy —
-    // the only copy of the bytes — still exists; a ghost pending row
-    // (copy already vanished, bytes nowhere) falls through and deletes
-    // normally. The route holds no cache handle of its own, so the copy
-    // check rides the VFS's cache tree; a name that cannot form a valid
-    // `RelPath` can never match a stored row, so it skips the guard.
-    if let Ok(rel) = RelPath::new(&clean_rel) {
-        let pending_with_copy = match state.vfs.db().get_file(&clean_rel) {
-            Ok(Some(row)) => !row.is_dir && !row.is_uploaded && state.vfs.local_copy_exists(&rel),
-            Ok(None) => false,
-            Err(error) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
-        };
-        if pending_with_copy {
-            return error_json(
-                StatusCode::CONFLICT,
-                format!("still uploading, try again after it finishes: {filename}"),
-            );
-        }
-    }
-    match state.vfs.db().delete_file(&clean_rel) {
-        Ok(()) => Json(serde_json::json!({ "success": true, "deleted": filename })).into_response(),
+    let Ok(rel) = RelPath::new(&clean_rel) else {
+        // A name that cannot form a valid RelPath can never match a
+        // stored row; the baseline's unconditional delete was a no-op
+        // success, and the idempotent answer keeps that shape.
+        return delete_success(filename);
+    };
+    match state.vfs.remove_file(&rel).await {
+        Ok(()) => delete_success(filename),
+        // The pending-upload guard's 409 face, unchanged: the row's
+        // local cache copy is the only copy of the bytes.
+        Err(VfsError::UploadPending(_)) => error_json(
+            StatusCode::CONFLICT,
+            format!("still uploading, try again after it finishes: {filename}"),
+        ),
+        // Idempotent delete — exactly the no-op success the baseline's
+        // unconditional delete_file produced for a missing row.
+        Err(VfsError::NotFound(_)) => delete_success(filename),
+        // Directories: Vfs::remove_file refuses them, but the frontend
+        // renders the delete button on folder rows and the baseline
+        // deleted the row unconditionally — keep that shape (rows only;
+        // the remote stays, Python mirror) and ring the doorbell the
+        // direct write used to skip (deletion = tombstone origin).
+        Err(VfsError::IsDirectory(_)) => match state.vfs.db().delete_file(&clean_rel) {
+            Ok(()) => {
+                state.vfs.wake_sync();
+                delete_success(filename)
+            }
+            Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        },
         Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
+}
+
+/// The delete route's success body: Python's shape echoing the raw
+/// filename from the request (shared by the file, directory and
+/// idempotent-miss arms).
+fn delete_success(filename: &str) -> Response {
+    Json(serde_json::json!({ "success": true, "deleted": filename })).into_response()
 }
 
 /// One parsed single-range byte spec (the `bytes=a-b` family).
