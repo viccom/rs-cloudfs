@@ -1099,3 +1099,36 @@ async fn delete_pending_upload_conflict() {
         "the ghost row is gone"
     );
 }
+
+/// 18 (review High-2): the dashboard's delete rings the sync wake —
+///     a deletion is the tombstone's origin; the route must not
+///     bypass the VFS layer (and its doorbell ring) with a direct db
+///     write. Asserted on an uploaded row (the deletable shape).
+#[tokio::test]
+async fn delete_rings_the_sync_wake() {
+    let env = test_env().await;
+    let addr = env.server.local_addr();
+    seed_row(&env.db, "/wake-doomed.txt", false, 5, true);
+
+    let notifier = env.vfs.sync_notifier();
+    let wake = notifier.notified();
+    tokio::pin!(wake);
+    wake.as_mut().enable();
+
+    let resp = send(
+        addr,
+        &request(
+            "POST",
+            "/api/delete",
+            addr,
+            &[("Content-Type", "application/json")],
+            r#"{"filename":"wake-doomed.txt"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 200, "ok: {resp}");
+
+    tokio::time::timeout(Duration::from_secs(1), wake.as_mut())
+        .await
+        .expect("delete must ring the sync wake");
+}
