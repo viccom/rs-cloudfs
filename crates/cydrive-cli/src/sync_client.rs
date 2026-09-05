@@ -45,6 +45,20 @@ pub const SYNC_SECRET_ENV: &str = "CYDRIVE_SYNC_SECRET";
 /// slower than this is a dead peer, not a big drive.
 pub const SYNC_HTTP_TIMEOUT: Duration = Duration::from_secs(300);
 
+/// Longest the doorbell reader waits for ANY frame — a data event, a
+/// keepalive comment, even a bare blank line — before declaring the
+/// stream dead: warn, close the channel, and let the caller's
+/// reconnect chain heal. 90s = 4.5× the server's default 20s heartbeat,
+/// so any liveness the server advertises arrives well inside the
+/// budget. The heartbeat is server-configurable; if one is raised past
+/// this budget the reader merely reconnects a bit more often than
+/// strictly needed — an over-tight budget costs extra reconnects,
+/// never correctness (events interrupt an idle window at any moment).
+/// Without this deadline a half-open connection (NAT expiry, sleep
+/// wake, Wi-Fi switch) parks the read forever: TCP never notices, and
+/// the reconnect chain never runs (review High-3).
+pub const FRAME_IDLE_TIMEOUT: Duration = Duration::from_secs(90);
+
 /// Cap (characters) for response bodies quoted into error messages —
 /// the truncated server answer stays diagnosable without flooding logs.
 pub const ERROR_BODY_MAX_CHARS: usize = 512;
@@ -162,6 +176,10 @@ pub struct HttpSyncClient {
     client: Client<HttpsConnector<HttpConnector>, Full<Bytes>>,
     /// Per-request budget (see [`HttpSyncClient::with_request_timeout`]).
     request_timeout: Duration,
+    /// Doorbell reader idle budget (see [`FRAME_IDLE_TIMEOUT`]) — how
+    /// long one `frame()` read may park before the stream is declared
+    /// dead and the channel closes for a reconnect.
+    frame_idle_timeout: Duration,
     /// This instance's stable sync identity (from
     /// [`cydrive_core::database::MetaDatabase::sync_client_id`]): rides
     /// on push/pull (the access log's client tag) and on subscribe (the
@@ -205,8 +223,18 @@ impl HttpSyncClient {
             base_url: sync_url.trim_end_matches('/').to_string(),
             client: Client::builder(TokioExecutor::new()).build(connector),
             request_timeout,
+            frame_idle_timeout: FRAME_IDLE_TIMEOUT,
             client_id,
         }
+    }
+
+    /// Overrides the doorbell reader's idle budget (see
+    /// [`FRAME_IDLE_TIMEOUT`]) — the seam the half-open-stream
+    /// regression tests use to keep their windows sub-second;
+    /// production callers keep the 90s default.
+    pub fn with_frame_idle_timeout(mut self, idle: Duration) -> Self {
+        self.frame_idle_timeout = idle;
+        self
     }
 
     /// The wire form of this client's identity: `None` when anonymous

@@ -273,3 +273,44 @@ async fn subscribe_stream_maps_rejection_to_client_error() {
         "the error must name the endpoint: {message}"
     );
 }
+
+// --------------------------------------------------- liveness (High-3) ---
+
+/// A half-open doorbell stream (review High-3): the endpoint delivers
+/// one frame and then goes silent while the TCP connection stays open
+/// — the shape a NAT expiry, a sleep/wake or a Wi-Fi switch leaves
+/// behind, where TCP itself notices nothing. The reader must give up
+/// after the injected idle budget and close the channel (recv turns
+/// None), so the caller's reconnect chain can heal — instead of
+/// parking the read forever. The 5s guard turns a regression back
+/// into a test failure rather than a hung suite.
+#[tokio::test]
+async fn subscribe_stream_recovers_from_a_silent_half_open_stream() {
+    let addr = spawn_raw_sse_endpoint(b"data: {\"max_version\":1,\"origin\":null}\n\n").await;
+    let client = HttpSyncClient::with_request_timeout(
+        &format!("http://{addr}"),
+        Duration::from_secs(10),
+        "idle-probe".to_string(),
+    )
+    .with_frame_idle_timeout(Duration::from_millis(500));
+    let mut doorbell = client
+        .subscribe_stream("ns", None)
+        .await
+        .expect("subscription opens against the raw endpoint");
+
+    // The one frame the endpoint sent arrives and parses.
+    let event = tokio::time::timeout(Duration::from_secs(2), doorbell.recv())
+        .await
+        .expect("the first frame must arrive")
+        .expect("the stream is open");
+    assert_eq!(event.max_version, 1);
+
+    // Then silence with the connection still open: the reader must
+    // exit within the idle budget — the channel closes (recv None),
+    // it does not hang.
+    let next = tokio::time::timeout(Duration::from_secs(5), doorbell.recv()).await;
+    assert!(
+        matches!(next, Ok(None)),
+        "the reader must close the channel on a silent stream instead of parking forever"
+    );
+}
