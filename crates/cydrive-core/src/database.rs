@@ -20,10 +20,13 @@
 //! contract DDL above stays byte-identical and untouched.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::{Arc, Mutex};
 use std::time::{SystemTime, UNIX_EPOCH};
 
+use rusqlite::hooks::Action;
 use rusqlite::{params, Connection, OptionalExtension};
+use tokio::sync::Notify;
 
 /// Error wrapper around [`rusqlite::Error`].
 #[derive(Debug, thiserror::Error)]
@@ -130,8 +133,54 @@ pub struct FileUpsert {
 /// not Sync, which blocked sharing `Arc<MetaDatabase>` across tokio
 /// tasks). Every public method takes the lock for its full body; no
 /// public method calls another, so the lock is never re-entered.
+///
+/// The connection carries a rusqlite `update_hook` (wake chokepoint
+/// batch, 2026-09-06): every `files` table row change rings the
+/// doorbell this type owns and exposes via
+/// [`MetaDatabase::sync_notifier`]. This is the single chokepoint that
+/// replaced the hand-placed `Vfs::wake_sync()` call sites — a write
+/// path can no longer forget to ring, because the ring happens in the
+/// layer every write already goes through.
 pub struct MetaDatabase {
     conn: Mutex<Connection>,
+    /// The sync doorbell rung by the update hook. The database (not the
+    /// VFS) owns it: `MetaDatabase` necessarily exists before any
+    /// consumer ([`crate::vfs::Vfs::new`] takes an `Arc<MetaDatabase>`),
+    /// so the doorbell's lifetime equals the hook's with no constructor
+    /// ordering or injection to get wrong — the alternative (Vfs builds
+    /// the `Notify`, then injects it into an already-open connection)
+    /// would need a post-construction setter and leaves a window where
+    /// the hook exists but rings a placeholder. `Vfs::sync_notifier`
+    /// delegates here, so every existing consumer keeps its handle.
+    files_wake: Arc<Notify>,
+    /// While set, the update hook stays silent (see
+    /// [`MetaDatabase::suppress_files_hook`]).
+    hook_suppressed: Arc<AtomicBool>,
+}
+
+/// RAII silence over the files-table doorbell, returned by
+/// [`MetaDatabase::suppress_files_hook`]. Dropping it re-enables the
+/// hook — early returns included — so a suppressed span can never leak
+/// past its scope.
+///
+/// The flag is connection-global and guards are not counted: nesting a
+/// second guard inside a live one re-enables the doorbell at the inner
+/// drop. The only possible failure of that shape is a benign extra wake
+/// (one extra sync pass that finds nothing), never a lost one — so the
+/// simple bool is enough for the two call sites (sync apply, hydrate
+/// cache-flag flips), neither of which nests. A files write racing a
+/// suppression span from another thread is also silenced; both spans
+/// contain no await points, and the cost is bounded to at most one
+/// fallback-tick delay with eventual consistency intact.
+#[must_use = "the hook stays silent only while the guard is alive; dropping it re-enables immediately"]
+pub struct FilesHookSuppression {
+    flag: Arc<AtomicBool>,
+}
+
+impl Drop for FilesHookSuppression {
+    fn drop(&mut self) {
+        self.flag.store(false, Ordering::Release);
+    }
 }
 
 /// Column list shared by every `files` SELECT (index-mapped by
@@ -263,9 +312,87 @@ impl MetaDatabase {
                 client_id TEXT NOT NULL
             );",
         )?;
+        // Files-table change doorbell (wake chokepoint batch): one
+        // update_hook per connection, installed once here so any later
+        // row change — from this crate, the WebDAV adapter, the web
+        // dashboard, the upload queue or a future caller — rings the
+        // same [`Notify`] the CLI's sync task waits on. rusqlite's hook
+        // is `FnMut + Send + 'static` and fires synchronously on the
+        // thread executing the write (while that writer holds the
+        // connection mutex), so the callback owns its state through
+        // captured `Arc`s instead of borrowing the connection; a
+        // `Notify` handle is deliberately cheap to clone for exactly
+        // this cross-thread shape, and `notify_one` is sync-call-safe.
+        //
+        // Scope and timing notes, all benign by design:
+        // - the hook fires per changed row, pre-commit inside
+        //   transactions — a rolled-back `delete_file` transaction can
+        //   ring for a change that never landed, costing one redundant
+        //   sync pass; many rows (a directory rename) coalesce into one
+        //   permit (`notify_one` stores at most one);
+        // - one-off tools that open the db without a sync task
+        //   (migrate, setup, doctor) install the hook with no waiter:
+        //   at most one permit is parked and dropped with the database
+        //   — a no-op;
+        // - DDL and the sync-lite tables never fire it (row INSERT /
+        //   UPDATE / DELETE on `files` only).
+        let files_wake = Arc::new(Notify::new());
+        let hook_suppressed = Arc::new(AtomicBool::new(false));
+        {
+            let wake = Arc::clone(&files_wake);
+            let suppressed = Arc::clone(&hook_suppressed);
+            conn.update_hook(Some(
+                move |action: Action, _db_name: &str, table: &str, _row_id: i64| {
+                    if table != "files" {
+                        return;
+                    }
+                    match action {
+                        Action::SQLITE_INSERT | Action::SQLITE_UPDATE | Action::SQLITE_DELETE => {}
+                        // SQLITE_UNKNOWN and any future action: not a
+                        // row change we can interpret — stay silent.
+                        _ => return,
+                    }
+                    if suppressed.load(Ordering::Acquire) {
+                        return;
+                    }
+                    wake.notify_one();
+                },
+            ))?;
+        }
         Ok(Self {
             conn: Mutex::new(conn),
+            files_wake,
+            hook_suppressed,
         })
+    }
+
+    /// The shared sync doorbell (doorbell model, quasi-realtime batch):
+    /// the CLI's periodic sync task holds this handle and waits on
+    /// `notified()` alongside its interval tick, turning files-table
+    /// changes into immediate passes. The update hook rings it on every
+    /// `files` row change; `notify_one` (not `notify_waiters`) keeps the
+    /// batch's permit semantics — a wake arriving while a pass is in
+    /// flight parks a permit and fires a follow-up pass, and several
+    /// wakes coalesce into one pass ("many events, one pass").
+    pub fn sync_notifier(&self) -> Arc<Notify> {
+        Arc::clone(&self.files_wake)
+    }
+
+    /// Silences the files-table doorbell for the lifetime of the
+    /// returned guard (drop restores it). The consumer is code whose
+    /// own writes must not trigger a local sync pass:
+    ///
+    /// - the sync engine's pull-apply (`sync::apply_pulled_rows`) —
+    ///   remote rows applied locally; ringing would start a redundant
+    ///   pass for data that already is at its server version;
+    /// - hydrate's `is_cached` flips (and cache clears) — a local-only
+    ///   flag the sync payload deliberately excludes, so a pass for it
+    ///   is pure waste.
+    pub fn suppress_files_hook(&self) -> FilesHookSuppression {
+        self.hook_suppressed.store(true, Ordering::Release);
+        FilesHookSuppression {
+            flag: Arc::clone(&self.hook_suppressed),
+        }
     }
 
     /// Inserts or updates the row keyed by `rel_path`.
@@ -468,6 +595,10 @@ impl MetaDatabase {
     /// uploads keep their flag too: their cache copy is the only copy of
     /// the bytes (plan revision A1), so it must not read as freed.
     pub fn clear_cached_flags(&self) -> Result<u64, DbError> {
+        // is_cached-only UPDATE — a local flag the sync payload excludes,
+        // so the doorbell stays silent for it (same rationale as
+        // hydrate's suppressed cache-flag flips).
+        let _quiet = self.suppress_files_hook();
         let conn = self
             .conn
             .lock()

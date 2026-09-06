@@ -200,27 +200,18 @@ pub struct Vfs {
     transport: Arc<dyn CloudTransport>,
     cfg: VfsConfig,
     queue: UploadQueueHandle,
-    /// The quasi-realtime sync doorbell (doorbell model, approved design):
-    /// every local `files` table change rings it once so the CLI sync task
-    /// can run a pass immediately instead of waiting for the fallback tick.
-    /// The upload queue's success persist rings the same `Notify` through
-    /// the handle injected at construction ([`UploadQueueConfig::sync_wake`]).
-    sync_wake: Arc<Notify>,
 }
 
 impl Vfs {
     /// Assembles the VFS and spawns its upload queue; the
     /// `UploadQueueConfig` is derived from `cfg` (`chunk_size_bytes`
-    /// carried over unchanged). The queue receives this VFS's sync wake
-    /// handle, so an upload's success persist rings the same doorbell as
-    /// the local change hooks.
+    /// carried over unchanged).
     pub fn new(
         db: Arc<MetaDatabase>,
         cache: CacheManager,
         transport: Arc<dyn CloudTransport>,
         cfg: VfsConfig,
     ) -> Self {
-        let sync_wake = Arc::new(Notify::new());
         let queue = spawn_queue(
             Arc::clone(&db),
             Arc::clone(&transport),
@@ -230,7 +221,6 @@ impl Vfs {
                 retry: cfg.retry.clone(),
                 chunk_size_bytes: cfg.chunk_size_bytes,
                 encryption_password: cfg.encryption_password.clone(),
-                sync_wake: Some(Arc::clone(&sync_wake)),
             },
         );
         Self {
@@ -239,26 +229,24 @@ impl Vfs {
             transport,
             cfg,
             queue,
-            sync_wake,
         }
     }
 
-    /// Rings the sync doorbell. `notify_one` (not `notify_waiters`) is the
-    /// semantically correct choice for the doorbell model: a wake that
-    /// arrives while a pass is in flight parks a permit and fires a
-    /// follow-up pass, and several wakes coalesce into one permit — one
-    /// pass — which is exactly the desired "many events, one pass"
-    /// merging. (`notify_waiters` would drop any wake arriving while
-    /// nobody waits, delaying the change to the next fallback tick.)
+    /// Rings the sync doorbell manually. Since the wake chokepoint batch
+    /// the doorbell lives on the database (its `update_hook` rings for
+    /// every `files` row change), so this is no longer the mechanism —
+    /// it remains as an explicit escape hatch for callers that change
+    /// sync-relevant state without touching the `files` table.
     pub fn wake_sync(&self) {
-        self.sync_wake.notify_one();
+        self.db.sync_notifier().notify_one();
     }
 
     /// The shared sync doorbell — the CLI's periodic sync task holds this
     /// and waits on `notified()` alongside its interval tick, turning
-    /// local changes into immediate passes.
+    /// local changes into immediate passes. Delegates to the database's
+    /// doorbell: that is where the files-table `update_hook` rings.
     pub fn sync_notifier(&self) -> Arc<Notify> {
-        Arc::clone(&self.sync_wake)
+        self.db.sync_notifier()
     }
 
     /// Upload path (fire-and-forget, Python parity). Stages the bytes to
@@ -354,10 +342,8 @@ impl Vfs {
             })
             .await
             .map_err(map_queue_error)?;
-        // Sync doorbell: the pending row is durable and the job accepted —
-        // a sync pass from here on sees the change. Synchronous by design,
-        // preserving the no-await-after-enqueue contract above.
-        self.wake_sync();
+        // No manual doorbell here anymore: the pending-row upsert above
+        // already rang it through the db-layer files hook (the chokepoint).
         Ok(())
     }
 
@@ -391,7 +377,12 @@ impl Vfs {
         // 0-byte rows have no remote bytes; materialize an empty copy.
         if row.size == 0 {
             write_atomic(&local, &[])?;
-            self.db.upsert_file(&cached_upsert(&row, true))?;
+            // is_cached-only flip — local flag the sync payload excludes,
+            // so the doorbell stays silent for it.
+            {
+                let _quiet = self.db.suppress_files_hook();
+                self.db.upsert_file(&cached_upsert(&row, true))?;
+            }
             self.cache.record_access(rel);
             return Ok(local);
         }
@@ -425,6 +416,9 @@ impl Vfs {
         // except the cached flag.
         for victim in self.cache.evict_lru(row.size.max(0) as u64)? {
             if let Some(victim_row) = self.db.get_file(victim.as_str())? {
+                // is_cached-only flip — local flag the sync payload
+                // excludes, so the doorbell stays silent for it.
+                let _quiet = self.db.suppress_files_hook();
                 self.db.upsert_file(&cached_upsert(&victim_row, false))?;
             }
         }
@@ -480,7 +474,13 @@ impl Vfs {
                 std::fs::rename(&staged, &local)?;
             }
 
-            self.db.upsert_file(&cached_upsert(&row, true))?;
+            // is_cached-only flip — local flag the sync payload excludes,
+            // so the doorbell stays silent for it (the chokepoint hook
+            // would otherwise ring for every hydration).
+            {
+                let _quiet = self.db.suppress_files_hook();
+                self.db.upsert_file(&cached_upsert(&row, true))?;
+            }
             Ok(())
         };
         let failed = match tokio::time::timeout(timeout, download).await {
@@ -577,8 +577,8 @@ impl Vfs {
             size = file.handle.total_size,
             "indexed inbound remote file (metadata only)"
         );
-        // Sync doorbell: the inbound row landed — a pass can push it.
-        self.wake_sync();
+        // No manual doorbell: the inbound row upsert above rang it
+        // through the db-layer files hook.
         Ok(rel)
     }
 
@@ -636,9 +636,8 @@ impl Vfs {
             chunk_count: 0,
             mime_type: None,
         })?;
-        // Sync doorbell: a directory row is a syncable change like any
-        // other.
-        self.wake_sync();
+        // No manual doorbell: the directory row upsert above rang it
+        // through the db-layer files hook.
         Ok(())
     }
 
@@ -672,8 +671,8 @@ impl Vfs {
                 tracing::warn!(%error, rel_path = %rel, "failed to remove cache copy");
             }
         }
-        // Sync doorbell: the row is gone — a pass pushes the tombstone.
-        self.wake_sync();
+        // No manual doorbell: the row delete above rang it through the
+        // db-layer files hook (deletion = tombstone origin).
         Ok(())
     }
 

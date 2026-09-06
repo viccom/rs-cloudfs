@@ -125,18 +125,23 @@ async fn suppression_guard_silences_writes_and_restores() {
 
     let guard = db.suppress_files_hook();
 
-    // Suppressed: the write lands but the doorbell stays silent.
-    let suppressed_wake = notifier.notified();
-    tokio::pin!(suppressed_wake);
-    suppressed_wake.as_mut().enable();
-    db.upsert_file(&row_upsert("/quiet.txt"))
-        .expect("suppressed write lands");
-    assert!(
-        tokio::time::timeout(Duration::from_millis(250), suppressed_wake.as_mut())
-            .await
-            .is_err(),
-        "a write under the suppression guard must not ring"
-    );
+    // Suppressed: the write lands but the doorbell stays silent. The
+    // waiter lives in its own scope so it is DROPPED before the restore
+    // half — a stale enabled waiter would otherwise be eligible to
+    // consume the restored notify_one, starving the assertion's waiter.
+    {
+        let suppressed_wake = notifier.notified();
+        tokio::pin!(suppressed_wake);
+        suppressed_wake.as_mut().enable();
+        db.upsert_file(&row_upsert("/quiet.txt"))
+            .expect("suppressed write lands");
+        assert!(
+            tokio::time::timeout(Duration::from_millis(250), suppressed_wake.as_mut())
+                .await
+                .is_err(),
+            "a write under the suppression guard must not ring"
+        );
+    }
 
     drop(guard);
 

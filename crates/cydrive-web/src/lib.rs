@@ -410,13 +410,11 @@ async fn api_delete(State(state): State<AppState>, body: Json<serde_json::Value>
         // Directories: Vfs::remove_file refuses them, but the frontend
         // renders the delete button on folder rows and the baseline
         // deleted the row unconditionally — keep that shape (rows only;
-        // the remote stays, Python mirror) and ring the doorbell the
-        // direct write used to skip (deletion = tombstone origin).
+        // the remote stays, Python mirror). No manual doorbell needed:
+        // the row delete rings the db-layer files hook (the chokepoint;
+        // deletion = tombstone origin).
         Err(VfsError::IsDirectory(_)) => match state.vfs.db().delete_file(&clean_rel) {
-            Ok(()) => {
-                state.vfs.wake_sync();
-                delete_success(filename)
-            }
+            Ok(()) => delete_success(filename),
             Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
         },
         Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),

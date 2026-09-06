@@ -377,6 +377,24 @@ pub fn apply_pulled_rows(
     rows: &[SyncPulledRow],
     max_version: i64,
 ) -> Result<ApplyOutcome, SyncError> {
+    // Silence the db-layer files doorbell for the whole apply: these
+    // writes are remote rows landing locally, and ringing would start a
+    // redundant pass ("remote apply -> hook ring -> pointless pass",
+    // the wake-chokepoint batch's suppression case). Correctness — can
+    // these writes lose a push by staying silent? No:
+    // - live rows applied below end with `sync_mirror_set` keyed to the
+    //   *payload* hash, and the rebuilt local row serializes to that
+    //   same payload (the convergence guarantee), so the next
+    //   `push_diff` finds hash-equal and pushes nothing for them;
+    // - tombstone-applied paths have no local row and no mirror row,
+    //   and `push_diff` outputs nothing for a path absent from both
+    //   sides;
+    // - the version-idempotency gate above re-pulls these rows as
+    //   skips. The span is fully synchronous (no await inside), so
+    //   same-thread callers cannot interleave; a files write racing it
+    //   from another thread is silenced too, at the bounded cost of
+    //   one fallback-tick delay (see `FilesHookSuppression`).
+    let _no_doorbell = db.suppress_files_hook();
     let mut outcome = ApplyOutcome {
         pulled: rows.len(),
         ..ApplyOutcome::default()

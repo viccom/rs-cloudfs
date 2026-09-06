@@ -46,7 +46,6 @@ fn test_cfg(chunk_size_bytes: u64) -> UploadQueueConfig {
         retry: fast_retry(),
         chunk_size_bytes,
         encryption_password: None,
-        sync_wake: None,
     }
 }
 

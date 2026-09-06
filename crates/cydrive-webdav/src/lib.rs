@@ -256,9 +256,9 @@ impl DavFileSystem for CyDriveFs {
                 return Err(FsError::Exists);
             }
             self.db.delete_file(rel.as_str()).map_err(db_err)?;
-            // The tombstone's origin: deletion is a files-row mutation
-            // — ring the realtime sync wake (same rationale as MOVE).
-            self.vfs.wake_sync();
+            // No manual doorbell: the row delete above rang the db-layer
+            // files hook (the chokepoint) — deletion is the tombstone's
+            // origin either way.
             Ok(())
         })
     }
@@ -284,9 +284,9 @@ impl DavFileSystem for CyDriveFs {
                 return Err(FsError::Forbidden);
             }
             self.db.delete_file(rel.as_str()).map_err(db_err)?;
-            // The tombstone's origin: deletion is a files-row mutation
-            // — ring the realtime sync wake (same rationale as MOVE).
-            self.vfs.wake_sync();
+            // No manual doorbell: the row delete above rang the db-layer
+            // files hook (the chokepoint) — deletion is the tombstone's
+            // origin either way.
             // Cached copy goes too; removal errors are ignored (Python
             // `handle_delete` swallows OSError). The remote message is
             // deliberately NOT deleted (Python parity).
@@ -326,9 +326,9 @@ impl DavFileSystem for CyDriveFs {
             self.db
                 .rename_path(from.as_str(), to.as_str())
                 .map_err(db_err)?;
-            // Overwrite deletions above and the rename itself are both
-            // files-row mutations — ring the realtime sync wake.
-            self.vfs.wake_sync();
+            // No manual doorbell: the overwrite deletion above (when it
+            // happened) and the rename's row updates all rang the
+            // db-layer files hook (the chokepoint).
             let from_local = self.cache.local_path(&from);
             let to_local = self.cache.local_path(&to);
             if row.is_dir {
