@@ -1100,6 +1100,16 @@ async fn delete_pending_upload_conflict() {
     );
 }
 
+/// Drain any wake permit stored by seeding writes (`notify_one` keeps a
+/// permit when no waiter is enabled), so the assertion can only pass on
+/// the operation under test — not on seeding echoes.
+async fn drain_stale_wake_permits(notifier: &tokio::sync::Notify) {
+    while tokio::time::timeout(Duration::from_millis(50), notifier.notified())
+        .await
+        .is_ok()
+    {}
+}
+
 /// 18 (review High-2): the dashboard's delete rings the sync wake —
 ///     a deletion is the tombstone's origin; the route must not
 ///     bypass the VFS layer (and its doorbell ring) with a direct db
@@ -1111,6 +1121,7 @@ async fn delete_rings_the_sync_wake() {
     seed_row(&env.db, "/wake-doomed.txt", false, 5, true);
 
     let notifier = env.vfs.sync_notifier();
+    drain_stale_wake_permits(&notifier).await;
     let wake = notifier.notified();
     tokio::pin!(wake);
     wake.as_mut().enable();

@@ -587,6 +587,18 @@ async fn create_dir_visible_and_duplicate_exists() {
     assert_eq!(err, FsError::NotFound);
 }
 
+/// Drain any wake permit stored by seeding writes (`notify_one` keeps a
+/// permit when no waiter is enabled), so the assertion in each rings-test
+/// can only pass on the operation under test — not on seeding echoes.
+async fn drain_stale_wake_permits(notifier: &tokio::sync::Notify) {
+    use std::time::Duration;
+
+    while tokio::time::timeout(Duration::from_millis(50), notifier.notified())
+        .await
+        .is_ok()
+    {}
+}
+
 /// MOVE rings the sync wake: every files-row mutation must ring so the
 /// realtime sync pass runs promptly instead of waiting for the interval.
 #[tokio::test]
@@ -597,6 +609,7 @@ async fn rename_rings_the_sync_wake() {
     seed_remote_file(&db, &mock, "/wake-old.bin", b"payload", 2).await;
 
     let notifier = vfs.sync_notifier();
+    drain_stale_wake_permits(&notifier).await;
     let wake = notifier.notified();
     tokio::pin!(wake);
     wake.as_mut().enable();
@@ -626,6 +639,7 @@ async fn remove_file_rings_the_sync_wake() {
     seed_remote_file(&db, &mock, "/wake-doomed.bin", b"payload", 2).await;
 
     let notifier = vfs.sync_notifier();
+    drain_stale_wake_permits(&notifier).await;
     let wake = notifier.notified();
     tokio::pin!(wake);
     wake.as_mut().enable();
@@ -649,6 +663,7 @@ async fn remove_dir_rings_the_sync_wake() {
     seed_row(&db, "/wake-empty-dir", true, 0);
 
     let notifier = vfs.sync_notifier();
+    drain_stale_wake_permits(&notifier).await;
     let wake = notifier.notified();
     tokio::pin!(wake);
     wake.as_mut().enable();

@@ -103,6 +103,16 @@ fn seed_uploaded_row(db: &MetaDatabase, path: &str, msg_id: i64) {
     .expect("seed uploaded row");
 }
 
+/// Drain any wake permit stored by seeding writes (`notify_one` keeps a
+/// permit when no waiter is enabled), so the assertion below can only
+/// pass on the operation under test — not on seeding echoes.
+async fn drain_stale_wake_permits(notifier: &tokio::sync::Notify) {
+    while tokio::time::timeout(Duration::from_millis(50), notifier.notified())
+        .await
+        .is_ok()
+    {}
+}
+
 // ------------------------------------------------------ positive hooks ---
 
 /// `put` rings the wake once the enqueue is accepted (the enqueue-wake
@@ -132,6 +142,7 @@ async fn remove_file_wakes_after_success() {
     seed_uploaded_row(&db, "/bye.txt", 9);
 
     let notifier = vfs.sync_notifier();
+    drain_stale_wake_permits(&notifier).await;
 
     let wake = notifier.notified();
     tokio::pin!(wake);
