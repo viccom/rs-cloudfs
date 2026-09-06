@@ -726,7 +726,7 @@ dependencies = [
 
 [[package]]
 name = "cydrive-cli"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -755,7 +755,7 @@ dependencies = [
 
 [[package]]
 name = "cydrive-core"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "aes-gcm",
  "async-trait",
@@ -780,7 +780,7 @@ dependencies = [
 
 [[package]]
 name = "cydrive-platform"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "cydrive-core",
  "thiserror 2.0.20",
@@ -789,7 +789,7 @@ dependencies = [
 
 [[package]]
 name = "cydrive-sync"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "anyhow",
  "axum",
@@ -811,7 +811,7 @@ dependencies = [
 
 [[package]]
 name = "cydrive-telegram"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "async-trait",
  "bytes",
@@ -827,7 +827,7 @@ dependencies = [
 
 [[package]]
 name = "cydrive-web"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "axum",
  "cydrive-core",
@@ -841,7 +841,7 @@ dependencies = [
 
 [[package]]
 name = "cydrive-webdav"
-version = "0.7.1"
+version = "0.7.2"
 dependencies = [
  "bytes",
  "cydrive-core",
