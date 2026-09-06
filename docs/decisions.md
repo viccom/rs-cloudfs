@@ -244,3 +244,12 @@
 - **P3（Med-2）**：EventHub 增 per-(ns,client_id) 活跃订阅计数（与 receiver 创建同临界区；pump 退出唯一清理点递减、先于 receiver drop）；双活（≥2）时**不跳过且事件 origin 置 None 下发**（客户端二次跳过自然放行、回声走幂等闸；单活保持省一轮 pass 优化不变）；双活出现即 warn（ns/client 各前 8 字符，提示 db 拷贝嫌疑）——静默退化变可诊断。客户端零改动。
 - **门禁**：win workspace 524 / wsl 三 crate 427 全绿（+14）；fmt/clippy 零警告；三单元红→绿断言零漂移（P1 单元 3 绿 commit 的新增对照测试为增量非改动）。
 - **遗留**：Low 项未动（SYNC_HEARTBEAT 上界 panic 循环、serde 400 回显、connect 停机门、debug 全量 origin、setup 抹 secret、enqueue 失败唤醒、测试缺口四项）——decisions 上一条挂账。
+
+## 2026-09-05 唤醒收口批（refactor/wake-chokepoint，0.7.2）：files 表变更门铃单点化
+
+- **动机**：手工 wake_sync 埋点是「靠人记得」的设计缺陷——0.7.0 审查已实证产出两条漏埋 High（后补）；负责人裁决按架构改进收口。
+- **实现**：MetaDatabase 构造时装 rusqlite `update_hook`（需 `hooks` feature）——INSERT/UPDATE/DELETE 且表名=files 即 `notify_one`（同步上下文安全）；Notify **db 自持**（db 先于任何消费者存在，生命周期=钩子，pub API `vfs.sync_notifier()` 委托零变化）；**抑制位** RAII guard（`#[must_use]`，Drop 恢复，非嵌套语义=至多良性多响一次永不丢响）；消费方=sync apply 整段（丢推不可能论证注释：applied 行与 mirror hash 相等不推）+ hydrate 三处 is_cached 写 + clear_cached_flags（is_cached 不入 payload 的原则一致化）。
+- **埋点退役**：Vfs 四处/upload_queue ring+字段/webdav 三处/web 一处全部删除；新写路径自动获得唤醒（覆盖面净增：webdav MKCOL 直写此前就无埋点）。webdav MKCOL note：等下——MKCOL 走 Vfs::create_dir？收口后无所谓直写与否，钩子统管。
+- **已知后果与修复**：`notify_one` 无等待者存 permit → 5 个既有正向 rings 测试（seed 写库存 permit）被陈旧回声空洞化（子代理如实申报）——主会话补 drain 纪律（`drain_stale_wake_permits` 辅助，50ms 窗耗尽存留 permit）恢复判别力（b2f4286）；真实证明力=db_wake.rs 三测（直写 db 也响/抑制静默+恢复/chunks 写不误响）。
+- **门禁**：win 527 / wsl 430 全绿；既有全部行为护栏测试零改动通过（等价性证明）。rusqlite +hooks feature（非默认，无版本变化）。
+- **后续待办不变**：百度 spike 等凭据；trait 瘦身等 spike 结论；Low 项挂账。
