@@ -349,3 +349,9 @@
 - **合并策略**：feat/phase0-1 全部 commit 合回 main（本地 merge；无 origin 远端可推）。worktree 移除、分支保留可追溯。不部署生产位（Phase 2 验收后统一裁决，计划原文）。
 - **执行期累积的待负责人项**（详见 tracker「待负责人清单」节）：baidu1 链失效、并行会话异常、方案 A 语义备选、KDF DoS 缓解、gen_compat_fixtures 路径、CI 首跑校准等。
 - 门禁终态：win fmt/clippy 干净 + 617 passed 0 failed（ignored 6 真机）；wsl E 批态 618 passed 0 failed（+1 平台 cfg 既有差异）；release 全 workspace 构建通过。
+
+## 2026-09-07 C-1 终态验证补遗（构建竞态 + 验证诚实性修正）
+
+- **现象**：版本 bump commit（858b687）后 `cargo test --workspace` 连续三次编译失败（dav_server/base64「required to be available in rlib format」→ E0786 元数据无效），选择性 clean 无效，全清（46.7GiB）后首次并行重建仍失败；但单目标 `cargo test -p cloudkit-cli --test run_e2e` 可编可跑，重试全量即绿。
+- **结论**：非代码缺陷（lockfile diff 仅 9 行版本号；d0da789 上 617 绿实证）——判为 Windows 全清后大规模并行 rustc 的瞬时竞态（文件锁类）。处置先例：单目标验证→重试全量。
+- **诚实性修正**：收口条目初稿写「win 617 绿」时该结论在 858b687 上**尚未真实跑过**（链式门禁的测试步骤实际失败但被管道退出码掩盖——awk 空输入仍 exit 0 使 && 链继续）。现已实证补全（617 passed 0 failed，85 个 ok 行，零失败）。教训入册：**门禁链中禁用会吞非零退出的管道聚合，测试步骤必须独立判定退出码**。
