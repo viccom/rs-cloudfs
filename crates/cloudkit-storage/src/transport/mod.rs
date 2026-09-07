@@ -143,6 +143,27 @@ pub trait CloudTransport: Send + Sync {
     async fn connect(&self) -> Result<(), StorageError>;
     /// Uploads `job` chunk-by-chunk, returning the receipt on success.
     async fn upload(&self, job: &UploadJob) -> Result<UploadReceipt, StorageError>;
+    /// Streaming-upload face (Batch E / E-3, foundation D7): uploads the
+    /// byte stream `data` under `job`'s chunk plan instead of reading
+    /// `job.local_path`. `job.size` / `chunk_count` / `chunk_size` carry
+    /// the same plan semantics as [`CloudTransport::upload`] and `data`
+    /// must yield exactly `job.size` bytes before EOF; `job.local_path`
+    /// is provenance only (the caller's plaintext cache copy — the bytes
+    /// on the wire are the stream's). Encryption chunking and storage
+    /// chunking are orthogonal (D1): the stream is an opaque byte
+    /// sequence to the transport.
+    ///
+    /// Provided default: [`StorageError::Unsupported`] — the
+    /// capability-probe evolution rule (interfaces §1: prefer provided
+    /// methods over trait forks; consumers must degrade, never panic).
+    async fn upload_stream(
+        &self,
+        job: &UploadJob,
+        data: ByteStream,
+    ) -> Result<UploadReceipt, StorageError> {
+        let _ = (job, data);
+        Err(StorageError::Unsupported)
+    }
     /// Streams the full bytes of `file`.
     async fn open(&self, file: &RemoteHandle) -> Result<ByteStream, StorageError>;
     /// Streams the slice `[off, min(off + len, EOF))` of `file`.

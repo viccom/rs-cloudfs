@@ -52,6 +52,8 @@ impl Default for MockState {
             upload_script: VecDeque::new(),
             incoming_events: Vec::new(),
             upload_calls: Vec::new(),
+            stream_upload_calls: Vec::new(),
+            max_stream_frame: 0,
             deleted: Vec::new(),
             open_delay: Duration::ZERO,
             sent_texts: Vec::new(),
@@ -93,6 +95,13 @@ struct MockState {
     incoming_events: Vec<Result<IncomingEvent, StorageError>>,
     /// Snapshot of every `upload()` job, in call order.
     upload_calls: Vec<UploadJob>,
+    /// Snapshot of every `upload_stream()` job, in call order (recorded
+    /// separately from `upload_calls` so tests can pin which face ran).
+    stream_upload_calls: Vec<UploadJob>,
+    /// Largest single `Bytes` frame any `upload_stream()` call delivered
+    /// (0 = no stream upload ran) — the observable behind the v2 wiring's
+    /// memory-granularity assertions.
+    max_stream_frame: usize,
     /// msg_ids successfully deleted, in order.
     deleted: Vec<i32>,
     /// Artificial pre-stream delay injected by `open`/`open_range`
@@ -181,6 +190,23 @@ impl MockTransport {
         self.lock()
             .map(|state| state.upload_calls.clone())
             .unwrap_or_default()
+    }
+
+    /// Snapshot of every `upload_stream` call's job, in order — recorded
+    /// separately from [`MockTransport::upload_calls`] so tests can pin
+    /// which face an upload went through.
+    pub fn stream_upload_calls(&self) -> Vec<UploadJob> {
+        self.lock()
+            .map(|state| state.stream_upload_calls.clone())
+            .unwrap_or_default()
+    }
+
+    /// Largest single `Bytes` frame any `upload_stream` call delivered
+    /// (0 = no stream upload ran) — the observable behind the v2 wiring's
+    /// memory-granularity assertions (peak frame must stay within one
+    /// crypto chunk + tag).
+    pub fn max_stream_frame(&self) -> usize {
+        self.lock().map(|state| state.max_stream_frame).unwrap_or(0)
     }
 
     /// msg_ids successfully deleted, in order.
