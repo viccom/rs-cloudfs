@@ -298,3 +298,16 @@
 - **⑤ 能力位声明（R4 过渡期）**：grammers = INBOUND/CHAT/RANGE_READ/MULTIPART（依据：驱动单测 + rs-CyDrive 生产真机；conformance 前置属 Phase 2，已在代码注释注明；未声明位逐个列明理由——telegram 为影子索引 D4 故无 AUTHORITATIVE_INDEX 等）；Mock = INBOUND/CHAT/RANGE_READ（恰为上游测试行使面）。
 - **护栏证据**：既有 555 测试全程保持绿；迁移期护栏当场抓住 mock 单块命名分支丢失（`hello.txt` 被写成 `hello.txt.part000`）——修复后全绿；终态 562 passed 0 failed（+7 新语义测试）/ clippy -D warnings / fmt / check_layers 全过；`rg 'cloudkit-core' crates/drivers/ck-telegram/Cargo.toml` 为空（注释措辞一并避让字面命中）。
 - **取舍记录**：transport::ByteStream（Send+Sync，历史接缝）与 vocab::ByteStream（Send，StorageDriver 家族）两类型并存——bounds 延续迁移前形态保 WebDAV 消费面零变化；transport 模块符号不在 storage crate root re-export（防与词汇类型遮蔽）。
+
+## 2026-09-07 Batch E：cloudkit-crypto 独立成 crate + v2 分块 AEAD 格式裁决（E-1/E-2）
+
+- **背景**：foundation D7 要求加密装饰器双格式——v1 GCM 冻结维护（Python 互操作，R6）+ v2 分块 AEAD（流式+随机访问+流式水合）。红 3e46ea8 → 绿 19a2f2f（迁移 23702ea 在前）。
+- **① crate 切分与依赖姿态**：`cloudkit-crypto` 独立 crate（不依赖 workspace 内其他 crate），crypto 定位 L2 侧基础能力被 core 消费不算违规（architecture §1.5 注）；core/src/crypto.rs 改薄 re-export shim 维持 `cloudkit_core::crypto::*` 路径（vfs/upload_queue 及测试 import 零改动）。**流式原语取 sync `std::io::Read/Write` 而非 async trait**——零 tokio 依赖保持 crate 轻量，异步适配（spawn_blocking 包裹）归 L4 消费方（E-3 接线时定）。
+- **② v1 迁移的「字节不变」证明形态**：函数体逐字迁移（src/v1.rs），共享 CryptoError 上移 crate root（原两变体序与 Display 字符串原样）；Python 互操作向量测试 git mv 随迁（前后各 11 passed），文件 diff 仅 2 行机械路径调整（模块 doc 头 + use 行），断言零改动。GcmV1 经 trait 的流式面为**迁移特征化测试**（格式恒等断言），不要求 TDD 红——红集中在 v2 新语义。
+- **③ v2 容器格式（自设计，STREAM 构造）**：头 34B = `magic b"CKCRYPT2" | version 0x01 | reserved 0 | salt 16B | PBKDF2 迭代数 u32BE | chunk_size u32BE`；每块独立 AES-256-GCM，**nonce = 4B 零前缀 || counter_be56 || 末块标志字节**（末块判定进 nonce 域分隔——边界截断后新尾块以 final 位解密必认证失败，这是防截断的核心机制，对齐 Tink STREAM）；**AAD = 完整 34B 头**（salt/KDF 参数/块大小与每块密码学绑定，头部拼接与逐字段改写全拒）。非末块恒 `chunk_size+16`B；末块 `1..=chunk_size+16`（空文件=单个空末块）；结构自定界（`n-1=(body-16)/(chunk+16)` 唯一解且校验末块长落界），decrypt_range 凭总长定位块不触碰数据；**非典范空尾块（n>1 且末块明文 0）按 Malformed 拒绝**——编码器只对空文件发空末块。
+- **④ 流式末块判定 = 1 字节前瞻而非持两块**：fill 满一块后 peek 一字节判 EOF——工作集 = 块缓冲 + 1B（优于 hold-back 双缓冲），代价是精确倍数文件以**满末块**收尾（无空尾块，格式非典范形态因此可拒）。粒度证据：9.5MiB@1MiB 读粒度 ≤ 块、写粒度 ≤ 块+tag。
+- **⑤ KDF 与 v1 协同而非独立演进**：默认同参数（PBKDF2-HMAC-SHA256 100k、16B 随机 salt），但**迭代数入头**——后续调优不改格式破兼容；v1 保持硬编码（冻结契约）。跨格式 key+nonce 撞车需 2^-128 salt 碰撞，忽略。
+- **⑥ 解密侧容器自述优先**：chunk_size 以头内值为准，读者 AeadV2 配置不参与解密（防错配解密出垃圾/误报）；配置只管加密侧。decrypt_range 语义 = storage Range 同款**半开+钳制**（end 钳到明文长、start≥长得空）——与 L2 Range 断言②语义对齐，hydrate 分发（E-4）无需翻译。
+- **⑦ 已知风险挂账（待负责人裁）**：头内 PBKDF2 迭代数不可信——伪造头可放大 KDF 工作量（测试翻转高位字节即 ~16.8M 迭代，单测跑 ~60s 的原因）。候选缓解：头内迭代数上限（Malformed 拒绝）或 KDF 参数版本化；本批不动（改动会动已红测试的期望错误类，且上限值选择需裁决）。
+- **⑧ 零 serde 先行**：CryptoSchemeId 暂不带 Serialize/Deserialize——E-4 Entry 字段落位时随需加 derive（YAGNI，避免无消费者的依赖面）。
+- **验证**：aead_v2 16 / gcm_v1 11 / scheme 5 全绿；workspace 586 passed 0 failed（565 基线 + 21 新增）/ clippy -D warnings / fmt / check_layers 全过；红证据 3e46ea8（aead_v2 15 failed + scheme 1 failed，断言红）。

@@ -47,8 +47,8 @@ Batch P0 已收口；**Batch S（百度 spike）已收口（2026-09-07，止损�
 
 | # | 任务 | 状态 | 证据/注记 |
 |---|---|---|---|
-| E-1 | cloudkit-crypto：CryptoScheme trait + v1 GCM 迁入（字节零变化，互操作测试护航） | ⬜ | |
-| E-2 | v2 分块 AEAD 核心（STREAM 构造；roundtrip/tamper 拒绝/跨块 Range） | ⬜ | |
+| E-1 | cloudkit-crypto：CryptoScheme trait + v1 GCM 迁入（字节零变化，互操作测试护航） | ✅ | 迁移 23702ea：crate 独立（无 workspace 内依赖，sync std::io）+ trait/Id 语义契约成文 + core shim（`cloudkit_core::crypto::*` 零改动）；互操作向量测试 git mv 随迁前后各 11 passed、diff 仅 2 行机械路径（断言零改动）；workspace 565 与基线一致 |
+| E-2 | v2 分块 AEAD 核心（STREAM 构造；roundtrip/tamper 拒绝/跨块 Range） | ✅ | 红 3e46ea8 → 绿 19a2f2f：格式=34B 头（magic/version/salt/迭代数/chunk_size 护栏 64KiB..=4MiB）+ 每块 GCM（nonce=counter_be56+末块标志域分隔、AAD=全头）；测试面 roundtrip 八尺寸/六类 tamper 全拒/decrypt_range 11 区间与全量切片逐字节一致/9.5MiB 流式粒度断言/护栏边界；终态 aead_v2 16 + scheme 5 新测试，workspace 586 passed 0 failed/clippy/fmt/check_layers 全过；格式裁决入 decisions.md（含 KDF DoS 放大挂账待裁） |
 | E-3 | 流式加密上传接线（零 .enc.tmp；内存峰值断言） | ⬜ | |
 | E-4 | `encryption_scheme` 配置键 + Entry/payload scheme 字段 + hydrate 按 scheme 分发 | ⬜ | legacy json 拒收；旧实例忽略新字段 |
 | E-5 | 真机 v2 冒烟（telegram 加密小文件上传/下载往返） | ⬜ | |

@@ -20,7 +20,7 @@
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 527 测试（fork 基线；Phase 0 后更新本行）
+cargo test --workspace --no-fail-fast            # 586 测试（Batch E E-1/E-2 后；含 cloudkit-crypto 32）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 scripts/check_layers                             # R1 层依赖门禁（CI 同款；动 Cargo.toml 依赖后必跑）
