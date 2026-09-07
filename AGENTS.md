@@ -20,7 +20,7 @@
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 613 测试（Batch E 全代码任务后；ignored 6 为既有真机）
+cargo test --workspace --no-fail-fast            # 617 测试（E-5 修复后；ignored 6 为既有真机）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 scripts/check_layers                             # R1 层依赖门禁（CI 同款；动 Cargo.toml 依赖后必跑）
