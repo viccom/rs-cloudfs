@@ -269,3 +269,10 @@
 - **门禁证据**：win 每改名 commit 前 fmt/clippy/test 全绿（527 不变）×7 + 终态全绿；WSL clone ~/rs-cloudfs + cargo check 过 + 全量 test 528 passed 0 failed（+1 = bin_cli.rs 平台 cfg 既有差异，rg 核查非改名引入）；`cydrive --version` = `cydrive 0.7.2`。
 - **待负责人**：scripts/gen_compat_fixtures.py 输出路径仍指旧 crates/cydrive-core（fixture 文件已随 git mv 迁移，脚本不在本批授权内未动）——修复时点待裁决；CI workflow 从未真实触发（仓库无 origin），首跑需校准。
 - **回滚**：git revert fe61e8e..b9bc044 各 commit（纯机械可逆）；WSL 通道可整目录删除重建。
+
+## 2026-09-07 Batch S 百度 spike：断点续传取「持久化 uploadid」而非「重 precreate 已传列表」
+
+- **冲突双方**：multicloud 计划 Batch S 任务原文预设「precreate 返回已传分片列表、重传只补差集」 vs 实测 API 行为——相同 path/size/block_list 二次 precreate 返回**新 uploadid + 全量待传列表**（旧会话分片不随之返回）。
+- **采纳裁决**：B2 断点续传 = precreate 后**立即持久化 uploadid**（path/size/block_md5/完成位图随分片落盘），恢复时用旧 uploadid 重发一个缺失分片探活，活则只补差集（spike 实证：phase1=[0,1,2] 后 phase2 仅传 [3..7]，create errno=0 即服务端确认旧分片保留）。
+- **风险**：uploadid 会话有效期未知（spike 仅验证跨进程分钟级存活）；若过期则整体重传（兜底路径已实现）。附带发现一并约束 B2：服务端 `md5` 字段为内部 content-id 非字面 MD5（校验走内容比对/CDN content-md5 头）；rtype=1 为冲突重命名（覆盖语义需 rtype=3，待复核）；CDN 下载仅授权 ≤4MiB 有界 Range + netdisk UA。
+- **证据**：docs/reports/2026-09-07-baidu-spike.md §3。

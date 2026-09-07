@@ -7,7 +7,7 @@
 
 ## 当前焦点
 
-P0-3 已收口（2026-09-07）；下一步 = P0-4（门禁全绿 + WSL 通道 ~/rs-cloudfs + `cydrive --version` 验证）。
+Batch P0 已收口；**Batch S（百度 spike）已收口（2026-09-07，止损未触发，六项全档）**；下一步 = Batch R（trait 瘦身，TDD——百度 errno 三档映射/断点续传参数按 spike 报告 docs/reports/2026-09-07-baidu-spike.md 落地）。
 
 ---
 
@@ -24,13 +24,13 @@ P0-3 已收口（2026-09-07）；下一步 = P0-4（门禁全绿 + WSL 通道 ~/
 
 | # | 任务 | 状态 | 证据/注记 |
 |---|---|---|---|
-| S-1 | token 刷新链跑通（refresh_token → 新 access） | ⬜ | |
-| S-2 | QPS/限额三连测（列目录/分片/下载，记录拒绝形态；PCFS appkey 桶局限标注） | ⬜ | |
-| S-3 | 上传三步曲 + 断点续传差集（中途杀进程只补差集） | ⬜ | |
-| S-4 | 秒传 return_type 分支行为 | ⬜ | |
-| S-5 | dlink+Range 复测 + dlink 有效缓存时长 | ⬜ | |
-| S-6 | ≥1GB 上/下行吞吐实测 | ⬜ | |
-| S-7 | spike 报告落档（docs/reports/）+ 止损判定 | ⬜ | ⛔止损 → R/E 不受影响继续 |
+| S-1 | token 刷新链跑通（refresh_token → 新 access） | ✅ | `examples/baidu_spike refresh`：http=200 expires_in=30d/143ms（baidu1.json 链已被消费失效 → 改用 **baidu2.json**，待负责人知悉）；token 只落 %TEMP%；appkey/secret 运行时解析自 PCFS client.go（值零入库） |
+| S-2 | QPS/限额三连测（列目录/分片/下载，记录拒绝形态；PCFS appkey 桶局限标注） | ✅ | list 10 连发（含并发）全 200/errno=0（204–501ms）；superfile2 同分片 10 连发（含并发）全 error_code=0；下载流 5 连发（含并发）全 302+206——**零 429/31034/拒绝**；⚠ 结论仅对 PCFS 第三方 appkey 桶有效（正式 appkey 须复跑，工具已就位） |
+| S-3 | 上传三步曲 + 断点续传差集（中途杀进程只补差集） | ✅ | abort 上传 [0,1,2] 后 `std::process::abort()` 硬杀；continue 用**持久化旧 uploadid** 探活成功 → 只补 [3,4,5,6,7]（2.3s）→ create errno=0 = 服务端保留旧分片（差集成立）。任务预设「重 precreate 拿已传列表」实测不成立（同参重 precreate = 新 uploadid + 全量列表）——裁决记 docs/decisions.md 2026-09-07 Batch S 条目。附带：服务端 `md5` 字段为 content-id 非字面 MD5（校验走内容/CDN 头）；rtype=1=冲突重命名（覆盖需 rtype=3，待 B2 复核） |
+| S-4 | 秒传 return_type 分支行为 | ✅ | 此 appkey 桶**秒传不触发**：同内容即时 + 延迟 2min+ 复测均 return_type=1（响应含 uploadid+block_list）；B2 仍实现 return_type=2 分支但不作功能依赖 |
+| S-5 | dlink+Range 复测 + dlink 有效缓存时长 | ✅ | 302→CDN head/mid/tail 三点 206 字节级匹配；**下载三约束**：有界 Range≤4MiB（8MiB 即 403/31326，位置无关）+ netdisk UA（Mozilla 全 403）+ 禁无 Range/开放 Range；dlink 直连/追加 token 两态并存（fallback 必做）；单 dlink 支撑 256 分片×4 并发 1GiB 下载且 **≥56min 未失效**（探测进程被环境终止时仍 206，上界未测到）→ B2 缓存 TTL 30min + 403 驱动刷新 |
+| S-6 | ≥1GB 上/下行吞吐实测 | ✅ | 1GiB：上行 27.4 MB/s（256 分片×4 并发 39.3s，复跑 25.2 一致）、下行 21.7 MB/s（256×4MiB 有界分片×4 流，单 dlink 复用，256/256 206 字节全额）；远超 5MB/s 止损线 |
+| S-7 | spike 报告落档（docs/reports/）+ 止损判定 | ✅ | 报告 = docs/reports/2026-09-07-baidu-spike.md（六项：方法/原始输出/结论/B 批参数建议）；**止损未触发**；远端 cleanup 完成（9 文件 + spike 目录全删，复查 errno=-9；删除走回收站如实记录）；门禁 fmt/clippy -D warnings 干净 + test 527 passed 0 failed |
 
 ## Batch R：trait 瘦身（纯重构，TDD）
 
