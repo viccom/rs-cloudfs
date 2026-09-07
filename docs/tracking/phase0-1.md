@@ -18,7 +18,7 @@ P0-3 已收口（2026-09-07）；下一步 = P0-4（门禁全绿 + WSL 通道 ~/
 | P0-1 | worktree/分支建立（feat/phase0-1） | ✅ | 负责人预授权 P0 直 main（Kickoff 指令），不开 worktree |
 | P0-2 | crate 改名 cydrive-*→cloudkit-*/ck-*（逐 crate 提交，二进制名不变） | ✅ | fe61e8e / 83cc23d / 5f2b986 / 8bc031f / 360a675 / e6581f9 / 50d13b2（core→cloudkit-core、telegram→drivers/ck-telegram、sync→cloudkit-sync-server、webdav→cloudkit-webdav、web→cloudkit-web、platform→cloudkit-platform、cli→cloudkit-cli）；每 commit 前三步门禁全绿，测试计数保持 527；`[[bin]] cydrive`/`cydrive-sync-server`、`CYDRIVE_*` env、`cydrive_sync.db` 等契约未动 |
 | P0-3 | `scripts/check_layers` + CI 秘密扫描步骤 | ✅ | 代码/CI 交付 = b9bc044：两脚本入库（POSIX sh，shellcheck 干净；`.gitattributes` 锁 LF）+ ci.yml 接入（checkout fetch-depth:0，fmt 前两 step：layer check R1 / secret scan R3）；check_layers 正例 7 manifests 全绿、反例（临时目录：L3+crate→driver、driver→driver 各抓到 exit 1；组合根豁免/注释行/vendor 排除对照不误报）；scan_secrets 全树零命中、反例五路（push 真实 before / zeros 回退 / PR / 干净区间 OK / 本地全树）均符合预期，行号精确定位 bad.txt:3、短值 `password = "short"` 不误报；不可用 range/非 git 目录=响亮失败非静默 OK（exit 2/128）；三步门禁随批全绿（fmt/clippy 干净，test 527 passed 0 failed） |
-| P0-4 | 门禁全绿 + WSL 通道（~/rs-cloudfs）建立 + `--version` 验证 | ⬜ | |
+| P0-4 | 门禁全绿 + WSL 通道（~/rs-cloudfs）建立 + `--version` 验证 | ✅ | 终态门禁：win fmt/clippy 干净 + `cargo test --workspace` 全 suite 0 failed（527）；WSL `~/rs-cloudfs` clone 自 /mnt/e（git fetch 单向同步法）+ `cargo check` 23.50s 过 + 全量 `cargo test --workspace` **528 passed 0 failed**（+1 为 bin_cli.rs 平台 cfg 既有差异，核查过非改名引入）；`cydrive --version` → `cydrive 0.7.2`（bin 名不变） |
 
 ## Batch S：百度 spike（验证驱动，非 TDD）
 

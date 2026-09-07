@@ -260,3 +260,12 @@
 - **规范先行（负责人指令「代码未动，规范先行」）**：docs/standards/ 五份（architecture/code-style/interfaces/logging/documentation）+ AGENTS/README 重写 + 融合基线设计 v1.0→v1.2。规范素材 = rs-CyDrive 全部生产纪律 + PrivateCloudFS 正反经验（错误泄漏/硬编码密钥/CTR 无认证/调试残留为反例；能力位/TokenCallback/conformance 思想为正面）。
 - **红队复审（独立子代理）修复集**：H1 本条目与提交落盘；H2 architecture §1.5 过渡豁免清单（ck-telegram→core 反向依赖 Phase 1 R 解除、crate 名 Phase 0、R4 conformance 前置 Phase 2、core 合体长期豁免+组合根豁免）；H3 multicloud 计划加 SUPERSEDED banner（Kickoff 作废、附录 A 仍有效、接口形状以 D1-D10 为准）；H4 conformance 最小断言集八条落 interfaces.md + Phase 2 前置任务「驱动接入手册」；M1 local 入分层图/crate 树；M2 D6 local 卷形态（规范化根路径）+ D10 权威后端 sync 验收口径；M3 Phase 1 R 批验收补真机 Telegram 冒烟；M4 AGENTS 补 PROPPATCH 教训/补遗节指针/继承挂账；M5/M6 Phase 0 交付 check_layers 脚本与 CI 秘密扫描；M7 §7a E2E 隔离裁决（独立测试 chat + /_e2e/ 前缀 + 收尾清理）；M8 层级规则组合根豁免与 crypto 定位；L1-L7 全修（README 链接/章节序/门禁口径统一/参数守卫条款/R4 local 豁免/文档两档制）。
 - **待负责人确认**：基线设计 §9-2/9-3/9-4（旧仓冻结时点 / bot 分 crate 时点 / R-E 批序）。
+
+## 2026-09-07 Phase 0 搬迁改名批收口（P0-A/B/C，直 main）
+
+- **P0 直 main 裁决**：Kickoff 预授权「P0 可直 main（机械批酌情）」，采纳直 main——每 commit 三步门禁全绿 + git mv 保历史，机械噪音不进 feature 分支；S/R/E 自 main 切 `feat/phase0-1` worktree 执行。
+- **改动**：7 crate 改名（cloudkit-core/-sync-server/-cli/-platform/-web/-webdav + drivers/ck-telegram，fe61e8e..50d13b2，119 文件）；bin 名 `cydrive`/`cydrive-sync-server`、`CYDRIVE_*` env、`cydrive_sync.db` 等用户契约零变化；scripts/check_layers（R1 机械闸，组合根豁免 cloudkit-cli）+ scripts/scan_secrets（R3 最小闸，扫事件 diff 新增行，紧模式防误报）+ CI 双 step 接入（b9bc044）。
+- **取舍**：①telegram 落 crates/drivers/ 子目录（foundation §3 结构）；②scan_secrets 模式大小写敏感（-i 会命中 gen_compat_fixtures.py:31 已知假密码，误报会阻断 CI）——局限已注于脚本头；③examples 形态：Batch S spike 将以 workspace-excluded 独立 crate 落 examples/baidu_spike（真网调用不进 CI 门禁，零 workspace 依赖耦合）。
+- **门禁证据**：win 每改名 commit 前 fmt/clippy/test 全绿（527 不变）×7 + 终态全绿；WSL clone ~/rs-cloudfs + cargo check 过 + 全量 test 528 passed 0 failed（+1 = bin_cli.rs 平台 cfg 既有差异，rg 核查非改名引入）；`cydrive --version` = `cydrive 0.7.2`。
+- **待负责人**：scripts/gen_compat_fixtures.py 输出路径仍指旧 crates/cydrive-core（fixture 文件已随 git mv 迁移，脚本不在本批授权内未动）——修复时点待裁决；CI workflow 从未真实触发（仓库无 origin），首跑需校准。
+- **回滚**：git revert fe61e8e..b9bc044 各 commit（纯机械可逆）；WSL 通道可整目录删除重建。
