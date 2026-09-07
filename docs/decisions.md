@@ -355,3 +355,10 @@
 - **现象**：版本 bump commit（858b687）后 `cargo test --workspace` 连续三次编译失败（dav_server/base64「required to be available in rlib format」→ E0786 元数据无效），选择性 clean 无效，全清（46.7GiB）后首次并行重建仍失败；但单目标 `cargo test -p cloudkit-cli --test run_e2e` 可编可跑，重试全量即绿。
 - **结论**：非代码缺陷（lockfile diff 仅 9 行版本号；d0da789 上 617 绿实证）——判为 Windows 全清后大规模并行 rustc 的瞬时竞态（文件锁类）。处置先例：单目标验证→重试全量。
 - **诚实性修正**：收口条目初稿写「win 617 绿」时该结论在 858b687 上**尚未真实跑过**（链式门禁的测试步骤实际失败但被管道退出码掩盖——awk 空输入仍 exit 0 使 && 链继续）。现已实证补全（617 passed 0 failed，85 个 ok 行，零失败）。教训入册：**门禁链中禁用会吞非零退出的管道聚合，测试步骤必须独立判定退出码**。
+
+## 2026-09-07 百度凭据与测试根裁决（负责人指令）+ 新根验证轮
+
+- **负责人裁决**：① `E:\GitHub\rs-CyDrive\test\instances` 下的百度授权即**正式可用凭据**（此前 tracker 挂账「baidu1 链失效需补发」就此销账——baidu 链以 instances 现值为准，spike 侧 token 持续刷新维护即可）；② **测试根 = `/apps` 下新建子目录**（本轮用 `/apps/cloudfs-spike`），PCFS 的 `/apps/privatefs` 为其生产数据**绝不触碰**；③ 协议逻辑不明处**以 PCFS 源码（E:\Go_codes\PrivateCloudFS）为权威参照**——该项目生产可用，代码可能有 bug 但功能全通。
+- **工具配合**：spike 增 `BAIDU_SPIKE_REMOTE_DIR` env 覆盖（指定根不探测直接用）+ dlink TTL 探针预算 63→131 分钟（4c0e46b）。
+- **新根验证轮（2026-09-07，全部真实输出）**：token 直接可用（ls errno=0）；`/apps` 列 14 条目（privatefs 在列、只读）；`resume abort/continue` 在 `/apps/cloudfs-spike` 复现差集续传（[0,1,2]→只补 [3,4,5,6,7]，create errno=0，final_size_ok，uploadid 会话存活）；cleanup 远端剩余 0（xpan 删除进回收站 10 天保留，API 不可验证回收站——已知限制）；dlink TTL 上界长探针后台进行中（结果回填 spike 报告附录）。
+- **对 Phase 2 B 批的指导意义**：ck-baidu 的 E2E 测试根沿用「/apps 下专用子目录」模式；协议实现疑义先查 PCFS 源码再自行试验。
