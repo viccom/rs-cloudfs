@@ -189,3 +189,37 @@ async fn inbound_probe_preserves_drain_once_events() {
     let second = again.next().await;
     assert!(second.is_none(), "second drain yields nothing new");
 }
+
+/// 8. The declared capability bits are injectable through the builder
+///    (R-5: consumer degrade tests need a transport that *declares* bits
+///    off — e.g. a storage-only backend with no RANGE_READ — while the
+///    trait probes stay on, mirroring how a real driver's bit declaration
+///    and optional-trait impls are two separate faces). The default
+///    (plain `new` and a bare builder) keeps the three-bit declaration
+///    test 2 pins.
+#[test]
+fn builder_overrides_declared_capabilities() {
+    let injected = Capabilities::none();
+    let t = MockTransport::builder().capabilities(injected).build();
+    assert_eq!(
+        t.capabilities(),
+        injected,
+        "the injected all-off declaration wins"
+    );
+    let injected = Capabilities {
+        range_read: false,
+        inbound: true,
+        chat: false,
+        ..Capabilities::none()
+    };
+    let t = MockTransport::builder().capabilities(injected).build();
+    assert_eq!(t.capabilities(), injected, "a partial declaration wins");
+
+    // Defaults unchanged: the bare builder still declares the three bits
+    // exactly like plain `new()` (test 2 stays pinned).
+    assert_eq!(
+        MockTransport::builder().build().capabilities(),
+        MockTransport::new().capabilities(),
+        "bare builder default matches plain new()"
+    );
+}

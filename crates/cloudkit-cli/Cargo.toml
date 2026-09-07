@@ -103,6 +103,11 @@ axum = { version = "=0.8.9", default-features = false, features = [
     "tokio",
 ] }
 tempfile = "3"
+# Log-capture subscriber for the boot-banner test (R-5 capability
+# declaration); same 0.3 line the workspace already uses, fmt-only.
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+] }
 # lib deps already union in rt-multi-thread/macros/signal plus the
 # control channel's net/io-util/time; the e2e tests' explicit rt/macros
 # entry stays as the test-side base (net/io-util below are now redundant

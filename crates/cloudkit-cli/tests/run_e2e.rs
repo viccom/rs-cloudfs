@@ -497,6 +497,84 @@ async fn run_instance_stops_via_control_channel() {
     drop(handle); // STOP is the whole exit; never call shutdown() here
 }
 
+// --------------------------------------- Batch R R-5: capability banner ---
+
+/// A `MakeWriter` that appends formatted log lines into a shared buffer,
+/// so a test can boot the stack under a capturing subscriber and assert
+/// on the boot banner (tracing's `set_default` guard is thread-local;
+/// `#[tokio::test]`'s default current-thread runtime keeps every spawned
+/// task — inbound worker, accept loop — on this same thread, so the
+/// whole boot logs through the capture).
+struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+
+impl std::io::Write for &LogBuffer {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        let mut sink = self
+            .0
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        sink.extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
+    type Writer = &'a LogBuffer;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self
+    }
+}
+
+/// R-5: boot declares the transport's capability bits once, next to the
+/// WebDAV banner (interfaces §1 / logging §2: one-shot lifecycle info;
+/// consumer degrade warnings elsewhere — inbound worker not started, bot
+/// commands dropped — point back at this line for diagnosis). The mock
+/// declares exactly RANGE_READ / INBOUND / CHAT (transport_traits test
+/// 2), so the banner must show those three on and the storage-side bits
+/// off.
+#[tokio::test]
+async fn boot_declares_transport_capabilities() {
+    let buffer = Arc::new(Mutex::new(Vec::new()));
+    let subscriber = tracing_subscriber::fmt()
+        .with_writer(LogBuffer(Arc::clone(&buffer)))
+        .with_max_level(tracing::Level::INFO)
+        .finish();
+    let _capture = tracing::subscriber::set_default(subscriber);
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cfg = temp_config(dir.path(), 0);
+    let mock = mock_transport().await;
+    let handle = boot(&cfg, mock).await;
+
+    let logs = {
+        let sink = buffer
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        String::from_utf8_lossy(&sink).into_owned()
+    };
+    assert!(
+        logs.contains("transport capabilities"),
+        "the one-line capability declaration is present at boot: {logs}"
+    );
+    assert!(
+        logs.contains("range_read=true")
+            && logs.contains("inbound=true")
+            && logs.contains("chat=true"),
+        "the mock's three declared bits show ON: {logs}"
+    );
+    assert!(
+        logs.contains("resume=false"),
+        "undeclared bits show OFF (the full nine-bit line): {logs}"
+    );
+
+    handle.shutdown().await;
+}
+
 // ---------------------------------------------- task 3 (plan C3): sigterm ---
 
 /// The unix SIGTERM helper resolves on a *real* signal (plan task 3's
