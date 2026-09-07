@@ -15,7 +15,7 @@
 5. `docs/decisions.md` —— 历史裁决（自 rs-CyDrive 继承，继续追加）
 
 ## 当前阶段
-**Phase -1 规范先行已完成（2026-09-07）**；仓库 = fork 基线代码（cydrive 0.7.2，527 测试绿）+ 治理文档集。**下一步 = Phase 0 搬迁批**（crate 改名重排为 cloudkit-*/ck-*，见基线设计 §5，纯搬迁每步测试绿）→ Phase 1（spike/trait 瘦身/加密 v2）→ Phase 2（ck-local + ck-baidu + 端到端硬验收）。
+**Phase -1 规范先行已完成（2026-09-07）**；仓库 = fork 基线代码（cydrive 0.7.2，527 测试绿）+ 治理文档集。**下一步 = Phase 0 + Phase 1**（`docs/plans/2026-09-07-phase0-1-execution.md`——含预授权 Kickoff 指令，覆盖搬迁改名/百度 spike/trait 瘦身/加密 v2 流式）→ Phase 2（驱动接入手册 → ck-local + ck-baidu + 端到端硬验收）。
 
 ## 常用命令（仓库根）
 ```
