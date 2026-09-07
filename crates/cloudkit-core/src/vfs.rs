@@ -317,7 +317,19 @@ impl Vfs {
             Some(parent) => parent.as_str().to_string(),
             None => "/".to_string(),
         };
-        self.db.upsert_file(&FileUpsert {
+        // The global switch decides the flag up front (Python
+        // `is_encrypted` in telegram_client.py:164-174); the queue
+        // then encrypts rows whose flag is set while it holds a
+        // password (the AND semantics). `chunk_count` above is still
+        // planned on the plaintext — the worker overwrites it with
+        // the real ciphertext chunk count on success. A row flagged
+        // encrypted also records the configured container scheme here
+        // (E-4): the read path dispatches on this per-row value, never
+        // on the live config, so turning the config key later never
+        // breaks reads of already-stored files. Unencrypted rows keep
+        // the plain upsert — the column stays at its `gcm` default
+        // and the scheme key stays dormant without a password.
+        let upsert = FileUpsert {
             rel_path: rel.as_str().to_string(),
             name: rel.name().to_string(),
             parent_dir,
@@ -330,16 +342,16 @@ impl Vfs {
             telegram_msg_id: None,
             is_uploaded: false,
             is_cached: true,
-            // The global switch decides the flag up front (Python
-            // `is_encrypted` in telegram_client.py:164-174); the queue
-            // then encrypts rows whose flag is set while it holds a
-            // password (the AND semantics). `chunk_count` above is still
-            // planned on the plaintext — the worker overwrites it with
-            // the real ciphertext chunk count on success.
             is_encrypted: self.cfg.encryption_password.is_some(),
             chunk_count: chunk_count as i64,
             mime_type: None,
-        })?;
+        };
+        if self.cfg.encryption_password.is_some() {
+            self.db
+                .upsert_file_scheme(&upsert, self.cfg.encryption_scheme.as_str())?;
+        } else {
+            self.db.upsert_file(&upsert)?;
+        }
 
         self.queue
             .enqueue(UploadJob {

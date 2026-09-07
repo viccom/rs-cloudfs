@@ -131,9 +131,17 @@ impl RowPayload {
             is_encrypted: file.is_encrypted,
             chunk_count: file.chunk_count,
             mime_type: file.mime_type.clone(),
-            // RED-phase stub: the scheme mapping (non-`gcm` encrypted rows
-            // carry `Some(scheme)`) lands with the green commit.
-            scheme: None,
+            // Only non-default schemes ride along: an encrypted row whose
+            // column reads `gcm` serializes byte-identical with the
+            // pre-E-4 payload, and an unencrypted row never carries a
+            // scheme even if the column holds a stray value (the field is
+            // gated on `is_encrypted`, matching the read path's dispatch
+            // condition).
+            scheme: if file.is_encrypted && file.encryption_scheme != crate::config::SCHEME_GCM {
+                Some(file.encryption_scheme.clone())
+            } else {
+                None
+            },
             chunks: chunks
                 .iter()
                 .map(|c| PayloadChunk {
@@ -523,21 +531,31 @@ pub fn apply_pulled_rows(
 /// no stale values to keep — a true full replace.
 fn replace_row(db: &MetaDatabase, rel_path: &str, payload: &RowPayload) -> Result<(), SyncError> {
     db.delete_file(rel_path)?;
-    let file_id = db.upsert_file(&FileUpsert {
-        rel_path: rel_path.to_string(),
-        name: payload.name.clone(),
-        parent_dir: payload.parent_dir.clone(),
-        size: payload.size,
-        mtime: payload.mtime,
-        sha256: payload.sha256.clone(),
-        is_dir: payload.is_dir,
-        telegram_msg_id: payload.telegram_msg_id,
-        is_uploaded: payload.is_uploaded,
-        is_cached: false,
-        is_encrypted: payload.is_encrypted,
-        chunk_count: payload.chunk_count,
-        mime_type: payload.mime_type.clone(),
-    })?;
+    // The scheme rides through the payload: absent (`None`, the legacy
+    // form) decodes to the frozen v1 default `gcm`; a carried scheme is
+    // restored exactly. `upsert_file_scheme` (not plain `upsert_file`)
+    // because this is a delete+insert — the insert's column default
+    // would be indistinguishable here, but going through the explicit
+    // writer keeps the scheme-restoring intent visible and future-proof
+    // against a changed default.
+    let file_id = db.upsert_file_scheme(
+        &FileUpsert {
+            rel_path: rel_path.to_string(),
+            name: payload.name.clone(),
+            parent_dir: payload.parent_dir.clone(),
+            size: payload.size,
+            mtime: payload.mtime,
+            sha256: payload.sha256.clone(),
+            is_dir: payload.is_dir,
+            telegram_msg_id: payload.telegram_msg_id,
+            is_uploaded: payload.is_uploaded,
+            is_cached: false,
+            is_encrypted: payload.is_encrypted,
+            chunk_count: payload.chunk_count,
+            mime_type: payload.mime_type.clone(),
+        },
+        payload.scheme.as_deref().unwrap_or(crate::config::SCHEME_GCM),
+    )?;
     for chunk in &payload.chunks {
         if let Some(msg_id) = chunk.msg_id {
             db.upsert_chunk(file_id, chunk.index, msg_id, chunk.size, None)?;

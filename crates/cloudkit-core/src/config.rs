@@ -84,6 +84,7 @@ const KNOWN_TOML_KEYS: &[&str] = &[
     "hydrate_timeout_secs",
     "encryption_password",
     "enable_encryption",
+    "encryption_scheme",
     "proxy_url",
     "sync_url",
     "sync_secret",
@@ -112,6 +113,7 @@ const LEGACY_REJECTED_KEYS: &[&str] = &[
     "queue_capacity",
     "hydrate_timeout_secs",
     "mount_point",
+    "encryption_scheme",
     "sync_url",
     "sync_secret",
     "sync_interval_secs",
@@ -278,9 +280,10 @@ pub struct CyDriveConfig {
     /// Container scheme for NEW encrypted uploads (Batch E / E-4):
     /// `"gcm"` (default, Python-compatible v1) or `"aead_v2"` (streaming
     /// v2). Read paths dispatch on the per-row scheme in the metadata DB,
-    /// never on this key. RED-phase stub: the wire/parse integration lands
-    /// with the green commit (KNOWN_TOML_KEYS / legacy rejection).
-    #[serde(skip)]
+    /// never on this key. Value validation is exhaustive at parse time
+    /// (the field is a typed enum — an unknown variant is a
+    /// [`ConfigError::Parse`] naming both accepted values and never
+    /// reaches `validate`, which therefore adds no rule for this key).
     pub encryption_scheme: EncryptionScheme,
     /// Optional SOCKS5 proxy URL for the Telegram MTProto connection
     /// (e.g. `"socks5://127.0.0.1:7897"` for a local Clash mixed port);

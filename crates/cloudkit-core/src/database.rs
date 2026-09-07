@@ -17,7 +17,11 @@
 //! Outside the frozen contract: the sync-lite mirror tables `sync_mirror`
 //! and `sync_state` (2026-09-04 plan, «客户端») are Rust-added, purely
 //! additive `IF NOT EXISTS` tables created in a separate batch — the
-//! contract DDL above stays byte-identical and untouched.
+//! contract DDL above stays byte-identical and untouched — and the
+//! `files.encryption_scheme` column (Batch E / E-4) is added by a
+//! pragma-guarded `ALTER TABLE` in the same separate-batch spirit,
+//! `NOT NULL DEFAULT 'gcm'` so pre-existing rows and Python-shaped
+//! INSERTs keep their exact pre-E-4 behavior.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -190,10 +194,12 @@ impl Drop for FilesHookSuppression {
 }
 
 /// Column list shared by every `files` SELECT (index-mapped by
-/// [`row_to_file`]).
+/// [`row_to_file`]). `encryption_scheme` is selected by name, so the
+/// logical order here never depends on the physical column order (the
+/// migration appends the column at the end of adopted databases).
 const FILE_COLUMNS: &str = "id, rel_path, name, parent_dir, size, mtime, sha256, \
      is_dir, telegram_msg_id, is_uploaded, is_cached, is_encrypted, chunk_count, \
-     mime_type, created_at, updated_at";
+     mime_type, encryption_scheme, created_at, updated_at";
 
 /// Maps a `files` row (in [`FILE_COLUMNS`] order) to a [`FileRecord`].
 fn row_to_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
@@ -212,12 +218,9 @@ fn row_to_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
         is_encrypted: row.get::<_, i64>(11)? != 0,
         chunk_count: row.get(12)?,
         mime_type: row.get(13)?,
-        created_at: row.get(14)?,
-        updated_at: row.get(15)?,
-        // RED-phase stub: the column lands with the green commit
-        // (SELECT/FILE_COLUMNS/migration); every row reads as the
-        // frozen v1 scheme until then.
-        encryption_scheme: "gcm".to_string(),
+        encryption_scheme: row.get(14)?,
+        created_at: row.get(15)?,
+        updated_at: row.get(16)?,
     })
 }
 
@@ -322,6 +325,34 @@ impl MetaDatabase {
                 client_id TEXT NOT NULL
             );",
         )?;
+        // Rust-added `files.encryption_scheme` column (Batch E / E-4, red
+        // line R6 additive schema): the Python-contract DDL batch above
+        // stays byte-identical, so the column lands here as a separate
+        // `ALTER TABLE ... ADD COLUMN` guarded by a pragma probe (SQLite
+        // has no `ADD COLUMN IF NOT EXISTS`; the probe keeps re-openings
+        // and concurrently adopted databases idempotent). The `DEFAULT
+        // 'gcm'` backfills every pre-existing row to the frozen v1 scheme
+        // — exactly the behavior those rows already had — and keeps every
+        // Python-shaped INSERT (column omitted) working unchanged. A
+        // Python baseline instance reading this database later simply
+        // ignores the unknown column (SQLite never projects unstated
+        // columns); nothing is renamed or dropped.
+        {
+            let has_column = conn
+                .query_row(
+                    "SELECT EXISTS (SELECT 1 FROM pragma_table_info('files') \
+                     WHERE name = 'encryption_scheme')",
+                    [],
+                    |row| row.get::<_, i64>(0),
+                )?
+                != 0;
+            if !has_column {
+                conn.execute_batch(
+                    "ALTER TABLE files \
+                     ADD COLUMN encryption_scheme TEXT NOT NULL DEFAULT 'gcm';",
+                )?;
+            }
+        }
         // Files-table change doorbell (wake chokepoint batch): one
         // update_hook per connection, installed once here so any later
         // row change — from this crate, the WebDAV adapter, the web
@@ -479,10 +510,53 @@ impl MetaDatabase {
         entry: &FileUpsert,
         encryption_scheme: &str,
     ) -> Result<i64, DbError> {
-        // RED-phase stub: the column and its write path land with the
-        // green commit; the scheme argument is ignored for now.
-        let _ = encryption_scheme;
-        self.upsert_file(entry)
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = now();
+        let id = conn.query_row(
+            "INSERT INTO files (
+                rel_path, name, parent_dir, size, mtime, sha256, is_dir,
+                telegram_msg_id, is_uploaded, is_cached, is_encrypted, chunk_count, mime_type,
+                encryption_scheme, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            ON CONFLICT(rel_path) DO UPDATE SET
+                name=excluded.name,
+                parent_dir=excluded.parent_dir,
+                size=excluded.size,
+                mtime=excluded.mtime,
+                sha256=coalesce(excluded.sha256, files.sha256),
+                telegram_msg_id=coalesce(excluded.telegram_msg_id, files.telegram_msg_id),
+                is_uploaded=excluded.is_uploaded,
+                is_cached=excluded.is_cached,
+                is_encrypted=excluded.is_encrypted,
+                chunk_count=excluded.chunk_count,
+                mime_type=coalesce(excluded.mime_type, files.mime_type),
+                encryption_scheme=excluded.encryption_scheme,
+                updated_at=excluded.updated_at
+            RETURNING id",
+            params![
+                entry.rel_path,
+                entry.name,
+                entry.parent_dir,
+                entry.size,
+                entry.mtime,
+                entry.sha256,
+                entry.is_dir as i64,
+                entry.telegram_msg_id,
+                entry.is_uploaded as i64,
+                entry.is_cached as i64,
+                entry.is_encrypted as i64,
+                entry.chunk_count,
+                entry.mime_type,
+                encryption_scheme,
+                now,
+                now,
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(id)
     }
 
     /// Looks up a single row by its unique virtual path.
