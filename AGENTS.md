@@ -29,6 +29,7 @@ cargo fmt --all -- --check
 - 七条架构红线（architecture.md §2）——违反即返工
 - 凭据红线：`test/` 全目录 gitignore；凭据只从 `E:\GitHub\rs-CyDrive\test\` 或 env 读；**任何凭据值不入代码/文档/日志/提交**（负责人后期轮换授权）
 - 质量：TDD 红→绿留证、断言零漂移、workspace 级门禁、真机测试 `#[ignore]`
+- **大任务纪律（负责人 2026-09-07 指令）**：代码量较大的任务必须以 TDD 思想为指导；**每个计划必须配套任务单与跟踪记录表**（`docs/tracking/<phase>.md`——任务分解×状态×完成情况×证据，每批收口更新并随 commit 提交）
 - 提交：conventional commits、不加署名尾注、批次 worktree 隔离
 - 文档：行为变更同批更新 README/AGENTS 计数/相关 docs；裁决入 decisions.md
 
