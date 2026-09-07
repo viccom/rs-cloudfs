@@ -38,6 +38,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+use ck_telegram::config::{
+    TransportConfig, DEFAULT_API_HASH, DEFAULT_API_ID, DEFAULT_SESSION_STEM,
+};
+use ck_telegram::transport::GrammersTransport;
 use cloudkit_core::cache::CacheManager;
 use cloudkit_core::config::CyDriveConfig;
 use cloudkit_core::credentials::{
@@ -49,10 +53,6 @@ use cloudkit_core::rel_path::RelPath;
 use cloudkit_core::sync::{namespace_key, sync_once, SyncOutcome};
 use cloudkit_core::transport::CloudTransport;
 use cloudkit_core::vfs::{Vfs, VfsConfig, VfsError};
-use cydrive_telegram::config::{
-    TransportConfig, DEFAULT_API_HASH, DEFAULT_API_ID, DEFAULT_SESSION_STEM,
-};
-use cydrive_telegram::transport::GrammersTransport;
 use cydrive_web::WebUiServer;
 use cydrive_webdav::{CyDriveFs, WebDavServer};
 use tokio::net::TcpStream;

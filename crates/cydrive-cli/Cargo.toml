@@ -24,7 +24,7 @@ clap = { version = "4", features = ["derive"] }
 comfy-table = "8.0.0"
 cloudkit-core = { path = "../cloudkit-core" }
 cydrive-platform = { path = "../cydrive-platform" }
-cydrive-telegram = { path = "../cydrive-telegram" }
+ck-telegram = { path = "../drivers/ck-telegram" }
 cydrive-web = { path = "../cydrive-web" }
 cydrive-webdav = { path = "../cydrive-webdav" }
 # Sync-lite client (Batch B4): the wire types this CLI maps onto core's

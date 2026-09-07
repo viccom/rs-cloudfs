@@ -5,9 +5,9 @@ members = [
     "crates/cydrive-cli",
     "crates/cydrive-platform",
     "crates/cydrive-sync",
-    "crates/cydrive-telegram",
     "crates/cydrive-web",
     "crates/cydrive-webdav",
+    "crates/drivers/ck-telegram",
 ]
 # Not a member on purpose: an external path dependency keeps rustc's
 # cap-lints=allow for upstream code (fmt/clippy gates stay ours), while

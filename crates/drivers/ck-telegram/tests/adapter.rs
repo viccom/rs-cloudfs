@@ -1,5 +1,5 @@
 //! RED-phase spec tests for the three pure adapter modules of
-//! `cydrive-telegram`: `plan` (upload send planning from an UploadJob),
+//! `ck-telegram`: `plan` (upload send planning from an UploadJob),
 //! `stream` (range-serving adapter over download iterators) and `config`
 //! (baseline transport constants, contract 3). The tested functions are
 //! `todo!()` stubs: every test here must fail with "not yet implemented"
@@ -8,14 +8,14 @@
 use std::path::PathBuf;
 use std::task::{Context, Poll, Waker};
 
-use cloudkit_core::rel_path::RelPath;
-use cloudkit_core::transport::{ByteStream, UploadJob};
-use cydrive_telegram::caption::{multi_part_caption, single_file_caption};
-use cydrive_telegram::config::{
+use ck_telegram::caption::{multi_part_caption, single_file_caption};
+use ck_telegram::config::{
     TransportConfig, DEFAULT_API_HASH, DEFAULT_API_ID, DEFAULT_SESSION_STEM,
 };
-use cydrive_telegram::plan::{plan_chunk_sends, ChunkSend};
-use cydrive_telegram::stream::serve_range;
+use ck_telegram::plan::{plan_chunk_sends, ChunkSend};
+use ck_telegram::stream::serve_range;
+use cloudkit_core::rel_path::RelPath;
+use cloudkit_core::transport::{ByteStream, UploadJob};
 
 /// Builds a pure (no disk access) UploadJob with the given chunk plan.
 fn job_for(rel: &str, size: u64, chunk_count: u32, chunk_size: u64) -> UploadJob {

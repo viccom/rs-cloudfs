@@ -7,7 +7,7 @@
 //! ```text
 //! CYDRIVE_SPIKE_SESSION=<abs session copy> CYDRIVE_BOT_TOKEN=... \
 //! CYDRIVE_CHAT_ID=... CYDRIVE_PROXY_URL=socks5://127.0.0.1:7897 \
-//! cargo run -p cydrive-telegram --example history_spike --release
+//! cargo run -p ck-telegram --example history_spike --release
 //! ```
 //!
 //! Exit 0 + printed messages = history is readable (rescan viable);

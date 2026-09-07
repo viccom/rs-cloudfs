@@ -1,5 +1,5 @@
 [package]
-name = "cydrive-telegram"
+name = "ck-telegram"
 description = "CloudTransport implementation over Telegram MTProto (grammers); pure contract logic first"
 version.workspace = true
 edition.workspace = true
@@ -11,7 +11,7 @@ workspace = true
 [dependencies]
 async-trait = "0.1"
 bytes = "1"
-cloudkit-core = { path = "../cloudkit-core" }
+cloudkit-core = { path = "../../cloudkit-core" }
 futures-core = "0.3"
 # `stream::unfold` wraps the update-forwarding channel into the boxed
 # `IncomingStream` shape (same crate/features as cloudkit-core uses).

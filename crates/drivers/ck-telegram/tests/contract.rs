@@ -1,13 +1,13 @@
-//! Byte-exact contract tests for the pure logic of `cydrive-telegram`
+//! Byte-exact contract tests for the pure logic of `ck-telegram`
 //! (caption snapshots, flood-wait parsing, range planning), frozen against
 //! the Python baseline. See `docs/decisions.md` 2026-09-03 for the
 //! chunk-naming erratum these expectations follow.
 
-use cydrive_telegram::caption::{
+use ck_telegram::caption::{
     clean_rel_path, multi_part_caption, part_document_name, single_file_caption,
 };
-use cydrive_telegram::flood::parse_flood_wait;
-use cydrive_telegram::range::{range_plan, RangePlan};
+use ck_telegram::flood::parse_flood_wait;
+use ck_telegram::range::{range_plan, RangePlan};
 
 // ---------------------------------------------------------------- caption --
 

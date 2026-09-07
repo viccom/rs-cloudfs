@@ -474,6 +474,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ck-telegram"
+version = "0.7.2"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "cloudkit-core",
+ "futures-core",
+ "futures-util",
+ "grammers-client",
+ "grammers-session",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "clap"
 version = "4.6.6"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -757,12 +773,12 @@ dependencies = [
  "async-trait",
  "axum",
  "bytes",
+ "ck-telegram",
  "clap",
  "cloudkit-core",
  "comfy-table",
  "cydrive-platform",
  "cydrive-sync",
- "cydrive-telegram",
  "cydrive-web",
  "cydrive-webdav",
  "dialoguer",
@@ -807,22 +823,6 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
-]
-
-[[package]]
-name = "cydrive-telegram"
-version = "0.7.2"
-dependencies = [
- "async-trait",
- "bytes",
- "cloudkit-core",
- "futures-core",
- "futures-util",
- "grammers-client",
- "grammers-session",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
 ]
 
 [[package]]

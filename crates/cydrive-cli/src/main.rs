@@ -20,12 +20,12 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+use ck_telegram::transport::GrammersTransport;
 use clap::{Parser, Subcommand};
 use cloudkit_core::config::CyDriveConfig;
 use cloudkit_core::logging::LogConfig;
 use cloudkit_core::rel_path::RelPath;
 use cydrive_cli::{discover_config, run_with_transport};
-use cydrive_telegram::transport::GrammersTransport;
 
 /// CyDrive — Telegram as an unlimited cloud drive, served over WebDAV.
 #[derive(Debug, Parser)]
