@@ -4,7 +4,7 @@
 //! serialization, row hashing, the namespace key, the [`SyncClient`]
 //! seam, the pull-apply state machine and the push diff. The orchestration
 //! ([`sync_once`]) and the HTTP client live one layer up; this module must
-//! stay free of `cydrive-sync` (wire types map onto the types here at the
+//! stay free of `cloudkit-sync-server` (wire types map onto the types here at the
 //! CLI layer).
 //!
 //! A *logical row* is one `files` row plus its `chunks` sequence,
@@ -234,7 +234,7 @@ pub struct SyncOutcome {
 }
 
 /// The server seam of the sync engine. The CLI layer provides the HTTP
-/// implementation over the `cydrive-sync` wire protocol; core must not
+/// implementation over the `cloudkit-sync-server` wire protocol; core must not
 /// depend on that crate, so both sides speak the types above and the CLI
 /// maps them.
 #[async_trait]

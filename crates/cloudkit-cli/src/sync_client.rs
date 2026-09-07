@@ -3,7 +3,7 @@
 //!
 //! One thin transport: POST JSON to `{sync_url}/v1/push` and
 //! `{sync_url}/v1/pull`, speaking the frozen wire types of the
-//! `cydrive-sync` crate and mapping them field-for-field onto core's
+//! `cloudkit-sync-server` crate and mapping them field-for-field onto core's
 //! sync-engine types (core deliberately does not depend on the wire
 //! crate; this module is the mapping layer the plan assigns to the CLI).
 //!

@@ -20,7 +20,7 @@ path = "src/main.rs"
 
 [dependencies]
 anyhow = "1"
-# Exact pin, mirroring the cydrive-web precedent for HTTP frameworks.
+# Exact pin, mirroring the cloudkit-web precedent for HTTP frameworks.
 axum = { version = "=0.8.9", default-features = false, features = [
     "http1",
     "json",

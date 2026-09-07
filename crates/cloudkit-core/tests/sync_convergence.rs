@@ -44,7 +44,7 @@ struct ServerInner {
     rows: HashMap<String, StoredRow>,
 }
 
-/// Family-scale stand-in for the `cydrive-sync` server: per-row monotonic
+/// Family-scale stand-in for the `cloudkit-sync-server` server: per-row monotonic
 /// versions, last push wins, tombstones overwrite.
 struct InMemorySyncServer {
     inner: Mutex<ServerInner>,
