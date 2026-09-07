@@ -287,3 +287,14 @@
 - **⑤ conformance 接入形态 = `assert_conforms(&dyn ConformanceHarness)` 函数 + `conformance_suite!` 宏糖**：错误回放（断言⑤）经 harness 注入符号码 + 期望映射——L2 运行时不认识任何后端错误码（R1）；百度 errno 三档只以 test-only fixture 钉死（110→Unauthorized{true}（自动刷新重放一次后仍失败）、111/-6→Unauthorized{false}），真实映射表归 ck-baidu（Batch B1）。
 - **⑥ RESUME 断言⑦观测点取「中断之后」**：重传量只计第二次上传实际发给后端的字节（第一段流量是正常上传成本非差集）；声明 RESUME 却不可观测 → 套件判失败（R4：声明即必须可验证）。
 - **验证**：tests/ 红绿两提交零 diff（`git diff 489852e 0625e65 -- crates/cloudkit-storage/tests/` 为空）；workspace 门禁 555 passed 0 failed；套件在实现期当场抓住 mock `ensure_parents` 把目标末段建成目录的 bug（断言① commit-on-close 不可见性红）——套件检出力的一次真实行使。
+
+## 2026-09-07 Batch R 第二段：CloudTransport 家族迁 L2 与错误归一（R-3/R-4）
+
+- **背景**：trait 住在 cloudkit-core 造成 ck-telegram→core 反向依赖（architecture §1.5 过渡豁免首行）；D2 要求 L3+ 永远只见 StorageError。红 93a8981 → 绿 8f8e784（波及面清单与变体映射表全文在绿提交正文）。
+- **① trait 拆分形态**：核心面 = connect/upload/open/open_range/delete_remote + `capabilities()`（**必选**，镜像 StorageDriver 强制诚实声明）+ `as_inbound()`/`as_chat()`（provided 默认 None，免 dyn upcasting）；incoming 移入 `InboundCap`、send_text/send_document 移入 `ChatCap`（默认实现返回 `StorageError::Unsupported`，替换原 transport 本地「not supported」Remote 错误）。
+- **② 错误归一映射**：NotConnected→Invalid（非法状态类）、FloodWait{seconds}→RateLimited{retry_after:Some}（逐秒保留）、Disconnected/Remote→Unavailable（消息保留）、NotFound(i32)→NotFound（id 载荷舍去——分类学无载荷变体，诊断上下文由调用点日志承担；属本批唯一载荷损失点，已逐类列出）、Io→Io(String)（storage error.rs 增 `From<io::Error>`）。Unauthorized 预留 Phase 2 baidu 三档（telegram bot 无自动自救流，不发明行为）。
+- **③ 随迁 L2 的契约载荷**：`vpath::RelPath`（VFS 绝对式路径——UploadJob 字段所需；与 `vocab::RelPath` 卷相对路径并存是有意的，归一留 Phase 2 议）+ `part_name`（分块命名契约 3，mock 与 telegram 共用单一实现）；core 以 re-export shim 维持 `cloudkit_core::{rel_path, transport, chunker::part_name}` 路径——core/webdav/web/cli 测试 import 零改动。
+- **④ 消费方最小适配（R-5 的子集就地完成）**：bot.rs 处理器签名换 `&dyn ChatCap`（调用点零改动）；inbound worker 内 as_inbound/as_chat 探测（缺位 warn 不 panic，无 INBOUND 位则 worker 不启动）；上传降级通知经 as_chat（缺位日志跳过）。webdav/启动日志声明面留 R-5。
+- **⑤ 能力位声明（R4 过渡期）**：grammers = INBOUND/CHAT/RANGE_READ/MULTIPART（依据：驱动单测 + rs-CyDrive 生产真机；conformance 前置属 Phase 2，已在代码注释注明；未声明位逐个列明理由——telegram 为影子索引 D4 故无 AUTHORITATIVE_INDEX 等）；Mock = INBOUND/CHAT/RANGE_READ（恰为上游测试行使面）。
+- **护栏证据**：既有 555 测试全程保持绿；迁移期护栏当场抓住 mock 单块命名分支丢失（`hello.txt` 被写成 `hello.txt.part000`）——修复后全绿；终态 562 passed 0 failed（+7 新语义测试）/ clippy -D warnings / fmt / check_layers 全过；`rg 'cloudkit-core' crates/drivers/ck-telegram/Cargo.toml` 为空（注释措辞一并避让字面命中）。
+- **取舍记录**：transport::ByteStream（Send+Sync，历史接缝）与 vocab::ByteStream（Send，StorageDriver 家族）两类型并存——bounds 延续迁移前形态保 WebDAV 消费面零变化；transport 模块符号不在 storage crate root re-export（防与词汇类型遮蔽）。

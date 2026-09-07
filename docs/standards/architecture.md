@@ -22,7 +22,7 @@ L0 基础    http(代理/IPv4/连接池) / keyring / logging / config
 
 | 现存偏差 | 消除批次 |
 |---|---|
-| ck-telegram（现 cydrive-telegram）→ core 反向依赖（trait 在 core） | Phase 1 R（trait 迁 L2） |
+| ck-telegram（现 cydrive-telegram）→ core 反向依赖（trait 在 core） | Phase 1 R —— **已消除**（R-3/R-4 批 2026-09-07：CloudTransport trait 家族迁入 cloudkit-storage（L2），ck-telegram 改依赖 L2，`rg 'cloudkit-core' crates/drivers/ck-telegram/Cargo.toml` 为空） |
 | crate 名仍为 cydrive-*，R1 的 crate 边界机械保障未就位 | Phase 0 —— **已全部消除**（改名：P0-A 批 2026-09-07，foundation §3 映射，二进制名不变；`scripts/check_layers` + CI 接入 + CI 秘密扫描：P0-B 批 2026-09-07） |
 | Capabilities 声明暂无法满足 R4 的 conformance 前置 | Phase 2（套件随 ck-local 建立；此前能力位以驱动单测+真机为准并注明） |
 | cloudkit-core 跨层合体（L3+L4） | 长期接受（拆分成本 > 收益，北极星裁决） |

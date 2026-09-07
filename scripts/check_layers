@@ -15,10 +15,12 @@
 #      (same layer, no peer deps) — same matching rules, no exemption.
 #
 # Deliberately NOT checked here:
-#   - driver -> core reverse dependency: declared transitional exemption
-#     (architecture.md §1.5), scheduled to be resolved in Phase 1 Batch R;
-#   - same-layer deps between non-driver crates: needs the L2 storage
-#     crate to exist first; extend this script then.
+#   - driver -> core reverse dependency: RESOLVED in Phase 1 Batch R
+#     (2026-09-07, architecture.md §1.5 exemption closed; the trait family
+#     moved to L2 cloudkit-storage, drivers now depend downward only);
+#   - same-layer deps between non-driver crates: cloudkit-storage (L2)
+#     exists since Batch R-1, but no same-layer edge among non-driver
+#     crates is worth a rule yet — extend this script when one appears.
 #
 # Usage: scripts/check_layers [repo-root]     (default: this repository)
 # Requires: POSIX sh + find/grep/sed (Git Bash, ubuntu/windows CI bash).
