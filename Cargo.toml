@@ -2,9 +2,9 @@
 resolver = "2"
 members = [
     "crates/cloudkit-core",
+    "crates/cloudkit-sync-server",
     "crates/cydrive-cli",
     "crates/cydrive-platform",
-    "crates/cydrive-sync",
     "crates/cydrive-web",
     "crates/cydrive-webdav",
     "crates/drivers/ck-telegram",

@@ -29,7 +29,7 @@ cydrive-web = { path = "../cydrive-web" }
 cydrive-webdav = { path = "../cydrive-webdav" }
 # Sync-lite client (Batch B4): the wire types this CLI maps onto core's
 # sync engine at runtime.
-cydrive-sync = { path = "../cydrive-sync" }
+cloudkit-sync-server = { path = "../cloudkit-sync-server" }
 dialoguer = "0.12.0"
 # Request/response types for the sync HTTP client (already in the lock
 # tree via the axum/hyper graph — zero new packages for Cargo.lock).
@@ -37,7 +37,7 @@ bytes = "1"
 http = "1"
 http-body-util = "0.1"
 # Real-HTTP sync client (hyper-util legacy client; same feature set
-# cydrive-sync's own e2e tests use).
+# cloudkit-sync-server's own e2e tests use).
 hyper-util = { version = "0.1", default-features = false, features = [
     "client",
     "client-legacy",
@@ -94,9 +94,9 @@ keyring = { version = "3", features = ["apple-native"] }
 keyring = { version = "3", features = ["sync-secret-service", "crypto-rust"] }
 
 [dev-dependencies]
-# e2e (sync-lite Batch B4): spawn the real sync server — the cydrive-sync
+# e2e (sync-lite Batch B4): spawn the real sync server — the cloudkit-sync-server
 # router served by axum on an ephemeral loopback port (same feature set
-# as cydrive-sync's own axum entry, so feature unification keeps one set).
+# as cloudkit-sync-server's own axum entry, so feature unification keeps one set).
 axum = { version = "=0.8.9", default-features = false, features = [
     "http1",
     "json",

@@ -9,8 +9,8 @@
 //! - a batch of N rows raises the counter by exactly N (one
 //!   transaction: all-or-nothing writes and increments)
 
-use cydrive_sync::store::SyncStore;
-use cydrive_sync::wire::PushRow;
+use cloudkit_sync_server::store::SyncStore;
+use cloudkit_sync_server::wire::PushRow;
 
 fn row(rel_path: &str, deleted: bool, payload: &str) -> PushRow {
     PushRow {
@@ -53,7 +53,7 @@ fn versions_increase_monotonically_across_batches() {
 
     let (rows, max_version) = store.pull("ns", 0).unwrap();
     assert_eq!(max_version, 3);
-    let get = |r: &cydrive_sync::wire::PulledRow| r.version;
+    let get = |r: &cloudkit_sync_server::wire::PulledRow| r.version;
     assert_eq!(
         get(rows.iter().find(|r| r.rel_path == "/a").unwrap()),
         2,

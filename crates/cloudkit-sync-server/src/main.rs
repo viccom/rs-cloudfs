@@ -13,10 +13,10 @@
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
-use cydrive_sync::config::SyncServerConfig;
-use cydrive_sync::router::router_with_heartbeat;
-use cydrive_sync::startup::{decide_startup, StartupDecision};
-use cydrive_sync::store::SyncStore;
+use cloudkit_sync_server::config::SyncServerConfig;
+use cloudkit_sync_server::router::router_with_heartbeat;
+use cloudkit_sync_server::startup::{decide_startup, StartupDecision};
+use cloudkit_sync_server::store::SyncStore;
 
 /// The `--help` text; also appended after `Invalid` errors, so the
 /// refusal and the usage travel together on stderr.

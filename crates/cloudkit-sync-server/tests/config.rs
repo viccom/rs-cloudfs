@@ -5,7 +5,9 @@
 use std::path::PathBuf;
 use std::time::Duration;
 
-use cydrive_sync::config::{parse_config, ConfigError, DEFAULT_DB_FILENAME, DEFAULT_LISTEN};
+use cloudkit_sync_server::config::{
+    parse_config, ConfigError, DEFAULT_DB_FILENAME, DEFAULT_LISTEN,
+};
 
 #[test]
 fn defaults_when_inputs_are_the_documented_defaults() {

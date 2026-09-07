@@ -22,7 +22,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use bytes::Bytes;
 use cloudkit_core::sync::{SyncClient, SyncError, SyncPullResult, SyncPulledRow, SyncRowUpdate};
-use cydrive_sync::wire::{
+use cloudkit_sync_server::wire::{
     PullRequest, PullResponse, PushRequest, PushResponse, PushRow, SubscribeEvent, SubscribeRequest,
 };
 use http_body_util::{BodyExt, Full};

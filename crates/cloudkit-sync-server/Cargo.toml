@@ -1,5 +1,5 @@
 [package]
-name = "cydrive-sync"
+name = "cloudkit-sync-server"
 description = "CyDrive lite metadata sync server: LWW rows over JSON push/pull endpoints"
 version.workspace = true
 edition.workspace = true
@@ -9,7 +9,7 @@ license.workspace = true
 workspace = true
 
 [lib]
-name = "cydrive_sync"
+name = "cloudkit_sync_server"
 path = "src/lib.rs"
 
 # Not part of the release set on purpose (sync-lite Batch A): the sync

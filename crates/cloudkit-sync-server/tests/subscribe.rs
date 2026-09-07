@@ -39,9 +39,9 @@ use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-use cydrive_sync::events::EventHub;
-use cydrive_sync::router::router_with_hub;
-use cydrive_sync::store::SyncStore;
+use cloudkit_sync_server::events::EventHub;
+use cloudkit_sync_server::router::router_with_hub;
+use cloudkit_sync_server::store::SyncStore;
 
 /// A heartbeat long enough that keepalive frames never interleave with
 /// the data frames a test asserts on.

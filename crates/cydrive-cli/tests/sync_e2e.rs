@@ -33,10 +33,10 @@ use cloudkit_core::sync::SyncClient;
 use cloudkit_core::sync::SyncError;
 use cloudkit_core::transport::mock::MockTransport;
 use cloudkit_core::transport::CloudTransport;
+use cloudkit_sync_server::router::router;
+use cloudkit_sync_server::store::SyncStore;
 use cydrive_cli::sync_client::{HttpSyncClient, SYNC_SECRET_ENV};
 use cydrive_cli::{resolve_sync_secret, run_sync_command, run_with_transport, RunHandle};
-use cydrive_sync::router::router;
-use cydrive_sync::store::SyncStore;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio::time::sleep;
@@ -79,7 +79,7 @@ fn test_namespace() -> String {
 }
 
 /// Spawns the real sync server (in-memory store) on `127.0.0.1:0`,
-/// mirroring cydrive-sync's own e2e assembly.
+/// mirroring cloudkit-sync-server's own e2e assembly.
 async fn spawn_sync_server(secret: Option<&str>) -> (SocketAddr, Arc<SyncStore>) {
     let store = Arc::new(SyncStore::open_in_memory().expect("in-memory sync store"));
     let app = router(Arc::clone(&store), secret.map(str::to_string));

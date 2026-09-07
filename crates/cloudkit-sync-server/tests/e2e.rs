@@ -21,9 +21,9 @@ use http_body_util::{BodyExt, Full};
 use hyper_util::client::legacy::Client;
 use hyper_util::rt::TokioExecutor;
 
-use cydrive_sync::router::router;
-use cydrive_sync::store::SyncStore;
-use cydrive_sync::wire::{PullRequest, PullResponse, PushRequest, PushResponse, PushRow};
+use cloudkit_sync_server::router::router;
+use cloudkit_sync_server::store::SyncStore;
+use cloudkit_sync_server::wire::{PullRequest, PullResponse, PushRequest, PushResponse, PushRow};
 
 /// Spawns the real server (in-memory store) on `127.0.0.1:0` and
 /// returns its address.

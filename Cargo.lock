@@ -555,6 +555,28 @@ dependencies = [
 ]
 
 [[package]]
+name = "cloudkit-sync-server"
+version = "0.7.2"
+dependencies = [
+ "anyhow",
+ "axum",
+ "bytes",
+ "futures-core",
+ "futures-util",
+ "http-body-util",
+ "hyper",
+ "hyper-util",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "cmov"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -776,9 +798,9 @@ dependencies = [
  "ck-telegram",
  "clap",
  "cloudkit-core",
+ "cloudkit-sync-server",
  "comfy-table",
  "cydrive-platform",
- "cydrive-sync",
  "cydrive-web",
  "cydrive-webdav",
  "dialoguer",
@@ -801,28 +823,6 @@ dependencies = [
  "cloudkit-core",
  "thiserror 2.0.20",
  "winreg",
-]
-
-[[package]]
-name = "cydrive-sync"
-version = "0.7.2"
-dependencies = [
- "anyhow",
- "axum",
- "bytes",
- "futures-core",
- "futures-util",
- "http-body-util",
- "hyper",
- "hyper-util",
- "rusqlite",
- "serde",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "tracing",
- "tracing-subscriber",
 ]
 
 [[package]]

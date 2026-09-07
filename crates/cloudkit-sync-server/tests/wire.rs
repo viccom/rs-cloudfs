@@ -2,7 +2,7 @@
 //! module (Batch B) will both produce and consume — frozen here so
 //! client and server cannot drift.
 
-use cydrive_sync::wire::{
+use cloudkit_sync_server::wire::{
     PullRequest, PullResponse, PulledRow, PushRequest, PushResponse, PushRow, SubscribeEvent,
     SubscribeRequest,
 };

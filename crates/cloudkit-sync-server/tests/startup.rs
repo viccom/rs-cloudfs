@@ -3,7 +3,7 @@
 //! refuse, pinning the exact accepted shapes so a mistyped or stray
 //! argument can never silently start the service.
 
-use cydrive_sync::startup::{decide_startup, StartupDecision};
+use cloudkit_sync_server::startup::{decide_startup, StartupDecision};
 
 fn args(list: &[&str]) -> Vec<String> {
     list.iter().map(|s| s.to_string()).collect()
