@@ -1,4 +1,4 @@
-//! RED-phase tests for `cydrive_core::rel_path`.
+//! RED-phase tests for `cloudkit_core::rel_path`.
 //!
 //! Contract under test: a virtual path always starts with `/`, uses `/` as
 //! the sole separator, directories are plain records (no trailing slash),
@@ -8,7 +8,7 @@
 use std::collections::HashSet;
 use std::str::FromStr;
 
-use cydrive_core::rel_path::{PathError, RelPath};
+use cloudkit_core::rel_path::{PathError, RelPath};
 
 fn rp(s: &str) -> RelPath {
     RelPath::new(s).expect("expected a valid virtual path")

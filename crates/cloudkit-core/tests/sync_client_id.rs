@@ -14,7 +14,7 @@
 //! the server's origin-skip ("never ring the pusher's own bell") keeps
 //! working across restarts.
 
-use cydrive_core::database::MetaDatabase;
+use cloudkit_core::database::MetaDatabase;
 
 fn fresh_db(tag: &str) -> (tempfile::TempDir, MetaDatabase) {
     let dir = tempfile::tempdir().expect("tempdir");

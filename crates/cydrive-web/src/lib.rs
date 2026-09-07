@@ -59,9 +59,9 @@ use rust_embed::RustEmbed;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
-use cydrive_core::database::FileRecord;
-use cydrive_core::rel_path::RelPath;
-use cydrive_core::vfs::{Vfs, VfsError};
+use cloudkit_core::database::FileRecord;
+use cloudkit_core::rel_path::RelPath;
+use cloudkit_core::vfs::{Vfs, VfsError};
 
 /// Configuration knobs for the dashboard: the source of the
 /// `/api/stats` extra fields plus nothing else — binding goes through

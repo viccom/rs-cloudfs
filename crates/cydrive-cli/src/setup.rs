@@ -30,8 +30,8 @@
 use std::path::Path;
 
 use anyhow::{Context, Result};
-use cydrive_core::config::CyDriveConfig;
-use cydrive_core::credentials::{CredentialStore, BOT_TOKEN, ENCRYPTION_PASSWORD};
+use cloudkit_core::config::CyDriveConfig;
+use cloudkit_core::credentials::{CredentialStore, BOT_TOKEN, ENCRYPTION_PASSWORD};
 
 /// The wizard's collected answers.
 #[derive(Debug, Clone, PartialEq, Eq)]

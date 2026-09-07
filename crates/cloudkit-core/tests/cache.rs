@@ -1,8 +1,8 @@
-//! RED-phase tests for `cydrive_core::cache`.
+//! RED-phase tests for `cloudkit_core::cache`.
 //!
 //! Contract under test: Python `cydrive/cache_manager.py` semantics with the
 //! one mandated design change — LRU recency comes from the in-memory
-//! [`cydrive_core::cache::CacheManager::record_access`] log instead of the
+//! [`cloudkit_core::cache::CacheManager::record_access`] log instead of the
 //! filesystem atime (unreliable on Windows). The on-disk layout stays a
 //! mirror of the virtual path tree, so Python cache directories keep working.
 
@@ -11,8 +11,8 @@ use std::path::{Path, PathBuf};
 use std::thread;
 use std::time::{Duration, SystemTime};
 
-use cydrive_core::cache::CacheManager;
-use cydrive_core::rel_path::RelPath;
+use cloudkit_core::cache::CacheManager;
+use cloudkit_core::rel_path::RelPath;
 
 // ------------------------------------------------------------- helpers ---
 

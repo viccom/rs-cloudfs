@@ -1,4 +1,4 @@
-//! RED-phase tests for `cydrive_core::crypto`.
+//! RED-phase tests for `cloudkit_core::crypto`.
 //!
 //! Wire format (frozen compatibility contract, byte-compatible with the
 //! Python `CyCrypto`): `[16B salt][12B nonce][AES-256-GCM ciphertext + 16B
@@ -8,7 +8,7 @@
 //! against a real Python-generated fixture).
 
 use base64::Engine as _;
-use cydrive_core::crypto::{
+use cloudkit_core::crypto::{
     decrypt, derive_key, encrypt, CryptoError, KEY_SIZE, NONCE_SIZE, PBKDF2_ITERATIONS, SALT_SIZE,
 };
 

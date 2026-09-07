@@ -1,10 +1,10 @@
-//! RED-phase test for `cydrive_core::logging::init` (process-global setup).
+//! RED-phase test for `cloudkit_core::logging::init` (process-global setup).
 //!
 //! Each integration-test file runs in its own process, so the global default
 //! subscriber may be installed here and only here. This file contains exactly
 //! one test function because `init` succeeds at most once per process.
 
-use cydrive_core::logging::{init, LogConfig, LogInitError, LOG_FILE_PREFIX};
+use cloudkit_core::logging::{init, LogConfig, LogInitError, LOG_FILE_PREFIX};
 
 #[test]
 fn init_writes_rolling_file_then_rejects_reinit() {

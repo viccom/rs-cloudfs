@@ -1,4 +1,4 @@
-//! RED-phase tests for `cydrive_core::upload_queue`. All bodies are
+//! RED-phase tests for `cloudkit_core::upload_queue`. All bodies are
 //! expected to panic with "not yet implemented" until the GREEN phase
 //! lands.
 //!
@@ -16,12 +16,12 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use cydrive_core::cache::CacheManager;
-use cydrive_core::database::{FileUpsert, MetaDatabase};
-use cydrive_core::rel_path::RelPath;
-use cydrive_core::transport::mock::{MockTransport, UploadAction};
-use cydrive_core::transport::{CloudTransport, TransportError, UploadJob, UploadReceipt};
-use cydrive_core::upload_queue::{
+use cloudkit_core::cache::CacheManager;
+use cloudkit_core::database::{FileUpsert, MetaDatabase};
+use cloudkit_core::rel_path::RelPath;
+use cloudkit_core::transport::mock::{MockTransport, UploadAction};
+use cloudkit_core::transport::{CloudTransport, TransportError, UploadJob, UploadReceipt};
+use cloudkit_core::upload_queue::{
     decide_retry, spawn_queue, QueueError, QueueStats, RetryDecision, RetryPolicy,
     UploadQueueConfig,
 };
@@ -624,7 +624,7 @@ async fn success_computes_sha256_for_small_files() {
     let (_dir, db, cache, mock) = test_env().await;
     let local = seed_pending(&db, &cache, "/docs/hashed.bin", b"hello cydrive", 1);
     let expected_sha =
-        cydrive_core::chunker::sha256_file(&local).expect("hash the seeded plaintext");
+        cloudkit_core::chunker::sha256_file(&local).expect("hash the seeded plaintext");
     let transport: Arc<dyn CloudTransport> = mock.clone();
     let handle = spawn_queue(db.clone(), transport, test_cfg(64));
 
@@ -653,7 +653,7 @@ async fn success_computes_sha256_for_small_files() {
 ///     covered by test 14 plus code review.
 #[test]
 fn oversized_files_skip_sha256() {
-    use cydrive_core::upload_queue::{should_hash, SHA256_MAX_BYTES};
+    use cloudkit_core::upload_queue::{should_hash, SHA256_MAX_BYTES};
 
     assert_eq!(
         SHA256_MAX_BYTES,
@@ -709,7 +709,7 @@ async fn encrypted_upload_stores_decryptable_ciphertext() {
     }
     assert_eq!(joined.len(), 49, "5 B plaintext + 44 B crypto overhead");
     assert_eq!(
-        cydrive_core::crypto::decrypt("pw", &joined).expect("decrypt the joined ciphertext"),
+        cloudkit_core::crypto::decrypt("pw", &joined).expect("decrypt the joined ciphertext"),
         b"12345",
         "remote chunks concatenate into decryptable ciphertext"
     );
@@ -760,7 +760,7 @@ async fn encrypted_upload_hashes_plaintext_sha256() {
     let (_dir, db, cache, mock) = test_env().await;
     let local = seed_encrypted_pending(&db, &cache, "/enc/hash.bin", b"12345", 1);
     let expected_sha =
-        cydrive_core::chunker::sha256_file(&local).expect("hash the seeded plaintext");
+        cloudkit_core::chunker::sha256_file(&local).expect("hash the seeded plaintext");
     let transport: Arc<dyn CloudTransport> = mock.clone();
     let handle = spawn_queue(db.clone(), transport, encrypted_cfg(16, "pw"));
 
@@ -869,17 +869,17 @@ impl CloudTransport for DeleteOnUploadTransport {
 
     async fn open(
         &self,
-        file: &cydrive_core::transport::RemoteHandle,
-    ) -> Result<cydrive_core::transport::ByteStream, TransportError> {
+        file: &cloudkit_core::transport::RemoteHandle,
+    ) -> Result<cloudkit_core::transport::ByteStream, TransportError> {
         self.inner.open(file).await
     }
 
     async fn open_range(
         &self,
-        file: &cydrive_core::transport::RemoteHandle,
+        file: &cloudkit_core::transport::RemoteHandle,
         off: u64,
         len: u64,
-    ) -> Result<cydrive_core::transport::ByteStream, TransportError> {
+    ) -> Result<cloudkit_core::transport::ByteStream, TransportError> {
         self.inner.open_range(file, off, len).await
     }
 
@@ -887,7 +887,7 @@ impl CloudTransport for DeleteOnUploadTransport {
         self.inner.delete_remote(msg_id).await
     }
 
-    fn incoming(&self) -> cydrive_core::transport::IncomingStream {
+    fn incoming(&self) -> cloudkit_core::transport::IncomingStream {
         self.inner.incoming()
     }
 }
@@ -897,7 +897,7 @@ async fn sha256_computed_before_upload_survives_local_delete() {
     let (_dir, db, cache, mock) = test_env().await;
     let local = seed_pending(&db, &cache, "/race/hashed.bin", b"hello cydrive", 1);
     let expected_sha =
-        cydrive_core::chunker::sha256_file(&local).expect("hash the seeded plaintext");
+        cloudkit_core::chunker::sha256_file(&local).expect("hash the seeded plaintext");
     let transport: Arc<dyn CloudTransport> = Arc::new(DeleteOnUploadTransport {
         inner: mock.clone(),
     });
@@ -1007,17 +1007,17 @@ impl CloudTransport for BrokenSendTextTransport {
 
     async fn open(
         &self,
-        file: &cydrive_core::transport::RemoteHandle,
-    ) -> Result<cydrive_core::transport::ByteStream, TransportError> {
+        file: &cloudkit_core::transport::RemoteHandle,
+    ) -> Result<cloudkit_core::transport::ByteStream, TransportError> {
         self.inner.open(file).await
     }
 
     async fn open_range(
         &self,
-        file: &cydrive_core::transport::RemoteHandle,
+        file: &cloudkit_core::transport::RemoteHandle,
         off: u64,
         len: u64,
-    ) -> Result<cydrive_core::transport::ByteStream, TransportError> {
+    ) -> Result<cloudkit_core::transport::ByteStream, TransportError> {
         self.inner.open_range(file, off, len).await
     }
 
@@ -1025,7 +1025,7 @@ impl CloudTransport for BrokenSendTextTransport {
         self.inner.delete_remote(msg_id).await
     }
 
-    fn incoming(&self) -> cydrive_core::transport::IncomingStream {
+    fn incoming(&self) -> cloudkit_core::transport::IncomingStream {
         self.inner.incoming()
     }
 

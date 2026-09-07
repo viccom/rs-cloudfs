@@ -2,7 +2,7 @@
 //! iterators (the glue between [`crate::range::range_plan`] and `ByteStream`).
 
 use bytes::Bytes;
-use cydrive_core::transport::{ByteStream, TransportError};
+use cloudkit_core::transport::{ByteStream, TransportError};
 use futures_core::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};

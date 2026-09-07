@@ -1,4 +1,4 @@
-//! RED-phase tests for `cydrive_core::database`.
+//! RED-phase tests for `cloudkit_core::database`.
 //!
 //! Contract under test: the SQLite schema and SQL semantics of the Python
 //! `cydrive/database.py` (frozen by `docs/rust-rewrite-design.md`,
@@ -10,7 +10,7 @@
 use std::thread;
 use std::time::Duration;
 
-use cydrive_core::database::{FileRecord, FileUpsert, MetaDatabase, Stats};
+use cloudkit_core::database::{FileRecord, FileUpsert, MetaDatabase, Stats};
 use rusqlite::Connection;
 
 // ------------------------------------------------------------- helpers ---

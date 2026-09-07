@@ -213,7 +213,7 @@ pub fn default_mount_point(home: &std::path::Path) -> std::path::PathBuf {
 /// needs no re-validation here; `home` is only consulted in the default
 /// arm (the caller passes `$HOME`).
 pub fn auto_mount_target(
-    cfg: &cydrive_core::config::CyDriveConfig,
+    cfg: &cloudkit_core::config::CyDriveConfig,
     home: &std::path::Path,
 ) -> Option<std::path::PathBuf> {
     if !cfg.auto_mount_drive {

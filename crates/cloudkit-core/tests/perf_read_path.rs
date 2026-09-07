@@ -1,7 +1,7 @@
 //! Offline read-path performance benchmark (M6).
 //!
 //! `#[ignore]`d by default: it seeds 100k rows and asserts a wall-clock
-//! budget, so it is opt-in (`cargo test -p cydrive-core --test
+//! budget, so it is opt-in (`cargo test -p cloudkit-core --test
 //! perf_read_path -- --ignored --nocapture`) rather than part of the
 //! per-commit suite. M6 acceptance wants "reads must be cheap": this
 //! benchmark measures the metadata DB side (`MetaDatabase::list_dir`)
@@ -12,7 +12,7 @@
 
 use std::time::Instant;
 
-use cydrive_core::database::MetaDatabase;
+use cloudkit_core::database::MetaDatabase;
 use rusqlite::Connection;
 
 /// Budget: mean per-call latency of `list_dir` must stay under this.

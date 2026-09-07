@@ -1,4 +1,4 @@
-//! RED-phase tests for the sync-lite config keys of `cydrive_core::config`.
+//! RED-phase tests for the sync-lite config keys of `cloudkit_core::config`.
 //!
 //! Contract under test (docs/plans/2026-09-04-sync-lite.md, «客户端»):
 //! `CyDriveConfig` gains `sync_url` (`Option<String>`, `None` = feature
@@ -22,7 +22,7 @@
 use std::fs;
 use std::sync::{Mutex, MutexGuard};
 
-use cydrive_core::config::{ConfigError, CyDriveConfig};
+use cloudkit_core::config::{ConfigError, CyDriveConfig};
 
 // ------------------------------------------------------------- helpers ---
 

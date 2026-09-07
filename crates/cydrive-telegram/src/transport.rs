@@ -17,7 +17,7 @@
 //!   `config.session_path`, write-through): grammers-session is redirected
 //!   by the workspace `[patch.crates-io]` to an in-tree vendored copy whose
 //!   sqlite-storage backend is rusqlite(bundled) — the same SQLite
-//!   cydrive-core links — because upstream's libsql backend statically
+//!   cloudkit-core links — because upstream's libsql backend statically
 //!   bundles a second SQLite whose C symbols collide on MSVC with
 //!   rusqlite(bundled) (`LNK2005`). A stored authorization key means
 //!   `bot_sign_in` is skipped on restarts.
@@ -48,7 +48,7 @@ use crate::flood::parse_flood_wait;
 use crate::plan::plan_chunk_sends;
 use crate::range::{range_plan, MAX_CHUNK_SIZE};
 use crate::stream::serve_range;
-use cydrive_core::transport::{
+use cloudkit_core::transport::{
     ByteStream, CloudTransport, InboundFile, IncomingEvent, IncomingStream, RemoteHandle,
     TransportError, UploadJob, UploadReceipt,
 };
@@ -506,7 +506,7 @@ impl CloudTransport for GrammersTransport {
 /// media shapes real chats produce (document vs sticker vs photo,
 /// unnamed documents, album grouping) needs a live bot account sending
 /// real media. The unit-testable policy (fallback naming, chat
-/// filtering semantics) lives in `cydrive-core`'s inbound tests.
+/// filtering semantics) lives in `cloudkit-core`'s inbound tests.
 fn map_update(update: &Update, chat: &grammers_session::types::PeerRef) -> Option<IncomingEvent> {
     let Update::NewMessage(message) = update else {
         return None;

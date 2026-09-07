@@ -15,7 +15,7 @@
 //! [`CredentialError::Unavailable`] — callers degrade instead of dying
 //! (config discovery) or fail loudly (migrate).
 
-use cydrive_core::credentials::{CredentialError, CredentialStore, SERVICE, USER};
+use cloudkit_core::credentials::{CredentialError, CredentialStore, SERVICE, USER};
 use keyring::Entry;
 
 /// OS-backed credential store through keyring 3.x.

@@ -1,4 +1,4 @@
-//! RED-phase tests for `cydrive_core::config`.
+//! RED-phase tests for `cloudkit_core::config`.
 //!
 //! Contract under test: Python `cydrive/config.py` (field set, defaults and
 //! legacy `config.json` handling — unknown keys ignored, missing fields
@@ -9,7 +9,7 @@
 use std::fs;
 use std::sync::{Mutex, MutexGuard};
 
-use cydrive_core::config::{ConfigError, CyDriveConfig};
+use cloudkit_core::config::{ConfigError, CyDriveConfig};
 
 // ------------------------------------------------------------- helpers ---
 
@@ -537,7 +537,7 @@ fn hydrate_timeout_default_is_1800_across_the_chain() {
         "Default impl aligned with the serde default"
     );
     assert_eq!(
-        cydrive_core::vfs::VfsConfig::default().hydrate_timeout,
+        cloudkit_core::vfs::VfsConfig::default().hydrate_timeout,
         std::time::Duration::from_secs(1800),
         "VfsConfig::default (the chain's fallback when no config maps over) aligned"
     );

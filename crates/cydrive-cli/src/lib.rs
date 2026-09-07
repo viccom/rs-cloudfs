@@ -38,17 +38,17 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
-use cydrive_core::cache::CacheManager;
-use cydrive_core::config::CyDriveConfig;
-use cydrive_core::credentials::{
+use cloudkit_core::cache::CacheManager;
+use cloudkit_core::config::CyDriveConfig;
+use cloudkit_core::credentials::{
     CredentialStore, InMemoryStore, BOT_TOKEN, ENCRYPTION_PASSWORD, SERVICE,
 };
-use cydrive_core::database::MetaDatabase;
-use cydrive_core::inbound::spawn_inbound_worker;
-use cydrive_core::rel_path::RelPath;
-use cydrive_core::sync::{namespace_key, sync_once, SyncOutcome};
-use cydrive_core::transport::CloudTransport;
-use cydrive_core::vfs::{Vfs, VfsConfig, VfsError};
+use cloudkit_core::database::MetaDatabase;
+use cloudkit_core::inbound::spawn_inbound_worker;
+use cloudkit_core::rel_path::RelPath;
+use cloudkit_core::sync::{namespace_key, sync_once, SyncOutcome};
+use cloudkit_core::transport::CloudTransport;
+use cloudkit_core::vfs::{Vfs, VfsConfig, VfsError};
 use cydrive_telegram::config::{
     TransportConfig, DEFAULT_API_HASH, DEFAULT_API_ID, DEFAULT_SESSION_STEM,
 };
@@ -147,7 +147,7 @@ pub fn format_storage_size(total_bytes: i64) -> String {
 /// extras the web dashboard's `/api/stats` also exposes. Pure — the CLI
 /// feeds it `MetaDatabase::get_stats` output and prints verbatim.
 pub fn format_stats_report(
-    stats: &cydrive_core::database::Stats,
+    stats: &cloudkit_core::database::Stats,
     drive_letter: &str,
     webdav_url: &str,
 ) -> String {
@@ -746,7 +746,7 @@ pub fn cache_stats(cfg: &CyDriveConfig) -> Result<()> {
 /// manager over the config paths alone, no transport. Deletes the
 /// cached copies of **uploaded** files and clears their `is_cached`
 /// flags via the shared pending-preserving path
-/// (`cydrive_core::vfs::clear_cache_preserving_pending`, the same one
+/// (`cloudkit_core::vfs::clear_cache_preserving_pending`, the same one
 /// behind `Vfs::cache_clear`): pending uploads (`is_uploaded = 0`) keep
 /// both their local copy (for them it is the only copy of the bytes)
 /// and their flag. Prints the freed bytes and the number of cleared
@@ -760,7 +760,7 @@ pub fn cache_clear_cmd(cfg: &CyDriveConfig) -> Result<()> {
     // Plan revision A1: pending uploads survive the clear — the shared
     // core helper owns that semantics (review M1 single source).
     let before = cache.total_size();
-    let cleared = cydrive_core::vfs::clear_cache_preserving_pending(&db, &cache)
+    let cleared = cloudkit_core::vfs::clear_cache_preserving_pending(&db, &cache)
         .context("clearing the local cache")?;
     let freed = before - cache.total_size();
     println!(

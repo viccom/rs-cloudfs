@@ -514,6 +514,31 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
+name = "cloudkit-core"
+version = "0.7.2"
+dependencies = [
+ "aes-gcm",
+ "async-trait",
+ "base64 0.23.1",
+ "bytes",
+ "futures-core",
+ "futures-util",
+ "pbkdf2",
+ "rand 0.10.2",
+ "rusqlite",
+ "serde",
+ "serde_json",
+ "sha2 0.11.0",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+ "toml",
+ "tracing",
+ "tracing-appender",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "cmov"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -733,8 +758,8 @@ dependencies = [
  "axum",
  "bytes",
  "clap",
+ "cloudkit-core",
  "comfy-table",
- "cydrive-core",
  "cydrive-platform",
  "cydrive-sync",
  "cydrive-telegram",
@@ -754,35 +779,10 @@ dependencies = [
 ]
 
 [[package]]
-name = "cydrive-core"
-version = "0.7.2"
-dependencies = [
- "aes-gcm",
- "async-trait",
- "base64 0.23.1",
- "bytes",
- "futures-core",
- "futures-util",
- "pbkdf2",
- "rand 0.10.2",
- "rusqlite",
- "serde",
- "serde_json",
- "sha2 0.11.0",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
- "toml",
- "tracing",
- "tracing-appender",
- "tracing-subscriber",
-]
-
-[[package]]
 name = "cydrive-platform"
 version = "0.7.2"
 dependencies = [
- "cydrive-core",
+ "cloudkit-core",
  "thiserror 2.0.20",
  "winreg",
 ]
@@ -815,7 +815,7 @@ version = "0.7.2"
 dependencies = [
  "async-trait",
  "bytes",
- "cydrive-core",
+ "cloudkit-core",
  "futures-core",
  "futures-util",
  "grammers-client",
@@ -830,7 +830,7 @@ name = "cydrive-web"
 version = "0.7.2"
 dependencies = [
  "axum",
- "cydrive-core",
+ "cloudkit-core",
  "mime_guess",
  "rust-embed",
  "serde_json",
@@ -844,7 +844,7 @@ name = "cydrive-webdav"
 version = "0.7.2"
 dependencies = [
  "bytes",
- "cydrive-core",
+ "cloudkit-core",
  "dav-server",
  "futures-util",
  "http",

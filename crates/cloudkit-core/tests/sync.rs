@@ -1,4 +1,4 @@
-//! RED-phase tests for the sync-lite pure engine of `cydrive_core::sync`
+//! RED-phase tests for the sync-lite pure engine of `cloudkit_core::sync`
 //! (docs/plans/2026-09-04-sync-lite.md, «客户端», core kernel unit).
 //!
 //! Contract under test:
@@ -30,10 +30,10 @@
 //!   `skipped_invalid` and skipped without wedging the cursor;
 //!   `max_pulled` advances monotonically.
 
-use cydrive_core::cache::CacheManager;
-use cydrive_core::database::{ChunkRecord, FileRecord, FileUpsert, MetaDatabase};
-use cydrive_core::rel_path::RelPath;
-use cydrive_core::sync::{
+use cloudkit_core::cache::CacheManager;
+use cloudkit_core::database::{ChunkRecord, FileRecord, FileUpsert, MetaDatabase};
+use cloudkit_core::rel_path::RelPath;
+use cloudkit_core::sync::{
     apply_pulled_rows, deserialize_row, namespace_key, push_diff, row_hash, serialize_row,
     ApplyOutcome, PayloadChunk, RowPayload, SyncPulledRow, SyncRowUpdate,
 };

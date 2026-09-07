@@ -21,7 +21,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
-use cydrive_core::sync::{SyncClient, SyncError, SyncPullResult, SyncPulledRow, SyncRowUpdate};
+use cloudkit_core::sync::{SyncClient, SyncError, SyncPullResult, SyncPulledRow, SyncRowUpdate};
 use cydrive_sync::wire::{
     PullRequest, PullResponse, PushRequest, PushResponse, PushRow, SubscribeEvent, SubscribeRequest,
 };
@@ -192,7 +192,7 @@ pub struct HttpSyncClient {
     /// dead and the channel closes for a reconnect.
     frame_idle_timeout: Duration,
     /// This instance's stable sync identity (from
-    /// [`cydrive_core::database::MetaDatabase::sync_client_id`]): rides
+    /// [`cloudkit_core::database::MetaDatabase::sync_client_id`]): rides
     /// on push/pull (the access log's client tag) and on subscribe (the
     /// doorbell's origin-skip). An empty string means "no identity" and
     /// serializes away — the anonymous pre-doorbell wire form.

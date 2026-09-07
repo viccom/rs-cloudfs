@@ -8,7 +8,7 @@
 
 use std::sync::Arc;
 
-use cydrive_core::database::{FileUpsert, MetaDatabase};
+use cloudkit_core::database::{FileUpsert, MetaDatabase};
 
 #[tokio::test]
 async fn arc_database_shares_one_db_across_spawned_tasks() {

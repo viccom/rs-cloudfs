@@ -20,8 +20,8 @@
 
 use std::time::Duration;
 
+use cloudkit_core::config::CyDriveConfig;
 use cydrive_cli::connect_stack_with_deadline;
-use cydrive_core::config::CyDriveConfig;
 
 /// Spawns a silent SOCKS5 proxy: accepts every TCP connection and then
 /// holds it open without ever writing a byte. The client completes the

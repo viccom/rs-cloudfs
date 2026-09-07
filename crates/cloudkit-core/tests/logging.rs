@@ -1,4 +1,4 @@
-//! RED-phase tests for `cydrive_core::logging` (subscriber construction only).
+//! RED-phase tests for `cloudkit_core::logging` (subscriber construction only).
 //!
 //! These tests exercise [`build_subscriber`] through a thread-local default
 //! dispatcher; the process-global default subscriber is never touched here.
@@ -12,7 +12,7 @@
 use std::io::Write;
 use std::sync::{Arc, Mutex, MutexGuard};
 
-use cydrive_core::logging::{build_subscriber, LogConfig, LogFormat};
+use cloudkit_core::logging::{build_subscriber, LogConfig, LogFormat};
 use tracing_subscriber::fmt::MakeWriter;
 
 // ------------------------------------------------------------- helpers ---

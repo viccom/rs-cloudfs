@@ -29,7 +29,7 @@ axum = { version = "=0.8.9", default-features = false, features = [
 # SSE doorbell stream: Body::from_stream takes any futures-core Stream
 # (same lock-tree version as the axum graph).
 futures-core = "0.3"
-# Same version/features as cydrive-core: one bundled SQLite across the
+# Same version/features as cloudkit-core: one bundled SQLite across the
 # whole workspace (the vendored grammers-session relies on that).
 rusqlite = { version = "0.40.2", features = ["bundled"] }
 serde = { version = "1.0.229", features = ["derive"] }

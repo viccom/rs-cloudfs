@@ -1,4 +1,4 @@
-//! RED-phase tests for `cydrive_core::inbound` (M2 inbound indexing
+//! RED-phase tests for `cloudkit_core::inbound` (M2 inbound indexing
 //! unit). All bodies are expected to panic with "not yet implemented"
 //! until the GREEN phase lands.
 //!
@@ -24,15 +24,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use cydrive_core::cache::CacheManager;
-use cydrive_core::database::MetaDatabase;
-use cydrive_core::inbound::spawn_inbound_worker;
-use cydrive_core::transport::mock::MockTransport;
-use cydrive_core::transport::{
+use cloudkit_core::cache::CacheManager;
+use cloudkit_core::database::MetaDatabase;
+use cloudkit_core::inbound::spawn_inbound_worker;
+use cloudkit_core::transport::mock::MockTransport;
+use cloudkit_core::transport::{
     CloudTransport, InboundFile, IncomingEvent, RemoteHandle, TransportError,
 };
-use cydrive_core::upload_queue::RetryPolicy;
-use cydrive_core::vfs::{Vfs, VfsConfig};
+use cloudkit_core::upload_queue::RetryPolicy;
+use cloudkit_core::vfs::{Vfs, VfsConfig};
 
 /// VfsConfig for the inbound tests: default chunking, one queue worker,
 /// tiny capacity — the queue is never exercised here, it only has to

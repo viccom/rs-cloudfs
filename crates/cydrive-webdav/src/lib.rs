@@ -38,10 +38,10 @@ use dav_server::fs::{
 use futures_util::StreamExt;
 use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 
-use cydrive_core::cache::CacheManager;
-use cydrive_core::database::{DbError, FileRecord, FileUpsert, MetaDatabase};
-use cydrive_core::rel_path::RelPath;
-use cydrive_core::vfs::{Vfs, VfsError};
+use cloudkit_core::cache::CacheManager;
+use cloudkit_core::database::{DbError, FileRecord, FileUpsert, MetaDatabase};
+use cloudkit_core::rel_path::RelPath;
+use cloudkit_core::vfs::{Vfs, VfsError};
 
 /// Virtual cloud headroom reported by the quota (compat contract 6:
 /// Python `get_available_bytes` = 10 TiB).

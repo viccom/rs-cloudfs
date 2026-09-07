@@ -1,15 +1,15 @@
-//! RED-phase tests for `cydrive_core::credentials` and the config
+//! RED-phase tests for `cloudkit_core::credentials` and the config
 //! backfill evolution (M5-1: credential vault).
 //!
-//! Contract under test: the [`cydrive_core::credentials::CredentialStore`]
+//! Contract under test: the [`cloudkit_core::credentials::CredentialStore`]
 //! seam (get / set / idempotent delete, the `InMemoryStore` test double)
 //! and [`CyDriveConfig::with_credential_backfill`] — the "file > store"
 //! precedence leg of env > file > keyring (the Python flaw of plaintext
 //! `config.json` secrets is fixed by relocating them to the OS store,
 //! see `docs/rust-rewrite-design.md`, «凭据保管»).
 
-use cydrive_core::config::CyDriveConfig;
-use cydrive_core::credentials::{CredentialStore, InMemoryStore, BOT_TOKEN, ENCRYPTION_PASSWORD};
+use cloudkit_core::config::CyDriveConfig;
+use cloudkit_core::credentials::{CredentialStore, InMemoryStore, BOT_TOKEN, ENCRYPTION_PASSWORD};
 
 // ------------------------------------------------------- store semantics ---
 

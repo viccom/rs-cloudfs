@@ -21,7 +21,7 @@ use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::{bail, Context as _, Result};
-use cydrive_core::config::CyDriveConfig;
+use cloudkit_core::config::CyDriveConfig;
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 

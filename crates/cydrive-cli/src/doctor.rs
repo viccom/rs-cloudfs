@@ -22,8 +22,8 @@ use std::net::TcpListener;
 use std::path::PathBuf;
 use std::sync::Arc;
 
-use cydrive_core::credentials::{CredentialError, CredentialStore, BOT_TOKEN};
-use cydrive_core::database::MetaDatabase;
+use cloudkit_core::credentials::{CredentialError, CredentialStore, BOT_TOKEN};
+use cloudkit_core::database::MetaDatabase;
 use cydrive_platform::{BASIC_AUTH_LEVEL, FILE_SIZE_LIMIT_BYTES};
 
 /// Verdict of one doctor check.

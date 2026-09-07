@@ -9,7 +9,7 @@
 //!   the counter value of its last write, `deleted` the tombstone
 //!   flag, `payload` an opaque string.
 //!
-//! Concurrency follows the cydrive-core `MetaDatabase` precedent
+//! Concurrency follows the cloudkit-core `MetaDatabase` precedent
 //! (decision log 2026-09-02): the connection sits behind a
 //! `std::sync::Mutex` so `&self` methods are callable from any thread
 //! (axum handlers run on the tokio runtime); every public method

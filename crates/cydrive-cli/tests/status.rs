@@ -20,9 +20,9 @@
 use std::net::{SocketAddr, TcpListener};
 use std::path::Path;
 
+use cloudkit_core::config::CyDriveConfig;
 use cydrive_cli::control::ControlServer;
 use cydrive_cli::{collect_status, render_status, StatusReport};
-use cydrive_core::config::CyDriveConfig;
 
 // ------------------------------------------------------------- helpers ---
 

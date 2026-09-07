@@ -29,11 +29,11 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use cydrive_core::cache::CacheManager;
-use cydrive_core::database::{FileUpsert, MetaDatabase};
-use cydrive_core::transport::mock::MockTransport;
-use cydrive_core::transport::CloudTransport;
-use cydrive_core::vfs::{Vfs, VfsConfig};
+use cloudkit_core::cache::CacheManager;
+use cloudkit_core::database::{FileUpsert, MetaDatabase};
+use cloudkit_core::transport::mock::MockTransport;
+use cloudkit_core::transport::CloudTransport;
+use cloudkit_core::vfs::{Vfs, VfsConfig};
 
 // ------------------------------------------------------------- helpers ---
 

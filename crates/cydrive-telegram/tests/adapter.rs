@@ -8,8 +8,8 @@
 use std::path::PathBuf;
 use std::task::{Context, Poll, Waker};
 
-use cydrive_core::rel_path::RelPath;
-use cydrive_core::transport::{ByteStream, UploadJob};
+use cloudkit_core::rel_path::RelPath;
+use cloudkit_core::transport::{ByteStream, UploadJob};
 use cydrive_telegram::caption::{multi_part_caption, single_file_caption};
 use cydrive_telegram::config::{
     TransportConfig, DEFAULT_API_HASH, DEFAULT_API_ID, DEFAULT_SESSION_STEM,

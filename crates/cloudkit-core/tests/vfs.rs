@@ -1,4 +1,4 @@
-//! RED-phase tests for `cydrive_core::vfs`. All bodies are expected to
+//! RED-phase tests for `cloudkit_core::vfs`. All bodies are expected to
 //! panic with "not yet implemented" until the GREEN phase lands.
 //!
 //! Contract under test (design doc «关键数据流» upload/download paths +
@@ -23,14 +23,14 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
-use cydrive_core::cache::CacheManager;
-use cydrive_core::crypto::encrypt;
-use cydrive_core::database::{FileUpsert, MetaDatabase};
-use cydrive_core::rel_path::RelPath;
-use cydrive_core::transport::mock::MockTransport;
-use cydrive_core::transport::{CloudTransport, UploadJob, UploadReceipt};
-use cydrive_core::upload_queue::RetryPolicy;
-use cydrive_core::vfs::{Vfs, VfsConfig, VfsError};
+use cloudkit_core::cache::CacheManager;
+use cloudkit_core::crypto::encrypt;
+use cloudkit_core::database::{FileUpsert, MetaDatabase};
+use cloudkit_core::rel_path::RelPath;
+use cloudkit_core::transport::mock::MockTransport;
+use cloudkit_core::transport::{CloudTransport, UploadJob, UploadReceipt};
+use cloudkit_core::upload_queue::RetryPolicy;
+use cloudkit_core::vfs::{Vfs, VfsConfig, VfsError};
 
 /// VfsConfig for integration tests: tiny chunk size (multi-chunk at byte
 /// scales), one worker (deterministic order), capacity 16, fast retry
@@ -745,7 +745,7 @@ async fn encrypted_roundtrip_put_upload_hydrate() {
     }
     assert_eq!(joined.len(), 58, "14 B plaintext + 44 B crypto overhead");
     assert_eq!(
-        cydrive_core::crypto::decrypt("pw", &joined).expect("decrypt the joined remote bytes"),
+        cloudkit_core::crypto::decrypt("pw", &joined).expect("decrypt the joined remote bytes"),
         plaintext,
         "the remote holds decryptable ciphertext"
     );

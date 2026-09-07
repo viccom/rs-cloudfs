@@ -3,7 +3,7 @@
 //! Python baseline's `upload_file` performs.
 
 use crate::caption::{clean_rel_path, multi_part_caption, part_document_name, single_file_caption};
-use cydrive_core::transport::UploadJob;
+use cloudkit_core::transport::UploadJob;
 
 /// One send_file call planned from an upload job.
 #[derive(Debug, Clone, PartialEq, Eq)]

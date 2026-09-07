@@ -1,4 +1,4 @@
-//! RED-phase tests for the sync-lite tables of `cydrive_core::database`.
+//! RED-phase tests for the sync-lite tables of `cloudkit_core::database`.
 //!
 //! Contract under test (docs/plans/2026-09-04-sync-lite.md, «客户端»):
 //! `MetaDatabase` grows two **additive** tables (the Python-contract DDL
@@ -18,7 +18,7 @@
 //! (ordered for deterministic diffs) and `sync_state_get` (no row = 0) /
 //! `sync_state_set` (upsert into the single `id = 0` row).
 
-use cydrive_core::database::MetaDatabase;
+use cloudkit_core::database::MetaDatabase;
 use rusqlite::Connection;
 
 // ------------------------------------------------------------- helpers ---

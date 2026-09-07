@@ -1,5 +1,5 @@
 [package]
-name = "cydrive-core"
+name = "cloudkit-core"
 description = "CyDrive domain core: VFS paths, metadata DB, cache, crypto, chunking"
 version.workspace = true
 edition.workspace = true

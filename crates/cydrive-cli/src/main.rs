@@ -21,10 +21,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use clap::{Parser, Subcommand};
+use cloudkit_core::config::CyDriveConfig;
+use cloudkit_core::logging::LogConfig;
+use cloudkit_core::rel_path::RelPath;
 use cydrive_cli::{discover_config, run_with_transport};
-use cydrive_core::config::CyDriveConfig;
-use cydrive_core::logging::LogConfig;
-use cydrive_core::rel_path::RelPath;
 use cydrive_telegram::transport::GrammersTransport;
 
 /// CyDrive — Telegram as an unlimited cloud drive, served over WebDAV.
@@ -380,7 +380,7 @@ fn migrate_cmd() -> Result<()> {
 /// open the metadata DB and print the report table.
 fn stats_cmd() -> Result<()> {
     let cfg = discover_config().context("config discovery failed")?;
-    let db = cydrive_core::database::MetaDatabase::open(std::path::Path::new(&cfg.db_path))
+    let db = cloudkit_core::database::MetaDatabase::open(std::path::Path::new(&cfg.db_path))
         .with_context(|| format!("opening metadata db {:?}", cfg.db_path))?;
     let stats = db.get_stats().context("reading drive statistics")?;
     println!(
@@ -407,7 +407,7 @@ fn doctor_cmd() -> Result<()> {
     // doctor checks read: a failed constructor becomes an
     // UnavailableKeyring so the credentials check sees the headless
     // condition (C6) instead of a healthy-looking in-memory fallback.
-    let credential_store: Arc<dyn cydrive_core::credentials::CredentialStore> =
+    let credential_store: Arc<dyn cloudkit_core::credentials::CredentialStore> =
         match cydrive_cli::KeyringStore::new() {
             Ok(store) => Arc::new(store),
             Err(error) => Arc::new(cydrive_cli::doctor::UnavailableKeyring::new(
@@ -461,7 +461,7 @@ fn setup_cmd() -> Result<()> {
     cydrive_cli::setup::run_setup_interactive(
         store
             .as_ref()
-            .map(|s| s as &dyn cydrive_core::credentials::CredentialStore),
+            .map(|s| s as &dyn cloudkit_core::credentials::CredentialStore),
     )
 }
 
@@ -492,7 +492,7 @@ async fn run() -> Result<()> {
     }
 
     // Pretty/INFO on stdout; a parseable RUST_LOG overrides the level.
-    cydrive_core::logging::init(&LogConfig::default()).context("initializing logging")?;
+    cloudkit_core::logging::init(&LogConfig::default()).context("initializing logging")?;
 
     let transport_config = cydrive_cli::transport_config_from(&cfg, &cwd);
     println!(

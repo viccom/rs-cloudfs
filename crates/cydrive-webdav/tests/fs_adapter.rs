@@ -20,13 +20,13 @@ use dav_server::davpath::DavPath;
 use dav_server::fs::{DavFileSystem, FsError, OpenOptions};
 use futures_util::StreamExt;
 
-use cydrive_core::cache::CacheManager;
-use cydrive_core::database::{FileUpsert, MetaDatabase};
-use cydrive_core::rel_path::RelPath;
-use cydrive_core::transport::mock::MockTransport;
-use cydrive_core::transport::{CloudTransport, UploadJob, UploadReceipt};
-use cydrive_core::upload_queue::RetryPolicy;
-use cydrive_core::vfs::{Vfs, VfsConfig};
+use cloudkit_core::cache::CacheManager;
+use cloudkit_core::database::{FileUpsert, MetaDatabase};
+use cloudkit_core::rel_path::RelPath;
+use cloudkit_core::transport::mock::MockTransport;
+use cloudkit_core::transport::{CloudTransport, UploadJob, UploadReceipt};
+use cloudkit_core::upload_queue::RetryPolicy;
+use cloudkit_core::vfs::{Vfs, VfsConfig};
 use cydrive_webdav::CyDriveFs;
 
 /// The virtual 10 TB quota from compat contract 6 (Python

@@ -1,4 +1,4 @@
-//! RED-phase tests for the `proxy_url` extension of `cydrive_core::config`.
+//! RED-phase tests for the `proxy_url` extension of `cloudkit_core::config`.
 //!
 //! Contract under test: `CyDriveConfig` gains an optional SOCKS5 proxy URL
 //! (`None` by default, backward-compatible — an existing `config.toml`
@@ -10,7 +10,7 @@
 use std::fs;
 use std::sync::{Mutex, MutexGuard};
 
-use cydrive_core::config::CyDriveConfig;
+use cloudkit_core::config::CyDriveConfig;
 
 // ------------------------------------------------------------- helpers ---
 

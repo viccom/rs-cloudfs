@@ -24,7 +24,7 @@
 
 use std::path::Path;
 
-use cydrive_core::config::CyDriveConfig;
+use cloudkit_core::config::CyDriveConfig;
 use cydrive_platform::{
     auto_mount_target, davfs_mount_command, davfs_unmount_command, default_mount_point,
     detect_mount_backend, fusermount_unmount_command, gio_mount_command, mount_command,

@@ -21,10 +21,10 @@ use std::collections::HashMap;
 use std::sync::Mutex;
 
 use async_trait::async_trait;
-use cydrive_core::cache::CacheManager;
-use cydrive_core::database::{FileUpsert, MetaDatabase};
-use cydrive_core::rel_path::RelPath;
-use cydrive_core::sync::{
+use cloudkit_core::cache::CacheManager;
+use cloudkit_core::database::{FileUpsert, MetaDatabase};
+use cloudkit_core::rel_path::RelPath;
+use cloudkit_core::sync::{
     namespace_key, row_hash, serialize_row, sync_once, SyncClient, SyncError, SyncOutcome,
     SyncPullResult, SyncPulledRow, SyncRowUpdate,
 };

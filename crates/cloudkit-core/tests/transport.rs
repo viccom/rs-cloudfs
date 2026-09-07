@@ -1,4 +1,4 @@
-//! RED-phase tests for `cydrive_core::transport` (CloudTransport trait +
+//! RED-phase tests for `cloudkit_core::transport` (CloudTransport trait +
 //! MockTransport). All bodies are expected to panic with "not yet
 //! implemented" until the GREEN phase lands.
 //!
@@ -12,9 +12,9 @@
 //! open / open_range slicing, delete semantics, and drain-once incoming
 //! events.
 
-use cydrive_core::rel_path::RelPath;
-use cydrive_core::transport::mock::{MockTransport, UploadAction};
-use cydrive_core::transport::{
+use cloudkit_core::rel_path::RelPath;
+use cloudkit_core::transport::mock::{MockTransport, UploadAction};
+use cloudkit_core::transport::{
     ByteStream, CloudTransport, InboundFile, IncomingEvent, IncomingStream, RemoteHandle,
     TransportError, UploadJob,
 };

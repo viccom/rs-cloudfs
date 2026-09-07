@@ -1,4 +1,4 @@
-//! RED-phase tests for `cydrive_core::bot` (M2 bot-command unit). All
+//! RED-phase tests for `cloudkit_core::bot` (M2 bot-command unit). All
 //! bodies panic through the `handle_command`/inspection-API stubs until
 //! the GREEN phase lands.
 //!
@@ -16,15 +16,15 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use cydrive_core::bot::handle_command;
-use cydrive_core::cache::CacheManager;
-use cydrive_core::database::{FileUpsert, MetaDatabase};
-use cydrive_core::inbound::spawn_inbound_worker;
-use cydrive_core::rel_path::RelPath;
-use cydrive_core::transport::mock::MockTransport;
-use cydrive_core::transport::{CloudTransport, IncomingEvent};
-use cydrive_core::upload_queue::RetryPolicy;
-use cydrive_core::vfs::{Vfs, VfsConfig};
+use cloudkit_core::bot::handle_command;
+use cloudkit_core::cache::CacheManager;
+use cloudkit_core::database::{FileUpsert, MetaDatabase};
+use cloudkit_core::inbound::spawn_inbound_worker;
+use cloudkit_core::rel_path::RelPath;
+use cloudkit_core::transport::mock::MockTransport;
+use cloudkit_core::transport::{CloudTransport, IncomingEvent};
+use cloudkit_core::upload_queue::RetryPolicy;
+use cloudkit_core::vfs::{Vfs, VfsConfig};
 
 /// Help text: Python baseline (`telegram_client.py:99-107`) extended with
 /// the tier-1 command rows (plan contract C8, commit 5725976): `/ls`,
@@ -662,11 +662,11 @@ async fn queue_reports_counters() {
     let db = Arc::new(MetaDatabase::open(&dir.path().join("meta.db")).expect("open temp db"));
     let mock = Arc::new(
         MockTransport::builder()
-            .upload_action(cydrive_core::transport::mock::UploadAction::Fail {
-                error: cydrive_core::transport::TransportError::Disconnected("flaky 1".into()),
+            .upload_action(cloudkit_core::transport::mock::UploadAction::Fail {
+                error: cloudkit_core::transport::TransportError::Disconnected("flaky 1".into()),
             })
-            .upload_action(cydrive_core::transport::mock::UploadAction::Fail {
-                error: cydrive_core::transport::TransportError::Disconnected("flaky 2".into()),
+            .upload_action(cloudkit_core::transport::mock::UploadAction::Fail {
+                error: cloudkit_core::transport::TransportError::Disconnected("flaky 2".into()),
             })
             .build(),
     );

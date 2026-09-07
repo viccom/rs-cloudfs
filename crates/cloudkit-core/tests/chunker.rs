@@ -1,4 +1,4 @@
-//! RED-phase tests for `cydrive_core::chunker`.
+//! RED-phase tests for `cloudkit_core::chunker`.
 //!
 //! Contract under test (aligned with Python `chunker.py`): part naming
 //! `{base}.part{idx:03}` (zero-padded 3 digits, index from 0, wider for
@@ -6,7 +6,7 @@
 //! (strictly greater), merge concatenates parts in the given order, and
 //! SHA-256 digests are lowercase hex.
 
-use cydrive_core::chunker::{
+use cloudkit_core::chunker::{
     merge_chunks, needs_chunking, part_name, sha256_file, split_file, PartInfo, CHUNK_BUFFER_SIZE,
 };
 use std::fs;

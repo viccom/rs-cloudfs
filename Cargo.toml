@@ -1,8 +1,8 @@
 [workspace]
 resolver = "2"
 members = [
+    "crates/cloudkit-core",
     "crates/cydrive-cli",
-    "crates/cydrive-core",
     "crates/cydrive-platform",
     "crates/cydrive-sync",
     "crates/cydrive-telegram",

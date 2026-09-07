@@ -21,8 +21,8 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use cloudkit_core::sync::{SyncClient, SyncError, SyncRowUpdate};
 use cydrive_cli::sync_client::{sse_frame_data, HttpSyncClient};
-use cydrive_core::sync::{SyncClient, SyncError, SyncRowUpdate};
 use cydrive_sync::events::EventHub;
 use cydrive_sync::router::router_with_hub;
 use cydrive_sync::store::SyncStore;

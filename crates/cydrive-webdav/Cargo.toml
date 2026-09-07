@@ -10,7 +10,7 @@ workspace = true
 
 [dependencies]
 bytes = "1"
-cydrive-core = { path = "../cydrive-core" }
+cloudkit-core = { path = "../cloudkit-core" }
 dav-server = "=0.11.0"
 futures-util = "0.3"
 http = "1"
