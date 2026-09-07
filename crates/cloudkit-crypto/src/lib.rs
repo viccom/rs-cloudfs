@@ -18,11 +18,13 @@
 //! structural error) — never as wrong plaintext.
 
 pub mod v1;
+pub mod v2;
 
 use std::io::{Read, Write};
 use std::ops::Range;
 
 pub use v1::GcmV1;
+pub use v2::AeadV2;
 
 /// Identifies the container format of an encrypted payload.
 ///
@@ -69,6 +71,26 @@ pub enum CryptoError {
     /// Underlying reader/writer failed during streaming encryption/decryption.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
+    /// v2 container does not start with the expected magic bytes.
+    #[error("not a cloudkit-crypto v2 container (bad magic)")]
+    BadMagic,
+    /// v2 container version byte is not understood by this build.
+    #[error("unsupported container version: {0}")]
+    UnsupportedVersion(u8),
+    /// v2 container structure is inconsistent (bad lengths/reserved/chunk math).
+    #[error("malformed ciphertext structure")]
+    Malformed,
+    /// Configured chunk size is outside the format guardrails
+    /// (container headers carry out-of-guardrail sizes as
+    /// [`CryptoError::Malformed`] — untrusted input never borrows the
+    /// constructor's error).
+    #[error(
+        "invalid chunk size {size}: must be between {min} and {max} bytes",
+        size = 0,
+        min = v2::MIN_CHUNK_SIZE,
+        max = v2::MAX_CHUNK_SIZE
+    )]
+    InvalidChunkSize(usize),
 }
 
 /// A client-side encryption container format (foundation D7).
