@@ -77,7 +77,7 @@ mod tests {
     /// manager**, so it never runs in the CI gate. Run it manually with
     ///
     /// ```text
-    /// cargo test -p cydrive-cli --lib ignored_keyring_roundtrip -- --ignored
+    /// cargo test -p cloudkit-cli --lib ignored_keyring_roundtrip -- --ignored
     /// ```
     ///
     /// The entries live under a unique per-run service suffix so a

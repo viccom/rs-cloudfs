@@ -22,10 +22,10 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use ck_telegram::transport::GrammersTransport;
 use clap::{Parser, Subcommand};
+use cloudkit_cli::{discover_config, run_with_transport};
 use cloudkit_core::config::CyDriveConfig;
 use cloudkit_core::logging::LogConfig;
 use cloudkit_core::rel_path::RelPath;
-use cydrive_cli::{discover_config, run_with_transport};
 
 /// CyDrive — Telegram as an unlimited cloud drive, served over WebDAV.
 #[derive(Debug, Parser)]
@@ -169,7 +169,7 @@ fn require_configured(cfg: &CyDriveConfig) -> Result<()> {
 /// instance to shut down gracefully via the loopback control channel.
 async fn stop_cmd() -> Result<()> {
     let cfg = discover_config().context("config discovery failed")?;
-    cydrive_cli::control::stop_cmd(&cfg).await
+    cloudkit_cli::control::stop_cmd(&cfg).await
 }
 
 /// `cydrive status`: discover the config (same cwd rule as `run`/`stop`
@@ -178,13 +178,13 @@ async fn stop_cmd() -> Result<()> {
 /// the probes and print the rendered report.
 async fn status_cmd() -> Result<()> {
     let cfg = discover_config().context("config discovery failed")?;
-    let report = cydrive_cli::collect_status(&cfg).await;
+    let report = cloudkit_cli::collect_status(&cfg).await;
     println!(
         "{}",
-        cydrive_cli::render_status(
+        cloudkit_cli::render_status(
             &report,
-            &cydrive_cli::default_mount_url(&cfg),
-            cydrive_cli::dashboard_url(&cfg),
+            &cloudkit_cli::default_mount_url(&cfg),
+            cloudkit_cli::dashboard_url(&cfg),
         )
     );
     Ok(())
@@ -205,8 +205,8 @@ async fn push_cmd(path: PathBuf, dest: Option<String>) -> Result<()> {
     let dest = RelPath::new(&dest)
         .with_context(|| format!("invalid drive path {dest:?} (drive paths start with \"/\")"))?;
 
-    let stack = cydrive_cli::connect_stack(&cfg).await?;
-    let pushed = cydrive_cli::push_file(&stack.vfs, &path, &dest).await?;
+    let stack = cloudkit_cli::connect_stack(&cfg).await?;
+    let pushed = cloudkit_cli::push_file(&stack.vfs, &path, &dest).await?;
     println!("pushed {pushed} bytes; draining the upload queue ...");
     stack.shutdown().await;
 
@@ -219,7 +219,7 @@ async fn push_cmd(path: PathBuf, dest: Option<String>) -> Result<()> {
         Some(row) => println!(
             "uploaded: {} ({})",
             dest.as_str(),
-            cydrive_cli::format_storage_size(row.size)
+            cloudkit_cli::format_storage_size(row.size)
         ),
         None => println!(
             "queued but not uploaded yet (degraded or still pending); will retry on next run"
@@ -235,8 +235,8 @@ async fn pull_cmd(path: String, out: PathBuf) -> Result<()> {
     require_configured(&cfg)?;
     let rel = RelPath::new(&path).with_context(|| format!("invalid drive path {path:?}"))?;
 
-    let stack = cydrive_cli::connect_stack(&cfg).await?;
-    let pulled_to = cydrive_cli::pull_file(&stack.vfs, &rel, &out).await?;
+    let stack = cloudkit_cli::connect_stack(&cfg).await?;
+    let pulled_to = cloudkit_cli::pull_file(&stack.vfs, &rel, &out).await?;
     let bytes = std::fs::metadata(&pulled_to)
         .with_context(|| format!("reading the pulled file {}", pulled_to.display()))?
         .len();
@@ -254,8 +254,8 @@ async fn pull_cmd(path: String, out: PathBuf) -> Result<()> {
 fn cache_cmd(action: CacheAction) -> Result<()> {
     let cfg = discover_config().context("config discovery failed")?;
     match action {
-        CacheAction::Stats => cydrive_cli::cache_stats(&cfg),
-        CacheAction::Clear => cydrive_cli::cache_clear_cmd(&cfg),
+        CacheAction::Stats => cloudkit_cli::cache_stats(&cfg),
+        CacheAction::Clear => cloudkit_cli::cache_clear_cmd(&cfg),
     }
 }
 
@@ -267,9 +267,9 @@ fn cache_cmd(action: CacheAction) -> Result<()> {
 /// `CYDRIVE_SYNC_SECRET` over the config.toml `sync_secret` key.
 async fn sync_cmd() -> Result<()> {
     let cfg = discover_config().context("config discovery failed")?;
-    let secret = cydrive_cli::resolve_sync_secret(&cfg);
-    let outcome = cydrive_cli::run_sync_command(&cfg, secret.as_deref()).await?;
-    println!("{}", cydrive_cli::render_sync_summary(&outcome));
+    let secret = cloudkit_cli::resolve_sync_secret(&cfg);
+    let outcome = cloudkit_cli::run_sync_command(&cfg, secret.as_deref()).await?;
+    println!("{}", cloudkit_cli::render_sync_summary(&outcome));
     Ok(())
 }
 
@@ -286,7 +286,7 @@ async fn mount_cmd(
     #[cfg(unix)]
     {
         let _ = letter; // Windows-only flag
-        let url = url.unwrap_or_else(|| cydrive_cli::default_mount_url(&cfg));
+        let url = url.unwrap_or_else(|| cloudkit_cli::default_mount_url(&cfg));
         let mount_point = unix_mount_point(path)?;
         let report = cloudkit_platform::linux::mount_drive(&mount_point, &url)
             .with_context(|| format!("mounting {url} at {}", mount_point.display()))?;
@@ -299,7 +299,7 @@ async fn mount_cmd(
         if path.is_some() {
             anyhow::bail!("--path applies to Unix mounts only; Windows uses drive letters");
         }
-        let (letter, url) = cydrive_cli::resolve_mount_params(&cfg, url, letter);
+        let (letter, url) = cloudkit_cli::resolve_mount_params(&cfg, url, letter);
         let mounted = cloudkit_platform::windows::mount_drive(&letter, &url)
             .with_context(|| format!("mounting {url} at {letter}"))?;
         println!("CyDrive mounted at {mounted} -> {url}");
@@ -327,7 +327,7 @@ async fn unmount_cmd(letter: Option<String>, path: Option<PathBuf>) -> Result<()
         if path.is_some() {
             anyhow::bail!("--path applies to Unix mounts only; Windows uses drive letters");
         }
-        let letter = cydrive_cli::resolve_unmount_letter(&cfg, letter);
+        let letter = cloudkit_cli::resolve_unmount_letter(&cfg, letter);
         cloudkit_platform::windows::unmount_drive(&letter)
             .with_context(|| format!("unmounting {letter}"))?;
         println!("CyDrive unmounted from {letter}");
@@ -366,12 +366,12 @@ async fn fix_reg_cmd() -> Result<()> {
 /// hard error here — migrating secrets into a volatile in-memory
 /// fallback would report success while losing them.
 fn migrate_cmd() -> Result<()> {
-    let store = cydrive_cli::KeyringStore::new().context(
+    let store = cloudkit_cli::KeyringStore::new().context(
         "the OS credential store is unavailable, so cydrive migrate cannot persist \
          your secrets; bring the platform keyring up (Windows Credential Manager / \
          macOS Keychain / Secret Service) and retry",
     )?;
-    let report = cydrive_cli::run_migrate(&store).context("migration failed")?;
+    let report = cloudkit_cli::run_migrate(&store).context("migration failed")?;
     print!("{report}");
     Ok(())
 }
@@ -385,10 +385,10 @@ fn stats_cmd() -> Result<()> {
     let stats = db.get_stats().context("reading drive statistics")?;
     println!(
         "{}",
-        cydrive_cli::format_stats_report(
+        cloudkit_cli::format_stats_report(
             &stats,
             &cfg.drive_letter,
-            &cydrive_cli::default_mount_url(&cfg)
+            &cloudkit_cli::default_mount_url(&cfg)
         )
     );
     Ok(())
@@ -408,13 +408,13 @@ fn doctor_cmd() -> Result<()> {
     // UnavailableKeyring so the credentials check sees the headless
     // condition (C6) instead of a healthy-looking in-memory fallback.
     let credential_store: Arc<dyn cloudkit_core::credentials::CredentialStore> =
-        match cydrive_cli::KeyringStore::new() {
+        match cloudkit_cli::KeyringStore::new() {
             Ok(store) => Arc::new(store),
-            Err(error) => Arc::new(cydrive_cli::doctor::UnavailableKeyring::new(
+            Err(error) => Arc::new(cloudkit_cli::doctor::UnavailableKeyring::new(
                 error.to_string(),
             )),
         };
-    let ctx = cydrive_cli::doctor::DoctorContext {
+    let ctx = cloudkit_cli::doctor::DoctorContext {
         config_present,
         db_path: config_present.then(|| std::path::PathBuf::from(&cfg.db_path)),
         cache_path: config_present.then(|| std::path::PathBuf::from(&cfg.cache_path)),
@@ -423,9 +423,9 @@ fn doctor_cmd() -> Result<()> {
         bot_token: cfg.bot_token.clone(),
         credential_store,
     };
-    let mut results = cydrive_cli::doctor::run_doctor(&ctx);
-    results.extend(cydrive_cli::doctor::platform_checks());
-    print!("{}", cydrive_cli::doctor::render_report(&results));
+    let mut results = cloudkit_cli::doctor::run_doctor(&ctx);
+    results.extend(cloudkit_cli::doctor::platform_checks());
+    print!("{}", cloudkit_cli::doctor::render_report(&results));
     Ok(())
 }
 
@@ -436,7 +436,7 @@ fn doctor_cmd() -> Result<()> {
 /// pre-2026-09-04 behavior of silently storing them in a volatile
 /// in-memory fallback reported success while losing the token.
 fn setup_cmd() -> Result<()> {
-    let store: Option<cydrive_cli::KeyringStore> = match cydrive_cli::KeyringStore::new() {
+    let store: Option<cloudkit_cli::KeyringStore> = match cloudkit_cli::KeyringStore::new() {
         Ok(store) => Some(store),
         Err(error) => {
             println!(
@@ -458,7 +458,7 @@ fn setup_cmd() -> Result<()> {
             None
         }
     };
-    cydrive_cli::setup::run_setup_interactive(
+    cloudkit_cli::setup::run_setup_interactive(
         store
             .as_ref()
             .map(|s| s as &dyn cloudkit_core::credentials::CredentialStore),
@@ -494,14 +494,14 @@ async fn run() -> Result<()> {
     // Pretty/INFO on stdout; a parseable RUST_LOG overrides the level.
     cloudkit_core::logging::init(&LogConfig::default()).context("initializing logging")?;
 
-    let transport_config = cydrive_cli::transport_config_from(&cfg, &cwd);
+    let transport_config = cloudkit_cli::transport_config_from(&cfg, &cwd);
     println!(
         "Connecting to Telegram (session: {}) ...",
         transport_config.session_path.display()
     );
-    let connect = cydrive_cli::connect_with_deadline(
+    let connect = cloudkit_cli::connect_with_deadline(
         GrammersTransport::connect(transport_config),
-        cydrive_cli::CONNECT_DEADLINE,
+        cloudkit_cli::CONNECT_DEADLINE,
     );
     let transport = tokio::select! {
         result = connect => match result {
@@ -509,12 +509,12 @@ async fn run() -> Result<()> {
             Err(error) => {
                 eprintln!("Error: connecting the Telegram transport");
                 match &error {
-                    cydrive_cli::ConnectGuardError::Deadline(_) => {}
-                    cydrive_cli::ConnectGuardError::Inner(source) => {
+                    cloudkit_cli::ConnectGuardError::Deadline(_) => {}
+                    cloudkit_cli::ConnectGuardError::Inner(source) => {
                         eprintln!("Caused by:\n    {source}");
                     }
                 }
-                eprintln!("{}", cydrive_cli::connect_failure_hint());
+                eprintln!("{}", cloudkit_cli::connect_failure_hint());
                 std::process::exit(1);
             }
         },
@@ -542,7 +542,7 @@ async fn run() -> Result<()> {
     // Whichever wins, the same graceful drain follows.
     let stop_source = tokio::select! {
         _ = tokio::signal::ctrl_c() => "Ctrl+C",
-        _ = cydrive_cli::sigterm() => "SIGTERM",
+        _ = cloudkit_cli::sigterm() => "SIGTERM",
         _ = handle.wait_for_stop_request() => "stop command",
     };
     println!("{stop_source} received.");

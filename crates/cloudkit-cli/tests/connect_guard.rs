@@ -8,7 +8,7 @@
 
 use std::time::Duration;
 
-use cydrive_cli::{connect_with_deadline, ConnectGuardError};
+use cloudkit_cli::{connect_with_deadline, ConnectGuardError};
 
 /// A future that never resolves: models a blocked TCP connect.
 fn pending_result() -> impl std::future::Future<Output = Result<u8, String>> {

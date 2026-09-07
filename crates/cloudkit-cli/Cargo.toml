@@ -1,5 +1,5 @@
 [package]
-name = "cydrive-cli"
+name = "cloudkit-cli"
 description = "CyDrive binary: minimal run orchestration (config discovery, VFS + transport + WebDAV boot)"
 version.workspace = true
 edition.workspace = true
@@ -9,7 +9,7 @@ license.workspace = true
 workspace = true
 
 [lib]
-name = "cydrive_cli"
+name = "cloudkit_cli"
 path = "src/lib.rs"
 
 [[bin]]

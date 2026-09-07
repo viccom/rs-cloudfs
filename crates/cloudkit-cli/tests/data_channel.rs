@@ -33,6 +33,7 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
+use cloudkit_cli::{cache_clear_cmd, pull_file, push_file, vfs_config};
 use cloudkit_core::cache::CacheManager;
 use cloudkit_core::config::CyDriveConfig;
 use cloudkit_core::database::MetaDatabase;
@@ -41,7 +42,6 @@ use cloudkit_core::transport::mock::MockTransport;
 use cloudkit_core::transport::CloudTransport;
 use cloudkit_core::upload_queue::RetryPolicy;
 use cloudkit_core::vfs::{Vfs, VfsConfig};
-use cydrive_cli::{cache_clear_cmd, pull_file, push_file, vfs_config};
 
 // ------------------------------------------------------------- helpers ---
 

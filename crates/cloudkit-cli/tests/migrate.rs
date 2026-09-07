@@ -15,10 +15,10 @@ use std::path::Path;
 use std::path::PathBuf;
 use std::sync::{Mutex, MutexGuard};
 
+use cloudkit_cli::{discover_config_with_store, run_migrate};
 use cloudkit_core::config::CyDriveConfig;
 use cloudkit_core::credentials::{CredentialStore, InMemoryStore, BOT_TOKEN, ENCRYPTION_PASSWORD};
 use cloudkit_core::database::{FileUpsert, MetaDatabase};
-use cydrive_cli::{discover_config_with_store, run_migrate};
 
 // ------------------------------------------------------------- helpers ---
 

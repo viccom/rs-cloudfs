@@ -11,7 +11,7 @@
 //! missing (no instance) or stale (dead port), removing the stale file.
 //!
 //! Assertion layers: the C1 pieces are pinned straight against
-//! `cydrive_cli::control`; the C2 pieces are pinned against the library
+//! `cloudkit_cli::control`; the C2 pieces are pinned against the library
 //! body `control::stop_cmd(&cfg)` (the established thin-arm pattern —
 //! `cache_stats` / `cache_clear_cmd` / `run_migrate` — so `main.rs`'s
 //! `Stop` arm is discover_config + stop_cmd by construction, and the
@@ -28,10 +28,10 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
-use cloudkit_core::config::CyDriveConfig;
-use cydrive_cli::control::{
+use cloudkit_cli::control::{
     control_file_path, read_control_addr, send_ping, send_stop, stop_cmd, ControlServer,
 };
+use cloudkit_core::config::CyDriveConfig;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 

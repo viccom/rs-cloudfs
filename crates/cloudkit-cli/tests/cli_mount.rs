@@ -6,8 +6,8 @@
 //! (the actual `net use` / registry side belongs to the real-machine
 //! checklist in `crates/cloudkit-platform/tests/platform.rs`).
 
+use cloudkit_cli::{default_mount_url, resolve_mount_params, resolve_unmount_letter};
 use cloudkit_core::config::CyDriveConfig;
-use cydrive_cli::{default_mount_url, resolve_mount_params, resolve_unmount_letter};
 
 /// The default URL is glued straight from the config's WebDAV host/port:
 /// `http://127.0.0.1:8080` on defaults, reflecting overrides verbatim.

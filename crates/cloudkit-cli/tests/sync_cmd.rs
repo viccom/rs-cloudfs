@@ -5,16 +5,16 @@
 
 use std::sync::{Mutex, MutexGuard};
 
-use cloudkit_core::config::CyDriveConfig;
-use cloudkit_core::sync::{SyncOutcome, SyncPulledRow, SyncRowUpdate};
-use cloudkit_sync_server::wire::{PullResponse, PulledRow, PushRow};
-use cydrive_cli::sync_client::{
+use cloudkit_cli::sync_client::{
     endpoint_url, pull_core_result, push_wire_rows, truncate_for_log, SYNC_SECRET_ENV,
 };
-use cydrive_cli::{
+use cloudkit_cli::{
     parse_sync_secret, render_sync_summary, resolve_sync_secret, run_sync_command,
     sync_secret_from_env,
 };
+use cloudkit_core::config::CyDriveConfig;
+use cloudkit_core::sync::{SyncOutcome, SyncPulledRow, SyncRowUpdate};
+use cloudkit_sync_server::wire::{PullResponse, PulledRow, PushRow};
 
 // ------------------------------------------------------------- helpers ---
 

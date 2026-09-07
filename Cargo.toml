@@ -3,7 +3,7 @@ resolver = "2"
 members = [
     "crates/cloudkit-core",
     "crates/cloudkit-sync-server",
-    "crates/cydrive-cli",
+    "crates/cloudkit-cli",
     "crates/cloudkit-platform",
     "crates/cloudkit-web",
     "crates/cloudkit-webdav",

@@ -21,12 +21,12 @@ use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use cloudkit_cli::control::{control_file_path, read_control_addr, send_stop};
+use cloudkit_cli::{discover_config, run_with_transport, vfs_config, RunHandle, ShutdownWatch};
 use cloudkit_core::config::CyDriveConfig;
 use cloudkit_core::database::{FileUpsert, MetaDatabase};
 use cloudkit_core::transport::mock::MockTransport;
 use cloudkit_core::transport::CloudTransport;
-use cydrive_cli::control::{control_file_path, read_control_addr, send_stop};
-use cydrive_cli::{discover_config, run_with_transport, vfs_config, RunHandle, ShutdownWatch};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio::time::{sleep, timeout};
@@ -510,7 +510,7 @@ async fn run_instance_stops_via_control_channel() {
 #[ignore = "sends a real SIGTERM to the test process; run explicitly on unix: cargo test -- --ignored"]
 #[tokio::test]
 async fn sigterm_future_resolves_on_real_signal() {
-    let waiter = tokio::spawn(async { cydrive_cli::sigterm().await });
+    let waiter = tokio::spawn(async { cloudkit_cli::sigterm().await });
     sleep(Duration::from_millis(200)).await;
     let status = std::process::Command::new("kill")
         .args(["-TERM", &std::process::id().to_string()])

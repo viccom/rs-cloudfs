@@ -5,7 +5,7 @@
 //!
 //! Contract under test:
 //!
-//! * [`cydrive_cli::format_stats_report`] — a comfy-table report with the
+//! * [`cloudkit_cli::format_stats_report`] — a comfy-table report with the
 //!   Python `/stats` rows (Total Files/Folders/Cloud Storage/Synced/Pending)
 //!   plus Drive/URL, sizes human-readable via the bot's `size_gb >= 1`
 //!   branch semantics;
@@ -16,7 +16,7 @@
 //! * the setup wizard's pure core — token validation mirroring the Python
 //!   wizard texts, `apply_wizard` field filling + letter normalisation,
 //!   `persist_setup` scrubbing + store roundtrip through
-//!   [`cydrive_cli::discover_config_with_store`].
+//!   [`cloudkit_cli::discover_config_with_store`].
 //!
 //! The interactive dialoguer layer and `platform_checks` (real registry /
 //! `sc query` / live Telegram) are compile-verified only — a doctor run
@@ -27,14 +27,14 @@ use std::net::TcpListener;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex, MutexGuard};
 
+use cloudkit_cli::doctor::{
+    evaluate_webclient_params, render_report, run_doctor, CheckResult, CheckStatus, DoctorContext,
+};
+use cloudkit_cli::setup::{apply_wizard, persist_setup, validate_token, WizardAnswers};
+use cloudkit_cli::{discover_config_with_store, format_stats_report};
 use cloudkit_core::config::CyDriveConfig;
 use cloudkit_core::credentials::{CredentialError, CredentialStore, InMemoryStore, BOT_TOKEN};
 use cloudkit_core::database::{FileUpsert, MetaDatabase, Stats};
-use cydrive_cli::doctor::{
-    evaluate_webclient_params, render_report, run_doctor, CheckResult, CheckStatus, DoctorContext,
-};
-use cydrive_cli::setup::{apply_wizard, persist_setup, validate_token, WizardAnswers};
-use cydrive_cli::{discover_config_with_store, format_stats_report};
 
 // ------------------------------------------------------------- helpers ---
 

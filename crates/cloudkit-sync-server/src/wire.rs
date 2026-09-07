@@ -1,7 +1,7 @@
 //! Wire protocol types for the sync-lite HTTP API (v1).
 //!
 //! These structs are the frozen JSON contract shared by this server
-//! and the client (cydrive-cli's sync module, Batch B): field names
+//! and the client (cloudkit-cli's sync module, Batch B): field names
 //! are `snake_case`, `secret` is optional, and deletions travel as
 //! tombstone rows (`deleted: true` with an empty payload).
 //!

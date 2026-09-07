@@ -26,6 +26,8 @@ use std::path::Path;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 
+use cloudkit_cli::sync_client::{HttpSyncClient, SYNC_SECRET_ENV};
+use cloudkit_cli::{resolve_sync_secret, run_sync_command, run_with_transport, RunHandle};
 use cloudkit_core::config::CyDriveConfig;
 use cloudkit_core::database::{FileUpsert, MetaDatabase};
 use cloudkit_core::sync::namespace_key;
@@ -35,8 +37,6 @@ use cloudkit_core::transport::mock::MockTransport;
 use cloudkit_core::transport::CloudTransport;
 use cloudkit_sync_server::router::router;
 use cloudkit_sync_server::store::SyncStore;
-use cydrive_cli::sync_client::{HttpSyncClient, SYNC_SECRET_ENV};
-use cydrive_cli::{resolve_sync_secret, run_sync_command, run_with_transport, RunHandle};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio::time::sleep;

@@ -21,11 +21,11 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
+use cloudkit_cli::sync_client::{sse_frame_data, HttpSyncClient};
 use cloudkit_core::sync::{SyncClient, SyncError, SyncRowUpdate};
 use cloudkit_sync_server::events::EventHub;
 use cloudkit_sync_server::router::router_with_hub;
 use cloudkit_sync_server::store::SyncStore;
-use cydrive_cli::sync_client::{sse_frame_data, HttpSyncClient};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::time::{sleep, Instant};
 

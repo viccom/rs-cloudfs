@@ -1,4 +1,4 @@
-//! Wire-protocol JSON shapes: the exact bytes cydrive-cli's sync
+//! Wire-protocol JSON shapes: the exact bytes cloudkit-cli's sync
 //! module (Batch B) will both produce and consume — frozen here so
 //! client and server cannot drift.
 

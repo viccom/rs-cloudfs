@@ -28,6 +28,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use cloudkit_cli::sync_client::HttpSyncClient;
+use cloudkit_cli::{run_with_transport, spawn_sync_doorbell, RunHandle, ShutdownWatch};
 use cloudkit_core::config::CyDriveConfig;
 use cloudkit_core::database::{FileRecord, FileUpsert, MetaDatabase};
 use cloudkit_core::sync::namespace_key;
@@ -36,8 +38,6 @@ use cloudkit_core::transport::mock::MockTransport;
 use cloudkit_core::transport::CloudTransport;
 use cloudkit_sync_server::router::router;
 use cloudkit_sync_server::store::SyncStore;
-use cydrive_cli::sync_client::HttpSyncClient;
-use cydrive_cli::{run_with_transport, spawn_sync_doorbell, RunHandle, ShutdownWatch};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio::sync::Notify;
@@ -480,7 +480,7 @@ async fn doorbell_task_skips_self_rings_foreign_and_reconnects() {
         "laptop-1".to_string(),
         Arc::clone(&wake),
         Arc::clone(&watch),
-        cydrive_cli::DoorbellBackoff {
+        cloudkit_cli::DoorbellBackoff {
             initial: Duration::from_millis(50),
             max: Duration::from_millis(200),
         },
