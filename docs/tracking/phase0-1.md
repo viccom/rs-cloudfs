@@ -70,6 +70,6 @@ Batch P0 已收口；**Batch S（百度 spike）已收口（2026-09-07，止损�
 4. **KDF DoS 放大缓解**（E-2 遗留）：伪造头可放大 PBKDF2 工作量（候选：头内迭代上限/版本化）；forged_header 单测因此实跑 ~114s
 5. **gen_compat_fixtures.py 输出路径已断**（P0-A 发现）：仍指旧 crates/cydrive-core，修复时点待定
 6. **CI workflow 从未真实触发**（无 origin 远端）：首跑需校准（fetch-depth:0/双 OS bash 步骤）
-7. **dlink TTL 上界**：探针预算已扩至 ~131min，本轮后台实测中（结果回填 spike 报告；下界已够 B2 的 30min 保守 TTL）
+7. ~~dlink TTL 上界未测到~~ **已销账（2026-09-08 增补轮）**：≥96min 仍 206（预算封顶）；B2 缓存 TTL 建议上调至 60–90min（spike 报告附录 B）
 8. **限额/秒传结论仅对 PCFS 第三方 appkey 桶有效**：正式 appkey 到位后须复跑 spike qps/rapid 子命令（工具就位）
 9. 基线设计 §9-2/9-3/9-4 三项既有待确认（旧仓冻结时点 / bot 分 crate 时点 / R-E 批序——R→E 已按建议执行）

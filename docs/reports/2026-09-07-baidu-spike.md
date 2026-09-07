@@ -218,3 +218,13 @@ cargo run --manifest-path examples/baidu_spike/Cargo.toml --release -- cleanup
 ```
 
 token 缓存与日志在 `%TEMP%\baidu_spike\`（token.json / state.json / resume_state.json / logs/ / target-diag/）——本机临时目录，不入仓库。
+
+---
+
+## 附录 B：2026-09-08 增补轮（负责人凭据/测试根裁决后）
+
+- **背景**：负责人裁决——instances 授权即正式凭据；测试根 = `/apps` 下新建子目录（本轮 `/apps/cloudfs-spike`）；PCFS 源码为协议权威参照。工具随之增 `BAIDU_SPIKE_REMOTE_DIR` env 覆盖（4c0e46b）+ cleanup 同步支持（后续 fix）。
+- **token**：直接可用（`ls errno=0`，无需重新授权）。
+- **差集续传复验（新根）**：phase1=[0,1,2] 杀进程 → phase2 只补 [3,4,5,6,7]（7259ms），create errno=0，与 §3 结论一致。
+- **dlink TTL 上界（S-5 挂账补测）**：探针预算扩至 96min，结果 **96.0min 仍 206、预算封顶未测到失效**——下界自 56min 推高至 ≥96min。**B2 参数建议修订**：dlink 缓存 TTL 从 30min 保守值上调至 **60–90min 安全区间**（失效即重取 dlink 的兜底逻辑不变）。
+- **零污染证明**：`/apps` 测试前 14 条目 → 测试后 14 条目（`/apps/privatefs` 全程只读未动）；本轮所建 `/apps/cloudfs-spike` 及全部测试文件已删（dir_recheck errno=-9；xpan 删除进回收站 10 天保留为 API 已知限制）。
