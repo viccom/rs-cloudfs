@@ -46,9 +46,26 @@ impl Capabilities {
     /// 子集判定：`self` 是否包含 `other` 声明的全部能力位
     /// （`a.contains(&b)` ⇔ b ⊆ a；`contains(&self)` 恒真，即自反）。
     pub fn contains(&self, other: &Capabilities) -> bool {
-        // red-commit skeleton: 判定逻辑在绿提交落地
-        let _ = (self, other);
-        false
+        let Capabilities {
+            range_read,
+            resume,
+            multipart,
+            server_side_move,
+            rapid_upload,
+            authoritative_index,
+            change_feed,
+            inbound,
+            chat,
+        } = *other;
+        self.range_read >= range_read
+            && self.resume >= resume
+            && self.multipart >= multipart
+            && self.server_side_move >= server_side_move
+            && self.rapid_upload >= rapid_upload
+            && self.authoritative_index >= authoritative_index
+            && self.change_feed >= change_feed
+            && self.inbound >= inbound
+            && self.chat >= chat
     }
 
     /// 是否一个能力位都没有声明。

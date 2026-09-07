@@ -32,7 +32,17 @@ impl RelPath {
     /// 解析并校验一个相对路径；非法形态（绝对前缀/`..`/空组件/反斜杠等）
     /// 返回 [`StorageError::Invalid`]。
     pub fn new(s: &str) -> Result<Self, StorageError> {
-        // red-commit skeleton: 校验在绿提交落地
+        if s.is_empty() {
+            return Ok(RelPath::root());
+        }
+        if s.starts_with('/') || s.ends_with('/') || s.contains('\\') || s.contains('\0') {
+            return Err(StorageError::Invalid);
+        }
+        for comp in s.split('/') {
+            if comp.is_empty() || comp == "." || comp == ".." {
+                return Err(StorageError::Invalid);
+            }
+        }
         Ok(RelPath(s.to_string()))
     }
 
@@ -117,7 +127,11 @@ pub struct Range {
 impl Range {
     /// 构造并校验：`end` 为 `Some` 且 `<= start` 时返回 `Invalid`。
     pub fn new(start: u64, end: Option<u64>) -> Result<Self, StorageError> {
-        // red-commit skeleton: 校验在绿提交落地
+        if let Some(e) = end {
+            if e < start {
+                return Err(StorageError::Invalid);
+            }
+        }
         Ok(Range { start, end })
     }
 

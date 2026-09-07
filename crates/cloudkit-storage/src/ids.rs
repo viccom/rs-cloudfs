@@ -30,7 +30,16 @@ impl VolumeId {
     /// 解析 `scheme:key` 文本形态：首个 `:` 前为 scheme（限 ASCII 字母
     /// 数字与 `-`/`_`），其余整体为 key（非空，可再含 `:`）。
     pub fn parse(s: &str) -> Result<Self, StorageError> {
-        // red-commit skeleton: 校验在绿提交落地
+        let Some((scheme, key)) = s.split_once(':') else {
+            return Err(StorageError::Invalid);
+        };
+        let scheme_ok = !scheme.is_empty()
+            && scheme
+                .chars()
+                .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_');
+        if !scheme_ok || key.is_empty() {
+            return Err(StorageError::Invalid);
+        }
         Ok(VolumeId(s.to_string()))
     }
 

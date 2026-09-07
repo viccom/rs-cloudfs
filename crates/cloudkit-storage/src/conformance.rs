@@ -483,7 +483,7 @@ async fn assert_resume(
     if !caps.resume {
         return; // 未声明 RESUME：自动跳过（能力位门控）
     }
-    let Some(mark) = harness.backend_bytes_received().await else {
+    let Some(pre_mark) = harness.backend_bytes_received().await else {
         panic!("⑦ 声明了 RESUME 却无法观测后端收到的字节数——R4：声明即必须可验证");
     };
     let total = 5 * chunk + 7;
@@ -504,6 +504,13 @@ async fn assert_resume(
         .await
         .unwrap_or_else(|e| panic!("⑦ 第一段 write: {e}"));
     drop(st1); // 不 close 不 abort：中断
+               // 观测点取中断之后：重传量只计「第二次上传」实际发给后端的字节
+               // （第一段的流量是正常上传成本，不是差集重传）
+    let mark = harness
+        .backend_bytes_received()
+        .await
+        .expect("⑦ 观测点必须持续可用");
+    assert!(mark >= pre_mark, "⑦ 观测点计数器必须单调不减");
 
     // 重新上传同路径：应只补未 staging 完成的块
     let mut st2 = driver
