@@ -999,11 +999,20 @@ pub async fn throughput() -> Result<()> {
 pub async fn cleanup() -> Result<()> {
     let ctx = Ctx::init()?;
 
-    // Remote dir may be known from state; otherwise probe read-only (never
-    // create anything during cleanup).
-    let dir = {
-        let st = ctx.state.lock().unwrap();
-        st.remote_dir.clone()
+    // Remote dir: BAIDU_SPIKE_REMOTE_DIR wins (same rule as
+    // resolve_remote_dir — without it, cleanup would sweep the stale
+    // state dir and silently miss env-rooted leftovers); else state;
+    // else probe read-only (never create anything during cleanup).
+    let env_dir = std::env::var("BAIDU_SPIKE_REMOTE_DIR")
+        .ok()
+        .filter(|d| !d.is_empty());
+    let dir = if let Some(d) = env_dir {
+        Some(d)
+    } else {
+        {
+            let st = ctx.state.lock().unwrap();
+            st.remote_dir.clone()
+        }
     };
     let dir = match dir {
         Some(d) => Some(d),
