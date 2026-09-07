@@ -134,8 +134,9 @@ async fn budget_env(
     let mock = MockTransport::new();
     mock.connect().await.expect("pre-connect");
     let mock = Arc::new(mock);
-    let transport: Arc<dyn CloudTransport> =
-        Arc::new(BudgetTrimTransport { inner: Arc::clone(&mock) });
+    let transport: Arc<dyn CloudTransport> = Arc::new(BudgetTrimTransport {
+        inner: Arc::clone(&mock),
+    });
     let cfg = VfsConfig {
         chunk_size_bytes: 4096,
         workers: 1,
@@ -256,8 +257,7 @@ async fn v2_encrypted_plaintext_sized_row_hydrates_over_budget_transport() {
 #[tokio::test]
 async fn plaintext_row_hydrates_within_its_row_size_budget() {
     let plaintext = pattern(200);
-    let (_dir, db, cache_root, _mock, vfs) =
-        budget_env(EncryptionScheme::Gcm, None).await;
+    let (_dir, db, cache_root, _mock, vfs) = budget_env(EncryptionScheme::Gcm, None).await;
 
     let rel = RelPath::new("/plain.bin").expect("rel");
     vfs.put(&rel, &plaintext, 1.0).await.expect("put");

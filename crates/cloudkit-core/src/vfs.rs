@@ -509,10 +509,34 @@ impl Vfs {
         // the WebDAV thread's `future.result(timeout=180)` cap). Cache
         // hits and the LRU bookkeeping above are local fast paths and
         // stay outside the bound.
+        // Download budget (E-5, adjudicated plan B): the row's `size` is
+        // the PLAINTEXT length under the Python contract (R6), but for
+        // encrypted rows the remote artifact is the ciphertext container
+        // (v1: salt + nonce + plaintext + tag; v2: header + plaintext +
+        // one tag per crypto chunk) — always LONGER than the plaintext. A
+        // budget-honest transport treats `total_size` as a hard cap (the
+        // telegram `open()` serves through `serve_range(…, 0, total_size)`),
+        // so budgeting an encrypted row by `row.size` trims the ciphertext
+        // and the final AEAD tag check fails — the real-machine E-5 defect
+        // (2621440 B plaintext budget vs 2621522 B container, 82 bytes
+        // short; the v1 path carries the same latent defect, merely never
+        // exercised on a real machine before E-5). Encrypted containers
+        // are self-describing and AEAD-authenticated: the decryptor itself
+        // validates completeness and integrity, so the budget is not a
+        // correctness source — encrypted rows download unbounded (the
+        // telegram `open()` already pulls every part document in full, so
+        // u64::MAX is a pure pass-through with zero extra I/O). Plaintext
+        // rows keep the row-size budget unchanged. Alternative semantics
+        // (row size stores the ciphertext length — plan A) recorded in
+        // decisions.md as pending-owner-review.
         let handle = RemoteHandle {
             first_msg_id,
             chunk_msg_ids: msg_ids,
-            total_size: row.size.max(0) as u64,
+            total_size: if row.is_encrypted {
+                u64::MAX
+            } else {
+                row.size.max(0) as u64
+            },
         };
         let staged = tmp_sibling(&local);
         if let Some(parent) = local.parent() {

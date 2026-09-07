@@ -306,7 +306,7 @@ impl CloudTransport for MockTransport {
     }
 
     async fn open(&self, file: &RemoteHandle) -> Result<ByteStream, StorageError> {
-        let (delay, data) = {
+        let (delay, mut data) = {
             let state = self.lock()?;
             if !state.connected {
                 return Err(StorageError::Invalid);
@@ -316,6 +316,17 @@ impl CloudTransport for MockTransport {
                 concat_chunks(&state, &file.chunk_msg_ids)?,
             )
         };
+        // serve_range parity (E-5): the handle's byte budget is a hard
+        // cap — at most `total_size` bytes flow, over-read is trimmed, a
+        // short read under the cap stays the consumer's concern. The real
+        // ck-telegram `open()` wraps its frames in `serve_range(…, 0,
+        // total_size)`; a mock more generous than the real backend keeps
+        // budget mismatches invisible to every upstream test (that blind
+        // spot shipped the E-5 defect). The guard keeps the truncating
+        // cast safe: `total_size < data.len()` implies it fits a usize.
+        if data.len() as u64 > file.total_size {
+            data.truncate(file.total_size as usize);
+        }
         // Guard dropped before sleeping: locks never span an await.
         tokio::time::sleep(delay).await;
         Ok(frame_stream(vec![Ok(Bytes::from(data))]))
