@@ -341,3 +341,11 @@
 - **mock 语义补齐**：MockTransport::open 增加 serve_range 同语义裁剪（至多 total_size 字节、超读裁掉、预算内短读容忍）——mock 与真机预算语义对齐，堵住盲区；无界预算下裁剪为 no-op，既有测试全量回绿、断言零改动。新测试面：`tests/transport.rs` 8a（mock 裁剪语义）+ `tests/vfs_encrypted_budget.rs`（BudgetTrimTransport 诚实传输层下 v1/v2 加密往返 + 明文控制组——hydrate 契约不依赖 mock 自身诚实化进度，双保险）。
 - **待负责人复核（方案 A 备选语义）**：加密行 WebDAV Content-Length 目前=明文长（行 size=明文长的自然推论，与 Python 一致）。若未来希望加密行 Content-Length=密文长（行 size 改存密文/容器长），需明示裁决——那是 Python 契约语义变更（R6 触点）、必须同步改既有 v1 断言（`encrypted_roundtrip` row.size==14 等）且跨版本 sync payload 含义漂移，已在执行期被否一次（2026-09-07，主会话裁决记录于 bab0794 提交正文）。
 - **验证**：红 614 passed / 3 failed（既有 613 全绿 + 明文控制组绿）→ 绿 617 passed / 0 failed / 6 ignored；clippy -D warnings / fmt / check_layers（9 manifests）全过。真机 v2 冒烟复验由主会话执行。
+
+## 2026-09-07 Phase 0+1 全量收口（C-1，feat/phase0-1）
+
+- **E-5 真机复验通过**（主会话）：修复版 release 下新推 1.25MB（跨块）与遗留 2.5MB 两文件 push→cache clear→pull 字节全等；清理/停止/配置逐字节还原（enable_encryption=false）/停机态保持——v2 全链（流式加密→telegram→流式解密）真机闭环。
+- **版本 0.8.0**（workspace 单点）：trait 破坏性演进（CloudTransport 家族迁 L2 + InboundCap/ChatCap 拆分 + StorageError 归一）+ 新 crate cloudkit-storage/cloudkit-crypto。bin 名 cydrive/cydrive-sync-server 不变。
+- **合并策略**：feat/phase0-1 全部 commit 合回 main（本地 merge；无 origin 远端可推）。worktree 移除、分支保留可追溯。不部署生产位（Phase 2 验收后统一裁决，计划原文）。
+- **执行期累积的待负责人项**（详见 tracker「待负责人清单」节）：baidu1 链失效、并行会话异常、方案 A 语义备选、KDF DoS 缓解、gen_compat_fixtures 路径、CI 首跑校准等。
+- 门禁终态：win fmt/clippy 干净 + 617 passed 0 failed（ignored 6 真机）；wsl E 批态 618 passed 0 failed（+1 平台 cfg 既有差异）；release 全 workspace 构建通过。

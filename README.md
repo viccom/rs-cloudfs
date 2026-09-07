@@ -22,9 +22,9 @@ L1 驱动  telegram │ baidu │ local │ (未来: 115/123/s3…)
 |---|---|---|
 | Phase -1 | 规范先行（架构约束/代码/接口/日志/文档五标准 + 本 README/AGENTS） | ✅ 完成 |
 | 基线 | fork 自 rs-CyDrive 0.7.2（527 测试绿，telegram 后端生产可用） | ✅ 完成 |
-| Phase 0 | crate 改名重排（cloudkit-*/ck-*），纯搬迁 | ⬜ 下一步 |
-| Phase 1 | 百度 spike → StorageDriver 抽象落地 → 加密 v2 流式 | ⬜ |
-| Phase 2 | ck-local + ck-baidu + 三后端端到端硬验收 | ⬜ |
+| Phase 0 | crate 改名重排（cloudkit-*/ck-*），纯搬迁 + 层检查/秘密扫描 CI 门禁 | ✅ 完成 |
+| Phase 1 | 百度 spike → StorageDriver 抽象落地 → 加密 v2 流式（0.8.0，617+ 测试绿，含真机冒烟两轮） | ✅ 完成 |
+| Phase 2 | ck-local + ck-baidu + 三后端端到端硬验收 | ⬜ 下一步（前置：驱动接入手册） |
 | Phase 3 | 115/123/多卷挂载/桌面端/自更新（择机） | ⬜ |
 
 阶段计划与裁决：[docs/plans/2026-09-07-cloudfusion-foundation.md](docs/plans/2026-09-07-cloudfusion-foundation.md) ｜ 历史裁决：[docs/decisions.md](docs/decisions.md)

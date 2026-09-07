@@ -20,7 +20,7 @@ members = [
 exclude = ["crates/vendor/grammers-session", "examples/baidu_spike"]
 
 [workspace.package]
-version = "0.7.2"
+version = "0.8.0"
 edition = "2021"
 license = "MIT"
 

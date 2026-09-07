@@ -16,7 +16,7 @@
 6. `docs/tracking/phase0-1.md` —— 当前任务跟踪单（**开工先读、每批收口更新**）
 
 ## 当前阶段
-**Phase -1 规范先行已完成（2026-09-07）**；仓库 = fork 基线代码（cydrive 0.7.2，527 测试绿）+ 治理文档集。**下一步 = Phase 0 + Phase 1**（`docs/plans/2026-09-07-phase0-1-execution.md`——含预授权 Kickoff 指令，覆盖搬迁改名/百度 spike/trait 瘦身/加密 v2 流式）→ Phase 2（驱动接入手册 → ck-local + ck-baidu + 端到端硬验收）。
+**Phase 0 + Phase 1 已完成（2026-09-07，版本 0.8.0，win 617 + wsl 618 测试绿）**：crate 已改名重排（cloudkit-*/drivers/ck-*，bin 名 cydrive 契约不变）；cloudkit-storage（L2：StorageDriver 家族 + conformance 八断言 + Mock）/cloudkit-crypto（v1 GCM 冻结 + v2 分块 AEAD 流式）落地；CloudTransport 演进迁 L2（InboundCap/ChatCap 拆分，ck-telegram→core 反向依赖已解除）；百度 spike 完成未触止损（docs/reports/2026-09-07-baidu-spike.md）；真机冒烟两轮（R-6 全链路 + E-5 v2 加密往返，E-5 抓出并修复 hydrate 预算截断缺陷——v1 同型基线遗留一并修复）。**下一步 = Phase 2**（前置任务「驱动接入手册」→ ck-local + ck-baidu + 端到端硬验收）。
 
 ## 常用命令（仓库根）
 ```

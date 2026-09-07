@@ -475,7 +475,7 @@ dependencies = [
 
 [[package]]
 name = "ck-telegram"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -531,7 +531,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cloudkit-cli"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -561,7 +561,7 @@ dependencies = [
 
 [[package]]
 name = "cloudkit-core"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -585,7 +585,7 @@ dependencies = [
 
 [[package]]
 name = "cloudkit-crypto"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "aes-gcm",
  "base64 0.23.1",
@@ -598,7 +598,7 @@ dependencies = [
 
 [[package]]
 name = "cloudkit-platform"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "cloudkit-core",
  "thiserror 2.0.20",
@@ -607,7 +607,7 @@ dependencies = [
 
 [[package]]
 name = "cloudkit-storage"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -621,7 +621,7 @@ dependencies = [
 
 [[package]]
 name = "cloudkit-sync-server"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -643,7 +643,7 @@ dependencies = [
 
 [[package]]
 name = "cloudkit-web"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "axum",
  "cloudkit-core",
@@ -657,7 +657,7 @@ dependencies = [
 
 [[package]]
 name = "cloudkit-webdav"
-version = "0.7.2"
+version = "0.8.0"
 dependencies = [
  "bytes",
  "cloudkit-core",
