@@ -58,10 +58,18 @@ Batch P0 已收口；**Batch S（百度 spike）已收口（2026-09-07，止损�
 | # | 任务 | 状态 | 证据/注记 |
 |---|---|---|---|
 | C-1 | 版本 0.8.0 + decisions/AGENTS 入档 + release 构建验证（不部署生产位） | ✅ | 版本 workspace 单点 0.7.2→0.8.0（Cargo.lock 8 包同步）；AGENTS 当前阶段/计数与 README 状态表更新；decisions 收口条目入档；release 全 workspace 构建 + `cydrive --version` 验证；未部署生产位（计划裁决） |
-| C-2 | 收尾汇报（改动/证据/未询问决定与回滚/待负责人清单） | 🔶 | 会话收尾输出（负责人侧） |
+| C-2 | 收尾汇报（改动/证据/未询问决定与回滚/待负责人清单） | ✅ | 会话收尾报告已交付（本表 + decisions.md 全量证据链） |
 
 ---
 
 ## 待负责人清单（执行期累积，收尾汇报汇总）
 
-1. （空——执行 Agent 遇疑问/裁决点时追加于此并继续可继续部分）
+1. **baidu1.json 链失效**：refresh_token 一次一换已被消费（spike 改用 baidu2，只用其 token 未触其数据）；若 baidu1 链另有用途请补发
+2. **并行会话异常**：16:18–16:39 与 16:50 前后两批非本会话派发的 commit（E-1/E-2 四连 + E-4 红 e7581c3）出现在 feat/phase0-1；经独立复核质量通过后采纳——若非负责人所为请告知（可 revert：23702ea/3e46ea8/19a2f2f/6eedb25/e7581c3）
+3. **加密行 size 语义备选（方案 A）**：现裁决 B（行 size=明文长，Python 对齐；hydrate 加密行无界预算）；若希望加密行 Content-Length=密文长需明示裁决（decisions E-5 条目）
+4. **KDF DoS 放大缓解**（E-2 遗留）：伪造头可放大 PBKDF2 工作量（候选：头内迭代上限/版本化）；forged_header 单测因此实跑 ~114s
+5. **gen_compat_fixtures.py 输出路径已断**（P0-A 发现）：仍指旧 crates/cydrive-core，修复时点待定
+6. **CI workflow 从未真实触发**（无 origin 远端）：首跑需校准（fetch-depth:0/双 OS bash 步骤）
+7. **dlink TTL 上界未测到**（≥56min 仍 206）：下界已够 B2 的 30min 保守 TTL，上界可后补
+8. **限额/秒传结论仅对 PCFS 第三方 appkey 桶有效**：正式 appkey 到位后须复跑 spike qps/rapid 子命令（工具就位）
+9. 基线设计 §9-2/9-3/9-4 三项既有待确认（旧仓冻结时点 / bot 分 crate 时点 / R-E 批序——R→E 已按建议执行）
