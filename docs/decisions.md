@@ -318,3 +318,16 @@
 - **PROPPATCH 陷阱条款回归通过**：207 全成功，MiniRedir 整单不回滚。
 - **⚠ 并行会话异常（待负责人确认）**：16:18–16:39 窗口（本会话正执行 R-6，未派发任何子代理）分支上出现 Batch E 第一段 4 个 commit（23702ea/3e46ea8/19a2f2f/6eedb25，作者同为 viccom）——疑似负责人或另一会话执行。本会话已派独立子代理复核：detached HEAD 重放红 commit 输出与 commit message 逐字吻合、v1 互操作向量 11 测试迁移前后一致（diff 仅 2 行机械路径）、函数体逐行比对零变化、门禁 586 passed 0 failed + clippy/fmt/check_layers 全过——**质量验证通过后采纳**。若非负责人所为请告知，可整体 revert 该 4 commit。
 - R-3/R-4/R-5 细节裁决已在各自 commit 正文与 tracker 行内（波及面清单/映射表/webdav Range 现状裁决/mock 能力注入面）。
+
+## 2026-09-07 Batch E 第二段：E-4 scheme 元数据 schema + E-3 流式上传面（E-3/E-4）
+
+- **背景**：foundation D7 收尾——v2 需要入口（配置键）、身份（Entry 元数据）、通道（流式上传）与回读（按 scheme 分发水合）。E-4 红 e7581c3（前段会话落位的 10 红）→ 绿 64d9eb7；E-3 红 747e23d → 绿 d7fa206。
+- **① files 表加列裁决（R6 触点）**：不新建迁移框架——沿用 sync-lite 表的「契约 DDL batch 冻结 byte-identical + Rust 附加 batch」既有模式扩展到列级：`encryption_scheme TEXT NOT NULL DEFAULT 'gcm'` 经 pragma_table_info 探测守卫的 ALTER TABLE 落位（SQLite 无 ADD COLUMN IF NOT EXISTS；守卫保重开/并发采纳幂等）。默认值 gcm 使 E-4 对既有库纯加法：旧行回填即其既有行为（v1），Python 形 INSERT（省略列）继续工作，Python 基线实例读新库天然忽略未知列。FILE_COLUMNS 显式列名 SELECT，逻辑列序不依赖物理列序（迁移列追加在表尾）。
+- **② scheme 写入面最小化**：仅两个 origin 写 scheme 列（put 按配置、sync apply 恢复拉取行），其余全部写路径（队列成功持久化/hydrate 缓存翻转/入站索引/目录行）继续 plain upsert_file——insert 走列默认、conflict-update 保留旧值，既有写路径行为零变化（红测钉死 plain upsert 保留语义）。
+- **③ sync payload wire 形态**：`scheme: Option<String>`，serde default + skip None——**仅非 gcm 加密行携带**（gcm 行与 pre-E-4 payload 字节一致，由守护绿测试钉死）；旧形态 JSON 解析为 None（=gcm）；旧消费者 serde 丢弃未知键不炸。apply 侧 replace_row 改走 upsert_file_scheme 恢复（None→gcm）。
+- **④ 流式上传面 = CloudTransport provided 方法而非可选 trait+能力位**：`upload_stream(job, ByteStream)` 默认 `Err(Unsupported)`（interfaces §1 演进规则：优先 provided 方法）。理由：真实实现者仅 mock/telegram 两面，能力位+探测样板是过度设计；Unsupported 沿用队列既有重试/降级语义。ck-baidu 接入时若流式面普遍缺失再升能力位（tracker 待办）。**复用 UploadJob 而非新类型**：size/chunk_count/chunk_size 与 upload() 同语义（mock 双面共用 finish_upload 校验），local_path 降格为 provenance（线上字节来自流）。
+- **⑤ v2 上传的内存模型**：明文 File（spawn_blocking）→ AeadV2::encrypt_stream 逐块 → ChannelWriter 每次 write 一帧 → 容量 4 的 tokio mpsc（背压）→ unfold 成 ByteStream → upload_stream。峰值常驻 = 通道容量 × 1MiB + 加密器一块工作集，与文件大小无关；证据形态 = mock max_stream_frame 峰值帧 ≤ 1MiB+16B（crypto 侧粒度契约钉到传输缝）+ 8.5MiB 数据量级。密文总长按公式预先精确计划（34B 头 + 明文 + n×16B tag；空文件一块 tag-only），驱动 chunk plan 无需先见密文。
+- **⑥ v2 重试重跑加密（含 PBKDF2+新盐）**：无密文暂存可复用正是流式路径的定义（零 .enc.tmp）；重试罕见，逐次新盐是密码学保守方向。
+- **⑦ hydrate 三路分发**：gcm → 冻结整文件解密路径（零变化，护栏测试：v1 行在 v2 配置下照走 v1）；aead_v2 → 流式水合（staged 密文 → decrypt_stream 逐块 → .dec.tmp 兄弟 → 原子 rename → 删密文；失败自清 .dec.tmp）；未知 scheme → VfsError::UnsupportedEncryptionScheme（点名坏值+两已知值+升级指引——新版本实例加密的文件绝不猜格式）。分发依据是行内 scheme 列，**永不读活配置**（换配置键不断旧文件回读，红测钉死）。
+- **⑧ telegram 桥**：StreamReader（ByteStream→tokio AsyncRead，单帧缓冲）+ 每 part take 喂 grammers upload_stream；caption/命名复用 plan_chunk_sends 的 is_encrypted=false 形态（v1 密文上传同款——R6 caption 契约）。流长于计划拒收。tests/stream_reader.rs 冒烟抓住 split_off/split_to 取片方向 bug（帧内字节倒置）——绿前修复。
+- **验证**：E-3/E-4 红→绿序列 604/7 → 613 passed 0 failed（6 ignored 既有真机）；clippy -D warnings / fmt / check_layers 全过；v1 护栏零改动（tests/upload_queue.rs 唯一 diff = test_cfg +1 字段机械修；crypto 全部测试文件零 diff）；wire 双向兼容与 DB 迁移采纳由 encryption_scheme_metadata.rs 6 测试钉死。真机 telegram v2 冒烟 = E-5（主会话统一安排）。
