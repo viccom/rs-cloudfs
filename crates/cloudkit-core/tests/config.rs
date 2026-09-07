@@ -9,7 +9,7 @@
 use std::fs;
 use std::sync::{Mutex, MutexGuard};
 
-use cloudkit_core::config::{ConfigError, CyDriveConfig};
+use cloudkit_core::config::{ConfigError, CyDriveConfig, EncryptionScheme};
 
 // ------------------------------------------------------------- helpers ---
 
@@ -222,6 +222,7 @@ fn toml_roundtrip_preserves_full_config() {
         hydrate_timeout_secs: 180,
         encryption_password: None,
         enable_encryption: false,
+        encryption_scheme: EncryptionScheme::Gcm,
         proxy_url: None,
         sync_url: None,
         sync_secret: None,

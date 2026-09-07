@@ -73,6 +73,7 @@ fn record(rel_path: &str, size: i64, is_uploaded: bool) -> FileRecord {
         is_encrypted: false,
         chunk_count: 1,
         mime_type: Some("application/octet-stream".to_string()),
+        encryption_scheme: "gcm".to_string(),
         created_at: Some(1_759_971_500.25),
         updated_at: Some(1_759_971_600.75),
     }
@@ -175,6 +176,7 @@ fn serialize_row_carries_all_data_fields_and_roundtrips() {
             is_encrypted: false,
             chunk_count: 3,
             mime_type: Some("application/octet-stream".to_string()),
+            scheme: None,
             chunks: vec![
                 PayloadChunk {
                     index: 0,

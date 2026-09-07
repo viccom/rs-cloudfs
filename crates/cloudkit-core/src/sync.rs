@@ -99,6 +99,15 @@ pub struct RowPayload {
     pub chunk_count: i64,
     /// MIME type, when known.
     pub mime_type: Option<String>,
+    /// Container scheme of the encrypted payload (Batch E / E-4). Wire
+    /// compatibility (interfaces §4): `None` — the default — serializes
+    /// to nothing, byte-identical with the pre-E-4 payload, and covers
+    /// every legacy row (`"gcm"`); only non-default schemes
+    /// (`"aead_v2"`) ride along. Old consumers ignore the key (unknown
+    /// JSON fields are dropped by `serde` default), old payloads decode
+    /// with `None`.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub scheme: Option<String>,
     /// The file's chunk sequence, ordered by `index` (empty for
     /// directories and not-yet-uploaded rows).
     pub chunks: Vec<PayloadChunk>,
@@ -122,6 +131,9 @@ impl RowPayload {
             is_encrypted: file.is_encrypted,
             chunk_count: file.chunk_count,
             mime_type: file.mime_type.clone(),
+            // RED-phase stub: the scheme mapping (non-`gcm` encrypted rows
+            // carry `Some(scheme)`) lands with the green commit.
+            scheme: None,
             chunks: chunks
                 .iter()
                 .map(|c| PayloadChunk {

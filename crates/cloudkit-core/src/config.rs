@@ -117,6 +117,46 @@ const LEGACY_REJECTED_KEYS: &[&str] = &[
     "sync_interval_secs",
 ];
 
+/// Client-side encryption container scheme (Batch E / E-4, foundation D7).
+///
+/// Chooses the format new encrypted uploads are sealed with:
+///
+/// - [`EncryptionScheme::Gcm`] — v1 whole-file AES-256-GCM, Python
+///   `CyCrypto` wire compatible (the default; existing behavior, red line
+///   R6). Requires buffering the whole plaintext, kept for compatibility.
+/// - [`EncryptionScheme::AeadV2`] — v2 chunked STREAM-construction AEAD:
+///   streaming upload (zero `.enc.tmp`) and streaming hydration.
+///
+/// The read path dispatches on the per-row scheme recorded in the
+/// metadata DB, not on this key — switching the key never breaks reads of
+/// already-stored files.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EncryptionScheme {
+    /// v1 whole-file GCM (Python compatible, frozen; the default).
+    #[default]
+    Gcm,
+    /// v2 chunked AEAD (streaming + random access).
+    AeadV2,
+}
+
+impl EncryptionScheme {
+    /// Stable identifier as stored in the `files.encryption_scheme`
+    /// column and compared on the read path.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            EncryptionScheme::Gcm => "gcm",
+            EncryptionScheme::AeadV2 => "aead_v2",
+        }
+    }
+}
+
+/// Value of [`EncryptionScheme::as_str`] for rows/files sealed with the
+/// frozen v1 format (also the DB column default).
+pub const SCHEME_GCM: &str = "gcm";
+/// Value of [`EncryptionScheme::as_str`] for v2 chunked-AEAD payloads.
+pub const SCHEME_AEAD_V2: &str = "aead_v2";
+
 /// Default `upload_workers` (tier-1 contract C6).
 fn default_upload_workers() -> u32 {
     2
@@ -235,6 +275,13 @@ pub struct CyDriveConfig {
     pub encryption_password: Option<String>,
     /// Whether client-side encryption is enabled.
     pub enable_encryption: bool,
+    /// Container scheme for NEW encrypted uploads (Batch E / E-4):
+    /// `"gcm"` (default, Python-compatible v1) or `"aead_v2"` (streaming
+    /// v2). Read paths dispatch on the per-row scheme in the metadata DB,
+    /// never on this key. RED-phase stub: the wire/parse integration lands
+    /// with the green commit (KNOWN_TOML_KEYS / legacy rejection).
+    #[serde(skip)]
+    pub encryption_scheme: EncryptionScheme,
     /// Optional SOCKS5 proxy URL for the Telegram MTProto connection
     /// (e.g. `"socks5://127.0.0.1:7897"` for a local Clash mixed port);
     /// `None` connects directly. `validate` imposes no rules on it — any
@@ -292,6 +339,7 @@ impl Default for CyDriveConfig {
             hydrate_timeout_secs: default_hydrate_timeout_secs(),
             encryption_password: None,
             enable_encryption: false,
+            encryption_scheme: EncryptionScheme::default(),
             proxy_url: None,
             sync_url: None,
             sync_secret: None,

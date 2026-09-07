@@ -210,6 +210,7 @@ fn foreign_payload(rel_path: &str, msg_id: i64) -> String {
             is_encrypted: false,
             chunk_count: 1,
             mime_type: None,
+            encryption_scheme: "gcm".to_string(),
             created_at: None,
             updated_at: None,
         },

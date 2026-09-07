@@ -39,6 +39,12 @@ pub struct VfsConfig {
     pub retry: RetryPolicy,
     /// Password enabling client-side encryption; default `None`.
     pub encryption_password: Option<String>,
+    /// Container scheme for newly encrypted rows (Batch E / E-4):
+    /// `Gcm` (default — v1 whole-file staging, byte-identical to the
+    /// pre-E-4 behavior) or `AeadV2` (streaming upload, zero `.enc.tmp`).
+    /// Recorded on the `files` row at `put` time; the read path dispatches
+    /// on the row's scheme, never on this field.
+    pub encryption_scheme: crate::config::EncryptionScheme,
     /// Upper bound on the remote-dependent span of a hydration
     /// (transport open through the final cache copy); default 1800s.
     /// The Python baseline mirrored the WebDAV thread's
@@ -60,6 +66,7 @@ impl Default for VfsConfig {
             queue_capacity: 256,
             retry: RetryPolicy::default(),
             encryption_password: None,
+            encryption_scheme: crate::config::EncryptionScheme::default(),
             hydrate_timeout: std::time::Duration::from_secs(
                 // Keep aligned with `config::default_hydrate_timeout_secs`
                 // (BUG②): this is the conversion chain's fallback when no

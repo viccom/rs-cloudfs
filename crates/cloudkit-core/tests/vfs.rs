@@ -46,6 +46,7 @@ fn test_cfg(chunk_size_bytes: u64, encryption_password: Option<&str>) -> VfsConf
             max_attempts: 3,
         },
         encryption_password: encryption_password.map(str::to_string),
+        encryption_scheme: cloudkit_core::config::EncryptionScheme::Gcm,
         hydrate_timeout: Duration::from_secs(180),
     }
 }

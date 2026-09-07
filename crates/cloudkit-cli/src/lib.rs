@@ -352,6 +352,11 @@ pub fn vfs_config(cfg: &CyDriveConfig) -> VfsConfig {
         } else {
             None
         },
+        // Batch E / E-4: the container scheme for new encrypted uploads.
+        // Unlike the password it rides along unconditionally — it only
+        // takes effect on rows the password actually flags as encrypted,
+        // and the read path keys on the per-row scheme, never this field.
+        encryption_scheme: cfg.encryption_scheme,
         hydrate_timeout: Duration::from_secs(cfg.hydrate_timeout_secs),
     }
 }

@@ -73,6 +73,12 @@ pub struct FileRecord {
     pub chunk_count: i64,
     /// MIME type, when known.
     pub mime_type: Option<String>,
+    /// Container scheme of the encrypted payload (`files.encryption_scheme`
+    /// column, Batch E / E-4): `"gcm"` (frozen v1, the column default for
+    /// pre-existing rows) or `"aead_v2"`. Meaningful only while
+    /// `is_encrypted` is set. Unknown values from a newer build must not
+    /// break row reads — consumers dispatch with an actionable error.
+    pub encryption_scheme: String,
     /// Row creation time (set by the DB on first insert).
     pub created_at: Option<f64>,
     /// Last update time (set by the DB on every upsert).
@@ -208,6 +214,10 @@ fn row_to_file(row: &rusqlite::Row<'_>) -> rusqlite::Result<FileRecord> {
         mime_type: row.get(13)?,
         created_at: row.get(14)?,
         updated_at: row.get(15)?,
+        // RED-phase stub: the column lands with the green commit
+        // (SELECT/FILE_COLUMNS/migration); every row reads as the
+        // frozen v1 scheme until then.
+        encryption_scheme: "gcm".to_string(),
     })
 }
 
@@ -449,6 +459,30 @@ impl MetaDatabase {
             |row| row.get(0),
         )?;
         Ok(id)
+    }
+
+    /// Inserts or updates the row keyed by `rel_path`, additionally
+    /// writing the `encryption_scheme` column (Batch E / E-4).
+    ///
+    /// Semantics identical to [`MetaDatabase::upsert_file`] except the
+    /// scheme column is set to `encryption_scheme` on both the insert and
+    /// the conflict-update paths. Callers: the VFS `put` path (recording
+    /// the configured scheme on newly-flagged encrypted rows) and the
+    /// sync apply (`replace_row`, restoring a pulled row's scheme after
+    /// its delete+insert). Everything else keeps using
+    /// [`MetaDatabase::upsert_file`], under which the column is
+    /// `DEFAULT 'gcm'` on insert and silently preserved on update — so
+    /// every pre-E-4 writer (this build, the Python baseline) leaves the
+    /// column exactly as it was.
+    pub fn upsert_file_scheme(
+        &self,
+        entry: &FileUpsert,
+        encryption_scheme: &str,
+    ) -> Result<i64, DbError> {
+        // RED-phase stub: the column and its write path land with the
+        // green commit; the scheme argument is ignored for now.
+        let _ = encryption_scheme;
+        self.upsert_file(entry)
     }
 
     /// Looks up a single row by its unique virtual path.

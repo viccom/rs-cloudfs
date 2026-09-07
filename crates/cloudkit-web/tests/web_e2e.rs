@@ -47,6 +47,7 @@ fn base_cfg() -> VfsConfig {
             max_attempts: 3,
         },
         encryption_password: None,
+        encryption_scheme: cloudkit_core::config::EncryptionScheme::Gcm,
         hydrate_timeout: Duration::from_secs(180),
     }
 }
