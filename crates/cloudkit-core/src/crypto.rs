@@ -9,4 +9,4 @@
 pub use cloudkit_crypto::v1::{
     decrypt, derive_key, encrypt, KEY_SIZE, NONCE_SIZE, PBKDF2_ITERATIONS, SALT_SIZE,
 };
-pub use cloudkit_crypto::{CryptoError, CryptoScheme, CryptoSchemeId, GcmV1};
+pub use cloudkit_crypto::{AeadV2, CryptoError, CryptoScheme, CryptoSchemeId, GcmV1};
