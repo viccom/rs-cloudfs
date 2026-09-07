@@ -715,7 +715,8 @@ fn vfs_err(error: VfsError) -> FsError {
         | VfsError::Db(_)
         | VfsError::Transport(_)
         | VfsError::Crypto(_)
-        | VfsError::Timeout(_) => FsError::GeneralFailure,
+        | VfsError::Timeout(_)
+        | VfsError::UnsupportedEncryptionScheme { .. } => FsError::GeneralFailure,
         VfsError::Io(error) => io_err(error),
     }
 }

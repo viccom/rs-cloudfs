@@ -50,9 +50,7 @@ impl CloudTransport for DefaultFaceTransport {
 
 fn bytes_stream(frames: Vec<Vec<u8>>) -> ByteStream {
     Box::pin(stream::iter(
-        frames
-            .into_iter()
-            .map(|f| Ok(bytes::Bytes::from(f))),
+        frames.into_iter().map(|f| Ok(bytes::Bytes::from(f))),
     ))
 }
 
@@ -82,7 +80,10 @@ async fn mock_upload_stream_collects_frames_into_chunked_messages() {
     mock.connect().await.expect("connect");
     // 10 bytes in three frames, chunk plan 4/4/2.
     let receipt = mock
-        .upload_stream(&job(10, 4, 3), bytes_stream(vec![vec![1, 2, 3, 4, 5], vec![6, 7, 8, 9], vec![10]]))
+        .upload_stream(
+            &job(10, 4, 3),
+            bytes_stream(vec![vec![1, 2, 3, 4, 5], vec![6, 7, 8, 9], vec![10]]),
+        )
         .await
         .expect("stream upload");
     assert_eq!(receipt.uploaded_bytes, 10);
@@ -93,10 +94,17 @@ async fn mock_upload_stream_collects_frames_into_chunked_messages() {
         .iter()
         .flat_map(|id| mock.message(*id).expect("stored"))
         .collect();
-    assert_eq!(joined, vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10], "frames concatenated in order");
+    assert_eq!(
+        joined,
+        vec![1, 2, 3, 4, 5, 6, 7, 8, 9, 10],
+        "frames concatenated in order"
+    );
     // The stream face records its own call log, separate from upload().
     assert_eq!(mock.stream_upload_calls().len(), 1);
-    assert!(mock.upload_calls().is_empty(), "the stream face must not log into upload()");
+    assert!(
+        mock.upload_calls().is_empty(),
+        "the stream face must not log into upload()"
+    );
 }
 
 #[tokio::test]
@@ -106,7 +114,10 @@ async fn mock_upload_stream_enforces_the_chunk_plan() {
     // Stream carries 9 bytes but the plan says 10 — same mismatch
     // semantics as the file face.
     let err = mock
-        .upload_stream(&job(10, 4, 3), bytes_stream(vec![vec![1, 2, 3, 4, 5], vec![6, 7, 8, 9]]))
+        .upload_stream(
+            &job(10, 4, 3),
+            bytes_stream(vec![vec![1, 2, 3, 4, 5], vec![6, 7, 8, 9]]),
+        )
         .await
         .expect_err("plan mismatch must fail");
     assert!(matches!(err, StorageError::Unavailable(_)), "got: {err:?}");
@@ -116,10 +127,17 @@ async fn mock_upload_stream_enforces_the_chunk_plan() {
 async fn mock_upload_stream_records_the_largest_frame() {
     let mock = MockTransport::new();
     mock.connect().await.expect("connect");
-    mock.upload_stream(&job(6, 3, 2), bytes_stream(vec![vec![1, 2], vec![3, 4, 5], vec![6]]))
-        .await
-        .expect("stream upload");
-    assert_eq!(mock.max_stream_frame(), 3, "peak frame size is observable for memory assertions");
+    mock.upload_stream(
+        &job(6, 3, 2),
+        bytes_stream(vec![vec![1, 2], vec![3, 4, 5], vec![6]]),
+    )
+    .await
+    .expect("stream upload");
+    assert_eq!(
+        mock.max_stream_frame(),
+        3,
+        "peak frame size is observable for memory assertions"
+    );
 }
 
 #[tokio::test]
@@ -172,7 +190,12 @@ async fn mock_upload_stream_plays_the_upload_script() {
         .await
         .expect_err("scripted failure");
     assert!(
-        matches!(err, StorageError::RateLimited { retry_after: Some(_) }),
+        matches!(
+            err,
+            StorageError::RateLimited {
+                retry_after: Some(_)
+            }
+        ),
         "got: {err:?}"
     );
 }

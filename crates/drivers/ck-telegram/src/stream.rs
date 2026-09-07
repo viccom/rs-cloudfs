@@ -75,3 +75,61 @@ impl Stream for RangeStream {
         Poll::Ready(self.next_frame().map(Ok))
     }
 }
+
+/// Adapts a [`ByteStream`] (futures `Stream` of `Bytes` frames) into a
+/// `tokio::io::AsyncRead` — the v2 streaming-upload bridge (Batch E /
+/// E-3): the queue hands the ciphertext over as a frames stream, while
+/// grammers' `Client::upload_stream` consumes an `AsyncRead`. Buffers at
+/// most one frame at a time, so the memory profile of a streaming v2
+/// upload stays at one crypto chunk per hop regardless of file size.
+pub struct StreamReader {
+    stream: Pin<Box<dyn Stream<Item = Result<Bytes, StorageError>> + Send + Sync>>,
+    pending: Bytes,
+    done: bool,
+}
+
+impl StreamReader {
+    /// Wraps `stream`; read it to EOF (a `StorageError` frame surfaces as
+    /// an `io::Error` on the reading side).
+    pub fn new(stream: ByteStream) -> Self {
+        Self {
+            stream,
+            pending: Bytes::new(),
+            done: false,
+        }
+    }
+}
+
+impl tokio::io::AsyncRead for StreamReader {
+    /// Serves the pending frame slice first, then polls the backing
+    /// stream for the next frame. EOF only after the stream ends AND the
+    /// pending frame is drained. The struct is `Unpin` by construction
+    /// (boxed stream + `Bytes`), so plain field access is safe.
+    fn poll_read(
+        mut self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        loop {
+            if !self.pending.is_empty() {
+                let n = self.pending.len().min(buf.remaining());
+                // `split_to` hands out the head slice and keeps the rest —
+                // zero-copy on the Bytes refcount either way.
+                let head = self.pending.split_to(n);
+                buf.put_slice(&head);
+                return Poll::Ready(Ok(()));
+            }
+            if self.done {
+                return Poll::Ready(Ok(()));
+            }
+            match self.stream.as_mut().poll_next(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Some(Ok(frame))) => self.pending = frame,
+                Poll::Ready(Some(Err(error))) => {
+                    return Poll::Ready(Err(std::io::Error::other(error.to_string())));
+                }
+                Poll::Ready(None) => self.done = true,
+            }
+        }
+    }
+}

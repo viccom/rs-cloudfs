@@ -106,10 +106,8 @@ fn remote_bytes(db: &MetaDatabase, mock: &MockTransport, rel: &str) -> Vec<u8> {
     chunks
         .iter()
         .flat_map(|c| {
-            mock.message(
-                i32::try_from(c.telegram_msg_id.expect("msg id")).expect("narrow"),
-            )
-            .expect("stored chunk")
+            mock.message(i32::try_from(c.telegram_msg_id.expect("msg id")).expect("narrow"))
+                .expect("stored chunk")
         })
         .collect()
 }
@@ -161,7 +159,11 @@ async fn aead_v2_upload_streams_and_hydrates_roundtrip() {
     // The remote bytes are a genuine v2 container that decrypts back to
     // the plaintext (container check, independent of the hydrate path).
     let ciphertext = remote_bytes(&db, &mock, "/big.bin");
-    assert_eq!(ciphertext.len(), V2_HEADER + n + 9 * TAG_SIZE, "v2 size formula");
+    assert_eq!(
+        ciphertext.len(),
+        V2_HEADER + n + 9 * TAG_SIZE,
+        "v2 size formula"
+    );
     let scheme = AeadV2::new();
     let mut decrypted = Vec::new();
     scheme
@@ -169,9 +171,10 @@ async fn aead_v2_upload_streams_and_hydrates_roundtrip() {
         .expect("container decrypts");
     assert_eq!(decrypted, plaintext);
 
-    // Hydrate (cache miss forced by removing the local copy) returns the
-    // plaintext bytes through the v2 streaming path.
-    std::fs::remove_file(cache_twin(&cache_root).local_path(&rel)).expect("drop cache copy");
+    // Hydrate (cache miss: the successful upload already removed the
+    // local copy; tolerate a still-present one) returns the plaintext
+    // bytes through the v2 streaming path.
+    let _ = std::fs::remove_file(cache_twin(&cache_root).local_path(&rel));
     let path = vfs.hydrate(&rel).await.expect("hydrate");
     let mut roundtrip = Vec::new();
     std::fs::File::open(&path)
@@ -306,7 +309,10 @@ async fn unknown_scheme_hydrate_fails_with_an_actionable_error() {
     // The successful upload already removed the local copy (hydrate is
     // a guaranteed miss); tolerate a still-present copy for robustness.
     let _ = std::fs::remove_file(cache_twin(&cache_root).local_path(&rel));
-    let err = vfs.hydrate(&rel).await.expect_err("unknown scheme must fail");
+    let err = vfs
+        .hydrate(&rel)
+        .await
+        .expect_err("unknown scheme must fail");
     let message = format!("{err}");
     assert!(
         message.contains("rot13") && message.contains("gcm") && message.contains("aead_v2"),

@@ -47,7 +47,7 @@ use crate::config::TransportConfig;
 use crate::flood::parse_flood_wait;
 use crate::plan::plan_chunk_sends;
 use crate::range::{range_plan, MAX_CHUNK_SIZE};
-use crate::stream::serve_range;
+use crate::stream::{serve_range, StreamReader};
 use cloudkit_storage::transport::{
     ByteStream, ChatCap, CloudTransport, InboundCap, InboundFile, IncomingEvent, IncomingStream,
     RemoteHandle, StorageError, UploadJob, UploadReceipt,
@@ -299,6 +299,66 @@ impl CloudTransport for GrammersTransport {
                 .map_err(map_invocation_error)?;
             chunk_msg_ids.push(message.id());
             uploaded_bytes += send.byte_len;
+        }
+        Ok(UploadReceipt {
+            first_msg_id: chunk_msg_ids.first().copied().unwrap_or_default(),
+            chunk_msg_ids,
+            uploaded_bytes,
+        })
+    }
+
+    /// Streaming-upload face (Batch E / E-3): the v2 encrypted-ciphertext
+    /// stream, split by the same [`plan_chunk_sends`] captions/names the
+    /// file face uses (the v1 encrypted path also uploads ciphertext
+    /// planned with `is_encrypted = false` — the R6 caption contract),
+    /// each part read off the [`StreamReader`] bridge with `take` so
+    /// peak memory stays at one part's upload buffer plus one crypto
+    /// chunk — no ciphertext file ever exists locally. A stream longer
+    /// than the planned size is refused; a shorter one surfaces as the
+    /// grammers upload error for the missing bytes.
+    async fn upload_stream(
+        &self,
+        job: &UploadJob,
+        data: ByteStream,
+    ) -> Result<UploadReceipt, StorageError> {
+        let sends = plan_chunk_sends(job, false);
+        let mut reader = StreamReader::new(data);
+        let mut chunk_msg_ids = Vec::with_capacity(sends.len());
+        let mut uploaded_bytes = 0;
+        for send in &sends {
+            let part_len = usize::try_from(send.byte_len).map_err(|_| {
+                StorageError::Unavailable(format!("part too large: {} bytes", send.byte_len))
+            })?;
+            let mut part = (&mut reader).take(part_len as u64);
+            let uploaded = self
+                .client
+                .upload_stream(&mut part, part_len, send.document_name.clone())
+                .await?;
+            let message = self
+                .client
+                .send_message(
+                    self.chat,
+                    InputMessage::new()
+                        .text(send.caption.clone())
+                        .document(uploaded),
+                )
+                .await
+                .map_err(map_invocation_error)?;
+            chunk_msg_ids.push(message.id());
+            uploaded_bytes += send.byte_len;
+        }
+        // Every planned byte was consumed; the stream must now be at EOF.
+        // A longer stream means the caller's plan disagrees with its own
+        // bytes — refuse rather than silently truncate.
+        let mut probe = [0u8; 1];
+        match reader.read(&mut probe).await {
+            Ok(0) => {}
+            Ok(_) => {
+                return Err(StorageError::Unavailable(
+                    "upload_stream: stream carries more bytes than the job planned".to_string(),
+                ));
+            }
+            Err(error) => return Err(StorageError::Io(error.to_string())),
         }
         Ok(UploadReceipt {
             first_msg_id: chunk_msg_ids.first().copied().unwrap_or_default(),

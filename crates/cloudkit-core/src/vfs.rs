@@ -102,6 +102,15 @@ pub enum VfsError {
     /// Decryption failed.
     #[error("crypto error: {0}")]
     Crypto(#[from] CryptoError),
+    /// The row's `encryption_scheme` names a scheme this build does not
+    /// know — the read path cannot dispatch. A newer build encrypted
+    /// this file; the message names the stored value and both schemes
+    /// this build understands so the operator can act.
+    #[error(
+        "unsupported encryption scheme {scheme:?} on {path}: this build \
+         knows \"gcm\" and \"aead_v2\" (upgrade the instance that stored it)"
+    )]
+    UnsupportedEncryptionScheme { scheme: String, path: String },
     /// Local file I/O failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -159,6 +168,53 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let staged = tmp_sibling(target);
     std::fs::write(&staged, bytes)?;
     std::fs::rename(&staged, target)
+}
+
+/// Sibling staging path of the plaintext-under-decryption: the full file
+/// name plus a `.dec.tmp` suffix. The v2 streaming hydration decrypts
+/// into this sibling (it cannot decrypt in place — the staged file holds
+/// the ciphertext being read) and promotes it with an atomic rename.
+fn dec_tmp_sibling(target: &Path) -> PathBuf {
+    let file_name = target.file_name().unwrap_or_else(|| OsStr::new("cydrive"));
+    let mut staged = file_name.to_os_string();
+    staged.push(".dec.tmp");
+    target.with_file_name(staged)
+}
+
+/// v2 streaming hydration (E-3): decrypt the staged ciphertext file
+/// chunk-by-chunk into the `.dec.tmp` sibling, then promote it onto the
+/// final cache path atomically and drop the consumed ciphertext. Neither
+/// the ciphertext nor the plaintext is ever buffered whole — the v2
+/// decryptor walks one crypto chunk at a time (the frozen v1 path keeps
+/// its whole-file buffering; that is the format's documented cost).
+///
+/// Failure of any step removes the `.dec.tmp` sibling and leaves the
+/// staged ciphertext for the caller's existing cleanup path.
+fn hydrate_v2(password: &str, staged: &Path, local: &Path) -> Result<(), VfsError> {
+    use cloudkit_crypto::CryptoScheme as _;
+    let dec = dec_tmp_sibling(local);
+    let scheme = cloudkit_crypto::AeadV2::new();
+    let result = (|| -> Result<(), CryptoError> {
+        let mut src = std::fs::File::open(staged)?;
+        let mut dst = std::io::BufWriter::new(std::fs::File::create(&dec)?);
+        scheme.decrypt_stream(password, &mut src, &mut dst)?;
+        dst.flush()?;
+        Ok(())
+    })();
+    match result {
+        Ok(()) => {
+            // The closure's drop already flushed and closed the output
+            // file (Windows rename safety); promote the plaintext onto
+            // the final path and drop the consumed ciphertext.
+            std::fs::rename(&dec, local)?;
+            std::fs::remove_file(staged)?;
+            Ok(())
+        }
+        Err(error) => {
+            let _ = std::fs::remove_file(&dec);
+            Err(error.into())
+        }
+    }
 }
 
 /// Rebuilds the upsert of `row` with `is_cached` flipped and every other
@@ -230,6 +286,7 @@ impl Vfs {
                 retry: cfg.retry.clone(),
                 chunk_size_bytes: cfg.chunk_size_bytes,
                 encryption_password: cfg.encryption_password.clone(),
+                encryption_scheme: cfg.encryption_scheme,
             },
         );
         Self {
@@ -483,14 +540,35 @@ impl Vfs {
             // overwrites the now-consumed ciphertext staging file and
             // renames the plaintext onto the final path in one atomic
             // promotion.
+            //
+            // Scheme dispatch (E-3) is on the ROW, never on the live
+            // config: `gcm` rows keep the frozen whole-file path below
+            // (zero change), `aead_v2` rows hydrate through the v2
+            // streaming decryptor (constant memory — no whole-ciphertext
+            // buffering, the staging file feeds the decryptor chunk by
+            // chunk), and an unknown scheme fails with an actionable
+            // error instead of guessing.
             if row.is_encrypted {
                 let password = self
                     .cfg
                     .encryption_password
                     .as_deref()
                     .ok_or(VfsError::MissingPassword)?;
-                let plaintext = crypto::decrypt(password, &std::fs::read(&staged)?)?;
-                write_atomic(&local, &plaintext)?;
+                match row.encryption_scheme.as_str() {
+                    crate::config::SCHEME_GCM => {
+                        let plaintext = crypto::decrypt(password, &std::fs::read(&staged)?)?;
+                        write_atomic(&local, &plaintext)?;
+                    }
+                    crate::config::SCHEME_AEAD_V2 => {
+                        hydrate_v2(password, &staged, &local)?;
+                    }
+                    unknown => {
+                        return Err(VfsError::UnsupportedEncryptionScheme {
+                            scheme: unknown.to_string(),
+                            path: row.rel_path.clone(),
+                        });
+                    }
+                }
             } else {
                 std::fs::rename(&staged, &local)?;
             }

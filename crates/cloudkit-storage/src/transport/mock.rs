@@ -258,47 +258,51 @@ impl CloudTransport for MockTransport {
         let data = std::fs::read(&job.local_path)?;
 
         let mut state = self.lock()?;
-        let total = data.len() as u64;
-        // Defensive: a plan with chunk_size 0 would otherwise divide by zero.
-        let chunk_size = job.chunk_size.max(1);
-        let actual_chunks = if total == 0 {
-            1
-        } else {
-            total.div_ceil(chunk_size)
-        };
-        if actual_chunks != u64::from(job.chunk_count) {
-            return Err(StorageError::Unavailable(format!(
-                "chunk plan mismatch: {total} bytes at chunk_size {} split into \
-                 {actual_chunks} chunks, but the job planned {}",
-                job.chunk_size, job.chunk_count
-            )));
+        finish_upload(&mut state, job, &data)
+    }
+
+    async fn upload_stream(
+        &self,
+        job: &UploadJob,
+        data: ByteStream,
+    ) -> Result<UploadReceipt, StorageError> {
+        {
+            let mut state = self.lock()?;
+            state.stream_upload_calls.push(job.clone());
+            if !state.connected {
+                return Err(StorageError::Invalid);
+            }
         }
 
-        // Consume the script in order; an exhausted script behaves as Ok.
-        let action = match state.upload_script.pop_front() {
-            Some(action) => action,
-            None => UploadAction::Ok,
-        };
-        let total_chunks = actual_chunks as usize;
-        let chunks_to_store = match action {
-            UploadAction::Ok => total_chunks,
-            UploadAction::Fail { error } => return Err(error),
-            UploadAction::FailAfterChunks { chunks, error } => {
-                let prefix = chunks.min(total_chunks);
-                store_chunks(&mut state, job, &data, total_chunks, prefix);
-                return Err(error);
+        // Collect the stream frames, recording the peak frame size (the
+        // observable the v2 wiring's memory-granularity asserts on). A
+        // stream error fails the call as ordinary transport I/O.
+        let mut collected: Vec<u8> = Vec::new();
+        let mut frames = data;
+        while let Some(frame) = futures_util::StreamExt::next(&mut frames).await {
+            let frame = frame?;
+            if collected.len() as u64 + frame.len() as u64 > job.size {
+                return Err(StorageError::Unavailable(format!(
+                    "stream exceeded the planned {} bytes",
+                    job.size
+                )));
             }
-        };
-        let chunk_msg_ids = store_chunks(&mut state, job, &data, total_chunks, chunks_to_store);
-        let first_msg_id = chunk_msg_ids
-            .first()
-            .copied()
-            .ok_or_else(|| StorageError::Unavailable("upload stored no chunks".to_string()))?;
-        Ok(UploadReceipt {
-            first_msg_id,
-            chunk_msg_ids,
-            uploaded_bytes: total,
-        })
+            {
+                let mut state = self.lock()?;
+                state.max_stream_frame = state.max_stream_frame.max(frame.len());
+            }
+            collected.extend_from_slice(&frame);
+        }
+
+        let mut state = self.lock()?;
+        if collected.len() as u64 != job.size {
+            return Err(StorageError::Unavailable(format!(
+                "chunk plan mismatch: stream ended at {} bytes, but the job planned {}",
+                collected.len(),
+                job.size
+            )));
+        }
+        finish_upload(&mut state, job, &collected)
     }
 
     async fn open(&self, file: &RemoteHandle) -> Result<ByteStream, StorageError> {
@@ -413,6 +417,57 @@ impl ChatCap for MockTransport {
 /// baseline: `os.path.basename` of the virtual path). Every chunk caption
 /// carries the rel_path and a 1-based `i/n` part marker (Python baseline:
 /// enumerate is 0-based for names, captions print `idx + 1`).
+/// Shared tail of `upload` and `upload_stream`: chunk-plan validation
+/// against the collected bytes, the scripted action and the store — both
+/// faces must be behaviorally identical from the plan onwards.
+fn finish_upload(
+    state: &mut MockState,
+    job: &UploadJob,
+    data: &[u8],
+) -> Result<UploadReceipt, StorageError> {
+    let total = data.len() as u64;
+    // Defensive: a plan with chunk_size 0 would otherwise divide by zero.
+    let chunk_size = job.chunk_size.max(1);
+    let actual_chunks = if total == 0 {
+        1
+    } else {
+        total.div_ceil(chunk_size)
+    };
+    if actual_chunks != u64::from(job.chunk_count) {
+        return Err(StorageError::Unavailable(format!(
+            "chunk plan mismatch: {total} bytes at chunk_size {} split into \
+             {actual_chunks} chunks, but the job planned {}",
+            job.chunk_size, job.chunk_count
+        )));
+    }
+
+    // Consume the script in order; an exhausted script behaves as Ok.
+    let action = match state.upload_script.pop_front() {
+        Some(action) => action,
+        None => UploadAction::Ok,
+    };
+    let total_chunks = actual_chunks as usize;
+    let chunks_to_store = match action {
+        UploadAction::Ok => total_chunks,
+        UploadAction::Fail { error } => return Err(error),
+        UploadAction::FailAfterChunks { chunks, error } => {
+            let prefix = chunks.min(total_chunks);
+            store_chunks(state, job, data, total_chunks, prefix);
+            return Err(error);
+        }
+    };
+    let chunk_msg_ids = store_chunks(state, job, data, total_chunks, chunks_to_store);
+    let first_msg_id = chunk_msg_ids
+        .first()
+        .copied()
+        .ok_or_else(|| StorageError::Unavailable("upload stored no chunks".to_string()))?;
+    Ok(UploadReceipt {
+        first_msg_id,
+        chunk_msg_ids,
+        uploaded_bytes: total,
+    })
+}
+
 fn store_chunks(
     state: &mut MockState,
     job: &UploadJob,

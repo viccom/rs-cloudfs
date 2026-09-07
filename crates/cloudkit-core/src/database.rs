@@ -338,14 +338,12 @@ impl MetaDatabase {
         // ignores the unknown column (SQLite never projects unstated
         // columns); nothing is renamed or dropped.
         {
-            let has_column = conn
-                .query_row(
-                    "SELECT EXISTS (SELECT 1 FROM pragma_table_info('files') \
+            let has_column = conn.query_row(
+                "SELECT EXISTS (SELECT 1 FROM pragma_table_info('files') \
                      WHERE name = 'encryption_scheme')",
-                    [],
-                    |row| row.get::<_, i64>(0),
-                )?
-                != 0;
+                [],
+                |row| row.get::<_, i64>(0),
+            )? != 0;
             if !has_column {
                 conn.execute_batch(
                     "ALTER TABLE files \

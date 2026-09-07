@@ -48,6 +48,7 @@ fn test_cfg(chunk_size_bytes: u64) -> UploadQueueConfig {
         retry: fast_retry(),
         chunk_size_bytes,
         encryption_password: None,
+        encryption_scheme: cloudkit_core::config::EncryptionScheme::default(),
     }
 }
 

@@ -151,6 +151,13 @@ pub struct UploadQueueConfig {
     /// `is_encrypted` flag is set *and* this is `Some`); default `None`
     /// keeps every upload byte-identical to the plaintext path.
     pub encryption_password: Option<String>,
+    /// Container scheme for rows this queue uploads encrypted (Batch E /
+    /// E-3): `Gcm` (default — the frozen v1 whole-file `.enc.tmp`
+    /// staging, byte-identical to the pre-E-3 behavior) or `AeadV2`
+    /// (streaming encryption straight into `upload_stream`, zero
+    /// ciphertext staging file). Mirrored from `VfsConfig` by
+    /// [`crate::vfs::Vfs::new`].
+    pub encryption_scheme: crate::config::EncryptionScheme,
 }
 
 impl Default for UploadQueueConfig {
@@ -163,6 +170,7 @@ impl Default for UploadQueueConfig {
             retry: RetryPolicy::default(),
             chunk_size_bytes: DEFAULT_CHUNK_SIZE_MB * 1024 * 1024,
             encryption_password: None,
+            encryption_scheme: crate::config::EncryptionScheme::default(),
         }
     }
 }
@@ -416,6 +424,131 @@ impl Drop for EncTempGuard {
     }
 }
 
+/// Exact ciphertext length of a v2 container for `plain` plaintext bytes
+/// at the default 1 MiB crypto chunk: header + per chunk (plain_len +
+/// tag); the empty file carries one tag-only final chunk (the encoder
+/// always seals at least one chunk, so the container is
+/// self-describing). Used to plan the storage chunk split BEFORE the
+/// stream runs — the transport's chunk plan must be exact.
+fn v2_cipher_size(plain: u64) -> u64 {
+    const CRYPTO_CHUNK: u64 = cloudkit_crypto::v2::DEFAULT_CHUNK_SIZE as u64;
+    const HEADER: u64 = cloudkit_crypto::v2::HEADER_SIZE as u64;
+    const TAG: u64 = cloudkit_crypto::v2::TAG_SIZE as u64;
+    let n = if plain == 0 {
+        1
+    } else {
+        plain.div_ceil(CRYPTO_CHUNK)
+    };
+    HEADER + plain + n * TAG
+}
+
+/// `std::io::Write` end of the streaming-encryption bridge: every write
+/// the v2 encryptor emits (header once, then one chunk+tag at a time)
+/// becomes one channel frame. Bounded channel capacity is the
+/// backpressure that keeps the whole pipeline at a few crypto chunks of
+/// resident memory; `blocking_send` is legal because the encryptor runs
+/// inside `spawn_blocking`.
+struct ChannelWriter {
+    tx: tokio::sync::mpsc::Sender<Result<bytes::Bytes, std::io::Error>>,
+}
+
+impl std::io::Write for ChannelWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.tx
+            .blocking_send(Ok(bytes::Bytes::copy_from_slice(buf)))
+            .map(|_| buf.len())
+            .map_err(|_| {
+                std::io::Error::new(
+                    std::io::ErrorKind::BrokenPipe,
+                    "upload_stream consumer dropped the ciphertext stream",
+                )
+            })
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// One v2 streaming upload attempt (E-3): the plaintext cache copy is
+/// re-opened, streamed through the v2 chunked-AEAD encryptor on a
+/// blocking thread, and the ciphertext frames flow through a bounded
+/// channel straight into [`CloudTransport::upload_stream`] — no
+/// ciphertext file ever exists on disk, and resident memory stays at
+/// channel capacity × crypto chunk regardless of file size. Returns the
+/// receipt plus the ciphertext job the transport saw (the persist step's
+/// chunk math follows ciphertext boundaries).
+///
+/// Each call re-derives the key (fresh salt, fresh PBKDF2) — retries are
+/// the rare path and a per-attempt salt is the cryptographically
+/// conservative direction; a partially-uploaded previous attempt left
+/// nothing local to reuse by design.
+async fn upload_v2_stream(
+    transport: &dyn CloudTransport,
+    job: &UploadJob,
+    password: &str,
+) -> Result<(UploadReceipt, UploadJob), StorageError> {
+    let cipher_size = v2_cipher_size(job.size);
+    let cipher_chunk_count = if cipher_size == 0 {
+        0
+    } else {
+        cipher_size.div_ceil(job.chunk_size.max(1)) as u32
+    };
+    let cipher_job = UploadJob {
+        rel_path: job.rel_path.clone(),
+        // Provenance only: the bytes on the wire are the stream's.
+        local_path: job.local_path.clone(),
+        size: cipher_size,
+        chunk_count: cipher_chunk_count,
+        chunk_size: job.chunk_size,
+    };
+
+    // Encrypt on a blocking thread; the bounded channel (a few frames)
+    // turns the sync writer into the async stream with backpressure.
+    let (tx, rx) = tokio::sync::mpsc::channel::<Result<bytes::Bytes, std::io::Error>>(4);
+    let plain_path = job.local_path.clone();
+    let password = password.to_string();
+    let encrypt = tokio::task::spawn_blocking(move || -> std::io::Result<u64> {
+        use cloudkit_crypto::CryptoScheme as _;
+        let mut src = std::fs::File::open(&plain_path)?;
+        let scheme = cloudkit_crypto::AeadV2::new();
+        let mut dst = ChannelWriter { tx };
+        match scheme.encrypt_stream(&password, &mut src, &mut dst) {
+            Ok(written) => Ok(written),
+            Err(cloudkit_crypto::CryptoError::Io(error)) => Err(error),
+            Err(error) => Err(std::io::Error::other(error.to_string())),
+        }
+    });
+    let stream = futures_util::stream::unfold(rx, |mut rx| async move {
+        rx.recv().await.map(|item| {
+            let frame = item.map_err(|error| StorageError::Io(error.to_string()));
+            (frame, rx)
+        })
+    });
+    let stream: crate::transport::ByteStream = Box::pin(stream);
+
+    let receipt = match transport.upload_stream(&cipher_job, stream).await {
+        Ok(receipt) => receipt,
+        Err(error) => {
+            // The consumer is gone; join the encryptor so it exits
+            // through the BrokenPipe path instead of leaking the task.
+            let _ = encrypt.await;
+            return Err(error);
+        }
+    };
+    let written = encrypt
+        .await
+        .map_err(|error| StorageError::Unavailable(format!("v2 encryption task failed: {error}")))?
+        .map_err(|error| StorageError::Io(error.to_string()))?;
+    if written != cipher_size {
+        return Err(StorageError::Unavailable(format!(
+            "v2 ciphertext length {written} disagrees with the planned {cipher_size}; \
+             refusing to persist a chunk plan computed on the wrong size"
+        )));
+    }
+    Ok((receipt, cipher_job))
+}
+
 /// Runs one job to a terminal state, updating the stats counters and
 /// never touching a row's remote state on failure paths.
 async fn process_job(
@@ -470,7 +603,11 @@ async fn process_job(
     // Encrypted staging: required only when the row is flagged encrypted
     // AND the queue carries a password (Python AND semantics). Staged
     // once and reused across retries of the same job; the guard deletes
-    // the temp ciphertext on every exit path.
+    // the temp ciphertext on every exit path. V2 rows (E-3) skip this
+    // entirely — their ciphertext exists only as a stream, per attempt.
+    let use_v2 = row.is_encrypted
+        && cfg.encryption_password.is_some()
+        && cfg.encryption_scheme == crate::config::EncryptionScheme::AeadV2;
     let mut staged: Option<StagedUpload> = None;
     let mut enc_tmp = EncTempGuard(None);
 
@@ -479,7 +616,7 @@ async fn process_job(
         // Lazily (re)attempt the staging: an I/O failure here behaves
         // like any other upload failure — backoff/degrade, plaintext
         // untouched, retried on the next loop pass.
-        if staged.is_none() && row.is_encrypted && cfg.encryption_password.is_some() {
+        if !use_v2 && staged.is_none() && row.is_encrypted && cfg.encryption_password.is_some() {
             let password = cfg.encryption_password.as_deref().expect("checked above");
             match stage_encrypted(&job, password) {
                 Ok(s) => {
@@ -516,25 +653,42 @@ async fn process_job(
                 }
             }
         }
-        // What the transport sees: the ciphertext job when staged, the
-        // plaintext job otherwise (password None is byte-identical to the
-        // pre-encryption behavior).
-        let target = staged.as_ref().map(|s| &s.job).unwrap_or(&job);
-        match transport.upload(target).await {
-            Ok(receipt) => {
+        // What the transport sees: the v2 ciphertext stream (re-encrypted
+        // per attempt, zero staging file), the v1 ciphertext job when
+        // staged, or the plaintext job otherwise (password None is
+        // byte-identical to the pre-encryption behavior). All three
+        // resolve to the receipt plus the job the transport actually
+        // saw, so the persist step's chunk math follows the bytes on the
+        // wire.
+        let outcome = if use_v2 {
+            let password = cfg
+                .encryption_password
+                .as_deref()
+                .expect("use_v2 implies a password");
+            upload_v2_stream(transport, &job, password).await
+        } else {
+            let target = staged.as_ref().map(|s| &s.job).unwrap_or(&job);
+            transport
+                .upload(target)
+                .await
+                .map(|receipt| (receipt, target.clone()))
+        };
+        match outcome {
+            Ok((receipt, target)) => {
                 // The digest was computed up front (before the first
                 // attempt), so it is already in hand for both the staged
                 // (plaintext digest of the encrypted upload) and the
                 // plaintext path — no hash runs after the remote success.
-                // Row size: encrypted rows keep their plaintext size
-                // (Python upserts `file_size`, the plaintext length);
-                // plaintext rows take the receipt's byte count as before.
-                let file_size = if staged.is_some() {
+                // Row size: encrypted rows (v1 staged or v2 streamed)
+                // keep their plaintext size (Python upserts `file_size`,
+                // the plaintext length); plaintext rows take the
+                // receipt's byte count as before.
+                let file_size = if use_v2 || staged.is_some() {
                     row.size
                 } else {
                     receipt.uploaded_bytes as i64
                 };
-                match persist_success(db, &row, target, &receipt, file_size, sha256) {
+                match persist_success(db, &row, &target, &receipt, file_size, sha256) {
                     Ok(()) => {
                         delete_local_copy(&job.local_path);
                         // No manual sync doorbell anymore: the success

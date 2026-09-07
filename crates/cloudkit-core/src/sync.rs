@@ -554,7 +554,10 @@ fn replace_row(db: &MetaDatabase, rel_path: &str, payload: &RowPayload) -> Resul
             chunk_count: payload.chunk_count,
             mime_type: payload.mime_type.clone(),
         },
-        payload.scheme.as_deref().unwrap_or(crate::config::SCHEME_GCM),
+        payload
+            .scheme
+            .as_deref()
+            .unwrap_or(crate::config::SCHEME_GCM),
     )?;
     for chunk in &payload.chunks {
         if let Some(msg_id) = chunk.msg_id {
