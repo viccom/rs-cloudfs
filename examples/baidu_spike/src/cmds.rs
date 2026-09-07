@@ -48,11 +48,19 @@ fn file_md5(path: &Path) -> Result<String> {
     Ok(hex::encode(h.finalize()))
 }
 
-/// Resolve (and memoize) the spike remote dir. Third-party appkeys are
-/// sandboxed; we probe candidate prefixes with a precreate-only call
-/// (a pending upload without superfile2 leaves no file behind, so the probe
-/// is side-effect free) and record which prefix the API actually accepts.
+/// Resolve (and memoize) the spike remote dir. `BAIDU_SPIKE_REMOTE_DIR`
+/// wins outright (owner directive 2026-09-07: dedicated test roots live
+/// under /apps, never PCFS's live /apps/privatefs tree) — no probing,
+/// the named dir is created on first upload. Without the env, candidate
+/// prefixes are probed side-effect free (precreate-only) and the accepted
+/// one is recorded.
 async fn resolve_remote_dir(ctx: &Ctx) -> Result<String> {
+    if let Ok(d) = std::env::var("BAIDU_SPIKE_REMOTE_DIR") {
+        if !d.is_empty() {
+            summ(format!("remote_dir|env_override={d}"));
+            return Ok(d);
+        }
+    }
     if let Some(d) = ctx.state.lock().unwrap().remote_dir.clone() {
         return Ok(d);
     }
@@ -822,7 +830,10 @@ pub async fn dlink() -> Result<()> {
     // cache duration: keep reusing the SAME dlink until it dies (or budget out)
     let steps = [
         30u64, 30, 60, 120, 240, 480, 900, 300, 300, 300, 300, 300, 300, 300,
-    ]; // cumulative: 0.5,1,2,4,8,23,28,...,63 min — loop breaks early on failure
+        300, 300, 300, 300, 300, 300,
+    ]; // cumulative ≈ 131min — loop breaks early on failure; extended
+       // from ~63min on 2026-09-07 (owner directive: settle the TTL upper
+       // bound; the earlier probe was killed externally at 56min while 206)
     let mut elapsed_s = 0u64;
     let mut last_ok_min = 0.0f64;
     let mut expired_at_min: Option<f64> = None;
