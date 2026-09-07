@@ -1,0 +1,23 @@
+[package]
+name = "cloudkit-crypto"
+description = "Client-side encryption schemes: frozen v1 GCM (Python interop) + v2 chunked AEAD (STREAM construction)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+# Deliberately dependency-light: sync `std::io` streaming only, no tokio —
+# async adaptation (spawn_blocking wrappers) is an L4 consumer concern
+# (foundation D7; architecture.md places crypto at L2-side foundations).
+[dependencies]
+aes-gcm = "0.11.1"
+pbkdf2 = "0.13.0"
+rand = "0.10.2"
+sha2 = "0.11.0"
+thiserror = "2"
+
+[dev-dependencies]
+base64 = "0.23.1"
+serde_json = "1.0.151"

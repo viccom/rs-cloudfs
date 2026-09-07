@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/cloudkit-storage",
+    "crates/cloudkit-crypto",
     "crates/cloudkit-core",
     "crates/cloudkit-sync-server",
     "crates/cloudkit-cli",

@@ -9,15 +9,16 @@ license.workspace = true
 workspace = true
 
 [dependencies]
-aes-gcm = "0.11.1"
 async-trait = "0.1"
 bytes = "1"
 # L3→L2 合法依赖（architecture §1）：transport trait 家族与 StorageError
 # 分类学的家（Batch R 迁入）；本 crate 以 re-export 维持既有路径兼容。
 cloudkit-storage = { path = "../cloudkit-storage" }
+# 加密方案 crate（Batch E 迁入）：crypto 定位 L2 侧基础能力，被 core
+# 消费不算违规（architecture §1.5 注）；core/src/crypto.rs 为兼容 shim。
+cloudkit-crypto = { path = "../cloudkit-crypto" }
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false }
-pbkdf2 = "0.13.0"
 rand = "0.10.2"
 # "hooks": Connection::update_hook — the files-table change doorbell
 # (wake chokepoint batch); not a rusqlite default feature.
@@ -33,7 +34,6 @@ tracing-appender = "0.2"
 tracing-subscriber = { version = "0.3", features = ["env-filter", "fmt", "json"] }
 
 [dev-dependencies]
-base64 = "0.23.1"
 serde_json = "1.0.151"
 tempfile = "3"
 tokio = { version = "1", features = ["rt", "macros"] }

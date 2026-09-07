@@ -563,14 +563,12 @@ dependencies = [
 name = "cloudkit-core"
 version = "0.7.2"
 dependencies = [
- "aes-gcm",
  "async-trait",
- "base64 0.23.1",
  "bytes",
+ "cloudkit-crypto",
  "cloudkit-storage",
  "futures-core",
  "futures-util",
- "pbkdf2",
  "rand 0.10.2",
  "rusqlite",
  "serde",
@@ -583,6 +581,19 @@ dependencies = [
  "tracing",
  "tracing-appender",
  "tracing-subscriber",
+]
+
+[[package]]
+name = "cloudkit-crypto"
+version = "0.7.2"
+dependencies = [
+ "aes-gcm",
+ "base64 0.23.1",
+ "pbkdf2",
+ "rand 0.10.2",
+ "serde_json",
+ "sha2 0.11.0",
+ "thiserror 2.0.20",
 ]
 
 [[package]]
