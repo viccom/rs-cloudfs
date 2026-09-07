@@ -1,5 +1,6 @@
 # CyDrive CI (M6). Quality gates for every push/PR on both supported
-# desktop platforms: fmt, clippy (deny warnings), full test suite.
+# desktop platforms: architecture/secret gates (R1/R3), fmt, clippy
+# (deny warnings), full test suite.
 #
 # NOTE (honesty): this workflow has NOT been triggered yet — it was
 # committed from a dev environment with no push access. Expect
@@ -21,7 +22,7 @@ env:
 
 jobs:
   check:
-    name: fmt + clippy + test (${{ matrix.os }})
+    name: R1/R3 gates + fmt + clippy + test (${{ matrix.os }})
     strategy:
       fail-fast: false
       matrix:
@@ -29,6 +30,27 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Full history: the secret-scan step diffs the event range
+          # (base/before commits), which needs more than depth 1.
+          fetch-depth: 0
+
+      # R1 mechanical gate (architecture.md §2): no crate outside
+      # crates/drivers/* — except the cloudkit-cli composition root —
+      # may depend on a driver crate. OS-independent by nature, but run
+      # on both matrix OSes anyway: sub-second cost and it exercises the
+      # script under Git Bash on windows too.
+      - name: layer check (R1)
+        run: sh scripts/check_layers
+        shell: bash
+
+      # R3 minimal gate: grep the ADDED lines of this push/PR for
+      # credential-shaped literals (mode selection + force-push/first-push
+      # fallbacks live in the script). Minimal home-grade pattern set,
+      # extendable in scripts/scan_secrets.
+      - name: secret scan (R3)
+        run: sh scripts/scan_secrets
+        shell: bash
 
       # Matches rust-toolchain.toml (channel = "stable").
       - uses: dtolnay/rust-toolchain@stable

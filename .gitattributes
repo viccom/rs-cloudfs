@@ -1,0 +1,5 @@
+# POSIX sh gate scripts must keep LF endings: Git Bash (local + windows CI
+# runner) chokes on CRLF shebangs/commands, and this machine checks out with
+# core.autocrlf=true. Everything else in the repo stays at git defaults.
+scripts/check_layers text eol=lf
+scripts/scan_secrets text eol=lf

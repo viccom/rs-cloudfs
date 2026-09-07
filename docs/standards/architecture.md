@@ -23,7 +23,7 @@ L0 基础    http(代理/IPv4/连接池) / keyring / logging / config
 | 现存偏差 | 消除批次 |
 |---|---|
 | ck-telegram（现 cydrive-telegram）→ core 反向依赖（trait 在 core） | Phase 1 R（trait 迁 L2） |
-| crate 名仍为 cydrive-*，R1 的 crate 边界机械保障未就位 | Phase 0（改名 + `scripts/check_layers` + CI）——改名半项已于 Phase 0 P0-A 批消除（2026-09-07，foundation §3 映射，二进制名不变）；`check_layers` + CI 项待后续批 |
+| crate 名仍为 cydrive-*，R1 的 crate 边界机械保障未就位 | Phase 0 —— **已全部消除**（改名：P0-A 批 2026-09-07，foundation §3 映射，二进制名不变；`scripts/check_layers` + CI 接入 + CI 秘密扫描：P0-B 批 2026-09-07） |
 | Capabilities 声明暂无法满足 R4 的 conformance 前置 | Phase 2（套件随 ck-local 建立；此前能力位以驱动单测+真机为准并注明） |
 | cloudkit-core 跨层合体（L3+L4） | 长期接受（拆分成本 > 收益，北极星裁决） |
 
@@ -60,7 +60,7 @@ crates/
 ```
 
 - **二进制名保持 `cydrive`**（部署位零感知）+ 新增 `cydrive-sync-server` 不变；
-- R1 的机械保障（**Phase 0 交付**）：`scripts/check_layers`（校验 L3+ crate 的 Cargo.toml 无 drivers/* 依赖）+ 接入 CI；
+- R1 的机械保障（**已交付**，Phase 0 P0-B 2026-09-07）：`scripts/check_layers`（drivers/* 之外 crate 的 Cargo.toml 禁 drivers/* 路径依赖与 ck-* 包名，组合根 cloudkit-cli 豁免；drivers 同层互赖亦禁）+ 接入 CI（fmt 前独立 step）；另附 `scripts/scan_secrets`（R3 最小机械保障，扫 push/PR 新增行，见脚本头注释的模式与回退说明）；
 - vendor 目录（grammers-session）延续 rs-CyDrive 的 exclude + [patch] 模式。
 
 ## 5. 实例与配置模型（D5）

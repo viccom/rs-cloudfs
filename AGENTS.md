@@ -23,6 +23,8 @@
 cargo test --workspace --no-fail-fast            # 527 测试（fork 基线；Phase 0 后更新本行）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
+scripts/check_layers                             # R1 层依赖门禁（CI 同款；动 Cargo.toml 依赖后必跑）
+scripts/scan_secrets                             # R3 秘密扫描门禁（CI 同款；本地模式=全树扫描）
 ```
 
 ## 硬性规则（摘要，全文见 standards/）

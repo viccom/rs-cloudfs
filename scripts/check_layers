@@ -1,0 +1,77 @@
+#!/bin/sh
+# check_layers — mechanical check for architecture red line R1
+# (docs/standards/architecture.md §1/§2: L2 and above must not import any
+# L1 drivers/* symbol).
+#
+# What it enforces, per crate manifest under crates/ (vendor/ excluded):
+#   1. A crate OUTSIDE crates/drivers/* must not depend on any driver:
+#      no `ck-*` dependency key, no path dependency resolving into a
+#      drivers/ directory or a ck-* directory, no `package = "ck-*"`
+#      rename target. [dependencies], [dev-dependencies] and
+#      target-specific tables are all covered (line-based scan).
+#      Exemption: the composition root(s) below — the assembly layer is
+#      the one crate allowed to wire drivers in (architecture.md §1).
+#   2. A crate INSIDE crates/drivers/* must not depend on another driver
+#      (same layer, no peer deps) — same matching rules, no exemption.
+#
+# Deliberately NOT checked here:
+#   - driver -> core reverse dependency: declared transitional exemption
+#     (architecture.md §1.5), scheduled to be resolved in Phase 1 Batch R;
+#   - same-layer deps between non-driver crates: needs the L2 storage
+#     crate to exist first; extend this script then.
+#
+# Usage: scripts/check_layers [repo-root]     (default: this repository)
+# Requires: POSIX sh + find/grep/sed (Git Bash, ubuntu/windows CI bash).
+# Manifest paths must not contain spaces (true for this repo).
+# Exit 0 = clean, 1 = violations (listed on stderr with file:line).
+
+set -eu
+
+ROOT=${1:-$(dirname -- "$0")/..}
+cd "$ROOT"
+
+# The only crates allowed to depend on drivers: the composition root.
+COMPOSITION_ROOTS="crates/cloudkit-cli"
+
+# One ERE, four shapes of "this manifest depends on a driver crate":
+#   a) dependency key with the ck- prefix      ck-telegram = { ... }
+#   b) path value into a drivers/ directory    path = "../drivers/ck-x"
+#   c) rename target                           alias = { package = "ck-x" }
+#   d) path value into a ck-* directory        path = "../ck-x" (driver sibling)
+RE='(^[[:space:]]*ck-[A-Za-z0-9_-]+[[:space:]]*=|path[[:space:]]*=[[:space:]]*"([^"]*/)?drivers/|path[[:space:]]*=[[:space:]]*"([^"]*/)?ck-[^"/]*"|package[[:space:]]*=[[:space:]]*"ck-)'
+
+fail=0
+checked=0
+driver_count=0
+
+# Manifest paths in this repo contain no spaces.
+for mf in $(find crates -name Cargo.toml -not -path '*/vendor/*' | sort); do
+    checked=$((checked + 1))
+    dir=${mf%/Cargo.toml}
+
+    case " $COMPOSITION_ROOTS " in
+        *" $dir "*) continue ;; # composition root: allowed to depend on drivers
+    esac
+    case "$dir" in
+        crates/drivers/*) driver_count=$((driver_count + 1)) ;;
+    esac
+
+    # Strip comments first: commented-out deps must not count as violations.
+    hits=$(sed -e 's/#.*$//' "$mf" | grep -nE "$RE" || true)
+    if [ -n "$hits" ]; then
+        while IFS= read -r line; do
+            printf 'FAIL [R1] %s:%s -> depends on a driver crate\n' "$mf" "$line" >&2
+        done <<EOF
+$hits
+EOF
+        fail=$((fail + 1))
+    fi
+done
+
+if [ "$fail" -gt 0 ]; then
+    printf 'check_layers: FAIL - %d manifest(s) violate R1 (see above)\n' "$fail" >&2
+    exit 1
+fi
+
+printf 'check_layers: OK - %d manifests checked (%d driver crate(s)), no R1 violations (composition-root exemption: %s)\n' \
+    "$checked" "$driver_count" "$COMPOSITION_ROOTS"
