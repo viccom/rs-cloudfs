@@ -5,6 +5,8 @@
 
 **任务范围（负责人 2026-09-07 指令）**：完成第一阶段全部任务 = **Phase 0（搬迁改名）+ Phase 1（Batch S 百度 spike / Batch R trait 瘦身 / Batch E 加密 v2 流式）**，全程自主、不中途确认，疑问记录进 decisions.md 并在收尾报告集中列出。
 
+> **执行跟踪**：`docs/tracking/phase0-1.md`——任务分解与状态表；**每批收口必须更新该表并随 commit 提交**；新会话开工第一件事读该表续跑。
+
 ---
 
 ## Batch 顺序与验收
@@ -42,4 +44,4 @@
 > 2. 凭据（只读，绝不入库/入日志/入提交）：百度 refresh_token 在 `E:\GitHub\rs-CyDrive\test\instances\baidu*.json`（access_token 已过期属预期，spike 首步用 PCFS appkey——`E:\Go_codes\PrivateCloudFS\drivers\baidu\client.go:69` 处只读参照——刷新获取新 token，存 OS 临时目录）；telegram 真机冒烟用 `D:\Tools\rs-CyDrive` 生产实例（谨慎协议见 Batch R 验收）。
 > 3. 纪律：TDD（S 批除外，验证驱动）；断言零漂移；workspace 级三步门禁每批必过；跨平台改动加 WSL（~/rs-cloudfs 克隆自建）；conformance 断言集八条不得缩减；规范冲突以 standards/ 为准并记 decisions。
 > 4. 中止条件：spike 止损点（继续 R/E）；重派两次仍不绿；契约矛盾；需动 Python 兼容红线——停、留现场、写清结论。
-> 5. 收尾汇报：改动摘要/每批验证证据（真实输出）/未询问的决定与回滚/疑问与待负责人清单。
+> 5. 每批收口更新 `docs/tracking/phase0-1.md`（状态+证据）并提交；收尾汇报：改动摘要/每批验证证据（真实输出）/未询问的决定与回滚/疑问与待负责人清单。

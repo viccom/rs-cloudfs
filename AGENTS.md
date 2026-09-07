@@ -13,6 +13,7 @@
 3. `docs/standards/code-style.md` / `interfaces.md` / `logging.md` / `documentation.md` —— 门禁与规范
 4. `docs/plans/2026-09-06-multicloud.md` —— 百度情报附录 A（端点/参数/errno/dlink/Range 实证）
 5. `docs/decisions.md` —— 历史裁决（自 rs-CyDrive 继承，继续追加）
+6. `docs/tracking/phase0-1.md` —— 当前任务跟踪单（**开工先读、每批收口更新**）
 
 ## 当前阶段
 **Phase -1 规范先行已完成（2026-09-07）**；仓库 = fork 基线代码（cydrive 0.7.2，527 测试绿）+ 治理文档集。**下一步 = Phase 0 + Phase 1**（`docs/plans/2026-09-07-phase0-1-execution.md`——含预授权 Kickoff 指令，覆盖搬迁改名/百度 spike/trait 瘦身/加密 v2 流式）→ Phase 2（驱动接入手册 → ck-local + ck-baidu + 端到端硬验收）。
