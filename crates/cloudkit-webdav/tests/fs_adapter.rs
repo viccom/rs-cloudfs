@@ -27,7 +27,7 @@ use cloudkit_core::transport::mock::MockTransport;
 use cloudkit_core::transport::{CloudTransport, UploadJob, UploadReceipt};
 use cloudkit_core::upload_queue::RetryPolicy;
 use cloudkit_core::vfs::{Vfs, VfsConfig};
-use cydrive_webdav::CyDriveFs;
+use cloudkit_webdav::CyDriveFs;
 
 /// The virtual 10 TB quota from compat contract 6 (Python
 /// `get_available_bytes`).

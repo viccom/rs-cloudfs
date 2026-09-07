@@ -4,7 +4,7 @@
 //! `MockTransport` + Vfs + `WebUiServer` on an ephemeral loopback port
 //! (`127.0.0.1:0`; production's 127.0.0.1:8088 contract is the caller's
 //! concern) — and drives it with hand-rolled HTTP/1.1 over a raw
-//! `TcpStream`, mirroring the `cydrive-webdav` smoke-test harness. The
+//! `TcpStream`, mirroring the `cloudkit-webdav` smoke-test harness. The
 //! scenarios pin the Python `cydrive/web_ui/app.py` wire contract:
 //! the six routes' JSON shapes field by field (the zero-change frontend
 //! `static/js/app.js` consumes exactly these), the multipart upload

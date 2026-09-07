@@ -26,7 +26,7 @@ cloudkit-core = { path = "../cloudkit-core" }
 cydrive-platform = { path = "../cydrive-platform" }
 ck-telegram = { path = "../drivers/ck-telegram" }
 cydrive-web = { path = "../cydrive-web" }
-cydrive-webdav = { path = "../cydrive-webdav" }
+cloudkit-webdav = { path = "../cloudkit-webdav" }
 # Sync-lite client (Batch B4): the wire types this CLI maps onto core's
 # sync engine at runtime.
 cloudkit-sync-server = { path = "../cloudkit-sync-server" }

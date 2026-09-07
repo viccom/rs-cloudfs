@@ -6,7 +6,7 @@
 //! and `Vfs::ingest_file`.
 //!
 //! Semantics mirror the WebDAV adapter's mutation paths
-//! (`crates/cydrive-webdav/src/lib.rs`) but surface the core error enum:
+//! (`crates/cloudkit-webdav/src/lib.rs`) but surface the core error enum:
 //! `create_dir` upserts a directory *row* only (no filesystem directory —
 //! those are created lazily by put/hydrate), `remove_file` deletes the
 //! row and the local cache copy while deliberately keeping the remote

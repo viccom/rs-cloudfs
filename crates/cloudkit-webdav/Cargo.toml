@@ -1,5 +1,5 @@
 [package]
-name = "cydrive-webdav"
+name = "cloudkit-webdav"
 description = "CyDrive WebDAV layer: DavFileSystem adapter over the VFS"
 version.workspace = true
 edition.workspace = true

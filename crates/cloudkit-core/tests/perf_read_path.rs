@@ -6,7 +6,7 @@
 //! per-commit suite. M6 acceptance wants "reads must be cheap": this
 //! benchmark measures the metadata DB side (`MetaDatabase::list_dir`)
 //! on a realistic tree (100 dirs x 1000 files). The real PROPFIND path
-//! adds WebDAV XML serialization on top in `cydrive-webdav`; that layer
+//! adds WebDAV XML serialization on top in `cloudkit-webdav`; that layer
 //! is not measured here — this is the DB-direct lower bound that the
 //! XML layer is expected to dominate by a small constant factor.
 

@@ -23,7 +23,7 @@ use cloudkit_core::transport::mock::MockTransport;
 use cloudkit_core::transport::{CloudTransport, UploadJob, UploadReceipt};
 use cloudkit_core::upload_queue::RetryPolicy;
 use cloudkit_core::vfs::{Vfs, VfsConfig};
-use cydrive_webdav::{CyDriveFs, WebDavServer};
+use cloudkit_webdav::{CyDriveFs, WebDavServer};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 

@@ -577,6 +577,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "cloudkit-webdav"
+version = "0.7.2"
+dependencies = [
+ "bytes",
+ "cloudkit-core",
+ "dav-server",
+ "futures-util",
+ "http",
+ "hyper",
+ "hyper-util",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "cmov"
 version = "0.5.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -799,10 +815,10 @@ dependencies = [
  "clap",
  "cloudkit-core",
  "cloudkit-sync-server",
+ "cloudkit-webdav",
  "comfy-table",
  "cydrive-platform",
  "cydrive-web",
- "cydrive-webdav",
  "dialoguer",
  "http",
  "http-body-util",
@@ -834,22 +850,6 @@ dependencies = [
  "mime_guess",
  "rust-embed",
  "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
-]
-
-[[package]]
-name = "cydrive-webdav"
-version = "0.7.2"
-dependencies = [
- "bytes",
- "cloudkit-core",
- "dav-server",
- "futures-util",
- "http",
- "hyper",
- "hyper-util",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
