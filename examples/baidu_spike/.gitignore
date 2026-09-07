@@ -1,0 +1,3 @@
+# build artifacts (root .gitignore's /target/ is root-anchored and does not
+# reach this excluded crate's own target directory)
+/target

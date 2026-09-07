@@ -1,0 +1,35 @@
+[package]
+name = "baidu-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Batch S verification-driven spike (2026-09-07) — real-network Baidu Pan
+# probes. This crate is EXCLUDED from the workspace on purpose (see the
+# root Cargo.toml exclude list): it performs live network calls and must
+# never enter CI gates (fmt/clippy/test are run for the workspace only).
+#
+# Credential discipline (docs/plans/2026-09-07-cloudfusion-foundation.md §7a):
+# nothing sensitive is committed. At RUNTIME we read
+#   - refresh_token from the instance JSON under E:\GitHub\rs-CyDrive\test\
+#     (path overridable via BAIDU_SPIKE_INSTANCE),
+#   - appkey/client_secret parsed out of the PrivateCloudFS Go sources
+#     (E:\Go_codes\PrivateCloudFS\drivers\baidu\client.go, overridable via
+#     BAIDU_SPIKE_PCFS_GO) or via BAIDU_SPIKE_CLIENT_ID/SECRET env vars.
+# Refreshed tokens are cached in the OS temp dir (BAIDU_SPIKE_TMP), never
+# in the repository. All printed output is scrubbed (tokens masked).
+
+[dependencies]
+anyhow = "1"
+futures-util = "0.3"
+hex = "0.4"
+md-5 = "0.10"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "multipart",
+    "rustls-tls",
+    "stream",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "fs", "io-util"] }
