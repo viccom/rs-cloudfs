@@ -323,6 +323,45 @@ async fn open_round_trips_full_chunked_file() {
     assert_eq!(bytes, b"abcdefg");
 }
 
+/// 8a. open() honors the RemoteHandle byte budget — serve_range parity:
+///     at most `total_size` bytes flow and any over-read is trimmed (the
+///     ck-telegram `open()` wraps its frames in
+///     `serve_range(frames, 0, total_size)`; a mock more generous than the
+///     real backend keeps budget mismatches invisible to every upstream
+///     test — the E-5 single-test blind spot).
+#[tokio::test]
+async fn open_trims_to_the_handle_budget() {
+    let (_dir, path) = write_temp_file("budget.bin", b"abcdefg");
+    let t = MockTransport::new();
+    t.connect().await.expect("connect");
+
+    let job = job_for("/budget.bin", path, 7, 3, 3);
+    let receipt = t.upload(&job).await.expect("upload");
+
+    // Budget below the stored bytes: the stream stops at the budget.
+    let handle = RemoteHandle {
+        first_msg_id: receipt.first_msg_id,
+        chunk_msg_ids: receipt.chunk_msg_ids.clone(),
+        total_size: 4,
+    };
+    let bytes = drain(t.open(&handle).await.expect("open"))
+        .await
+        .expect("stream ok");
+    assert_eq!(bytes, b"abcd", "budget is a hard cap, over-read trimmed");
+
+    // Budget at/above the stored bytes: everything flows (a short read
+    // under the cap stays the consumer's concern — serve_range parity).
+    let handle = RemoteHandle {
+        first_msg_id: receipt.first_msg_id,
+        chunk_msg_ids: receipt.chunk_msg_ids.clone(),
+        total_size: u64::MAX,
+    };
+    let bytes = drain(t.open(&handle).await.expect("open"))
+        .await
+        .expect("stream ok");
+    assert_eq!(bytes, b"abcdefg", "an unbounded budget passes everything");
+}
+
 /// 9. open() with an unknown msg_id fails with NotFound (the converged
 ///     taxonomy carries no id payload; the pre-split TransportError did).
 #[tokio::test]
