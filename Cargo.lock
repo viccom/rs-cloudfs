@@ -577,6 +577,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "cloudkit-web"
+version = "0.7.2"
+dependencies = [
+ "axum",
+ "cloudkit-core",
+ "mime_guess",
+ "rust-embed",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "cloudkit-webdav"
 version = "0.7.2"
 dependencies = [
@@ -815,10 +829,10 @@ dependencies = [
  "clap",
  "cloudkit-core",
  "cloudkit-sync-server",
+ "cloudkit-web",
  "cloudkit-webdav",
  "comfy-table",
  "cydrive-platform",
- "cydrive-web",
  "dialoguer",
  "http",
  "http-body-util",
@@ -839,20 +853,6 @@ dependencies = [
  "cloudkit-core",
  "thiserror 2.0.20",
  "winreg",
-]
-
-[[package]]
-name = "cydrive-web"
-version = "0.7.2"
-dependencies = [
- "axum",
- "cloudkit-core",
- "mime_guess",
- "rust-embed",
- "serde_json",
- "tempfile",
- "thiserror 2.0.20",
- "tokio",
 ]
 
 [[package]]

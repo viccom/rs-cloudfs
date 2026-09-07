@@ -1,5 +1,5 @@
 [package]
-name = "cydrive-web"
+name = "cloudkit-web"
 description = "CyDrive web dashboard: the six-route aiohttp UI contract on axum"
 version.workspace = true
 edition.workspace = true

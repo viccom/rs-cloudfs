@@ -53,8 +53,8 @@ use cloudkit_core::rel_path::RelPath;
 use cloudkit_core::sync::{namespace_key, sync_once, SyncOutcome};
 use cloudkit_core::transport::CloudTransport;
 use cloudkit_core::vfs::{Vfs, VfsConfig, VfsError};
+use cloudkit_web::WebUiServer;
 use cloudkit_webdav::{CyDriveFs, WebDavServer};
-use cydrive_web::WebUiServer;
 use tokio::net::TcpStream;
 use tokio::sync::Notify;
 
@@ -429,7 +429,7 @@ pub async fn run_with_transport(
             .web_ui_host
             .parse()
             .with_context(|| format!("parsing web_ui_host {:?}", cfg.web_ui_host))?;
-        let ui_cfg = cydrive_web::WebUiConfig {
+        let ui_cfg = cloudkit_web::WebUiConfig {
             drive_letter: cfg.drive_letter.clone(),
             webdav_url: default_mount_url(cfg),
             chat_id: cfg.chat_id,

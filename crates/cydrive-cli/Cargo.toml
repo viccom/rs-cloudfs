@@ -25,7 +25,7 @@ comfy-table = "8.0.0"
 cloudkit-core = { path = "../cloudkit-core" }
 cydrive-platform = { path = "../cydrive-platform" }
 ck-telegram = { path = "../drivers/ck-telegram" }
-cydrive-web = { path = "../cydrive-web" }
+cloudkit-web = { path = "../cloudkit-web" }
 cloudkit-webdav = { path = "../cloudkit-webdav" }
 # Sync-lite client (Batch B4): the wire types this CLI maps onto core's
 # sync engine at runtime.
