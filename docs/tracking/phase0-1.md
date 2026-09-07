@@ -36,8 +36,8 @@ Batch P0 已收口；**Batch S（百度 spike）已收口（2026-09-07，止损�
 
 | # | 任务 | 状态 | 证据/注记 |
 |---|---|---|---|
-| R-1 | cloudkit-storage：StorageDriver/Capabilities/StorageError/VolumeId（TDD） | ⬜ | 百度 errno 三档映射单测预埋 |
-| R-2 | conformance_suite 框架 + mock 跑通八断言（interfaces §6，不得缩减） | ⬜ | |
+| R-1 | cloudkit-storage：StorageDriver/Capabilities/StorageError/VolumeId（TDD） | ✅ | 红 489852e → 绿 0625e65；types 语义 20 测试绿；百度 errno 三档 fixture 6 测试绿（110→Unauthorized{true}/111、-6→Unauthorized{false}，test-only，R1）；偏离草图裁决见绿提交正文（Listing/Box<dyn UploadStager>/ByteStream Stream 形态等 6 项） |
+| R-2 | conformance_suite 框架 + mock 跑通八断言（interfaces §6，不得缩减） | ✅ | 八条齐：①往返+commit-on-close 不可见 ②Range 半开/钳制/start≥size 声明 ③分页完整稳定有序 ④mkdir/delete 幂等声明恒定 ⑤错误表回放（mock 经百度三档码） ⑥rename 文件+目录 ⑦RESUME 差集（bytes_received 可观测，重传≤差集上界） ⑧并发读；tests/ 红绿两提交零 diff（断言零漂移）；套件实现期当场抓住 mock 的 ensure_parents 把末段建目录的 bug（①断言红）；workspace 门禁 555 passed 0 failed |
 | R-3 | CloudTransport 演进 + InboundCap/ChatCap 拆分（波及面清单先行） | ⬜ | |
 | R-4 | ck-telegram 适配 + →core 反向依赖解除（过渡豁免表销账） | ⬜ | |
 | R-5 | 消费方能力探测降级（bot worker/webdav，无能力禁用不 panic） | ⬜ | |

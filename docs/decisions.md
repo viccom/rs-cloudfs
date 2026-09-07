@@ -276,3 +276,14 @@
 - **采纳裁决**：B2 断点续传 = precreate 后**立即持久化 uploadid**（path/size/block_md5/完成位图随分片落盘），恢复时用旧 uploadid 重发一个缺失分片探活，活则只补差集（spike 实证：phase1=[0,1,2] 后 phase2 仅传 [3..7]，create errno=0 即服务端确认旧分片保留）。
 - **风险**：uploadid 会话有效期未知（spike 仅验证跨进程分钟级存活）；若过期则整体重传（兜底路径已实现）。附带发现一并约束 B2：服务端 `md5` 字段为内部 content-id 非字面 MD5（校验走内容比对/CDN content-md5 头）；rtype=1 为冲突重命名（覆盖语义需 rtype=3，待复核）；CDN 下载仅授权 ≤4MiB 有界 Range + netdisk UA。
 - **证据**：docs/reports/2026-09-07-baidu-spike.md §3。
+
+## 2026-09-07 Batch R：cloudkit-storage 契约面六项裁决（D1 草图偏离）
+
+- **背景**：R-1/R-2 落地 L2 存储抽象（红 489852e → 绿 0625e65，TDD）；D1 签名是草图，以下偏离点逐项裁决（正文亦见绿提交）。
+- **① list 返回 `Listing{entries, next: Option<PageCursor>}` 而非草图 `Vec<Entry>`**：游标型后端必须回吐续读位置，裸 Vec 使「分页语义统一在 Page」不可实现；offset 型后端以不透明令牌编码 offset 即可归一。
+- **② writer 返回 `Box<dyn UploadStager>`，close/abort 消费 `self: Box<Self>`**：dyn 兼容（`Arc<dyn StorageDriver>` 直传）+ 暂存器终态语义；`write(&[u8])` 而非 Bytes——trait object 调用面低摩擦，零拷贝诉求由 reader 侧 Bytes 承担。
+- **③ `ByteStream = Pin<Box<dyn futures Stream<Item=Result<Bytes, StorageError>> + Send>>`**：流中途错误必须承载分类学（R2），`tokio::io::AsyncRead` 做不到；AsyncRead 适配归 L4（WebDAV 层）。
+- **④ Capabilities 为 bool 字段 struct 而非 bitflags**：零新依赖；九位逐字段文档注释承载 R4 诚实语义（含 conformance 断言映射）；子集比较 `contains` 逐位判定。
+- **⑤ conformance 接入形态 = `assert_conforms(&dyn ConformanceHarness)` 函数 + `conformance_suite!` 宏糖**：错误回放（断言⑤）经 harness 注入符号码 + 期望映射——L2 运行时不认识任何后端错误码（R1）；百度 errno 三档只以 test-only fixture 钉死（110→Unauthorized{true}（自动刷新重放一次后仍失败）、111/-6→Unauthorized{false}），真实映射表归 ck-baidu（Batch B1）。
+- **⑥ RESUME 断言⑦观测点取「中断之后」**：重传量只计第二次上传实际发给后端的字节（第一段流量是正常上传成本非差集）；声明 RESUME 却不可观测 → 套件判失败（R4：声明即必须可验证）。
+- **验证**：tests/ 红绿两提交零 diff（`git diff 489852e 0625e65 -- crates/cloudkit-storage/tests/` 为空）；workspace 门禁 555 passed 0 failed；套件在实现期当场抓住 mock `ensure_parents` 把目标末段建成目录的 bug（断言① commit-on-close 不可见性红）——套件检出力的一次真实行使。
