@@ -7,7 +7,7 @@
 
 ## 当前焦点
 
-**未开工**——等待 Kickoff 启动（执行计划文末预授权指令）。
+P0-2 已收口（2026-09-07）；下一步 = P0-3（`scripts/check_layers` + CI 秘密扫描）→ P0-4（WSL 通道 + `--version`）。
 
 ---
 
@@ -15,8 +15,8 @@
 
 | # | 任务 | 状态 | 证据/注记 |
 |---|---|---|---|
-| P0-1 | worktree/分支建立（feat/phase0-1） | ⬜ | |
-| P0-2 | crate 改名 cydrive-*→cloudkit-*/ck-*（逐 crate 提交，二进制名不变） | ⬜ | |
+| P0-1 | worktree/分支建立（feat/phase0-1） | ✅ | 负责人预授权 P0 直 main（Kickoff 指令），不开 worktree |
+| P0-2 | crate 改名 cydrive-*→cloudkit-*/ck-*（逐 crate 提交，二进制名不变） | ✅ | fe61e8e / 83cc23d / 5f2b986 / 8bc031f / 360a675 / e6581f9 / 50d13b2（core→cloudkit-core、telegram→drivers/ck-telegram、sync→cloudkit-sync-server、webdav→cloudkit-webdav、web→cloudkit-web、platform→cloudkit-platform、cli→cloudkit-cli）；每 commit 前三步门禁全绿，测试计数保持 527；`[[bin]] cydrive`/`cydrive-sync-server`、`CYDRIVE_*` env、`cydrive_sync.db` 等契约未动 |
 | P0-3 | `scripts/check_layers` + CI 秘密扫描步骤 | ⬜ | |
 | P0-4 | 门禁全绿 + WSL 通道（~/rs-cloudfs）建立 + `--version` 验证 | ⬜ | |
 
