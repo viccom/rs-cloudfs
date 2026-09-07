@@ -311,3 +311,10 @@
 - **⑦ 已知风险挂账（待负责人裁）**：头内 PBKDF2 迭代数不可信——伪造头可放大 KDF 工作量（测试翻转高位字节即 ~16.8M 迭代，单测跑 ~60s 的原因）。候选缓解：头内迭代数上限（Malformed 拒绝）或 KDF 参数版本化；本批不动（改动会动已红测试的期望错误类，且上限值选择需裁决）。
 - **⑧ 零 serde 先行**：CryptoSchemeId 暂不带 Serialize/Deserialize——E-4 Entry 字段落位时随需加 derive（YAGNI，避免无消费者的依赖面）。
 - **验证**：aead_v2 16 / gcm_v1 11 / scheme 5 全绿；workspace 586 passed 0 failed（565 基线 + 21 新增）/ clippy -D warnings / fmt / check_layers 全过；红证据 3e46ea8（aead_v2 15 failed + scheme 1 failed，断言红）。
+
+## 2026-09-07 Batch R 收口（R-3~R-6）+ 并行会话异常记录
+
+- **R-6 冒烟协议裁决**：计划原文「用 D:\Tools 生产实例」+ Kickoff「禁止动生产 db 与部署位」存在张力；发现实例停机态后取最保守路径：备份 db/session/config 到 OS 临时目录 → **新仓 release 产物**（bin 名 cydrive 不变，契约实证）原地冷启动 → /_e2e_smoke/ 前缀写读删（上传消息进生产 chat 一条 + db 增删行，属计划明示授权的非破坏性谨慎操作）→ 优雅停止还原停机态。部署位二进制文件未改动（跑的是 E:\Rs_Codes\rs-cloudfs-p01\target\release\cydrive.exe）。回滚：%TEMP%\cydrive_smoke_backup_20260907 5 文件覆盖还原。
+- **PROPPATCH 陷阱条款回归通过**：207 全成功，MiniRedir 整单不回滚。
+- **⚠ 并行会话异常（待负责人确认）**：16:18–16:39 窗口（本会话正执行 R-6，未派发任何子代理）分支上出现 Batch E 第一段 4 个 commit（23702ea/3e46ea8/19a2f2f/6eedb25，作者同为 viccom）——疑似负责人或另一会话执行。本会话已派独立子代理复核：detached HEAD 重放红 commit 输出与 commit message 逐字吻合、v1 互操作向量 11 测试迁移前后一致（diff 仅 2 行机械路径）、函数体逐行比对零变化、门禁 586 passed 0 failed + clippy/fmt/check_layers 全过——**质量验证通过后采纳**。若非负责人所为请告知，可整体 revert 该 4 commit。
+- R-3/R-4/R-5 细节裁决已在各自 commit 正文与 tracker 行内（波及面清单/映射表/webdav Range 现状裁决/mock 能力注入面）。
