@@ -1,80 +1,46 @@
-# rs-CyDrive — Agent 工作须知
+# rs-cloudfs — Agent 工作须知
 
 ## 项目信息
-- 项目：CyDrive 的 Rust 完全重写（Telegram 无限云盘：本地 WebDAV 服务挂载 Windows `Y:` 盘 + Web 仪表盘 :8088 + Bot 命令）
-- 技术栈：Rust（edition 2024）/ tokio / grammers（MTProto）/ dav-server（WebDAV）/ axum / rusqlite
-- **北极星（负责人 2026-09-02 裁决）**：「一个稳定好用的程序」——方向性取舍偏保守/稳定，总则见 docs/decisions.md
-- **权威设计文档：`docs/rust-rewrite-design.md`**——crate 划分、选型依据、已核实的 API 面、里程碑与验收标准都在其中，动工前必读
-- 行为基线与兼容契约：见 `E:\GitHub\CyDrive`（Python 版）根目录 `AGENTS.md` 的「契约」节——DB schema、加密格式、分块命名/caption、端口、注册表行为，破坏即与现有用户数据不兼容
+- 项目：rs-cloudfs = rs-CyDrive × PrivateCloudFS 融合体——多云存储平台（统一存储抽象之上的 WebDAV 挂载/仪表盘/同步/CLI；后端：telegram / baidu / local，未来 115/123/s3）
+- 技术栈：Rust（edition 2021）/ tokio / axum / dav-server / rusqlite(bundled) / grammers(telegram) / hyper-rustls
+- **血统**：fork 自 rs-CyDrive（全 git 历史；remote `upstream-cydrive` 只读参照，禁止 push）；PrivateCloudFS（`E:\Go_codes\PrivateCloudFS`，Go）是设计参照系与踩坑情报源（情报附录在 multicloud 计划）
+- **北极星**：「一个稳定好用的程序」——重组已验证资产，不重写
+- 行为基线与兼容契约：Python 版 CyDrive 契约（DB schema/分块命名/caption/端口）经 rs-CyDrive 继承，telegram 驱动延续遵守（红线 R6）
+
+## 必读（开工前，按序）
+1. `docs/plans/2026-09-07-cloudfusion-foundation.md` —— 融合基线设计 v1.1（阶段计划/裁决状态/E2E 凭据策略）
+2. `docs/standards/architecture.md` —— 六层架构 + 红线 R1–R7（**L2 以上禁 import 驱动符号**等）
+3. `docs/standards/code-style.md` / `interfaces.md` / `logging.md` / `documentation.md` —— 门禁与规范
+4. `docs/plans/2026-09-06-multicloud.md` —— 百度情报附录 A（端点/参数/errno/dlink/Range 实证）
+5. `docs/decisions.md` —— 历史裁决（自 rs-CyDrive 继承，继续追加）
 
 ## 当前阶段
-**M1 已完成**（分支 `feat/m1-core`，自 feat/m0-core 切出；M0 内容见 git 历史：workspace + config/cache/chunker/crypto/database/logging/rel_path 七模块 + 互操作契约测试；CI/keyring/deny 归属待裁决见 `docs/decisions.md`）。M1 交付（130 测试全绿）：
-- `transport`：`CloudTransport` trait（async_trait，dyn 兼容）+ UploadJob/UploadReceipt/RemoteHandle/IncomingEvent/TransportError（FloodWait{seconds} 归一化）+ `MockTransport`（脚本化错误注入；分块命名 **`{basename含扩展名}.part{000起0基三位}`**、caption `i/n` 1 基——契约 3 勘误版，见 decisions.md 2026-09-02（勘误条）；open/open_range 切片；drain-once incoming）
-- `upload_queue`：有界 mpsc + N worker；`decide_retry` 纯函数（指数退避封顶；FloodWait 按服务端秒数精确等待且不计入降级）；连续失败达 max_attempts 降级停试；成功才写 DB+删缓存；0 字节跳传输；`requeue_pending` 只入队本地存在的行
-- `vfs`：门面装配——`put`（.tmp+原子 rename→pending 行→入队，enqueue 后无 await 点保证受理语义）、`hydrate`（缓存命中优先→分块合并下载→加密行解密为明文缓存→LRU 驱逐并清被逐行 is_cached）、queue_stats/shutdown 委托
-- `MetaDatabase` 已内部 Mutex 化支持 Arc 跨 await（选型裁决见 decisions.md）
-- 语义裁决与延后项见 decisions.md 2026-09-02 三条（FloodWait 不降级/持久化失败不重传/upload_failed 列延后到迁移单元）
-
-**M2 进行中**（分支 `feat/m2-telegram`，自 feat/m1-core 切出）：新 crate `cydrive-telegram`。已完成首单元（3f878e2 红 + 9607457 绿，15 测试）：纯契约模块——`caption.rs`（单文件/多块 caption **Python 逐字快照**：Path:/File:/Part: 标签、KB 整除、加密后缀；`clean_rel_path` 按基线求值顺序（先 strip '/' 后替换 '\'，反斜杠输入产出 `//a/b` 是基线真实行为）；`part_document_name` 复用 core `chunker::part_name`）、`flood.rs`（`parse_flood_wait`：FLOOD_WAIT_N 秒数解析、裸 FLOOD_WAIT=0、其余 None）、`range.rs`（`range_plan`：skip/head/take 换算 + chunk_size 4096 整倍数且 4096..=512KB 校验）。
-M2 已完成第三单元（70617a9，编译验证 wiring，无新测试）：`src/transport.rs`——`GrammersTransport` 实现 `CloudTransport`：connect（`SenderPool::new`+`tokio::spawn(pool.runner.run())` 驱动、`bot_sign_in`、chat 解析 `PeerId::from_bot_api_dialog_id`）、upload（`plan_chunk_sends` → 每块 `File::seek+take` 流式切片 → `upload_stream` → `send_message` 带 caption/document → UploadReceipt；加密 TODO(M2 encryption)）、open（逐 part 全量拉取 + serve_range；已知限制：整文件内存缓冲，M3 走 VFS 水合）、open_range（**part 边界从远端 document size 现场推导**——RemoteHandle 不带 chunk 计划；每相交 part `range_plan`+`chunk_size/skip_chunks`+`serve_range`）、delete_remote（0 删→NotFound）、错误映射（RpcError{name,value} 重构后走 `parse_flood_wait`；Dropped→Disconnected；client 内建 AutoSleep 与 Python FloodWait 语义对齐）；`incoming()` 为 todo!()（留给入站单元）。依赖 `grammers-client = "=0.10.0"` + `grammers-session = "=0.10.0"`（crates.io 精确锁替代 git-rev；0.10 实际 API 面与设计文档补遗差异 + **session 持久化已裁决落地（见第四单元）**）。
-M2 已完成第四单元（48f41ab 文档 + 4d1c771 实现，4 新测试）：**session 持久化**——in-tree vendor `crates/vendor/grammers-session`（上游 0.10.0 拷贝，仅 SqliteSession 的 libsql→rusqlite(bundled) 移植，write-through/表结构逐字保留；VENDOR.md 记来源与 re-vendor 指引）+ 根 `[patch.crates-io]` 重定向（`cargo tree -i` 证实全图单一份，MSVC LNK2005 消除）+ transport 接线 `SqliteSession::open(cfg.session_path)`（契约 3 `cynet_bot_session` 文件落地、重启免登录）。vendor 为 **workspace exclude 的外部 path dep**（cap-lints allow，fmt/clippy 门禁不覆盖上游代码）。⚠ M6 发布前需为 vendor 补上游 LICENSE 文本（crates.io 包不含，VENDOR.md 已注明来源）。
-M2 剩余（让位于垂直切片，可用优先，见下）：入站 stream_updates 索引 + Bot 命令（含补齐 /get，`pool.updates` receiver 须构造期消费，transport.rs 有 NOTE(inbound) 锚点）→ 加密上传路径（TODO(M2 encryption)）→ 真机三档 smoke（100MB/2GB/3GB）+ FloodWait 注入「待人工」。**grammers 0.10 API 以 `src/transport.rs` 实现为权威**，设计文档补遗节待回填。
-
-**垂直切片（可用优先，2026-09-02 负责人指令 + decisions.md 队列重排条；自动化已提频至每小时）**：
-- **A 已完成（bd5e877，19 新测试，工作区 178 全绿）**：`cydrive-webdav`——`CyDriveFs` 实现 dav-server 0.11 `DavFileSystem`（**trait 非 async_trait，手写 FsFuture/Box::pin**；其余与设计文档差异见提交信息：symlink_metadata 转发 metadata、DavMetaData 是 DynClone、etag() 需覆写、mime 无 FS 接口由库按扩展名推导）：metadata/read_dir/open 读写/create_dir/remove_dir/remove_file/rename/get_quota（used=DB 总量、total=used+10TB 契约）；写入 `.tmp` staging + **flush=PUT 提交点**（dav-server 语义核实）原子入队；copy NotImplemented（Explorer 复制走 PUT）。基线镜像：DELETE 不删远端（同 Python）、MKCOL 同；**MOVE 基线本来就是坏的（500），定义稳健语义**：`MetaDatabase::rename_path` 原位 UPDATE（保 file_id→chunks 链接防孤儿化）+ 缓存子树移动 + 远端不动。core 增 `Vfs::put_staged`（大文件不整文件读回）+ `rename_path`，均带测试。边界：range PUT 安全但不做 RFC 补丁合并；rename 后远端 caption 过期（无碍重组）。
-- **B 已完成（1660ba5，9 冒烟测试，工作区 187 全绿）**：`src/server.rs`——`WebDavServer::serve(fs, addr)`（dav-server 0.11 **无自带 hyper 装配**，照 examples/hyper.rs 自起：TcpListener → accept loop → http1 serve_connection；`DavHandler` 直接对接 hyper 1.x Body）+ **FakeLs 锁系统**（不装则 ALLOW 不含 LOCK/UNLOCK，Explorer 挂载必需）+ 方法集 WEBDAV_RW + principal("cydrive") + `local_addr()`（:0 → 实际端口）+ 幂等 graceful shutdown（hyper 1.x `Connection::graceful_shutdown`）。冒烟：PROPFIND 207/GET 字节与头/Range 206/PUT→队列全周期/0 字节 PUT/MKCOL 201 重复 405/DELETE 204 不删远端/MOVE 改名/OPTIONS DAV 头与 ALLOW。实测语义记录：OPTIONS 对 collection 的 ALLOW 不含 PUT（dav-server 策略）；hyper 用 "1"（Cargo.lock 锁 1.11.1，semver 稳定不 exact-pin）。
-- **C 已完成（4f09bec，6 端到端测试，工作区 193 全绿；`target/debug/cydrive.exe` 已产出）**：`cydrive-cli`（bin 名 `cydrive`，clap 唯一子命令 run）——`discover_config`（cwd: config.toml → legacy config.json → 带指引的 Err，env overrides）→ validate/is_configured 门 → logging init → `GrammersTransport::connect` → `run_with_transport`（**transport 注入 seam**：e2e 全走 MockTransport，真机路径编译验证）→ db/cache → Vfs → **requeue_pending（WebDAV 前，断电恢复）** → `WebDavServer::serve` → ctrl_c → RunHandle::shutdown（WebDAV 排干 → 队列排干）。e2e：PROPFIND/PUT 全周期到 Mock 远端、pending 启动重入队、toml 优先/legacy 兼容、缺配置可行动错误、优雅停机拒连。core 增 `Vfs::requeue_pending` 委托（+10 行，e2e 驱动）。与 Python cli.py 顺序差异三条（connect 提前=fail-fast、requeue=新增修复、退出排干=加强）见提交信息。
-- **D 已完成（bb0c6c9，11 新测试 + 2 #[ignore] 真机项，工作区 204 全绿）**：`cydrive-platform`——纯逻辑（normalize/pick 盘符链 `Z,Y,X,W,V,U,T,S` 基线镜像含全占用回退、bitmask 解码、mount/unmount 命令构造、契约常量）+ `windows.rs`（cfg(windows) 真实现：sc 查启 WebClient、winreg 写 `FileSizeLimitInBytes=0xFFFFFFFF`/`BasicAuthLevel=2` + net stop/start、mount 先卸载清冲突再 `net use /persistent:no`、盘符 std 探测 A..Z）+ `windows_stub.rs`（cfg(not(windows)) 全 Unsupported，Linux 可编译由 cfg 纪律保证）。CLI 接线：`mount/unmount/fix-reg` 子命令（flag>config 解析纯函数可测）+ `run_with_transport` 自动挂载（auto_mount_drive 且 Windows；失败仅 warn 服务继续）+ `RunHandle.mounted_letter`（shutdown 末尾卸载）。真机项 `#[ignore]`：`ignored_mount_unmount_roundtrip`（CYDRIVE_TEST_MOUNT_URL）、`ignored_optimize_webdav_registry`（管理员）。
-- **垂直切片 A–D 全部完成 =「可运行程序」达成**（2026-09-02）：`target/debug/cydrive.exe`，`cydrive run/mount/unmount/fix-reg`。真机验收待人工：bot token config 冒烟 + Explorer 挂盘实测 + ignored 真机测试（管理员）。
-- **稳定性补齐 E1+E2 已完成（61b5a05 + cc292e3，5 新测试，工作区 209 全绿）**：E1 `hydrate` 超时——`VfsConfig.hydrate_timeout`（默认 180s，基线并发语义）包裹 transport.open 起的全部下载/写盘/解密，超时 `VfsError::Timeout` 且**统一清理所有失败路径的 .tmp**（含既有错误路径补修）；MockTransport 增 `open_delay` 测试旋钮。E2 上传侧 sha256——≤100MB（`SHA256_MAX_BYTES` + `should_hash` 纯函数）成功上传后哈希明文入行（失败仅 warn 不降级），**sha 版 ETag（契约 6）自此可达**。已修（0.5.2）：解密失败不再残留密文（staging 内解密+原子晋级，Python 基线同款缺陷经授权偏离）。
-- **M2 遗留①入站索引已完成（4a52949，7 新测试，工作区 216 全绿）**：`core::inbound`（`spawn_inbound_worker`：File→`Vfs::index_inbound` 根目录元数据索引（Python 基线逐字段镜像：同名覆盖/嵌套名原样/空名回退 `Telegram_File_{id}.bin`/chunk_count=1/mime 恒 None 差距已注）；Command 日志占位待 Bot 单元；Err 事件不杀 worker）+ **transport `incoming()` 真接线**（构造期保留 `pool.updates`，`stream_updates`+`map_update`：chat 过滤、media 优先于 text、Document/Sticker/Photo→File；`NOTE(real-machine)` 待真机验证）+ CLI 集成（serve 前启动 worker，RunHandle 私有字段 join）。MockTransport 增强：`incoming_results` Err 注入（原 incoming 契约零改动）。
-- **M2 遗留②Bot 命令已完成（2f334b0，10 新测试，工作区 226 全绿；trait 演进裁决见 decisions.md 2026-09-02 条）**：`core::bot::handle_command`——/help /stats /search **基线文本逐字镜像**（含 startswith 怪癖、GB/MB 分支、15 行上限、KB 整除）+ **/get 补齐**（精确路径→唯一名命中→hydrate→send_document；miss/ambiguous/失败均有回复，新文本已标注）；CloudTransport 增 provided 方法 `send_text`/`send_document`（默认 Unsupported，非 breaking），MockTransport 覆写记录（`sent_texts`/`sent_documents` 检视）；worker Command 臂接 dispatch（Err 仅 warn）；`Vfs::db()` 访问器；GrammersTransport 真接线仅编译验证（NOTE(real-machine)，真机待验）。
-- **M2 遗留③上传加密已完成（13d38d4，7 新测试，工作区 233 全绿；负责人批复整文件语义、流式列 v2，见 decisions.md）**：队列侧整文件加密——`UploadQueueConfig.encryption_password` + 行 is_encrypted 双条件；sha256 对**明文**、行 size=明文/chunk_count=密文块数（密文=明文+44B 恒定开销，块边界按密文）、`{name}.enc.tmp` 成败均清、明文缓存仍仅成功删；CLI `vfs_config`（已 pub）补 `enable_encryption AND password` 映射；**离线全闭环证明**：put→上传密文（mock 内可解密回明文）→hydrate 回明文。0 字节不加密（契约）。已知微差：跨重试复用同一密文文件（Python 每次重加密，字节等价）。
-- **M2 全部闭环（2026-09-02）**：传输壳/session 持久化/纯契约模块/入站索引/Bot 命令（/get 补齐）/上传加密。真机 smoke（100MB/2GB/3GB + Bot 命令 + FloodWait）仍待人工。
-- **M4 已完成（d7f7413，10 新测试，工作区 243 全绿）**：`cydrive-web`——axum `=0.8.9` :8088 六契约路由逐字段镜像 app.py（/api/files 16 键 is_* 发 0/1 int、/api/stats 11 键全集含 host/port 反解、upload multipart `file`+DefaultBodyLimit 1900MB+受理即回、**delete 单次**（修复 Python 调两次，设计文档授权）、download hydrate 流式+inline disposition+逐字 404 正文、`GET /` 静态）；前端资产（css/js/img/templates）**拷贝自 Python 版且 byte-identical**，rust-embed 嵌入（debug 读盘/release 编译期嵌入——release 验证属 M6）；CLI 按 enable_web_ui 接线（**注意 CyDriveConfig 默认 true**，e2e 需显式关否则 8088 互撞），shutdown 顺序 WebDAV→WebUI→队列→inbound→卸载。已知差距：delete 不清孤儿缓存副本（注释标注）；新路由（/api/list、Range 下载、/api/queue）为设计文档增量，未做（下批）。
-- **M4 增量路由已完成（95ffaf9，7 新测试，工作区 250 全绿）**：`/api/list?path=`（归一 + 空目录 200/不存在 404/非法 400 语义固化；**空盘根 404 是规则直接后果**已注释）、`/api/download` 标准 HTTP 单区间 Range（206 精确切片+Content-Range、a≥size 416、畸形/多区间宽容回 200——aiohttp 基线能力）、`/api/queue`（四计数器+pending）。实现注：axum 无 query feature，手写 ~30 行 query 解析（`+` 不解空格——路径组件语义，注释声明）。
-- **M5-1 已完成（f32fc2c，9 新测试，工作区 259 全绿）**：凭据保管 + migrate——core `credentials.rs`（CredentialStore trait + InMemoryStore + SERVICE/USER 常量）、cli `keyring_store.rs`（**keyring 3.6.3**，平台 target features：windows-native/apple-native/sync-secret-service+crypto-rust；可用性=只读探测；docs 4.x API 不可用已按实查调整）、配置优先级 **env > 文件 > keyring**（`with_credential_backfill` 仅空值回填；discover 无凭据库降级 InMemory+warn，**migrate 硬失败**——秘密迁进易失内存比失败更危险）、`save_toml_scrubbed` 脱敏写入、`migrate` 子命令（json 优先源→凭据入 store→脱敏 toml→db/缓存零拷贝采用（Python 默认名检测）→DB 计数报告→json 不自动删→session 重登说明；幂等）。`#[ignore]` 新增 keyring 真机往返（未手动执行过）。
-- **M5-2 已完成（04b9f58，13 新测试，工作区 272 全绿）= M5 收官**：`doctor`（DoctorContext 注入式检查聚合：config/db/cache/双端口 bind 语义 Ok/Warn，端口占用=Warn 非 Fail；platform_checks：注册表只读对照（`read_webclient_params`+纯评估三态）+WebClient 运行态 + **telegram 连通恒 Warn 指引 run**——离线不拨号，诚实边界）；`stats`（comfy-table 8.0，含人类可读容量）；`setup`（dialoguer 0.12 交互薄层 + 纯逻辑全测：token 循环校验/apply/persist 脱敏入 store/roundtrip discover）。自定裁定已注明：无冒号 token 直接重问（Python 是 confirm 可保留）；db/cache 不存在=Warn（新装语义）。子命令全集：run/mount/unmount/fix-reg/migrate/stats/doctor/setup（对齐 Python + migrate/doctor 增量）。
-- **M6 自动可做部分已完成（5a40192）= 全队列（M1–M6 自动化项）交付完毕（2026-09-02）**：vendor LICENSE-MIT/APACHE 自上游 Codeberg（Lonami/grammers）取回入库；cargo-deny v0.20.2 安装并跑通 licenses/sources/bans（**零 GPL**，唯一 MPL-2.0=htmlescape 已注释；advisories 因本机 github.com 不通诚实降级，留 CI 首跑）；`cargo build --release` 首验（**13.1MB** vs debug 20.6MB，空目录自包含 `--version/--help/doctor` 通过，**rust-embed 编译期嵌入经二进制取证证实**——CSS 字节特征在 release 二进制内）；`.github/workflows/ci.yml`（win+linux 矩阵三步门禁，未 push 待人工激活）；cargo-dist 0.32.0 `[workspace.metadata.dist]` 配置（实跑留发布时刻）；`perf_read_path` 基准（10 万行真实 SQLite，list_dir("/") 0.32ms / 1000 行目录 2.7ms，**余量 34–300×**，#[ignore] 按需跑；XML 序列化层未计，注明）。工作区 272 测试零回归。
-- **真机首验反馈修复完成（2026-09-03，282 测试全绿）**：① Explorer 拷贝失败根因=**PROPPATCH 405 → MiniRedir 回滚**（真机抓包：空PUT 201→LOCK 200→PUT body 204→PROPPATCH 405→DELETE 回滚；数据其实已上传成功）；修复=方法集加 PROPPATCH+patch_props 全成功（dav-server 对 getlastmodified 内部 403/外层 207，与 Apache mod_dav 同型）；本机 Copy-Item 复测 COPY_OK。② sha256 挪到上传前（DeleteOnUploadTransport 确定性复现竞态）。**真机全闭环达成**：Explorer 同栈拷贝→WebDAV→队列→经 Clash 到真实 Telegram→stats uploaded_files=1。
-- **SOCKS5 代理支持已完成 + 首次真实 Telegram 互通达成（2026-09-03）**：`CyDriveConfig.proxy_url`（toml 键 `proxy_url`，env `CYDRIVE_PROXY_URL`，空串=清除）→ `TransportConfig` → `SenderPool::with_configuration(ConnectionParams.proxy_url)`（grammers-client `proxy` feature → tokio-socks）。真机验证：经 Clash 7897 用真实 token 完成 bot_sign_in，仪表盘 200 / api/stats 200 / PROPFIND 207（decisions.md 2026-09-03 条）。MTProto fake-TLS 密钥直吃列 v2。
-- **剩余全部为人工项**（Explorer 实测/挂盘等）：见 decisions.md 与下「待人工总清单」；网络前提 = Clash 等本地代理运行中 + config 配 proxy_url。
-- **Tier-1 实用功能批已完成（2026-09-03，worktree feat/tier1-utilities，TDD 红→绿全程，workspace 317 测试零回归；2026-09-04 审查修复批：connect 死线接入 push/pull、pending 删除保护三面（UploadPending/409/Forbidden，幽灵行放行）、cache clear 单点化、目录 push 门禁——workspace 325 全绿，decisions.md 当日条）
-- **服务生命周期批已完成（2026-09-04，worktree feat/service-lifecycle，win 341 / wsl 67 测试全绿）**：①`cydrive stop`——回环控制通道（`cydrive.control` 端口文件 + STOP 行协议，cli `control.rs`），三停机源（Ctrl+C/SIGTERM/stop）经 ShutdownWatch 汇流、停机序列唯一 stop 任务执行恰好一次，RunHandle 公有签名零变化；②SIGTERM cfg(unix) 真实现 + WSL 真信号用例 PASS（非 unix 存根 pending）；③doctor headless keyring 提示（token 空+keyring 不可达→Warn 指 CYDRIVE_BOT_TOKEN，DoctorContext 增注入字段）；④deploy/cydrive.service（SIGTERM 原生、TimeoutStopSec=600）；⑤platform Linux 挂载链（detect gio→davfs2 纯函数 + cfg(linux) mount/unmount + CLI unix 分支；run 自动挂载与 davfs2 secrets 配置延后）。顺手修 M5-2 遗留 doctor cfg!→#[cfg] 缺口（首次 unix 编译暴露）。davfs2 真机往返待真实 Linux 主机；systemd unit 未实跑。运行期产物 `cydrive.control` 已 gitignore。
-- **status + Linux 自动挂载批已完成（2026-09-04，worktree feat/status-and-automount，win 352 测试全绿 + WSL 真机 e2e PASS）**：①`cydrive status`（PING 协议 + net use//proc/mounts 解析纯函数 + StatusReport/collect/render，跨平台）；②`mount_point` 可选键（绝对路径，None=$HOME/CyDrive，Windows 忽略）；③Linux run 自动挂载（auto_mount_target 决策 + stale 清理 + 非交互挂载失败仅 warn + 停机卸载 mounted_point 字段）。裁决与真机证据见 decisions.md 当日条。**：① CLI `push <path> [--dest]` / `pull <path> <out>`（`Vfs::ingest_file` 流式 staging，绕开 Explorer 4GB-1 与 Web UI 1900MB 上限；push 排干后报终态）+ `cache stats|clear`（**A1 语义：clear 只清已上传副本，pending staging 保留**）；② Bot 命令 `/ls [path]`（20 条上限）/mkdir/rm（远端消息保留）/quota/queue（/queue 与 web /api/queue 同源口径）；③ 上传降级 bot 通知恒开（send_text best-effort）；④ config 新键 `upload_workers`(1..=32,def 2)/`queue_capacity`(>=workers,def 256)/`hydrate_timeout_secs`(1..=86400,def 180) → `vfs_config` 接线，legacy json 拒收三键。core 新增 `Vfs::create_dir/remove_file/cache_clear/ingest_file` + `MetaDatabase::clear_cached_flags/pending_file_paths` + `CacheManager::clear_except`；`VfsError` 新 variant Exists/ParentMissing（webdav 映射 Exists→Exists、ParentMissing→NotFound 409）。执行期裁决见 decisions.md 2026-09-03 tier-1 条（含 Task1 门禁漏检 webdav 断链的教训）。真机 push/pull 冒烟待人工。
-- **sync-lite 批已完成（2026-09-04，worktree feat/sync-lite，TDD 红→绿全程，workspace 436 绿 / WSL 343 绿；已合并 main @ 0.5.0）**：云端元数据同步（家庭版）——新 crate `cydrive-sync`（lib+bin `cydrive-sync-server`：SyncStore LWW 引擎/每 ns 单调版本计数器/墓碑、axum POST /v1/push + /v1/pull、env SYNC_LISTEN/SYNC_DB/SYNC_SECRET、deploy/cydrive-sync.service、push body 上限 64MB、secret 只 gate push）+ core `sync.rs` 纯内核（payload=files 行+chunks JSON、row_hash=SHA-256、namespace_key=hex(SHA-256(token:chat))、push-diff、pull-apply（幂等闸/墓碑删三处/ghost-pending 跳过/remote-wins 覆盖清陈旧缓存）、sync_once；**payload 排除 is_cached/id/created_at/updated_at**（不可恢复字段入 payload 会双端互推不收敛）、**max_pulled 只由 pull 推进**（计划原文修正，防漏拉））+ config `sync_url`/`sync_interval_secs`（legacy json 拒收）+ MetaDatabase `sync_mirror`/`sync_state` 纯增量表 + cli `HttpSyncClient`（hyper-util）/`cydrive sync` 子命令（secret 走 env `CYDRIVE_SYNC_SECRET`）/run 周期任务（失败仅 warn）。真机验收：本机 server + 生产 db 只读副本实例 A ↔ 空盘 B 收敛/LWW/墓碑/幂等全过；WSL 空盘实例 C 跨 NAT 到宿主 server 与 A 全字段一致；生产 db 哈希前后核验未变。执行期裁决全文见 decisions.md 2026-09-04 sync-lite 条。
-M2 已完成第二单元（34e2476 红 + 356009c 绿，10 测试）：纯适配逻辑——`plan.rs`（`plan_chunk_sends`：单/多块发送计划，name/caption/byte_len 全走契约模块，纯函数不触盘）、`stream.rs`（`serve_range`：RangeStream 状态机，head-skip/take 裁剪、迭代器耗尽不报错，coerce 到 ByteStream；为此 crate 直接依赖 bytes/futures-core，版本同 cydrive-core）、`config.rs`（`DEFAULT_API_ID=6`/`DEFAULT_API_HASH="eb06d4abfb49dc3eeb1aeb98ae0f581e"`/`DEFAULT_SESSION_STEM="cynet_bot_session"` 契约常量 + `TransportConfig`）。grammers 接入与 transport 壳是下一步（编译验证的 wiring，纯逻辑已全部就绪）。
+**Phase -1 规范先行已完成（2026-09-07）**；仓库 = fork 基线代码（cydrive 0.7.2，527 测试绿）+ 治理文档集。**下一步 = Phase 0 搬迁批**（crate 改名重排为 cloudkit-*/ck-*，见基线设计 §5，纯搬迁每步测试绿）→ Phase 1（spike/trait 瘦身/加密 v2）→ Phase 2（ck-local + ck-baidu + 端到端硬验收）。
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 全部 527 测试（core 279 + sync 61 + cli 90 + telegram 29 + webdav 30 + web 18 + platform 20；#[ignore] 真机/真网项照旧）
-
-## 待人工总清单（自动交付完成后剩余项）
-1. **真机 bot token 冒烟**：config（setup/migrate 产物）→ `cydrive run` → Explorer Y: 盘拖入/下载/播放；三档文件（100MB/2GB/3GB 分块）+ FloodWait 实测
-2. **Bot 命令实测**：/stats /search /get（含加密文件）；手机发文件 → 盘内出现（入站映射 NOTE(real-machine) 待验）
-3. **Explorer 挂盘全清单 + litmus 套件**（litmus 工具未装，可后续自动化补）
-4. **#[ignore] 真机测试 ×3**：mount/unmount 往返、注册表调优、keyring 往返（管理员）
-5. **push 激活 CI**（本地三步门禁已等效预验）；cargo deny advisories（需 github.com 连通）；cargo-dist 实跑（发布时刻）
-6. **性能真机对照**：PROPFIND XML 层与 2GB 吞吐（离线 DB 层基准已 0.32/2.7ms）
-8. **sync server 生产部署（人工）**：cydrive-sync-server.exe（Windows 构建产物已放 D:\Tools
-s-CyDrive；Linux 服务器需自建 release）部署到负责人服务器 + deploy/cydrive-sync.service + SYNC_SECRET + 反代 TLS；随后各机 config.toml 配 sync_url
-7. 可选后续：rs-CyDrive README 刷新（M0 时代内容已过时）、分支合并策略（feat/m2-telegram 含全部工作，main 落后）
-cargo clippy -p cydrive-core --all-targets -- -D warnings
+cargo test --workspace --no-fail-fast            # 527 测试（fork 基线；Phase 0 后更新本行）
+cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
-python scripts/gen_compat_fixtures.py       # 重新生成互操作 fixture（需能 import E:\GitHub\CyDrive）
 ```
 
-## 硬性规则
-- 兼容红线（设计文档「兼容契约」节）不经用户明确同意不得改动；契约测试必须双向（Python 生成样本 ↔ Rust 实现）
-- grammers 用 git 依赖锁精确 commit（官方 minor 即换 TL layer，视同 breaking）
-- 质量门禁（照搬 M0 定义）：`cargo fmt --all -- --check`、`cargo clippy --all-targets -- -D warnings`、`cargo test` 全绿才算完成；`cargo deny check` 把关许可证
-- 错误处理：库 crate 用 thiserror，CLI 顶层用 anyhow，Result 模式；生产路径禁止 unwrap/expect
-- 平台代码 `#[cfg(windows)]`/`#[cfg(unix)]` 隔离，Windows 模块必须保证在 Linux 可编译（对应 Python 版 git 历史 feaac0b 的教训）
-- 运行期产物绝不提交：config.toml/json、*.session、*.db*、Telegram_Cache/ 等（见 .gitignore）
-- 提交信息 conventional commits（feat/fix/docs:），与两个仓库现状一致
+## 硬性规则（摘要，全文见 standards/）
+- 七条架构红线（architecture.md §2）——违反即返工
+- 凭据红线：`test/` 全目录 gitignore；凭据只从 `E:\GitHub\rs-CyDrive\test\` 或 env 读；**任何凭据值不入代码/文档/日志/提交**（负责人后期轮换授权）
+- 质量：TDD 红→绿留证、断言零漂移、workspace 级门禁、真机测试 `#[ignore]`
+- 提交：conventional commits、不加署名尾注、批次 worktree 隔离
+- 文档：行为变更同批更新 README/AGENTS 计数/相关 docs；裁决入 decisions.md
 
-## 已知陷阱（实现时直接查设计文档「深度调研补遗」节）
-- axum Multipart 默认 2MB 体积上限——上传路由必须显式 DefaultBodyLimit
-- grammers FloodWait 藏在 `InvocationError::Rpc` 里，用 `err.is("FLOOD_WAIT")` 判定、从错误名解析秒数；库级重试用 RetryPolicy trait
-- dav-server 的 DavFile 是 Bytes/seek 模型（read_bytes/seek/flush），不是 AsyncRead——直通流需自行包装 DownloadIter
-- Windows WebClient：资源管理器上传单文件硬上限 4GB-1（注册表 DWORD 极限），平台级无解；挂载需 Basic 认证 + BasicAuthLevel=2
+## 已知陷阱（自 rs-CyDrive 继承 + 融合新增）
+- Windows Git Bash：`ls`/`tree`/`du`/`ps` 别名禁用（用 `fd`/`rg`）；wsl.exe 复杂命令须 `.sh` 脚本路线（引号吞噬）
+- 探索子代理拿结论，主会话不整读大文件（hub-and-spoke）
+- 百度 API：强制 IPv4 dial、dlink 须追加 access_token、errno 110/111/-6 三档（详见 multicloud 附录 A）
+- **Explorer 上传链路**：空 PUT→LOCK→PUT→PROPPATCH——**PROPPATCH 必须全成功（207）而非 405**，否则 MiniRedir 整单回滚「看似失败实则已传」（rs-CyDrive 2026-09-03 真机首验最贵教训，百度 E2E 直接承重）
+- 实现期陷阱查 `docs/rust-rewrite-design.md`「深度调研补遗」节（axum 2MB body 上限/grammers FloodWait 藏点/dav-server Bytes-Seek 模型/WebClient 4GB-1/挂载 Basic 认证）
+- PCFS 反面教材勿抄：错误类型跨层泄漏、硬编码密钥、纯 CTR 无认证、注释掉的调试日志
+
+## 待人工清单
+1. 基线设计 §9-2/9-3/9-4 三项建议待负责人确认（旧仓冻结时点 / bot 分 crate 时点 / R-E 批序）
+2. Phase 2 E2E 前提供 `E:\GitHub\rs-CyDrive\test\` telegram 测试配置（**独立测试 chat**，见 foundation §7a 隔离裁决；baidu token 已验证可用）
+3. 新仓远端 origin 待建（当前仅 upstream-cydrive 只读、push 已禁用）
+4. 自 rs-CyDrive 继承的挂账（旧仓 decisions.md 末条）：P3 hydrate 快照回写竞态、复审 Low 项（--help 文案余项/凭据门槛统一/sync_url host 校验/SyncClient trait 文档/64MB 并发闸）、#[ignore] 真机测试 ×3、litmus 套件、deny advisories、scripts/gen_compat_fixtures.py 契约 fixture 流程

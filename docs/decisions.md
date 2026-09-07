@@ -253,3 +253,10 @@
 - **已知后果与修复**：`notify_one` 无等待者存 permit → 5 个既有正向 rings 测试（seed 写库存 permit）被陈旧回声空洞化（子代理如实申报）——主会话补 drain 纪律（`drain_stale_wake_permits` 辅助，50ms 窗耗尽存留 permit）恢复判别力（b2f4286）；真实证明力=db_wake.rs 三测（直写 db 也响/抑制静默+恢复/chunks 写不误响）。
 - **门禁**：win 527 / wsl 430 全绿；既有全部行为护栏测试零改动通过（等价性证明）。rusqlite +hooks feature（非默认，无版本变化）。
 - **后续待办不变**：百度 spike 等凭据；trait 瘦身等 spike 结论；Low 项挂账。
+
+## 2026-09-07 rs-cloudfs 建仓与 Phase -1 规范先行（负责人六项指令）
+
+- **建仓**：E:\Rs_Codess-cloudfs fork 自 rs-CyDrive@9a691f2（全历史保留；remote 改名 upstream-cydrive 且 push URL 置 no-push 防误推）；test/ 凭据目录未随 fork 入库（gitignore 两仓同规则）。
+- **规范先行（负责人指令「代码未动，规范先行」）**：docs/standards/ 五份（architecture/code-style/interfaces/logging/documentation）+ AGENTS/README 重写 + 融合基线设计 v1.0→v1.2。规范素材 = rs-CyDrive 全部生产纪律 + PrivateCloudFS 正反经验（错误泄漏/硬编码密钥/CTR 无认证/调试残留为反例；能力位/TokenCallback/conformance 思想为正面）。
+- **红队复审（独立子代理）修复集**：H1 本条目与提交落盘；H2 architecture §1.5 过渡豁免清单（ck-telegram→core 反向依赖 Phase 1 R 解除、crate 名 Phase 0、R4 conformance 前置 Phase 2、core 合体长期豁免+组合根豁免）；H3 multicloud 计划加 SUPERSEDED banner（Kickoff 作废、附录 A 仍有效、接口形状以 D1-D10 为准）；H4 conformance 最小断言集八条落 interfaces.md + Phase 2 前置任务「驱动接入手册」；M1 local 入分层图/crate 树；M2 D6 local 卷形态（规范化根路径）+ D10 权威后端 sync 验收口径；M3 Phase 1 R 批验收补真机 Telegram 冒烟；M4 AGENTS 补 PROPPATCH 教训/补遗节指针/继承挂账；M5/M6 Phase 0 交付 check_layers 脚本与 CI 秘密扫描；M7 §7a E2E 隔离裁决（独立测试 chat + /_e2e/ 前缀 + 收尾清理）；M8 层级规则组合根豁免与 crypto 定位；L1-L7 全修（README 链接/章节序/门禁口径统一/参数守卫条款/R4 local 豁免/文档两档制）。
+- **待负责人确认**：基线设计 §9-2/9-3/9-4（旧仓冻结时点 / bot 分 crate 时点 / R-E 批序）。

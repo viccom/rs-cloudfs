@@ -1,6 +1,8 @@
 # rs-CyDrive 多云后端支持（Phase 0 spike → 百度网盘 → 双后端并存）设计 + 实施计划
 
-> **For Claude:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
+> **⚠ SUPERSEDED（2026-09-07，rs-cloudfs 建仓）**：本计划已整体并入 `2026-09-07-cloudfusion-foundation.md` v1.2 的 Phase 1–2。**本文 Kickoff 指令作废**（其 worktree/仓库指向旧仓 rs-CyDrive）；接口形状以 foundation **D1–D10 为准**（本文 A1 的 CloudTransport 瘦身形状已被 D1 取代）。仍然有效：**附录 A（百度情报索引）**、Batch S 六项验证定义、B1–B3 任务描述（按 D1 重读）、止损点。执行一律在 rs-cloudfs 仓库按 foundation 阶段计划进行。
+>
+> **For Claude（历史存档）:** REQUIRED SUB-SKILL: Use superpowers:executing-plans to implement this plan task-by-task.
 
 **定位（2026-09-06 会话裁决）**：从「Telegram 单后端」演进为「可插拔多云后端」；首个新后端 = 百度网盘（负责人 SVIP + 个人开发者 appkey，实测带宽可跑满）。参照系 = 负责人自己的 Go 项目 `E:\Go_codes\PrivateCloudFS`（百度/115/123 driver 已实战，情报见附录 A）。
 
