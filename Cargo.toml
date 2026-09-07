@@ -4,7 +4,7 @@ members = [
     "crates/cloudkit-core",
     "crates/cloudkit-sync-server",
     "crates/cydrive-cli",
-    "crates/cydrive-platform",
+    "crates/cloudkit-platform",
     "crates/cloudkit-web",
     "crates/cloudkit-webdav",
     "crates/drivers/ck-telegram",

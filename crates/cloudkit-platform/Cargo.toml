@@ -1,5 +1,5 @@
 [package]
-name = "cydrive-platform"
+name = "cloudkit-platform"
 description = "Platform glue for CyDrive: Windows WebDAV drive mapping and WebClient registry tuning (cross-platform letter logic plus cfg-gated Windows implementation)"
 version.workspace = true
 edition.workspace = true

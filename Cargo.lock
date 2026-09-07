@@ -555,6 +555,15 @@ dependencies = [
 ]
 
 [[package]]
+name = "cloudkit-platform"
+version = "0.7.2"
+dependencies = [
+ "cloudkit-core",
+ "thiserror 2.0.20",
+ "winreg",
+]
+
+[[package]]
 name = "cloudkit-sync-server"
 version = "0.7.2"
 dependencies = [
@@ -828,11 +837,11 @@ dependencies = [
  "ck-telegram",
  "clap",
  "cloudkit-core",
+ "cloudkit-platform",
  "cloudkit-sync-server",
  "cloudkit-web",
  "cloudkit-webdav",
  "comfy-table",
- "cydrive-platform",
  "dialoguer",
  "http",
  "http-body-util",
@@ -844,15 +853,6 @@ dependencies = [
  "thiserror 2.0.20",
  "tokio",
  "tracing",
-]
-
-[[package]]
-name = "cydrive-platform"
-version = "0.7.2"
-dependencies = [
- "cloudkit-core",
- "thiserror 2.0.20",
- "winreg",
 ]
 
 [[package]]

@@ -150,9 +150,9 @@ pub fn run_setup_interactive(store: Option<&dyn CredentialStore>) -> Result<()> 
         .context("reading the chat id")?;
 
     let drive_letter = if cfg!(windows) {
-        let default_letter = cydrive_platform::pick_drive_letter(
+        let default_letter = cloudkit_platform::pick_drive_letter(
             "Y:",
-            &cydrive_platform::windows::used_drive_letters(),
+            &cloudkit_platform::windows::used_drive_letters(),
         );
         Input::new()
             .with_prompt("Windows drive letter")

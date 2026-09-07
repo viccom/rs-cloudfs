@@ -23,7 +23,7 @@ async-trait = "0.1"
 clap = { version = "4", features = ["derive"] }
 comfy-table = "8.0.0"
 cloudkit-core = { path = "../cloudkit-core" }
-cydrive-platform = { path = "../cydrive-platform" }
+cloudkit-platform = { path = "../cloudkit-platform" }
 ck-telegram = { path = "../drivers/ck-telegram" }
 cloudkit-web = { path = "../cloudkit-web" }
 cloudkit-webdav = { path = "../cloudkit-webdav" }

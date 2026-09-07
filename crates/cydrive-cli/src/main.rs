@@ -288,7 +288,7 @@ async fn mount_cmd(
         let _ = letter; // Windows-only flag
         let url = url.unwrap_or_else(|| cydrive_cli::default_mount_url(&cfg));
         let mount_point = unix_mount_point(path)?;
-        let report = cydrive_platform::linux::mount_drive(&mount_point, &url)
+        let report = cloudkit_platform::linux::mount_drive(&mount_point, &url)
             .with_context(|| format!("mounting {url} at {}", mount_point.display()))?;
         println!("{report}");
         Ok(())
@@ -300,7 +300,7 @@ async fn mount_cmd(
             anyhow::bail!("--path applies to Unix mounts only; Windows uses drive letters");
         }
         let (letter, url) = cydrive_cli::resolve_mount_params(&cfg, url, letter);
-        let mounted = cydrive_platform::windows::mount_drive(&letter, &url)
+        let mounted = cloudkit_platform::windows::mount_drive(&letter, &url)
             .with_context(|| format!("mounting {url} at {letter}"))?;
         println!("CyDrive mounted at {mounted} -> {url}");
         Ok(())
@@ -316,7 +316,7 @@ async fn unmount_cmd(letter: Option<String>, path: Option<PathBuf>) -> Result<()
     {
         let _ = (&cfg, letter); // unmount takes no config defaults on Unix
         let mount_point = unix_mount_point(path)?;
-        let report = cydrive_platform::linux::unmount_drive(&mount_point)
+        let report = cloudkit_platform::linux::unmount_drive(&mount_point)
             .with_context(|| format!("unmounting {}", mount_point.display()))?;
         println!("{report}");
         Ok(())
@@ -328,7 +328,7 @@ async fn unmount_cmd(letter: Option<String>, path: Option<PathBuf>) -> Result<()
             anyhow::bail!("--path applies to Unix mounts only; Windows uses drive letters");
         }
         let letter = cydrive_cli::resolve_unmount_letter(&cfg, letter);
-        cydrive_platform::windows::unmount_drive(&letter)
+        cloudkit_platform::windows::unmount_drive(&letter)
             .with_context(|| format!("unmounting {letter}"))?;
         println!("CyDrive unmounted from {letter}");
         Ok(())
@@ -345,9 +345,9 @@ fn unix_mount_point(path: Option<PathBuf>) -> Result<PathBuf> {
         None => {
             let home = std::env::var("HOME")
                 .context("no --path given and $HOME is unset; pass --path <dir>")?;
-            Ok(cydrive_platform::default_mount_point(std::path::Path::new(
-                &home,
-            )))
+            Ok(cloudkit_platform::default_mount_point(
+                std::path::Path::new(&home),
+            ))
         }
     }
 }
@@ -355,7 +355,7 @@ fn unix_mount_point(path: Option<PathBuf>) -> Result<PathBuf> {
 /// `cydrive fix-reg`: write the WebClient tuning values and restart the
 /// service (mirrors the Python `fix-reg` subcommand).
 async fn fix_reg_cmd() -> Result<()> {
-    cydrive_platform::windows::optimize_webdav_registry()
+    cloudkit_platform::windows::optimize_webdav_registry()
         .context("tuning the WebClient registry")?;
     println!("WebClient registry tuned (4 GB limit, Basic auth) and restarted");
     Ok(())

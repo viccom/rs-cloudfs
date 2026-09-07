@@ -2,9 +2,9 @@
 //!
 //! The `mount` / `unmount` / `fix-reg` subcommands resolve their `--url`
 //! and `--letter` flags against the config before touching
-//! `cydrive-platform`; only that pure resolution layer is testable offline
+//! `cloudkit-platform`; only that pure resolution layer is testable offline
 //! (the actual `net use` / registry side belongs to the real-machine
-//! checklist in `crates/cydrive-platform/tests/platform.rs`).
+//! checklist in `crates/cloudkit-platform/tests/platform.rs`).
 
 use cloudkit_core::config::CyDriveConfig;
 use cydrive_cli::{default_mount_url, resolve_mount_params, resolve_unmount_letter};

@@ -524,7 +524,7 @@ pub async fn run_with_transport(
             }
         }
         if let Some(letter) = unmount_letter {
-            if let Err(e) = cydrive_platform::windows::unmount_drive(&letter) {
+            if let Err(e) = cloudkit_platform::windows::unmount_drive(&letter) {
                 tracing::warn!(
                     letter = %letter,
                     error = %e,
@@ -538,7 +538,7 @@ pub async fn run_with_transport(
         // everywhere through the stubs, and each claim only ever exists
         // on its own platform, so exactly one arm can run.
         if let Some(point) = unmount_point {
-            if let Err(e) = cydrive_platform::linux::unmount_drive(&point) {
+            if let Err(e) = cloudkit_platform::linux::unmount_drive(&point) {
                 tracing::warn!(
                     point = %point.display(),
                     error = %e,
@@ -1118,7 +1118,7 @@ fn mount_if_configured(cfg: &CyDriveConfig) -> (Option<String>, Option<PathBuf>)
         // missing $HOME still lets an explicit mount_point key carry the
         // auto-mount.
         let target = match std::env::var("HOME") {
-            Ok(home) => cydrive_platform::auto_mount_target(cfg, Path::new(&home)),
+            Ok(home) => cloudkit_platform::auto_mount_target(cfg, Path::new(&home)),
             Err(_no_home) => cfg.mount_point.as_deref().map(PathBuf::from),
         };
         let Some(target) = target else {
@@ -1133,8 +1133,8 @@ fn mount_if_configured(cfg: &CyDriveConfig) -> (Option<String>, Option<PathBuf>)
         // Stale cleanup first: a leftover davfs mount from a previous run
         // (or a crashed session) must not keep serving a dead server
         // under the fresh one.
-        cydrive_platform::linux::unmount_stale_for(&url);
-        match cydrive_platform::linux::mount_drive(&target, &url) {
+        cloudkit_platform::linux::unmount_stale_for(&url);
+        match cloudkit_platform::linux::mount_drive(&target, &url) {
             Ok(report) => {
                 println!("{report}");
                 (None, Some(target))
@@ -1169,7 +1169,7 @@ fn mount_if_configured(cfg: &CyDriveConfig) -> (Option<String>, Option<PathBuf>)
         }
         let url = default_mount_url(cfg);
         println!("Mounting drive letter {} -> {} ...", cfg.drive_letter, url);
-        match cydrive_platform::windows::mount_drive(&cfg.drive_letter, &url) {
+        match cloudkit_platform::windows::mount_drive(&cfg.drive_letter, &url) {
             Ok(letter) => {
                 println!("Drive mounted: {letter} -> {url}");
                 (Some(letter), None)
@@ -1232,7 +1232,7 @@ pub struct StatusReport {
 ///   `instance` empty and `control` carries the address (stale);
 /// - WebDAV / dashboard ports: 1s connect probes (the dashboard only
 ///   when `enable_web_ui`);
-/// - mount: [`cydrive_platform::current_mount_for`] against the glued
+/// - mount: [`cloudkit_platform::current_mount_for`] against the glued
 ///   drive URL.
 pub async fn collect_status(cfg: &CyDriveConfig) -> StatusReport {
     let (instance, control) = match control::read_control_addr(cfg) {
@@ -1252,7 +1252,7 @@ pub async fn collect_status(cfg: &CyDriveConfig) -> StatusReport {
         Some(url) => probe_listening(&cfg.web_ui_host, cfg.web_ui_port, &url).await,
         None => None,
     };
-    let mount = cydrive_platform::current_mount_for(&webdav_url);
+    let mount = cloudkit_platform::current_mount_for(&webdav_url);
     StatusReport {
         instance,
         control,
@@ -1314,7 +1314,7 @@ pub fn render_status(r: &StatusReport, webdav_url: &str, dash_url: Option<String
 /// Resolves the `mount` subcommand's arguments: an explicit `--url` /
 /// `--letter` wins, otherwise the config's `drive_letter` and the glued
 /// default URL apply. Letters pass through verbatim; normalization is
-/// [`cydrive_platform::windows::mount_drive`]'s concern.
+/// [`cloudkit_platform::windows::mount_drive`]'s concern.
 pub fn resolve_mount_params(
     cfg: &CyDriveConfig,
     url: Option<String>,

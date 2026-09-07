@@ -1,4 +1,4 @@
-//! Offline contract tests for the `cydrive-platform` crate (unit D).
+//! Offline contract tests for the `cloudkit-platform` crate (unit D).
 //!
 //! Everything here exercises pure cross-platform logic — no drive is
 //! mapped and no registry key is touched by a default `cargo test` run.
@@ -19,13 +19,13 @@
 //! Run them by hand with:
 //!
 //! ```text
-//! cargo test -p cydrive-platform --test platform -- --ignored
+//! cargo test -p cloudkit-platform --test platform -- --ignored
 //! ```
 
 use std::path::Path;
 
 use cloudkit_core::config::CyDriveConfig;
-use cydrive_platform::{
+use cloudkit_platform::{
     auto_mount_target, davfs_mount_command, davfs_unmount_command, default_mount_point,
     detect_mount_backend, fusermount_unmount_command, gio_mount_command, mount_command,
     normalize_drive_letter, parse_net_use_mapping, parse_proc_mounts_davfs, pick_drive_letter,
@@ -142,8 +142,8 @@ fn contract_constants() {
 #[cfg(not(windows))]
 #[test]
 fn unsupported_stub_shape() {
-    use cydrive_platform::windows;
-    use cydrive_platform::PlatformError;
+    use cloudkit_platform::windows;
+    use cloudkit_platform::PlatformError;
 
     fn expect_unsupported(result: Result<(), PlatformError>) {
         match result {
@@ -268,7 +268,7 @@ fn default_mount_point_under_home() {
 #[cfg(not(target_os = "linux"))]
 #[test]
 fn linux_stub_shape() {
-    use cydrive_platform::{linux, PlatformError};
+    use cloudkit_platform::{linux, PlatformError};
 
     fn expect_unsupported(result: Result<String, PlatformError>) {
         match result {
@@ -391,12 +391,12 @@ tmpfs /run tmpfs rw,nosuid,nodev 0 0
 fn ignored_mount_unmount_roundtrip() {
     let url = std::env::var("CYDRIVE_TEST_MOUNT_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
-    let letter = cydrive_platform::windows::mount_drive("Y:", &url).expect("mount succeeds");
+    let letter = cloudkit_platform::windows::mount_drive("Y:", &url).expect("mount succeeds");
     assert!(
         letter.len() == 2 && letter.ends_with(':'),
         "mount returns a canonical letter, got {letter:?}"
     );
-    cydrive_platform::windows::unmount_drive(&letter).expect("unmount succeeds");
+    cloudkit_platform::windows::unmount_drive(&letter).expect("unmount succeeds");
 }
 
 /// Real-machine registry tuning (see the checklist in the module docs).
@@ -404,7 +404,7 @@ fn ignored_mount_unmount_roundtrip() {
 #[test]
 #[ignore = "real-machine: writes HKLM WebClient registry values and restarts the service; needs an admin shell"]
 fn ignored_optimize_webdav_registry() {
-    cydrive_platform::windows::optimize_webdav_registry().expect("registry tuning succeeds");
+    cloudkit_platform::windows::optimize_webdav_registry().expect("registry tuning succeeds");
 }
 
 /// Real-machine Linux davfs2 round-trip (see the checklist in the module
@@ -418,12 +418,12 @@ fn ignored_davfs_mount_unmount_roundtrip() {
     let url = std::env::var("CYDRIVE_TEST_MOUNT_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
     let mount_point = std::env::temp_dir().join("cydrive_davfs_roundtrip");
-    let mounted = cydrive_platform::linux::mount_drive(&mount_point, &url).expect("mount");
+    let mounted = cloudkit_platform::linux::mount_drive(&mount_point, &url).expect("mount");
     assert!(
         mounted.contains("davfs2"),
         "expected the davfs2 backend, got: {mounted}"
     );
-    let unmounted = cydrive_platform::linux::unmount_drive(&mount_point).expect("unmount");
+    let unmounted = cloudkit_platform::linux::unmount_drive(&mount_point).expect("unmount");
     assert!(
         unmounted.contains("Unmounted"),
         "expected an unmount report, got: {unmounted}"
@@ -490,7 +490,7 @@ fn auto_mount_target_respects_flag_and_key() {
 #[test]
 #[ignore = "real-machine: needs mount.davfs on PATH (davfs2 package, usually root) and a reachable WebDAV server (CYDRIVE_TEST_MOUNT_URL, default http://127.0.0.1:8080)"]
 fn ignored_unix_automount_roundtrip() {
-    use cydrive_platform::linux;
+    use cloudkit_platform::linux;
 
     let url = std::env::var("CYDRIVE_TEST_MOUNT_URL")
         .unwrap_or_else(|_| "http://127.0.0.1:8080".to_string());
@@ -563,11 +563,11 @@ fn ignored_unix_automount_roundtrip() {
 #[test]
 fn davfs_pid_file_path_derivation() {
     assert_eq!(
-        cydrive_platform::davfs_pid_file_path("/root/CyDrive"),
+        cloudkit_platform::davfs_pid_file_path("/root/CyDrive"),
         "/var/run/mount.davfs/root-CyDrive.pid"
     );
     assert_eq!(
-        cydrive_platform::davfs_pid_file_path("/mnt/cydrive"),
+        cloudkit_platform::davfs_pid_file_path("/mnt/cydrive"),
         "/var/run/mount.davfs/mnt-cydrive.pid"
     );
 }
@@ -578,11 +578,11 @@ fn parse_davfs_pid_file_hint_extracts_path() {
                   Either /root/CyDrive is used by another process,\n\
                   or another mount process ended irregular";
     assert_eq!(
-        cydrive_platform::parse_davfs_pid_file_hint(stderr).as_deref(),
+        cloudkit_platform::parse_davfs_pid_file_hint(stderr).as_deref(),
         Some("/var/run/mount.davfs/root-CyDrive.pid")
     );
     assert_eq!(
-        cydrive_platform::parse_davfs_pid_file_hint("some other error"),
+        cloudkit_platform::parse_davfs_pid_file_hint("some other error"),
         None
     );
 }
@@ -596,7 +596,7 @@ fn run_with_timeout_kills_hanging_child() {
     let start = std::time::Instant::now();
     let argv = vec!["sleep".to_string(), "30".to_string()];
     let result =
-        cydrive_platform::linux::run_with_timeout(&argv, std::time::Duration::from_secs(1));
+        cloudkit_platform::linux::run_with_timeout(&argv, std::time::Duration::from_secs(1));
     let elapsed = start.elapsed();
     assert!(
         result.is_err(),

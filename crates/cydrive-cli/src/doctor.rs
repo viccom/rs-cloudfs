@@ -24,7 +24,7 @@ use std::sync::Arc;
 
 use cloudkit_core::credentials::{CredentialError, CredentialStore, BOT_TOKEN};
 use cloudkit_core::database::MetaDatabase;
-use cydrive_platform::{BASIC_AUTH_LEVEL, FILE_SIZE_LIMIT_BYTES};
+use cloudkit_platform::{BASIC_AUTH_LEVEL, FILE_SIZE_LIMIT_BYTES};
 
 /// Verdict of one doctor check.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -324,7 +324,7 @@ pub fn platform_checks() -> Vec<CheckResult> {
     #[cfg(windows)]
     {
         results.push(evaluate_webclient_params(
-            cydrive_platform::windows::read_webclient_params(),
+            cloudkit_platform::windows::read_webclient_params(),
         ));
         results.push(webclient_service_check());
     }
