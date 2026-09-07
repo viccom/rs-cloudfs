@@ -30,7 +30,7 @@ use cloudkit_core::cache::CacheManager;
 use cloudkit_core::database::{FileUpsert, MetaDatabase};
 use cloudkit_core::rel_path::RelPath;
 use cloudkit_core::transport::mock::{MockTransport, UploadAction};
-use cloudkit_core::transport::{CloudTransport, InboundFile, RemoteHandle, TransportError};
+use cloudkit_core::transport::{CloudTransport, InboundFile, RemoteHandle, StorageError};
 use cloudkit_core::upload_queue::RetryPolicy;
 use cloudkit_core::vfs::{Vfs, VfsConfig, VfsError};
 
@@ -282,7 +282,7 @@ async fn failed_remove_does_not_wake() {
 #[tokio::test]
 async fn degraded_upload_never_rings_the_success_hook() {
     let fail = || UploadAction::Fail {
-        error: TransportError::Remote("injected upload failure".to_string()),
+        error: StorageError::Unavailable("injected upload failure".to_string()),
     };
     let (_dir, vfs, _db) = test_vfs(
         MockTransport::builder()

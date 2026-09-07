@@ -2,7 +2,7 @@
 //! iterators (the glue between [`crate::range::range_plan`] and `ByteStream`).
 
 use bytes::Bytes;
-use cloudkit_core::transport::{ByteStream, TransportError};
+use cloudkit_storage::transport::{ByteStream, StorageError};
 use futures_core::Stream;
 use std::pin::Pin;
 use std::task::{Context, Poll};
@@ -12,7 +12,7 @@ use std::task::{Context, Poll};
 /// the first chunk. Chunk boundaries are NOT preserved: output Bytes frames
 /// are whatever remains of each input chunk after skip/take bookkeeping
 /// (frames are non-empty). Yields at most bytes_to_yield bytes; stops early
-/// (no error) when the iterator ends first. TransportError is never produced
+/// (no error) when the iterator ends first. StorageError is never produced
 /// by this adapter itself.
 pub fn serve_range<I>(iter: I, skip_bytes_in_first: u64, bytes_to_yield: u64) -> ByteStream
 where
@@ -67,7 +67,7 @@ impl RangeStream {
 }
 
 impl Stream for RangeStream {
-    type Item = Result<Bytes, TransportError>;
+    type Item = Result<Bytes, StorageError>;
 
     /// The backing iterator is fully buffered in memory, so every poll
     /// resolves immediately; `Pending` is never returned.

@@ -12,6 +12,9 @@ workspace = true
 aes-gcm = "0.11.1"
 async-trait = "0.1"
 bytes = "1"
+# L3→L2 合法依赖（architecture §1）：transport trait 家族与 StorageError
+# 分类学的家（Batch R 迁入）；本 crate 以 re-export 维持既有路径兼容。
+cloudkit-storage = { path = "../cloudkit-storage" }
 futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false }
 pbkdf2 = "0.13.0"

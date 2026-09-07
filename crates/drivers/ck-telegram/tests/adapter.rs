@@ -14,8 +14,8 @@ use ck_telegram::config::{
 };
 use ck_telegram::plan::{plan_chunk_sends, ChunkSend};
 use ck_telegram::stream::serve_range;
-use cloudkit_core::rel_path::RelPath;
-use cloudkit_core::transport::{ByteStream, UploadJob};
+use cloudkit_storage::transport::{ByteStream, UploadJob};
+use cloudkit_storage::vpath::RelPath;
 
 /// Builds a pure (no disk access) UploadJob with the given chunk plan.
 fn job_for(rel: &str, size: u64, chunk_count: u32, chunk_size: u64) -> UploadJob {

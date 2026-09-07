@@ -2,7 +2,7 @@
 //! baseline (`telegram_client.py`). Captions are the only remote-side link
 //! between uploaded parts and their original virtual path.
 
-use cloudkit_core::chunker::part_name;
+use cloudkit_storage::transport::part_name;
 
 /// Normalizes a virtual path exactly like Python telegram_client.py:154:
 /// "/" + rel.strip("/").replace("\\", "/")  (empty segments collapse via strip only at ends)

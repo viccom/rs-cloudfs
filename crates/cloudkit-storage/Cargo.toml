@@ -15,6 +15,10 @@ futures-core = "0.3"
 futures-util = { version = "0.3", default-features = false }
 serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2"
+# transport::mock 的 open/open_range 注入人为延迟（stalling remote 模拟）；
+# mock 是 pub API（上游 core/webdav/web/cli 测试经 re-export 使用），
+# 故进正式依赖而非 dev-dependency。
+tokio = { version = "1", features = ["time"] }
 
 [dev-dependencies]
 serde_json = "1.0.151"

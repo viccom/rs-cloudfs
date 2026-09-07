@@ -26,7 +26,7 @@ use cloudkit_core::cache::CacheManager;
 use cloudkit_core::database::{FileUpsert, MetaDatabase};
 use cloudkit_core::rel_path::RelPath;
 use cloudkit_core::transport::mock::{MockTransport, UploadAction};
-use cloudkit_core::transport::{CloudTransport, TransportError, UploadJob, UploadReceipt};
+use cloudkit_core::transport::{CloudTransport, StorageError, UploadJob, UploadReceipt};
 use cloudkit_core::upload_queue::RetryPolicy;
 use cloudkit_core::vfs::{Vfs, VfsConfig};
 use cloudkit_web::{WebUiConfig, WebUiServer};
@@ -553,7 +553,7 @@ async fn upload_multipart_roundtrip() {
     let mock = Arc::new(
         MockTransport::builder()
             .upload_action(UploadAction::Fail {
-                error: TransportError::Remote("scripted first-attempt failure".to_string()),
+                error: StorageError::Unavailable("scripted first-attempt failure".to_string()),
             })
             .build(),
     );

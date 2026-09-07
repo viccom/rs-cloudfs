@@ -32,7 +32,7 @@ use tokio::task::JoinHandle;
 use crate::cache::CacheManager;
 use crate::database::{DbError, FileRecord, FileUpsert, MetaDatabase};
 use crate::rel_path::RelPath;
-use crate::transport::{CloudTransport, TransportError, UploadJob, UploadReceipt};
+use crate::transport::{CloudTransport, StorageError, UploadJob, UploadReceipt};
 
 /// File size above which uploads split into `.partNNN` chunks; 1900 MB
 /// keeps every message under Telegram's 2 GB per-message cap (contract 5).
@@ -84,21 +84,27 @@ pub enum RetryDecision {
 
 /// The single judge of retry semantics for a failed upload attempt.
 ///
-/// - `FloodWait { seconds }` → [`RetryDecision::RetryAfter`] of exactly
-///   those seconds: never clamped by `max_backoff`, never degraded no
-///   matter how large `consecutive_failures` is.
+/// - `RateLimited { retry_after: Some(wait) }` (the old FloodWait) →
+///   [`RetryDecision::RetryAfter`] of exactly that long: never clamped by
+///   `max_backoff`, never degraded no matter how large
+///   `consecutive_failures` is.
 /// - Any other error, with `n = consecutive_failures` (counting the
 ///   current failure, starting at 1): `n >= max_attempts` degrades,
 ///   otherwise retry after `min(initial * 2^(n-1), max)`.
 pub fn decide_retry(
     policy: &RetryPolicy,
-    error: &TransportError,
+    error: &StorageError,
     consecutive_failures: u32,
 ) -> RetryDecision {
-    // FloodWait is the server's authoritative word: honor it exactly,
-    // before any attempt accounting (never clamped, never degrading).
-    if let TransportError::FloodWait { seconds } = error {
-        return RetryDecision::RetryAfter(Duration::from_secs(u64::from(*seconds)));
+    // The server's authoritative wait is honored exactly, before any
+    // attempt accounting (never clamped, never degrading). A RateLimited
+    // without a retry_after has no authoritative word to honor and falls
+    // through to the regular backoff ladder.
+    if let StorageError::RateLimited {
+        retry_after: Some(wait),
+    } = error
+    {
+        return RetryDecision::RetryAfter(*wait);
     }
     if consecutive_failures >= policy.max_attempts {
         return RetryDecision::Degrade;
@@ -481,7 +487,7 @@ async fn process_job(
                     staged = Some(s);
                 }
                 Err(error) => {
-                    let error = TransportError::Io(error);
+                    let error = StorageError::Io(error.to_string());
                     consecutive_failures += 1;
                     match decide_retry(&cfg.retry, &error, consecutive_failures) {
                         RetryDecision::RetryAfter(delay) => {
@@ -553,13 +559,15 @@ async fn process_job(
                 }
                 return; // `enc_tmp` drops here: ciphertext temp deleted.
             }
-            Err(TransportError::FloodWait { seconds }) => {
+            Err(StorageError::RateLimited {
+                retry_after: Some(wait),
+            }) => {
                 tracing::info!(
                     rel_path = %job.rel_path,
-                    seconds,
+                    retry_after = ?wait,
                     "flood wait; retrying the whole upload"
                 );
-                tokio::time::sleep(Duration::from_secs(u64::from(seconds))).await;
+                tokio::time::sleep(wait).await;
                 bump(&stats.retries);
                 continue;
             }
@@ -590,18 +598,28 @@ async fn process_job(
                         // Best-effort bot notice, always on (degradation is
                         // a rare terminal state worth surfacing — one per
                         // degraded job); a failed notification must never
-                        // break the degrade path.
+                        // break the degrade path. Capability probing
+                        // (interfaces §1): a transport without CHAT skips
+                        // the notice with a log line, never panics.
                         let notice = format!(
                             "⚠️ CyDrive: upload failed after {n} attempts: {rel} — kept on disk, will retry on next start",
                             n = consecutive_failures,
                             rel = job.rel_path,
                         );
-                        if let Err(notify_error) = transport.send_text(&notice).await {
-                            tracing::warn!(
-                                %notify_error,
+                        match transport.as_chat() {
+                            Some(chat) => {
+                                if let Err(notify_error) = chat.send_text(&notice).await {
+                                    tracing::warn!(
+                                        %notify_error,
+                                        rel_path = %job.rel_path,
+                                        "degrade notification failed"
+                                    );
+                                }
+                            }
+                            None => tracing::info!(
                                 rel_path = %job.rel_path,
-                                "degrade notification failed"
-                            );
+                                "transport declares no CHAT capability; degrade notice skipped"
+                            ),
                         }
                         return; // `enc_tmp` drops here too.
                     }
@@ -774,7 +792,8 @@ fn delete_local_copy(local_path: &Path) {
 ///      `sha256` = the digest computed before the first attempt (None
 ///      for oversized files or a failed hash — warn only, never an
 ///      upload failure); delete the local file; count succeeded.
-///    - `Err(FloodWait { s })` → sleep `s` (0 sleeps nothing), count
+///    - `Err(RateLimited { retry_after: Some(s) })` (the old FloodWait) → sleep
+///      `s` (0 sleeps nothing), count
 ///      retries, retry the whole upload (never counts toward
 ///      degradation).
 ///    - any other `Err` → [`decide_retry`]: sleep-and-retry (count

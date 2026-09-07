@@ -57,9 +57,12 @@ pub fn needs_chunking(size: u64, chunk_mb: u64) -> bool {
 
 /// Part file name for `base_name` and `chunk_index`:
 /// `{base}.part{idx:03}` (min-width padding, so index 1000 keeps growing).
-pub fn part_name(base_name: &str, chunk_index: usize) -> String {
-    format!("{base_name}.part{chunk_index:03}")
-}
+///
+/// Lives in L2 since Batch R (`cloudkit_storage::transport::part_name` —
+/// the chunk-naming compat contract is shared by the mock and the telegram
+/// driver); re-exported here so `cloudkit_core::chunker::part_name` keeps
+/// working.
+pub use cloudkit_storage::transport::part_name;
 
 /// Splits `input` into `ceil(size / chunk_mb MiB)` parts inside `out_dir`
 /// (at least one part for a non-empty file); each `sha256` is lowercase hex.

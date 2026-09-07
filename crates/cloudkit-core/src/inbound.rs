@@ -6,6 +6,12 @@
 //! hydration asks for it (Zero-Disk / "Pure Cloud"). The worker drives
 //! the whole stream lifecycle — a bad event or a failed row upsert only
 //! warns, it never kills the worker.
+//!
+//! Capability probing (interfaces §1, since the Batch R trait split):
+//! the worker consumes [`crate::transport::InboundCap`] (obtained via
+//! `CloudTransport::as_inbound`) and dispatches commands through
+//! `as_chat`. A transport declaring neither bit gets a logged, non-panic
+//! degrade: no inbound worker, commands dropped with a warning.
 
 use std::sync::Arc;
 
@@ -43,19 +49,28 @@ impl InboundWorkerHandle {
     }
 }
 
-/// Spawns the inbound worker: consumes `transport.incoming()`, indexes
-/// [`IncomingEvent::File`] events into the VFS at the root (metadata
-/// only, Python baseline) and dispatches [`IncomingEvent::Command`]
-/// events to the bot command handler (replies go back over the same
-/// transport). `Err` events and failed command handling only warn — a bad
-/// event never kills the worker.
+/// Spawns the inbound worker: consumes the transport's inbound stream,
+/// indexes [`IncomingEvent::File`] events into the VFS at the root
+/// (metadata only, Python baseline) and dispatches
+/// [`IncomingEvent::Command`] events to the bot command handler (replies
+/// go back over the same transport's CHAT capability). `Err` events and
+/// failed command handling only warn — a bad event never kills the
+/// worker. A transport without INBOUND logs once and runs no worker
+/// (capability degrade, never a panic).
 pub fn spawn_inbound_worker(
     vfs: Arc<Vfs>,
     transport: Arc<dyn CloudTransport>,
     drive_letter: String,
 ) -> InboundWorkerHandle {
     let task = tokio::spawn(async move {
-        let mut stream = transport.incoming();
+        let Some(inbound) = transport.as_inbound() else {
+            tracing::warn!(
+                capabilities = ?transport.capabilities(),
+                "transport declares no INBOUND capability; inbound worker not started"
+            );
+            return;
+        };
+        let mut stream = inbound.incoming();
         while let Some(event) = stream.next().await {
             match event {
                 Ok(IncomingEvent::File(file)) => {
@@ -71,19 +86,30 @@ pub fn spawn_inbound_worker(
                 }
                 Ok(IncomingEvent::Command { text }) => {
                     // Bot command dispatch: the reply target is the
-                    // configured chat (send_text/send_document on the
-                    // same transport). A failed reply only warns — the
-                    // worker keeps consuming events.
-                    if let Err(error) = crate::bot::handle_command(
-                        &vfs.db(),
-                        &vfs,
-                        transport.as_ref(),
-                        &drive_letter,
-                        &text,
-                    )
-                    .await
-                    {
-                        tracing::warn!(%error, %text, "bot command failed; continuing");
+                    // configured chat (ChatCap on the same transport). A
+                    // missing CHAT bit drops the command with a warning;
+                    // a failed reply only warns — the worker keeps
+                    // consuming events either way.
+                    match transport.as_chat() {
+                        Some(chat) => {
+                            if let Err(error) = crate::bot::handle_command(
+                                &vfs.db(),
+                                &vfs,
+                                chat,
+                                &drive_letter,
+                                &text,
+                            )
+                            .await
+                            {
+                                tracing::warn!(%error, %text, "bot command failed; continuing");
+                            }
+                        }
+                        None => {
+                            tracing::warn!(
+                                %text,
+                                "transport declares no CHAT capability; bot command dropped"
+                            );
+                        }
                     }
                 }
                 Err(error) => {

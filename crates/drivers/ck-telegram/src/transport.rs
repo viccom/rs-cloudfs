@@ -48,22 +48,26 @@ use crate::flood::parse_flood_wait;
 use crate::plan::plan_chunk_sends;
 use crate::range::{range_plan, MAX_CHUNK_SIZE};
 use crate::stream::serve_range;
-use cloudkit_core::transport::{
-    ByteStream, CloudTransport, InboundFile, IncomingEvent, IncomingStream, RemoteHandle,
-    TransportError, UploadJob, UploadReceipt,
+use cloudkit_storage::transport::{
+    ByteStream, ChatCap, CloudTransport, InboundCap, InboundFile, IncomingEvent, IncomingStream,
+    RemoteHandle, StorageError, UploadJob, UploadReceipt,
 };
+use cloudkit_storage::Capabilities;
 
-/// Maps a grammers [`InvocationError`] onto [`TransportError`].
+/// Maps a grammers [`InvocationError`] onto the converged taxonomy
+/// [`StorageError`] (R2: backend errors never cross the layer boundary
+/// raw; the variant mapping table lives at the L2 module docs).
 ///
 /// grammers 0.10 splits the numeric suffix out of RPC error names
 /// (`"FLOOD_WAIT_31"` arrives as `name = "FLOOD_WAIT"`, `value = Some(31)`),
 /// so the wire-format name is re-joined before being fed to the pure
 /// [`parse_flood_wait`] parser (the single source of truth for the name
-/// format). `FLOOD_WAIT*` becomes [`TransportError::FloodWait`], I/O errors
-/// pass through, a dropped pool runner maps to [`TransportError::Disconnected`],
-/// and everything else is [`TransportError::Remote`] carrying the re-joined
-/// error name.
-fn map_invocation_error(err: InvocationError) -> TransportError {
+/// format). `FLOOD_WAIT*` becomes
+/// `StorageError::RateLimited { retry_after }`, I/O errors pass through
+/// as `Io` (message preserved), a dropped pool runner maps to
+/// `Unavailable`, and everything else is `Unavailable` carrying the
+/// re-joined error name (diagnosable, retry-reasonable).
+fn map_invocation_error(err: InvocationError) -> StorageError {
     match err {
         InvocationError::Rpc(rpc) => {
             let joined = match rpc.value {
@@ -71,14 +75,14 @@ fn map_invocation_error(err: InvocationError) -> TransportError {
                 None => rpc.name.clone(),
             };
             parse_flood_wait(&joined)
-                .map(|seconds| TransportError::FloodWait { seconds })
-                .unwrap_or_else(|| TransportError::Remote(joined))
+                .map(|seconds| StorageError::RateLimited {
+                    retry_after: Some(std::time::Duration::from_secs(u64::from(seconds))),
+                })
+                .unwrap_or_else(|| StorageError::Unavailable(joined))
         }
-        InvocationError::Io(io) => TransportError::Io(io),
-        InvocationError::Dropped => {
-            TransportError::Disconnected("sender pool runner is gone".into())
-        }
-        other => TransportError::Remote(other.to_string()),
+        InvocationError::Io(io) => StorageError::Io(io.to_string()),
+        InvocationError::Dropped => StorageError::Unavailable("sender pool runner is gone".into()),
+        other => StorageError::Unavailable(other.to_string()),
     }
 }
 
@@ -116,11 +120,11 @@ impl GrammersTransport {
     /// Telegram accepts for peers the bot may address (e.g. chats the bot is
     /// a member of). The first send/delete against the chat is what
     /// ultimately validates it.
-    pub async fn connect(config: TransportConfig) -> Result<Self, TransportError> {
+    pub async fn connect(config: TransportConfig) -> Result<Self, StorageError> {
         let session: Arc<SqliteSession> = Arc::new(
             SqliteSession::open(&config.session_path)
                 .await
-                .map_err(|e| TransportError::Remote(format!("session open: {e}")))?,
+                .map_err(|e| StorageError::Unavailable(format!("session open: {e}")))?,
         );
         // `SenderPool::new` would use `ConnectionParams::default()`, whose
         // descriptive fields are machine-specific (probed 2026-09-03 on the
@@ -162,7 +166,7 @@ impl GrammersTransport {
         }
 
         let peer_id = PeerId::from_bot_api_dialog_id(config.chat_id).ok_or_else(|| {
-            TransportError::Remote(format!(
+            StorageError::Unavailable(format!(
                 "chat_id {} is not a valid dialog id",
                 config.chat_id
             ))
@@ -170,7 +174,7 @@ impl GrammersTransport {
         let chat = session
             .peer_ref(peer_id)
             .await
-            .map_err(|e| TransportError::Remote(format!("peer lookup: {e}")))?
+            .map_err(|e| StorageError::Unavailable(format!("peer lookup: {e}")))?
             .unwrap_or_else(|| peer_id.to_ambient_ref());
 
         Ok(Self {
@@ -189,10 +193,10 @@ impl GrammersTransport {
 
     /// Fetches the media of one remote part message by id.
     ///
-    /// [`TransportError::NotFound`] is returned both when the message id is
+    /// [`StorageError::NotFound`] is returned both when the message id is
     /// unknown to the chat and when the message carries no downloadable
     /// media; the transport cannot do anything useful in either case.
-    async fn part_media(&self, msg_id: i32) -> Result<Media, TransportError> {
+    async fn part_media(&self, msg_id: i32) -> Result<Media, StorageError> {
         let messages = self
             .client
             .get_messages_by_id(self.chat, &[msg_id])
@@ -202,8 +206,8 @@ impl GrammersTransport {
             .into_iter()
             .next()
             .flatten()
-            .ok_or(TransportError::NotFound(msg_id))?;
-        message.media().ok_or(TransportError::NotFound(msg_id))
+            .ok_or(StorageError::NotFound)?;
+        message.media().ok_or(StorageError::NotFound)
     }
 
     /// Downloads `[offset, offset + len)` of one part's document, reusing
@@ -222,9 +226,9 @@ impl GrammersTransport {
         media: &Media,
         offset: u64,
         len: u64,
-    ) -> Result<(Vec<Vec<u8>>, u64), TransportError> {
+    ) -> Result<(Vec<Vec<u8>>, u64), StorageError> {
         let plan = range_plan(offset, len, MAX_CHUNK_SIZE)
-            .map_err(|e| TransportError::Remote(e.to_string()))?;
+            .map_err(|e| StorageError::Unavailable(e.to_string()))?;
         let mut download = self
             .client
             .iter_download(media)
@@ -250,7 +254,7 @@ impl CloudTransport for GrammersTransport {
     /// No-op: construction (see [`GrammersTransport::connect`]) performs the
     /// whole login flow, so an existing transport is always connected and
     /// re-invoking this is a no-op.
-    async fn connect(&self) -> Result<(), TransportError> {
+    async fn connect(&self) -> Result<(), StorageError> {
         Ok(())
     }
 
@@ -264,7 +268,7 @@ impl CloudTransport for GrammersTransport {
     /// A 0-byte job plans zero sends (the caller is expected to skip those
     /// uploads entirely, mirroring the Python placeholder-file behavior) and
     /// produces an empty receipt with `first_msg_id == 0`.
-    async fn upload(&self, job: &UploadJob) -> Result<UploadReceipt, TransportError> {
+    async fn upload(&self, job: &UploadJob) -> Result<UploadReceipt, StorageError> {
         // TODO(M2 encryption): whether bytes/captions are encrypted is
         // decided upstream (encrypt-then-chunk); until that unit lands,
         // sends are planned and captioned as plaintext.
@@ -274,7 +278,7 @@ impl CloudTransport for GrammersTransport {
         for (index, send) in sends.iter().enumerate() {
             let start = job.chunk_size * index as u64;
             let part_len = usize::try_from(send.byte_len).map_err(|_| {
-                TransportError::Remote(format!("part too large: {} bytes", send.byte_len))
+                StorageError::Unavailable(format!("part too large: {} bytes", send.byte_len))
             })?;
             let mut file = tokio::fs::File::open(&job.local_path).await?;
             file.seek(std::io::SeekFrom::Start(start)).await?;
@@ -311,7 +315,7 @@ impl CloudTransport for GrammersTransport {
     /// in memory, so a full `open` holds the entire file in RAM. The M3
     /// cache layer is the hydrate-to-disk path for whole files (as in the
     /// Python baseline); `open_range` is the bounded-memory entry point.
-    async fn open(&self, file: &RemoteHandle) -> Result<ByteStream, TransportError> {
+    async fn open(&self, file: &RemoteHandle) -> Result<ByteStream, StorageError> {
         let mut frames: Vec<Vec<u8>> = Vec::new();
         for &msg_id in &file.chunk_msg_ids {
             let media = self.part_media(msg_id).await?;
@@ -336,7 +340,7 @@ impl CloudTransport for GrammersTransport {
         file: &RemoteHandle,
         off: u64,
         len: u64,
-    ) -> Result<ByteStream, TransportError> {
+    ) -> Result<ByteStream, StorageError> {
         // Clamp to EOF per the trait contract.
         let want = len.min(file.total_size.saturating_sub(off));
         if want == 0 {
@@ -352,8 +356,9 @@ impl CloudTransport for GrammersTransport {
                 break; // window entirely before this part
             }
             let media = self.part_media(msg_id).await?;
-            let part_len = u64::try_from(media.size().unwrap_or_default())
-                .map_err(|_| TransportError::Remote(format!("part {msg_id} has no known size")))?;
+            let part_len = u64::try_from(media.size().unwrap_or_default()).map_err(|_| {
+                StorageError::Unavailable(format!("part {msg_id} has no known size"))
+            })?;
             let part_end = part_start + part_len;
             if window_start < part_end {
                 // Intersects [window_start, window_end): for the first
@@ -377,19 +382,58 @@ impl CloudTransport for GrammersTransport {
 
     /// Deletes one remote message. Telegram reports the count of deleted
     /// messages; zero (message already gone) surfaces as
-    /// [`TransportError::NotFound`].
-    async fn delete_remote(&self, msg_id: i32) -> Result<(), TransportError> {
+    /// [`StorageError::NotFound`].
+    async fn delete_remote(&self, msg_id: i32) -> Result<(), StorageError> {
         let deleted = self
             .client
             .delete_messages(self.chat, &[msg_id])
             .await
             .map_err(map_invocation_error)?;
         if deleted == 0 {
-            return Err(TransportError::NotFound(msg_id));
+            return Err(StorageError::NotFound);
         }
         Ok(())
     }
 
+    /// Capability declaration (R4). **Transition-period basis (Phase 1)**:
+    /// the declared bits rest on this driver's unit tests plus the
+    /// production-verified rs-CyDrive runs — the conformance-suite
+    /// prerequisite (Phase 2 driver handbook) is not in place yet, which
+    /// is exactly why the undeclared bits stay off (宁缺勿滥):
+    ///
+    /// - `range_read`: `open_range` is unit-tested (range planning/serving)
+    ///   and production-verified via the WebDAV read path;
+    /// - `multipart`: the transport performs Telegram-native chunked part
+    ///   uploads itself (`plan_chunk_sends`, 1900 MB parts — contract 5),
+    ///   unit-tested and production-verified;
+    /// - `inbound` / `chat`: the bot inbound/reply surfaces; wiring is
+    ///   compile-verified offline and shape-identical to the Python
+    ///   baseline's production behavior (see NOTE(real-machine) items);
+    /// - NOT declared: `resume` (no mid-upload resume against Telegram),
+    ///   `server_side_move` (no rename primitive wired), `rapid_upload`
+    ///   (no content-addressed upload), `authoritative_index` (Telegram
+    ///   is a shadow index by design, foundation D4), `change_feed` (no
+    ///   push API consumed).
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            range_read: true,
+            multipart: true,
+            inbound: true,
+            chat: true,
+            ..Capabilities::none()
+        }
+    }
+
+    fn as_inbound(&self) -> Option<&dyn InboundCap> {
+        Some(self)
+    }
+
+    fn as_chat(&self) -> Option<&dyn ChatCap> {
+        Some(self)
+    }
+}
+
+impl InboundCap for GrammersTransport {
     /// Wires the M2 inbound unit: consumes the pool's raw update receiver
     /// (kept from [`GrammersTransport::connect`]) through
     /// `Client::stream_updates`, forwarding mapped events over a channel
@@ -405,7 +449,7 @@ impl CloudTransport for GrammersTransport {
             .take();
         let Some(rx_updates) = rx_updates else {
             return Box::pin(futures_util::stream::iter(vec![Err(
-                TransportError::Remote(
+                StorageError::Unavailable(
                     "the incoming stream is already wired (the update receiver was consumed)"
                         .into(),
                 ),
@@ -426,7 +470,7 @@ impl CloudTransport for GrammersTransport {
                     // stream_updates failed before any update arrived:
                     // surface the failure once and end the forwarding
                     // task (the consumer sees an Err item, then EOF).
-                    let _ = tx.send(Err(TransportError::Remote(format!(
+                    let _ = tx.send(Err(StorageError::Unavailable(format!(
                         "stream_updates failed to start: {error}"
                     ))));
                     return;
@@ -457,13 +501,16 @@ impl CloudTransport for GrammersTransport {
             rx.recv().await.map(|item| (item, rx))
         }))
     }
+}
 
+#[async_trait]
+impl ChatCap for GrammersTransport {
     /// Sends a plain text message to the configured chat (bot replies).
     ///
     /// NOTE(real-machine): wiring follows `upload`'s `send_message` shape
     /// verbatim; actual delivery needs a live bot account (offline this
     /// is compile-verified only — see the module's grammers notes).
-    async fn send_text(&self, text: &str) -> Result<(), TransportError> {
+    async fn send_text(&self, text: &str) -> Result<(), StorageError> {
         self.client
             .send_message(self.chat, InputMessage::new().text(text.to_string()))
             .await
@@ -478,7 +525,7 @@ impl CloudTransport for GrammersTransport {
     /// NOTE(real-machine): the in-memory cursor mirrors `upload`'s
     /// stream plumbing; actual delivery needs a live bot account
     /// (offline this is compile-verified only).
-    async fn send_document(&self, name: &str, bytes: &[u8]) -> Result<(), TransportError> {
+    async fn send_document(&self, name: &str, bytes: &[u8]) -> Result<(), StorageError> {
         let mut cursor = std::io::Cursor::new(bytes.to_vec());
         let uploaded = self
             .client

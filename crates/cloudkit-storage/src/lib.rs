@@ -13,6 +13,14 @@
 //! [`capability`]（九能力位，D3）→ [`error`]（分类学，D2）→ [`stager`]
 //! （commit-on-close）→ [`driver`]（主 trait，D1）→ [`optional`]（可选
 //! trait 骨架）→ [`mock`]（内存后端）→ [`conformance`]（八条断言套件，D9）。
+//! 另有 Phase 1 Batch R 迁入的历史接缝家族：[`transport`]（CloudTransport
+//! trait 家族 + 契约类型 + MockTransport，R-3/R-4）与 [`vpath`]（其
+//! 载荷路径类型）。
+//!
+//! 注意：[`transport::ByteStream`]（Send+Sync，历史接缝）与
+//! [`vocab::ByteStream`]（Send，StorageDriver 家族）是两个类型；transport
+//! 模块的符号只在模块路径下暴露（不在 crate root re-export），避免与
+//! 词汇类型遮蔽混淆。
 
 pub mod capability;
 pub mod conformance;
@@ -22,7 +30,9 @@ pub mod ids;
 pub mod mock;
 pub mod optional;
 pub mod stager;
+pub mod transport;
 pub mod vocab;
+pub mod vpath;
 
 pub use capability::Capabilities;
 pub use conformance::{assert_conforms, ConformanceHarness, ErrorReplay};

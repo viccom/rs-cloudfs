@@ -57,3 +57,13 @@ pub enum StorageError {
     #[error("backend unavailable: {0}")]
     Unavailable(String),
 }
+
+/// 本地 `io::Error` 归置为 [`StorageError::Io`]（`to_string()` 保留消息）。
+///
+/// 服务于 trait 家族的 `?` 传播形态（mock / 驱动上传路径读取本地文件）；
+/// 分类学本身不携带 io::Error 载荷（Clone/Eq 派生的代价取舍）。
+impl From<std::io::Error> for StorageError {
+    fn from(error: std::io::Error) -> Self {
+        StorageError::Io(error.to_string())
+    }
+}

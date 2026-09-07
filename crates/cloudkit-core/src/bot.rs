@@ -3,10 +3,12 @@
 //!
 //! One inbound command text is matched against the Python prefix chain
 //! (help -> stats -> search -> get; unknown text is silently ignored) and
-//! answered through [`CloudTransport::send_text`] /
-//! [`CloudTransport::send_document`] — the reply target is the configured
-//! chat, the same peer the inbound stream filters on. Reply-send failures
-//! propagate to the caller (the inbound worker warns and keeps consuming).
+//! answered through [`ChatCap::send_text`] /
+//! [`ChatCap::send_document`] — the reply target is the configured
+//! chat, the same peer the inbound stream filters on (the CHAT capability
+//! trait since the Batch R split; callers obtain it by probing
+//! `CloudTransport::as_chat`). Reply-send failures propagate to the
+//! caller (the inbound worker warns and keeps consuming).
 //!
 //! Mirrored Python quirks (frozen contract):
 //!
@@ -35,7 +37,7 @@ use std::sync::Arc;
 
 use crate::database::MetaDatabase;
 use crate::rel_path::RelPath;
-use crate::transport::CloudTransport;
+use crate::transport::{ChatCap, StorageError};
 use crate::vfs::{Vfs, VfsError};
 
 /// Errors surfaced while handling one bot command.
@@ -46,7 +48,7 @@ pub enum BotError {
     Db(#[from] crate::database::DbError),
     /// Sending the reply (or the document) failed.
     #[error("transport error: {0}")]
-    Transport(#[from] crate::transport::TransportError),
+    Transport(#[from] StorageError),
     /// Hydrating the requested file failed.
     #[error("vfs error: {0}")]
     Vfs(#[from] crate::vfs::VfsError),
@@ -74,7 +76,7 @@ const BYTES_PER_MB: f64 = 1024.0 * 1024.0;
 pub async fn handle_command(
     db: &Arc<MetaDatabase>,
     vfs: &Vfs,
-    transport: &dyn CloudTransport,
+    transport: &dyn ChatCap,
     drive_letter: &str,
     text: &str,
 ) -> Result<(), BotError> {
@@ -127,7 +129,7 @@ pub async fn handle_command(
 /// icon, `size // 1024` KB — floor division, Python `//` parity).
 async fn handle_search(
     db: &Arc<MetaDatabase>,
-    transport: &dyn CloudTransport,
+    transport: &dyn ChatCap,
     text: &str,
 ) -> Result<(), BotError> {
     let Some(query) = split_maxsplit1(text) else {
@@ -166,7 +168,7 @@ async fn handle_search(
 async fn handle_get(
     db: &Arc<MetaDatabase>,
     vfs: &Vfs,
-    transport: &dyn CloudTransport,
+    transport: &dyn ChatCap,
     text: &str,
 ) -> Result<(), BotError> {
     let Some(token) = split_maxsplit1(text) else {
@@ -248,7 +250,7 @@ async fn handle_get(
 /// self-designed (tier-1, no Python baseline).
 async fn handle_ls(
     db: &Arc<MetaDatabase>,
-    transport: &dyn CloudTransport,
+    transport: &dyn ChatCap,
     text: &str,
 ) -> Result<(), BotError> {
     // The path defaults to the root (`/ls` == `/ls /`).
@@ -311,11 +313,7 @@ async fn handle_ls(
 /// (DB only — no filesystem directory, mirroring the WebDAV layer);
 /// `Exists` / `ParentMissing` get their own short replies, anything else
 /// propagates. Self-designed wording (tier-1).
-async fn handle_mkdir(
-    vfs: &Vfs,
-    transport: &dyn CloudTransport,
-    text: &str,
-) -> Result<(), BotError> {
+async fn handle_mkdir(vfs: &Vfs, transport: &dyn ChatCap, text: &str) -> Result<(), BotError> {
     let Some(token) = split_maxsplit1(text) else {
         transport.send_text("usage: /mkdir <path>").await?;
         return Ok(());
@@ -347,7 +345,7 @@ async fn handle_mkdir(
 /// ([`Vfs::remove_file`]); the remote Telegram messages are deliberately
 /// kept (Python parity) and the reply says so. Self-designed wording
 /// (tier-1).
-async fn handle_rm(vfs: &Vfs, transport: &dyn CloudTransport, text: &str) -> Result<(), BotError> {
+async fn handle_rm(vfs: &Vfs, transport: &dyn ChatCap, text: &str) -> Result<(), BotError> {
     let Some(token) = split_maxsplit1(text) else {
         transport.send_text("usage: /rm <path>").await?;
         return Ok(());
@@ -397,7 +395,7 @@ async fn handle_rm(vfs: &Vfs, transport: &dyn CloudTransport, text: &str) -> Res
 /// wording (tier-1).
 async fn handle_quota(
     db: &Arc<MetaDatabase>,
-    transport: &dyn CloudTransport,
+    transport: &dyn ChatCap,
     drive_letter: &str,
 ) -> Result<(), BotError> {
     let stats = db.get_stats()?;
@@ -417,7 +415,7 @@ async fn handle_quota(
 async fn handle_queue(
     db: &Arc<MetaDatabase>,
     vfs: &Vfs,
-    transport: &dyn CloudTransport,
+    transport: &dyn ChatCap,
 ) -> Result<(), BotError> {
     let queue = vfs.queue_stats();
     let pending = db.get_stats()?.pending_uploads;

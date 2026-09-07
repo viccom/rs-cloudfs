@@ -29,7 +29,7 @@ use cloudkit_core::database::MetaDatabase;
 use cloudkit_core::inbound::spawn_inbound_worker;
 use cloudkit_core::transport::mock::MockTransport;
 use cloudkit_core::transport::{
-    CloudTransport, InboundFile, IncomingEvent, RemoteHandle, TransportError,
+    CloudTransport, InboundFile, IncomingEvent, RemoteHandle, StorageError,
 };
 use cloudkit_core::upload_queue::RetryPolicy;
 use cloudkit_core::vfs::{Vfs, VfsConfig};
@@ -71,7 +71,7 @@ async fn test_env() -> (tempfile::TempDir, Arc<MetaDatabase>, Arc<Vfs>) {
 /// `events` and handed back as the trait object so the same `Arc` backs
 /// both the `Vfs` and the inbound worker.
 async fn worker_env(
-    events: Vec<Result<IncomingEvent, TransportError>>,
+    events: Vec<Result<IncomingEvent, StorageError>>,
 ) -> (
     tempfile::TempDir,
     Arc<MetaDatabase>,
@@ -92,7 +92,7 @@ async fn worker_env(
 }
 
 /// Builds a single-message `File` event for the scripted transports.
-fn file_event(filename: &str, msg_id: i32, size: u64) -> Result<IncomingEvent, TransportError> {
+fn file_event(filename: &str, msg_id: i32, size: u64) -> Result<IncomingEvent, StorageError> {
     Ok(IncomingEvent::File(InboundFile {
         filename: filename.to_string(),
         handle: RemoteHandle {
@@ -278,7 +278,7 @@ async fn worker_indexes_scripted_events() {
 #[tokio::test]
 async fn worker_survives_error_events() {
     let (_dir, db, vfs, transport) = worker_env(vec![
-        Err(TransportError::Disconnected("scripted failure".into())),
+        Err(StorageError::Unavailable("scripted failure".into())),
         file_event("after-error.bin", 31, 9),
     ])
     .await;

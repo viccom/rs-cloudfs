@@ -20,7 +20,9 @@ use cloudkit_core::cache::CacheManager;
 use cloudkit_core::database::{FileUpsert, MetaDatabase};
 use cloudkit_core::rel_path::RelPath;
 use cloudkit_core::transport::mock::{MockTransport, UploadAction};
-use cloudkit_core::transport::{CloudTransport, TransportError, UploadJob, UploadReceipt};
+use cloudkit_core::transport::{
+    Capabilities, ChatCap, CloudTransport, InboundCap, StorageError, UploadJob, UploadReceipt,
+};
 use cloudkit_core::upload_queue::{
     decide_retry, spawn_queue, QueueError, QueueStats, RetryDecision, RetryPolicy,
     UploadQueueConfig,
@@ -212,7 +214,7 @@ async fn first_non_flood_failure_retries_with_initial_backoff() {
         max_backoff: Duration::from_secs(5),
         max_attempts: 5,
     };
-    let err = TransportError::Disconnected("socket closed".into());
+    let err = StorageError::Unavailable("socket closed".into());
 
     assert!(
         matches!(
@@ -232,7 +234,7 @@ async fn backoff_doubles_and_caps_at_max() {
         max_backoff: Duration::from_secs(5),
         max_attempts: 20,
     };
-    let err = TransportError::Disconnected("down".into());
+    let err = StorageError::Unavailable("down".into());
 
     assert!(
         matches!(
@@ -265,7 +267,7 @@ async fn flood_wait_uses_server_seconds_exactly_and_never_degrades() {
     // Below the initial backoff: 0s still means RetryAfter(0).
     assert!(
         matches!(
-            decide_retry(&policy, &TransportError::FloodWait { seconds: 0 }, 1),
+            decide_retry(&policy, &StorageError::RateLimited { retry_after: Some(Duration::from_secs(0)) }, 1),
             RetryDecision::RetryAfter(d) if d == Duration::ZERO
         ),
         "FloodWait(0) retries immediately, not after initial_backoff"
@@ -273,7 +275,7 @@ async fn flood_wait_uses_server_seconds_exactly_and_never_degrades() {
     // Above the max backoff: no clamping.
     assert!(
         matches!(
-            decide_retry(&policy, &TransportError::FloodWait { seconds: 7 }, 1),
+            decide_retry(&policy, &StorageError::RateLimited { retry_after: Some(Duration::from_secs(7)) }, 1),
             RetryDecision::RetryAfter(d) if d == Duration::from_secs(7)
         ),
         "FloodWait(7) sleeps 7s even beyond max_backoff"
@@ -281,7 +283,7 @@ async fn flood_wait_uses_server_seconds_exactly_and_never_degrades() {
     // A huge streak of failures still never degrades a FloodWait.
     assert!(
         matches!(
-            decide_retry(&policy, &TransportError::FloodWait { seconds: 7 }, 999),
+            decide_retry(&policy, &StorageError::RateLimited { retry_after: Some(Duration::from_secs(7)) }, 999),
             RetryDecision::RetryAfter(d) if d == Duration::from_secs(7)
         ),
         "FloodWait never degrades, regardless of consecutive_failures"
@@ -297,7 +299,7 @@ async fn non_flood_failure_at_max_attempts_degrades() {
         max_backoff: Duration::from_millis(2),
         max_attempts: 3,
     };
-    let err = TransportError::Remote("chat gone".into());
+    let err = StorageError::Unavailable("chat gone".into());
 
     assert!(
         matches!(decide_retry(&policy, &err, 3), RetryDecision::Degrade),
@@ -391,7 +393,9 @@ async fn multi_chunk_success_records_per_chunk_rows() {
 async fn flood_wait_sleeps_then_retries_whole_upload() {
     let mock = MockTransport::builder()
         .upload_action(UploadAction::Fail {
-            error: TransportError::FloodWait { seconds: 0 },
+            error: StorageError::RateLimited {
+                retry_after: Some(Duration::from_secs(0)),
+            },
         })
         .upload_action(UploadAction::Ok)
         .build();
@@ -424,7 +428,7 @@ async fn flood_wait_sleeps_then_retries_whole_upload() {
 async fn transient_error_backs_off_then_succeeds() {
     let mock = MockTransport::builder()
         .upload_action(UploadAction::Fail {
-            error: TransportError::Disconnected("x".into()),
+            error: StorageError::Unavailable("x".into()),
         })
         .upload_action(UploadAction::Ok)
         .build();
@@ -455,13 +459,13 @@ async fn transient_error_backs_off_then_succeeds() {
 async fn consecutive_failures_degrade_and_stop_retrying() {
     let mock = MockTransport::builder()
         .upload_action(UploadAction::Fail {
-            error: TransportError::Disconnected("down 1".into()),
+            error: StorageError::Unavailable("down 1".into()),
         })
         .upload_action(UploadAction::Fail {
-            error: TransportError::Disconnected("down 2".into()),
+            error: StorageError::Unavailable("down 2".into()),
         })
         .upload_action(UploadAction::Fail {
-            error: TransportError::Disconnected("down 3".into()),
+            error: StorageError::Unavailable("down 3".into()),
         })
         .build();
     let (_dir, db, cache, mock) = test_env_with_mock(mock).await;
@@ -857,11 +861,11 @@ struct DeleteOnUploadTransport {
 
 #[async_trait::async_trait]
 impl CloudTransport for DeleteOnUploadTransport {
-    async fn connect(&self) -> Result<(), TransportError> {
+    async fn connect(&self) -> Result<(), StorageError> {
         self.inner.connect().await
     }
 
-    async fn upload(&self, job: &UploadJob) -> Result<UploadReceipt, TransportError> {
+    async fn upload(&self, job: &UploadJob) -> Result<UploadReceipt, StorageError> {
         let receipt = self.inner.upload(job).await?;
         let _ = fs::remove_file(&job.local_path);
         Ok(receipt)
@@ -870,7 +874,7 @@ impl CloudTransport for DeleteOnUploadTransport {
     async fn open(
         &self,
         file: &cloudkit_core::transport::RemoteHandle,
-    ) -> Result<cloudkit_core::transport::ByteStream, TransportError> {
+    ) -> Result<cloudkit_core::transport::ByteStream, StorageError> {
         self.inner.open(file).await
     }
 
@@ -879,16 +883,24 @@ impl CloudTransport for DeleteOnUploadTransport {
         file: &cloudkit_core::transport::RemoteHandle,
         off: u64,
         len: u64,
-    ) -> Result<cloudkit_core::transport::ByteStream, TransportError> {
+    ) -> Result<cloudkit_core::transport::ByteStream, StorageError> {
         self.inner.open_range(file, off, len).await
     }
 
-    async fn delete_remote(&self, msg_id: i32) -> Result<(), TransportError> {
+    async fn delete_remote(&self, msg_id: i32) -> Result<(), StorageError> {
         self.inner.delete_remote(msg_id).await
     }
 
-    fn incoming(&self) -> cloudkit_core::transport::IncomingStream {
-        self.inner.incoming()
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn as_inbound(&self) -> Option<&dyn InboundCap> {
+        self.inner.as_inbound()
+    }
+
+    fn as_chat(&self) -> Option<&dyn ChatCap> {
+        self.inner.as_chat()
     }
 }
 
@@ -937,13 +949,13 @@ async fn sha256_computed_before_upload_survives_local_delete() {
 async fn degrade_sends_bot_notification() {
     let mock = MockTransport::builder()
         .upload_action(UploadAction::Fail {
-            error: TransportError::Disconnected("down 1".into()),
+            error: StorageError::Unavailable("down 1".into()),
         })
         .upload_action(UploadAction::Fail {
-            error: TransportError::Disconnected("down 2".into()),
+            error: StorageError::Unavailable("down 2".into()),
         })
         .upload_action(UploadAction::Fail {
-            error: TransportError::Disconnected("down 3".into()),
+            error: StorageError::Unavailable("down 3".into()),
         })
         .build();
     let (_dir, db, cache, mock) = test_env_with_mock(mock).await;
@@ -997,18 +1009,18 @@ struct BrokenSendTextTransport {
 
 #[async_trait::async_trait]
 impl CloudTransport for BrokenSendTextTransport {
-    async fn connect(&self) -> Result<(), TransportError> {
+    async fn connect(&self) -> Result<(), StorageError> {
         self.inner.connect().await
     }
 
-    async fn upload(&self, job: &UploadJob) -> Result<UploadReceipt, TransportError> {
+    async fn upload(&self, job: &UploadJob) -> Result<UploadReceipt, StorageError> {
         self.inner.upload(job).await
     }
 
     async fn open(
         &self,
         file: &cloudkit_core::transport::RemoteHandle,
-    ) -> Result<cloudkit_core::transport::ByteStream, TransportError> {
+    ) -> Result<cloudkit_core::transport::ByteStream, StorageError> {
         self.inner.open(file).await
     }
 
@@ -1017,22 +1029,36 @@ impl CloudTransport for BrokenSendTextTransport {
         file: &cloudkit_core::transport::RemoteHandle,
         off: u64,
         len: u64,
-    ) -> Result<cloudkit_core::transport::ByteStream, TransportError> {
+    ) -> Result<cloudkit_core::transport::ByteStream, StorageError> {
         self.inner.open_range(file, off, len).await
     }
 
-    async fn delete_remote(&self, msg_id: i32) -> Result<(), TransportError> {
+    async fn delete_remote(&self, msg_id: i32) -> Result<(), StorageError> {
         self.inner.delete_remote(msg_id).await
     }
 
-    fn incoming(&self) -> cloudkit_core::transport::IncomingStream {
-        self.inner.incoming()
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
     }
 
-    async fn send_text(&self, _text: &str) -> Result<(), TransportError> {
+    fn as_inbound(&self) -> Option<&dyn InboundCap> {
+        self.inner.as_inbound()
+    }
+
+    fn as_chat(&self) -> Option<&dyn ChatCap> {
+        Some(self)
+    }
+}
+
+/// The broken reply surface itself (ChatCap since the Batch R split): the
+/// attempt counter lives on the wrapper, the failure is what test 23
+/// exercises.
+#[async_trait::async_trait]
+impl ChatCap for BrokenSendTextTransport {
+    async fn send_text(&self, _text: &str) -> Result<(), StorageError> {
         self.send_text_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
-        Err(TransportError::Remote("send_text is broken".into()))
+        Err(StorageError::Unavailable("send_text is broken".into()))
     }
 }
 
@@ -1044,13 +1070,13 @@ impl CloudTransport for BrokenSendTextTransport {
 async fn degrade_notification_failure_is_swallowed() {
     let mock = MockTransport::builder()
         .upload_action(UploadAction::Fail {
-            error: TransportError::Disconnected("down 1".into()),
+            error: StorageError::Unavailable("down 1".into()),
         })
         .upload_action(UploadAction::Fail {
-            error: TransportError::Disconnected("down 2".into()),
+            error: StorageError::Unavailable("down 2".into()),
         })
         .upload_action(UploadAction::Fail {
-            error: TransportError::Disconnected("down 3".into()),
+            error: StorageError::Unavailable("down 3".into()),
         })
         .build();
     let (_dir, db, cache, mock) = test_env_with_mock(mock).await;

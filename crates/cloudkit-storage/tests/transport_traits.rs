@@ -17,11 +17,9 @@
 use std::path::PathBuf;
 
 use cloudkit_storage::transport::mock::MockTransport;
-use cloudkit_storage::transport::{
-    ByteStream, ChatCap, CloudTransport, InboundCap, RemoteHandle, UploadJob,
-};
-use cloudkit_storage::{Capabilities, StorageError};
+use cloudkit_storage::transport::{ByteStream, ChatCap, CloudTransport, RemoteHandle, UploadJob};
 use cloudkit_storage::vpath::RelPath;
+use cloudkit_storage::{Capabilities, StorageError};
 use futures_util::StreamExt;
 
 /// A storage-only transport: the bare core face, no optional traits, no
@@ -34,7 +32,10 @@ impl CloudTransport for StorageOnlyTransport {
     async fn connect(&self) -> Result<(), StorageError> {
         Ok(())
     }
-    async fn upload(&self, _job: &UploadJob) -> Result<cloudkit_storage::transport::UploadReceipt, StorageError> {
+    async fn upload(
+        &self,
+        _job: &UploadJob,
+    ) -> Result<cloudkit_storage::transport::UploadReceipt, StorageError> {
         unimplemented!("not exercised")
     }
     async fn open(&self, _file: &RemoteHandle) -> Result<ByteStream, StorageError> {
@@ -92,12 +93,13 @@ fn mock_declares_inbound_chat_range_read_only() {
 async fn mock_probes_carry_chat_semantics() {
     let t = MockTransport::new();
     assert!(t.as_inbound().is_some(), "mock implements InboundCap");
-    let chat = t
-        .as_chat()
-        .expect("mock implements ChatCap");
+    let chat = t.as_chat().expect("mock implements ChatCap");
     chat.send_text("hello").await.expect("send_text");
     chat.send_text("again").await.expect("send_text");
-    assert_eq!(t.sent_texts(), vec!["hello".to_string(), "again".to_string()]);
+    assert_eq!(
+        t.sent_texts(),
+        vec!["hello".to_string(), "again".to_string()]
+    );
 }
 
 /// 4. A ChatCap implementor that overrides nothing gets the taxonomy's

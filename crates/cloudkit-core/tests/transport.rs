@@ -16,14 +16,15 @@ use cloudkit_core::rel_path::RelPath;
 use cloudkit_core::transport::mock::{MockTransport, UploadAction};
 use cloudkit_core::transport::{
     ByteStream, CloudTransport, InboundFile, IncomingEvent, IncomingStream, RemoteHandle,
-    TransportError, UploadJob,
+    StorageError, UploadJob,
 };
 use futures_util::StreamExt;
 use std::fs;
 use std::path::PathBuf;
+use std::time::Duration;
 
 /// Concatenates every chunk of a byte stream; propagates the first error.
-async fn drain(stream: ByteStream) -> Result<Vec<u8>, TransportError> {
+async fn drain(stream: ByteStream) -> Result<Vec<u8>, StorageError> {
     let mut stream = stream;
     let mut out = Vec::new();
     while let Some(chunk) = stream.next().await {
@@ -33,7 +34,7 @@ async fn drain(stream: ByteStream) -> Result<Vec<u8>, TransportError> {
 }
 
 /// Collects every event of an incoming stream; propagates the first error.
-async fn drain_events(stream: IncomingStream) -> Result<Vec<IncomingEvent>, TransportError> {
+async fn drain_events(stream: IncomingStream) -> Result<Vec<IncomingEvent>, StorageError> {
     let mut stream = stream;
     let mut out = Vec::new();
     while let Some(event) = stream.next().await {
@@ -84,30 +85,24 @@ async fn operations_before_connect_return_not_connected() {
     let job = job_for("/gate.txt", path, 7, 1, 64);
 
     let err = t.upload(&job).await.unwrap_err();
-    assert!(
-        matches!(err, TransportError::NotConnected),
-        "upload: {err:?}"
-    );
+    assert!(matches!(err, StorageError::Invalid), "upload: {err:?}");
 
     // ByteStream has no Debug, so assert on the Result directly.
     assert!(
-        matches!(
-            t.open(&handle_for(1, 7)).await,
-            Err(TransportError::NotConnected)
-        ),
+        matches!(t.open(&handle_for(1, 7)).await, Err(StorageError::Invalid)),
         "open"
     );
     assert!(
         matches!(
             t.open_range(&handle_for(1, 7), 0, 3).await,
-            Err(TransportError::NotConnected)
+            Err(StorageError::Invalid)
         ),
         "open_range"
     );
 
     let err = t.delete_remote(1).await.unwrap_err();
     assert!(
-        matches!(err, TransportError::NotConnected),
+        matches!(err, StorageError::Invalid),
         "delete_remote: {err:?}"
     );
 }
@@ -117,21 +112,18 @@ async fn operations_before_connect_return_not_connected() {
 async fn scripted_connect_failure_passes_through_and_keeps_gate_closed() {
     let (_dir, path) = write_temp_file("gate2.txt", b"still gated");
     let t = MockTransport::builder()
-        .connect_result(Err(TransportError::Disconnected("auth rejected".into())))
+        .connect_result(Err(StorageError::Unavailable("auth rejected".into())))
         .build();
 
     let err = t.connect().await.unwrap_err();
     assert!(
-        matches!(err, TransportError::Disconnected(ref msg) if msg == "auth rejected"),
+        matches!(err, StorageError::Unavailable(ref msg) if msg == "auth rejected"),
         "connect: {err:?}"
     );
 
     let job = job_for("/gate2.txt", path, 12, 1, 64);
     let err = t.upload(&job).await.unwrap_err();
-    assert!(
-        matches!(err, TransportError::NotConnected),
-        "upload: {err:?}"
-    );
+    assert!(matches!(err, StorageError::Invalid), "upload: {err:?}");
 }
 
 /// 3. Single-chunk upload: receipt fields, exact bytes, plain name,
@@ -227,7 +219,7 @@ async fn chunk_count_mismatch_fails_without_storing_messages() {
     let job = job_for("/plan.bin", path, 7, 2, 3);
     let err = t.upload(&job).await.unwrap_err();
     assert!(
-        matches!(&err, TransportError::Remote(msg) if msg.contains("chunk plan mismatch")),
+        matches!(&err, StorageError::Unavailable(msg) if msg.contains("chunk plan mismatch")),
         "expected Remote(chunk plan mismatch ...), got: {err:?}"
     );
 
@@ -243,7 +235,9 @@ async fn flood_wait_script_fails_then_retry_succeeds() {
     let (_dir, path) = write_temp_file("flood.bin", b"flooding");
     let t = MockTransport::builder()
         .upload_action(UploadAction::Fail {
-            error: TransportError::FloodWait { seconds: 30 },
+            error: StorageError::RateLimited {
+                retry_after: Some(Duration::from_secs(30)),
+            },
         })
         .upload_action(UploadAction::Ok)
         .build();
@@ -252,7 +246,7 @@ async fn flood_wait_script_fails_then_retry_succeeds() {
     let job = job_for("/flood.bin", path, 8, 1, 64);
     let err = t.upload(&job).await.unwrap_err();
     assert!(
-        matches!(err, TransportError::FloodWait { seconds: 30 }),
+        matches!(&err, StorageError::RateLimited { retry_after: Some(wait) } if *wait == Duration::from_secs(30)),
         "first upload: {err:?}"
     );
 
@@ -269,7 +263,7 @@ async fn fail_after_chunks_persists_prefix_then_retry_completes() {
     let t = MockTransport::builder()
         .upload_action(UploadAction::FailAfterChunks {
             chunks: 2,
-            error: TransportError::Disconnected("mid-upload".into()),
+            error: StorageError::Unavailable("mid-upload".into()),
         })
         .build();
     t.connect().await.expect("connect");
@@ -277,7 +271,7 @@ async fn fail_after_chunks_persists_prefix_then_retry_completes() {
     let job = job_for("/docs/clip.bin", path, 7, 3, 3);
     let err = t.upload(&job).await.unwrap_err();
     assert!(
-        matches!(err, TransportError::Disconnected(_)),
+        matches!(err, StorageError::Unavailable(_)),
         "first upload: {err:?}"
     );
 
@@ -329,7 +323,8 @@ async fn open_round_trips_full_chunked_file() {
     assert_eq!(bytes, b"abcdefg");
 }
 
-/// 9. open() with an unknown msg_id fails with NotFound(id).
+/// 9. open() with an unknown msg_id fails with NotFound (the converged
+///     taxonomy carries no id payload; the pre-split TransportError did).
 #[tokio::test]
 async fn open_unknown_msg_id_returns_not_found() {
     let t = MockTransport::new();
@@ -337,10 +332,7 @@ async fn open_unknown_msg_id_returns_not_found() {
 
     let handle = handle_for(999, 3);
     assert!(
-        matches!(
-            t.open(&handle).await,
-            Err(TransportError::NotFound(id)) if id == 999
-        ),
+        matches!(t.open(&handle).await, Err(StorageError::NotFound)),
         "open with unknown msg id"
     );
 }
@@ -395,16 +387,13 @@ async fn delete_remote_removes_message_and_rejects_unknown_ids() {
     assert_eq!(t.deleted(), vec![receipt.first_msg_id]);
 
     assert!(
-        matches!(
-            t.open(&handle).await,
-            Err(TransportError::NotFound(id)) if id == receipt.first_msg_id
-        ),
+        matches!(t.open(&handle).await, Err(StorageError::NotFound)),
         "open after delete must fail NotFound"
     );
 
     let err = t.delete_remote(4242).await.unwrap_err();
     assert!(
-        matches!(err, TransportError::NotFound(id) if id == 4242),
+        matches!(err, StorageError::NotFound),
         "delete unknown: {err:?}"
     );
 }
@@ -429,7 +418,13 @@ async fn incoming_drains_scripted_events_once_in_order() {
         ])
         .build();
 
-    let events = drain_events(t.incoming()).await.expect("first drain");
+    let events = drain_events(
+        t.as_inbound()
+            .expect("mock implements InboundCap")
+            .incoming(),
+    )
+    .await
+    .expect("first drain");
     assert_eq!(events.len(), 2, "both scripted events arrive");
     match &events[0] {
         IncomingEvent::File(f) => {
@@ -445,7 +440,13 @@ async fn incoming_drains_scripted_events_once_in_order() {
         other => panic!("second event must be Command, got {other:?}"),
     }
 
-    let again = drain_events(t.incoming()).await.expect("second drain");
+    let again = drain_events(
+        t.as_inbound()
+            .expect("mock implements InboundCap")
+            .incoming(),
+    )
+    .await
+    .expect("second drain");
     assert!(again.is_empty(), "second drain yields no new events");
 }
 

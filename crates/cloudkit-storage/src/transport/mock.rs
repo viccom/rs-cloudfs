@@ -1,14 +1,16 @@
 //! In-memory [`CloudTransport`](super::CloudTransport) for tests.
 //!
-//! Scriptable error injection (connect failures, FloodWait, mid-upload
+//! Scriptable error injection (connect failures, rate limits, mid-upload
 //! disconnects) plus inspection APIs so tests can assert on stored
 //! messages, remote names, captions and upload calls.
 //!
-//! The frozen behavior contract is pinned by `tests/transport.rs`.
+//! The frozen behavior contract is pinned by `cloudkit-core`'s
+//! `tests/transport.rs` (re-exported path); the trait-family split
+//! semantics by this crate's `tests/transport_traits.rs`.
 
 use super::{
-    ByteStream, CloudTransport, IncomingEvent, IncomingStream, RemoteHandle, TransportError,
-    UploadJob, UploadReceipt,
+    ByteStream, Capabilities, ChatCap, CloudTransport, InboundCap, IncomingEvent, IncomingStream,
+    RemoteHandle, StorageError, UploadJob, UploadReceipt,
 };
 use bytes::Bytes;
 use futures_core::Stream;
@@ -24,14 +26,14 @@ pub enum UploadAction {
     /// Fail the call with `error` before any chunk is stored.
     Fail {
         /// Error to return.
-        error: TransportError,
+        error: StorageError,
     },
     /// Store the first `chunks` chunks for real, then fail with `error`.
     FailAfterChunks {
         /// Number of leading chunks to store before failing.
         chunks: usize,
         /// Error to return after the prefix is stored.
-        error: TransportError,
+        error: StorageError,
     },
 }
 
@@ -66,13 +68,13 @@ struct MockState {
     /// Whether `connect()` has succeeded at least once.
     connected: bool,
     /// Scripted result of the first `connect()` call; `None` means Ok.
-    connect_result: Option<Result<(), TransportError>>,
+    connect_result: Option<Result<(), StorageError>>,
     /// Scripted upload outcomes, consumed in order.
     upload_script: VecDeque<UploadAction>,
     /// Events handed out by `incoming()`; drained on the first call.
     /// Results so a scripted transport error can interleave with events
     /// (the inbound worker must survive `Err` frames).
-    incoming_events: Vec<Result<IncomingEvent, TransportError>>,
+    incoming_events: Vec<Result<IncomingEvent, StorageError>>,
     /// Snapshot of every `upload()` job, in call order.
     upload_calls: Vec<UploadJob>,
     /// msg_ids successfully deleted, in order.
@@ -111,11 +113,11 @@ impl MockTransport {
         }
     }
 
-    /// Locks the interior state; a poisoned lock surfaces as `Remote`.
-    fn lock(&self) -> Result<MutexGuard<'_, MockState>, TransportError> {
+    /// Locks the interior state; a poisoned lock surfaces as `Unavailable`.
+    fn lock(&self) -> Result<MutexGuard<'_, MockState>, StorageError> {
         self.state
             .lock()
-            .map_err(|_| TransportError::Remote("mock state lock poisoned".to_string()))
+            .map_err(|_| StorageError::Unavailable("mock state lock poisoned".to_string()))
     }
 
     /// Stored bytes of the message `msg_id`, if present.
@@ -184,7 +186,7 @@ impl MockTransport {
 
 #[async_trait::async_trait]
 impl CloudTransport for MockTransport {
-    async fn connect(&self) -> Result<(), TransportError> {
+    async fn connect(&self) -> Result<(), StorageError> {
         let mut state = self.lock()?;
         match state.connect_result.take() {
             // Scripted failure passes through and keeps the gate shut.
@@ -196,16 +198,16 @@ impl CloudTransport for MockTransport {
         }
     }
 
-    async fn upload(&self, job: &UploadJob) -> Result<UploadReceipt, TransportError> {
+    async fn upload(&self, job: &UploadJob) -> Result<UploadReceipt, StorageError> {
         {
             let mut state = self.lock()?;
             state.upload_calls.push(job.clone());
             if !state.connected {
-                return Err(TransportError::NotConnected);
+                return Err(StorageError::Invalid);
             }
         }
 
-        // Read the real file; I/O failures surface as `TransportError::Io`.
+        // Read the real file; I/O failures surface as `StorageError::Io`.
         let data = std::fs::read(&job.local_path)?;
 
         let mut state = self.lock()?;
@@ -218,7 +220,7 @@ impl CloudTransport for MockTransport {
             total.div_ceil(chunk_size)
         };
         if actual_chunks != u64::from(job.chunk_count) {
-            return Err(TransportError::Remote(format!(
+            return Err(StorageError::Unavailable(format!(
                 "chunk plan mismatch: {total} bytes at chunk_size {} split into \
                  {actual_chunks} chunks, but the job planned {}",
                 job.chunk_size, job.chunk_count
@@ -244,7 +246,7 @@ impl CloudTransport for MockTransport {
         let first_msg_id = chunk_msg_ids
             .first()
             .copied()
-            .ok_or_else(|| TransportError::Remote("upload stored no chunks".to_string()))?;
+            .ok_or_else(|| StorageError::Unavailable("upload stored no chunks".to_string()))?;
         Ok(UploadReceipt {
             first_msg_id,
             chunk_msg_ids,
@@ -252,11 +254,11 @@ impl CloudTransport for MockTransport {
         })
     }
 
-    async fn open(&self, file: &RemoteHandle) -> Result<ByteStream, TransportError> {
+    async fn open(&self, file: &RemoteHandle) -> Result<ByteStream, StorageError> {
         let (delay, data) = {
             let state = self.lock()?;
             if !state.connected {
-                return Err(TransportError::NotConnected);
+                return Err(StorageError::Invalid);
             }
             (
                 state.open_delay,
@@ -273,11 +275,11 @@ impl CloudTransport for MockTransport {
         file: &RemoteHandle,
         off: u64,
         len: u64,
-    ) -> Result<ByteStream, TransportError> {
+    ) -> Result<ByteStream, StorageError> {
         let (delay, data) = {
             let state = self.lock()?;
             if !state.connected {
-                return Err(TransportError::NotConnected);
+                return Err(StorageError::Invalid);
             }
             let data = concat_chunks(&state, &file.chunk_msg_ids)?;
             let total = data.len() as u64;
@@ -294,20 +296,43 @@ impl CloudTransport for MockTransport {
         Ok(frame_stream(vec![Ok(Bytes::from(data))]))
     }
 
-    async fn delete_remote(&self, msg_id: i32) -> Result<(), TransportError> {
+    async fn delete_remote(&self, msg_id: i32) -> Result<(), StorageError> {
         let mut state = self.lock()?;
         if !state.connected {
-            return Err(TransportError::NotConnected);
+            return Err(StorageError::Invalid);
         }
         match state.messages.remove(&msg_id) {
             Some(_) => {
                 state.deleted.push(msg_id);
                 Ok(())
             }
-            None => Err(TransportError::NotFound(msg_id)),
+            None => Err(StorageError::NotFound),
         }
     }
 
+    /// Mock declares exactly the three bits the upstream test suites
+    /// exercise (bot replies, inbound events, range slicing); everything
+    /// else stays off (R4: 宁缺勿滥 — this is test infrastructure, not a
+    /// claim about any real backend).
+    fn capabilities(&self) -> Capabilities {
+        Capabilities {
+            range_read: true,
+            inbound: true,
+            chat: true,
+            ..Capabilities::none()
+        }
+    }
+
+    fn as_inbound(&self) -> Option<&dyn InboundCap> {
+        Some(self)
+    }
+
+    fn as_chat(&self) -> Option<&dyn ChatCap> {
+        Some(self)
+    }
+}
+
+impl InboundCap for MockTransport {
     fn incoming(&self) -> IncomingStream {
         let events = self
             .lock()
@@ -315,14 +340,17 @@ impl CloudTransport for MockTransport {
             .unwrap_or_default();
         frame_stream(events)
     }
+}
 
-    async fn send_text(&self, text: &str) -> Result<(), TransportError> {
+#[async_trait::async_trait]
+impl ChatCap for MockTransport {
+    async fn send_text(&self, text: &str) -> Result<(), StorageError> {
         let mut state = self.lock()?;
         state.sent_texts.push(text.to_string());
         Ok(())
     }
 
-    async fn send_document(&self, name: &str, bytes: &[u8]) -> Result<(), TransportError> {
+    async fn send_document(&self, name: &str, bytes: &[u8]) -> Result<(), StorageError> {
         let mut state = self.lock()?;
         state
             .sent_documents
@@ -362,7 +390,7 @@ fn store_chunks(
             .saturating_mul(chunk_size)
             .min(data.len() as u64)) as usize;
         let name = if total_chunks > 1 {
-            format!("{file_name}.part{:03}", index)
+            super::part_name(file_name, index)
         } else {
             file_name.to_owned()
         };
@@ -384,12 +412,12 @@ fn store_chunks(
 
 /// Concatenates the stored bytes of `chunk_msg_ids` in order; an unknown
 /// id fails with `NotFound`.
-fn concat_chunks(state: &MockState, chunk_msg_ids: &[i32]) -> Result<Vec<u8>, TransportError> {
+fn concat_chunks(state: &MockState, chunk_msg_ids: &[i32]) -> Result<Vec<u8>, StorageError> {
     let mut data = Vec::new();
     for &msg_id in chunk_msg_ids {
         match state.messages.get(&msg_id) {
             Some((bytes, _, _)) => data.extend_from_slice(bytes),
-            None => return Err(TransportError::NotFound(msg_id)),
+            None => return Err(StorageError::NotFound),
         }
     }
     Ok(data)
@@ -398,8 +426,8 @@ fn concat_chunks(state: &MockState, chunk_msg_ids: &[i32]) -> Result<Vec<u8>, Tr
 /// Wraps fully-buffered frames into the boxed stream shapes used by
 /// [`ByteStream`] and [`IncomingStream`].
 fn frame_stream<T>(
-    frames: Vec<Result<T, TransportError>>,
-) -> Pin<Box<dyn Stream<Item = Result<T, TransportError>> + Send + Sync>>
+    frames: Vec<Result<T, StorageError>>,
+) -> Pin<Box<dyn Stream<Item = Result<T, StorageError>> + Send + Sync>>
 where
     T: Send + Sync + 'static,
 {
@@ -408,15 +436,15 @@ where
 
 /// Builder for [`MockTransport`]; interior state is private.
 pub struct MockTransportBuilder {
-    connect_result: Option<Result<(), TransportError>>,
+    connect_result: Option<Result<(), StorageError>>,
     upload_script: VecDeque<UploadAction>,
-    incoming_events: Vec<Result<IncomingEvent, TransportError>>,
+    incoming_events: Vec<Result<IncomingEvent, StorageError>>,
     open_delay: Duration,
 }
 
 impl MockTransportBuilder {
     /// Sets the result of the first `connect` call (default `Ok`).
-    pub fn connect_result(mut self, result: Result<(), TransportError>) -> Self {
+    pub fn connect_result(mut self, result: Result<(), StorageError>) -> Self {
         self.connect_result = Some(result);
         self
     }
@@ -444,7 +472,7 @@ impl MockTransportBuilder {
     /// Sets the results yielded by `incoming` (drained once), errors
     /// included — the scripted-transport-error counterpart of
     /// [`MockTransportBuilder::incoming`].
-    pub fn incoming_results(mut self, events: Vec<Result<IncomingEvent, TransportError>>) -> Self {
+    pub fn incoming_results(mut self, events: Vec<Result<IncomingEvent, StorageError>>) -> Self {
         self.incoming_events = events;
         self
     }

@@ -17,7 +17,7 @@ use crate::cache::CacheManager;
 use crate::crypto::{self, CryptoError};
 use crate::database::{DbError, FileRecord, FileUpsert, MetaDatabase};
 use crate::rel_path::RelPath;
-use crate::transport::{CloudTransport, InboundFile, RemoteHandle, TransportError, UploadJob};
+use crate::transport::{CloudTransport, InboundFile, RemoteHandle, StorageError, UploadJob};
 use crate::upload_queue::{
     spawn_queue, QueueError, QueueStats, RetryPolicy, UploadQueueConfig, UploadQueueHandle,
     DEFAULT_CHUNK_SIZE_MB,
@@ -88,9 +88,10 @@ pub enum VfsError {
     /// Metadata persistence failed.
     #[error("metadata db error: {0}")]
     Db(#[from] DbError),
-    /// The remote backend failed.
+    /// The remote backend failed (D2: converged taxonomy, L3+ only ever
+    /// sees [`StorageError`]).
     #[error("transport error: {0}")]
-    Transport(#[from] TransportError),
+    Transport(#[from] StorageError),
     /// Decryption failed.
     #[error("crypto error: {0}")]
     Crypto(#[from] CryptoError),
@@ -174,10 +175,11 @@ fn cached_upsert(row: &FileRecord, is_cached: bool) -> FileUpsert {
 }
 
 /// Narrows an i64 metadata message id to the transport's i32; an id that
-/// does not fit is corrupt metadata, surfaced as a transport error.
+/// does not fit is corrupt metadata, surfaced as a transport error
+/// (mapped `Remote` → `Unavailable`, message payload preserved).
 fn narrow_msg_id(id: i64) -> Result<i32, VfsError> {
     i32::try_from(id).map_err(|_| {
-        VfsError::Transport(TransportError::Remote(format!(
+        VfsError::Transport(StorageError::Unavailable(format!(
             "message id {id} does not fit an i32"
         )))
     })
@@ -393,7 +395,7 @@ impl Vfs {
         let mut msg_ids = Vec::with_capacity(chunks.len());
         for chunk in &chunks {
             let id = chunk.telegram_msg_id.ok_or_else(|| {
-                VfsError::Transport(TransportError::Remote(format!(
+                VfsError::Transport(StorageError::Unavailable(format!(
                     "chunk {} of {} has no remote message id",
                     chunk.chunk_index, row.rel_path
                 )))

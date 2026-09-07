@@ -11,10 +11,13 @@ workspace = true
 [dependencies]
 async-trait = "0.1"
 bytes = "1"
-cloudkit-core = { path = "../../cloudkit-core" }
+# L1→L2 合法依赖（architecture §1 依赖方向）：trait 家族与契约类型
+# （含错误分类学 StorageError）自 Batch R 起住在 L2。本 crate 对
+# 对 core 领域 crate（cloudkit_core）的反向依赖已解除（§1.5 过渡豁免销账）。
+cloudkit-storage = { path = "../../cloudkit-storage" }
 futures-core = "0.3"
 # `stream::unfold` wraps the update-forwarding channel into the boxed
-# `IncomingStream` shape (same crate/features as cloudkit-core uses).
+# `IncomingStream` shape (the same crate/features the core crate uses).
 futures-util = { version = "0.3", default-features = false }
 # Exact `=` pins: grammers treats minor versions as breaking (TL layer
 # changes), so any semver-compatible drift must be a deliberate upgrade.
@@ -23,7 +26,7 @@ futures-util = { version = "0.3", default-features = false }
 grammers-client = { version = "=0.10.0", features = ["proxy"] }
 # Redirected by the workspace [patch.crates-io] to the in-tree vendored copy
 # (crates/vendor/grammers-session) whose sqlite-storage backend is
-# rusqlite(bundled) — same SQLite cloudkit-core links — instead of libsql.
+# rusqlite(bundled) — the same SQLite the core crate links — instead of libsql.
 # sqlite-storage is now needed by transport.rs for file-backed persistence;
 # default-features stays off to keep the feature set explicit.
 grammers-session = { version = "=0.10.0", default-features = false, features = [

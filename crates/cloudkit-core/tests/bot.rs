@@ -663,10 +663,10 @@ async fn queue_reports_counters() {
     let mock = Arc::new(
         MockTransport::builder()
             .upload_action(cloudkit_core::transport::mock::UploadAction::Fail {
-                error: cloudkit_core::transport::TransportError::Disconnected("flaky 1".into()),
+                error: cloudkit_core::transport::StorageError::Unavailable("flaky 1".into()),
             })
             .upload_action(cloudkit_core::transport::mock::UploadAction::Fail {
-                error: cloudkit_core::transport::TransportError::Disconnected("flaky 2".into()),
+                error: cloudkit_core::transport::StorageError::Unavailable("flaky 2".into()),
             })
             .build(),
     );
