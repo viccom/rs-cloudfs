@@ -7,7 +7,9 @@
 //! - metadata / listings answer straight off the SQLite rows (PROPFIND
 //!   never touches the network);
 //! - reads hydrate through [`Vfs::hydrate`] (cache first, remote
-//!   download + optional decrypt second);
+//!   download + optional decrypt second) — the remote always sees a
+//!   whole-file `open`, so Range requests slice the local cached copy
+//!   and never depend on the transport's RANGE_READ bit (R-5);
 //! - writes stage into a `.{name}.tmp` sibling of the cache path and
 //!   commit on `flush` — fsync, atomic rename, pending row, enqueued
 //!   upload — never reading the payload back into memory;
@@ -109,6 +111,19 @@ impl DavFileSystem for CyDriveFs {
             let rel = dav_to_rel(path)?;
             if options.read && !options.write {
                 // Read state: the row must be a file; hydrate then wrap.
+                //
+                // R-5 capability note: Range requests never reach the
+                // transport — hydration always streams the WHOLE file
+                // through `Vfs::hydrate` (`CloudTransport::open`, never
+                // `open_range`) and dav-server then slices the local
+                // cached copy via `HydratedFile` seeks. A transport that
+                // declares no RANGE_READ therefore serves byte-identical
+                // Range behavior (interfaces §1: degrade, never a panic);
+                // pinned by the smoke test
+                // `get_range_without_range_read_capability_still_slices`.
+                // Any future remote-Range forwarding MUST first check
+                // `capabilities().range_read` and fall back to this
+                // whole-file path when the bit is off.
                 let row = self.row(&rel)?.ok_or(FsError::NotFound)?;
                 if row.is_dir {
                     return Err(FsError::Forbidden);

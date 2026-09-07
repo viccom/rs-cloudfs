@@ -56,7 +56,23 @@ impl Default for MockState {
             open_delay: Duration::ZERO,
             sent_texts: Vec::new(),
             sent_documents: Vec::new(),
+            capabilities: mock_default_capabilities(),
         }
+    }
+}
+
+/// The bits the mock declares by default: exactly the three the upstream
+/// test suites exercise (bot replies, inbound events, range slicing);
+/// everything else stays off (R4: 宁缺勿滥 — this is test infrastructure,
+/// not a claim about any real backend). Consumer degrade tests override
+/// through [`MockTransportBuilder::capabilities`] to pin "declared-off"
+/// transports.
+fn mock_default_capabilities() -> Capabilities {
+    Capabilities {
+        range_read: true,
+        inbound: true,
+        chat: true,
+        ..Capabilities::none()
     }
 }
 
@@ -86,6 +102,10 @@ struct MockState {
     sent_texts: Vec<String>,
     /// Documents recorded by `send_document`, in call order.
     sent_documents: Vec<(String, Vec<u8>)>,
+    /// Bits `capabilities()` reports (the declared face); independent of
+    /// the optional-trait impls below (the probed face) — default
+    /// [`mock_default_capabilities`], builder-overridable.
+    capabilities: Capabilities,
 }
 
 /// In-memory transport; interior state is private.
@@ -110,6 +130,7 @@ impl MockTransport {
             upload_script: VecDeque::new(),
             incoming_events: Vec::new(),
             open_delay: Duration::ZERO,
+            capabilities: mock_default_capabilities(),
         }
     }
 
@@ -310,17 +331,14 @@ impl CloudTransport for MockTransport {
         }
     }
 
-    /// Mock declares exactly the three bits the upstream test suites
-    /// exercise (bot replies, inbound events, range slicing); everything
-    /// else stays off (R4: 宁缺勿滥 — this is test infrastructure, not a
-    /// claim about any real backend).
+    /// The declared bits come from the (builder-overridable) state; the
+    /// default is [`mock_default_capabilities`]. A poisoned lock falls
+    /// back to that same default — `capabilities()` is a synchronous
+    /// probe that must never panic (interfaces §1).
     fn capabilities(&self) -> Capabilities {
-        Capabilities {
-            range_read: true,
-            inbound: true,
-            chat: true,
-            ..Capabilities::none()
-        }
+        self.lock()
+            .map(|state| state.capabilities)
+            .unwrap_or_else(|_| mock_default_capabilities())
     }
 
     fn as_inbound(&self) -> Option<&dyn InboundCap> {
@@ -440,6 +458,7 @@ pub struct MockTransportBuilder {
     upload_script: VecDeque<UploadAction>,
     incoming_events: Vec<Result<IncomingEvent, StorageError>>,
     open_delay: Duration,
+    capabilities: Capabilities,
 }
 
 impl MockTransportBuilder {
@@ -477,6 +496,18 @@ impl MockTransportBuilder {
         self
     }
 
+    /// Overrides the declared capability bits (default: the three bits of
+    /// [`mock_default_capabilities`]). Consumer degrade tests use this to
+    /// pin a transport that *declares* bits off — e.g. a storage-only
+    /// backend with no RANGE_READ — while the optional-trait probes
+    /// (`as_inbound`/`as_chat`) stay on: the declared face and the
+    /// probed face are two separate concerns (a real driver's bit
+    /// declaration and its trait impls likewise come apart).
+    pub fn capabilities(mut self, caps: Capabilities) -> Self {
+        self.capabilities = caps;
+        self
+    }
+
     /// Finishes the transport.
     pub fn build(self) -> MockTransport {
         MockTransport {
@@ -485,6 +516,7 @@ impl MockTransportBuilder {
                 upload_script: self.upload_script,
                 incoming_events: self.incoming_events,
                 open_delay: self.open_delay,
+                capabilities: self.capabilities,
                 ..MockState::default()
             })),
         }

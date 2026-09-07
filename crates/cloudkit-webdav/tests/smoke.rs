@@ -20,7 +20,7 @@ use cloudkit_core::cache::CacheManager;
 use cloudkit_core::database::{FileUpsert, MetaDatabase};
 use cloudkit_core::rel_path::RelPath;
 use cloudkit_core::transport::mock::MockTransport;
-use cloudkit_core::transport::{CloudTransport, UploadJob, UploadReceipt};
+use cloudkit_core::transport::{Capabilities, CloudTransport, UploadJob, UploadReceipt};
 use cloudkit_core::upload_queue::RetryPolicy;
 use cloudkit_core::vfs::{Vfs, VfsConfig};
 use cloudkit_webdav::{CyDriveFs, WebDavServer};
@@ -57,11 +57,18 @@ struct Env {
 }
 
 async fn test_env() -> Env {
+    let mock = Arc::new(MockTransport::new());
+    mock.connect().await.expect("pre-connect mock transport");
+    test_env_for(mock).await
+}
+
+/// Same environment over a caller-built (pre-connected) transport — the
+/// seam the capability-degradation scenarios use to inject a transport
+/// with builder-overridden declared bits.
+async fn test_env_for(mock: Arc<MockTransport>) -> Env {
     let dir = tempfile::tempdir().expect("create temp dir");
     let cache_root = dir.path().join("cache");
     let db = Arc::new(MetaDatabase::open(&dir.path().join("meta.db")).expect("open temp db"));
-    let mock = Arc::new(MockTransport::new());
-    mock.connect().await.expect("pre-connect mock transport");
     let transport: Arc<dyn CloudTransport> = mock.clone();
     let vfs = Arc::new(Vfs::new(
         db.clone(),
@@ -346,6 +353,51 @@ async fn get_range_partial() {
     .await;
 
     assert_eq!(status_of(&resp), 206, "partial content: {resp}");
+    assert_eq!(
+        header(&resp, "content-range"),
+        Some("bytes 2-4/11"),
+        "inclusive slice bounds over the full length: {resp}"
+    );
+    assert_eq!(body_of(&resp), "llo");
+}
+
+/// 3b. The same Range GET on a transport that declares NO RANGE_READ
+///     answers the exact same 206: the WebDAV read path hydrates the
+///     whole file through `Vfs::hydrate` (transport `open`) and dav-server
+///     slices the local cached copy — the remote never sees a Range, so
+///     a storage-only transport degrades to identical behavior instead
+///     of forwarding an unsupported request (R-5 status-quo pin, see the
+///     read-state note in lib.rs; regression guard for any future
+///     remote-Range forwarding that forgets the capability check).
+#[tokio::test]
+async fn get_range_without_range_read_capability_still_slices() {
+    let mock = Arc::new(
+        MockTransport::builder()
+            .capabilities(Capabilities::none())
+            .build(),
+    );
+    assert!(
+        !mock.capabilities().range_read,
+        "precondition: the transport declares no RANGE_READ"
+    );
+    mock.connect().await.expect("pre-connect storage-only mock");
+    let env = test_env_for(mock).await;
+    let addr = env.server.local_addr();
+    seed_remote_file(&env.db, &env.mock, "/docs/hello.txt", b"hello world", 64).await;
+
+    let resp = send(
+        addr,
+        &request(
+            "GET",
+            "/docs/hello.txt",
+            addr,
+            &[("Range", "bytes=2-4")],
+            "",
+        ),
+    )
+    .await;
+
+    assert_eq!(status_of(&resp), 206, "identical partial content: {resp}");
     assert_eq!(
         header(&resp, "content-range"),
         Some("bytes 2-4/11"),

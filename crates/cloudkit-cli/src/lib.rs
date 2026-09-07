@@ -51,6 +51,7 @@ use cloudkit_core::database::MetaDatabase;
 use cloudkit_core::inbound::spawn_inbound_worker;
 use cloudkit_core::rel_path::RelPath;
 use cloudkit_core::sync::{namespace_key, sync_once, SyncOutcome};
+use cloudkit_core::transport::Capabilities;
 use cloudkit_core::transport::CloudTransport;
 use cloudkit_core::vfs::{Vfs, VfsConfig, VfsError};
 use cloudkit_web::WebUiServer;
@@ -355,6 +356,31 @@ pub fn vfs_config(cfg: &CyDriveConfig) -> VfsConfig {
     }
 }
 
+/// One-line transport capability declaration for the boot banner (R-5 /
+/// interfaces §1 / logging §2: one-shot lifecycle info). Every bit shows,
+/// on or off, in a fixed order — the consumer degrade warnings elsewhere
+/// (inbound worker not started, bot commands dropped) point back at this
+/// line for diagnosis.
+///
+/// Public for the pure-formatting tests (same frozen-API adjudication as
+/// [`vfs_config`]).
+pub fn transport_capabilities_line(caps: &Capabilities) -> String {
+    format!(
+        "range_read={}, resume={}, multipart={}, server_side_move={}, \
+         rapid_upload={}, authoritative_index={}, change_feed={}, \
+         inbound={}, chat={}",
+        caps.range_read,
+        caps.resume,
+        caps.multipart,
+        caps.server_side_move,
+        caps.rapid_upload,
+        caps.authoritative_index,
+        caps.change_feed,
+        caps.inbound,
+        caps.chat
+    )
+}
+
 /// Boots the full stack with an injected transport (tests pass a
 /// `MockTransport`; the `run` subcommand passes a `GrammersTransport`).
 ///
@@ -414,6 +440,15 @@ pub async fn run_with_transport(
         .webdav_host
         .parse()
         .with_context(|| format!("parsing webdav_host {:?}", cfg.webdav_host))?;
+    // Capability banner next to the listening line (R-5): declare every
+    // transport bit once at boot so the consumer degrade warnings (no
+    // INBOUND → no inbound worker, no CHAT → commands dropped) have a
+    // single diagnostic anchor. Ahead of the bind on purpose — a bind
+    // failure still leaves the declaration in the log.
+    tracing::info!(
+        capabilities = %transport_capabilities_line(&transport.capabilities()),
+        "transport capabilities declared"
+    );
     let server = WebDavServer::serve(fs, SocketAddr::new(host, cfg.webdav_port))
         .await
         .context("starting the WebDAV server")?;

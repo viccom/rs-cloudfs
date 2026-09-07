@@ -499,20 +499,20 @@ async fn run_instance_stops_via_control_channel() {
 
 // --------------------------------------- Batch R R-5: capability banner ---
 
-/// A `MakeWriter` that appends formatted log lines into a shared buffer,
-/// so a test can boot the stack under a capturing subscriber and assert
-/// on the boot banner (tracing's `set_default` guard is thread-local;
-/// `#[tokio::test]`'s default current-thread runtime keeps every spawned
-/// task — inbound worker, accept loop — on this same thread, so the
-/// whole boot logs through the capture).
-struct LogBuffer(Arc<Mutex<Vec<u8>>>);
+/// Process-wide log sink for the boot-banner test. The capture installs
+/// the binary's ONLY subscriber via `set_global_default`: a thread-local
+/// `set_default` loses the parallel-test Interest-cache race (the lib's
+/// `info!` callsites first evaluated on a no-subscriber thread stay
+/// cached "never", leaving this test's buffer empty), while the one
+/// global default covers every test thread uniformly.
+static LOGS: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+
+/// A `MakeWriter` draining into [`LOGS`].
+struct LogBuffer;
 
 impl std::io::Write for &LogBuffer {
     fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-        let mut sink = self
-            .0
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let mut sink = LOGS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         sink.extend_from_slice(buf);
         Ok(buf.len())
     }
@@ -539,12 +539,14 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for LogBuffer {
 /// off.
 #[tokio::test]
 async fn boot_declares_transport_capabilities() {
-    let buffer = Arc::new(Mutex::new(Vec::new()));
     let subscriber = tracing_subscriber::fmt()
-        .with_writer(LogBuffer(Arc::clone(&buffer)))
+        .with_writer(LogBuffer)
         .with_max_level(tracing::Level::INFO)
         .finish();
-    let _capture = tracing::subscriber::set_default(subscriber);
+    // This binary installs no other subscriber, so this succeeds exactly
+    // once; a parallel sibling landing here first is harmless (the sink
+    // is shared).
+    let _installed = tracing::subscriber::set_global_default(subscriber);
 
     let dir = tempfile::tempdir().expect("temp dir");
     let cfg = temp_config(dir.path(), 0);
@@ -552,9 +554,7 @@ async fn boot_declares_transport_capabilities() {
     let handle = boot(&cfg, mock).await;
 
     let logs = {
-        let sink = buffer
-            .lock()
-            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let sink = LOGS.lock().unwrap_or_else(|poisoned| poisoned.into_inner());
         String::from_utf8_lossy(&sink).into_owned()
     };
     assert!(
