@@ -593,6 +593,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "cloudkit-storage"
+version = "0.7.2"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "futures-core",
+ "futures-util",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.20",
+ "tokio",
+]
+
+[[package]]
 name = "cloudkit-sync-server"
 version = "0.7.2"
 dependencies = [
