@@ -391,3 +391,12 @@
 
 - **裁决**：Phase 2 维持既定顺序（驱动接入手册 → ck-local → ck-baidu，单卷先行）；**B3 完成后立即接 Phase 2.5 多卷启用批**（Registry + 每实例配置文件 + 每卷加密 + 多盘挂载，PCFS 模式去坑版）。百度加密/不加密双盘的首轮测试用 A4 双进程形态（两目录两 config），不阻塞多卷开发。
 - **附带**：telegram+加密过渡测试包同步交付负责人（release 产物 + 配置模板 + 使用说明，仓外目录不入库——R7）。
+
+## 2026-09-08 Batch L：ck-local 交付（conformance 第一真实公民）
+
+- **TDD 序列**：红 ea57136（Unsupported 骨架接入套件，断言① mkdir 红）→ 绿 04659d1（九方法全实现，①–⑥⑧ 绿、⑦未声明自动跳过）→ 修正 8f257e4（他卷 delete 契约对齐）。测试/实现委派隔离；绿阶段 conformance 既有断言零触碰（diff 审计过）。
+- **K6 落地形态**：BackendHandle = rel_path 字符串（根=空串，可往返）；VolumeId key = `canonicalize` 绝对形态（Windows `\\?\` 前缀，L2 opaque 合法）。delete 空句柄（卷根）→ Invalid（删除卷根无意义且危险）；他卷句柄 → NotFound（trait 契约）。
+- **实现期裁决**（计划授权范围内，可逆）：① staging = 根下 `.cklocal-staging/`（同卷保证 rename 原子），list 过滤该保留名（断言③集合完整性）；② **overwrite 不可见性超集**：chunk_size=1 契约使断言① 出现重复路径，第二次上传时旧已提交对象也须 staging 期不可见——writer 打开时旧文件 stash `.old`（abort/Drop 恢复，close 删）；③ 临时名 `{pid}-{seq}.part` 进程级 AtomicU64；④ **tokio::fs::File::write_all Ok 仅代表入队**后台 blocking 写，close 必须 `flush().await` 后取 metadata 才可信（曾致断言③ flaky，5×500 迭代验证修复）；⑤ 保留字符（`:?*<>|"`）跨平台统一拒绝 Invalid（防「Linux 可建、Windows 不可寻址」条目）；⑥ io 映射表 kind 敏感（NotFound/AlreadyExists/PermissionDenied→Unauthorized{false}/InvalidInput→对应变体，其余 Io）；⑦ rename 目标已存在显式预检 Exists（std::fs::rename 是覆盖语义）；⑧ quota total=None/used=0。
+- **能力位**：range_read/server_side_move/authoritative_index=true（逐位注码）；resume/multipart/rapid_upload/change_feed/inbound/chat=false（注理由）+ 九位精确值静态锁测试。
+- **验证**：`cargo test -p ck-local` 4 passed / 0 failed；workspace 628 passed / 0 failed（625 基线 +3）/ 6 ignored；clippy -D warnings / fmt / check_layers（10 manifests）全过。
+- **止损点未触发**：套件未暴露断言语义缺陷（发现的都是实现侧问题）。
