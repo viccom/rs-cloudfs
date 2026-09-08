@@ -429,3 +429,14 @@
 - **探针证据**（干净 curl，netdisk UA）：create isdir=1 对已存在目录返回 errno=0（成功假象），远端保留原目录并生成 `<名>_20260908_212145` 时间戳后缀**空副本**——非 -8。驱动「-8 → Exists」容错永不触发，ensure_parents 每次撞已存在层即产空目录垃圾；conformance ④ 真网必挂。
 - **裁决**：mkdir 与 ensure_parents 全面转 **list 预检**（先 list 父目录：已存在→Exists/跳过，不存在才 create）；-8 分支保留为防御语义。mock create 冲突建模对齐真实（errno=0 + 副本），使「未预检」实现可被离线测试检出。预检 list 流量顺带喂句柄缓存。
 - **残留形态记录**：本轮实证期间产生的远端垃圾（cloudfs-b2 下 10 个测试目录 + /apps 两个 suffixed 副本）已全数清理（filemanager delete 复查 n=0）；/apps/cloudfs-b2 保留为 B2 测试根空壳。
+
+## 2026-09-08 Batch B2 收口：ck-baidu 上传/下载全链交付（五轮真网实证链）
+
+- **TDD 序列**：红 a21114a（16 红：上传表单字节级/差集/dlink 缓存/conformance 接线）→ 绿 3696fe6 → 真网返工 31363（c6c22de + ef821e7）/meta 全废（ddbade4）/目录 create 预检（690834a）。终态 ck-baidu 42 passed（conformance ①–⑧ 全绿含 ⑦差集可观测）+ 真机 3/3。
+- **五项真网实证**（mock 无法预见、PCFS 未覆盖，各自有 decisions 条目）：① uinfo 用户键=uk 非 uid；② precreate 会话锁定全量 block_list（create 不一致重申 → 31363）→ 上传策略「到齐即传」；③ meta 端点在此 appkey 下全废（31300/31023）→ stat/Entry/delete 全面转 list + fs_id 句柄缓存 + 递归扫描；④ 目录 create 冲突 = errno=0 + 空副本重命名（非 -8）→ mkdir/ensure_parents list 预检；⑤ create 后 meta 索引秒级传播延迟（list 即时）。**MSYS 教训**：Git Bash 探针 path 形参被改写致首批探针全废（-7 假象），干净探针（MSYS_NO_PATHCONV）推翻两个错误中间结论——AGENTS 陷阱清单候选。
+- **K 落地**：K7（会话表 (path,size) 定位 + 探活三路 + abort 保留会话）、K8（dlink TTL 60min 默认 + 两段 fallback：追 token→重取 dlink）、K9（4MiB 有界 Range + netdisk UA；下载顺序实现，4 并发预取留 B3b）、K10（rtype=3 真机复核通过——同路径重传覆盖生效无 _2026 副本）、K16（mock axum 建模五轮迭代对齐真实）。
+- **能力位终态**：range_read/resume/multipart/server_side_move/rapid_upload/authoritative_index=true（逐位注码 + 九位静态锁）；conformance ⑦ 场景随「到齐即传」中立化（套件缺陷修复，ef821e7）。
+- **吞吐记录**：100MB 真机往返 up 6.5-6.7 MB/s / down 2.8-5.1 MB/s（顺序分片实现 + 网络波动；spike qps 复跑零拒绝排除限额形态）；串行上传是 conformance ⑦ 确定性契约（write 同步落定）的代价，整文件 4 并发路径在 B3b transport_face 实现。
+- **远端卫生**：全轮测试/探针遗留已清（cloudfs-b2 零条目复查）；/apps/privatefs 全程未触碰；cloudfs-b2 保留为测试根空壳。
+- **待负责人**：① 正式 appkey 到位后复测 meta 权限（31300 消失则可回切 meta 直查省流量）；② K10 复核项销账建议（rtype=3 真机通过）。
+- **验证**：workspace 671 passed 0 failed（9 ignored 含真机 3+既有 6）；clippy/fmt/check_layers（11 manifests）/scan_secrets 全过。
