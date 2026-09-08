@@ -487,7 +487,12 @@ async fn assert_resume(
         panic!("⑦ 声明了 RESUME 却无法观测后端收到的字节数——R4：声明即必须可验证");
     };
     let total = 5 * chunk + 7;
-    let staged = 3 * chunk + 4; // 3 个整块 + 半块
+    // 首段写到「数据到齐」（staged == total）。套件不规定驱动的 staging
+    // 缓冲策略：「写满即传」与「到齐即传」（B2 真网 31363 实证：百度
+    // precreate 会话锁定全量 block_list，只得到齐即传）均合法，到齐形态
+    // 对两者中立。判别力由上界保持——无会话复用的「假 resume」驱动在
+    // 二次上传将全量重传而超界（2026-09-08 套件缺陷修复，decisions 有档）。
+    let staged = total;
     let path = rp("conformance/a7/resume");
     let data = pattern(total as usize);
     let hint = WriteHint {
