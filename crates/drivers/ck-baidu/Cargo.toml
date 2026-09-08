@@ -1,0 +1,47 @@
+[package]
+name = "ck-baidu"
+description = "Baidu Pan StorageDriver - skeleton + OAuth state machine + metadata plane (Phase 2 Batch B1)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# StorageDriver trait 为 #[async_trait]，实现侧必须使用同一宏
+# （ck-local/ck-telegram 同款）。
+async-trait = "0.1"
+# L2 契约层是唯一 workspace 依赖——驱动 crate 禁依赖 cloudkit-core 与
+# 任何 L3+ crate（driver-onboarding §1 / R1，scripts/check_layers 拦截）。
+cloudkit-storage = { path = "../../cloudkit-storage" }
+# B2 分片 MD5（precreate block_list）——B1 先声明（计划 §3 Files 清单），
+# 上传路径在 Batch B2 接线使用。
+md-5 = "0.10"
+# HTTP 面：rustls（禁默认 native-tls，对齐 spike/sync 先例）；json=表单与
+# 响应解析、multipart=B2 superfile2、stream=B2 下载（特性集照抄
+# examples/baidu_spike Cargo.toml）。
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "multipart",
+    "rustls-tls",
+    "stream",
+] }
+# 载荷模型（derive 为响应/表单解析结构体备用，B1 绿阶段使用）。
+serde = { version = "1", features = ["derive"] }
+# api/client 层 JSON 载荷（reqwest json 特性同源；显式声明为直接依赖，
+# 计划 §3 五项依赖清单未列——响应解析必需，特此注明）。
+serde_json = "1"
+# token 状态 RwLock（spike Ctx.token 同款形态，刷新整体替换）。
+tokio = { version = "1", features = ["sync"] }
+
+[dev-dependencies]
+# mock baidu 内存后端（K16：axum 钉 0.8.9，cloudkit-sync-server 测试同款
+# 特性集——default-features=false 保持与 lock 一致的最小面）。
+axum = { version = "=0.8.9", default-features = false, features = [
+    "http1",
+    "json",
+    "tokio",
+] }
+# mock 监听（net）+ #[tokio::test]（rt/macros）。
+tokio = { version = "1", features = ["rt", "macros", "net"] }
