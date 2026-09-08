@@ -1,9 +1,11 @@
 #!/usr/bin/env python3
 """Generate interop contract fixtures using the ORIGINAL Python CyDrive code.
 
-Outputs into crates/cydrive-core/tests/compat/fixtures/:
-  - crypto_vector.json : ciphertext produced by cydrive.crypto.CyCrypto (AES-256-GCM v1 format)
-  - python_meta.sql    : SQL dump of a database created by cydrive.database.MetaDatabase
+Outputs (split since the Phase 0 rename + Batch E crypto-crate split):
+  - crates/cloudkit-crypto/tests/compat/fixtures/crypto_vector.json
+      ciphertext produced by cydrive.crypto.CyCrypto (AES-256-GCM v1 format)
+  - crates/cloudkit-core/tests/compat/fixtures/python_meta.sql
+      SQL dump of a database created by cydrive.database.MetaDatabase
 
 Run from anywhere: paths are resolved relative to this file and the Python repo.
 """
@@ -17,12 +19,16 @@ import tempfile
 
 CYDRIVE_PY_REPO = r"E:\GitHub\CyDrive"
 HERE = os.path.dirname(os.path.abspath(__file__))
-FIXTURES = os.path.normpath(
-    os.path.join(HERE, "..", "crates", "cydrive-core", "tests", "compat", "fixtures")
+CRYPTO_FIXTURES = os.path.normpath(
+    os.path.join(HERE, "..", "crates", "cloudkit-crypto", "tests", "compat", "fixtures")
+)
+META_FIXTURES = os.path.normpath(
+    os.path.join(HERE, "..", "crates", "cloudkit-core", "tests", "compat", "fixtures")
 )
 
 sys.path.insert(0, CYDRIVE_PY_REPO)
-os.makedirs(FIXTURES, exist_ok=True)
+os.makedirs(CRYPTO_FIXTURES, exist_ok=True)
+os.makedirs(META_FIXTURES, exist_ok=True)
 tmp = tempfile.mkdtemp(prefix="cydrive_fixtures_")
 
 # ---------------------------------------------------------------- crypto ----
@@ -52,7 +58,7 @@ vector = {
     "plaintext_base64": base64.b64encode(PLAINTEXT).decode("ascii"),
     "ciphertext_base64": base64.b64encode(ciphertext).decode("ascii"),
 }
-with open(os.path.join(FIXTURES, "crypto_vector.json"), "w", encoding="utf-8") as f:
+with open(os.path.join(CRYPTO_FIXTURES, "crypto_vector.json"), "w", encoding="utf-8") as f:
     json.dump(vector, f, indent=2)
 
 # ------------------------------------------------------------- database ----
@@ -81,10 +87,11 @@ for idx, (msg_id, size) in enumerate([(201, 1900 * MB), (202, 1900 * MB), (203, 
 conn = sqlite3.connect(db_path)
 dump = "\n".join(conn.iterdump()) + "\n"
 conn.close()
-with open(os.path.join(FIXTURES, "python_meta.sql"), "w", encoding="utf-8") as f:
+with open(os.path.join(META_FIXTURES, "python_meta.sql"), "w", encoding="utf-8") as f:
     f.write(dump)
 
-print("fixtures written to", FIXTURES)
-for name in sorted(os.listdir(FIXTURES)):
-    path = os.path.join(FIXTURES, name)
-    print(f"  {name}: {os.path.getsize(path)} bytes")
+for fixtures in (CRYPTO_FIXTURES, META_FIXTURES):
+    print("fixtures written to", fixtures)
+    for name in sorted(os.listdir(fixtures)):
+        path = os.path.join(fixtures, name)
+        print(f"  {name}: {os.path.getsize(path)} bytes")
