@@ -416,3 +416,10 @@
 - **裁决**：stager 流式策略「write 首块即传（部分 precreate）」→「**到齐即传**」（hint.size 已知且字节到齐 → write 返回前 precreate 全量 + 串行传满块 + 位图落盘；close 传尾块 + create 原样重申）。write 同步落定契约（conformance ⑦）保持；K7 会话恢复三路不变（drop/close-中断后二次 equip 差集补传）。mock create 增建模「block_list 一致性校验」（31363）。
 - **附带实证**：create 目录/rtype=3/deep precreate 均真网可用（errno=0）——K10 rtype=3 复核通过；31363 纳入 errno 码表（Invalid 族——参数与预创建不一致）。
 - **MSYS 教训**：Git Bash 探针中 `path=/apps/...` 形参被路径改写污染（→ C:/Program Files/Git/apps/...，百度报「文件夹 C: 命名不合法」errno=-7）——首批探针全部作废；干净探针（MSYS_NO_PATHCONV=1）推翻了「create 目录恒 -7」「rtype=3 不可用」两个错误中间结论。教训入 AGENTS 陷阱候选。
+
+## 2026-09-08 Batch B2 真网实证（第四轮）：meta 端点在此 appkey 下全废——stat/delete/Entry 构造全面转 list
+
+- **探针证据**（干净 curl，netdisk UA）：meta&path → error_code=31300 "stream type is not authorized"（无权限）；meta&fs_ids → 31023 param error（多编码变体同）；filemanager delete 的 fs_id 形态 → errno=12 不删除（只支持 path）；已传文件对 meta 轮询 10s 不可见（持续无权限非延迟）。PCFS 生产未暴露系其 entryCache 容错；spike 从未测 meta。
+- **裁决**：① stat = list 父目录 + path 精确匹配；② close 的 Entry 构造 = list 父目录 + fs_id 匹配（list_lookup 提为主路径）；③ delete 句柄解析 = fs_id→path 缓存（list/stat/Entry 流量填充，容量 4096）+ 未命中递归 list 扫描兜底；④ meta_by_path/meta_by_fs_id 停用保留（allow(dead_code)，正式 appkey 复测候选）；⑤ mock meta 臂保留无消费者（注释注码）。stat 的「注入 -9 → NotFound」语义在 list 主路径下自动成立（conformance ⑤ / errno_mapping 不弱化）。
+- **连带**：E2E/真机的 stat 可见性即时（list 实证）；K5（handle=fs_id 跨 rename 稳定）不变——缓存只是解析层，path 变更后缓存陈旧条目由递归扫描兜底纠偏（delete 失败时缓存失效重扫一次，注码）。
+- **待负责人**：正式 appkey（个人开发者）到位后复测 meta 权限（31300 是否消失）——若可用可回切 meta 直查（省 list 流量）；此裁决不影响正确性只影响效率。

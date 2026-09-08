@@ -38,7 +38,7 @@ use bytes::Bytes;
 use futures_core::Stream;
 use tokio::sync::mpsc;
 
-use cloudkit_storage::{ByteStream, EntryId, Range, StorageError, VolumeId};
+use cloudkit_storage::{ByteStream, Range, StorageError};
 
 use crate::api;
 use crate::client::BaiduClient;
@@ -82,27 +82,21 @@ impl DlinkCache {
 
 /// 打开读取流（driver.rs 委派）。
 ///
-/// - 句柄 = fs_id（K5）：他卷 → `NotFound`；不可解析 → `Invalid`；
+/// - 句柄 = fs_id（K5）：他卷 → `NotFound`；不可解析 → `Invalid`（两项
+///   校验在 driver.rs `reader` 完成，fs_id 与解析条目一并传入）；
 ///   指向目录 → `Invalid`（trait 契约）；
 /// - `range = None` 整读 `[0, size)`；`Some` 半开语义：end 越界钳制到
 ///   EOF，`start >= size` / 空窗口 → 空流（conformance ② 声明形态）；
-/// - fs_id → path/size 经 meta 直查（dlink 签发按 path，spike §5）。
+/// - fs_id → 条目解析（path/size/isdir）由 driver.rs 的句柄缓存 + 递归
+///   扫描供给（真网 31300 实证驱动，2026-09-08 第四轮返工——原 meta
+///   fs_ids 直查在此 appkey 下 31023 全废；dlink 签发按 path，spike §5）。
 pub(crate) async fn open_range(
     client: &Arc<BaiduClient>,
     cache: &Arc<DlinkCache>,
-    volume: &VolumeId,
-    id: &EntryId,
+    fs_id: i64,
+    remote: &api::RemoteEntry,
     range: Option<Range>,
 ) -> Result<ByteStream, StorageError> {
-    if id.volume != *volume {
-        return Err(StorageError::NotFound); // 他卷句柄（trait 契约）
-    }
-    let fs_id: i64 = id
-        .handle
-        .as_str()
-        .parse()
-        .map_err(|_| StorageError::Invalid)?;
-    let remote = api::meta_by_fs_id(client, &fs_id.to_string()).await?; // -9 → NotFound
     if remote.isdir != 0 {
         return Err(StorageError::Invalid); // 目录不可读
     }

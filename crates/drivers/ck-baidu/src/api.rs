@@ -9,10 +9,10 @@
 //! | 操作 | 端点 | 参数形态 | 源 |
 //! |---|---|---|---|
 //! | list | GET `/rest/2.0/xpan/file` | query 恰 `method=list&dir=<abs>&access_token`（**无分页参数**——driver 内 offset 游标切 Page，ck-local 先例） | spike api.rs:131-148；PCFS api.go:49-52 |
-//! | stat | GET 同上 | query 恰 `method=meta&path=<abs>&access_token`（**path 参数**，非 filelist） | PCFS api.go:110-113 |
-//! | stat（按句柄） | GET 同上 | query `method=meta&fs_ids=[<id>]&access_token`（fs_id → path 解析，delete 流程用；数组形态） | PCFS api.go:176-179 |
+//! | ~~stat（meta&path）~~ | GET 同上 | **已停用**（真网 31300 实证 2026-09-08，见下节）——stat 改「list 父目录 + path 精确匹配」（`driver.rs` stat / `upload.rs` open_writer 预检共用） | 真网探针 #1 |
+//! | ~~stat（meta&fs_ids）~~ | GET 同上 | **已停用**（真网 31023 实证 2026-09-08）——fs_id → 条目解析改「句柄缓存（list/stat/Entry 流量填充）+ 未命中递归 list 扫描」（`driver.rs` HandleCache/scan_dir） | 真网探针 #2 |
 //! | mkdir | POST 同上 | query `method=create&access_token`；form 恰 `path=<abs>&isdir=1` 两字段（application/x-www-form-urlencoded） | PCFS api.go:708-735 |
-//! | delete | POST 同上 | query `method=filemanager&opera=delete&access_token`；form 恰 `filelist` 字段 = `[{"path":<abs>}]`；**检查 info[] 逐项 errno** | spike api.rs:468-517（比 PCFS 严，按 spike） |
+//! | delete | POST 同上 | query `method=filemanager&opera=delete&access_token`；form 恰 `filelist` 字段 = `[{"path":<abs>}]`（**仅 path 形态**——fs_id 形态 errno=12 不删，真网实证 #3）；**检查 info[] 逐项 errno** | spike api.rs:468-517（比 PCFS 严，按 spike）+ 真网探针 #3 |
 //! | move（rename） | POST 同上 | query `method=filemanager&opera=move&access_token`；form `async=1` + `filelist=[{"path":…,"dest":…,"newname":…,"ondup":"overwrite"}]`；**不轮询 taskid** | PCFS api.go:781-870（829-845 形态） |
 //! | quota | GET 同上 | query 恰 `method=quota&access_token`（拼在 xpan/file 上）；响应顶层 `used`/`total`（i64） | PCFS api.go:914-933 |
 //! | uinfo | GET `/rest/2.0/xpan/nas` | query 恰 `method=uinfo&access_token`（**在 /xpan/nas 不在 /xpan/file**）；响应顶层含 `uk`（用户标识——实抓 2026-09-08，无 `uid` 字段） | PCFS internal/baiduauth/config.go:370-373（端点）+ 实抓（字段名） |
@@ -25,6 +25,17 @@
 //! B2 已接线（本批）：precreate / superfile2（client.rs，PCS 域 error_code
 //! 族）/ create（文件）/ dlink（client.rs fetch_dlink）——三步曲编排在
 //! `upload.rs`、下载器在 `download.rs`；wire 形态见上表 spike 源码行号。
+//!
+//! ## meta 端点停用（真网 31300/31023 实证，2026-09-08 第四轮返工）
+//!
+//! 干净探针（netdisk UA）实证此第三方 appkey 下 **meta 端点全废**：
+//! `meta&path` → error_code=31300 "stream type is not authorized"（持续
+//! 无权限非延迟——已传文件轮询 10s 不可见）；`meta&fs_ids` → 31023
+//! param error（多编码变体同）。PCFS 生产未暴露系其 entryCache 容错，
+//! spike 从未测 meta。由此 stat / close 的 Entry 构造 / delete（及 reader
+//! 的 dlink 签发）句柄解析全部转 list 实现（端点表上两行注停用）。
+//! [`meta_by_path`]/[`meta_by_fs_id`] 停用保留——正式 appkey（个人
+//! 开发者）到位后复测 31300 是否消失，可用则回切省 list 流量。
 //!
 //! ## errno → StorageError 映射表（R2 义务；mock 钉死）
 //!
@@ -141,6 +152,12 @@ pub(crate) async fn list(
 }
 
 /// GET `method=meta&path=<abs>`——单条目元数据（PCFS api.go:110-113）。
+///
+/// **已停用**（2026-09-08 真网 31300 实证：此第三方 appkey 无 meta 权限
+/// ——"stream type is not authorized"，持续无权限非延迟；decisions 有档）。
+/// 不删除：正式 appkey（个人开发者）到位后复测候选，恢复成本低（调用点
+/// 已在 driver.rs stat / upload.rs open_writer 改 list 父目录 + path 匹配）。
+#[allow(dead_code)]
 pub(crate) async fn meta_by_path(
     client: &BaiduClient,
     path: &str,
@@ -152,6 +169,11 @@ pub(crate) async fn meta_by_path(
 }
 
 /// GET `method=meta&fs_ids=[<id>]`——按句柄解析（PCFS api.go:176-179）。
+///
+/// **已停用**（2026-09-08 真网 31023 实证：fs_ids 形态同样 param error，
+/// 多编码变体同；decisions 有档）。不删除：正式 appkey 复测候选。fs_id →
+/// 条目解析改「句柄缓存 + 递归 list 扫描」（driver.rs）。
+#[allow(dead_code)]
 pub(crate) async fn meta_by_fs_id(
     client: &BaiduClient,
     fs_id: &str,
@@ -169,6 +191,10 @@ pub(crate) async fn meta_by_fs_id(
 ///
 /// errno!=0 已在 client 层归一（-9 → `NotFound`）；这里只兜「errno=0 但
 /// list 空/畸形」的防御形态 → `NotFound`/`Unavailable`。
+///
+/// 仅被已停用的 [`meta_by_path`]/[`meta_by_fs_id`] 使用（2026-09-08
+/// 31300/31023 停用连带）——随两函数一并 `allow(dead_code)` 保留。
+#[allow(dead_code)]
 fn single_entry(v: &Value) -> Result<RemoteEntry, StorageError> {
     let Some(item) = v
         .get("list")

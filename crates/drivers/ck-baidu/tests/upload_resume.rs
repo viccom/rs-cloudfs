@@ -40,7 +40,9 @@ use ck_baidu::{factory, BaiduDriver};
 use cloudkit_storage::{EntryKind, RelPath, StorageDriver, StorageError, WriteHint};
 use futures_util::StreamExt;
 
-use common::{pattern_bytes, MockBaidu, CHUNK_4M, MOCK_ROOT};
+use common::{
+    filter_recorded, parse_urlencoded, pattern_bytes, MockBaidu, CHUNK_4M, MOCK_ROOT, XPAN_FILE,
+};
 
 /// K7 会话表 JSON 落盘目录（任务契约形态 `<dir>/baidu_state/sessions/`）。
 fn sessions_json_dir(sessions_root: &tempfile::TempDir) -> PathBuf {
@@ -449,11 +451,16 @@ async fn writer_on_existing_directory_path_is_invalid() {
     );
 }
 
-/// close 的 Entry 构造必须存活「索引传播延迟」（真网 2026-09-08 实证：
-/// create 成功后立即 meta by fs_id 可能短暂 -9——上传本体已成功；list
-/// 即时可见，spike §6）。meta NotFound → 父目录 list 兜底，close 不失败。
+/// 真网 31300/31023 实证驱动（2026-09-08 第四轮返工，原
+/// `close_survives_meta_propagation_delay_via_list_fallback` 改造）：此
+/// appkey 下 meta 端点全废——close 的 Entry 构造不再有 meta 主路径，
+/// **直接经父目录 list + fs_id 匹配**（list 即时可见——真网探针 #4/#5：
+/// create 后 list 立即可见，meta 轮询 10s 不可见是持续无权限非延迟）。
+/// 新契约：上传全程零 `method=meta` 流量；close 的 Entry 由父目录 list
+/// 构造且句柄可回读。（mock 的 `fail_next_meta` 注入面保留——正式 appkey
+/// 复测 meta 权限时的恢复面，驱动已不消费。）
 #[tokio::test]
-async fn close_survives_meta_propagation_delay_via_list_fallback() {
+async fn close_builds_entry_via_parent_list_without_meta() {
     let (mock, _base) = MockBaidu::start().await;
     mock.seed_dir(MOCK_ROOT);
     let driver = driver_with_sessions(&mock, None).await;
@@ -465,14 +472,30 @@ async fn close_survives_meta_propagation_delay_via_list_fallback() {
         .await
         .expect("writer 打开");
     stager.write(&data).await.expect("write 到齐");
-    // 注入：close 的 entry_for 所发 meta 顶 -9（一次性消费；此时 create
-    // 已成功、文件已在 mock 树中——精确复刻真网延迟形态）。
-    mock.fail_next_meta();
-    let entry = stager.close().await.expect("close 必须存活索引延迟");
+    let entry = stager.close().await.expect("close 构造 Entry");
 
     assert_eq!(entry.kind, EntryKind::File);
     assert_eq!(entry.size, data.len() as u64);
-    // list 兜底路径拿到的 fs_id/mtime 有效：reader 可回读。
+    assert!(entry.mtime > 0.0, "mtime 为正 epoch 秒（后端入树时间戳）");
+    // 新契约 wire 断言：全程零 meta 调用；Entry 经父目录 list 构造。
+    let recorded = mock.recorded();
+    let metas = filter_recorded(&recorded, "GET", XPAN_FILE, &["method=meta"]);
+    assert!(
+        metas.is_empty(),
+        "close 的 Entry 构造不经 meta（31300 停用）：{metas:?}"
+    );
+    let listed_parent = filter_recorded(&recorded, "GET", XPAN_FILE, &["method=list"])
+        .into_iter()
+        .any(|r| {
+            parse_urlencoded(&r.query)
+                .iter()
+                .any(|(k, v)| k == "dir" && v == MOCK_ROOT)
+        });
+    assert!(
+        listed_parent,
+        "close 的 Entry 经父目录 list 构造（dir={MOCK_ROOT}）"
+    );
+    // list 构造的句柄有效：reader 可回读全量内容。
     let got = read_all(&driver, &entry).await;
-    assert_eq!(got, data, "兜底 Entry 的句柄可回读全量内容");
+    assert_eq!(got, data, "list 构造 Entry 的句柄可回读全量内容");
 }

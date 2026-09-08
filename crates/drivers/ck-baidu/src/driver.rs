@@ -9,15 +9,22 @@
 //!
 //! - **句柄**：fs_id 十进制字符串（K5；跨 rename 稳定——PCFS
 //!   api.go:170-171 先例）；他卷句柄 → `NotFound`（ck-local 同款契约）；
+//! - **meta 停用**（真网 31300/31023 实证，2026-09-08 第四轮返工——见
+//!   [`crate::api`] 模块文档）：stat = **list 父目录 + path 精确匹配**；
+//!   fs_id → 条目解析（delete 句柄 / reader 的 dlink 签发路径）= **句柄
+//!   缓存**（[`HandleCache`]，list/stat/Entry 流量批量填充，容量 4096）
+//!   → 未命中**递归 list 扫描**（卷根深度优先，`scan_dir`）；
 //! - **delete 幂等形态**：删除不存在句柄 → `NotFound` 恒定（conformance
-//!   断言④钉死——不可解析 fs_id 视同不存在句柄，从本卷 fs_id 空间
-//!   视角即不存在）；解析走 `method=meta&fs_ids=[<id>]` 直查——PCFS
-//!   api.go:176-179 姊妹形态，相对「本地缓存 path」方案少一份驱动内
-//!   状态；xpan 删除走回收站 10 天是后端已知限制，非驱动语义）；
+//!   断言④钉死——不可解析 fs_id 视同不存在句柄；可解析但全树扫描无
+//!   亦 `NotFound`）；filemanager delete **只支持 path 形态**（fs_id
+//!   形态 errno=12 不删，真网实证 #3）——path 由两级解析供给；缓存陈旧
+//!   （rename 后条目指向旧路径）由**纠偏腿**兜底：delete 撞 -9 → 条目
+//!   失效 + 重扫 + 重试一次（防删错/删空）；xpan 删除走回收站 10 天是
+//!   后端已知限制，非驱动语义）；
 //! - **list**：depth-1、按 [`RelPath`] 字典序稳定有序、内部 offset 游标
 //!   切 [`Page`]（后端无分页参数——spike api.rs:131-148 实证；游标
 //!   `off:{end}` 形态，ck-local/mock 先例）；卷外路径条目（后端异常回显）
-//!   跳过不透出；
+//!   跳过不透出；每次 list 顺带**批量填充句柄缓存**（一次 list 一次锁）；
 //! - **mtime**：读 `server_mtime`（api.rs 模块文档注源）；
 //! - **目录 size 恒 0**：后端对目录返回的实现值不透出（ck-local 同款）；
 //! - **mkdir**：逐级隐式创建（xpan create 不自动建父目录，mock 严格语义
@@ -38,7 +45,8 @@
 //!
 //! 错误映射表（errno 逐码注源）见 [`crate::api`] 模块文档。
 
-use std::sync::Arc;
+use std::collections::HashMap;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use async_trait::async_trait;
@@ -52,6 +60,58 @@ use crate::api;
 use crate::client::BaiduClient;
 use crate::{download, upload, BaiduParams};
 
+/// 句柄缓存容量上限（真网 31300 裁决，2026-09-08）：fs_id → 后端条目的
+/// 解析层缓存。超容**全清**（取舍：条目可由 list/扫描流量重建，代价是
+/// 一次性冷启动重扫；逐出最旧的 LRU 需要额外簿记且「最旧」在批量填充
+/// 形态下无实效——填充源本就是整目录列举，收益不抵复杂度）。
+const HANDLE_CACHE_CAP: usize = 4096;
+
+/// fs_id → 后端条目句柄缓存（真网 31300 裁决的解析层，2026-09-08）。
+///
+/// meta 端点在此 appkey 下全废（31300/31023），delete 句柄解析与 reader
+/// 的 dlink 签发路径需要 fs_id → path/isdir/size 的解析面——由本缓存 +
+/// 递归扫描（[`BaiduDriver::scan_dir`]）两级供给。**缓存只是解析层**：
+/// K5（handle=fs_id 跨 rename 稳定）不受影响，陈旧条目（rename 后指向
+/// 旧路径）由 delete 的纠偏腿（-9 → 失效重扫重试）兜底。
+///
+/// 填充点：`list`（批量，一次 list 一次锁）/ `stat`（父目录批量）/
+/// `entry_for`（父目录批量）/ `scan_dir`（逐目录批量）/ writer 预检。
+pub(crate) struct HandleCache {
+    map: Mutex<HashMap<i64, api::RemoteEntry>>,
+}
+
+impl HandleCache {
+    pub(crate) fn new() -> Self {
+        HandleCache {
+            map: Mutex::new(HashMap::new()),
+        }
+    }
+
+    fn get(&self, fs_id: i64) -> Option<api::RemoteEntry> {
+        self.map.lock().unwrap().get(&fs_id).cloned()
+    }
+
+    fn invalidate(&self, fs_id: i64) {
+        self.map.lock().unwrap().remove(&fs_id);
+    }
+
+    /// 批量填充（单次锁临界区；upload.rs 的 entry_for/预检填充点共用，
+    /// pub(crate)）。超容全清后重灌（见 [`HANDLE_CACHE_CAP`] 取舍注码）
+    /// ——插入项随后照常进入，保证本次填充原子可见。
+    pub(crate) fn put_batch(&self, entries: &[api::RemoteEntry]) {
+        if entries.is_empty() {
+            return;
+        }
+        let mut map = self.map.lock().unwrap();
+        if map.len() + entries.len() > HANDLE_CACHE_CAP {
+            map.clear();
+        }
+        for e in entries {
+            map.insert(e.fs_id, e.clone());
+        }
+    }
+}
+
 /// 百度网盘驱动。
 pub struct BaiduDriver {
     volume: VolumeId,
@@ -64,6 +124,8 @@ pub struct BaiduDriver {
     sessions: upload::SessionStore,
     /// K8 dlink 缓存（与下载流任务经 Arc 共享）。
     dlinks: Arc<download::DlinkCache>,
+    /// fs_id → 条目句柄缓存（与 stager 经 Arc 共享；解析层，见结构体文档）。
+    handles: Arc<HandleCache>,
 }
 
 impl BaiduDriver {
@@ -92,6 +154,7 @@ impl BaiduDriver {
             client,
             sessions: upload::SessionStore::new(params.sessions_dir.clone()),
             dlinks: Arc::new(download::DlinkCache::new(ttl)),
+            handles: Arc::new(HandleCache::new()),
         })
     }
 
@@ -163,6 +226,60 @@ impl BaiduDriver {
         })
     }
 
+    /// 按解析条目执行删除（delete 的操作相；陈旧纠偏重试共用）：
+    /// 目录 = 客户端递归（trait 契约「目录删除为递归」——深度优先删子树
+    /// 再删自身；mock 的 filemanager 钉了单条语义，真实后端的单调用递归
+    /// 形态留待真机窗口复核，多几次调用无语义差异）。
+    async fn delete_resolved(&self, remote: &api::RemoteEntry) -> Result<(), StorageError> {
+        if remote.isdir != 0 {
+            return self.delete_tree(&remote.path).await;
+        }
+        api::filemanager_delete(&self.client, &remote.path).await
+    }
+
+    /// fs_id → 后端条目解析（delete 句柄 / reader dlink 签发共用；真网
+    /// 31300/31023 裁决——meta fs_ids 直查停用）：句柄缓存命中 → 未命中
+    /// 递归扫描卷根。
+    async fn resolve_handle(&self, fs_id: i64) -> Result<api::RemoteEntry, StorageError> {
+        if let Some(hit) = self.handles.get(fs_id) {
+            return Ok(hit);
+        }
+        self.scan_dir(&self.root.clone(), fs_id).await
+    }
+
+    /// 递归 list 扫描（卷根深度优先；冷句柄的解析兜底）：逐目录列举
+    /// （顺带批量填充句柄缓存）→ 本层 fs_id 匹配即返回 → 目录下沉递归。
+    /// 只扫本卷子树（卷外回显经 rel_from_abs 过滤——防御）；全树无 →
+    /// `NotFound`。
+    ///
+    /// 子目录列举撞 `NotFound`（并发删除竞态）跳过继续；其他错误（网络/
+    /// 鉴权）上抛——扫描语义不吞真故障。
+    fn scan_dir<'a>(
+        &'a self,
+        dir: &'a str,
+        fs_id: i64,
+    ) -> std::pin::Pin<
+        Box<dyn std::future::Future<Output = Result<api::RemoteEntry, StorageError>> + Send + 'a>,
+    > {
+        Box::pin(async move {
+            let children = api::list(&self.client, dir).await?;
+            self.handles.put_batch(&children);
+            for child in children {
+                if child.fs_id == fs_id {
+                    return Ok(child);
+                }
+                if child.isdir != 0 && self.rel_from_abs(&child.path).is_some() {
+                    match self.scan_dir(&child.path, fs_id).await {
+                        Ok(hit) => return Ok(hit),
+                        Err(StorageError::NotFound) => continue, // 并发删除竞态
+                        Err(e) => return Err(e),
+                    }
+                }
+            }
+            Err(StorageError::NotFound)
+        })
+    }
+
     /// RemoteEntry + RelPath → Entry（list/stat 共用换算面）。
     ///
     /// - id.handle = fs_id 十进制字符串（K5）；
@@ -227,6 +344,10 @@ impl StorageDriver for BaiduDriver {
 
     async fn list(&self, dir: &RelPath, page: Page) -> Result<Listing, StorageError> {
         let remote = api::list(&self.client, &self.abs_path(dir)).await?;
+        // 顺带批量填充句柄缓存（一次 list 一次锁——真网 31300 裁决的
+        // 解析层资产；卷外回显条目一并入缓存无害：本卷签发的句柄空间
+        // 恒在卷内）。
+        self.handles.put_batch(&remote);
         let mut entries: Vec<Entry> = remote
             .iter()
             .filter_map(|e| {
@@ -257,14 +378,21 @@ impl StorageDriver for BaiduDriver {
     }
 
     async fn stat(&self, path: &RelPath) -> Result<Entry, StorageError> {
-        // 单点 meta 直查，无 list 兜底——曾试「索引延迟 list 兜底」（真机
-        // 2026-09-08 第四轮）后被撤销：会吞掉 conformance ⑤ 的 -9 错误
-        // 回放（注入语义 vs 延迟语义不可分辨）；且产品路径 stat 走本地
-        // db 短路（远端 stat 仅 hydrate 冷读，距写已远）。写后立即可见性
-        // 由 close 返回 Entry 承担（entry_for 的 list 兜底在 upload.rs）。
-        let remote = api::meta_by_path(&self.client, &self.abs_path(path)).await?;
-        // Entry.path 用请求时的 RelPath（后端回显 path 与拼接 abs 同值，
-        // 直接复用入参省一次剥离；-9 已在 client 层归一 NotFound）
+        // 真网 31300 实证驱动（2026-09-08 第四轮返工）：meta&path 在此
+        // appkey 下持续无权限（"stream type is not authorized"，轮询 10s
+        // 不可见——非延迟）；list 全程即时可用。stat = **list 父目录 +
+        // path 精确匹配**（父目录不存在 → list -9 → NotFound 语义保持；
+        // conformance ⑤ 的注入回放语义在新主路径下自动成立——注入顶
+        // 「下一个业务请求」即此 list）。
+        let abs = self.abs_path(path);
+        let entries = api::list(&self.client, &api::parent_abs(&abs)).await?;
+        self.handles.put_batch(&entries);
+        let remote = entries
+            .into_iter()
+            .find(|e| e.path == abs)
+            .ok_or(StorageError::NotFound)?;
+        // Entry.path 用请求时的 RelPath（匹配条目的回显 path 与拼接 abs
+        // 同值，直接复用入参省一次剥离）。
         Ok(self.entry_from_remote(&remote, path.clone()))
     }
 
@@ -297,20 +425,28 @@ impl StorageDriver for BaiduDriver {
         // 句柄 = fs_id 十进制字符串（K5）；不可解析 → NotFound（conformance
         // 断言④：不存在的句柄恒 NotFound——非数字形态在本卷 fs_id 空间
         // 视角即不存在）
-        if id.handle.as_str().parse::<i64>().is_err() {
+        let Ok(fs_id) = id.handle.as_str().parse::<i64>() else {
             return Err(StorageError::NotFound);
-        }
-        // fs_id → path 解析：meta fs_ids 直查（实现裁决见模块文档「delete
-        // 幂等形态」；-9 → NotFound）
-        let remote = api::meta_by_fs_id(&self.client, id.handle.as_str()).await?;
-        if remote.isdir != 0 {
-            // 目录删除 = 客户端递归（trait 契约「目录删除为递归」）：
-            // 深度优先删子树再删自身——mock 的 filemanager 钉了单条
-            // 语义，真实后端的单调用递归形态留待真机窗口复核（多几次
-            // 调用无语义差异）。
-            return self.delete_tree(&remote.path).await;
-        }
-        api::filemanager_delete(&self.client, &remote.path).await
+        };
+        // fs_id → path 解析两级（真网实证 #3：filemanager delete 只支持
+        // path 形态；#1/#2：meta 直查全废）：句柄缓存 → 递归扫描。
+        let remote = self.resolve_handle(fs_id).await?;
+        match self.delete_resolved(&remote).await {
+            Err(StorageError::NotFound) => {
+                // 缓存陈旧纠偏（decisions 2026-09-08 连带项）：rename 后
+                // 缓存条目指向旧路径 → filemanager 撞 -9——失效 + 重扫 +
+                // 重试一次（防陈旧缓存删错/删空）。扫描也无 → NotFound
+                // （对象确已不在，幂等语义保持）。
+                self.handles.invalidate(fs_id);
+                let fresh = self.resolve_handle(fs_id).await?;
+                self.delete_resolved(&fresh).await
+            }
+            res => res,
+        }?;
+        // 成功后失效本句柄缓存条目（防复删走陈旧路径多绕一轮纠偏；
+        // 目录删除的子条目残留条目由各自纠偏腿自愈——有界且自修正）。
+        self.handles.invalidate(fs_id);
+        Ok(())
     }
 
     async fn rename(&self, from: &RelPath, to: &RelPath) -> Result<(), StorageError> {
@@ -363,9 +499,19 @@ impl StorageDriver for BaiduDriver {
     }
 
     async fn reader(&self, id: &EntryId, range: Option<Range>) -> Result<ByteStream, StorageError> {
-        // 委派 download.rs：fs_id 句柄 → meta（path/size）→ dlink 缓存 →
-        // 4MiB 有界分片流（两段 fallback 内嵌分片拉取路径）。
-        download::open_range(&self.client, &self.dlinks, &self.volume, id, range).await
+        // 委派 download.rs：fs_id 句柄解析（缓存→扫描——真网 31300 裁决，
+        // meta 直查停用）→ dlink 缓存 → 4MiB 有界分片流（两段 fallback
+        // 内嵌分片拉取路径）。
+        if id.volume != self.volume {
+            return Err(StorageError::NotFound); // 他卷句柄（trait 契约）
+        }
+        let fs_id: i64 = id
+            .handle
+            .as_str()
+            .parse()
+            .map_err(|_| StorageError::Invalid)?;
+        let remote = self.resolve_handle(fs_id).await?; // 全树无 → NotFound
+        download::open_range(&self.client, &self.dlinks, fs_id, &remote, range).await
     }
 
     async fn writer(
@@ -373,8 +519,9 @@ impl StorageDriver for BaiduDriver {
         path: &RelPath,
         hint: &WriteHint,
     ) -> Result<Box<dyn UploadStager>, StorageError> {
-        // 委派 upload.rs：目标已存在目录在此判 `Invalid`（meta 预检），
-        // 三步曲/会话恢复延迟到首次网络动作（内容 md5 依赖数据到达）。
+        // 委派 upload.rs：目标已存在目录在此判 `Invalid`（父目录 list 预检
+        // ——真网 31300 裁决，meta 预检停用），三步曲/会话恢复延迟到首次
+        // 网络动作（内容 md5 依赖数据到达）。
         upload::open_writer(
             &self.client,
             &self.volume,
@@ -383,6 +530,7 @@ impl StorageDriver for BaiduDriver {
             path,
             hint,
             &self.sessions,
+            &self.handles,
         )
         .await
     }

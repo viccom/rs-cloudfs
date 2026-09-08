@@ -337,6 +337,9 @@ impl MockBaidu {
 
     /// 注入索引传播延迟：下一次 method=meta 顶 -9（一次性；见
     /// [`MockState::fail_next_meta`]——真网 2026-09-08 实证形态）。
+    ///
+    /// 真网 31300/31023 实证后（2026-09-08 第四轮返工）驱动已不调用
+    /// meta——本注入面暂无消费者，保留为正式 appkey 复测时的恢复面。
     pub fn fail_next_meta(&self) {
         self.state.lock().unwrap().fail_next_meta = true;
     }
@@ -580,6 +583,11 @@ async fn xpan_file(
             Json(json!({"errno": 0, "list": list})).into_response()
         }
         ("GET", "meta") => {
+            // 真网 31300/31023 实证（2026-09-08 第四轮返工）：此 appkey 下
+            // meta 端点全废，驱动已不调用（stat/Entry 构造/句柄解析全转
+            // list）——本路由臂成为**无消费者**，保留原样（历史 wire 断言
+            // 形态 + 正式 appkey 复测 meta 权限时的恢复面；fail_next_meta
+            // 注入面同理保留）。
             {
                 let mut st = state.lock().unwrap();
                 if st.fail_next_meta {

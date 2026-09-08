@@ -78,6 +78,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::api;
 use crate::client::BaiduClient;
+use crate::driver::HandleCache;
 
 /// 分片尺寸（4MiB；spike §2/§6——上/下载统一有界边界）。
 pub(crate) const CHUNK: usize = 4 * 1024 * 1024;
@@ -256,11 +257,22 @@ pub(crate) struct BaiduStager {
     probe_pending: bool,
     /// 秒传命中（precreate return_type=2 的 fs_id；close 直接收尾）。
     rapid_fs_id: Option<i64>,
+    /// fs_id → 条目句柄缓存（entry_for 的解析层资产填充点；真网 31300
+    /// 裁决——与 driver 共享经 Arc）。
+    handles: Arc<HandleCache>,
 }
 
 /// writer 打开（driver.rs 委派）：目标已存在目录 → `Invalid`（trait
 /// 契约）；会话装备延迟到首次网络动作（恢复校验需要内容 md5，打开时
 /// 未知）。
+///
+/// 已存在目录预检走**父目录 list + path 匹配**（真网 31300 实证驱动，
+/// 2026-09-08 第四轮返工——meta&path 停用）；卷根本身不可为 writer 目标
+///（恒为已存在目录——父目录 list 对根形态不可用（"/" 的父是自身），
+/// 先行短路保形态）。
+// 句柄缓存入参后达 8 参数——驱动内部委派函数（唯一调用点 driver.rs
+// writer），参数组包结构体反而遮蔽与 driver 字段的一一对应关系，allow。
+#[allow(clippy::too_many_arguments)]
 pub(crate) async fn open_writer(
     client: &Arc<BaiduClient>,
     volume: &VolumeId,
@@ -269,10 +281,19 @@ pub(crate) async fn open_writer(
     rel: &RelPath,
     hint: &WriteHint,
     sessions: &SessionStore,
+    handles: &Arc<HandleCache>,
 ) -> Result<Box<dyn UploadStager>, StorageError> {
-    if let Ok(remote) = api::meta_by_path(client, abs).await {
-        if remote.isdir != 0 {
-            return Err(StorageError::Invalid); // 目标路径是已存在目录
+    if rel.is_root() {
+        return Err(StorageError::Invalid); // 卷根恒为已存在目录
+    }
+    // 父目录不存在（list -9）→ 预检放行（ensure_parents 随后逐级创建；
+    // 与原 meta 预检的 NotFound 容忍语义一致）。
+    if let Ok(entries) = api::list(client, &api::parent_abs(abs)).await {
+        handles.put_batch(&entries); // 预检流量顺带填充句柄缓存
+        if let Some(hit) = entries.iter().find(|e| e.path == abs) {
+            if hit.isdir != 0 {
+                return Err(StorageError::Invalid); // 目标路径是已存在目录
+            }
         }
     }
     Ok(Box::new(BaiduStager {
@@ -293,6 +314,7 @@ pub(crate) async fn open_writer(
         done: BTreeSet::new(),
         probe_pending: false,
         rapid_fs_id: None,
+        handles: handles.clone(),
     }))
 }
 
@@ -512,18 +534,15 @@ impl BaiduStager {
         }
     }
 
-    /// Entry 构造（fs_id → meta 取 server_mtime/kind/size；断言①
-    /// mtime>0 的来源——后端入树时间戳）。
+    /// Entry 构造（list 主路径；断言① mtime>0 的来源——后端入树时间戳）。
     ///
-    /// 真网实证（2026-09-08）：create 成功后立即 meta 单点查询可能短暂
-    /// -9（索引传播延迟；上传本体已成功），而 list 即时可见（spike §6）。
-    /// close 不能因延迟失败——meta `NotFound` 时以父目录 list 兜底。
+    /// 真网 31300/31023 实证驱动（2026-09-08 第四轮返工）：meta 端点在此
+    /// appkey 下全废——原「meta by fs_id 主 + list 兜底」形态废除，
+    /// **list_lookup（父目录 list + fs_id 匹配）提为主路径**（list 即时
+    /// 可见——真网实证 #4/#5：create 后 list 立即可见，meta 不可见是持续
+    /// 无权限非延迟）。
     async fn entry_for(&self, fs_id: i64) -> Result<Entry, StorageError> {
-        let remote = match api::meta_by_fs_id(&self.client, &fs_id.to_string()).await {
-            Ok(remote) => remote,
-            Err(StorageError::NotFound) => self.list_lookup(fs_id).await?,
-            Err(e) => return Err(e),
-        };
+        let remote = self.list_lookup(fs_id).await?;
         Ok(Entry {
             id: EntryId::new(self.volume.clone(), BackendHandle::new(fs_id.to_string())),
             path: self.rel.clone(),
@@ -537,9 +556,11 @@ impl BaiduStager {
         })
     }
 
-    /// list 兜底（meta 索引延迟时）：父目录 depth-1 列举按 fs_id 定位。
+    /// 父目录 depth-1 列举按 fs_id 定位（entry_for 的主路径；顺带批量
+    /// 填充句柄缓存——close 产出的新 fs_id 是缓存的第一批资产来源之一）。
     async fn list_lookup(&self, fs_id: i64) -> Result<api::RemoteEntry, StorageError> {
         let entries = api::list(&self.client, &api::parent_abs(&self.abs)).await?;
+        self.handles.put_batch(&entries);
         entries
             .into_iter()
             .find(|e| e.fs_id == fs_id)
