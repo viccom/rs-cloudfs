@@ -13,7 +13,11 @@
 //! - **create**：spike api.rs:332-370 + PCFS api.go:581-587——form 恰六字段
 //!   `path,size,isdir=0,rtype,uploadid,block_list`；
 //! - **block_list** 形态：`["<md5hex>",...]`——分片 MD5 按 **4MiB 边界对
-//!   内容**计算（测试逐片对账），非全文件 MD5。
+//!   内容**计算（测试逐片对账），非全文件 MD5；
+//! - **precreate/create 的 block_list 一致性**（真网 31363 实证钉死，
+//!   2026-09-08 返工）：precreate 一次性锁定全量 block_list，create 的
+//!   block_list 必须**原样重申** precreate 会话锁定的声明（两者值相等
+//!   且为全量分片 md5——不一致真网报 errno=31363）。
 
 mod common;
 
@@ -206,6 +210,31 @@ async fn create_posts_exact_six_field_form_with_precreate_uploadid_and_blocks() 
     assert_eq!(uploadids.len(), 1, "恰一次 precreate（无中断重传）");
     let form = parse_urlencoded(&reqs[0].body);
     let path = format!("{MOCK_ROOT}/f3.bin");
+    // 真网 31363 实证约束的直接钉死（2026-09-08 返工）：create 的
+    // block_list 必须**原样重申** precreate 会话锁定的声明——两者值相等
+    // 且为全量分片 md5（不一致 → 真网 errno=31363，mock 同款建模）。
+    let precreate_reqs = filter_recorded(&recorded, "POST", XPAN_FILE, &["method=precreate"]);
+    assert_eq!(precreate_reqs.len(), 1, "precreate form 对账锚点恰一次");
+    let precreate_form = parse_urlencoded(&precreate_reqs[0].body);
+    let precreate_blocks = precreate_form
+        .iter()
+        .find(|(k, _)| k == "block_list")
+        .map(|(_, v)| v.clone())
+        .expect("precreate form 含 block_list 字段");
+    let create_blocks = form
+        .iter()
+        .find(|(k, _)| k == "block_list")
+        .map(|(_, v)| v.clone())
+        .expect("create form 含 block_list 字段");
+    assert_eq!(
+        create_blocks, precreate_blocks,
+        "create 的 block_list 必须与 precreate 声明一致（31363 约束）"
+    );
+    assert_eq!(
+        create_blocks,
+        expected_block_list_json(&data),
+        "create/precreate 一致的 block_list 必须是全量分片 md5（3 分片）"
+    );
     assert_exact_pairs(
         &form,
         &[

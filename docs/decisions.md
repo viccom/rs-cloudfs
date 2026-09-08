@@ -409,3 +409,10 @@
 - **实现裁决**：mock 基建落位 `tests/common/mod.rs`（计划原文 mock_backend.rs——Rust 集成测试共享模块形态限制）；未知 errno → Unavailable 载荷保留 errno=<code>（表外码 47002 钉死）；-8 → Exists 注「mock 建模 + B2 conformance 复核」（PCFS 无处理证据）；list 无分页参数（两源一致）→ driver 内 offset 游标切 Page；mtime=server_mtime（两源一致无 local_mtime）；serde_json 补入依赖（响应解析必需）；R3 三防线（reqwest 错误 without_url/体片段 token 掩码/错误消息不拼参数）。
 - **挂起 B2 复核项**：① rename 的 ondup=overwrite 覆盖语义与 trait「目标已存在 → Exists」的偏离（driver.rs 已显式声明，conformance 断言⑥若覆盖则需裁决）；② -8 映射。
 - **验证**：ck-baidu 17 passed（oauth 4/errno 5/metadata 字节级 8）；workspace 646 passed 0 failed（628→646）/ 6 ignored；clippy/fmt/check_layers（11 manifests）/scan_secrets 全过。
+
+## 2026-09-08 Batch B2 真网实证：precreate 会话锁定全量 block_list——流式策略改「到齐即传」
+
+- **探针证据**（主会话，干净 curl 探针，netdisk UA + MSYS_NO_PATHCONV）：precreate 部分声明 block_list（1 片）errno=0；superfile2 未声明分片照收；create 带全量（3 片）→ **errno=31363**（与 precreate 声明不一致被拒）。spike 未踩此坑因其全量算 md5 后才 precreate。
+- **裁决**：stager 流式策略「write 首块即传（部分 precreate）」→「**到齐即传**」（hint.size 已知且字节到齐 → write 返回前 precreate 全量 + 串行传满块 + 位图落盘；close 传尾块 + create 原样重申）。write 同步落定契约（conformance ⑦）保持；K7 会话恢复三路不变（drop/close-中断后二次 equip 差集补传）。mock create 增建模「block_list 一致性校验」（31363）。
+- **附带实证**：create 目录/rtype=3/deep precreate 均真网可用（errno=0）——K10 rtype=3 复核通过；31363 纳入 errno 码表（Invalid 族——参数与预创建不一致）。
+- **MSYS 教训**：Git Bash 探针中 `path=/apps/...` 形参被路径改写污染（→ C:/Program Files/Git/apps/...，百度报「文件夹 C: 命名不合法」errno=-7）——首批探针全部作废；干净探针（MSYS_NO_PATHCONV=1）推翻了「create 目录恒 -7」「rtype=3 不可用」两个错误中间结论。教训入 AGENTS 陷阱候选。

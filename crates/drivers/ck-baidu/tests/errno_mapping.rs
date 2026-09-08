@@ -88,6 +88,22 @@ async fn errno_31326_maps_to_unauthorized_recoverable_true() {
 }
 
 #[tokio::test]
+async fn errno_31363_maps_to_invalid() {
+    let (mock, driver) = setup().await;
+    // 31363 = create 参数与 precreate 预创建不一致（2026-09-08 真网探针
+    // 实证：create block_list ≠ precreate 会话锁定声明 → 31363）。映射
+    // Invalid 族——调用方参数与预创建会话矛盾，重试同参无意义。
+    mock.inject_errno(31363);
+
+    let err = stat_seeded(&driver).await.expect_err("31363 必须报错");
+    assert_eq!(
+        err,
+        StorageError::Invalid,
+        "31363（参数与预创建不一致，真网 31363 探针）→ Invalid"
+    );
+}
+
+#[tokio::test]
 async fn unknown_errno_maps_to_unavailable_with_code_preserved() {
     let (mock, driver) = setup().await;
     // 47002 = 刻意选的表外码（未入 B1 钉死映射表的真实百度码族）——

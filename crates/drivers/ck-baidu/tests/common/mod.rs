@@ -26,9 +26,12 @@
 //!   签发 + block_list 记档；`mark_instant` 命中路径返回 return_type=2
 //!   秒传腿）；`POST /rest/2.0/pcs/superfile2`（multipart 解析 partseq、
 //!   会话分片累积、`bytes_received_total` 计数、`inject_upload_death`
-//!   会话死亡注入）；`POST xpan/file?method=create`（isdir=0 腿校验分片
-//!   齐全（缺片/分片 md5 不符 errno=10，spike §3.3 实证形态）→ 组装文件
-//!   入树，rtype=3 覆盖语义）；
+//!   会话死亡注入）；`POST xpan/file?method=create`（isdir=0 腿校验
+//!   **block_list 与 precreate 会话锁定声明一致**（不一致 → errno=31363，
+//!   2026-09-08 真网探针实证——B2 返工裁决驱动）+ 分片齐全（缺片/分片
+//!   md5 不符 errno=10，spike §3.3 实证形态）→ 组装文件入树，rtype=3
+//!   覆盖语义）；superfile2 仍接受任意 partseq（真网实证接受未声明分片
+//!   ——分片级校验不受 31363 约束影响）；
 //! - **下载链路**：`GET xpan/file?method=download` → 302 Location
 //!   `{base}/cdn/{fs_id}?expires=<mock时钟+TTL>`；`GET /cdn/{fs_id}` 校验
 //!   netdisk UA + 有界 Range ≤4MiB（违反三约束之一 → 403 error_code=31326，
@@ -815,6 +818,13 @@ fn create_file_finish(state: &Shared, form: &[(String, String)], path: &str) -> 
         // 未知 uploadid：与缺片同族（服务端按会话校验，spike §3.3）。
         return errno_json(10);
     };
+    // 真网 31363 建模（2026-09-08 干净探针实证）：precreate 一次性锁定
+    // (path,size,block_list)，create 的 block_list 必须与 precreate 会话
+    // 锁定的声明**原样一致**——不一致 → errno=31363。此即推翻「流式部分
+    // 声明」策略的分歧点（create 带全量列表 ≠ precreate 部分声明 → 拒）。
+    if blocks != session.block_md5 {
+        return errno_json(31363);
+    }
     // 齐全性 + 逐片 md5 比对（分片索引 0..n 齐且内容 md5 与声明一致）。
     for (idx, want) in blocks.iter().enumerate() {
         match session.parts.get(&(idx as i64)) {

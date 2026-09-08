@@ -3,15 +3,38 @@
 //! wire 形态黄金参照：spike `examples/baidu_spike/src/api.rs:187-370` +
 //! PCFS `drivers/baidu/api.go:440-600`（分歧以 spike 实抓为准）。
 //!
+//! ## 真网 31363 实证与「到齐即传」策略（2026-09-08 B2 返工裁决）
+//!
+//! 干净探针（MSYS_NO_PATHCONV + netdisk UA）实证百度**会话模型**：
+//! precreate 一次性锁定 `(path, size, block_list)`；create 的 block_list
+//! 必须**原样重申** precreate 锁定的声明——不一致 → **errno=31363**。
+//! superfile2 则接受任意 partseq（含未声明分片）。由此「write 首块即传
+//! （precreate 部分声明）」不可行：部分声明会话在 create 必然 31363。
+//! spike 未踩此坑因其全量算 md5 后才 precreate。
+//!
+//! 裁决落点（stager 流式策略）：
+//!
+//! - **write「到齐即传」**：数据未到齐（无 hint 或累计字节 < hint.size）
+//!   时 write **不做任何网络动作**（本地 staging + 满块 md5 增量计算）；
+//!   到齐（hint.size 已知且累计 == size）时 write 返回前完成：precreate
+//!   （**全量** block_list，rtype=3）→ 串行 superfile2 传全部满块 → 位图
+//!   落盘；
+//! - **尾块归 close**：不满 4MiB 的最后一片在 close 时传（到齐时若无
+//!   尾块则 close 无补传）；
+//! - **create 重申会话列表**：close 的 create 用 precreate 时锁定的
+//!   block_list（存于 stager，装备时装载），**不是重算**——31363 免疫；
+//! - **无 hint.size**：全缓冲至 close（close 时 size=实际字节，precreate
+//!   全量）——真实调用面（WebDAV PUT / CLI copy）均带 Content-Length。
+//!
 //! ## 串行上传取舍（write 同步落定的代价）
 //!
-//! **`write()` 返回时，已写满的 4MiB 分片必须已上传完成**（superfile2
-//! error_code=0）且位图已落盘——drop 中断后 mock 会话恰含已满块、重建
-//! driver 差集恰补缺失（`tests/upload_resume.rs` / conformance ⑦ 钉死此
-//! 确定性）。因此 **stager 内满块上传是串行的**（每满块在 write 内
-//! await 完成），不并 4 worker：PCFS api.go:440-479 的 4 并发形态是
-//! 「整文件已知」路径的吞吐优化，与流式 stager 的确定性契约冲突。
-//! 「4 并发」语义的落点：B3b transport_face 的整文件路径（后续批次）。
+//! **到齐的 write() 返回时，全部满块必须已上传完成**（superfile2
+//! error_code=0）且位图已落盘——到齐后 drop，已传满块确定可复用、
+//! 重建 driver 差集恰补缺失（`tests/upload_resume.rs` 钉死此确定性）。
+//! 因此 **stager 内满块上传是串行的**（每满块在 write 内 await 完成），
+//! 不并 4 worker：PCFS api.go:440-479 的 4 并发形态是「整文件已知」
+//! 路径的吞吐优化，与流式 stager 的确定性契约冲突。「4 并发」语义的
+//! 落点：B3b transport_face 的整文件路径（后续批次）。
 //!
 //! ## 会话生命周期（K7）
 //!
@@ -19,6 +42,8 @@
 //!   （防同 path+size 不同内容误复用）；落盘 `<sessions_dir>/
 //!   baidu_state/sessions/<hash>.json`（hash = 定位键摘要），**随分片
 //!   完成即刻原子落盘**（tmp + rename）；
+//! - 会话 block_md5 恒为**全量列表**（到齐/close 才 precreate——31363
+//!   裁决后不存在部分声明形态）；
 //! - 恢复三路：查会话表 → 命中则**探活**（重发一个缺失分片，
 //!   error_code≠0 = 死）→ 活则差集补传 / 死则新 precreate 整体重传；
 //!   未命中 → 正常 precreate。**重 precreate 不是恢复手段**（spike
@@ -26,21 +51,16 @@
 //! - **abort/drop 不清会话表**（服务端分片 + 本地位图是可复用资产）；
 //!   仅 create 成功或 block_md5 校验不符时作废；
 //! - `sessions_dir = None` 时纯内存会话表——单进程内（同 driver）的
-//!   drop → 再 writer 恢复仍成立（conformance ⑦ 形态）。
-//!
-//! ## size 承诺与流式门槛
-//!
-//! 流式路径（write 内满块即传）**仅在 `hint.size` 已知时启用**：precreate
-//! 的 size 参数必须等于最终字节数（mock/服务端按会话校验 size），无承诺
-//! 时分次 write 会造成会话 size 漂移。无 hint 时数据全缓冲至 close 一次
-//! 成型（真实调用面——WebDAV PUT / CLI copy——均带 Content-Length size）。
+//!   drop → 再 writer 恢复仍成立。
 //!
 //! ## 探活期间的 drain 冻结
 //!
 //! 恢复会话探活未验证前（`probe_pending`）**不 drain 已处理块**：探活
 //! 撞死需要全量重传（含此前按位图跳过的块），块数据必须还在缓冲内。
 //! 探活成功（或新 precreate 会话）后恢复正常增量 drain。由此保证：
-//! 探活失败必发生在 drained=0 时刻，全量重传数据完备。
+//! 探活失败必发生在 drained=0 时刻，全量重传数据完备。恢复会话满块
+//! 全在位图时（无缺失满块），探活由 close 的尾块上传承担——数据因
+//! 冻结仍在缓冲，撞死后 close 内重装备全量重传仍数据完备。
 
 use std::collections::{BTreeSet, HashMap};
 use std::path::PathBuf;
@@ -72,8 +92,8 @@ pub(crate) struct SessionRecord {
     pub(crate) path: String,
     /// 会话认定的最终字节数（precreate size 参数）。
     pub(crate) size: u64,
-    /// precreate 时声明的分片 md5 列表（可能是部分列表——precreate 时
-    /// 后续分片内容未知）。
+    /// precreate 时锁定的**全量**分片 md5 列表（到齐/close 才 precreate
+    /// ——31363 裁决后不存在部分声明形态；create 必须原样重申此列表）。
     pub(crate) block_md5: Vec<String>,
     pub(crate) uploadid: String,
     /// 已上传完成（superfile2 error_code=0）的分片索引集。
@@ -172,29 +192,34 @@ pub(crate) fn md5_hex(data: &[u8]) -> String {
         .collect()
 }
 
-/// 三步曲 stager（B2）。
+/// 三步曲 stager（B2；「到齐即传」——2026-09-08 真网 31363 返工裁决）。
 ///
 /// ## 状态机（write → close / abort / drop）
 ///
-/// - `write`：数据入缓冲；有 size 承诺时流式处理——满块算 md5 → 首次
-///   网络动作前**装备会话**（恢复三路或新 precreate，见下）→ 缺失块
-///   逐块 superfile2（串行，见模块文档取舍）→ 位图落盘 → drain；
-/// - `close`：size 承诺校验（不符 → `Invalid`，WriteHint 契约）→ 尾块
-///   上传 → `create`（rtype=3）→ Entry → 会话作废；
+/// - `write`：数据入缓冲 + 满块 md5 增量计算（纯本地）；**数据到齐**
+///   （hint.size 已知且累计字节 == size）时在返回前完成：装备会话
+///   （恢复三路或新 precreate 全量 block_list，见下）→ 缺失满块逐块
+///   superfile2（串行，见模块文档取舍）→ 位图落盘 → drain。**未到齐
+///   零网络动作**（31363：precreate 需一次性锁定全量 block_list）；
+/// - `close`：size 承诺校验（不符 → `Invalid`，WriteHint 契约）→ 兜底
+///   装备（无 hint 全量定型 / 空文件 / 防御路径）→ 查缺补传含尾块
+///   （恢复会话探活未验证场景首个上传兼探活，撞死 → 重装备全量重传）
+///   → `create`（rtype=3，**原样重申会话锁定的 block_list**）→ Entry
+///   → 会话作废；
 /// - `abort` / Drop：弃内存态，**会话表保留**（K7 资产；位图已随分片
 ///   完成即刻落盘，Drop 无需善后动作）；
 /// - 秒传腿（precreate return_type=2）：零 superfile2/create，Entry 由
 ///   响应 fs_id 直接收尾（官方语义存在但 spike §4 实证此 appkey 桶不
 ///   触发——路径必须有、不依赖）。
 ///
-/// ## 恢复三路（首次网络动作前装备会话）
+/// ## 恢复三路（装备时）
 ///
 /// 1. [`SessionStore::load`] 命中 → 逐片校验会话 block_md5 与新内容已算
 ///    md5（前缀不一致 → 作废重建）→ 装备旧 uploadid + 位图，**首个
 ///    缺失分片上传兼探活**（Err = 会话死 → 作废 → 新 precreate + 全量
 ///    重传）；
-/// 2. 未命中 → 隐式建父目录 + `precreate`（rtype=3）→ return_type=2 走
-///    秒传收尾，否则装备新 uploadid（位图空）；
+/// 2. 未命中 → 隐式建父目录 + `precreate`（rtype=3，全量 block_list）
+///    → return_type=2 走秒传收尾，否则装备新 uploadid（位图空）；
 /// 3. 之后所有块按位图差集上传（in-done 块零流量复用）。
 pub(crate) struct BaiduStager {
     client: Arc<BaiduClient>,
@@ -215,10 +240,15 @@ pub(crate) struct BaiduStager {
     drained: u64,
     /// 已算出 md5 的分片（按全局索引序；含定型尾块）。
     block_md5: Vec<String>,
-    /// 尾块 md5 是否已计入（write 到达承诺量时提前定型）。
+    /// 尾块 md5 是否已计入（数据终态时定型——到齐或无承诺 close）。
     tail_included: bool,
     /// 活跃会话（precreate/恢复装备后）；None = 尚未装备。
     uploadid: Option<String>,
+    /// precreate 会话锁定的 block_list（装备时装载：新 precreate = 本次
+    /// 全量列表 / 恢复记录 = 记录锁定列表）。close 的 create **原样重申
+    /// 此列表**——真网 31363 实证：create 与 precreate 声明不一致被拒，
+    /// 故 create 不用重算的 [`Self::block_md5`] 而用会话锁定值。
+    session_blocks: Vec<String>,
     /// 已上传完成分片索引集（恢复时装载旧位图）。
     done: BTreeSet<u64>,
     /// 恢复会话的探活待验标记（首个缺失块上传兼探活，成功即验证活；
@@ -259,6 +289,7 @@ pub(crate) async fn open_writer(
         block_md5: Vec::new(),
         tail_included: false,
         uploadid: None,
+        session_blocks: Vec::new(),
         done: BTreeSet::new(),
         probe_pending: false,
         rapid_fs_id: None,
@@ -278,6 +309,7 @@ impl BaiduStager {
     }
 
     /// 会话装备（恢复三路或新 precreate；幂等——已装备/秒传直接返回）。
+    /// 装备即装载 `session_blocks`（create 重申锚点，31363 免疫）。
     async fn ensure_session(&mut self) -> Result<(), StorageError> {
         if self.uploadid.is_some() || self.rapid_fs_id.is_some() {
             return Ok(());
@@ -292,6 +324,7 @@ impl BaiduStager {
                 .all(|(new, old)| new == old);
             if consistent {
                 self.uploadid = Some(rec.uploadid.clone());
+                self.session_blocks = rec.block_md5.clone();
                 self.done = rec.done.iter().copied().collect();
                 self.probe_pending = true; // 首个缺失块上传兼探活
                 return Ok(());
@@ -309,6 +342,7 @@ impl BaiduStager {
             return Ok(());
         }
         self.uploadid = Some(outcome.uploadid);
+        self.session_blocks = self.block_md5.clone();
         self.done = BTreeSet::new();
         Ok(())
     }
@@ -393,49 +427,56 @@ impl BaiduStager {
             .await;
     }
 
+    /// 满块 md5 增量补算（每次 write 后推进；纯本地计算，无网络动作）。
+    fn compute_full_block_md5s(&mut self) {
+        let avail = self.buffer.len() / CHUNK;
+        for i in 0..avail {
+            let idx = self.drained as usize + i;
+            if idx >= self.block_md5.len() {
+                let md5 = md5_hex(&self.buffer[i * CHUNK..(i + 1) * CHUNK]);
+                self.block_md5.push(md5);
+            }
+        }
+    }
+
+    /// 尾块定型（数据终态时：hinted 到齐或无承诺 close）。定型后
+    /// `block_md5` 即最终**全量**形态——precreate 一次性锁定（31363：
+    /// 部分声明会话在 create 必然被拒，故定型先于装备）。
+    fn finalize_tail(&mut self) {
+        if self.tail_included || self.rapid_fs_id.is_some() {
+            return;
+        }
+        let avail = self.buffer.len() / CHUNK;
+        if !self.buffer.len().is_multiple_of(CHUNK) {
+            let tail = &self.buffer[avail * CHUNK..];
+            self.block_md5.push(md5_hex(tail));
+            self.tail_included = true;
+        }
+    }
+
     /// write 的流式处理（仅 size 承诺路径；无承诺全缓冲至 close）。
     ///
-    /// 步骤：满块 md5 补算 → 承诺量达成时尾块定型 → 会话装备（首次）→
-    /// 差集上传循环（探活撞死则重装备全量重传）→ drain（探活冻结期除外）。
+    /// **到齐即传**（31363 裁决）：未到齐（累计字节 < hint.size）直接
+    /// 返回——零网络动作；到齐时定型全量 block_md5 → 会话装备（首次，
+    /// 含恢复三路）→ 差集上传循环（探活撞死则重装备全量重传）→ drain
+    /// （探活冻结期除外，尾块始终保留归 close）。
     async fn flush_streaming(&mut self) -> Result<(), StorageError> {
+        self.compute_full_block_md5s();
+        let complete = self.hinted_size.is_some_and(|h| self.written == h);
+        if !complete {
+            return Ok(()); // 未到齐：不装备、不传（31363：不可部分声明）
+        }
+        self.finalize_tail();
+        let avail = (self.buffer.len() / CHUNK) as u64;
         loop {
-            let avail = (self.buffer.len() / CHUNK) as u64; // 缓冲内满块数
-                                                            // 满块 md5 补算（全局索引 = drained + i；幂等）。
-            for i in 0..avail as usize {
-                let idx = (self.drained as usize) + i;
-                if idx >= self.block_md5.len() {
-                    let md5 = md5_hex(&self.buffer[i * CHUNK..(i + 1) * CHUNK]);
-                    self.block_md5.push(md5);
-                }
-            }
-            // 尾块定型：承诺量达成且存在余数块（整块倍数无尾块——末块
-            // 由满块循环覆盖）。定型后 block_md5 即最终形态（precreate
-            // block_list 含尾块 md5，黄金参照形态）。
-            let complete = self.hinted_size.is_some_and(|h| self.written == h);
-            if complete
-                && !self.tail_included
-                && !self.buffer.len().is_multiple_of(CHUNK)
-                && self.rapid_fs_id.is_none()
-            {
-                let tail = &self.buffer[avail as usize * CHUNK..];
-                self.block_md5.push(md5_hex(tail));
-                self.tail_included = true;
-            }
-            // 会话装备时机：有满块或已达承诺量（空文件/纯尾块小文件在
-            // 此 precreate，block_list 为最终形态）。
-            if self.uploadid.is_none() && self.rapid_fs_id.is_none() && (avail > 0 || complete) {
-                self.ensure_session().await?;
-            }
+            self.ensure_session().await?;
             if self.rapid_fs_id.is_some() {
                 // 秒传命中：分片零上传（服务端已有同内容对象），数据可弃。
                 self.buffer.clear();
                 self.drained += avail;
                 return Ok(());
             }
-            if avail == 0 {
-                return Ok(()); // 无满块可处理（尾块归 close）
-            }
-            // 差集上传循环。
+            // 差集上传循环（满块；恢复会话首个缺失块兼探活）。
             let mut i: usize = 0;
             while i < avail as usize {
                 let seq = self.drained + i as u64;
@@ -462,7 +503,7 @@ impl BaiduStager {
                 continue; // 撞死重装备路径：loop 头重走
             }
             // drain（探活冻结期不 drain——probe_pending 仍真时数据保留，
-            // 供潜在全量重传）。
+            // 供潜在全量重传；尾块始终保留归 close）。
             if !self.probe_pending {
                 self.buffer.drain(..avail as usize * CHUNK);
                 self.drained += avail;
@@ -488,34 +529,26 @@ impl BaiduStager {
         })
     }
 
-    /// 无承诺路径的 close 全量处理：数据终态下切块 → 装备（含恢复）→
-    /// 差集上传（探活撞死则重装备整轮重来）。
-    async fn flush_at_close(&mut self) -> Result<(), StorageError> {
-        let avail = (self.buffer.len() / CHUNK) as u64;
-        for i in 0..avail as usize {
-            if i >= self.block_md5.len() {
-                let md5 = md5_hex(&self.buffer[i * CHUNK..(i + 1) * CHUNK]);
-                self.block_md5.push(md5);
-            }
-        }
-        if !self.buffer.len().is_multiple_of(CHUNK) {
-            let tail = &self.buffer[avail as usize * CHUNK..];
-            self.block_md5.push(md5_hex(tail));
-            self.tail_included = true;
-        }
+    /// close 的统一收尾循环：兜底装备（空文件/无承诺/防御路径——到齐
+    /// write 已装备则幂等复用会话）→ 查缺补传（含尾块；恢复会话探活
+    /// 未验证场景首个上传兼探活，撞死 → 重装备整轮重来——探活冻结
+    /// 保证此刻数据仍在缓冲）。
+    async fn finalize_and_upload_remaining(&mut self) -> Result<(), StorageError> {
         loop {
             self.ensure_session().await?;
             if self.rapid_fs_id.is_some() {
-                return Ok(());
+                return Ok(()); // 秒传腿：零分片零 create
             }
-            let total = self.block_md5.len() as u64;
-            let mut seq: u64 = 0;
-            while seq < total {
+            // 查缺补传：从 drained 起到全量末（含尾块；span 相对缓冲，
+            // 未 drain 的满块与尾块数据均在缓冲内）。
+            let mut seq = self.drained;
+            while seq < self.block_md5.len() as u64 {
                 if self.done.contains(&seq) {
                     seq += 1;
-                    continue;
+                    continue; // 位图命中（write 已传满块）：零流量复用
                 }
-                let (start, end) = block_span(seq as usize, self.buffer.len());
+                let start = (seq - self.drained) as usize * CHUNK;
+                let end = (start + CHUNK).min(self.buffer.len());
                 let data = Bytes::copy_from_slice(&self.buffer[start..end]);
                 match self.upload_block(seq, data).await {
                     Ok(()) => {
@@ -523,29 +556,28 @@ impl BaiduStager {
                     }
                     Err(e) => {
                         if self.uploadid.is_none() {
-                            break; // 撞死重装备路径：整轮重来
+                            // 探活撞死已作废：重装备（新 precreate）整轮
+                            // 重来（done 已清空，drained 因探活冻结必为 0，
+                            // 全量重传数据完备）。
+                            break;
                         }
                         return Err(e);
                     }
                 }
             }
-            if self.uploadid.is_some() {
+            if self.uploadid.is_some() || self.rapid_fs_id.is_some() {
                 return Ok(());
             }
+            // 撞死重装备路径：loop 头重走。
         }
     }
 }
 
-/// 分片 `idx` 在缓冲内的字节区间 `[start, end)`（尾块取到缓冲末尾）。
-fn block_span(idx: usize, buffer_len: usize) -> (usize, usize) {
-    let start = idx * CHUNK;
-    let end = (start + CHUNK).min(buffer_len);
-    (start, end)
-}
-
 #[async_trait]
 impl UploadStager for BaiduStager {
-    /// 追加数据：流式处理满块（有 size 承诺时；同步落定契约见模块文档）。
+    /// 追加数据：本地 staging + 满块 md5 增量计算；**到齐即传**（有 size
+    /// 承诺且累计到量时，write 返回前完成全量 precreate + 满块串行上传
+    /// + 位图落盘——同步落定契约见模块文档；未到齐零网络动作）。
     async fn write(&mut self, data: &[u8]) -> Result<(), StorageError> {
         self.written += data.len() as u64;
         self.buffer.extend_from_slice(data);
@@ -555,11 +587,13 @@ impl UploadStager for BaiduStager {
         if self.hinted_size.is_some() {
             self.flush_streaming().await?;
         }
-        // 无承诺：全缓冲至 close（流式门槛，见模块文档）。
+        // 无承诺：全缓冲至 close（数据终态时全量成型，见 close）。
         Ok(())
     }
 
-    /// 提交：承诺校验 → 尾块/无承诺全量处理 → create → Entry → 会话作废。
+    /// 提交：承诺校验 → 无承诺路径全量定型 → 统一收尾（兜底装备 + 尾块/
+    /// 查缺补传，探活撞死重装备全量重传）→ create（**原样重申会话锁定
+    /// 的 block_list**，31363）→ Entry → 会话作废。
     async fn close(mut self: Box<Self>) -> Result<Entry, StorageError> {
         if let Some(hinted) = self.hinted_size {
             if self.written != hinted {
@@ -569,10 +603,15 @@ impl UploadStager for BaiduStager {
             }
         }
         let size = self.final_size();
-        // 无承诺路径的 close 全量处理（数据此刻终态：size/分片全可定）。
-        if self.hinted_size.is_none() && !self.buffer.is_empty() {
-            self.flush_at_close().await?;
+        // 无承诺路径：数据此刻终态（size/分片全可定）——定型全量
+        // block_md5，装备与上传由统一收尾循环承担。
+        if self.hinted_size.is_none() {
+            self.compute_full_block_md5s();
+            self.finalize_tail();
         }
+        // 统一收尾：兜底装备（空文件 write([]) 从未触发到齐路径/防御）→
+        // 查缺补传含尾块 →（秒传腿短路）。
+        self.finalize_and_upload_remaining().await?;
         // 秒传腿：precreate return_type=2 已带 fs_id，零收尾调用。
         if let Some(fs_id) = self.rapid_fs_id {
             let entry = self.entry_for(fs_id).await?;
@@ -582,32 +621,18 @@ impl UploadStager for BaiduStager {
                 ..entry
             });
         }
-        if self.uploadid.is_none() {
-            // 空文件（written=0 且承诺 0）/防御兜底：装备在此发生。
-            self.ensure_session().await?;
-        }
-        if let Some(fs_id) = self.rapid_fs_id {
-            let entry = self.entry_for(fs_id).await?;
-            self.sessions.remove(&self.abs, size).await;
-            return Ok(Entry {
-                size: self.written,
-                ..entry
-            });
-        }
-        // 尾块上传（位图未含时；探活未验证场景此上传兼探活）。
-        if !self.buffer.is_empty() {
-            let avail = self.buffer.len() / CHUNK;
-            let tail_idx = self.block_md5.len() as u64 - 1;
-            if !self.done.contains(&tail_idx) {
-                let tail = Bytes::copy_from_slice(&self.buffer[avail * CHUNK..]);
-                self.upload_block(tail_idx, tail).await?;
-            }
-            self.buffer.clear();
-        }
-        // create 收尾（rtype=3 覆盖语义）→ Entry → 会话作废。
+        self.buffer.clear();
+        // create 收尾（rtype=3 覆盖语义）——block_list 用 precreate 会话
+        // 锁定的 [`Self::session_blocks`]（原样重申，非重算：31363）。
         let uploadid = self.uploadid.clone().expect("close 前必已装备会话");
-        let fs_id =
-            api::create_file(&self.client, &self.abs, &uploadid, size, &self.block_md5).await?;
+        let fs_id = api::create_file(
+            &self.client,
+            &self.abs,
+            &uploadid,
+            size,
+            &self.session_blocks,
+        )
+        .await?;
         let entry = self.entry_for(fs_id).await?;
         self.sessions.remove(&self.abs, size).await;
         Ok(entry)

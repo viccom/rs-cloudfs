@@ -198,9 +198,12 @@ impl StorageDriver for BaiduDriver {
             // 断言②全套绿（半开/钳制/空窗口/start>=size=空流）——
             // download.rs 的 4MiB 有界窗口拼接对上层透明。
             range_read: true,
-            // 断言⑦绿（K7 差集可观测：drop → 再 writer 只补缺失分片，
-            // `backend_bytes_received` 上界断言过）——upload.rs 会话表
-            // （内存 + sessions_dir 磁盘双层）。
+            // K7 差集可观测（到齐 drop → 再 writer 0 满块重传，仅补尾块
+            // ——`tests/upload_resume.rs` 差集断言钉死）；upload.rs 会话表
+            // （内存 + sessions_dir 磁盘双层）。注：conformance ⑦ 现行
+            // 场景（**未到齐**部分写 drop）在「到齐即传」（真网 31363
+            // 裁决）下首段零上传、次段全量，撞 ⑦ 的按 staging 对齐差集
+            // 上界——待 harness 场景适配裁决（2026-09-08 B2 返工挂账）。
             resume: true,
             // superfile2 4MiB 分片后端原生分块（三步曲主体）。
             multipart: true,

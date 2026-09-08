@@ -7,13 +7,20 @@
 //!   （path/size/block_md5/uploadid/完成位图，随分片完成即刻落盘）；
 //!   `sessions_dir=None` 时纯内存会话仍支撑单进程内恢复（conformance ⑦
 //!   形态），跨进程恢复由本套件 `Some(dir)` 钉死；
-//! - **中断形态**（对齐 conformance ⑦）：stager 写部分数据后**直接 drop**
-//!   （不 close 不 abort）——已 staging 完成的分片（4MiB 整块）是可复用
-//!   资产，未完成块（含只写了几个字节的开头块）不算完成、必须重传；
+//! - **「到齐即传」策略**（2026-09-08 真网 31363 实证驱动，B2 返工）：
+//!   precreate 一次性锁定全量 block_list 且 create 必须原样重申——
+//!   数据未到齐（累计字节 < hint.size）时 write **不做任何网络动作**
+//!   （无 precreate、无分片、零后端流量）；到齐后 write 返回前完成
+//!   全量 precreate + 串行传全部满块 + 位图落盘（write 同步落定契约
+//!   保持——drop 后已传满块确定）；尾块（不满 4MiB 的最后一片）在
+//!   close 时传；
+//! - **中断形态**（对齐「到齐即传」）：stager write 全量数据（满块已
+//!   传、尾块未传）后**直接 drop**（不 close 不 abort）——已上传的满块
+//!   是可复用资产；未到齐 drop 则无会话无分片（见专测）；
 //! - **差集**：同 sessions_dir 重建 driver（模拟进程重启）后 writer 恢复
-//!   旧会话（旧 uploadid），第二次上传 mock **只收到缺失分片**——探活
-//!   分片必须是缺失分片之一（不得重传已完成分片，spike §3
-//!   old_uploadid_probe 形态）；
+//!   旧会话（旧 uploadid），第二次上传 mock **只收到缺失分片**（到齐
+//!   drop 场景 = 恰尾块，0 满块重传）——探活分片必须是缺失分片之一
+//!   （不得重传已完成分片，spike §3 old_uploadid_probe 形态）；
 //! - **会话死亡兜底**：旧 uploadid 探活撞非 0 error_code → 整体重传
 //!   （新 precreate 新 uploadid + 全量分片）——**重 precreate 不是恢复
 //!   手段**（spike §3.2 实证：同参重发返回新 uploadid + 全量列表）；
@@ -127,10 +134,13 @@ async fn dropped_stager_resumes_diff_only_after_driver_rebuild() {
     mock.seed_dir(MOCK_ROOT);
     let sessions_root = tempfile::tempdir().expect("sessions tempdir");
 
-    let data = pattern_bytes(3 * CHUNK_4M);
+    // 3 满块 + 1MiB 尾块（尾块归 close——到齐即传只传满块）。
+    let data = pattern_bytes(3 * CHUNK_4M + CHUNK_4M / 4);
 
-    // 第一段：写 1 整块 + 3 字节后 drop（conformance ⑦形态的中断——
-    // 不 close 不 abort）。块 0 完整（完成）、块 1 只有 3 字节（未完成）。
+    // 第一段：write 全量（数据到齐）后 drop（不 close 不 abort）——真网
+    // 31363 实证驱动的场景改造：旧形态「写部分数据后 drop（已满块即传）」
+    // 依赖部分声明 precreate，已被 31363 否定；新形态到齐后满块已传、
+    // 尾块未传，差集断言语义保留（第二次只补缺失分片）。
     let path = RelPath::new("resume.bin").expect("rel path");
     {
         let d1 = driver_with_sessions(&mock, Some(sessions_root.path().to_path_buf())).await;
@@ -138,21 +148,20 @@ async fn dropped_stager_resumes_diff_only_after_driver_rebuild() {
             .writer(&path, &hint_for(data.len()))
             .await
             .expect("第一段 writer 打开");
-        st1.write(&data[..CHUNK_4M + 3])
+        st1.write(&data)
             .await
-            .expect("第一段 write（1 整块+3字节）");
+            .expect("第一段 write 全量（到齐即传）");
         drop(st1); // 中断
     }
 
-    // 契约钉死：write 返回时**已写满的块已完成上传**（drop 后立即可观测
-    // ——conformance ⑦ 在 drop 后立即取观测点，要求此确定性；「close 时
-    // 统一传」或「in-flight 未落定」形态均不可通过差集上界）。
+    // 契约钉死：write 返回时**到齐满块已完成上传**（drop 后立即可观测
+    // ——write 同步落定契约保持）；尾块归 close，不在到齐时传。
     let uploads = mock.uploadids();
     assert_eq!(uploads.len(), 1, "第一段恰一次 precreate（旧会话锚点）");
     assert_eq!(
         mock.session_partseqs(&uploads[0]),
-        vec![0],
-        "write 返回时块 0 已到达后端（写满即传、同步落定）"
+        vec![0, 1, 2],
+        "write 到齐返回时满块 0/1/2 已到达后端（到齐即传、同步落定；尾块未传）"
     );
 
     // K7 落盘形态：中断后会话表里恰一个会话文件（随分片完成即刻落盘）。
@@ -173,8 +182,8 @@ async fn dropped_stager_resumes_diff_only_after_driver_rebuild() {
     let entry = st2.close().await.expect("续传 close");
     assert_eq!(entry.size, data.len() as u64);
 
-    // 差集断言：续传恰补块 1+块 2（探活分片是缺失分片之一且计入补传；
-    // 不重传已完成块、不重 precreate）。
+    // 差集断言：续传 0 满块重传 + 恰补尾块（探活分片是缺失分片之一且
+    // 计入补传；不重传已完成块、不重 precreate）。
     assert_eq!(
         mock.uploadids().len(),
         1,
@@ -183,13 +192,13 @@ async fn dropped_stager_resumes_diff_only_after_driver_rebuild() {
     let retransferred = mock.bytes_received_total() - mark;
     assert_eq!(
         retransferred,
-        (2 * CHUNK_4M) as u64,
-        "续传恰补传块 1+块 2（差集字节精确断言；块 0 复用、探活不额外重传）"
+        (CHUNK_4M / 4) as u64,
+        "续传恰补尾块（差集字节精确断言；3 满块复用、0 满块重传）"
     );
     assert_eq!(
         mock.session_partseqs(&mock.uploadids()[0]),
-        vec![0, 1, 2],
-        "旧会话最终分片集 = 全集（块 0 中断前 + 块 1/2 续传补齐）"
+        vec![0, 1, 2, 3],
+        "旧会话最终分片集 = 全集（满块 0/1/2 中断前 + 尾块 3 续传补齐）"
     );
 
     // 收尾校验：内容正确 + create 成功 + 会话作废。
@@ -198,28 +207,95 @@ async fn dropped_stager_resumes_diff_only_after_driver_rebuild() {
     assert_eq!(session_file_count(&sessions_root), 0, "close 后会话作废");
 }
 
+/// 真网 31363 实证驱动（新模式钉死，2026-09-08 返工）：数据未到齐时
+/// write **不做任何网络动作**——precreate 需一次性锁定全量 block_list，
+/// 部分声明会话在 create 必然 31363。未到齐 drop → 无会话、无分片、零
+/// 后端流量；随后正常全量上传不受影响。
+#[tokio::test]
+async fn partial_write_drop_stages_nothing_until_data_complete() {
+    let (mock, _base) = MockBaidu::start().await;
+    mock.seed_dir(MOCK_ROOT);
+    let sessions_root = tempfile::tempdir().expect("sessions tempdir");
+
+    let data = pattern_bytes(3 * CHUNK_4M);
+    let path = RelPath::new("partial.bin").expect("rel path");
+    {
+        let d1 = driver_with_sessions(&mock, Some(sessions_root.path().to_path_buf())).await;
+        let mut st1 = d1
+            .writer(&path, &hint_for(data.len()))
+            .await
+            .expect("第一段 writer 打开");
+        // 1 整块 + 3 字节（未到齐：累计 < hint.size）。
+        st1.write(&data[..CHUNK_4M + 3])
+            .await
+            .expect("第一段 write（未到齐）");
+        drop(st1); // 中断
+    }
+
+    assert!(
+        mock.uploadids().is_empty(),
+        "未到齐不 precreate（31363：precreate 一次性锁定全量 block_list）"
+    );
+    assert_eq!(
+        mock.superfile2_records().len(),
+        0,
+        "未到齐零分片上传（无会话可挂分片）"
+    );
+    assert_eq!(
+        session_file_count(&sessions_root),
+        0,
+        "未到齐无会话资产（无 precreate 即无会话记录）"
+    );
+    assert_eq!(
+        mock.bytes_received_total(),
+        0,
+        "未到齐零后端流量（本地 staging 不产生网络动作）"
+    );
+
+    // 后续正常路径不受影响：全量 writer → 到齐 → 全量 precreate → close。
+    let d2 = driver_with_sessions(&mock, Some(sessions_root.path().to_path_buf())).await;
+    let mut st2 = d2
+        .writer(&path, &hint_for(data.len()))
+        .await
+        .expect("全量 writer 打开");
+    st2.write(&data).await.expect("全量 write（到齐）");
+    let entry = st2.close().await.expect("全量 close");
+    assert_eq!(entry.size, data.len() as u64);
+    assert_eq!(mock.uploadids().len(), 1, "到齐才 precreate（恰一次）");
+    assert_eq!(
+        mock.session_partseqs(&mock.uploadids()[0]),
+        vec![0, 1, 2],
+        "到齐即传全量满块"
+    );
+    let got = read_all(&d2, &entry).await;
+    assert_eq!(got, data, "全量上传结果逐字节正确");
+}
+
 #[tokio::test]
 async fn dead_session_falls_back_to_full_reupload_with_new_uploadid() {
     let (mock, _base) = MockBaidu::start().await;
     mock.seed_dir(MOCK_ROOT);
     let sessions_root = tempfile::tempdir().expect("sessions tempdir");
 
-    let data = pattern_bytes(3 * CHUNK_4M);
+    // 3 满块 + 尾块：真网 31363 实证驱动的场景调整——到齐即传后 drop，
+    // 恢复会话满块全在位图（无缺失满块），探活由 close 的尾块上传承担。
+    let data = pattern_bytes(3 * CHUNK_4M + CHUNK_4M / 4);
     let path = RelPath::new("dead.bin").expect("rel path");
 
-    // 第一段：1 整块后 drop（旧会话建立 + 块 0 落位图）。
+    // 第一段：write 全量（到齐，满块 0/1/2 已传）后 drop。
     {
         let d1 = driver_with_sessions(&mock, Some(sessions_root.path().to_path_buf())).await;
         let mut st1 = d1
             .writer(&path, &hint_for(data.len()))
             .await
             .expect("第一段 writer");
-        st1.write(&data[..CHUNK_4M]).await.expect("第一段 write");
+        st1.write(&data).await.expect("第一段 write 全量（到齐）");
         drop(st1);
     }
     let old_uploadid = mock.uploadids()[0].clone();
 
-    // 注入会话死亡：旧 uploadid 的下一分片（=探活分片）顶非 0 error_code。
+    // 注入会话死亡：旧 uploadid 的下一分片（=close 尾块上传，兼探活）顶
+    // 非 0 error_code。
     mock.inject_upload_death(&old_uploadid);
 
     // 重建 driver → 续传：探活撞死 → 整体重传（新 precreate 新 uploadid）。
@@ -242,8 +318,8 @@ async fn dead_session_falls_back_to_full_reupload_with_new_uploadid() {
     assert_ne!(uploads[1], old_uploadid);
     assert_eq!(
         mock.session_partseqs(&uploads[1]),
-        vec![0, 1, 2],
-        "兜底腿：新会话全量分片重传"
+        vec![0, 1, 2, 3],
+        "兜底腿：新会话全量分片重传（3 满块 + 尾块）"
     );
 
     // 内容正确（整体重传同样必须收尾正确）。
@@ -257,7 +333,9 @@ async fn explicit_abort_keeps_session_for_later_diff_resume() {
     mock.seed_dir(MOCK_ROOT);
     let sessions_root = tempfile::tempdir().expect("sessions tempdir");
 
-    let data = pattern_bytes(3 * CHUNK_4M);
+    // 3 满块 + 尾块（真网 31363 实证驱动：到齐即传形态，abort 后差集 =
+    // 恰尾块）。
+    let data = pattern_bytes(3 * CHUNK_4M + CHUNK_4M / 4);
     let path = RelPath::new("abort.bin").expect("rel path");
 
     // 显式 abort：不清会话表（上传会话是可复用资产——abort 只放弃本次
@@ -268,7 +346,9 @@ async fn explicit_abort_keeps_session_for_later_diff_resume() {
             .writer(&path, &hint_for(data.len()))
             .await
             .expect("writer 打开");
-        st1.write(&data[..CHUNK_4M]).await.expect("write 1 块");
+        st1.write(&data)
+            .await
+            .expect("write 全量（到齐，满块已传）");
         st1.abort().await.expect("显式 abort");
     }
     assert_eq!(
@@ -277,7 +357,7 @@ async fn explicit_abort_keeps_session_for_later_diff_resume() {
         "abort 不清会话表（K7 资产保留——与 close 成功的作废语义相对）"
     );
 
-    // abort 后仍可差集续传：重建 driver → 只补 {1,2}。
+    // abort 后仍可差集续传：重建 driver → 只补尾块（0 满块重传）。
     let mark = mock.bytes_received_total();
     let d2 = driver_with_sessions(&mock, Some(sessions_root.path().to_path_buf())).await;
     let mut st2 = d2
@@ -291,8 +371,8 @@ async fn explicit_abort_keeps_session_for_later_diff_resume() {
     let retransferred = mock.bytes_received_total() - mark;
     assert_eq!(
         retransferred,
-        (2 * CHUNK_4M) as u64,
-        "abort 后差集续传：恰补传块 1+块 2（块 0 复用）"
+        (CHUNK_4M / 4) as u64,
+        "abort 后差集续传：恰补尾块（3 满块复用、0 满块重传）"
     );
     let got = read_all(&d2, &entry).await;
     assert_eq!(got, data, "abort 后续传结果逐字节正确");

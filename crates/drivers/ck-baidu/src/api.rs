@@ -39,6 +39,7 @@
 //! | 31034 | 访问频次超限 | `RateLimited { retry_after: None }` + client 单点重试一次（固定短退避，K15） | spike §2 / 附录 A（multicloud 计划 ：143） |
 //! | -9 | 文件/目录不存在 | `NotFound` | spike cleanup 实证（dir_recheck errno=-9） |
 //! | 12 | 参数错误 | `Invalid` | 附录 A errno 档 |
+//! | 31363 | 参数与预创建不一致（create block_list ≠ precreate 会话锁定声明） | `Invalid` | 真网探针实证 2026-09-08（Batch B2 返工裁决，decisions.md）——B2「到齐即传」策略的驱动证据 |
 //! | 31326 | 下载鉴权失败（CDN 403） | `Unauthorized { recoverable: true }`（重取 dlink/追 token 可救——B2 两段 fallback 的前提） | spike §5 dl-try 矩阵 |
 //! | 其他 | 未知 | `Unavailable`（载荷保留 `errno=<code>` 与后端原始消息，R2 可诊断约定） | cloudkit-storage error.rs 归置约定 |
 //!
@@ -90,7 +91,7 @@ pub(crate) fn map_errno(errno: i64, payload: &str) -> StorageError {
         111 | -6 => StorageError::Unauthorized { recoverable: false },
         -8 => StorageError::Exists, // mock 建模 + B2 conformance 复核（模块文档注源）
         -9 => StorageError::NotFound,
-        12 => StorageError::Invalid,
+        12 | 31363 => StorageError::Invalid, // 31363：create 与 precreate 会话锁定声明不一致（真网探针 2026-09-08）
         31034 => StorageError::RateLimited { retry_after: None },
         31326 => StorageError::Unauthorized { recoverable: true },
         _ => StorageError::Unavailable(format!("baidu errno={errno}: {payload}")),
@@ -268,6 +269,10 @@ pub(crate) struct PrecreateOutcome {
 /// - **rtype=3**（K10 覆盖语义——spike 用 1 是冲突重命名，本驱动明确改 3；
 ///   真机复核归 `tests/real_machine.rs` rtype3 用例）；
 /// - `block_list` = 分片 md5 hex 的 JSON 数组字符串（空文件 `[]`）；
+/// - **会话锁定语义**（真网 31363 实证，2026-09-08）：precreate 一次性
+///   锁定 `(path,size,block_list)`——调用方必须传**全量**列表（到齐/
+///   数据终态才 precreate，见 upload.rs「到齐即传」），create 必须原样
+///   重申；部分声明虽被接受（errno=0）但 create 阶段必 31363；
 /// - 响应 block_list（服务端仍需上传的分片索引）不消费：**重 precreate
 ///   不是恢复手段**（spike §3.2 实证——同参重发返回新 uploadid + 全量
 ///   列表），恢复只走 upload.rs 的旧 uploadid 探活差集腿。
@@ -308,8 +313,11 @@ pub(crate) async fn precreate(
 /// spike `api.rs:332-370` + PCFS api.go:581-587：form 恰六字段
 /// `path,size,isdir=0,rtype,uploadid,block_list`；rtype=3 同 precreate）。
 ///
-/// 返回新对象 fs_id（mock/服务端按会话校验分片齐全 + 逐片 md5，缺片
-/// errno=10 → 经映射表归一为 `Unavailable`）。
+/// - **block_list 必须原样重申 precreate 会话锁定的声明**（真网 31363
+///   实证，2026-09-08：不一致 → errno=31363 → `Invalid`）——调用方
+///   （upload.rs）持会话锁定列表而非重算；
+/// - 返回新对象 fs_id（mock/服务端按会话校验分片齐全 + 逐片 md5，缺片
+///   errno=10 → 经映射表归一为 `Unavailable`）。
 pub(crate) async fn create_file(
     client: &BaiduClient,
     path: &str,
