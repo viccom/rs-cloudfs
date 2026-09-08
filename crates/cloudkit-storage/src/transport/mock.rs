@@ -55,6 +55,7 @@ impl Default for MockState {
             stream_upload_calls: Vec::new(),
             max_stream_frame: 0,
             deleted: Vec::new(),
+            delete_script: VecDeque::new(),
             open_delay: Duration::ZERO,
             sent_texts: Vec::new(),
             sent_documents: Vec::new(),
@@ -104,6 +105,11 @@ struct MockState {
     max_stream_frame: usize,
     /// msg_ids successfully deleted, in order.
     deleted: Vec<i64>,
+    /// Scripted outcomes of `delete_remote`, consumed in order (B3b / K4
+    /// red tests: an `Err` fails the call BEFORE anything is removed —
+    /// the idempotent-retry contract's "remote refused" leg). An
+    /// exhausted or `Ok` script behaves as the normal deletion.
+    delete_script: VecDeque<Result<(), StorageError>>,
     /// Artificial pre-stream delay injected by `open`/`open_range`
     /// (tests simulate a stalling remote); zero by default.
     open_delay: Duration,
@@ -137,6 +143,7 @@ impl MockTransport {
         MockTransportBuilder {
             connect_result: None,
             upload_script: VecDeque::new(),
+            delete_script: VecDeque::new(),
             incoming_events: Vec::new(),
             open_delay: Duration::ZERO,
             capabilities: mock_default_capabilities(),
@@ -364,10 +371,19 @@ impl CloudTransport for MockTransport {
     /// anything is removed (all-or-nothing, mirroring the pre-K3 single
     /// -message semantics for the single-chunk handles every existing
     /// test uses).
+    ///
+    /// B3b / K4: a scripted `Err` (see
+    /// [`MockTransportBuilder::delete_action`]) fails the call up front —
+    /// no id is removed — so a consumer's retry sees the SAME scripted
+    /// queue position semantics as the upload script (consumed in order,
+    /// one entry per call).
     async fn delete_remote(&self, handle: &RemoteHandle) -> Result<(), StorageError> {
         let mut state = self.lock()?;
         if !state.connected {
             return Err(StorageError::Invalid);
+        }
+        if let Some(Err(error)) = state.delete_script.pop_front() {
+            return Err(error);
         }
         for msg_id in &handle.chunk_msg_ids {
             if !state.messages.contains_key(msg_id) {
@@ -557,6 +573,7 @@ where
 pub struct MockTransportBuilder {
     connect_result: Option<Result<(), StorageError>>,
     upload_script: VecDeque<UploadAction>,
+    delete_script: VecDeque<Result<(), StorageError>>,
     incoming_events: Vec<Result<IncomingEvent, StorageError>>,
     open_delay: Duration,
     capabilities: Capabilities,
@@ -580,6 +597,16 @@ impl MockTransportBuilder {
     /// exhausted scripts behave as [`UploadAction::Ok`].
     pub fn upload_action(mut self, action: UploadAction) -> Self {
         self.upload_script.push_back(action);
+        self
+    }
+
+    /// Appends a scripted `delete_remote` outcome (B3b / K4): an `Err`
+    /// fails the call before anything is removed; `Ok(())` (or an
+    /// exhausted script) performs the normal id-based deletion. Scripts
+    /// are consumed in order, one entry per call — a consumer that
+    /// retries once consumes two entries.
+    pub fn delete_action(mut self, result: Result<(), StorageError>) -> Self {
+        self.delete_script.push_back(result);
         self
     }
 
@@ -615,6 +642,7 @@ impl MockTransportBuilder {
             state: Arc::new(Mutex::new(MockState {
                 connect_result: self.connect_result,
                 upload_script: self.upload_script,
+                delete_script: self.delete_script,
                 incoming_events: self.incoming_events,
                 open_delay: self.open_delay,
                 capabilities: self.capabilities,
