@@ -378,3 +378,11 @@
 - **deny advisories 销账**：`cargo deny check advisories` → `advisories ok`（0.20.2；经 HTTPS_PROXY=127.0.0.1:7897 拉库——**旧仓「github.com 443 不通」限制自此有绕行方案**，直连仍不通）。
 - 门禁：fmt/clippy 干净 + workspace **625 passed 0 failed**（618→625：P3 +1 / host 校验 +1（并入 config 套件计数）/ 模拟器 +1 / 闸 +4，按套件聚合）；无 cfg 面改动。
 - **剩余验证类挂账**：#[ignore] 真机 ×3、litmus 套件——随真机窗口跑，不阻塞 Phase 2。
+
+## 2026-09-08 PCFS 多实例模型研究（负责人指令）+ 多卷时机裁决待定
+
+- **负责人信号**：PCFS 可同进程运行多个存储实例（同厂多账号/异厂混挂），要求认真参考——对 D5「v1 实例=后端」与 D6「v1 单卷」的既定节奏构成方向性输入，**多卷启用时机待负责人裁决**（本条目挂起）。
+- **PCFS 实测形态（探索代理结论，引用为其文件:行号）**：①配置=进程级 config.yaml + 每实例一 JSON（data/instances/{name}.json，含 root_dir/encrypt/encryption_key/token）；②Registry=map[实例名]Driver+RWMutex，启动全量拉起（失败跳过）+fsnotify 热重载；③**无 OS 挂载层**——多实例是 HTTP API `/api/v1/storage/{instance}/{path}` + 前端切换器，非盘符；④加密完全按实例（CryptoWrapper 装饰器+每实例密钥文件）；⑤索引=纯内存 entryCache 惰性填充（重启即失，缓存模式全内容驻内存仅演示级）；⑥路由=driver:path 前缀 ID SplitN 分发；⑦「实例 ACL」实为 View 模式分发白名单（view_acl.json），非能力限制。
+- **对 rs-cloudfs 的映射**：PCFS Registry/实例文件/每实例加密装饰器/前缀 ID 隔离可干净映射到 D6 VolumeId（VolumeId 即卷名，EntryId 前缀式天然隔离）；但 PCFS 无盘符——**我们的差异化恰是 OS 挂载**，多卷形态应为「一进程多卷各自挂盘」（U:=卷1, V:=卷2，每卷独立 webdav 路径/端口）或 union 根（D6 原文预留）。索引侧不复刻 PCFS 纯内存形态（我们 db 是持久资产）——倾向每卷独立 db/cache 子目录（R6 零 schema 变更）。
+- **PCFS 坑（勿抄清单）**：List 失败静默回退陈旧内存数据；driver.Delete 失败被吞仍删本地索引（云端孤儿）；缓存模式 ETag 短前缀 ID 碰撞；CryptoWrapper 改名致 Name 前缀嗅探脆弱；baidu 根路径硬编码泄漏到聚合层（R1 反面教材原址）。
+- **建议（待裁决）**：Phase 2 维持既定顺序（手册→ck-local→ck-baidu，单卷先行——多卷建立在有真实驱动之上），B3 后立即接 **Phase 2.5 多卷启用批**（Registry+实例文件+每卷加密+多盘挂载）；负责人若要求多卷先行也可（会先只有 telegram 一厂可挂）。负责人可用 A4 双进程形态（两目录两 config）先行测试百度加密/不加密双盘，不阻塞。
