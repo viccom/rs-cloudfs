@@ -166,15 +166,30 @@ impl BaiduDriver {
     }
 
     /// RelPath → 后端绝对路径（root 前缀拼接；根目录即 root 本身）。
+    ///
+    /// B3b 起委派 upload::abs_of 共享函数（stager/transport 面/driver
+    /// 三处同源，杜绝前缀拼接逻辑漂移）。
     fn abs_path(&self, rel: &RelPath) -> String {
-        if rel.is_root() {
-            return self.root.clone();
-        }
-        if self.root == "/" {
-            format!("/{}", rel.as_str())
-        } else {
-            format!("{}/{}", self.root, rel.as_str())
-        }
+        upload::abs_of(&self.root, rel)
+    }
+
+    /// transport 面整文件上传（B3b 段一）：委派 upload::upload_whole_file
+    ///（[`UPLOAD_WORKERS`] 并发 superfile2 + K7 会话表与 stager 共用）。
+    pub(crate) async fn upload_whole_file(
+        &self,
+        rel: &RelPath,
+        data: bytes::Bytes,
+    ) -> Result<Entry, StorageError> {
+        upload::upload_whole_file(
+            &self.client,
+            &self.volume,
+            &self.root,
+            rel,
+            data,
+            &self.sessions,
+            &self.handles,
+        )
+        .await
     }
 
     /// 后端绝对路径 → RelPath（root 前缀剥离；不可剥离/非法形态 → None

@@ -30,6 +30,10 @@ reqwest = { version = "0.12", default-features = false, features = [
 # ByteStream 产生侧（download.rs 的分片流实现 futures_core::Stream；
 # ck-telegram 同款形态）。
 futures-core = "0.3"
+# transport 面 upload_stream 的帧消费（StreamExt::next；B3b）——与
+# dev-dependencies 同版本（lock 既有），default-features=false 保持
+# 最小面（只取 stream 组合子）。
+futures-util = { version = "0.3", default-features = false }
 # 分片净荷类型（superfile2 multipart part / 下载流帧；cloudkit-storage
 # ByteStream 同源 crate）。
 bytes = "1"

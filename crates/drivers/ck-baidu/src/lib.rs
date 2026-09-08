@@ -1,16 +1,22 @@
-//! # ck-baidu——百度网盘驱动（L2 驱动 crate，Phase 2 Batch B1+B2）
+//! # ck-baidu——百度网盘驱动（L2 驱动 crate，Phase 2 Batch B1+B2+B3b）
 //!
 //! B1（已交付）：crate 骨架、oauth 刷新状态机（K13）、HTTP client（spike
 //! `examples/baidu_spike` 改造复用）、errno 映射表（mock 钉死）与
 //! StorageDriver **元数据面**（list/stat/mkdir/delete/rename/quota）。
 //!
-//! B2（本批）：writer 接三步曲上传（precreate rtype=3 / superfile2 4MiB
+//! B2（已交付）：writer 接三步曲上传（precreate rtype=3 / superfile2 4MiB
 //! 分片串行落定 / create + K7 差集续传会话表，`upload.rs`）、reader 接
 //! 下载器（dlink 缓存 K8 + 4MiB 有界 Range 分片流 K9 + 403 两段
-//! fallback，`download.rs`）、conformance 八断言全绿 + 能力位六位点亮。
+//! fallback，`download.rs`）、conformance 八断言全绿 + 能力位七位点亮
+//! （B3b 起 +remote_delete）。
+//!
+//! B3b（本批）：[`BaiduTransport`] CloudTransport 面（K5 fs_id 句柄——
+//! 整文件 **4 并发** superfile2 上传（stager 流式串行契约不变，两路共
+//! 用 K7 会话表）、upload_stream 全缓冲 staging 文件（31363 裁决）、
+//! open/delete 薄壳委派 StorageDriver 面，`transport_face.rs`）。
 //!
 //! 卷身份：`baidu:<uid>`（uinfo 取 uid，K5）；句柄 = fs_id 十进制字符串
-//! （跨 rename 稳定，PCFS api.go:170-171 先例）。
+//!（跨 rename 稳定，PCFS api.go:170-171 先例）。
 //!
 //! 层位置：只依赖 cloudkit-storage（L2）与外部 crate（driver-onboarding
 //! §1）；禁依赖 cloudkit-core 及任何 L3+ crate（R1）。
@@ -23,6 +29,7 @@ mod client;
 mod download;
 mod driver;
 mod oauth;
+mod transport_face;
 mod upload;
 
 use std::path::PathBuf;
@@ -32,6 +39,7 @@ use cloudkit_storage::StorageError;
 
 pub use driver::BaiduDriver;
 pub use oauth::TokenStore;
+pub use transport_face::BaiduTransport;
 
 /// 生产 API base（pan.baidu.com；spike api.rs:12 同值）。
 pub const DEFAULT_API_BASE: &str = "https://pan.baidu.com";

@@ -75,6 +75,8 @@ use cloudkit_storage::{
     WriteHint,
 };
 use serde::{Deserialize, Serialize};
+use tokio::sync::Semaphore;
+use tokio::task::JoinSet;
 
 use crate::api;
 use crate::client::BaiduClient;
@@ -82,6 +84,11 @@ use crate::driver::HandleCache;
 
 /// 分片尺寸（4MiB；spike §2/§6——上/下载统一有界边界）。
 pub(crate) const CHUNK: usize = 4 * 1024 * 1024;
+
+/// transport 面整文件上传的并发 worker 数（B3b；PCFS api.go:440-479 的
+/// 4 并发吞吐形态——stager 流式路径不并发的取舍见模块文档「串行上传
+/// 取舍」节，两条路径各守其契约）。
+pub(crate) const UPLOAD_WORKERS: usize = 4;
 
 /// 会话目录相对形态（K7 契约：`<sessions_dir>/baidu_state/sessions/`）。
 const SESSIONS_REL: [&str; 2] = ["baidu_state", "sessions"];
@@ -369,49 +376,10 @@ impl BaiduStager {
         Ok(())
     }
 
-    /// 隐式建父目录（**卷根下**逐级，不从后端绝对路径首段建起——/apps 等
-    /// 前缀非本卷资产）。
-    ///
-    /// **list 预检**（真网实证 2026-09-08 第五轮）：目录 create 撞已存在
-    /// ≠ -8——errno=0 成功假象 + `<名>_<时间戳>` 空副本重命名（每次上传
-    /// 到已有目录路径都产空目录垃圾）。每层先 list 父目录判断该层是否已
-    /// 存在（是 → 跳过 create；否 → create）；预检 list 结果顺带批量喂
-    /// 句柄缓存。-8 容错保留为防御语义（真网未观察到）。
+    /// 隐式建父目录：薄壳委派共享函数 [`ensure_parents`]（B3b 提取——
+    /// transport 面整文件路径共用同一预检协议，不重复）。
     async fn ensure_parents(&self) -> Result<(), StorageError> {
-        let Some(parent) = self.rel.parent() else {
-            return Ok(()); // 根下文件（rel 无父）：无中间层可建
-        };
-        if parent.is_root() {
-            return Ok(()); // 直接位于卷根：卷根已存在
-        }
-        let mut prefix = RelPath::root();
-        for comp in parent.components() {
-            prefix = prefix.join(comp)?;
-            let abs = self.abs_of(&prefix);
-            let siblings = api::list(&self.client, &api::parent_abs(&abs)).await?;
-            self.handles.put_batch(&siblings); // 预检流量顺带喂句柄缓存
-            if siblings.iter().any(|e| e.path == abs) {
-                continue; // 该层已存在：零 create 下沉（ghost 免疫）
-            }
-            match api::create_dir(&self.client, &abs).await {
-                Ok(()) => {}
-                Err(StorageError::Exists) => {} // 防御（真网实证 errno=0 形态，-8 不触发）
-                Err(e) => return Err(e),
-            }
-        }
-        Ok(())
-    }
-
-    /// 卷内路径 → 后端绝对路径（root 前缀拼接；driver::abs_path 同款）。
-    fn abs_of(&self, rel: &RelPath) -> String {
-        if rel.is_root() {
-            return self.root.clone();
-        }
-        if self.root == "/" {
-            format!("/{}", rel.as_str())
-        } else {
-            format!("{}/{}", self.root, rel.as_str())
-        }
+        ensure_parents(&self.client, &self.root, &self.rel, &self.handles).await
     }
 
     /// 上传单个分片（带探活/重建编排）。
@@ -546,37 +514,18 @@ impl BaiduStager {
         }
     }
 
-    /// Entry 构造（list 主路径；断言① mtime>0 的来源——后端入树时间戳）。
-    ///
-    /// 真网 31300/31023 实证驱动（2026-09-08 第四轮返工）：meta 端点在此
-    /// appkey 下全废——原「meta by fs_id 主 + list 兜底」形态废除，
-    /// **list_lookup（父目录 list + fs_id 匹配）提为主路径**（list 即时
-    /// 可见——真网实证 #4/#5：create 后 list 立即可见，meta 不可见是持续
-    /// 无权限非延迟）。
+    /// Entry 构造：薄壳委派共享函数 [`lookup_entry`]（B3b 提取——
+    /// transport 面整文件路径共用同一解析，不重复）。
     async fn entry_for(&self, fs_id: i64) -> Result<Entry, StorageError> {
-        let remote = self.list_lookup(fs_id).await?;
-        Ok(Entry {
-            id: EntryId::new(self.volume.clone(), BackendHandle::new(fs_id.to_string())),
-            path: self.rel.clone(),
-            kind: if remote.isdir != 0 {
-                EntryKind::Dir
-            } else {
-                EntryKind::File
-            },
-            size: remote.size.max(0) as u64,
-            mtime: remote.server_mtime as f64,
-        })
-    }
-
-    /// 父目录 depth-1 列举按 fs_id 定位（entry_for 的主路径；顺带批量
-    /// 填充句柄缓存——close 产出的新 fs_id 是缓存的第一批资产来源之一）。
-    async fn list_lookup(&self, fs_id: i64) -> Result<api::RemoteEntry, StorageError> {
-        let entries = api::list(&self.client, &api::parent_abs(&self.abs)).await?;
-        self.handles.put_batch(&entries);
-        entries
-            .into_iter()
-            .find(|e| e.fs_id == fs_id)
-            .ok_or(StorageError::NotFound)
+        lookup_entry(
+            &self.client,
+            &self.volume,
+            &self.rel,
+            &self.abs,
+            &self.handles,
+            fs_id,
+        )
+        .await
     }
 
     /// close 的统一收尾循环：兜底装备（空文件/无承诺/防御路径——到齐
@@ -696,4 +645,284 @@ impl UploadStager for BaiduStager {
         self.done.clear();
         Ok(())
     }
+}
+
+// ---------------------------------------------------------------------------
+// 两面共享的自由函数（B3b 提取：stager 流式路径与 transport 整文件路径
+// 共用同一协议逻辑，不重复）
+// ---------------------------------------------------------------------------
+
+/// 卷内路径 → 后端绝对路径（root 前缀拼接；driver.rs `abs_path` 同源
+/// ——stager/transport 面/driver 三处共用本函数，K6 前缀不泄漏 R1）。
+pub(crate) fn abs_of(root: &str, rel: &RelPath) -> String {
+    if rel.is_root() {
+        return root.to_string();
+    }
+    if root == "/" {
+        format!("/{}", rel.as_str())
+    } else {
+        format!("{root}/{}", rel.as_str())
+    }
+}
+
+/// 隐式建父目录（**卷根下**逐级，不从后端绝对路径首段建起——/apps 等
+/// 前缀非本卷资产）。
+///
+/// **list 预检**（真网实证 2026-09-08 第五轮）：目录 create 撞已存在
+/// ≠ -8——errno=0 成功假象 + `<名>_<时间戳>` 空副本重命名（每次上传
+/// 到已有目录路径都产空目录垃圾）。每层先 list 父目录判断该层是否已
+/// 存在（是 → 跳过 create；否 → create）；预检 list 结果顺带批量喂
+/// 句柄缓存。-8 容错保留为防御语义（真网未观察到）。
+pub(crate) async fn ensure_parents(
+    client: &Arc<BaiduClient>,
+    root: &str,
+    rel: &RelPath,
+    handles: &Arc<HandleCache>,
+) -> Result<(), StorageError> {
+    let Some(parent) = rel.parent() else {
+        return Ok(()); // 根下文件（rel 无父）：无中间层可建
+    };
+    if parent.is_root() {
+        return Ok(()); // 直接位于卷根：卷根已存在
+    }
+    let mut prefix = RelPath::root();
+    for comp in parent.components() {
+        prefix = prefix.join(comp)?;
+        let abs = abs_of(root, &prefix);
+        let siblings = api::list(client, &api::parent_abs(&abs)).await?;
+        handles.put_batch(&siblings); // 预检流量顺带喂句柄缓存
+        if siblings.iter().any(|e| e.path == abs) {
+            continue; // 该层已存在：零 create 下沉（ghost 免疫）
+        }
+        match api::create_dir(client, &abs).await {
+            Ok(()) => {}
+            Err(StorageError::Exists) => {} // 防御（真网实证 errno=0 形态，-8 不触发）
+            Err(e) => return Err(e),
+        }
+    }
+    Ok(())
+}
+
+/// fs_id → Entry（父目录 list + fs_id 匹配；真网 31300/31023 实证驱动，
+/// 2026-09-08 第四轮返工——meta 端点在此 appkey 下全废，list 即时可见是
+/// 主路径；断言① mtime>0 的来源即后端入树时间戳）。
+///
+/// 顺带批量填充句柄缓存——close/整文件上传产出的新 fs_id 是缓存的
+/// 第一批资产来源（transport 面后续 open/delete 的 warm 命中面）。
+pub(crate) async fn lookup_entry(
+    client: &Arc<BaiduClient>,
+    volume: &VolumeId,
+    rel: &RelPath,
+    abs: &str,
+    handles: &Arc<HandleCache>,
+    fs_id: i64,
+) -> Result<Entry, StorageError> {
+    let entries = api::list(client, &api::parent_abs(abs)).await?;
+    handles.put_batch(&entries);
+    let remote = entries
+        .into_iter()
+        .find(|e| e.fs_id == fs_id)
+        .ok_or(StorageError::NotFound)?;
+    Ok(Entry {
+        id: EntryId::new(volume.clone(), BackendHandle::new(remote.fs_id.to_string())),
+        path: rel.clone(),
+        kind: if remote.isdir != 0 {
+            EntryKind::Dir
+        } else {
+            EntryKind::File
+        },
+        size: remote.size.max(0) as u64,
+        mtime: remote.server_mtime as f64,
+    })
+}
+
+/// transport 面整文件上传（B3b 段一；[`UPLOAD_WORKERS`] 并发 superfile2）。
+///
+/// 与 stager 流式路径的分工（模块文档「串行上传取舍」的 B3b 兑现）：本
+/// 函数是 **close-once 整文件路径**——数据全量在手，吞吐优先；stager
+/// 的「到齐 write 同步落定」串行契约（conformance ⑦）不变。会话/位图
+/// 沿用 K7 会话表（与 stager 共用同一 [`SessionStore`]——同一
+/// `(path, size)` 会话可跨两路径差集续传），**位图随分片完成即刻落盘**。
+///
+/// 流程（恢复三路的整文件形态）：
+///
+/// 1. 会话表命中且全量 `block_md5` 一致 → 复用 uploadid + 位图（探活见
+///    下）；不一致（同 path+size 不同内容）→ 作废重建；
+/// 2. 恢复会话**探活**：首个缺失分片串行上传兼探活，撞死 → 作废 → 新
+///    precreate 全量重传（探活错误不外泄——会话死是预期恢复路径，stager
+///    同款语义）；满块全在位图 → 无探活，create 即收尾；
+/// 3. 新 precreate（隐式建父 + rtype=3 全量声明——31363 裁决）；秒传腿
+///    （return_type=2）零分片零 create；
+/// 4. 缺失分片 [`UPLOAD_WORKERS`] 并发上传（Semaphore 有界；每分片完成
+///    即更新共享位图 + 会话落盘）；任一失败 → abort 余量并上抛（已传
+///    分片的位图资产保留在会话表）；
+/// 5. `create`（原样重申 precreate 锁定的 block_list，31363）→ fs_id →
+///    [`lookup_entry`]（顺带填句柄缓存）→ 会话作废。
+pub(crate) async fn upload_whole_file(
+    client: &Arc<BaiduClient>,
+    volume: &VolumeId,
+    root: &str,
+    rel: &RelPath,
+    data: Bytes,
+    sessions: &SessionStore,
+    handles: &Arc<HandleCache>,
+) -> Result<Entry, StorageError> {
+    if rel.is_root() {
+        return Err(StorageError::Invalid); // 卷根不可作为上传目标
+    }
+    let abs = abs_of(root, rel);
+    let size = data.len() as u64;
+    let block_md5: Vec<String> = data.chunks(CHUNK).map(md5_hex).collect();
+
+    // 路一：会话表命中 → 全量 md5 一致才复用（整文件在手，比对全量
+    // 列表——比 stager 的前缀比对更严）；不一致 → 作废重建。
+    let mut uploadid: Option<String> = None;
+    let mut done: BTreeSet<u64> = BTreeSet::new();
+    let mut rapid_fs_id: Option<i64> = None;
+    if let Some(rec) = sessions.load(&abs, size).await {
+        if rec.block_md5 == block_md5 {
+            uploadid = Some(rec.uploadid.clone());
+            done = rec.done.iter().copied().collect();
+        } else {
+            sessions.remove(&abs, size).await;
+        }
+    }
+
+    // 探活（仅恢复会话且有缺失分片；首个缺失分片串行上传，stager 语义）。
+    if let Some(uid) = uploadid.clone() {
+        if let Some(probe_idx) = (0..block_md5.len() as u64).find(|i| !done.contains(i)) {
+            let part = part_slice(&data, probe_idx);
+            match client
+                .superfile2(&client.pcs_base, &abs, &uid, probe_idx, part)
+                .await
+            {
+                Ok(()) => {
+                    done.insert(probe_idx);
+                    persist_whole_session(sessions, &abs, size, &block_md5, &uid, &done).await;
+                }
+                Err(_) => {
+                    // 会话死（预期恢复路径）：作废 → 新 precreate 全量重传。
+                    sessions.remove(&abs, size).await;
+                    uploadid = None;
+                    done.clear();
+                }
+            }
+        }
+    }
+
+    // 路二/三：新 precreate（隐式建父 + 全量声明；rtype=3 覆盖语义）。
+    if uploadid.is_none() && rapid_fs_id.is_none() {
+        ensure_parents(client, root, rel, handles).await?;
+        let outcome = api::precreate(client, &abs, size, &block_md5).await?;
+        if outcome.return_type == 2 {
+            rapid_fs_id = Some(outcome.fs_id); // 秒传腿：零分片零 create
+        } else {
+            uploadid = Some(outcome.uploadid);
+            done.clear();
+        }
+    }
+
+    // 秒传腿收尾：fs_id 直取 Entry（Entry.size 对齐实际上传量，stager
+    // rapid 腿同款）。
+    if let Some(fs_id) = rapid_fs_id {
+        let entry = lookup_entry(client, volume, rel, &abs, handles, fs_id).await?;
+        return Ok(Entry { size, ..entry });
+    }
+
+    let uploadid = uploadid.expect("装备后必有权柄");
+    // 缺失分片并发上传（Semaphore 有界；每分片完成即位图落盘）。
+    let missing: Vec<u64> = (0..block_md5.len() as u64)
+        .filter(|i| !done.contains(i))
+        .collect();
+    if !missing.is_empty() {
+        let done_shared = Arc::new(Mutex::new(done));
+        let sem = Arc::new(Semaphore::new(UPLOAD_WORKERS));
+        let mut set: JoinSet<Result<u64, StorageError>> = JoinSet::new();
+        for idx in missing {
+            // 入队即取许可：任务存量恒 ≤ UPLOAD_WORKERS（内存有界——
+            // Bytes 切片是引用计数，非拷贝）。
+            let permit = sem
+                .clone()
+                .acquire_owned()
+                .await
+                .map_err(|e| StorageError::Unavailable(format!("upload semaphore: {e}")))?;
+            let client = Arc::clone(client);
+            let abs = abs.clone();
+            let uid = uploadid.clone();
+            let part = part_slice(&data, idx);
+            set.spawn(async move {
+                let _permit = permit;
+                client
+                    .superfile2(&client.pcs_base, &abs, &uid, idx, part)
+                    .await?;
+                Ok(idx)
+            });
+        }
+        let mut first_err: Option<StorageError> = None;
+        while let Some(joined) = set.join_next().await {
+            match joined {
+                Ok(Ok(idx)) => {
+                    let snapshot = {
+                        let mut guard = done_shared.lock().unwrap();
+                        guard.insert(idx);
+                        guard.clone()
+                    };
+                    persist_whole_session(sessions, &abs, size, &block_md5, &uploadid, &snapshot)
+                        .await;
+                }
+                Ok(Err(e)) => {
+                    if first_err.is_none() {
+                        first_err = Some(e);
+                    }
+                    set.abort_all(); // 不再烧流量（已传分片位图已在会话表）
+                }
+                Err(join_err) => {
+                    if first_err.is_none() {
+                        first_err = Some(StorageError::Unavailable(format!(
+                            "upload worker join: {join_err}"
+                        )));
+                    }
+                    set.abort_all();
+                }
+            }
+        }
+        if let Some(e) = first_err {
+            return Err(e);
+        }
+    }
+
+    // create 收尾：原样重申 precreate 会话锁定的 block_list（31363）。
+    let fs_id = api::create_file(client, &abs, &uploadid, size, &block_md5).await?;
+    let entry = lookup_entry(client, volume, rel, &abs, handles, fs_id).await?;
+    sessions.remove(&abs, size).await;
+    Ok(entry)
+}
+
+/// 整文件路径的会话即刻落盘（随分片完成；K7 契约——与 stager 的
+/// `persist_session` 同一落点，位图形态一致）。
+async fn persist_whole_session(
+    sessions: &SessionStore,
+    abs: &str,
+    size: u64,
+    block_md5: &[String],
+    uploadid: &str,
+    done: &BTreeSet<u64>,
+) {
+    sessions
+        .put(SessionRecord {
+            path: abs.to_string(),
+            size,
+            block_md5: block_md5.to_vec(),
+            uploadid: uploadid.to_string(),
+            done: done.iter().copied().collect(),
+        })
+        .await;
+}
+
+/// 全量缓冲 `data` 的第 `idx` 个 4MiB 分片（Bytes 切片 = 引用计数视图，
+/// 并发 worker 零拷贝）。
+fn part_slice(data: &Bytes, idx: u64) -> Bytes {
+    let start = (idx as usize) * CHUNK;
+    let end = ((idx as usize) + 1) * CHUNK;
+    data.slice(start..end.min(data.len()))
 }
