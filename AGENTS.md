@@ -20,7 +20,7 @@
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 618 测试（KDF 钳制修复后；ignored 6 为既有真机）
+cargo test --workspace --no-fail-fast            # 625 测试（继承挂账修复批后；ignored 6 为真机/平台类）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 scripts/check_layers                             # R1 层依赖门禁（CI 同款；动 Cargo.toml 依赖后必跑）
@@ -47,4 +47,4 @@ scripts/scan_secrets                             # R3 秘密扫描门禁（CI �
 1. 基线设计 §9-2/9-3/9-4 三项建议待负责人确认（旧仓冻结时点 / bot 分 crate 时点 / R-E 批序）
 2. Phase 2 E2E 前提供 `E:\GitHub\rs-CyDrive\test\` telegram 测试配置（**独立测试 chat**，见 foundation §7a 隔离裁决；baidu token 已验证可用）
 3. 新仓远端 origin 待建（当前仅 upstream-cydrive 只读、push 已禁用）
-4. 自 rs-CyDrive 继承的挂账（旧仓 decisions.md 末条）：P3 hydrate 快照回写竞态、复审 Low 项（--help 文案余项/凭据门槛统一/sync_url host 校验/SyncClient trait 文档/64MB 并发闸）、#[ignore] 真机测试 ×3、litmus 套件、deny advisories、scripts/gen_compat_fixtures.py 契约 fixture 流程
+4. 自 rs-CyDrive 继承的挂账——**2026-09-08 修复批后仅剩验证类**：P3 hydrate 快照回写竞态已修（47c4fc2，目标列写 set_cached_flag）；Low×5 已清（sync_url host 校验 f8040aa/模拟器排序 e93433a/SyncClient trait 文档 09fff2c/--help 实证漂移 bc34d43/64MB 并发闸 08fee1d；凭据门槛核实本已统一于 resolve_sync_secret）；gen_compat_fixtures.py 已修（5a3a319，重生成需同步改 database.rs 钉死的 created_at 断言）；deny advisories 已过（`advisories ok`，经 7897 代理拉库——github.com 直连不通的既有限制自此有绕行方案）。**剩余：#[ignore] 真机测试 ×3、litmus 套件（均验证类，随真机窗口跑）**

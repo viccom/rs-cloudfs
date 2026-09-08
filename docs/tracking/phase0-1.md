@@ -73,3 +73,19 @@ Batch P0 已收口；**Batch S（百度 spike）已收口（2026-09-07，止损�
 7. ~~dlink TTL 上界未测到~~ **已销账（2026-09-08 增补轮）**：≥96min 仍 206（预算封顶）；B2 缓存 TTL 建议上调至 60–90min（spike 报告附录 B）
 8. **限额/秒传结论仅对 PCFS 第三方 appkey 桶有效**：正式 appkey 到位后须复跑 spike qps/rapid 子命令（工具就位）
 9. 基线设计 §9-2/9-3/9-4 三项既有待确认（旧仓冻结时点 / bot 分 crate 时点 / R-E 批序——R→E 已按建议执行）
+
+## 2026-09-08 继承挂账修复批（后收口追加）
+
+| 项 | 状态 | 证据 |
+|---|---|---|
+| P3 hydrate 快照回写竞态 | ✅ 已修 | 红 2ba831c → 绿 47c4fc2（set_cached_flag 目标列写，三调用点） |
+| sync_url host 校验 | ✅ 已修 | f8040aa（红绿留证） |
+| 模拟器 pull 排序 | ✅ 已修 | e93433a（对齐服务端 version ASC） |
+| SyncClient trait 文档 | ✅ 已补 | 09fff2c |
+| --help 文案盘点 | ✅ 已清 | bc34d43（唯一漂移=setup keyring 文案，已修；余无漂移） |
+| 凭据门槛统一 | ✅ 销账（核实本已统一） | 两调用点同源 resolve_sync_secret，无绕过 |
+| 64MB 并发闸 | ✅ 已修 | 红 4b010b9 → 绿 08fee1d（Semaphore 2 permits，503 可行动） |
+| deny advisories | ✅ 已过 | `advisories ok`（经 7897 代理；github 直连限制有绕行） |
+| #[ignore] 真机 ×3 / litmus | ⬜ 验证类待真机窗口 | 不阻塞 Phase 2 |
+
+门禁终态：win 625 passed 0 failed / fmt / clippy 干净。

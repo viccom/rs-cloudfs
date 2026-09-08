@@ -369,3 +369,12 @@
 - **KDF DoS 钳制（一类 #1 修复，红 2c6efc1 → 绿 9faad3e）**：v2 头 PBKDF2 迭代数上界 1M（默认 100k 的 10 倍，留演进余量），解析期拒绝超界头（Malformed，先于任何 KDF 工作）。契约变更：既有 bad_iters 断言由「燃烧后 AuthFailed」改为「解析期 Malformed」，新增 in-cap（200k）篡改腿保留 AAD/密钥绑定覆盖；aead_v2 套件 ~127s→13s（16.8M 伪造腿消失）。
 - **gen_compat_fixtures.py 输出路径修复（一类 #4，5a3a319）**：两 fixture 在 Phase 0+E 批已分家（crypto_vector.json→cloudkit-crypto、python_meta.sql→cloudkit-core），脚本仍写旧 cydrive-core 死路径；改双输出目录并真跑端到端验证（两文件落位正确、两消费套件对新输出全绿）。**发现并记录**：`adopts_python_generated_database` 钉死了抓取时的 created_at epoch——重新生成 fixture 必须同步改该断言（fixture 与断言按设计耦合，非缺陷）；本轮还原旧 fixture 零 churn。
 - 门禁：fmt/clippy 干净 + workspace 618 passed 0 failed（+1 新测试）；无 cfg 面改动，WSL 不适用。
+
+## 2026-09-08 继承挂账修复批（P3 + Low×5 + 64MB 闸 + deny advisories）
+
+- **P3 hydrate 快照回写竞态（红 2ba831c → 绿 47c4fc2）**：hydrate/驱逐三处整行回写（cached_upsert）改为目标列写 `set_cached_flag(id, bool)`（`UPDATE files SET is_cached=?1 WHERE id=?2`，0 行=行已消失良性 Ok）——下载窗口内并发更新（PUT 覆盖/sync 应用）不再被旧快照复活吞噬；与 E-4「契约 upsert 冻结+目标列写」同型，R6 零 schema 变更；cached_upsert 随批删除；红测试用 StallingOpenTransport（Notify 门）确定性复现竞态（无计时器）。
+- **Low 清账**：①sync_url host 非空校验（f8040aa，可行动文案，手写最小解析不引 url crate）；②模拟器 pull 排序对齐服务端 version ASC（e93433a——原 (rel_path,version) 排序会掩掉顺序依赖 bug）；③SyncClient trait 四要素契约文档（09fff2c，interfaces §1）；④--help 全量盘点（bc34d43）：两 bin 全子命令对照行为，唯一实证漂移=setup 的 keyring 文案未提 headless 分支可写 config.toml，已修，其余无漂移；⑤凭据门槛：核实**本已统一**（两调用点同源 resolve_sync_secret，无绕过路径）——销账非修复。
+- **64MB 并发闸（红 4b010b9 → 绿 08fee1d）**：sync-server push/pull body 聚合段加 `MAX_CONCURRENT_BODY_BUFFERS=2` 信号量（2×64MB=128MB 峰值预算），try_acquire 立即 503（排队会无进展信号烧客户端超时，更不透明）；SSE subscribe 不入闸；router_with_gate 注入面。
+- **deny advisories 销账**：`cargo deny check advisories` → `advisories ok`（0.20.2；经 HTTPS_PROXY=127.0.0.1:7897 拉库——**旧仓「github.com 443 不通」限制自此有绕行方案**，直连仍不通）。
+- 门禁：fmt/clippy 干净 + workspace **625 passed 0 failed**（618→625：P3 +1 / host 校验 +1（并入 config 套件计数）/ 模拟器 +1 / 闸 +4，按套件聚合）；无 cfg 面改动。
+- **剩余验证类挂账**：#[ignore] 真机 ×3、litmus 套件——随真机窗口跑，不阻塞 Phase 2。
