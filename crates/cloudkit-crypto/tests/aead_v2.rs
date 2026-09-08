@@ -234,6 +234,30 @@ fn forged_header_fields_are_rejected() {
 }
 
 #[test]
+fn forged_iteration_count_above_cap_is_rejected_before_kdf() {
+    // KDF DoS clamp (owner fix directive 2026-09-08): an untrusted header
+    // must not be able to amplify PBKDF2 work past the accepted cap. The
+    // rejection happens structurally at header parse — before any KDF
+    // work — so a forged 1_000_001-iteration header fails in Malformed,
+    // not in AuthFailed after burning the derived-key cost.
+    let ct = scheme_small().encrypt(PW, &pattern(S + 10));
+
+    let mut absurd = ct.clone();
+    absurd[26..30].copy_from_slice(&1_000_001u32.to_be_bytes());
+    assert!(matches!(
+        scheme_small().decrypt(PW, &absurd),
+        Err(CryptoError::Malformed)
+    ));
+
+    let mut u32max = ct.clone();
+    u32max[26..30].copy_from_slice(&u32::MAX.to_be_bytes());
+    assert!(matches!(
+        scheme_small().decrypt(PW, &u32max),
+        Err(CryptoError::Malformed)
+    ));
+}
+
+#[test]
 fn swapped_chunk_order_is_rejected() {
     let ct = scheme_small().encrypt(PW, &pattern(3 * S));
     let ct_len = S + TAG_SIZE;
