@@ -142,7 +142,7 @@ fn seed_uploaded_row(
             mtime: 1_700_000_000.0,
             sha256: None,
             is_dir: false,
-            telegram_msg_id: Some(i64::from(receipt.first_msg_id)),
+            telegram_msg_id: Some(receipt.first_msg_id),
             is_uploaded: true,
             is_cached: false,
             is_encrypted,
@@ -157,7 +157,7 @@ fn seed_uploaded_row(
         } else {
             size - (chunk_size as i64) * (chunk_count - 1)
         };
-        db.upsert_chunk(file_id, index, i64::from(msg_id), chunk_row_size, None)
+        db.upsert_chunk(file_id, index, msg_id, chunk_row_size, None)
             .expect("seed chunk row");
     }
 }
@@ -497,7 +497,7 @@ async fn hydrate_evicts_lru_and_clears_flags() {
     assert!(a.is_uploaded, "A's uploaded state preserved");
     assert_eq!(
         a.telegram_msg_id,
-        Some(i64::from(receipt_a.first_msg_id)),
+        Some(receipt_a.first_msg_id),
         "A's msg id preserved"
     );
     let b = db
@@ -741,7 +741,7 @@ async fn encrypted_roundtrip_put_upload_hydrate() {
     let chunks = db.get_chunks_by_file_id(row.id).expect("read chunks");
     let mut joined = Vec::new();
     for chunk in &chunks {
-        let id = i32::try_from(chunk.telegram_msg_id.expect("chunk msg id")).expect("msg id fits");
+        let id = chunk.telegram_msg_id.expect("chunk msg id");
         joined.extend_from_slice(&mock.message(id).expect("stored remote message"));
     }
     assert_eq!(joined.len(), 58, "14 B plaintext + 44 B crypto overhead");

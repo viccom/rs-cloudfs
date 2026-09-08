@@ -49,7 +49,7 @@ impl CloudTransport for StorageOnlyTransport {
     ) -> Result<ByteStream, StorageError> {
         unimplemented!("not exercised")
     }
-    async fn delete_remote(&self, _msg_id: i32) -> Result<(), StorageError> {
+    async fn delete_remote(&self, _handle: &RemoteHandle) -> Result<(), StorageError> {
         unimplemented!("not exercised")
     }
     fn capabilities(&self) -> Capabilities {
@@ -144,7 +144,15 @@ async fn connect_gate_maps_to_storage_invalid() {
         matches!(err, StorageError::Invalid),
         "upload before connect: {err:?}"
     );
-    let err = t.delete_remote(1).await.unwrap_err();
+    let err = t
+        .delete_remote(&RemoteHandle {
+            first_msg_id: 1,
+            chunk_msg_ids: vec![1],
+            total_size: 0,
+            path: None,
+        })
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, StorageError::Invalid),
         "delete_remote before connect: {err:?}"
@@ -175,6 +183,7 @@ async fn inbound_probe_preserves_drain_once_events() {
                 first_msg_id: 10,
                 chunk_msg_ids: vec![10],
                 total_size: 42,
+                path: None,
             },
         })])
         .build();

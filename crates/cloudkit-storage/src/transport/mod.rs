@@ -77,9 +77,15 @@ pub struct UploadJob {
 #[derive(Debug)]
 pub struct UploadReceipt {
     /// msg_id of chunk 0; this is what the metadata DB stores (contract 5).
-    pub first_msg_id: i32,
+    ///
+    /// i64 (Batch B3a / K1): the metadata DB and sync payloads already
+    /// store message ids as i64 (baidu fs_id needs 50 bits), so the old
+    /// i32 seam forced lossy narrowing at every driver boundary. Drivers
+    /// whose native ids are narrower (telegram/grammers: i32) widen at
+    /// their boundary with `i64::from`.
+    pub first_msg_id: i64,
     /// msg_id of every chunk, in order; `len == chunk_count`.
-    pub chunk_msg_ids: Vec<i32>,
+    pub chunk_msg_ids: Vec<i64>,
     /// Total bytes actually uploaded.
     pub uploaded_bytes: u64,
 }
@@ -88,11 +94,18 @@ pub struct UploadReceipt {
 #[derive(Debug)]
 pub struct RemoteHandle {
     /// msg_id of chunk 0.
-    pub first_msg_id: i32,
+    pub first_msg_id: i64,
     /// msg_id of every chunk, in order (single chunk: `vec![msg_id]`).
-    pub chunk_msg_ids: Vec<i32>,
+    pub chunk_msg_ids: Vec<i64>,
     /// Total file size in bytes.
     pub total_size: u64,
+    /// Virtual path of the file, when the constructing side knows it
+    /// (Batch B3a / K2, additive). `None` for telegram-era flows — the
+    /// id-keyed backends never read it; path-addressed backends (local)
+    /// carry their locator here. Consumers must treat `None` and `Some`
+    /// identically on every id-keyed face (pinned by transport_traits
+    /// test 9).
+    pub path: Option<RelPath>,
 }
 
 /// A file received from the remote (indexed metadata only until hydrated).
@@ -173,8 +186,14 @@ pub trait CloudTransport: Send + Sync {
         off: u64,
         len: u64,
     ) -> Result<ByteStream, StorageError>;
-    /// Deletes one remote message.
-    async fn delete_remote(&self, msg_id: i32) -> Result<(), StorageError>;
+    /// Deletes the remote object `handle` refers to (Batch B3a / K3: the
+    /// whole handle instead of a bare msg_id — path-addressed backends
+    /// (local) delete by path, fs_id backends (baidu) need id + path;
+    /// id-keyed backends delete the handle's messages). Production flows
+    /// keep remote objects on VFS delete (Python parity), so the only
+    /// callers are trait contracts/tests today; B3b wiring (local/baidu)
+    /// consumes the handle shape.
+    async fn delete_remote(&self, handle: &RemoteHandle) -> Result<(), StorageError>;
     /// 能力位声明（R4：必须诚实——与 StorageDriver 同一要求）。
     fn capabilities(&self) -> Capabilities;
     /// 探测入站能力（默认无）。返回的借用与 `self` 同生命周期；

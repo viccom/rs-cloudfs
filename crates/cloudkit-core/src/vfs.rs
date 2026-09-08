@@ -217,17 +217,6 @@ fn hydrate_v2(password: &str, staged: &Path, local: &Path) -> Result<(), VfsErro
     }
 }
 
-/// Narrows an i64 metadata message id to the transport's i32; an id that
-/// does not fit is corrupt metadata, surfaced as a transport error
-/// (mapped `Remote` → `Unavailable`, message payload preserved).
-fn narrow_msg_id(id: i64) -> Result<i32, VfsError> {
-    i32::try_from(id).map_err(|_| {
-        VfsError::Transport(StorageError::Unavailable(format!(
-            "message id {id} does not fit an i32"
-        )))
-    })
-}
-
 /// Maps queue-handle errors onto the facade's error surface.
 fn map_queue_error(error: QueueError) -> VfsError {
     match error {
@@ -449,6 +438,8 @@ impl Vfs {
 
         // Remote handle: per-chunk rows first (already index-ordered),
         // else the row's chunk-0 msg id covers single-chunk files.
+        // Ids are i64 end-to-end since Batch B3a (K1) — the DB column
+        // and the transport seam speak the same width, no narrowing.
         let chunks = self.db.get_chunks_by_file_id(row.id)?;
         let mut msg_ids = Vec::with_capacity(chunks.len());
         for chunk in &chunks {
@@ -458,15 +449,15 @@ impl Vfs {
                     chunk.chunk_index, row.rel_path
                 )))
             })?;
-            msg_ids.push(narrow_msg_id(id)?);
+            msg_ids.push(id);
         }
         if msg_ids.is_empty() {
-            msg_ids.push(narrow_msg_id(
+            msg_ids.push(
                 // Pending upload whose local copy vanished: the bytes
                 // live neither locally nor remotely.
                 row.telegram_msg_id
                     .ok_or_else(|| VfsError::NotFound(row.rel_path.clone()))?,
-            )?);
+            );
         }
         // Non-empty by construction: chunk rows yielded ids, or the
         // fallback above pushed one (else we already returned).
@@ -521,6 +512,10 @@ impl Vfs {
             } else {
                 row.size.max(0) as u64
             },
+            // K2: the hydrate site owns the row's rel_path, so the
+            // handle carries it — a path-addressed backend (local) can
+            // locate the object by it; id-keyed backends ignore it.
+            path: Some(rel.clone()),
         };
         let staged = tmp_sibling(&local);
         if let Some(parent) = local.parent() {
@@ -674,7 +669,8 @@ impl Vfs {
             mtime: now,
             sha256: None,
             is_dir: false,
-            telegram_msg_id: Some(i64::from(msg_id)),
+            // K1: the handle's id is already the DB's i64 width.
+            telegram_msg_id: Some(msg_id),
             is_uploaded: true,
             is_cached: false,
             is_encrypted: false,

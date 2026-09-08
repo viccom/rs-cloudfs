@@ -40,7 +40,7 @@ impl CloudTransport for DefaultFaceTransport {
     ) -> Result<ByteStream, StorageError> {
         Err(StorageError::Unsupported)
     }
-    async fn delete_remote(&self, _msg_id: i32) -> Result<(), StorageError> {
+    async fn delete_remote(&self, _handle: &RemoteHandle) -> Result<(), StorageError> {
         Ok(())
     }
     fn capabilities(&self) -> Capabilities {

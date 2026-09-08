@@ -106,7 +106,7 @@ fn remote_bytes(db: &MetaDatabase, mock: &MockTransport, rel: &str) -> Vec<u8> {
     chunks
         .iter()
         .flat_map(|c| {
-            mock.message(i32::try_from(c.telegram_msg_id.expect("msg id")).expect("narrow"))
+            mock.message(c.telegram_msg_id.expect("msg id"))
                 .expect("stored chunk")
         })
         .collect()
@@ -254,7 +254,7 @@ async fn gcm_row_hydrates_through_the_frozen_v1_path_under_a_v2_config() {
         })
         .await
         .expect("seed upload");
-    let msg_id = i64::from(receipt.first_msg_id);
+    let msg_id = receipt.first_msg_id;
 
     db.upsert_file_scheme(
         &FileUpsert {

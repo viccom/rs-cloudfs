@@ -708,8 +708,7 @@ async fn encrypted_upload_stores_decryptable_ciphertext() {
     let chunks = db.get_chunks_by_file_id(row.id).expect("read chunks");
     let mut joined = Vec::new();
     for chunk in &chunks {
-        let id = i32::try_from(chunk.telegram_msg_id.expect("chunk msg id"))
-            .expect("msg id fits an i32");
+        let id = chunk.telegram_msg_id.expect("chunk msg id");
         joined.extend_from_slice(&mock.message(id).expect("stored remote message"));
     }
     assert_eq!(joined.len(), 49, "5 B plaintext + 44 B crypto overhead");
@@ -888,8 +887,11 @@ impl CloudTransport for DeleteOnUploadTransport {
         self.inner.open_range(file, off, len).await
     }
 
-    async fn delete_remote(&self, msg_id: i32) -> Result<(), StorageError> {
-        self.inner.delete_remote(msg_id).await
+    async fn delete_remote(
+        &self,
+        handle: &cloudkit_core::transport::RemoteHandle,
+    ) -> Result<(), StorageError> {
+        self.inner.delete_remote(handle).await
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -1034,8 +1036,11 @@ impl CloudTransport for BrokenSendTextTransport {
         self.inner.open_range(file, off, len).await
     }
 
-    async fn delete_remote(&self, msg_id: i32) -> Result<(), StorageError> {
-        self.inner.delete_remote(msg_id).await
+    async fn delete_remote(
+        &self,
+        handle: &cloudkit_core::transport::RemoteHandle,
+    ) -> Result<(), StorageError> {
+        self.inner.delete_remote(handle).await
     }
 
     fn capabilities(&self) -> Capabilities {

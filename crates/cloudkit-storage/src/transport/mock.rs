@@ -80,9 +80,9 @@ fn mock_default_capabilities() -> Capabilities {
 
 struct MockState {
     /// msg_id -> (stored bytes, remote document name, caption).
-    messages: BTreeMap<i32, (Vec<u8>, String, String)>,
+    messages: BTreeMap<i64, (Vec<u8>, String, String)>,
     /// Next msg_id to hand out; ids start at 1 (contract 5).
-    next_msg_id: i32,
+    next_msg_id: i64,
     /// Whether `connect()` has succeeded at least once.
     connected: bool,
     /// Scripted result of the first `connect()` call; `None` means Ok.
@@ -103,7 +103,7 @@ struct MockState {
     /// memory-granularity assertions.
     max_stream_frame: usize,
     /// msg_ids successfully deleted, in order.
-    deleted: Vec<i32>,
+    deleted: Vec<i64>,
     /// Artificial pre-stream delay injected by `open`/`open_range`
     /// (tests simulate a stalling remote); zero by default.
     open_delay: Duration,
@@ -151,7 +151,7 @@ impl MockTransport {
     }
 
     /// Stored bytes of the message `msg_id`, if present.
-    pub fn message(&self, msg_id: i32) -> Option<Vec<u8>> {
+    pub fn message(&self, msg_id: i64) -> Option<Vec<u8>> {
         self.lock()
             .ok()?
             .messages
@@ -210,7 +210,7 @@ impl MockTransport {
     }
 
     /// msg_ids successfully deleted, in order.
-    pub fn deleted(&self) -> Vec<i32> {
+    pub fn deleted(&self) -> Vec<i64> {
         self.lock()
             .map(|state| state.deleted.clone())
             .unwrap_or_default()
@@ -358,18 +358,27 @@ impl CloudTransport for MockTransport {
         Ok(frame_stream(vec![Ok(Bytes::from(data))]))
     }
 
-    async fn delete_remote(&self, msg_id: i32) -> Result<(), StorageError> {
+    /// Deletes every message the handle refers to (K3: the handle's ids,
+    /// in order — `path` is ignored, the mock is id-keyed). Any unknown
+    /// id fails the whole call with [`StorageError::NotFound`] before
+    /// anything is removed (all-or-nothing, mirroring the pre-K3 single
+    /// -message semantics for the single-chunk handles every existing
+    /// test uses).
+    async fn delete_remote(&self, handle: &RemoteHandle) -> Result<(), StorageError> {
         let mut state = self.lock()?;
         if !state.connected {
             return Err(StorageError::Invalid);
         }
-        match state.messages.remove(&msg_id) {
-            Some(_) => {
-                state.deleted.push(msg_id);
-                Ok(())
+        for msg_id in &handle.chunk_msg_ids {
+            if !state.messages.contains_key(msg_id) {
+                return Err(StorageError::NotFound);
             }
-            None => Err(StorageError::NotFound),
         }
+        for msg_id in &handle.chunk_msg_ids {
+            state.messages.remove(msg_id);
+            state.deleted.push(*msg_id);
+        }
+        Ok(())
     }
 
     /// The declared bits come from the (builder-overridable) state; the
@@ -485,7 +494,7 @@ fn store_chunks(
     data: &[u8],
     total_chunks: usize,
     count: usize,
-) -> Vec<i32> {
+) -> Vec<i64> {
     // Naming source is the virtual path's full basename (extension
     // included), mirroring the Python baseline (telegram_client.py:155).
     let file_name = job.rel_path.name();
@@ -522,7 +531,7 @@ fn store_chunks(
 
 /// Concatenates the stored bytes of `chunk_msg_ids` in order; an unknown
 /// id fails with `NotFound`.
-fn concat_chunks(state: &MockState, chunk_msg_ids: &[i32]) -> Result<Vec<u8>, StorageError> {
+fn concat_chunks(state: &MockState, chunk_msg_ids: &[i64]) -> Result<Vec<u8>, StorageError> {
     let mut data = Vec::new();
     for &msg_id in chunk_msg_ids {
         match state.messages.get(&msg_id) {

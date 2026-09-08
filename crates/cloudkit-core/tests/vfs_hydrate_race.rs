@@ -80,8 +80,8 @@ impl CloudTransport for StallingOpenTransport {
         self.inner.open_range(file, off, len).await
     }
 
-    async fn delete_remote(&self, msg_id: i32) -> Result<(), StorageError> {
-        self.inner.delete_remote(msg_id).await
+    async fn delete_remote(&self, handle: &RemoteHandle) -> Result<(), StorageError> {
+        self.inner.delete_remote(handle).await
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -116,7 +116,7 @@ async fn seed_uploaded_uncached(db: &MetaDatabase, mock: &Arc<MockTransport>) {
             mtime: 1_700_000_000.0,
             sha256: None,
             is_dir: false,
-            telegram_msg_id: Some(i64::from(receipt.first_msg_id)),
+            telegram_msg_id: Some(receipt.first_msg_id),
             is_uploaded: true,
             is_cached: false,
             is_encrypted: false,
@@ -124,7 +124,7 @@ async fn seed_uploaded_uncached(db: &MetaDatabase, mock: &Arc<MockTransport>) {
             mime_type: None,
         })
         .expect("seed files row");
-    db.upsert_chunk(file_id, 0, i64::from(receipt.first_msg_id), 9, None)
+    db.upsert_chunk(file_id, 0, receipt.first_msg_id, 9, None)
         .expect("seed chunk row");
 }
 

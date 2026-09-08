@@ -188,6 +188,7 @@ async fn index_inbound_wakes_after_row_write() {
             first_msg_id: 5,
             chunk_msg_ids: vec![5],
             total_size: 10,
+            path: None,
         },
     })
     .await
