@@ -115,7 +115,9 @@ enum Command {
     /// the Windows WebClient registry/service state.
     Doctor,
     /// Interactive first-time configuration wizard (bot token, chat ID,
-    /// drive letter); secrets go to the OS credential store.
+    /// drive letter); secrets go to the OS credential store, or by
+    /// explicit choice into config.toml when no credential store is
+    /// available (headless).
     Setup,
 }
 
