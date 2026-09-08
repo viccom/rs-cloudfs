@@ -4,8 +4,9 @@
 //!
 //! The [`InMemorySyncServer`] mirrors the server semantics: push assigns
 //! `++counter` per row and upserts, pull returns rows with
-//! `version > since`. Two throwaway databases then exercise the full
-//! pull → apply → diff → push cycle:
+//! `version > since` in version-ascending order (the store's
+//! `ORDER BY version ASC`). Two throwaway databases then exercise the
+//! full pull → apply → diff → push cycle:
 //!
 //! - A seeds data (directory, multi-chunk file, single-chunk file,
 //!   pending row without local bytes) and syncs;
@@ -104,7 +105,10 @@ impl SyncClient for InMemorySyncServer {
                 payload: stored.payload.clone(),
             })
             .collect();
-        rows.sort_by(|a, b| a.rel_path.cmp(&b.rel_path).then(a.version.cmp(&b.version)));
+        // Mirror the real server's wire behavior (`ORDER BY version ASC`
+        // in the sync-server store): pull answers in global version
+        // order, so ordering-dependent consumer bugs surface here too.
+        rows.sort_by_key(|row| row.version);
         Ok(SyncPullResult {
             rows,
             max_version: inner.counter,
@@ -213,6 +217,43 @@ fn mirror_hashes(db: &MetaDatabase) -> Vec<(String, String)> {
 }
 
 // --------------------------------------------------------------- tests ---
+
+/// The simulator must mirror the real server's wire behavior
+/// (`cloudkit-sync-server` store: `ORDER BY version ASC`): pull answers
+/// in global version order, never by `rel_path` — an ordering-dependent
+/// consumer bug would otherwise be masked by the test infrastructure
+/// itself.
+#[tokio::test]
+async fn simulator_pull_orders_rows_by_version_ascending() {
+    let server = InMemorySyncServer::new();
+    // Push "b" first (version 1), then "a" (version 2): a rel_path-first
+    // sort would answer [a(2), b(1)]; the wire order is [b(1), a(2)].
+    let row = |rel_path: &str| SyncRowUpdate {
+        rel_path: rel_path.to_string(),
+        deleted: false,
+        payload: "{}".to_string(),
+    };
+    server
+        .push("ns", None, &[row("b.txt")])
+        .await
+        .expect("push b");
+    server
+        .push("ns", None, &[row("a.txt")])
+        .await
+        .expect("push a");
+
+    let pulled = server.pull("ns", None, 0).await.expect("pull");
+    let order: Vec<(&str, i64)> = pulled
+        .rows
+        .iter()
+        .map(|row| (row.rel_path.as_str(), row.version))
+        .collect();
+    assert_eq!(
+        order,
+        vec![("b.txt", 1), ("a.txt", 2)],
+        "pull rows must arrive in version ASC order like the real server"
+    );
+}
 
 #[tokio::test]
 async fn sync_once_on_fresh_instance_and_empty_server_is_all_zero() {
