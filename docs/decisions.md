@@ -362,3 +362,10 @@
 - **工具配合**：spike 增 `BAIDU_SPIKE_REMOTE_DIR` env 覆盖（指定根不探测直接用）+ dlink TTL 探针预算 63→131 分钟（4c0e46b）。
 - **新根验证轮（2026-09-07，全部真实输出）**：token 直接可用（ls errno=0）；`/apps` 列 14 条目（privatefs 在列、只读）；`resume abort/continue` 在 `/apps/cloudfs-spike` 复现差集续传（[0,1,2]→只补 [3,4,5,6,7]，create errno=0，final_size_ok，uploadid 会话存活）；cleanup 远端剩余 0（xpan 删除进回收站 10 天保留，API 不可验证回收站——已知限制）；dlink TTL 上界长探针后台进行中（结果回填 spike 报告附录）。
 - **对 Phase 2 B 批的指导意义**：ck-baidu 的 E2E 测试根沿用「/apps 下专用子目录」模式；协议实现疑义先查 PCFS 源码再自行试验。
+
+## 2026-09-08 负责人裁决三项 + 两修复（KDF DoS / fixture 脚本）
+
+- **加密行 size 语义维持方案 B（负责人明示）**：行 size=明文长（Python 契约对齐），hydrate 加密行无界预算——tracker「方案 A 备选」销账；未来若需密文长语义须再走 R6 流程。
+- **KDF DoS 钳制（一类 #1 修复，红 2c6efc1 → 绿 9faad3e）**：v2 头 PBKDF2 迭代数上界 1M（默认 100k 的 10 倍，留演进余量），解析期拒绝超界头（Malformed，先于任何 KDF 工作）。契约变更：既有 bad_iters 断言由「燃烧后 AuthFailed」改为「解析期 Malformed」，新增 in-cap（200k）篡改腿保留 AAD/密钥绑定覆盖；aead_v2 套件 ~127s→13s（16.8M 伪造腿消失）。
+- **gen_compat_fixtures.py 输出路径修复（一类 #4，5a3a319）**：两 fixture 在 Phase 0+E 批已分家（crypto_vector.json→cloudkit-crypto、python_meta.sql→cloudkit-core），脚本仍写旧 cydrive-core 死路径；改双输出目录并真跑端到端验证（两文件落位正确、两消费套件对新输出全绿）。**发现并记录**：`adopts_python_generated_database` 钉死了抓取时的 created_at epoch——重新生成 fixture 必须同步改该断言（fixture 与断言按设计耦合，非缺陷）；本轮还原旧 fixture 零 churn。
+- 门禁：fmt/clippy 干净 + workspace 618 passed 0 failed（+1 新测试）；无 cfg 面改动，WSL 不适用。

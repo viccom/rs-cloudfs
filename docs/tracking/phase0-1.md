@@ -66,9 +66,9 @@ Batch P0 已收口；**Batch S（百度 spike）已收口（2026-09-07，止损�
 
 1. ~~baidu1.json 链失效需补发~~ **已销账（负责人 2026-09-07 裁决）**：instances 下授权即正式凭据；测试根 = /apps 下新建子目录（本轮 /apps/cloudfs-spike 已验证），privatefs 生产数据不触碰；协议疑义以 PCFS 源码为权威参照
 2. **并行会话异常**：16:18–16:39 与 16:50 前后两批非本会话派发的 commit（E-1/E-2 四连 + E-4 红 e7581c3）出现在 feat/phase0-1；经独立复核质量通过后采纳——若非负责人所为请告知（可 revert：23702ea/3e46ea8/19a2f2f/6eedb25/e7581c3）
-3. **加密行 size 语义备选（方案 A）**：现裁决 B（行 size=明文长，Python 对齐；hydrate 加密行无界预算）；若希望加密行 Content-Length=密文长需明示裁决（decisions E-5 条目）
-4. **KDF DoS 放大缓解**（E-2 遗留）：伪造头可放大 PBKDF2 工作量（候选：头内迭代上限/版本化）；forged_header 单测因此实跑 ~114s
-5. **gen_compat_fixtures.py 输出路径已断**（P0-A 发现）：仍指旧 crates/cydrive-core，修复时点待定
+3. ~~加密行 size 语义备选~~ **已销账（负责人 2026-09-08 明示维持方案 B）**：行 size=明文长；未来改密文长语义须再走 R6 流程
+4. ~~KDF DoS 放大~~ **已修复（2026-09-08，红 2c6efc1 → 绿 9faad3e）**：上界 1M 解析期拒绝；套件 ~127s→13s
+5. ~~gen_compat_fixtures.py 输出路径已断~~ **已修复（2026-09-08，5a3a319）**：双输出目录 + 端到端真跑验证；注意重生成 fixture 需同步改 database.rs 钉死的 created_at 断言（decisions 记录）
 6. **CI workflow 从未真实触发**（无 origin 远端）：首跑需校准（fetch-depth:0/双 OS bash 步骤）
 7. ~~dlink TTL 上界未测到~~ **已销账（2026-09-08 增补轮）**：≥96min 仍 206（预算封顶）；B2 缓存 TTL 建议上调至 60–90min（spike 报告附录 B）
 8. **限额/秒传结论仅对 PCFS 第三方 appkey 桶有效**：正式 appkey 到位后须复跑 spike qps/rapid 子命令（工具就位）
