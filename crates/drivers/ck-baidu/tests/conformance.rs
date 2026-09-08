@@ -133,6 +133,7 @@ async fn capabilities_are_the_declared_set() {
             change_feed: false,        // 无变更推送通道（拉取式后端）
             inbound: false,            // 无 bot 入站通道
             chat: false,               // 无对话通道
+            remote_delete: true,       // delete_remote 真删网盘对象（K4，B3b transport 面）
         }
     );
 }

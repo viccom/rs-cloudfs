@@ -107,6 +107,7 @@ fn capabilities_are_the_declared_set() {
             change_feed: false,        // 非云后端，无推送
             inbound: false,            // 无入站通道
             chat: false,               // 无对话通道
+            remote_delete: true,       // delete_remote 真删卷内文件（K4，B3b transport 面）
         }
     );
 }

@@ -194,6 +194,9 @@ impl StorageDriver for MockStorageDriver {
             change_feed: false,
             inbound: false,
             chat: false,
+            // K4：mock 无 CloudTransport 真删语义可声明（storage 面 delete
+            // 不在 transport 位语义内）——false。
+            remote_delete: false,
         }
     }
 

@@ -373,7 +373,7 @@ pub fn transport_capabilities_line(caps: &Capabilities) -> String {
     format!(
         "range_read={}, resume={}, multipart={}, server_side_move={}, \
          rapid_upload={}, authoritative_index={}, change_feed={}, \
-         inbound={}, chat={}",
+         inbound={}, chat={}, remote_delete={}",
         caps.range_read,
         caps.resume,
         caps.multipart,
@@ -382,7 +382,8 @@ pub fn transport_capabilities_line(caps: &Capabilities) -> String {
         caps.authoritative_index,
         caps.change_feed,
         caps.inbound,
-        caps.chat
+        caps.chat,
+        caps.remote_delete
     )
 }
 

@@ -89,6 +89,7 @@ fn mock_capabilities_are_the_declared_set() {
             change_feed: false,
             inbound: false,
             chat: false,
+            remote_delete: false,
         }
     );
 }

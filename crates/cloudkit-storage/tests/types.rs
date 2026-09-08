@@ -257,6 +257,7 @@ fn capabilities_default_is_none() {
     assert!(c.is_empty());
     assert!(!c.range_read && !c.resume && !c.multipart && !c.server_side_move);
     assert!(!c.rapid_upload && !c.authoritative_index && !c.change_feed && !c.inbound && !c.chat);
+    assert!(!c.remote_delete);
 }
 
 #[test]
@@ -271,6 +272,7 @@ fn capabilities_contains_is_reflexive_and_subset() {
         change_feed: true,
         inbound: true,
         chat: true,
+        remote_delete: true,
     };
     assert!(all_on.contains(&all_on), "自反");
     assert!(all_on.contains(&Capabilities::none()), "全集包含空集");

@@ -492,7 +492,10 @@ impl CloudTransport for GrammersTransport {
     ///   `server_side_move` (no rename primitive wired), `rapid_upload`
     ///   (no content-addressed upload), `authoritative_index` (Telegram
     ///   is a shadow index by design, foundation D4), `change_feed` (no
-    ///   push API consumed).
+    ///   push API consumed), `remote_delete` (K4/B3b: keep declared-off —
+    ///   `delete_remote` exists on this transport but production keeps
+    ///   remote objects on VFS delete per Python parity, so the consumer
+    ///   gate must see false; zero behavior change).
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             range_read: true,

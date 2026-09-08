@@ -346,6 +346,10 @@ impl StorageDriver for BaiduDriver {
             inbound: false,
             // 无对话通道。
             chat: false,
+            // K4（B3b transport 面）：delete_remote 经本驱动 delete 真删
+            // 网盘对象（fs_id 解析 + filemanager delete，transport_face.rs
+            // 薄壳委派）；StorageDriver.delete 的真删语义不变。
+            remote_delete: true,
         }
     }
 
