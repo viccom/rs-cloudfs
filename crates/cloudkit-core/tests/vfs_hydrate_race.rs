@@ -21,8 +21,7 @@ use cloudkit_core::database::{FileUpsert, MetaDatabase};
 use cloudkit_core::rel_path::RelPath;
 use cloudkit_core::transport::mock::MockTransport;
 use cloudkit_core::transport::{
-    ByteStream, Capabilities, CloudTransport, RemoteHandle, StorageError, UploadJob,
-    UploadReceipt,
+    ByteStream, Capabilities, CloudTransport, RemoteHandle, StorageError, UploadJob, UploadReceipt,
 };
 use cloudkit_core::upload_queue::RetryPolicy;
 use cloudkit_core::vfs::{Vfs, VfsConfig};
@@ -158,7 +157,10 @@ async fn hydrate_concurrent_update_survives_flag_flip() {
     let hydrate_vfs = Arc::clone(&vfs);
     let hydrate_rel = rel.clone();
     let task = tokio::spawn(async move { hydrate_vfs.hydrate(&hydrate_rel).await });
-    entered_rx.recv().await.expect("hydrate parked inside open()");
+    entered_rx
+        .recv()
+        .await
+        .expect("hydrate parked inside open()");
 
     // Download window is open: a concurrent upsert overwrites the row's
     // metadata (PUT-overwrite shape — new size/mtime/msg id are all Some
@@ -189,7 +191,10 @@ async fn hydrate_concurrent_update_survives_flag_flip() {
         .expect("hydrate task joins")
         .expect("hydrate succeeds");
     let bytes = std::fs::read(&hydrated).expect("read hydrated copy");
-    assert_eq!(bytes, b"OLD-BYTES", "remote bytes served through the old handle");
+    assert_eq!(
+        bytes, b"OLD-BYTES",
+        "remote bytes served through the old handle"
+    );
     vfs.shutdown().await;
 
     // The row must be the concurrently-updated row plus is_cached=true —
@@ -209,5 +214,8 @@ async fn hydrate_concurrent_update_survives_flag_flip() {
         "concurrent mtime update survives the flag flip"
     );
     assert!(row.is_cached, "hydration still flips the cached flag");
-    assert!(row.is_uploaded, "upload state carried by the concurrent row");
+    assert!(
+        row.is_uploaded,
+        "upload state carried by the concurrent row"
+    );
 }

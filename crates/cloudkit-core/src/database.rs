@@ -557,6 +557,32 @@ impl MetaDatabase {
         Ok(id)
     }
 
+    /// Flips the `is_cached` flag of the row with primary key `id` and
+    /// touches NOTHING else — hydrate/eviction's cache-flag bookkeeping
+    /// (P3 snapshot write-back race fix: those paths used to rebuild the
+    /// whole row from a pre-download snapshot and upsert it back, which
+    /// resurrected any column concurrently updated inside the download
+    /// window — a PUT overwrite's new size/msg id, a sync-applied remote
+    /// version — and the stale values then spread via push; same shape
+    /// as E-4's frozen-contract-upsert + targeted-column-write split).
+    /// An affected-rows count of 0 means the row vanished mid-operation
+    /// (e.g. a concurrent delete) — a benign no-op, surfaced as `Ok`.
+    ///
+    /// Like every `is_cached`-only write the caller wraps the call in
+    /// [`MetaDatabase::suppress_files_hook`]: the flag is local state the
+    /// sync payload excludes, so the files-table doorbell stays silent.
+    pub fn set_cached_flag(&self, id: i64, is_cached: bool) -> Result<(), DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "UPDATE files SET is_cached = ?1 WHERE id = ?2",
+            params![is_cached as i64, id],
+        )?;
+        Ok(())
+    }
+
     /// Looks up a single row by its unique virtual path.
     pub fn get_file(&self, rel_path: &str) -> Result<Option<FileRecord>, DbError> {
         let conn = self

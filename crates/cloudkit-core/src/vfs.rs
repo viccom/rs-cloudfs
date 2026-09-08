@@ -15,7 +15,7 @@ use tokio::sync::Notify;
 
 use crate::cache::CacheManager;
 use crate::crypto::{self, CryptoError};
-use crate::database::{DbError, FileRecord, FileUpsert, MetaDatabase};
+use crate::database::{DbError, FileUpsert, MetaDatabase};
 use crate::rel_path::RelPath;
 use crate::transport::{CloudTransport, InboundFile, RemoteHandle, StorageError, UploadJob};
 use crate::upload_queue::{
@@ -214,26 +214,6 @@ fn hydrate_v2(password: &str, staged: &Path, local: &Path) -> Result<(), VfsErro
             let _ = std::fs::remove_file(&dec);
             Err(error.into())
         }
-    }
-}
-
-/// Rebuilds the upsert of `row` with `is_cached` flipped and every other
-/// field carried over verbatim (used by hydration and by eviction).
-fn cached_upsert(row: &FileRecord, is_cached: bool) -> FileUpsert {
-    FileUpsert {
-        rel_path: row.rel_path.clone(),
-        name: row.name.clone(),
-        parent_dir: row.parent_dir.clone(),
-        size: row.size,
-        mtime: row.mtime,
-        sha256: row.sha256.clone(),
-        is_dir: row.is_dir,
-        telegram_msg_id: row.telegram_msg_id,
-        is_uploaded: row.is_uploaded,
-        is_cached,
-        is_encrypted: row.is_encrypted,
-        chunk_count: row.chunk_count,
-        mime_type: row.mime_type.clone(),
     }
 }
 
@@ -455,11 +435,13 @@ impl Vfs {
         // 0-byte rows have no remote bytes; materialize an empty copy.
         if row.size == 0 {
             write_atomic(&local, &[])?;
-            // is_cached-only flip — local flag the sync payload excludes,
-            // so the doorbell stays silent for it.
+            // is_cached-only flip — targeted column write, never a
+            // whole-row upsert of the stale snapshot (P3 race); the
+            // local flag is sync-payload-excluded, so the doorbell
+            // stays silent for it.
             {
                 let _quiet = self.db.suppress_files_hook();
-                self.db.upsert_file(&cached_upsert(&row, true))?;
+                self.db.set_cached_flag(row.id, true)?;
             }
             self.cache.record_access(rel);
             return Ok(local);
@@ -494,10 +476,12 @@ impl Vfs {
         // except the cached flag.
         for victim in self.cache.evict_lru(row.size.max(0) as u64)? {
             if let Some(victim_row) = self.db.get_file(victim.as_str())? {
-                // is_cached-only flip — local flag the sync payload
-                // excludes, so the doorbell stays silent for it.
+                // is_cached-only flip — targeted column write, never a
+                // whole-row upsert of a possibly-stale snapshot (P3
+                // race); the local flag is sync-payload-excluded, so
+                // the doorbell stays silent for it.
                 let _quiet = self.db.suppress_files_hook();
-                self.db.upsert_file(&cached_upsert(&victim_row, false))?;
+                self.db.set_cached_flag(victim_row.id, false)?;
             }
         }
 
@@ -597,12 +581,15 @@ impl Vfs {
                 std::fs::rename(&staged, &local)?;
             }
 
-            // is_cached-only flip — local flag the sync payload excludes,
+            // is_cached-only flip — targeted column write, never a
+            // whole-row upsert of the pre-download snapshot (P3 race:
+            // the row may have been concurrently updated inside the
+            // download window); the local flag is sync-payload-excluded,
             // so the doorbell stays silent for it (the chokepoint hook
             // would otherwise ring for every hydration).
             {
                 let _quiet = self.db.suppress_files_hook();
-                self.db.upsert_file(&cached_upsert(&row, true))?;
+                self.db.set_cached_flag(row.id, true)?;
             }
             Ok(())
         };
