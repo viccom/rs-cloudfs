@@ -45,7 +45,10 @@
 //! Same family as v1 by default: PBKDF2-HMAC-SHA256, 100 000 iterations
 //! ([`crate::v1::PBKDF2_ITERATIONS`]), fresh 16-byte salt per encryption.
 //! Unlike v1 (hardcoded, frozen), the iteration count travels in the
-//! header so the KDF can evolve without a format break. Cross-format key
+//! header so the KDF can evolve without a format break — bounded by
+//! [`MAX_HEADER_ITERATIONS`] so an untrusted header cannot amplify the
+//! KDF cost (forged headers above the cap are rejected at parse, before
+//! any PBKDF2 work; owner fix directive 2026-09-08). Cross-format key
 //! and nonce collisions are negligible: keys coincide only on a 2^-128
 //! salt collision between containers.
 //!
@@ -88,6 +91,12 @@ pub const TAG_SIZE: usize = 16;
 pub const MAGIC: [u8; 8] = *b"CKCRYPT2";
 /// Current container format version byte.
 pub const VERSION: u8 = 0x01;
+/// Largest PBKDF2 iteration count accepted from an untrusted header
+/// (guardrail: caps forged-header KDF amplification at 10x the default
+/// [`crate::v1::PBKDF2_ITERATIONS`] cost while leaving the in-header KDF
+/// room to evolve; headers above it are `Malformed` before any PBKDF2
+/// work runs).
+pub const MAX_HEADER_ITERATIONS: u32 = 1_000_000;
 /// Chunk counter capacity of the nonce layout (2^56 chunks).
 const MAX_CHUNKS: u64 = 1 << 56;
 
@@ -127,7 +136,9 @@ impl Header {
             return Err(CryptoError::Malformed);
         }
         let iterations = u32::from_be_bytes(ciphertext[26..30].try_into().unwrap());
-        if iterations == 0 {
+        if iterations == 0 || iterations > MAX_HEADER_ITERATIONS {
+            // Untrusted input: reject the KDF-DoS amplification range
+            // structurally, before any PBKDF2 work.
             return Err(CryptoError::Malformed);
         }
         let chunk_size = u32::from_be_bytes(ciphertext[30..34].try_into().unwrap()) as usize;

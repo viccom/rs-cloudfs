@@ -207,11 +207,24 @@ fn forged_header_fields_are_rejected() {
         Err(CryptoError::AuthFailed)
     ));
 
-    // Iteration count is bound by AAD (and changes the key): rejected.
+    // Iteration count: structurally out-of-cap values are rejected at
+    // parse (KDF-DoS clamp) — flipping the MSB lands at ~16.8M, far above
+    // MAX_HEADER_ITERATIONS, so this is Malformed before any PBKDF2 work
+    // (pre-clamp behavior: AuthFailed after the amplified burn; changed
+    // under the 2026-09-08 owner fix directive).
     let mut bad_iters = ct.clone();
     bad_iters[26] ^= 0x01;
     assert!(matches!(
         scheme_small().decrypt(PW, &bad_iters),
+        Err(CryptoError::Malformed)
+    ));
+
+    // Iteration count within the cap but different from what was used:
+    // bound by AAD and key derivation, rejected at authentication.
+    let mut in_cap_iters = ct.clone();
+    in_cap_iters[26..30].copy_from_slice(&200_000u32.to_be_bytes());
+    assert!(matches!(
+        scheme_small().decrypt(PW, &in_cap_iters),
         Err(CryptoError::AuthFailed)
     ));
 
