@@ -257,6 +257,36 @@ pub struct SyncOutcome {
 /// implementation over the `cloudkit-sync-server` wire protocol; core must not
 /// depend on that crate, so both sides speak the types above and the CLI
 /// maps them.
+///
+/// # Contract
+///
+/// (docs/standards/interfaces.md §1: semantics, errors, concurrency,
+/// lifecycle.)
+///
+/// * Semantics — [`push`](SyncClient::push) upserts whole rows into the
+///   namespace (last write wins, tombstones overwrite) and returns the
+///   server's maximum version after the batch; [`pull`](SyncClient::pull)
+///   returns every row with `version > since` plus the server's current
+///   maximum version. Pull answers in version-ascending order — the
+///   store's `ORDER BY version ASC`, the natural apply order.
+/// * Errors — every transport-level failure (unreachable server,
+///   timeout, non-2xx answer, undecodable response) surfaces as
+///   [`SyncError::Client`] carrying a human-readable chain. A server
+///   that rejects the request — including the shared-secret gate's
+///   403, which hits push and pull alike — is reported through the
+///   same variant, naming the HTTP status and a truncated error body;
+///   no failure is silently swallowed. The trait performs no retry of
+///   its own.
+/// * Concurrency — methods take `&self` and implementations are
+///   `Send + Sync`, so concurrent calls on one client are allowed. The
+///   engine itself drives one pass at a time (pull, then push) and
+///   relies on that serialization, not on client-side locking.
+/// * Lifecycle — the implementation owns its connections (pooling,
+///   keep-alive) and needs no connect/disconnect on this seam; dropping
+///   the client releases everything. Recovering from a failed pass is
+///   the caller's business: the periodic task simply runs the next
+///   pass, a manual `cydrive sync` surfaces the error and exits
+///   non-zero.
 #[async_trait]
 pub trait SyncClient: Send + Sync {
     /// Pushes `rows` into the namespace `key` (registering the namespace
@@ -270,8 +300,9 @@ pub trait SyncClient: Send + Sync {
         rows: &[SyncRowUpdate],
     ) -> Result<i64, SyncError>;
 
-    /// Returns every row of the namespace with `version > since`, plus
-    /// the server's current maximum version. `secret` is the optional
+    /// Returns every row of the namespace with `version > since` — in
+    /// version-ascending order, the natural apply order — plus the
+    /// server's current maximum version. `secret` is the optional
     /// family-level gate — servers configured with a shared secret
     /// reject a pull that does not carry it, so it must ride along on
     /// the pull exactly like on the push.
