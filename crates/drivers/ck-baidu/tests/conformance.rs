@@ -110,3 +110,29 @@ impl ConformanceHarness for BaiduHarness {
 }
 
 cloudkit_storage::conformance_suite!(BaiduHarness::new().await);
+
+/// 能力声明静态锁（R4 诚实性；B2 绿阶段新增——ck-local 先例）：九位
+/// 精确值钉死，防未来漂移。动态验证由 `conformance_suite_offline` 全套
+/// 跑通承担（⑦ RESUME 由 `resume` 位门控启用）。
+#[tokio::test]
+async fn capabilities_are_the_declared_set() {
+    let (mock, _base) = common::MockBaidu::start().await;
+    mock.seed_dir(common::MOCK_ROOT);
+    let driver = factory(&mock.params(None))
+        .await
+        .expect("baidu driver connect");
+    assert_eq!(
+        driver.capabilities(),
+        cloudkit_storage::Capabilities {
+            range_read: true,          // 断言②全套（4MiB 有界窗口拼接）
+            resume: true,              // 断言⑦（K7 差集会话表 + 位图复用）
+            multipart: true,           // superfile2 4MiB 分片后端原生分块
+            server_side_move: true,    // filemanager move 单侧搬移（断言⑥）
+            rapid_upload: true,        // return_type=2 路径（不依赖——spike §4）
+            authoritative_index: true, // list 即网盘真相（断言③）
+            change_feed: false,        // 无变更推送通道（拉取式后端）
+            inbound: false,            // 无 bot 入站通道
+            chat: false,               // 无对话通道
+        }
+    );
+}

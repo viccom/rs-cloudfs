@@ -22,8 +22,9 @@
 //! `server_mtime`——**mtime 读 `server_mtime`**（PCFS api.go:85-87/162-164；
 //! 两源均无 local_mtime）。
 //!
-//! B2 占位（本批不实现）：precreate / superfile2 / create（文件）/ dlink
-//! ——形态见计划 §4 与上表 spike 源码行号。
+//! B2 已接线（本批）：precreate / superfile2（client.rs，PCS 域 error_code
+//! 族）/ create（文件）/ dlink（client.rs fetch_dlink）——三步曲编排在
+//! `upload.rs`、下载器在 `download.rs`；wire 形态见上表 spike 源码行号。
 //!
 //! ## errno → StorageError 映射表（R2 义务；mock 钉死）
 //!
@@ -60,9 +61,11 @@ const XPAN_NAS: &str = "/rest/2.0/xpan/nas";
 /// 后端条目原始形态（list/meta 响应项；字段名 = 后端 JSON 原名，全部
 /// `default`——后端对目录省略 size/md5 等字段是常态，spike RemoteEntry
 /// 同款防御）。
-#[allow(dead_code)]
-// md5/server_filename B2 消费（秒传探测/文件名对账）；
-// 其余字段 B1 元数据面已读取——结构体整体保留 allow 至 B2 点亮。
+///
+/// 未建模 `md5`/`server_filename`：B2 复核结论——服务端 `md5` 字段非字面
+/// MD5 而是内容 id（spike §3 结论 4，比对无意义），秒传探测走 precreate
+/// return_type 响应而非该字段；文件名可由 path 尾段派生（驱动内不需要
+/// 独立字段）。serde 对未知 JSON 字段默认忽略，省略不影响解析。
 #[derive(Debug, Clone, Default, Deserialize)]
 pub(crate) struct RemoteEntry {
     #[serde(default)]
@@ -70,13 +73,9 @@ pub(crate) struct RemoteEntry {
     #[serde(default)]
     pub(crate) path: String,
     #[serde(default)]
-    pub(crate) server_filename: String,
-    #[serde(default)]
     pub(crate) size: i64,
     #[serde(default)]
     pub(crate) isdir: i64,
-    #[serde(default)]
-    pub(crate) md5: String,
     #[serde(default)]
     pub(crate) server_mtime: i64,
 }
@@ -247,4 +246,91 @@ pub(crate) async fn quota(client: &BaiduClient) -> Result<(i64, i64), StorageErr
     let used = v.get("used").and_then(Value::as_i64).unwrap_or(0);
     let total = v.get("total").and_then(Value::as_i64).unwrap_or(0);
     Ok((used, total))
+}
+
+/// precreate 响应（三步曲第一步；B2）。
+#[derive(Debug, Clone)]
+pub(crate) struct PrecreateOutcome {
+    /// 1 = 正常上传腿；2 = 秒传命中（fs_id 直接收尾，零 superfile2/create）。
+    pub(crate) return_type: i64,
+    pub(crate) uploadid: String,
+    /// 秒传腿的服务端对象句柄（正常腿为 0）。
+    pub(crate) fs_id: i64,
+}
+
+/// POST `method=precreate`——三步曲第一步（B2；wire 形态 = spike
+/// `api.rs:187-234` + PCFS api.go:488-493：query 恰 `method/access_token`
+/// 两参数，form 恰六字段 `path,size,isdir=0,autoinit=1,rtype,block_list`）。
+///
+/// - **rtype=3**（K10 覆盖语义——spike 用 1 是冲突重命名，本驱动明确改 3；
+///   真机复核归 `tests/real_machine.rs` rtype3 用例）；
+/// - `block_list` = 分片 md5 hex 的 JSON 数组字符串（空文件 `[]`）；
+/// - 响应 block_list（服务端仍需上传的分片索引）不消费：**重 precreate
+///   不是恢复手段**（spike §3.2 实证——同参重发返回新 uploadid + 全量
+///   列表），恢复只走 upload.rs 的旧 uploadid 探活差集腿。
+pub(crate) async fn precreate(
+    client: &BaiduClient,
+    path: &str,
+    size: u64,
+    block_md5: &[String],
+) -> Result<PrecreateOutcome, StorageError> {
+    let block_list = serde_json::to_string(block_md5)
+        .map_err(|e| StorageError::Io(format!("block_list serialize: {e}")))?;
+    let v = client
+        .api_post_form(
+            XPAN_FILE,
+            &[("method", "precreate")],
+            &[
+                ("path", path.to_string()),
+                ("size", size.to_string()),
+                ("isdir", "0".to_string()),
+                ("autoinit", "1".to_string()),
+                ("rtype", "3".to_string()),
+                ("block_list", block_list),
+            ],
+        )
+        .await?;
+    Ok(PrecreateOutcome {
+        return_type: v.get("return_type").and_then(Value::as_i64).unwrap_or(1),
+        uploadid: v
+            .get("uploadid")
+            .and_then(Value::as_str)
+            .unwrap_or("")
+            .to_string(),
+        fs_id: v.get("fs_id").and_then(Value::as_i64).unwrap_or(0),
+    })
+}
+
+/// POST `method=create`（isdir=0 文件腿）——三步曲收尾（B2；wire 形态 =
+/// spike `api.rs:332-370` + PCFS api.go:581-587：form 恰六字段
+/// `path,size,isdir=0,rtype,uploadid,block_list`；rtype=3 同 precreate）。
+///
+/// 返回新对象 fs_id（mock/服务端按会话校验分片齐全 + 逐片 md5，缺片
+/// errno=10 → 经映射表归一为 `Unavailable`）。
+pub(crate) async fn create_file(
+    client: &BaiduClient,
+    path: &str,
+    uploadid: &str,
+    size: u64,
+    block_md5: &[String],
+) -> Result<i64, StorageError> {
+    let block_list = serde_json::to_string(block_md5)
+        .map_err(|e| StorageError::Io(format!("block_list serialize: {e}")))?;
+    let v = client
+        .api_post_form(
+            XPAN_FILE,
+            &[("method", "create")],
+            &[
+                ("path", path.to_string()),
+                ("size", size.to_string()),
+                ("isdir", "0".to_string()),
+                ("rtype", "3".to_string()),
+                ("uploadid", uploadid.to_string()),
+                ("block_list", block_list),
+            ],
+        )
+        .await?;
+    v.get("fs_id")
+        .and_then(Value::as_i64)
+        .ok_or_else(|| StorageError::Unavailable("create response missing fs_id".into()))
 }

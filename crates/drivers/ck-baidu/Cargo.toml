@@ -27,14 +27,21 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "stream",
 ] }
+# ByteStream 产生侧（download.rs 的分片流实现 futures_core::Stream；
+# ck-telegram 同款形态）。
+futures-core = "0.3"
+# 分片净荷类型（superfile2 multipart part / 下载流帧；cloudkit-storage
+# ByteStream 同源 crate）。
+bytes = "1"
 # 载荷模型（derive 为响应/表单解析结构体备用，B1 绿阶段使用）。
 serde = { version = "1", features = ["derive"] }
 # api/client 层 JSON 载荷（reqwest json 特性同源；显式声明为直接依赖，
 # 计划 §3 五项依赖清单未列——响应解析必需，特此注明）。
 serde_json = "1"
 # token 状态 RwLock（spike Ctx.token 同款形态，刷新整体替换）；
-# time = K15 重试钩子的退避 sleep（client.rs）。
-tokio = { version = "1", features = ["sync", "time"] }
+# time = K15 重试钩子的退避 sleep（client.rs）；rt = B2 下载分片后台任务
+# （download.rs spawn）；fs = K7 会话表落盘（upload.rs 原子写）。
+tokio = { version = "1", features = ["sync", "time", "rt", "fs"] }
 
 [dev-dependencies]
 # mock baidu 内存后端（K16：axum 钉 0.8.9，cloudkit-sync-server 测试同款

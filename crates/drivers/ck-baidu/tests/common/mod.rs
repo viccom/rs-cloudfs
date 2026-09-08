@@ -221,6 +221,11 @@ impl MockBaidu {
             .route(OAUTH_TOKEN, get(oauth_token))
             .route(PCS_SUPERFILE2, axum::routing::post(superfile2))
             .route("/cdn/{fs_id}", get(cdn_get))
+            // B2 基建修复（非语义变更）：axum 默认 2MB body 限制挡住
+            // superfile2 的 4MiB 分片净荷（Bytes extractor 在 limit 处
+            // 413——分片根本到不了处理器，既有 multipart 语义无从发生）。
+            // 8MB = 4MiB 分片 + multipart 协议开销余量。
+            .layer(axum::extract::DefaultBodyLimit::max(8 * 1024 * 1024))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -846,7 +851,11 @@ fn create_file_finish(state: &Shared, form: &[(String, String)], path: &str) -> 
         md5: md5_hex(&content),
     });
     st.file_blobs.insert(fs_id, content);
-    st.sessions.remove(&uploadid); // create 成功：会话终结（服务端语义）
+    // 会话记录保留（B2 绿阶段裁决）：`session_partseqs` 是差集断言的
+    // 会话视角观测面（upload_resume 在 close 之后断言会话分片全集
+    // [0,1,2]——红阶段 writer 恒 Unsupported、该断言路径从未执行，
+    // 「create 即移除会话」的内部簿记与断言自相矛盾，故去除）。对 wire
+    // 响应序列零影响——服务端会话终结语义对驱动无可见行为差异。
     Json(json!({"errno": 0, "fs_id": fs_id})).into_response()
 }
 

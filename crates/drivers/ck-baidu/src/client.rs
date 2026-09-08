@@ -70,11 +70,14 @@ pub(crate) struct TokenPair {
 pub(crate) struct BaiduClient {
     /// pan/openapi API 面（redirect none + 60s 超时）。
     pub(crate) api: reqwest::Client,
-    /// CDN 流面（redirect none + 20s 连接超时）。
-    #[allow(dead_code)] // B1 一并构造（计划 §3）；B2 superfile2/下载路径消费后移除
+    /// CDN 流面（redirect none + 20s 连接超时；B2 superfile2 分片与
+    /// dlink/CDN 下载共用——spike Ctx.stream 同款双 client 形态）。
     pub(crate) stream: reqwest::Client,
     pub(crate) api_base: String,
     pub(crate) oauth_base: String,
+    /// superfile2 端点 base（PCS 域独立于 api_base；`BaiduParams::pcs_base`
+    /// 注入，缺省生产常量 `d.pcs.baidu.com`——测试经此指向 mock）。
+    pub(crate) pcs_base: String,
     pub(crate) app_key: String,
     pub(crate) app_secret: String,
     pub(crate) tokens: tokio::sync::RwLock<TokenPair>,
@@ -114,6 +117,10 @@ impl BaiduClient {
             stream,
             api_base: params.api_base.clone(),
             oauth_base: params.oauth_base.clone(),
+            pcs_base: params
+                .pcs_base
+                .clone()
+                .unwrap_or_else(|| crate::DEFAULT_PCS_BASE.to_string()),
             app_key: params.app_key.clone(),
             app_secret: params.app_secret.clone(),
             tokens: tokio::sync::RwLock::new(TokenPair {
@@ -147,6 +154,143 @@ impl BaiduClient {
     ) -> Result<Value, StorageError> {
         self.dispatch(&format!("{}{path}", self.api_base), true, query, Some(form))
             .await
+    }
+
+    /// POST `{pcs_base}/rest/2.0/pcs/superfile2`——分片上传（B2；wire 形态
+    /// = spike `api.rs:270-320`：query 恰六参数 + multipart 单 `file` part
+    /// （octet-stream），响应经 **error_code** 而非 errno 承载结果）。
+    ///
+    /// 策略：`error_code=110` 时刷新+重放一次（dispatch 同款自救——PCS
+    /// 域 token 语义与 xpan 一致）；其余非 0 经 [`crate::api::map_errno`]
+    /// 归一（探活语义「error_code≠0 = 会话死」由 upload.rs 消费 Err 判定）。
+    pub(crate) async fn superfile2(
+        &self,
+        pcs_base: &str,
+        path: &str,
+        uploadid: &str,
+        partseq: u64,
+        data: bytes::Bytes,
+    ) -> Result<(), StorageError> {
+        let url = format!("{pcs_base}/rest/2.0/pcs/superfile2");
+        let mut refreshed = false;
+        loop {
+            let token = self.tokens.read().await.access.clone();
+            // to_vec 拷贝：Part 要求 Cow 载荷且 loop 重放（110 自救）需
+            // data 可重复消费（Bytes 不可 Into<Cow>）。
+            let part = reqwest::multipart::Part::bytes(data.to_vec())
+                .file_name("file")
+                .mime_str("application/octet-stream")
+                .map_err(|e| StorageError::Io(format!("superfile2 part mime: {e}")))?;
+            let form = reqwest::multipart::Form::new().part("file", part);
+            let resp = self
+                .stream
+                .post(&url)
+                .query(&[
+                    ("method", "upload"),
+                    ("access_token", token.as_str()),
+                    ("path", path),
+                    ("type", "tmpfile"),
+                    ("uploadid", uploadid),
+                    ("partseq", partseq.to_string().as_str()),
+                ])
+                .multipart(form)
+                .send()
+                .await
+                .map_err(|e| {
+                    // without_url：PCS query 带 access_token（R3）。
+                    StorageError::Unavailable(format!("superfile2 transport: {}", e.without_url()))
+                })?;
+            let status = resp.status();
+            let body = resp.text().await.map_err(|e| {
+                StorageError::Unavailable(format!("superfile2 body read: {}", e.without_url()))
+            })?;
+            let v: Value = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(_) => {
+                    let snippet: String = body.chars().take(200).collect();
+                    let masked = snippet.replace(token.as_str(), &mask(&token));
+                    return Err(StorageError::Unavailable(format!(
+                        "superfile2 non-json (http {status}): {masked}"
+                    )));
+                }
+            };
+            let error_code = v.get("error_code").and_then(Value::as_i64).unwrap_or(0);
+            if error_code == 110 && !refreshed {
+                refreshed = true;
+                self.refresh_once(&token).await?;
+                continue; // 重放一次（loop 头重读 token）
+            }
+            if error_code != 0 {
+                let msg = v.get("error_msg").and_then(Value::as_str).unwrap_or("");
+                return Err(crate::api::map_errno(error_code, msg));
+            }
+            return Ok(());
+        }
+    }
+
+    /// GET `{api_base}/rest/2.0/xpan/file?method=download&access_token&path`
+    /// （恰三参数，spike `api.rs:377-409`）——**禁重定向**读 302 Location
+    /// 拿 dlink（B2 下载器入口）。
+    ///
+    /// 策略：110 刷新重放一次（dispatch 同款）；其余 errno 经映射表归一；
+    /// 非 302/301 的成功状态无 Location 可用 → `Unavailable`。
+    pub(crate) async fn fetch_dlink(&self, path: &str) -> Result<String, StorageError> {
+        let url = format!("{}/rest/2.0/xpan/file", self.api_base);
+        let mut refreshed = false;
+        loop {
+            let token = self.tokens.read().await.access.clone();
+            let resp = self
+                .api
+                .get(&url)
+                .query(&[
+                    ("method", "download"),
+                    ("access_token", token.as_str()),
+                    ("path", path),
+                ])
+                .send()
+                .await
+                .map_err(|e| {
+                    StorageError::Unavailable(format!("dlink transport: {}", e.without_url()))
+                })?;
+            let status = resp.status();
+            if status == reqwest::StatusCode::FOUND
+                || status == reqwest::StatusCode::MOVED_PERMANENTLY
+            {
+                return resp
+                    .headers()
+                    .get(reqwest::header::LOCATION)
+                    .and_then(|v| v.to_str().ok())
+                    .map(str::to_string)
+                    .ok_or_else(|| StorageError::Unavailable("dlink 302 missing Location".into()));
+            }
+            let body = resp.text().await.map_err(|e| {
+                StorageError::Unavailable(format!("dlink body read: {}", e.without_url()))
+            })?;
+            let v: Value = match serde_json::from_str(&body) {
+                Ok(v) => v,
+                Err(_) => {
+                    let snippet: String = body.chars().take(200).collect();
+                    let masked = snippet.replace(token.as_str(), &mask(&token));
+                    return Err(StorageError::Unavailable(format!(
+                        "dlink non-json (http {status}): {masked}"
+                    )));
+                }
+            };
+            let errno = v.get("errno").and_then(Value::as_i64).unwrap_or(0);
+            if errno == 110 && !refreshed {
+                refreshed = true;
+                self.refresh_once(&token).await?;
+                continue;
+            }
+            if errno != 0 {
+                let errmsg = v.get("errmsg").and_then(Value::as_str).unwrap_or("");
+                return Err(crate::api::map_errno(errno, errmsg));
+            }
+            // errno=0 但非 302：协议异常（spike 实抓 dlink 签发恒 302）。
+            return Err(StorageError::Unavailable(format!(
+                "dlink unexpected http {status} with errno=0"
+            )));
+        }
     }
 
     /// 统一请求策略引擎（K13/K15；每逻辑调用至多 1 次刷新 + 1 次退避重试）。

@@ -1,13 +1,13 @@
-//! # ck-baidu——百度网盘驱动（L2 驱动 crate，Phase 2 Batch B1）
+//! # ck-baidu——百度网盘驱动（L2 驱动 crate，Phase 2 Batch B1+B2）
 //!
-//! B1 范围：crate 骨架、oauth 刷新状态机（K13）、HTTP client（spike
+//! B1（已交付）：crate 骨架、oauth 刷新状态机（K13）、HTTP client（spike
 //! `examples/baidu_spike` 改造复用）、errno 映射表（mock 钉死）与
 //! StorageDriver **元数据面**（list/stat/mkdir/delete/rename/quota）。
 //!
-//! B2 进行中（红阶段已立测试契约）：writer 接三步曲上传（precreate
-//! rtype=3 / superfile2 4MiB 分片 / create + K7 差集续传会话）、reader 接
-//! 下载器（dlink 缓存 K8 + 4MiB 有界 Range）；当前 writer/reader 仍为
-//! `Unsupported` 占位。
+//! B2（本批）：writer 接三步曲上传（precreate rtype=3 / superfile2 4MiB
+//! 分片串行落定 / create + K7 差集续传会话表，`upload.rs`）、reader 接
+//! 下载器（dlink 缓存 K8 + 4MiB 有界 Range 分片流 K9 + 403 两段
+//! fallback，`download.rs`）、conformance 八断言全绿 + 能力位六位点亮。
 //!
 //! 卷身份：`baidu:<uid>`（uinfo 取 uid，K5）；句柄 = fs_id 十进制字符串
 //! （跨 rename 稳定，PCFS api.go:170-171 先例）。
@@ -20,8 +20,10 @@
 
 mod api;
 mod client;
+mod download;
 mod driver;
 mod oauth;
+mod upload;
 
 use std::path::PathBuf;
 use std::sync::Arc;
