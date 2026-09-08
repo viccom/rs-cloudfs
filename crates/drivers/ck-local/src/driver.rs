@@ -151,6 +151,12 @@ impl LocalDriver {
         })
     }
 
+    /// 规范化卷根绝对路径（transport 面 connect 探针的落点；pub(crate)，
+    /// B3b）。
+    pub(crate) fn root_path(&self) -> &std::path::Path {
+        &self.root
+    }
+
     /// RelPath → 卷内绝对路径（组件逐一拼接）。
     ///
     /// 路径安全：组件已过词汇层校验（无 `/`、无 `..`、无 `\`、非空），
