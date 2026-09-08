@@ -1,9 +1,8 @@
 //! ck-local conformance 套件接入（interfaces §6 / foundation D9）。
 //!
-//! Batch L 红阶段：被测对象是 Unsupported 占位骨架，预期
-//! `conformance_suite_offline` 在断言①（mkdir/上传往返）红——红证据归档
-//! 于红 commit；绿阶段（Batch L 实现批）①–⑥⑧ 转绿、⑦ RESUME 未声明
-//! 由能力位门控自动跳过。
+//! Batch L：被测对象是全量实现驱动，`conformance_suite_offline` 跑
+//! 断言①–⑥⑧（绿 commit 归档输出尾部）；⑦ RESUME 未声明由能力位门控
+//! 自动跳过。
 //!
 //! local 后端形态声明：无远端、无后端错误码 → 断言⑤空表（interfaces
 //! §6：仅 local 类允许）；`delete_missing`/`empty_range` 按 OS 文件系统
@@ -12,7 +11,7 @@
 use async_trait::async_trait;
 use ck_local::{factory, LocalDriver, LocalParams};
 use cloudkit_storage::conformance::ConformanceHarness;
-use cloudkit_storage::StorageDriver;
+use cloudkit_storage::{Capabilities, StorageDriver};
 
 /// 无分块驱动：chunk 边界报 1（ConformanceHarness::chunk_size 契约）。
 const CHUNK: u64 = 1;
@@ -60,8 +59,7 @@ impl ConformanceHarness for LocalHarness {
 cloudkit_storage::conformance_suite!(LocalHarness::new());
 
 /// 工厂冒烟：async 装配入口可用，卷形态 `local:<规范化根路径>`。
-/// 不断言 capabilities 具体值——绿阶段能力位逐位点开后该断言必漂移，
-/// 能力声明形态断言归绿阶段测试。
+/// 不断言 capabilities 具体值——能力声明形态断言归下方独立测试。
 #[tokio::test]
 async fn factory_bootstraps_local_volume() {
     let root = tempfile::tempdir().expect("创建临时根目录失败");
@@ -72,4 +70,28 @@ async fn factory_bootstraps_local_volume() {
     .expect("factory 构造失败");
     assert_eq!(driver.volume().scheme(), "local");
     assert!(!driver.volume().key().is_empty());
+}
+
+/// 能力声明静态锁（R4 诚实性）：九位精确值钉死，防未来漂移（先例：
+/// cloudkit-storage tests/conformance_mock.rs
+/// `mock_capabilities_are_the_declared_set`）。动态验证由
+/// `conformance_suite_offline` 全套跑通承担。
+#[test]
+fn capabilities_are_the_declared_set() {
+    let root = tempfile::tempdir().expect("创建临时根目录失败");
+    let driver = LocalDriver::new(root.path().to_path_buf()).expect("LocalDriver 构造失败");
+    assert_eq!(
+        driver.capabilities(),
+        Capabilities {
+            range_read: true,          // 断言②全套绿（半开/钳制/空窗口/start>=size 空流）
+            resume: false,             // 暂存不跨 stager 生命周期复活，无差集续传
+            multipart: false,          // 本地 FS 无远端分片概念
+            server_side_move: true,    // fs::rename 同卷原子移动（断言⑥）
+            rapid_upload: false,       // 无内容寻址去重后端
+            authoritative_index: true, // list 即本地 FS 真相（断言③；local 类真机豁免）
+            change_feed: false,        // 非云后端，无推送
+            inbound: false,            // 无入站通道
+            chat: false,               // 无对话通道
+        }
+    );
 }

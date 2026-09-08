@@ -1,13 +1,15 @@
 //! # ck-local——本地文件系统驱动（L2 驱动 crate，Phase 2 Batch L）。
 //!
 //! 后端 = 一个根目录下的普通文件系统。卷身份 `local:<规范化绝对根路径>`
-//! （D6：同根多实例共享卷，换根 = 换卷；根路径规范化归本驱动，L2 只存
+//!（D6：同根多实例共享卷，换根 = 换卷；根路径规范化归本驱动，L2 只存
 //! opaque key——Windows 盘符与 `\\?\` 前缀形态对 L2 合法）。
 //!
-//! **当前状态：TDD 红阶段骨架**——[`LocalDriver`] 九方法与
-//! [`LocalStager`] 全部返回 `StorageError::Unsupported`，能力位恒
-//! `Capabilities::none()`；conformance 套件（tests/conformance.rs）预期
-//! 在断言①红。绿阶段（Batch L 实现批）逐方法点亮并声明真实能力位。
+//! 驱动形态：StorageDriver 九方法全实现（conformance 断言①–⑥⑧ 绿；
+//! ⑦ RESUME 未声明自动跳过）。能力位三真六假，逐位注码见 driver.rs
+//! `capabilities()`：range_read / server_side_move / authoritative_index。
+//! 上传走 commit-on-close：暂存文件在卷根 `.cklocal-staging/`（保留名，
+//! list 不可见），close = 同卷原子 rename——详见 driver.rs / stager.rs
+//! 模块文档（含 io::Error 映射表与保留名规则）。
 //!
 //! 层位置：只依赖 cloudkit-storage（L2）与外部 crate（driver-onboarding
 //! §1）；禁依赖 cloudkit-core 及任何 L3+ crate（R1）。
