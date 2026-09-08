@@ -474,6 +474,16 @@ dependencies = [
 ]
 
 [[package]]
+name = "ck-local"
+version = "0.8.0"
+dependencies = [
+ "async-trait",
+ "cloudkit-storage",
+ "tempfile",
+ "tokio",
+]
+
+[[package]]
 name = "ck-telegram"
 version = "0.8.0"
 dependencies = [

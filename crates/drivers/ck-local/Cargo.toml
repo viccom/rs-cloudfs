@@ -1,0 +1,27 @@
+[package]
+name = "ck-local"
+description = "Local filesystem StorageDriver - conformance-wired skeleton (Phase 2 Batch L)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# StorageDriver/UploadStager 均为 #[async_trait] trait，实现侧必须使用
+# 同一宏（ck-telegram 同款）。
+async-trait = "0.1"
+# L2 契约层是唯一 workspace 依赖——驱动 crate 禁依赖 cloudkit-core 与
+# 任何 L3+ crate（driver-onboarding §1 / R1，scripts/check_layers 拦截）。
+cloudkit-storage = { path = "../../cloudkit-storage" }
+# factory 的目录创建/规范化经 spawn_blocking 隔离阻塞面（code-style §4）。
+tokio = { version = "1", features = ["rt"] }
+
+[dev-dependencies]
+# 临时根目录（Cargo.lock 已有该依赖——与 ck-telegram dev-dep 同版本复用，
+# 非 lock 新增）。
+tempfile = "3"
+# conformance_suite! 宏展开的 #[tokio::test] 需要 rt + macros
+# （cloudkit-storage lib.rs 宏文档明示消费 crate 自带）。
+tokio = { version = "1", features = ["rt", "macros"] }
