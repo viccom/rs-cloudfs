@@ -39,8 +39,7 @@ use cloudkit_sync_server::router::{router_with_gate, MAX_CONCURRENT_BODY_BUFFERS
 use cloudkit_sync_server::store::SyncStore;
 
 /// One valid minimal push batch.
-const PUSH_BODY: &str =
-    r#"{"key":"ns","rows":[{"rel_path":"/a","deleted":false,"payload":"x"}]}"#;
+const PUSH_BODY: &str = r#"{"key":"ns","rows":[{"rel_path":"/a","deleted":false,"payload":"x"}]}"#;
 /// One valid minimal pull request.
 const PULL_BODY: &str = r#"{"key":"ns","since":0}"#;
 
@@ -114,8 +113,7 @@ async fn exhausted_gate_sheds_push_and_pull_with_actionable_503() {
     for (path, body) in [("/v1/push", PUSH_BODY), ("/v1/pull", PULL_BODY)] {
         let (status, bytes) = post(addr, path, body).await;
         assert_eq!(status, StatusCode::SERVICE_UNAVAILABLE, "{path}: {bytes:?}");
-        let error: serde_json::Value =
-            serde_json::from_slice(&bytes).expect("503 body is JSON");
+        let error: serde_json::Value = serde_json::from_slice(&bytes).expect("503 body is JSON");
         let text = error
             .get("error")
             .and_then(|value| value.as_str())

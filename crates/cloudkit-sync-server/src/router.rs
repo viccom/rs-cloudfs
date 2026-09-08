@@ -8,10 +8,11 @@
 //! ungated subscribe would let a stranger watch the doorbell;
 //! mismatch or missing -> 403 whose body says where the client
 //! configures its secret; malformed JSON -> 400; store failures ->
-//! 500. Every error answers `{"error": "..."}` JSON. With *no*
-//! configured secret all endpoints stay open — pure loopback /
-//! tunnel deployments keep the old behavior (deliberate ruling, not
-//! an oversight).
+//! 500; a push/pull shed by the body-buffering gate -> 503 (see
+//! [`MAX_CONCURRENT_BODY_BUFFERS`]). Every error answers
+//! `{"error": "..."}` JSON. With *no* configured secret all
+//! endpoints stay open — pure loopback / tunnel deployments keep the
+//! old behavior (deliberate ruling, not an oversight).
 //!
 //! Wire compatibility (pull gained its `secret` field, and the
 //! doorbell batch added an optional `client_id` everywhere plus the
@@ -25,10 +26,10 @@
 //! at info (endpoint, namespace-key prefix, row count, max_version,
 //! elapsed ms, plus `client=<first 8 chars>` when the request carried
 //! a client_id), secret rejections at warn (never the secret itself,
-//! only missing/mismatched), 400/500 at error. Subscribe logs its
-//! accept line only — there is no "completion" for a long-lived
-//! stream, and per-doorbell-event logging would be pure noise (the
-//! triggering push already logs its own completion).
+//! only missing/mismatched), gate sheds at warn, 400/500 at error.
+//! Subscribe logs its accept line only — there is no "completion"
+//! for a long-lived stream, and per-doorbell-event logging would be
+//! pure noise (the triggering push already logs its own completion).
 //!
 //! Bodies are parsed manually (raw bytes -> serde_json) instead of via
 //! the `Json` extractor so that every malformed request lands on our
@@ -38,13 +39,13 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use axum::body::Bytes;
-use axum::extract::{DefaultBodyLimit, State};
+use axum::extract::{DefaultBodyLimit, Request, State};
 use axum::http::StatusCode;
+use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
 use axum::routing::post;
 use axum::{Json, Router};
 use serde::Serialize;
-
 use tokio::sync::Semaphore;
 
 use crate::config::DEFAULT_HEARTBEAT;
@@ -74,6 +75,12 @@ pub const MAX_CONCURRENT_BODY_BUFFERS: usize = 2;
 const SECRET_HELP: &str = "this server requires a shared secret; send it in the \
      request body's \"secret\" field (client side: sync_secret in config.toml or \
      the CYDRIVE_SYNC_SECRET environment variable)";
+
+/// The actionable body of a gate-shed 503: the overload is transient
+/// and not the client's fault, and its next step is to retry — kept
+/// clearly apart from the 403 secret failure and the 413 oversized
+/// batch (a too-large batch will never succeed; a shed one will).
+const BUSY_HELP: &str = "server is busy processing other sync batches, retry shortly";
 
 /// Shared handler state.
 #[derive(Clone)]
@@ -143,18 +150,25 @@ pub fn router_with_gate(
     heartbeat: Duration,
     body_gate: Arc<Semaphore>,
 ) -> Router {
+    let state = AppState {
+        store,
+        secret,
+        hub,
+        heartbeat,
+        body_gate,
+    };
     Router::new()
         .route("/v1/push", post(push_handler))
         .route("/v1/pull", post(pull_handler))
+        // The gate layer wraps ONLY the routes registered above —
+        // subscribe (registered after) streams without a permit.
+        .layer(middleware::from_fn_with_state(
+            state.clone(),
+            body_gate_middleware,
+        ))
         .route("/v1/subscribe", post(subscribe_handler))
         .layer(DefaultBodyLimit::max(MAX_BODY_BYTES))
-        .with_state(AppState {
-            store,
-            secret,
-            hub,
-            heartbeat,
-            body_gate,
-        })
+        .with_state(state)
 }
 
 /// Error body shape shared by 400/403/500.
@@ -200,6 +214,39 @@ fn secret_rejected(endpoint: &str, key: &str) -> Response {
 /// into logs.
 fn ns_prefix(key: &str) -> String {
     key.chars().take(8).collect()
+}
+
+/// The push/pull body-buffering gate, as route middleware over those
+/// two endpoints only: one permit per in-flight request, held from
+/// before the body is buffered (the `Bytes` extraction) until the
+/// response is built — exactly the buffered body's lifetime — so at
+/// most [`MAX_CONCURRENT_BODY_BUFFERS`] bodies are alive at once
+/// (2 × 64 MB = 128 MB peak). `try_acquire`, not a waiting `acquire`:
+/// a queued batch would sit on the wire burning the client's own
+/// timeout with no progress signal, while an immediate 503 +
+/// "retry shortly" is the actionable answer the client can back off
+/// on. Release is deterministic by Drop alone — the RAII
+/// `SemaphoreTryPermit` falls out of scope when the request finishes
+/// (success, any error path, or a panic unwinding the future), so
+/// there is no manual release anywhere to get wrong. (Named
+/// `*_middleware` rather than `body_gate`: the AppState field and the
+/// constructor parameter already own that name.)
+async fn body_gate_middleware(
+    State(state): State<AppState>,
+    request: Request,
+    next: Next,
+) -> Response {
+    let _permit = match state.body_gate.try_acquire() {
+        Ok(permit) => permit,
+        Err(_) => {
+            tracing::warn!(
+                path = %request.uri().path(),
+                "request shed: too many concurrent sync bodies"
+            );
+            return error_response(StatusCode::SERVICE_UNAVAILABLE, BUSY_HELP);
+        }
+    };
+    next.run(request).await
 }
 
 async fn push_handler(State(state): State<AppState>, body: Bytes) -> Response {
