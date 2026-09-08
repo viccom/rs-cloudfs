@@ -45,6 +45,8 @@ use axum::routing::post;
 use axum::{Json, Router};
 use serde::Serialize;
 
+use tokio::sync::Semaphore;
+
 use crate::config::DEFAULT_HEARTBEAT;
 use crate::events::{sse_response, EventHub};
 use crate::store::SyncStore;
@@ -56,6 +58,15 @@ use crate::wire::{
 /// for a full-drive initial push (tens of thousands of metadata rows);
 /// 64 MB covers family-scale drives with ample headroom.
 const MAX_BODY_BYTES: usize = 64 * 1024 * 1024;
+
+/// How many push/pull requests may hold a buffered request body in
+/// memory at the same time. Each buffered batch peaks at
+/// [`MAX_BODY_BYTES`] (64 MB), so 2 permits cap the worst-case
+/// concurrent buffering at 128 MB — a budget a family-grade box
+/// survives. A third concurrent batch is shed with 503 + a
+/// "retry shortly" hint instead of queueing (a queued batch would
+/// burn the client's timeout with no progress signal).
+pub const MAX_CONCURRENT_BODY_BUFFERS: usize = 2;
 
 /// The actionable tail of every secret 403: tells the client where its
 /// side configures the secret, so a stranger's probe and an honest
@@ -75,6 +86,11 @@ struct AppState {
     /// SSE keepalive interval (default [`DEFAULT_HEARTBEAT`]; tests
     /// inject ~100 ms).
     heartbeat: Duration,
+    /// Concurrency gate bounding how many push/pull request bodies
+    /// are buffered at once (memory budget: see
+    /// [`MAX_CONCURRENT_BODY_BUFFERS`]). Tests inject their own
+    /// semaphore and pre-acquire every permit to pin the shed path.
+    body_gate: Arc<Semaphore>,
 }
 
 /// The sync API router: `POST /v1/push` + `POST /v1/pull` +
@@ -99,12 +115,33 @@ pub fn router_with_heartbeat(
 
 /// The fully assembled router with every part injectable — the
 /// integration tests pass their own [`EventHub`] to observe the
-/// registry (receiver/channel counts) while driving real HTTP.
+/// registry (receiver/channel counts) while driving real HTTP. The
+/// body-buffering gate is the production default
+/// ([`MAX_CONCURRENT_BODY_BUFFERS`] permits).
 pub fn router_with_hub(
     store: Arc<SyncStore>,
     secret: Option<String>,
     hub: Arc<EventHub>,
     heartbeat: Duration,
+) -> Router {
+    router_with_gate(
+        store,
+        secret,
+        hub,
+        heartbeat,
+        Arc::new(Semaphore::new(MAX_CONCURRENT_BODY_BUFFERS)),
+    )
+}
+
+/// [`router_with_hub`] plus an injectable body-buffering gate — the
+/// gate tests hold every permit of their own semaphore to pin the
+/// 503 shed answer without racing real concurrent requests.
+pub fn router_with_gate(
+    store: Arc<SyncStore>,
+    secret: Option<String>,
+    hub: Arc<EventHub>,
+    heartbeat: Duration,
+    body_gate: Arc<Semaphore>,
 ) -> Router {
     Router::new()
         .route("/v1/push", post(push_handler))
@@ -116,6 +153,7 @@ pub fn router_with_hub(
             secret,
             hub,
             heartbeat,
+            body_gate,
         })
 }
 

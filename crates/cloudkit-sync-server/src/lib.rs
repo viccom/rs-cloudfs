@@ -33,7 +33,7 @@ pub use config::{
     DEFAULT_LISTEN,
 };
 pub use events::EventHub;
-pub use router::{router, router_with_heartbeat, router_with_hub};
+pub use router::{router, router_with_gate, router_with_heartbeat, router_with_hub};
 pub use store::{SyncStore, SyncStoreError};
 pub use wire::{
     PullRequest, PullResponse, PulledRow, PushRequest, PushResponse, PushRow, SubscribeEvent,
