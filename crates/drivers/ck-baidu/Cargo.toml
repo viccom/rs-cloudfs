@@ -32,8 +32,9 @@ serde = { version = "1", features = ["derive"] }
 # api/client 层 JSON 载荷（reqwest json 特性同源；显式声明为直接依赖，
 # 计划 §3 五项依赖清单未列——响应解析必需，特此注明）。
 serde_json = "1"
-# token 状态 RwLock（spike Ctx.token 同款形态，刷新整体替换）。
-tokio = { version = "1", features = ["sync"] }
+# token 状态 RwLock（spike Ctx.token 同款形态，刷新整体替换）；
+# time = K15 重试钩子的退避 sleep（client.rs）。
+tokio = { version = "1", features = ["sync", "time"] }
 
 [dev-dependencies]
 # mock baidu 内存后端（K16：axum 钉 0.8.9，cloudkit-sync-server 测试同款

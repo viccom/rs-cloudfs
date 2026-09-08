@@ -13,6 +13,11 @@
 //!   即便随后的重放失败也不回收（新 refresh_token 已是唯一活值）；
 //! - oauth 端点错误形态：顶层 `error`/`error_description` 字符串（HTTP
 //!   4xx），成功形态 `access_token`/`refresh_token`/`expires_in`。
+//!
+//! 刷新的**编排**（单飞锁 + 陈旧检查 + 持久化回调时序）在 client.rs 的
+//! `BaiduClient::refresh_once`；本模块只做单次 wire 请求与错误归一。
+
+use cloudkit_storage::StorageError;
 
 /// 刷新产物持久化回调（K13）。
 ///
@@ -27,4 +32,67 @@
 pub trait TokenStore: Send + Sync {
     /// 持久化刷新产物（access_token 与 refresh_token 一次一换，成对落盘）。
     fn save_tokens(&self, access_token: &str, refresh_token: &str);
+}
+
+/// GET `/oauth/2.0/token?grant_type=refresh_token&…`——标准刷新授权
+/// （wire 形态 = spike `api.rs:33-40` 实抓：恰四参数）。
+///
+/// 错误归一：
+/// - 顶层 `error` 字符串（HTTP 4xx，如 `invalid_grant`）→
+///   `Unauthorized { recoverable: false }`——refresh_token 已失效，唯一
+///   出路是人工重新授权（K13 三档之二；error/error_description 不含
+///   凭据值，可入载荷，但本驱动只取 error 码入日志路径，token 值
+///   **绝不**出现在任何载荷/日志——R3）；
+/// - 网络层失败 → `Unavailable`（暂时性；调用方（client.rs 的
+///   `BaiduClient` 单次自救机会）就此放弃并上抛——不重试 oauth 本身）；
+/// - 成功响应缺 `access_token`/`refresh_token` 字段 → `Unavailable`
+///   （协议异常；载荷不含响应体——半截响应可能携带一半新凭据对）。
+pub(crate) async fn refresh_grant(
+    http: &reqwest::Client,
+    oauth_base: &str,
+    app_key: &str,
+    app_secret: &str,
+    refresh_token: &str,
+) -> Result<super::client::TokenPair, StorageError> {
+    let resp = http
+        .get(format!("{oauth_base}/oauth/2.0/token"))
+        .query(&[
+            ("grant_type", "refresh_token"),
+            ("refresh_token", refresh_token),
+            ("client_id", app_key),
+            ("client_secret", app_secret),
+        ])
+        .send()
+        .await
+        .map_err(|e| {
+            // without_url：reqwest 错误串默认内嵌完整 URL（query 含
+            // refresh_token/client_secret——R3 凭据红线），剥离后再入载荷。
+            StorageError::Unavailable(format!("oauth transport: {}", e.without_url()))
+        })?;
+    let status = resp.status();
+    let body = resp
+        .text()
+        .await
+        .map_err(|e| StorageError::Unavailable(format!("oauth body read: {}", e.without_url())))?;
+    let v: serde_json::Value = serde_json::from_str(&body)
+        .map_err(|_| StorageError::Unavailable(format!("oauth non-json (http {status})")))?;
+    if let Some(_err) = v.get("error").and_then(|e| e.as_str()) {
+        // oauth 端点错误形态：顶层 error 字符串（spike api.rs:49-55 实抓）。
+        // invalid_grant = refresh_token 陈旧/失效（一次一换下旧值即刻作废）
+        // → Unauthorized{recoverable:false}（K13 三档之二）。Unauthorized
+        // 无载荷位，error/error_description 明细不外带（二者不含凭据值，
+        // 丢弃明细是分类学形态的既有取舍）。
+        return Err(StorageError::Unauthorized { recoverable: false });
+    }
+    let access = v
+        .get("access_token")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| StorageError::Unavailable("oauth response missing access_token".into()))?
+        .to_string();
+    let refresh = v
+        .get("refresh_token")
+        .and_then(|x| x.as_str())
+        .ok_or_else(|| StorageError::Unavailable("oauth response missing refresh_token".into()))?
+        .to_string();
+    Ok(super::client::TokenPair { access, refresh })
 }

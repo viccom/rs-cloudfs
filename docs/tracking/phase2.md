@@ -9,7 +9,7 @@
 | P2-0 | 前置任务：驱动接入手册 | ✅ | docs/standards/driver-onboarding.md v1.0（2026-09-08；PCFS 研究坑清单 + spike 百度参数引据） |
 | P2-1 | Phase 2 执行计划 + 本表细化 | ✅ | docs/plans/2026-09-08-phase2-execution.md（2026-09-08；批次 L/B1/B2/B3a/B3b/E2E/收口 + K1–K18 裁决 + Kickoff 预授权指令；**负责人已批准（2026-09-08），按 Kickoff 开工**） |
 | P2-2 | Batch L：ck-local（StorageDriver 面 + conformance 第一公民） | ✅ | 红 ea57136 → 绿 04659d1 → 契约修 8f257e4；ck-local 4 passed（①–⑥⑧ 绿/⑦未声明跳过/能力位九位静态锁/他卷 delete NotFound 契约钉）；workspace 628 passed 0 failed（6 ignored）+ clippy/fmt/check_layers 全过；裁决入 decisions 2026-09-08 Batch L 条目（K6 形态/tokio write_all 入队语义/overwrite stash 等 8 项） |
-| P2-3a | Batch B1：ck-baidu 骨架 + OAuth 状态机 + errno 映射 + 元数据面 | ⬜ | 计划 §3；验收 = oauth 三态/errno 逐码回放/表单字节级断言（mock baidu = axum）绿；spike api.rs 改造复用 |
+| P2-3a | Batch B1：ck-baidu 骨架 + OAuth 状态机 + errno 映射 + 元数据面 | ✅ | 红 9a969ac（12 文件骨架 + MockBaidu + 17 测试红于 Unsupported）→ 绿（本 commit）；ck-baidu 17 passed（oauth 三态+持久化 4 / errno 逐码回放 5 / 表单字节级断言 8）；workspace 646 passed 0 failed（6 ignored）+ clippy/fmt/check_layers/scan_secrets 全过；裁决 = delete 句柄走 meta fs_ids 直查（少一份驱动状态）、-8 无 PCFS 证据按「mock 建模+B2 复核」入表、K15 退避固定 80ms、rename ondup=overwrite 显式声明待 B2 断言⑥复核 |
 | P2-3b | Batch B2：三步曲上传（差集续传）+ 下载器（dlink 缓存）+ conformance 全绿 | ⬜ | 计划 §4；验收 = 八断言全绿（⑦差集可观测）+ 真机 #[ignore] 跑一次（rtype=3 复核）；spike 附录 B 参数（TTL 60min/4MiB Range/netdisk UA/4 并发） |
 | P2-3c | Batch B3a：L2 transport 类型演进（句柄 i32→i64 + RemoteHandle.path + delete_remote 签名） | ⬜ | 计划 §5；验收 = workspace 全绿 + 波及面清单 + telegram 行为零变化（断言漂移审计=仅机械字面量） |
 | P2-3d | Batch B3b：组合根接线（backend dispatch/config 三处同步/setup/doctor/namespace 后端感知/rebuild/remote_delete 删除接线） | ⬜ | 计划 §6；验收 = 三后端 mock 全栈装配绿 + telegram 缺省零改动 + WSL 双平台 |
