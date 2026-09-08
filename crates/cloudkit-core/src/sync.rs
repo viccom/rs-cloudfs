@@ -177,12 +177,95 @@ pub fn row_hash(payload: &str) -> String {
 /// The server never stores the bare token; same bot + chat = same drive,
 /// different member bots = different drives (both topologies, one
 /// mechanism).
+///
+/// **K12 guard rail (Phase 2)**: this telegram derivation is frozen
+/// byte-for-byte — deployed drives converge against these exact values,
+/// and [`namespace_key_for`]'s telegram arm must keep reproducing them
+/// (pinned by `tests/namespace_backend.rs` golden vectors). New
+/// backends go through [`NamespaceIdentity`], never through edits here.
 pub fn namespace_key(bot_token: &str, chat_id: &str) -> String {
     let mut hasher = Sha256::new();
     hasher.update(bot_token.as_bytes());
     hasher.update(b":");
     hasher.update(chat_id.as_bytes());
     hex_lower(&hasher.finalize())
+}
+
+/// The backend-aware namespace identity of a drive (Phase 2 / K12):
+/// which account-shaped input derives the sync server's namespace key.
+///
+/// - [`NamespaceIdentity::Telegram`] — the legacy bot-token + chat-id
+///   pair; derives through [`namespace_key`] unchanged (guard rail).
+/// - [`NamespaceIdentity::Baidu`] — the uinfo `uid`; the namespace is
+///   the raw volume identity `baidu:<uid>` (no hashing: the uid is
+///   already a stable, non-secret account identifier, same shape the
+///   driver's `VolumeId` carries).
+/// - [`NamespaceIdentity::Local`] — the **normalized** root path (the
+///   caller passes the driver's canonicalized root; normalization is
+///   ck-local's job, this layer hashes what it gets); the namespace is
+///   `local:<hash>` — the raw path is not shipped to the server, and a
+///   Windows path's separators/prefix would be hostile as a key anyway.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum NamespaceIdentity<'a> {
+    /// Telegram bot token (`"<id>:<secret>"`) + chat id.
+    Telegram {
+        /// Bot token from the config / credential chain.
+        bot_token: &'a str,
+        /// Chat id (stringified, the legacy derivation's input shape).
+        chat_id: &'a str,
+    },
+    /// Baidu account uid (uinfo).
+    Baidu {
+        /// The uid of the connected account.
+        uid: &'a str,
+    },
+    /// Local drive root (driver-normalized absolute path).
+    Local {
+        /// The normalized absolute root path.
+        root: &'a str,
+    },
+}
+
+/// Derives the sync server's namespace key for a backend identity
+/// (Phase 2 / K12). See [`NamespaceIdentity`] for the per-backend
+/// shapes; the telegram arm is the frozen legacy derivation.
+pub fn namespace_key_for(identity: &NamespaceIdentity<'_>) -> String {
+    match identity {
+        NamespaceIdentity::Telegram { bot_token, chat_id } => namespace_key(bot_token, chat_id),
+        NamespaceIdentity::Baidu { uid } => format!("baidu:{uid}"),
+        NamespaceIdentity::Local { root } => format!("local:{}", local_root_digest(root)),
+    }
+}
+
+/// 16-hex-digit digest of a local drive's root path
+/// ([`NamespaceIdentity::Local`]).
+///
+/// `DefaultHasher` (SipHash with fixed keys) is **not** cryptographic
+/// and its exact output is not guaranteed stable across rustc versions
+/// — both are acceptable here by design: this digest is a sync-isolation
+/// identifier, not a security boundary, and **local drives never start
+/// the sync task** ([`is_sync_supported`]), so the value only ever
+/// labels the drive (doctor output / future tooling). Collision odds
+/// for a family-scale set of roots at 2^64 are negligible. No new
+/// dependency is warranted for a non-security identifier.
+fn local_root_digest(root: &str) -> String {
+    use std::hash::{Hash, Hasher};
+    let mut hasher = std::collections::hash_map::DefaultHasher::new();
+    root.hash(&mut hasher);
+    format!("{:016x}", hasher.finish())
+}
+
+/// Whether a backend runs the metadata-sync task at all (Phase 2 / K12).
+///
+/// Telegram and baidu both sync (their namespaces are server-side
+/// keys). A **local** drive never starts the sync task — the local root
+/// IS the source of truth, and a `sync_url` set on a local instance is
+/// a misconfiguration surfaced as a doctor warning, never a running
+/// task. This is the判定 function for the doctor warning and the
+/// task-start gate; the run-flow wiring lands with the backend dispatch
+/// (Batch B3b 段二b).
+pub fn is_sync_supported(backend: &crate::config::Backend) -> bool {
+    !matches!(backend, crate::config::Backend::Local)
 }
 
 /// Lowercase hex of a digest (mirror of the `chunker` helper).
