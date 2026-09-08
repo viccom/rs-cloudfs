@@ -11,7 +11,9 @@
 use async_trait::async_trait;
 use ck_local::{factory, LocalDriver, LocalParams};
 use cloudkit_storage::conformance::ConformanceHarness;
-use cloudkit_storage::{Capabilities, StorageDriver};
+use cloudkit_storage::{
+    BackendHandle, Capabilities, EntryId, StorageDriver, StorageError, VolumeId,
+};
 
 /// 无分块驱动：chunk 边界报 1（ConformanceHarness::chunk_size 契约）。
 const CHUNK: u64 = 1;
@@ -70,6 +72,19 @@ async fn factory_bootstraps_local_volume() {
     .expect("factory 构造失败");
     assert_eq!(driver.volume().scheme(), "local");
     assert!(!driver.volume().key().is_empty());
+}
+
+/// L2 trait 契约钉死：他卷句柄 delete → `NotFound`（driver.rs 契约行
+/// 「他卷句柄 → NotFound」+ mock 先例；本卷视角下他卷对象即不存在）。
+#[tokio::test]
+async fn delete_foreign_volume_handle_yields_not_found() {
+    let root = tempfile::tempdir().expect("创建临时根目录失败");
+    let driver = LocalDriver::new(root.path().to_path_buf()).expect("LocalDriver 构造失败");
+    let foreign = EntryId::new(
+        VolumeId::new("local", "Z:/foreign-root").expect("他卷 VolumeId 构造失败"),
+        BackendHandle::new("a.txt"),
+    );
+    assert_eq!(driver.delete(&foreign).await, Err(StorageError::NotFound));
 }
 
 /// 能力声明静态锁（R4 诚实性）：九位精确值钉死，防未来漂移（先例：

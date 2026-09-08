@@ -272,9 +272,11 @@ impl StorageDriver for LocalDriver {
     }
 
     async fn delete(&self, id: &EntryId) -> Result<(), StorageError> {
-        // 他卷句柄 / 空句柄（= 卷根，删除卷根无意义且危险）→ Invalid
+        // 他卷句柄 → NotFound（trait 契约与 mock 先例：本卷视角下他卷
+        // 对象即不存在，与 reader 同形态）；空句柄（= 卷根，删除卷根
+        // 无意义且危险）→ Invalid
         if id.volume != self.volume {
-            return Err(StorageError::Invalid);
+            return Err(StorageError::NotFound);
         }
         let Some(rel) = rel_from_handle(id) else {
             return Err(StorageError::Invalid);
