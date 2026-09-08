@@ -400,3 +400,12 @@
 - **能力位**：range_read/server_side_move/authoritative_index=true（逐位注码）；resume/multipart/rapid_upload/change_feed/inbound/chat=false（注理由）+ 九位精确值静态锁测试。
 - **验证**：`cargo test -p ck-local` 4 passed / 0 failed；workspace 628 passed / 0 failed（625 基线 +3）/ 6 ignored；clippy -D warnings / fmt / check_layers（10 manifests）全过。
 - **止损点未触发**：套件未暴露断言语义缺陷（发现的都是实现侧问题）。
+
+## 2026-09-08 Batch B1：ck-baidu 骨架 + OAuth + errno + 元数据面
+
+- **TDD 序列**：红 9a969ac（12 文件骨架 + MockBaidu axum 内存后端 + 三套件 17 测试全红于 Unsupported）→ 绿 41f25e3（oauth/client/api/driver 六文件 +524/−77）。tests/ 两 commit 间零 diff（假绿检查过）。
+- **黄金参照查证修正**（PCFS 源码否定任务情报中的猜测）：filemanager move filelist = `[{path,dest,newname,ondup:"overwrite"}]` 四键 + form `async=1`（PCFS api.go:829-845）而非 `[{from,to}]`；stat = `method=meta&path=<abs>`（api.go:110-113）非 filelist/fs_ids（fs_ids 是姊妹形态，delete 句柄解析采用，api.go:176-179）。move **不轮询 taskid**（PCFS 从不轮询，两源一致，勿发明）。
+- **K 萁点落地**：K13（110 刷新重放一次/111,-6 零刷新直达 Unauthorized{false}/刷新 on-arrival 持久化——refresh 单飞锁 + 拿锁后陈旧双检，不浪费一次一换的 refresh_token）；K14（BaiduParams 无 appkey 默认值、不 derive Debug 防凭据 dump）；K15（31034/429 → RateLimited{None} + 单点重试一次、退避固定 80ms）；K16（MockBaidu = axum =0.8.9 内存后端 + 请求记录器 + 错误注入队列 + 一次一换 token 轮换）；K5（VolumeId=baidu:<uid> 经 uinfo /xpan/nas；BackendHandle=fs_id 十进制字符串）。
+- **实现裁决**：mock 基建落位 `tests/common/mod.rs`（计划原文 mock_backend.rs——Rust 集成测试共享模块形态限制）；未知 errno → Unavailable 载荷保留 errno=<code>（表外码 47002 钉死）；-8 → Exists 注「mock 建模 + B2 conformance 复核」（PCFS 无处理证据）；list 无分页参数（两源一致）→ driver 内 offset 游标切 Page；mtime=server_mtime（两源一致无 local_mtime）；serde_json 补入依赖（响应解析必需）；R3 三防线（reqwest 错误 without_url/体片段 token 掩码/错误消息不拼参数）。
+- **挂起 B2 复核项**：① rename 的 ondup=overwrite 覆盖语义与 trait「目标已存在 → Exists」的偏离（driver.rs 已显式声明，conformance 断言⑥若覆盖则需裁决）；② -8 映射。
+- **验证**：ck-baidu 17 passed（oauth 4/errno 5/metadata 字节级 8）；workspace 646 passed 0 failed（628→646）/ 6 ignored；clippy/fmt/check_layers（11 manifests）/scan_secrets 全过。
