@@ -13,8 +13,12 @@
 //! - writes stage into a `.{name}.tmp` sibling of the cache path and
 //!   commit on `flush` — fsync, atomic rename, pending row, enqueued
 //!   upload — never reading the payload back into memory;
-//! - delete removes the row plus any cached copy but never deletes
-//!   remote messages (Python `handle_delete` parity);
+//! - delete removes the row plus any cached copy; the remote side is
+//!   gated on the transport's `remote_delete` capability (K4, Phase 2):
+//!   bit on (baidu/local) → the remote object dies first through the
+//!   shared VFS seam and a refusal keeps the row; bit off
+//!   (telegram/mock) → the remote messages are kept (Python
+//!   `handle_delete` parity);
 //! - [`DavFileSystem::copy`] stays `NotImplemented` (Explorer
 //!   drag-copy rides the PUT path; see the design doc);
 //! - quota reports the DB total bytes with 10 TB of headroom (compat
@@ -270,6 +274,13 @@ impl DavFileSystem for CyDriveFs {
             if !self.db.list_dir(rel.as_str()).map_err(db_err)?.is_empty() {
                 return Err(FsError::Exists);
             }
+            // K4 remote-delete gate (Phase 2): a collection row on a
+            // remote_delete backend (baidu/local) has its remote object
+            // deleted FIRST — the shared VFS seam owns the ordering
+            // (idempotent retry; refusal keeps the row). Bit off
+            // (telegram/mock) is a no-op and the legacy row delete
+            // proceeds unchanged.
+            self.vfs.delete_remote_for_row(&rel).await.map_err(vfs_err)?;
             self.db.delete_file(rel.as_str()).map_err(db_err)?;
             // No manual doorbell: the row delete above rang the db-layer
             // files hook (the chokepoint) — deletion is the tombstone's
@@ -298,13 +309,20 @@ impl DavFileSystem for CyDriveFs {
             if !row.is_uploaded && self.cache.local_path(&rel).exists() {
                 return Err(FsError::Forbidden);
             }
+            // K4 remote-delete gate (Phase 2): the shared VFS seam —
+            // remote object first, row + cache only after it is gone;
+            // refusal aborts with the row kept. Bit off
+            // (telegram/mock) is a no-op (Python parity: the remote
+            // messages stay).
+            self.vfs.delete_remote_for_row(&rel).await.map_err(vfs_err)?;
             self.db.delete_file(rel.as_str()).map_err(db_err)?;
             // No manual doorbell: the row delete above rang the db-layer
             // files hook (the chokepoint) — deletion is the tombstone's
             // origin either way.
             // Cached copy goes too; removal errors are ignored (Python
-            // `handle_delete` swallows OSError). The remote message is
-            // deliberately NOT deleted (Python parity).
+            // `handle_delete` swallows OSError). With the gate on, the
+            // remote message WAS deleted above; with it off the legacy
+            // keep-the-remote behavior stands.
             let local = self.cache.local_path(&rel);
             if local.exists() {
                 let _ = std::fs::remove_file(&local);

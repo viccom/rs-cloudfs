@@ -372,14 +372,17 @@ async fn api_upload(State(state): State<AppState>, mut multipart: Multipart) -> 
 /// write bypassed the VFS layer: no pending-guard sharing, no
 /// cache-copy cleanup, no sync-doorbell ring), so the row, its cached
 /// copy and the realtime wake are all handled by the one call; the
-/// remote is never touched (baseline mirror). A pending upload whose
+/// remote side is the K4 gate inside that call (Phase 2): a
+/// `remote_delete` transport (baidu/local) deletes the remote object
+/// first and a refusal keeps the row, a bit-off transport (telegram)
+/// keeps the baseline's remote-stays mirror. A pending upload whose
 /// local cache copy still exists is refused with 409 (review H2 / plan
 /// F2, the same adjudication as the WebDAV DELETE): that copy is the
 /// only copy of the bytes. Directory rows keep the baseline's
 /// unconditional row delete — the dashboard renders the delete button
 /// on folders too and [`Vfs::remove_file`] refuses directories —
-/// plus the doorbell ring the direct write used to skip; a missing row
-/// answers the baseline's idempotent no-op success.
+/// behind the same K4 gate (`Vfs::delete_remote_for_row`); a missing
+/// row answers the baseline's idempotent no-op success.
 async fn api_delete(State(state): State<AppState>, body: Json<serde_json::Value>) -> Response {
     let filename = body
         .0
@@ -410,13 +413,23 @@ async fn api_delete(State(state): State<AppState>, body: Json<serde_json::Value>
         // Directories: Vfs::remove_file refuses them, but the frontend
         // renders the delete button on folder rows and the baseline
         // deleted the row unconditionally — keep that shape (rows only;
-        // the remote stays, Python mirror). No manual doorbell needed:
-        // the row delete rings the db-layer files hook (the chokepoint;
-        // deletion = tombstone origin).
-        Err(VfsError::IsDirectory(_)) => match state.vfs.db().delete_file(&clean_rel) {
-            Ok(()) => delete_success(filename),
-            Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
-        },
+        // with the remote_delete bit off the remote stays, Python
+        // mirror; with it on the K4 gate deletes the dir's remote
+        // object first and a refusal keeps the row). No manual doorbell
+        // needed: the row delete rings the db-layer files hook (the
+        // chokepoint; deletion = tombstone origin).
+        Err(VfsError::IsDirectory(_)) => {
+            if let Err(error) = state.vfs.delete_remote_for_row(&rel).await {
+                return error_json(
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    error.to_string(),
+                );
+            }
+            match state.vfs.db().delete_file(&clean_rel) {
+                Ok(()) => delete_success(filename),
+                Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+            }
+        }
         Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
 }

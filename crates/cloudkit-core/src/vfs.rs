@@ -15,7 +15,7 @@ use tokio::sync::Notify;
 
 use crate::cache::CacheManager;
 use crate::crypto::{self, CryptoError};
-use crate::database::{DbError, FileUpsert, MetaDatabase};
+use crate::database::{DbError, FileRecord, FileUpsert, MetaDatabase};
 use crate::rel_path::RelPath;
 use crate::transport::{CloudTransport, InboundFile, RemoteHandle, StorageError, UploadJob};
 use crate::upload_queue::{
@@ -747,14 +747,22 @@ impl Vfs {
         Ok(())
     }
 
-    /// Deletes the `rel` row and the local cache copy. The remote
-    /// Telegram messages are deliberately NOT deleted (Python
-    /// `handle_delete` parity — the WebDAV adapter shares this semantic),
-    /// so a cache copy removal failure is logged, never propagated.
-    /// A pending upload whose local cache copy still exists is refused
-    /// with [`VfsError::UploadPending`] — that copy is the only copy of
-    /// the bytes; a ghost pending row (copy already vanished) deletes
-    /// normally.
+    /// Deletes the `rel` row and the local cache copy. When the
+    /// transport declares the `remote_delete` capability (K4, Phase 2 —
+    /// baidu/local), the remote object is deleted FIRST through the
+    /// shared gate ([`Vfs::delete_remote_for_row`]): only after the
+    /// remote side has actually been removed do the row and the cached
+    /// copy die, so a refused remote delete aborts with the row kept
+    /// (an orphaned local delete would hand the authoritative-index
+    /// rebuild a resurrected file). Transports that declare the bit off
+    /// (telegram/mock) keep the legacy semantics byte-for-byte: the
+    /// remote Telegram messages are deliberately NOT deleted (Python
+    /// `handle_delete` parity — the WebDAV adapter shares this
+    /// semantic), so a cache copy removal failure is logged, never
+    /// propagated. A pending upload whose local cache copy still exists
+    /// is refused with [`VfsError::UploadPending`] — that copy is the
+    /// only copy of the bytes; a ghost pending row (copy already
+    /// vanished) deletes normally.
     pub async fn remove_file(&self, rel: &RelPath) -> Result<(), VfsError> {
         let row = self
             .db
@@ -769,6 +777,9 @@ impl Vfs {
         if !row.is_uploaded && self.local_copy_exists(rel) {
             return Err(VfsError::UploadPending(rel.as_str().to_string()));
         }
+        // K4 ordering: remote first (when the backend supports it),
+        // local state only after the remote side is gone.
+        self.delete_remote_gated(rel, &row).await?;
         self.db.delete_file(rel.as_str())?;
         // The cached copy goes too; a missing copy is the normal
         // not-cached case, and other removal errors never fail the call.
@@ -780,6 +791,82 @@ impl Vfs {
         // No manual doorbell: the row delete above rang it through the
         // db-layer files hook (deletion = tombstone origin).
         Ok(())
+    }
+
+    /// The K4 remote-delete gate as the shared seam for the surfaces'
+    /// DIRECTORY-delete paths (the WebDAV DELETE on a collection, the
+    /// dashboard's directory fallback): deletes the row's remote object
+    /// under the same ordering contract [`Vfs::remove_file`] carries —
+    /// the caller may only delete local state after this returns
+    /// `Ok(())`. Answers `Ok(())` immediately when the transport
+    /// declares no `remote_delete` (legacy semantics — telegram/mock)
+    /// or the row does not exist, so an ungated caller is a no-op, never
+    /// an error.
+    pub async fn delete_remote_for_row(&self, rel: &RelPath) -> Result<(), VfsError> {
+        if !self.transport.capabilities().remote_delete {
+            return Ok(());
+        }
+        let Some(row) = self.db.get_file(rel.as_str())? else {
+            return Ok(());
+        };
+        self.delete_remote_gated(rel, &row).await
+    }
+
+    /// One K4 gate evaluation: `remote_delete` bit on → delete the
+    /// row's remote object, tolerating NotFound (the idempotent end
+    /// state — the object is already gone) and retrying any other
+    /// failure exactly once (the remote may have deleted it under us,
+    /// or the refusal was transient). A refusal that survives the retry
+    /// aborts with an actionable error naming the path and the kept
+    /// row; the caller must not delete local state.
+    ///
+    /// Never-uploaded rows (`is_uploaded = false`) have no remote
+    /// object — the only remaining shape is the ghost pending row
+    /// (bytes neither local nor remote), which skips the gate and stays
+    /// deletable.
+    async fn delete_remote_gated(
+        &self,
+        rel: &RelPath,
+        row: &FileRecord,
+    ) -> Result<(), VfsError> {
+        if !self.transport.capabilities().remote_delete {
+            return Ok(());
+        }
+        if !row.is_uploaded {
+            return Ok(());
+        }
+        // The handle mirrors hydrate's: per-chunk rows first (already
+        // index-ordered), else the row's own chunk-0 id. A row with no
+        // id at all still carries the path (K2) — path-addressed
+        // backends (local) resolve by it, and id-keyed backends answer
+        // NotFound for the placeholder (tolerated above).
+        let chunks = self.db.get_chunks_by_file_id(row.id)?;
+        let mut msg_ids: Vec<i64> = chunks
+            .iter()
+            .filter_map(|chunk| chunk.telegram_msg_id)
+            .collect();
+        if msg_ids.is_empty() {
+            if let Some(id) = row.telegram_msg_id {
+                msg_ids.push(id);
+            }
+        }
+        let handle = RemoteHandle {
+            first_msg_id: msg_ids.first().copied().unwrap_or(0),
+            chunk_msg_ids: msg_ids,
+            total_size: row.size.max(0) as u64,
+            path: Some(rel.clone()),
+        };
+        match self.transport.delete_remote(&handle).await {
+            Ok(()) | Err(StorageError::NotFound) => Ok(()),
+            Err(first) => match self.transport.delete_remote(&handle).await {
+                Ok(()) | Err(StorageError::NotFound) => Ok(()),
+                Err(second) => Err(VfsError::Transport(StorageError::Unavailable(format!(
+                    "remote delete failed for {}: the row and its cache copy were KEPT — \
+                     retry the delete later; first attempt: {first}, retry: {second}",
+                    rel.as_str()
+                )))),
+            },
+        }
     }
 
     /// Whether a local cache copy of `rel` is currently on disk — a
