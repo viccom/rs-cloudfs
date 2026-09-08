@@ -223,3 +223,134 @@ fn builder_overrides_declared_capabilities() {
         "bare builder default matches plain new()"
     );
 }
+
+/// Uploads `bytes` through the streaming face (no disk file needed) and
+/// returns the receipt. Guard-rail helper for tests 9/10: the stream face
+/// is behaviorally identical to the file face from the chunk plan onwards
+/// (the mock's own contract), so receipts it produces are the real shape.
+async fn stream_upload_bytes(
+    t: &MockTransport,
+    rel: &str,
+    bytes: &'static [u8],
+) -> cloudkit_storage::transport::UploadReceipt {
+    let job = UploadJob {
+        rel_path: RelPath::new(rel).expect("valid rel path"),
+        local_path: PathBuf::new(),
+        size: bytes.len() as u64,
+        chunk_count: 1,
+        chunk_size: 64,
+    };
+    let data: ByteStream = Box::pin(futures_util::stream::iter(vec![Ok(
+        bytes::Bytes::from_static(bytes),
+    )]));
+    t.upload_stream(&job, data).await.expect("stream upload")
+}
+
+/// Drains a [`ByteStream`] to bytes; frames are infallible here (mock).
+async fn drain(mut stream: ByteStream) -> Vec<u8> {
+    let mut out = Vec::new();
+    while let Some(frame) = stream.next().await {
+        out.extend_from_slice(&frame.expect("frame ok"));
+    }
+    out
+}
+
+/// 9. K2 guard rail: `RemoteHandle::path` is an additive field — the
+///    storage faces key on message ids, never on the path. Handles that
+///    differ only in `path` (`None` vs `Some`) serve identical bytes
+///    through `open`/`open_range`, so a path-addressed driver (local) can
+///    carry its locator in the handle without perturbing the
+///    telegram-era behavior of id-keyed backends.
+///
+/// RED-phase note (Batch B3a): this test fails to *compile* until the
+/// field exists — the intentional guard-rail shape for an additive-type
+/// evolution (see the batch's tracking entry).
+#[tokio::test]
+async fn remote_handle_path_is_additive_on_the_storage_faces() {
+    let t = MockTransport::new();
+    t.connect().await.expect("connect");
+    let receipt = stream_upload_bytes(&t, "/guard.bin", b"0123456789").await;
+
+    let no_path = RemoteHandle {
+        first_msg_id: receipt.first_msg_id,
+        chunk_msg_ids: receipt.chunk_msg_ids.clone(),
+        total_size: receipt.uploaded_bytes,
+        path: None,
+    };
+    let relocated = RemoteHandle {
+        first_msg_id: receipt.first_msg_id,
+        chunk_msg_ids: receipt.chunk_msg_ids.clone(),
+        total_size: receipt.uploaded_bytes,
+        path: Some(RelPath::new("/relocated/elsewhere.bin").expect("valid path")),
+    };
+
+    assert!(no_path.path.is_none(), "explicit None stays None");
+    assert_eq!(
+        relocated.path.as_ref().map(|p| p.as_str()),
+        Some("/relocated/elsewhere.bin"),
+        "the path payload round-trips untouched"
+    );
+
+    // Identical bytes regardless of the path payload.
+    assert_eq!(
+        drain(t.open(&no_path).await.expect("open: no path")).await,
+        b"0123456789".to_vec()
+    );
+    assert_eq!(
+        drain(t.open(&relocated).await.expect("open: some path")).await,
+        b"0123456789".to_vec()
+    );
+    // Range parity too.
+    assert_eq!(
+        drain(t.open_range(&no_path, 2, 5).await.expect("range: no path")).await,
+        b"23456".to_vec()
+    );
+    assert_eq!(
+        drain(
+            t.open_range(&relocated, 2, 5)
+                .await
+                .expect("range: some path")
+        )
+        .await,
+        b"23456".to_vec()
+    );
+}
+
+/// 10. K1/K3 guard rails: handle ids are i64 end-to-end (an id beyond the
+///     i32 range flows through handle-shaped calls without narrowing —
+///     it simply behaves like any unknown id), and `delete_remote` takes
+///     the whole `&RemoteHandle`, deleting the handle's messages.
+#[tokio::test]
+async fn handle_ids_are_i64_and_delete_remote_takes_the_handle() {
+    let t = MockTransport::new();
+    t.connect().await.expect("connect");
+
+    // An i64-range id the mock never stored: NotFound, not a narrowing
+    // panic or a compile-time i32 conversion.
+    let beyond_i32 = RemoteHandle {
+        first_msg_id: 4_000_000_000,
+        chunk_msg_ids: vec![4_000_000_000],
+        total_size: 1,
+        path: None,
+    };
+    assert!(
+        matches!(
+            t.delete_remote(&beyond_i32).await,
+            Err(StorageError::NotFound)
+        ),
+        "unknown i64 id is a plain NotFound"
+    );
+
+    // Happy path: delete through a receipt-shaped handle; the i64 ids in
+    // the deleted log match the receipt verbatim.
+    let receipt = stream_upload_bytes(&t, "/gone.bin", b"xyz").await;
+    let handle = RemoteHandle {
+        first_msg_id: receipt.first_msg_id,
+        chunk_msg_ids: receipt.chunk_msg_ids.clone(),
+        total_size: receipt.uploaded_bytes,
+        path: None,
+    };
+    t.delete_remote(&handle).await.expect("delete via handle");
+    assert_eq!(t.deleted(), vec![receipt.first_msg_id]);
+    assert!(t.message(receipt.first_msg_id).is_none(), "message gone");
+}
