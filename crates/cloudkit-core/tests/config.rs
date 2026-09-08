@@ -9,7 +9,7 @@
 use std::fs;
 use std::sync::{Mutex, MutexGuard};
 
-use cloudkit_core::config::{ConfigError, CyDriveConfig, EncryptionScheme};
+use cloudkit_core::config::{Backend, ConfigError, CyDriveConfig, EncryptionScheme};
 
 // ------------------------------------------------------------- helpers ---
 
@@ -227,6 +227,15 @@ fn toml_roundtrip_preserves_full_config() {
         sync_url: None,
         sync_secret: None,
         sync_interval_secs: 300,
+        // Phase 2 / K17: the multi-backend keys (defaults keep this
+        // round-trip byte-compatible with the pre-Phase-2 shape).
+        backend: Backend::Telegram,
+        baidu_root: "/apps/cloudfs".to_string(),
+        baidu_app_key: None,
+        baidu_app_secret: None,
+        baidu_access_token: None,
+        baidu_refresh_token: None,
+        local_root: None,
     };
 
     cfg.save_toml(&path).expect("save_toml");

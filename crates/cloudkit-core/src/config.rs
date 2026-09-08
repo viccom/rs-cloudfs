@@ -89,6 +89,13 @@ const KNOWN_TOML_KEYS: &[&str] = &[
     "sync_url",
     "sync_secret",
     "sync_interval_secs",
+    "backend",
+    "baidu_root",
+    "baidu_app_key",
+    "baidu_app_secret",
+    "baidu_access_token",
+    "baidu_refresh_token",
+    "local_root",
 ];
 
 /// Numeric fields for which legacy JSON additionally accepts a numeric
@@ -117,6 +124,13 @@ const LEGACY_REJECTED_KEYS: &[&str] = &[
     "sync_url",
     "sync_secret",
     "sync_interval_secs",
+    "backend",
+    "baidu_root",
+    "baidu_app_key",
+    "baidu_app_secret",
+    "baidu_access_token",
+    "baidu_refresh_token",
+    "local_root",
 ];
 
 /// Client-side encryption container scheme (Batch E / E-4, foundation D7).
@@ -159,6 +173,42 @@ pub const SCHEME_GCM: &str = "gcm";
 /// Value of [`EncryptionScheme::as_str`] for v2 chunked-AEAD payloads.
 pub const SCHEME_AEAD_V2: &str = "aead_v2";
 
+/// Storage backend selector (Phase 2 / K17): which driver the
+/// composition root wires behind the transport seam.
+///
+/// The wire names are the stable `config.toml` spellings
+/// (`backend = "telegram" | "baidu" | "local"`). The default —
+/// [`Backend::Telegram`] — is the full-compatibility contract: a config
+/// without the `backend` key behaves exactly as the pre-Phase-2 build.
+/// Value validation is exhaustive at parse time (the field is a typed
+/// enum — an unknown variant is a [`ConfigError::Parse`] naming all
+/// accepted values and never reaches `validate`, which therefore adds
+/// no rule for the value itself; the backend's *cross-field*
+/// requirements — baidu credentials, an absolute `local_root` — are
+/// `validate` rules, see [`CyDriveConfig::validate`]).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum Backend {
+    /// Telegram MTProto drive (the original CyDrive, default).
+    #[default]
+    Telegram,
+    /// Baidu netapp drive (ck-baidu, authoritative index).
+    Baidu,
+    /// Local filesystem drive (ck-local, one root directory).
+    Local,
+}
+
+impl Backend {
+    /// Stable `config.toml` spelling of this backend.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Backend::Telegram => "telegram",
+            Backend::Baidu => "baidu",
+            Backend::Local => "local",
+        }
+    }
+}
+
 /// Default `upload_workers` (tier-1 contract C6).
 fn default_upload_workers() -> u32 {
     2
@@ -184,6 +234,14 @@ fn default_hydrate_timeout_secs() -> u64 {
 /// Default `sync_interval_secs` (sync-lite plan, client side).
 fn default_sync_interval_secs() -> u64 {
     300
+}
+
+/// Default `baidu_root` (Phase 2 / K17): the Baidu app-dir root
+/// (ck-baidu `DEFAULT_ROOT` — the driver crate owns the value, this
+/// mirrors it for the config default; the composition root passes the
+/// key through to `BaiduParams.root`).
+fn default_baidu_root() -> String {
+    "/apps/cloudfs".to_string()
 }
 
 /// Stringifies a path the way [`ConfigError`] variants expect ("as given").
@@ -312,6 +370,38 @@ pub struct CyDriveConfig {
     /// Sync polling interval in seconds (valid range 1..=86 400).
     #[serde(default = "default_sync_interval_secs")]
     pub sync_interval_secs: u64,
+    /// Storage backend selector (Phase 2 / K17); the `telegram` default
+    /// keeps every pre-Phase-2 config byte-compatible. Unknown values
+    /// are rejected at parse time (typed enum — see [`Backend`]); the
+    /// backend's cross-field requirements live in `validate`.
+    #[serde(default)]
+    pub backend: Backend,
+    /// Baidu drive root as a backend-absolute path (must start with
+    /// `'/'` when the backend is `baidu`; the default mirrors
+    /// ck-baidu's `DEFAULT_ROOT`).
+    #[serde(default = "default_baidu_root")]
+    pub baidu_root: String,
+    /// Baidu app key (K14 credential). No code default — the value
+    /// comes from this key or `CYDRIVE_BAIDU_APP_KEY`; required (with
+    /// the other three baidu keys) when `backend = "baidu"`.
+    pub baidu_app_key: Option<String>,
+    /// Baidu app secret (K14 credential); env route
+    /// `CYDRIVE_BAIDU_APP_SECRET`. See [`Self::baidu_app_key`].
+    pub baidu_app_secret: Option<String>,
+    /// Baidu OAuth access token (K14 credential); env route
+    /// `CYDRIVE_BAIDU_ACCESS_TOKEN`. Refreshed in place by the driver's
+    /// refresh machine; the persisted rotation is a Batch B3b setup
+    /// concern.
+    pub baidu_access_token: Option<String>,
+    /// Baidu OAuth refresh token (K14 credential); env route
+    /// `CYDRIVE_BAIDU_REFRESH_TOKEN`.
+    pub baidu_refresh_token: Option<String>,
+    /// Local drive root (ck-local volume root). Required and absolute
+    /// when `backend = "local"` (Windows `C:\...` and Unix `/...`
+    /// shapes both pass — [`std::path::Path::is_absolute`] semantics);
+    /// inert otherwise. No env route (K17 names env overrides for the
+    /// four baidu keys only).
+    pub local_root: Option<String>,
 }
 
 impl Default for CyDriveConfig {
@@ -347,6 +437,13 @@ impl Default for CyDriveConfig {
             sync_url: None,
             sync_secret: None,
             sync_interval_secs: default_sync_interval_secs(),
+            backend: Backend::default(),
+            baidu_root: default_baidu_root(),
+            baidu_app_key: None,
+            baidu_app_secret: None,
+            baidu_access_token: None,
+            baidu_refresh_token: None,
+            local_root: None,
         }
     }
 }
@@ -528,6 +625,10 @@ impl CyDriveConfig {
     /// | `CYDRIVE_ENABLE_ENCRYPTION` | `enable_encryption` | `"1"` or `"true"` (case-sensitive) → `true`; any other value → `false` |
     /// | `CYDRIVE_PROXY_URL` | `proxy_url` | verbatim string; an empty value clears the proxy (`None`) |
     /// | `CYDRIVE_SYNC_URL` | `sync_url` | verbatim string; an empty value clears the sync URL (`None`, feature off) |
+    /// | `CYDRIVE_BAIDU_APP_KEY` | `baidu_app_key` | verbatim string; an empty value clears it (`None`) — the proxy/sync_url precedent |
+    /// | `CYDRIVE_BAIDU_APP_SECRET` | `baidu_app_secret` | same empty-clears rule |
+    /// | `CYDRIVE_BAIDU_ACCESS_TOKEN` | `baidu_access_token` | same empty-clears rule |
+    /// | `CYDRIVE_BAIDU_REFRESH_TOKEN` | `baidu_refresh_token` | same empty-clears rule |
     pub fn with_env_overrides(self) -> Self {
         let mut config = self;
         if let Some(value) = env_string("CYDRIVE_BOT_TOKEN") {
@@ -556,6 +657,23 @@ impl CyDriveConfig {
         }
         if let Some(value) = env_string("CYDRIVE_SYNC_URL") {
             config.sync_url = (!value.is_empty()).then_some(value);
+        }
+        // K14 (Phase 2): the four baidu credential keys ride the same
+        // env > file chain as the other CYDRIVE_* overrides; a
+        // set-but-empty value explicitly clears the file value so a
+        // shell export can neutralise a stale token without editing
+        // config.toml.
+        if let Some(value) = env_string("CYDRIVE_BAIDU_APP_KEY") {
+            config.baidu_app_key = (!value.is_empty()).then_some(value);
+        }
+        if let Some(value) = env_string("CYDRIVE_BAIDU_APP_SECRET") {
+            config.baidu_app_secret = (!value.is_empty()).then_some(value);
+        }
+        if let Some(value) = env_string("CYDRIVE_BAIDU_ACCESS_TOKEN") {
+            config.baidu_access_token = (!value.is_empty()).then_some(value);
+        }
+        if let Some(value) = env_string("CYDRIVE_BAIDU_REFRESH_TOKEN") {
+            config.baidu_refresh_token = (!value.is_empty()).then_some(value);
         }
         config
     }
@@ -634,6 +752,15 @@ impl CyDriveConfig {
     /// * `sync_secret`: no format constraint — any non-empty string is a
     ///   legal secret, and a value that trims to empty reads as unset at
     ///   the CLI resolution layer (never a validation error).
+    /// * `backend` value: no rule here — the typed enum rejects unknown
+    ///   values at parse time (see [`Backend`]). Cross-field rules do
+    ///   live here: `backend = "baidu"` requires all four K14 credential
+    ///   keys (`baidu_app_key` / `baidu_app_secret` /
+    ///   `baidu_access_token` / `baidu_refresh_token`) set and non-empty
+    ///   (each naming its `CYDRIVE_BAIDU_*` env route in the error), and
+    ///   a `baidu_root` starting with `'/'`; `backend = "local"`
+    ///   requires `local_root` set and absolute. The telegram default
+    ///   triggers neither rule — pre-Phase-2 configs validate unchanged.
     ///
     /// Returns `Ok(())` when every rule holds.
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -725,6 +852,65 @@ impl CyDriveConfig {
                 return Err(ConfigError::Invalid(format!(
                     "sync_url needs a host, e.g. \"http://sync.example.org:8290\", got {url:?}"
                 )));
+            }
+        }
+        // Phase 2 / K17 cross-field rules, gated on the backend so the
+        // telegram default (every pre-Phase-2 config) never fires them.
+        if self.backend == Backend::Baidu {
+            for (name, value, env) in [
+                (
+                    "baidu_app_key",
+                    &self.baidu_app_key,
+                    "CYDRIVE_BAIDU_APP_KEY",
+                ),
+                (
+                    "baidu_app_secret",
+                    &self.baidu_app_secret,
+                    "CYDRIVE_BAIDU_APP_SECRET",
+                ),
+                (
+                    "baidu_access_token",
+                    &self.baidu_access_token,
+                    "CYDRIVE_BAIDU_ACCESS_TOKEN",
+                ),
+                (
+                    "baidu_refresh_token",
+                    &self.baidu_refresh_token,
+                    "CYDRIVE_BAIDU_REFRESH_TOKEN",
+                ),
+            ] {
+                if value.as_deref().is_none_or(str::is_empty) {
+                    return Err(ConfigError::Invalid(format!(
+                        "backend = \"baidu\" requires {name}: set it in config.toml or export \
+                         {env} (no code default exists for credentials)"
+                    )));
+                }
+            }
+            if !self.baidu_root.starts_with('/') {
+                return Err(ConfigError::Invalid(format!(
+                    "baidu_root must be a backend-absolute path starting with '/', e.g. \
+                     \"/apps/cloudfs\", got {:?}",
+                    self.baidu_root
+                )));
+            }
+        }
+        if self.backend == Backend::Local {
+            match self.local_root.as_deref() {
+                Some(root) if !root.trim().is_empty() => {
+                    if !Path::new(root).is_absolute() {
+                        return Err(ConfigError::Invalid(format!(
+                            "backend = \"local\" requires local_root to be an absolute path \
+                             (e.g. \"/srv/cloudfs\" or \"C:\\data\\cloudfs\"), got {root:?}"
+                        )));
+                    }
+                }
+                _ => {
+                    return Err(ConfigError::Invalid(
+                        "backend = \"local\" requires local_root: set it to the drive's root \
+                         directory as an absolute path in config.toml"
+                            .to_string(),
+                    ));
+                }
             }
         }
         Ok(())
