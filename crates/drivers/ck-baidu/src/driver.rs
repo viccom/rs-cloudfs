@@ -28,7 +28,12 @@
 //! - **mtime**：读 `server_mtime`（api.rs 模块文档注源）；
 //! - **目录 size 恒 0**：后端对目录返回的实现值不透出（ck-local 同款）；
 //! - **mkdir**：逐级隐式创建（xpan create 不自动建父目录，mock 严格语义
-//!   钉死）；中间层已存在（-8）继续下沉，最终层已存在 → `Exists`；
+//!   钉死）+ **list 预检**（真网实证 2026-09-08 第五轮：目录 create 撞
+//!   已存在 ≠ -8——errno=0 成功假象 + `<名>_<时间戳>` 空副本垃圾，见
+//!   `tests/dir_create_preflight.rs`）：每层先 list 父目录，已存在 → 跳过
+//!   create（最终层已存在 → `Exists`）；-8 分支保留为防御语义；
+//! - **ensure_parents**（writer 隐式建父）：同款逐级 list 预检（上传到
+//!   已有目录路径不产空副本垃圾；预检流量顺带喂句柄缓存）；
 //! - **rename**：目标已存在 → **覆盖**（`ondup=overwrite`——PCFS
 //!   api.go:829-845 钉死的表单形态即覆盖语义，mock/黄金参照一致；与
 //!   trait「目标已存在 → Exists」的驱动侧偏离在此显式声明；conformance
@@ -75,7 +80,9 @@ const HANDLE_CACHE_CAP: usize = 4096;
 /// 旧路径）由 delete 的纠偏腿（-9 → 失效重扫重试）兜底。
 ///
 /// 填充点：`list`（批量，一次 list 一次锁）/ `stat`（父目录批量）/
-/// `entry_for`（父目录批量）/ `scan_dir`（逐目录批量）/ writer 预检。
+/// `entry_for`（父目录批量）/ `scan_dir`（逐目录批量）/ writer 预检 /
+/// mkdir 与 ensure_parents 的逐级 list 预检（2026-09-08 第五轮真网实证
+/// 连带——预检流量是常态解析来源）。
 pub(crate) struct HandleCache {
     map: Mutex<HashMap<i64, api::RemoteEntry>>,
 }
@@ -400,17 +407,29 @@ impl StorageDriver for BaiduDriver {
         if path.is_root() {
             return Err(StorageError::Exists); // 卷根本就存在（ck-local/mock 同款语义）
         }
-        // 逐级隐式建父目录（trait 契约；xpan create 不自动建父——mock 严格
-        // 语义钉死）：浅层先行，中间层 -8（已存在）继续下沉，最终层 -8 →
-        // Exists（模块文档语义声明）。
+        // **list 预检**（真网实证 2026-09-08 第五轮）：目录 create 撞已存在
+        // ≠ -8——返回 errno=0（成功假象）且远端生成 `<名>_<时间戳>` 空副本
+        // （垃圾）。逐级隐式建父目录（trait 契约；xpan create 不自动建父
+        // ——mock 严格语义钉死）必须每层「先 list 父目录，已存在 → 跳过
+        // create（最终层 → Exists），不存在才 create」——这是不产垃圾的
+        // 唯一途径；-8 分支保留为防御语义（真网未观察到但语义安全）。
         let comps: Vec<&str> = path.components().collect();
         let last = comps.len() - 1;
         let mut prefix = RelPath::root();
         for (i, comp) in comps.into_iter().enumerate() {
             prefix = prefix.join(comp)?;
-            match api::create_dir(&self.client, &self.abs_path(&prefix)).await {
+            let abs = self.abs_path(&prefix);
+            let siblings = api::list(&self.client, &api::parent_abs(&abs)).await?;
+            self.handles.put_batch(&siblings); // 预检流量顺带批量喂句柄缓存
+            if siblings.iter().any(|e| e.path == abs) {
+                if i == last {
+                    return Err(StorageError::Exists); // 目标名已被占用（目录/文件占位同斥）
+                }
+                continue; // 中间层已存在：零 create 下沉（ghost 免疫）
+            }
+            match api::create_dir(&self.client, &abs).await {
                 Ok(()) => {}
-                Err(StorageError::Exists) if i != last => {}
+                Err(StorageError::Exists) if i != last => {} // 防御（真网实证 errno=0 形态，-8 不触发）
                 Err(e) => return Err(e),
             }
         }

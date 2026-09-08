@@ -423,3 +423,9 @@
 - **裁决**：① stat = list 父目录 + path 精确匹配；② close 的 Entry 构造 = list 父目录 + fs_id 匹配（list_lookup 提为主路径）；③ delete 句柄解析 = fs_id→path 缓存（list/stat/Entry 流量填充，容量 4096）+ 未命中递归 list 扫描兜底；④ meta_by_path/meta_by_fs_id 停用保留（allow(dead_code)，正式 appkey 复测候选）；⑤ mock meta 臂保留无消费者（注释注码）。stat 的「注入 -9 → NotFound」语义在 list 主路径下自动成立（conformance ⑤ / errno_mapping 不弱化）。
 - **连带**：E2E/真机的 stat 可见性即时（list 实证）；K5（handle=fs_id 跨 rename 稳定）不变——缓存只是解析层，path 变更后缓存陈旧条目由递归扫描兜底纠偏（delete 失败时缓存失效重扫一次，注码）。
 - **待负责人**：正式 appkey（个人开发者）到位后复测 meta 权限（31300 是否消失）——若可用可回切 meta 直查（省 list 流量）；此裁决不影响正确性只影响效率。
+
+## 2026-09-08 Batch B2 真网实证（第五轮）：目录 create 冲突 = errno=0 + 空副本重命名——mkdir/ensure_parents 全面转 list 预检
+
+- **探针证据**（干净 curl，netdisk UA）：create isdir=1 对已存在目录返回 errno=0（成功假象），远端保留原目录并生成 `<名>_20260908_212145` 时间戳后缀**空副本**——非 -8。驱动「-8 → Exists」容错永不触发，ensure_parents 每次撞已存在层即产空目录垃圾；conformance ④ 真网必挂。
+- **裁决**：mkdir 与 ensure_parents 全面转 **list 预检**（先 list 父目录：已存在→Exists/跳过，不存在才 create）；-8 分支保留为防御语义。mock create 冲突建模对齐真实（errno=0 + 副本），使「未预检」实现可被离线测试检出。预检 list 流量顺带喂句柄缓存。
+- **残留形态记录**：本轮实证期间产生的远端垃圾（cloudfs-b2 下 10 个测试目录 + /apps 两个 suffixed 副本）已全数清理（filemanager delete 复查 n=0）；/apps/cloudfs-b2 保留为 B2 测试根空壳。

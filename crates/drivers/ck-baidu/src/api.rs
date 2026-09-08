@@ -54,10 +54,13 @@
 //! | 31326 | 下载鉴权失败（CDN 403） | `Unauthorized { recoverable: true }`（重取 dlink/追 token 可救——B2 两段 fallback 的前提） | spike §5 dl-try 矩阵 |
 //! | 其他 | 未知 | `Unavailable`（载荷保留 `errno=<code>` 与后端原始消息，R2 可诊断约定） | cloudkit-storage error.rs 归置约定 |
 //!
-//! 另注（未入 B1 钉死表，mock 已按真实码建模）：-8 = 文件或目录已存在
-//! （mkdir 目标已存在 → `Exists`，B2 conformance 断言④覆盖）。注源：
-//! PCFS `drivers/baidu` 全目录 rg 无 -8 处理证据（2026-09-08 核实）——
-//! 本码按「mock 建模 + B2 conformance 复核」入表。
+//! 另注（2026-09-08 第五轮真网实证修订）：-8 = 文件或目录已存在——
+//! **目录 create 腿实证不触发**：干净探针（netdisk UA）实证 create
+//! isdir=1 撞已存在目录返回 errno=0（成功假象）+ 远端生成 `<名>_<时间戳>`
+//! 空副本重命名——非 -8。驱动 mkdir/ensure_parents 由此转 list 预检
+//! （不 create 已存在层），-8 映射保留为防御语义（文件族 create 的 -8
+//! 与 rtype 语义不受此实证影响）。注源：PCFS `drivers/baidu` 全目录 rg
+//! 无 -8 处理证据（2026-09-08 核实）+ B2 conformance 断言④。
 
 use cloudkit_storage::StorageError;
 use serde::Deserialize;
@@ -100,7 +103,9 @@ pub(crate) fn map_errno(errno: i64, payload: &str) -> StorageError {
         // 才走到这里；K13 → recoverable:true。
         110 => StorageError::Unauthorized { recoverable: true },
         111 | -6 => StorageError::Unauthorized { recoverable: false },
-        -8 => StorageError::Exists, // mock 建模 + B2 conformance 复核（模块文档注源）
+        // 防御语义（真网实证 2026-09-08 第五轮：目录 create 冲突实为
+        // errno=0 + 副本重命名，-8 不触发；文件族语义保留）。
+        -8 => StorageError::Exists,
         -9 => StorageError::NotFound,
         12 | 31363 => StorageError::Invalid, // 31363：create 与 precreate 会话锁定声明不一致（真网探针 2026-09-08）
         31034 => StorageError::RateLimited { retry_after: None },

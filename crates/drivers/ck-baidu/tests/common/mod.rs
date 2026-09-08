@@ -38,6 +38,14 @@
 //!   spike §5 dl-try 矩阵），`CdnAuthMode::TokenRequired` 建模「直连 403、
 //!   追加 access_token 后 206」两态；mock 时钟经 `advance_clock` 推进使旧
 //!   链 expires 过期（token 救不了——重取 dlink 才可恢复）。
+//!
+//! B2 第五轮真网返工扩展（2026-09-08，**语义修正**——原 -8 建模废除）：
+//!
+//! - **目录 create 冲突形态**：`POST xpan/file?method=create` form
+//!   `path=<已存在目录>&isdir=1` → **errno=0**（成功假象）+ 树中生成
+//!   `<原名>_<时间戳>`（mock 时钟换算 `%Y%m%d_%H%M%S`）空副本目录——
+//!   真网实证非 -8。由此「未预检」的驱动实现（直接 create 已存在层）在
+//!   离线测试即可被 `entry_count_with_prefix` 检出（ghost 副本观测面）。
 
 #![allow(dead_code)] // 三个测试二进制各自编译本模块，未用到的访问器按二进制豁免
 
@@ -396,6 +404,32 @@ impl MockBaidu {
         self.state.lock().unwrap().bytes_received_total
     }
 
+    /// 树中 path 以 `<prefix>` 开头的条目数（冲突副本观测面——后端冲突
+    /// 重命名形态 `<原名>_<时间戳>`，对 `<父>/<原名>_` 前缀计数即可检出
+    /// ghost 副本；`tests/dir_create_preflight.rs` 消费，2026-09-08 第五轮
+    /// 真网实证驱动）。
+    pub fn entry_count_with_prefix(&self, prefix: &str) -> usize {
+        self.state
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .filter(|e| e.path.starts_with(prefix))
+            .count()
+    }
+
+    /// 树条目全路径快照（通用树投影——测试侧自行做形态过滤，如 ghost
+    /// 后缀 `_<8位日期>_<6位时间>` 的泛化扫描）。
+    pub fn entry_paths(&self) -> Vec<String> {
+        self.state
+            .lock()
+            .unwrap()
+            .entries
+            .iter()
+            .map(|e| e.path.clone())
+            .collect()
+    }
+
     /// superfile2 分片请求解析视图（按到达序；差集/表单断言用）。
     pub fn superfile2_records(&self) -> Vec<Superfile2Record> {
         let st = self.state.lock().unwrap();
@@ -533,6 +567,29 @@ fn parent_of(path: &str) -> Option<&str> {
     path.rsplit_once('/').map(|(parent, _)| parent)
 }
 
+/// unix 秒 → 真实后端冲突副本后缀形态 `%Y%m%d_%H%M%S`（真网实证样本
+/// `20260908_212145`；UTC——测试不钉具体值，形态对齐即可）。日期换算 =
+/// civil_from_days（Howard Hinnant 算法），mock 不引 chrono 依赖。
+fn conflict_suffix(unix_secs: i64) -> String {
+    let days = unix_secs.div_euclid(86_400);
+    let sod = unix_secs.rem_euclid(86_400);
+    let z = days + 719_468;
+    let era = z.div_euclid(146_097);
+    let doe = z.rem_euclid(146_097);
+    let yoe = (doe - doe / 1460 + doe / 36524 - doe / 146_096) / 365;
+    let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+    let mp = (5 * doy + 2) / 153;
+    let d = doy - (153 * mp + 2) / 5 + 1;
+    let m = if mp < 10 { mp + 3 } else { mp - 9 };
+    let y = yoe + era * 400 + i64::from(m <= 2);
+    format!(
+        "{y:04}{m:02}{d:02}_{:02}{:02}{:02}",
+        sod / 3600,
+        (sod % 3600) / 60,
+        sod % 60
+    )
+}
+
 fn entry_json(e: &MockEntry) -> Value {
     json!({
         "fs_id": e.fs_id,
@@ -631,7 +688,39 @@ async fn xpan_file(
             }
             let mut st = state.lock().unwrap();
             if st.entries.iter().any(|e| e.path == path) {
-                return errno_json(-8); // 真实 errno：file or directory already exists（B2 断言④覆盖映射）
+                // 真网实证（2026-09-08 第五轮，干净探针 netdisk UA）：目录
+                // create 撞已存在 ≠ -8——返回 **errno=0**（成功假象），远端
+                // 保留原目录并生成 `<原名>_<时间戳>` 空副本目录（实证样本
+                // `20260908_212145`）。原 -8 建模废除；驱动侧 mkdir /
+                // ensure_parents 转 list 预检（不 create 已存在层），
+                // tests/dir_create_preflight.rs 钉死该预检的离线检出力。
+                let fs_id = st.next_fs_id;
+                st.next_fs_id += 1;
+                let now = st.mock_clock;
+                let parent = parent_of(&path).unwrap_or("/").to_string();
+                let name = path.rsplit('/').next().unwrap_or_default();
+                let mut ts = now;
+                let ghost_path = loop {
+                    let candidate = format!("{parent}/{name}_{}", conflict_suffix(ts));
+                    if !st.entries.iter().any(|e| e.path == candidate) {
+                        break candidate;
+                    }
+                    ts += 1; // 同秒重复冲突：推进一秒保副本唯一（防御形态）
+                };
+                st.entries.push(MockEntry {
+                    server_filename: ghost_path
+                        .rsplit('/')
+                        .next()
+                        .unwrap_or_default()
+                        .to_string(),
+                    path: ghost_path,
+                    isdir: true,
+                    size: 0,
+                    fs_id,
+                    server_mtime: now,
+                    md5: String::new(),
+                });
+                return Json(json!({"errno": 0, "fs_id": fs_id})).into_response();
             }
             if !st
                 .entries

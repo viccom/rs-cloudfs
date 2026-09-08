@@ -369,8 +369,14 @@ impl BaiduStager {
         Ok(())
     }
 
-    /// 隐式建父目录（**卷根下**逐级，已存在层继续下沉——与 mkdir 同款
-    /// 循环语义；不从后端绝对路径首段建起——/apps 等前缀非本卷资产）。
+    /// 隐式建父目录（**卷根下**逐级，不从后端绝对路径首段建起——/apps 等
+    /// 前缀非本卷资产）。
+    ///
+    /// **list 预检**（真网实证 2026-09-08 第五轮）：目录 create 撞已存在
+    /// ≠ -8——errno=0 成功假象 + `<名>_<时间戳>` 空副本重命名（每次上传
+    /// 到已有目录路径都产空目录垃圾）。每层先 list 父目录判断该层是否已
+    /// 存在（是 → 跳过 create；否 → create）；预检 list 结果顺带批量喂
+    /// 句柄缓存。-8 容错保留为防御语义（真网未观察到）。
     async fn ensure_parents(&self) -> Result<(), StorageError> {
         let Some(parent) = self.rel.parent() else {
             return Ok(()); // 根下文件（rel 无父）：无中间层可建
@@ -381,9 +387,15 @@ impl BaiduStager {
         let mut prefix = RelPath::root();
         for comp in parent.components() {
             prefix = prefix.join(comp)?;
-            match api::create_dir(&self.client, &self.abs_of(&prefix)).await {
+            let abs = self.abs_of(&prefix);
+            let siblings = api::list(&self.client, &api::parent_abs(&abs)).await?;
+            self.handles.put_batch(&siblings); // 预检流量顺带喂句柄缓存
+            if siblings.iter().any(|e| e.path == abs) {
+                continue; // 该层已存在：零 create 下沉（ghost 免疫）
+            }
+            match api::create_dir(&self.client, &abs).await {
                 Ok(()) => {}
-                Err(StorageError::Exists) => {}
+                Err(StorageError::Exists) => {} // 防御（真网实证 errno=0 形态，-8 不触发）
                 Err(e) => return Err(e),
             }
         }
