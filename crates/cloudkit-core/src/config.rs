@@ -628,7 +628,9 @@ impl CyDriveConfig {
     /// * `hydrate_timeout_secs`: must be in `1..=86_400`.
     /// * `sync_interval_secs`: must be in `1..=86_400`.
     /// * `sync_url`: when `Some`, must start with `http://` or `https://`
-    ///   (`None` means the sync feature is off and skips the check).
+    ///   and carry a non-empty host (`http://`, `http://:8290/x` and
+    ///   `http:///path` are rejected; `None` means the sync feature is
+    ///   off and skips the check).
     /// * `sync_secret`: no format constraint — any non-empty string is a
     ///   legal secret, and a value that trims to empty reads as unset at
     ///   the CLI resolution layer (never a validation error).
@@ -704,9 +706,24 @@ impl CyDriveConfig {
             )));
         }
         if let Some(url) = &self.sync_url {
-            if !url.starts_with("http://") && !url.starts_with("https://") {
+            let rest = url
+                .strip_prefix("http://")
+                .or_else(|| url.strip_prefix("https://"));
+            let Some(rest) = rest else {
                 return Err(ConfigError::Invalid(format!(
                     "sync_url must start with http:// or https://, got {url:?}"
+                )));
+            };
+            // Minimal authority parse (no url crate in core): the
+            // authority runs to the first '/', '?' or '#', the host to
+            // the first ':' (the port) or the authority's end. A scheme
+            // with no host — "http://", "http://:8290/x", "http:///path"
+            // — is not a reachable server and must fail loudly here.
+            let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
+            let host = authority.split(':').next().unwrap_or_default();
+            if host.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "sync_url needs a host, e.g. \"http://sync.example.org:8290\", got {url:?}"
                 )));
             }
         }

@@ -9,8 +9,9 @@
 //! fail loudly, not be silently swallowed). `CYDRIVE_SYNC_URL` overrides
 //! the file value env > file; an empty value clears it back to `None`
 //! (proxy_url precedent). When set, `sync_url` must start with `http://`
-//! or `https://` (actionable [`ConfigError::Invalid`] message); `None`
-//! skips the check.
+//! or `https://` and carry a non-empty host — the bare scheme, a
+//! port-only authority and a path-only URL are all rejected with an
+//! actionable [`ConfigError::Invalid`] message; `None` skips the check.
 //!
 //! The companion `sync_secret` key (`Option<String>`, default `None`)
 //! carries the optional family-level shared secret: accepted by the
@@ -196,6 +197,37 @@ fn sync_url_must_be_http_s_when_set() {
                      && message.contains("http")),
             "expected actionable Invalid error naming sync_url and the schemes, got: {err:?}"
         );
+    }
+}
+
+#[test]
+fn sync_url_with_empty_host_rejected() {
+    // Three malformed shapes that carry the right scheme prefix but no
+    // host: the bare scheme (empty authority), a port-only authority and
+    // a path-only URL — the prefix check alone waves them through.
+    for bad in ["http://", "http://:8290/x", "http:///path"] {
+        let cfg = CyDriveConfig {
+            sync_url: Some(bad.to_string()),
+            ..CyDriveConfig::default()
+        };
+        let err = cfg
+            .validate()
+            .expect_err("sync_url={bad:?} must be invalid");
+        assert!(
+            matches!(err, ConfigError::Invalid(ref message) if message.contains("sync_url")
+                     && message.contains("host")),
+            "expected actionable Invalid error naming sync_url and the missing host, got: {err:?}"
+        );
+    }
+
+    // A host with a port and a bare host both stay valid.
+    for good in ["http://sync.example.org:8290", "https://sync.example.org"] {
+        let cfg = CyDriveConfig {
+            sync_url: Some(good.to_string()),
+            ..CyDriveConfig::default()
+        };
+        cfg.validate()
+            .unwrap_or_else(|e| panic!("sync_url={good:?} must be valid: {e}"));
     }
 }
 
