@@ -10,17 +10,17 @@
 ## 必读（开工前，按序）
 1. `docs/plans/2026-09-07-cloudfusion-foundation.md` —— 融合基线设计 v1.1（阶段计划/裁决状态/E2E 凭据策略）
 2. `docs/standards/architecture.md` —— 六层架构 + 红线 R1–R7（**L2 以上禁 import 驱动符号**等）
-3. `docs/standards/code-style.md` / `interfaces.md` / `logging.md` / `documentation.md` —— 门禁与规范
+3. `docs/standards/code-style.md` / `interfaces.md` / `logging.md` / `documentation.md` / `driver-onboarding.md` —— 门禁与规范（driver-onboarding = 新驱动 PR 验收依据）
 4. `docs/plans/2026-09-06-multicloud.md` —— 百度情报附录 A（端点/参数/errno/dlink/Range 实证）
 5. `docs/decisions.md` —— 历史裁决（自 rs-CyDrive 继承，继续追加）
 6. `docs/tracking/phase0-1.md` —— 当前任务跟踪单（**开工先读、每批收口更新**）
 
 ## 当前阶段
-**Phase 0 + Phase 1 已完成（2026-09-07，版本 0.8.0，win 617 + wsl 618 测试绿）**：crate 已改名重排（cloudkit-*/drivers/ck-*，bin 名 cydrive 契约不变）；cloudkit-storage（L2：StorageDriver 家族 + conformance 八断言 + Mock）/cloudkit-crypto（v1 GCM 冻结 + v2 分块 AEAD 流式）落地；CloudTransport 演进迁 L2（InboundCap/ChatCap 拆分，ck-telegram→core 反向依赖已解除）；百度 spike 完成未触止损（docs/reports/2026-09-07-baidu-spike.md）；真机冒烟两轮（R-6 全链路 + E-5 v2 加密往返，E-5 抓出并修复 hydrate 预算截断缺陷——v1 同型基线遗留一并修复）。**下一步 = Phase 2**（前置任务「驱动接入手册」→ ck-local + ck-baidu + 端到端硬验收）。
+**Phase 2 已启动（2026-09-08）**：Phase 0+1 完成（0.8.0，win 625 绿；继承挂账代码项清零）；PCFS 多实例研究入档，多卷启用裁决=方案一（B3 后接 Phase 2.5）；前置任务「驱动接入手册」已交付（docs/standards/driver-onboarding.md）。**下一步 = 写 Phase 2 执行计划（含跟踪单）→ ck-local → ck-baidu B1–B3 → 三后端 E2E 硬验收 → Phase 2.5 多卷**。过渡测试包：E:\Rs_Codes\cydrive-0.8.0-testkit（telegram+加密 U:/V:，仓外不入库）。
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 625 测试（继承挂账修复批后；ignored 6 为真机/平台类）
+cargo test --workspace --no-fail-fast            # 625 测试（0.8.0+修复批；ignored 6 为真机/平台类）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 scripts/check_layers                             # R1 层依赖门禁（CI 同款；动 Cargo.toml 依赖后必跑）
