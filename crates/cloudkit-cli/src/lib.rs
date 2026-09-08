@@ -43,17 +43,19 @@ use ck_telegram::config::{
 };
 use ck_telegram::transport::GrammersTransport;
 use cloudkit_core::cache::CacheManager;
-use cloudkit_core::config::CyDriveConfig;
+use cloudkit_core::config::{Backend, CyDriveConfig};
 use cloudkit_core::credentials::{
     CredentialStore, InMemoryStore, BOT_TOKEN, ENCRYPTION_PASSWORD, SERVICE,
 };
 use cloudkit_core::database::MetaDatabase;
 use cloudkit_core::inbound::spawn_inbound_worker;
+use cloudkit_core::rebuild;
 use cloudkit_core::rel_path::RelPath;
 use cloudkit_core::sync::{namespace_key, sync_once, SyncOutcome};
 use cloudkit_core::transport::Capabilities;
 use cloudkit_core::transport::CloudTransport;
 use cloudkit_core::vfs::{Vfs, VfsConfig, VfsError};
+use cloudkit_storage::StorageDriver;
 use cloudkit_web::WebUiServer;
 use cloudkit_webdav::{CyDriveFs, WebDavServer};
 use tokio::net::TcpStream;
@@ -920,6 +922,94 @@ pub async fn run_sync_command(cfg: &CyDriveConfig, secret: Option<&str>) -> Resu
     sync_once(&db, &cache, &client, &key, secret)
         .await
         .with_context(|| format!("sync pass against {sync_url} failed"))
+}
+
+// ------------------------------------------- rebuild subcommand (K11) ---
+
+/// The canonical telegram rebuild refusal (Phase 2 / K11): telegram's
+/// remote store is message-shaped — the [`CloudTransport`] face has no
+/// list/stat, so there is no authoritative backend index to walk; this
+/// db IS the index (the shadow index). Shared by the seam gate
+/// ([`run_rebuild_with_driver`]) and the driver assembly
+/// ([`build_driver`]) so the two cannot drift.
+pub const TELEGRAM_REBUILD_REFUSAL: &str =
+    "rebuild is not supported for the telegram backend: its remote store is message-shaped \
+     (no list/index face to walk) — this db IS the authoritative index (the shadow index); \
+     use `cydrive sync` to replicate it to another instance instead";
+
+/// The `cydrive rebuild` body (Phase 2 / K11): bootstrap the instance
+/// metadata db from the backend's authoritative index. Assembles the
+/// driver from the config's `backend` key ([`build_driver`]), then runs
+/// the shared gate + walk against the instance db (`db_path`, same
+/// discovery as every other subcommand).
+pub async fn run_rebuild_command(cfg: &CyDriveConfig) -> Result<rebuild::RebuildOutcome> {
+    let driver = build_driver(cfg).await?;
+    run_rebuild_with_driver(cfg, driver.as_ref()).await
+}
+
+/// [`run_rebuild_command`] with the driver injected — the test seam
+/// (tests seed a `MockStorageDriver`; production feeds the
+/// backend-key assembly). Gates in order, all before any backend
+/// traffic: config validity, the telegram shadow-index refusal, the
+/// K11 plaintext-only gate; then the db open and the recursive walk.
+pub async fn run_rebuild_with_driver(
+    cfg: &CyDriveConfig,
+    driver: &dyn StorageDriver,
+) -> Result<rebuild::RebuildOutcome> {
+    cfg.validate().context("invalid configuration")?;
+    if cfg.backend == Backend::Telegram {
+        anyhow::bail!("{TELEGRAM_REBUILD_REFUSAL}");
+    }
+    // No context wrapper: RebuildError::EncryptedInstance's Display IS
+    // the actionable message (sync guidance) — a context would bury it.
+    rebuild::ensure_plaintext_instance(cfg)?;
+    let db = MetaDatabase::open(Path::new(&cfg.db_path))
+        .with_context(|| format!("opening metadata db {:?}", cfg.db_path))?;
+    rebuild::rebuild_from_backend(driver, &db, &cloudkit_storage::RelPath::root())
+        .await
+        .context("rebuilding the index from the backend")
+}
+
+/// The backend-key driver assembly for `rebuild` (B3b 段二a minimal
+/// form): telegram → the shadow-index refusal; baidu/local → the
+/// drivers' `factory`s behind `Arc<dyn StorageDriver>` (the rebuild
+/// walk needs the StorageDriver face — list/stat; the CloudTransport
+/// face carries no listing).
+///
+/// **B3b 段二b 收编点**: the full `backend` dispatch (transport faces,
+/// capability banner, proxy declaration) lands in the dispatch unit and
+/// is expected to absorb or replace this helper — keep it minimal.
+/// Known gap until then: the baidu params carry `token_store: None`,
+/// so a rotated refresh token is not persisted (K13 persistence is the
+/// setup/dispatch unit's wiring).
+async fn build_driver(cfg: &CyDriveConfig) -> Result<Arc<dyn StorageDriver>> {
+    match cfg.backend {
+        Backend::Telegram => anyhow::bail!("{TELEGRAM_REBUILD_REFUSAL}"),
+        Backend::Baidu => {
+            let params = ck_baidu::BaiduParams {
+                app_key: cfg.baidu_app_key.clone().unwrap_or_default(),
+                app_secret: cfg.baidu_app_secret.clone().unwrap_or_default(),
+                access_token: cfg.baidu_access_token.clone(),
+                refresh_token: cfg.baidu_refresh_token.clone(),
+                root: cfg.baidu_root.clone(),
+                ..Default::default()
+            };
+            let driver = ck_baidu::factory(&params)
+                .await
+                .map_err(|error| anyhow::anyhow!("connecting the baidu backend: {error}"))?;
+            Ok(driver)
+        }
+        Backend::Local => {
+            // validate() guarantees Some + absolute when backend=local.
+            let root = cfg.local_root.clone().unwrap_or_default();
+            let driver = ck_local::factory(&ck_local::LocalParams {
+                root: PathBuf::from(root),
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("initialising the local backend: {error}"))?;
+            Ok(driver)
+        }
+    }
 }
 
 /// Tuning of [`spawn_sync_doorbell`]'s reconnect loop (quasi-realtime

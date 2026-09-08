@@ -13,8 +13,9 @@
 //! metadata-sync pass against the configured cydrive-sync server),
 //! mount/unmount (drive mapping), fix-reg (WebClient tuning, elevated),
 //! migrate (legacy Python import), stats (drive statistics table),
-//! doctor (offline diagnosis + platform checks) and setup (interactive
-//! first-time wizard).
+//! rebuild (bootstrap the metadata DB from the baidu/local backend's
+//! authoritative index), doctor (offline diagnosis + platform checks)
+//! and setup (interactive first-time wizard).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -111,6 +112,11 @@ enum Command {
     /// Print drive statistics from the metadata DB (files, folders,
     /// cloud storage, pending uploads) as a table.
     Stats,
+    /// Rebuild this instance's metadata DB from the backend's
+    /// authoritative index (baidu / local backends; the instance db at
+    /// the current working directory is rebuilt in place). Encrypted
+    /// instances are refused — use `cydrive sync` for those.
+    Rebuild,
     /// Diagnose the local installation: config, DB, cache, ports, and
     /// the Windows WebClient registry/service state.
     Doctor,
@@ -146,6 +152,7 @@ async fn main() -> Result<()> {
         Command::FixReg => fix_reg_cmd().await,
         Command::Migrate => migrate_cmd(),
         Command::Stats => stats_cmd(),
+        Command::Rebuild => rebuild_cmd().await,
         Command::Doctor => doctor_cmd(),
         Command::Setup => setup_cmd(),
     }
@@ -392,6 +399,23 @@ fn stats_cmd() -> Result<()> {
             &cfg.drive_letter,
             &cloudkit_cli::default_mount_url(&cfg)
         )
+    );
+    Ok(())
+}
+
+/// `cydrive rebuild`: discover the config (same cwd rule as `run` —
+/// the instance db resolves from the discovered `db_path`), assemble
+/// the driver from the `backend` key and bootstrap the index. One-shot
+/// command: no tracing subscriber, its own output (the stats/doctor
+/// convention).
+async fn rebuild_cmd() -> Result<()> {
+    let cfg = discover_config().context("config discovery failed")?;
+    let outcome = cloudkit_cli::run_rebuild_command(&cfg).await?;
+    println!(
+        "rebuild complete: {} file row(s), {} directory row(s) rebuilt from the {} backend",
+        outcome.files,
+        outcome.dirs,
+        cfg.backend.as_str()
     );
     Ok(())
 }
