@@ -257,6 +257,11 @@ impl StorageDriver for BaiduDriver {
     }
 
     async fn stat(&self, path: &RelPath) -> Result<Entry, StorageError> {
+        // 单点 meta 直查，无 list 兜底——曾试「索引延迟 list 兜底」（真机
+        // 2026-09-08 第四轮）后被撤销：会吞掉 conformance ⑤ 的 -9 错误
+        // 回放（注入语义 vs 延迟语义不可分辨）；且产品路径 stat 走本地
+        // db 短路（远端 stat 仅 hydrate 冷读，距写已远）。写后立即可见性
+        // 由 close 返回 Entry 承担（entry_for 的 list 兜底在 upload.rs）。
         let remote = api::meta_by_path(&self.client, &self.abs_path(path)).await?;
         // Entry.path 用请求时的 RelPath（后端回显 path 与拼接 abs 同值，
         // 直接复用入参省一次剥离；-9 已在 client 层归一 NotFound）

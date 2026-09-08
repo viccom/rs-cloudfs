@@ -134,6 +134,22 @@ fn unique_sub(name: &str) -> RelPath {
     RelPath::new(&format!("{name}-{stamp}")).expect("rel path")
 }
 
+/// 真机 meta 索引传播延迟（2026-09-08 实证：新上传对象 meta 单点查询
+/// 短暂 -9，秒级恢复）：上传后的 stat 断言以轮询等待最终一致（500ms ×
+/// 20 = 10s 上界；超时 panic 保失败可见）。
+async fn poll_stat(driver: &BaiduDriver, path: &RelPath) -> cloudkit_storage::Entry {
+    for _ in 0..20 {
+        match driver.stat(path).await {
+            Ok(entry) => return entry,
+            Err(cloudkit_storage::StorageError::NotFound) => {
+                tokio::time::sleep(std::time::Duration::from_millis(500)).await;
+            }
+            Err(e) => panic!("真机 stat 轮询中非 NotFound 错误: {e}"),
+        }
+    }
+    panic!("真机 stat 轮询 10s 超时仍 NotFound（索引延迟异常）: {path:?}")
+}
+
 #[tokio::test]
 #[ignore = "真机套件：需 env 凭据 + 生产 endpoint（主会话真机窗口执行）"]
 async fn real_connect_refreshes_and_resolves_baidu_volume() {
@@ -167,7 +183,7 @@ async fn real_upload_roundtrip_rtype3_overwrites_without_rename_copy() {
     let entry = stager.close().await.expect("真机 close 三步曲");
     assert_eq!(entry.size, data.len() as u64);
 
-    let st = driver.stat(&path).await.expect("上传后 stat");
+    let st = poll_stat(&driver, &path).await;
     assert_eq!(st.size, data.len() as u64, "stat size 与上传一致");
     assert_eq!(st.kind, EntryKind::File);
 
@@ -197,7 +213,7 @@ async fn real_upload_roundtrip_rtype3_overwrites_without_rename_copy() {
     let entry2 = stager2.close().await.expect("覆盖 close");
     assert_eq!(entry2.size, data2.len() as u64, "覆盖后 size 更新");
 
-    let st2 = driver.stat(&path).await.expect("覆盖后 stat");
+    let st2 = poll_stat(&driver, &path).await;
     assert_eq!(
         st2.size,
         data2.len() as u64,
@@ -231,7 +247,7 @@ async fn real_upload_roundtrip_rtype3_overwrites_without_rename_copy() {
     assert_eq!(got2, &data2[mid2..mid2 + 65536], "覆盖内容生效");
 
     // cleanup：删本目录（递归）。
-    let dir_entry = driver.stat(&dir).await.expect("stat 目录");
+    let dir_entry = poll_stat(&driver, &dir).await;
     driver.delete(&dir_entry.id).await.expect("cleanup 删除");
     match driver.stat(&dir).await {
         Err(cloudkit_storage::StorageError::NotFound) => {}
@@ -262,7 +278,7 @@ async fn real_throughput_100mb_roundtrip_optional() {
     let up = t0.elapsed();
 
     let t1 = std::time::Instant::now();
-    let entry = driver.stat(&path).await.expect("stat");
+    let entry = poll_stat(&driver, &path).await;
     let got = read_all(driver.reader(&entry.id, None).await.expect("reader")).await;
     let down = t1.elapsed();
     assert_eq!(got.len(), size, "下载字节数一致");
@@ -276,6 +292,6 @@ async fn real_throughput_100mb_roundtrip_optional() {
     );
 
     // cleanup。
-    let dir_entry = driver.stat(&dir).await.expect("stat 目录");
+    let dir_entry = poll_stat(&driver, &dir).await;
     driver.delete(&dir_entry.id).await.expect("cleanup");
 }

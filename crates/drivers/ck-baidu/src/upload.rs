@@ -539,11 +539,7 @@ impl BaiduStager {
 
     /// list 兜底（meta 索引延迟时）：父目录 depth-1 列举按 fs_id 定位。
     async fn list_lookup(&self, fs_id: i64) -> Result<api::RemoteEntry, StorageError> {
-        let parent = match self.abs.rfind('/') {
-            Some(0) | None => "/".to_string(),
-            Some(i) => self.abs[..i].to_string(),
-        };
-        let entries = api::list(&self.client, &parent).await?;
+        let entries = api::list(&self.client, &api::parent_abs(&self.abs)).await?;
         entries
             .into_iter()
             .find(|e| e.fs_id == fs_id)

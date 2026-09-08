@@ -112,6 +112,15 @@ pub(crate) async fn uinfo(client: &BaiduClient) -> Result<i64, StorageError> {
         .ok_or_else(|| StorageError::Unavailable("uinfo response missing uk".into()))
 }
 
+/// 绝对路径的父目录（`/a/b` → `/a`；一级子项 → `/`；异常输入宽容 `/`）。
+/// 索引传播延迟兜底（meta -9 → 父目录 list）的共享路径工具。
+pub(crate) fn parent_abs(abs: &str) -> String {
+    match abs.rfind('/') {
+        Some(0) | None => "/".to_string(),
+        Some(i) => abs[..i].to_string(),
+    }
+}
+
 /// GET `method=list&dir=<abs>`——depth-1 条目（无分页参数，见模块文档）。
 pub(crate) async fn list(
     client: &BaiduClient,
