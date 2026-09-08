@@ -785,7 +785,10 @@ async fn xpan_nas(
         return resp;
     }
     let uid = state.lock().unwrap().uid;
-    Json(json!({"errno": 0, "uid": uid, "uname": "mockuser", "avatar": ""})).into_response()
+    // 建模对齐真实（B2 真机实抓 2026-09-08）：uinfo 响应键为 `uk`
+    // （用户标识），无 `uid` 字段；其余键按真实形态裁剪（baidu_name/
+    // netdisk_name 等，驱动不解析）。
+    Json(json!({"errno": 0, "uk": uid, "baidu_name": "mockuser"})).into_response()
 }
 
 // ---------------------------------------------------------------------------

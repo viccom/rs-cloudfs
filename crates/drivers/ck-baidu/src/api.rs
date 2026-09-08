@@ -15,7 +15,7 @@
 //! | delete | POST 同上 | query `method=filemanager&opera=delete&access_token`；form 恰 `filelist` 字段 = `[{"path":<abs>}]`；**检查 info[] 逐项 errno** | spike api.rs:468-517（比 PCFS 严，按 spike） |
 //! | move（rename） | POST 同上 | query `method=filemanager&opera=move&access_token`；form `async=1` + `filelist=[{"path":…,"dest":…,"newname":…,"ondup":"overwrite"}]`；**不轮询 taskid** | PCFS api.go:781-870（829-845 形态） |
 //! | quota | GET 同上 | query 恰 `method=quota&access_token`（拼在 xpan/file 上）；响应顶层 `used`/`total`（i64） | PCFS api.go:914-933 |
-//! | uinfo | GET `/rest/2.0/xpan/nas` | query 恰 `method=uinfo&access_token`（**在 /xpan/nas 不在 /xpan/file**）；响应顶层含 `uid` | PCFS internal/baiduauth/config.go:370-373 |
+//! | uinfo | GET `/rest/2.0/xpan/nas` | query 恰 `method=uinfo&access_token`（**在 /xpan/nas 不在 /xpan/file**）；响应顶层含 `uk`（用户标识——实抓 2026-09-08，无 `uid` 字段） | PCFS internal/baiduauth/config.go:370-373（端点）+ 实抓（字段名） |
 //! | oauth refresh | GET `/oauth/2.0/token` | query 恰 `grant_type=refresh_token&refresh_token=…&client_id=…&client_secret=…`；成功顶层 `access_token/refresh_token/expires_in`，失败顶层 `error/error_description` | spike api.rs:22-81 |
 //!
 //! 响应条目字段：`fs_id`/`path`/`server_filename`/`size`/`isdir`/`md5`/
@@ -97,15 +97,18 @@ pub(crate) fn map_errno(errno: i64, payload: &str) -> StorageError {
     }
 }
 
-/// GET `/rest/2.0/xpan/nas?method=uinfo`——取 uid（VolumeId 构造，K5）。
+/// GET `/rest/2.0/xpan/nas?method=uinfo`——取 `uk`（网盘用户标识，VolumeId
+/// 构造，K5；计划文本的「uid」泛指用户标识，实抓 2026-09-08 真实响应键为
+/// `uk`：`{errno, uk, baidu_name, netdisk_name, vip_type, …}` 无 `uid` 字段
+/// ——PCFS 未解析过此字段故无先例，以实抓为准记 decisions）。
 ///
-/// 注：在 `/xpan/nas` 不在 `/xpan/file`（PCFS baiduauth/config.go:370-373）；
+/// 注：在 `/rest/2.0/xpan/nas` 不在 `/xpan/file`（PCFS baiduauth/config.go:370-373）；
 /// 响应 errno!=0 时按映射表归一（110 会在 client 层自救一次）。
 pub(crate) async fn uinfo(client: &BaiduClient) -> Result<i64, StorageError> {
     let v = client.api_get(XPAN_NAS, &[("method", "uinfo")]).await?;
-    v.get("uid")
+    v.get("uk")
         .and_then(Value::as_i64)
-        .ok_or_else(|| StorageError::Unavailable("uinfo response missing uid".into()))
+        .ok_or_else(|| StorageError::Unavailable("uinfo response missing uk".into()))
 }
 
 /// GET `method=list&dir=<abs>`——depth-1 条目（无分页参数，见模块文档）。
