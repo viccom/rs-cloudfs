@@ -2,8 +2,12 @@
 //!
 //! B1 范围：crate 骨架、oauth 刷新状态机（K13）、HTTP client（spike
 //! `examples/baidu_spike` 改造复用）、errno 映射表（mock 钉死）与
-//! StorageDriver **元数据面**（list/stat/mkdir/delete/rename/quota）；
-//! writer/reader 返回 `Unsupported` 占位（Batch B2 接上传/下载）。
+//! StorageDriver **元数据面**（list/stat/mkdir/delete/rename/quota）。
+//!
+//! B2 进行中（红阶段已立测试契约）：writer 接三步曲上传（precreate
+//! rtype=3 / superfile2 4MiB 分片 / create + K7 差集续传会话）、reader 接
+//! 下载器（dlink 缓存 K8 + 4MiB 有界 Range）；当前 writer/reader 仍为
+//! `Unsupported` 占位。
 //!
 //! 卷身份：`baidu:<uid>`（uinfo 取 uid，K5）；句柄 = fs_id 十进制字符串
 //! （跨 rename 稳定，PCFS api.go:170-171 先例）。
@@ -19,6 +23,7 @@ mod client;
 mod driver;
 mod oauth;
 
+use std::path::PathBuf;
 use std::sync::Arc;
 
 use cloudkit_storage::StorageError;
@@ -30,6 +35,13 @@ pub use oauth::TokenStore;
 pub const DEFAULT_API_BASE: &str = "https://pan.baidu.com";
 /// 生产 OAuth base（openapi.baidu.com；spike api.rs:13 同值）。
 pub const DEFAULT_OAUTH_BASE: &str = "https://openapi.baidu.com";
+/// 生产 PCS base——superfile2 分片上传端点所在域（spike api.rs:14 /
+/// PCFS api.go:522 同值；独立于 pan.baidu.com，测试经 `pcs_base` 注入
+/// mock 后端）。
+pub const DEFAULT_PCS_BASE: &str = "https://d.pcs.baidu.com";
+/// dlink 缓存 TTL 缺省（秒，K8：spike 附录 B 实测下界 ≥96min，取 60min
+/// 保守值；403/31326 两段 fallback 兜底过期残余）。
+pub const DEFAULT_DLINK_TTL_SECS: u64 = 3600;
 /// 卷根缺省（K17：config 键 `baidu_root` 的默认值）。
 pub const DEFAULT_ROOT: &str = "/apps/cloudfs";
 
@@ -57,6 +69,40 @@ pub struct BaiduParams {
     pub api_base: String,
     pub oauth_base: String,
     pub token_store: Option<Arc<dyn TokenStore>>,
+    /// K7 会话表根目录：上传会话（path/size/block_md5/uploadid/完成位图）
+    /// 随分片完成即刻落盘于 `<sessions_dir>/baidu_state/sessions/<hash>.json`，
+    /// 供中断/进程重启后差集续传（Batch B2 契约，`tests/upload_resume.rs`
+    /// 钉死）。`None` = 纯内存会话——单进程内的 stager 丢弃→重建恢复仍
+    /// 可用（conformance ⑦形态），跨进程恢复不可用。
+    pub sessions_dir: Option<PathBuf>,
+    /// dlink 缓存 TTL（秒）；`None` = 缺省 3600（K8）。测试注入短 TTL 钉
+    /// 过期重取腿（`tests/dlink_cache.rs`）。
+    pub dlink_ttl_secs: Option<u64>,
+    /// superfile2 端点 base；`None` = 生产常量 `d.pcs.baidu.com`（PCS 域
+    /// 独立于 api_base——mock 后端经此注入单一 base URL）。
+    pub pcs_base: Option<String>,
+}
+
+impl Default for BaiduParams {
+    /// 凭据空置、base/root 取生产常量、可选注入位全 `None`。
+    ///
+    /// 意图：B2 起新增字段优先 Option 形态 + Default 补齐，既有构造点用
+    /// `..Default::default()` 吸收字段扩散（B2 测试基建约定）。
+    fn default() -> Self {
+        BaiduParams {
+            app_key: String::new(),
+            app_secret: String::new(),
+            access_token: None,
+            refresh_token: None,
+            root: DEFAULT_ROOT.to_string(),
+            api_base: DEFAULT_API_BASE.to_string(),
+            oauth_base: DEFAULT_OAUTH_BASE.to_string(),
+            token_store: None,
+            sessions_dir: None,
+            dlink_ttl_secs: None,
+            pcs_base: None,
+        }
+    }
 }
 
 impl BaiduParams {
@@ -74,6 +120,9 @@ impl BaiduParams {
             api_base: DEFAULT_API_BASE.to_string(),
             oauth_base: DEFAULT_OAUTH_BASE.to_string(),
             token_store: None,
+            sessions_dir: None,
+            dlink_ttl_secs: None,
+            pcs_base: None,
         }
     }
 }

@@ -586,7 +586,10 @@ fn pattern(n: usize) -> Vec<u8> {
     let mut x = 0x2Fu8;
     (0..n)
         .map(|i| {
-            x = x.wrapping_mul(31).wrapping_add(i as u8 + 7);
+            // wrapping：`i as u8 + 7` 在 i>248 时 debug 溢出 panic——分块
+            // 驱动（如 baidu 4MiB）的 N 覆盖必然触发；i≤248 与朴素形态值
+            // 恒等（零语义漂移，B2 发现的套件基建修复）。
+            x = x.wrapping_mul(31).wrapping_add((i as u8).wrapping_add(7));
             x
         })
         .collect()

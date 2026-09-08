@@ -46,3 +46,8 @@ axum = { version = "=0.8.9", default-features = false, features = [
 ] }
 # mock 监听（net）+ #[tokio::test]（rt/macros）。
 tokio = { version = "1", features = ["rt", "macros", "net"] }
+# B2 下载/续传测试消费 ByteStream（reader 读回比对；cloudkit-storage
+# conformance 套件同款最小特性集）。
+futures-util = { version = "0.3", default-features = false }
+# K7 会话表根目录（upload_resume 差集续传测试注入临时目录）。
+tempfile = "3"
