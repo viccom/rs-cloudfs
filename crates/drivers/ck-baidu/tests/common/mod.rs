@@ -174,6 +174,10 @@ struct MockState {
     dead_uploads: BTreeMap<String, i64>,
     /// 秒传路径集（precreate 命中 → return_type=2 + fs_id 直接收尾）。
     instant_paths: BTreeSet<String>,
+    /// 索引传播延迟注入：下一次 method=meta 顶 -9（一次性；真网实证
+    /// create 后 meta 单点查询短暂不可见而 list 即时——close 的 list
+    /// 兜底路径的触发面）。
+    fail_next_meta: bool,
     // --- B2 下载链路 ---
     /// mock 自身 base（302 Location 绝对 URL 拼接）。
     base_url: String,
@@ -213,6 +217,7 @@ impl MockBaidu {
             next_uploadid: 0,
             dead_uploads: BTreeMap::new(),
             instant_paths: BTreeSet::new(),
+            fail_next_meta: false,
             base_url: String::new(), // 占位，bind 后回填
             mock_clock: now,
             cdn_mode: CdnAuthMode::Direct,
@@ -328,6 +333,12 @@ impl MockBaidu {
             .unwrap()
             .instant_paths
             .insert(path.to_string());
+    }
+
+    /// 注入索引传播延迟：下一次 method=meta 顶 -9（一次性；见
+    /// [`MockState::fail_next_meta`]——真网 2026-09-08 实证形态）。
+    pub fn fail_next_meta(&self) {
+        self.state.lock().unwrap().fail_next_meta = true;
     }
 
     /// 注入会话死亡：该 uploadid 的**下一分片**返回非 0 error_code
@@ -569,6 +580,13 @@ async fn xpan_file(
             Json(json!({"errno": 0, "list": list})).into_response()
         }
         ("GET", "meta") => {
+            {
+                let mut st = state.lock().unwrap();
+                if st.fail_next_meta {
+                    st.fail_next_meta = false;
+                    return errno_json(-9);
+                }
+            }
             let st = state.lock().unwrap();
             let found = if let Some(fs_ids) = qp("fs_ids") {
                 // 形态 "[<id>,…]"（PCFS api.go:176-179）

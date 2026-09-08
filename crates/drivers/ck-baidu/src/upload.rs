@@ -514,8 +514,16 @@ impl BaiduStager {
 
     /// Entry 构造（fs_id → meta 取 server_mtime/kind/size；断言①
     /// mtime>0 的来源——后端入树时间戳）。
+    ///
+    /// 真网实证（2026-09-08）：create 成功后立即 meta 单点查询可能短暂
+    /// -9（索引传播延迟；上传本体已成功），而 list 即时可见（spike §6）。
+    /// close 不能因延迟失败——meta `NotFound` 时以父目录 list 兜底。
     async fn entry_for(&self, fs_id: i64) -> Result<Entry, StorageError> {
-        let remote = api::meta_by_fs_id(&self.client, &fs_id.to_string()).await?;
+        let remote = match api::meta_by_fs_id(&self.client, &fs_id.to_string()).await {
+            Ok(remote) => remote,
+            Err(StorageError::NotFound) => self.list_lookup(fs_id).await?,
+            Err(e) => return Err(e),
+        };
         Ok(Entry {
             id: EntryId::new(self.volume.clone(), BackendHandle::new(fs_id.to_string())),
             path: self.rel.clone(),
@@ -527,6 +535,19 @@ impl BaiduStager {
             size: remote.size.max(0) as u64,
             mtime: remote.server_mtime as f64,
         })
+    }
+
+    /// list 兜底（meta 索引延迟时）：父目录 depth-1 列举按 fs_id 定位。
+    async fn list_lookup(&self, fs_id: i64) -> Result<api::RemoteEntry, StorageError> {
+        let parent = match self.abs.rfind('/') {
+            Some(0) | None => "/".to_string(),
+            Some(i) => self.abs[..i].to_string(),
+        };
+        let entries = api::list(&self.client, &parent).await?;
+        entries
+            .into_iter()
+            .find(|e| e.fs_id == fs_id)
+            .ok_or(StorageError::NotFound)
     }
 
     /// close 的统一收尾循环：兜底装备（空文件/无承诺/防御路径——到齐

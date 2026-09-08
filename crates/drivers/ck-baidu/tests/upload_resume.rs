@@ -448,3 +448,31 @@ async fn writer_on_existing_directory_path_is_invalid() {
         "目标路径是已存在目录 → Invalid（trait 契约）"
     );
 }
+
+/// close 的 Entry 构造必须存活「索引传播延迟」（真网 2026-09-08 实证：
+/// create 成功后立即 meta by fs_id 可能短暂 -9——上传本体已成功；list
+/// 即时可见，spike §6）。meta NotFound → 父目录 list 兜底，close 不失败。
+#[tokio::test]
+async fn close_survives_meta_propagation_delay_via_list_fallback() {
+    let (mock, _base) = MockBaidu::start().await;
+    mock.seed_dir(MOCK_ROOT);
+    let driver = driver_with_sessions(&mock, None).await;
+
+    let data = pattern_bytes(CHUNK_4M + 11);
+    let path = RelPath::new("delay.bin").expect("rel path");
+    let mut stager = driver
+        .writer(&path, &hint_for(data.len()))
+        .await
+        .expect("writer 打开");
+    stager.write(&data).await.expect("write 到齐");
+    // 注入：close 的 entry_for 所发 meta 顶 -9（一次性消费；此时 create
+    // 已成功、文件已在 mock 树中——精确复刻真网延迟形态）。
+    mock.fail_next_meta();
+    let entry = stager.close().await.expect("close 必须存活索引延迟");
+
+    assert_eq!(entry.kind, EntryKind::File);
+    assert_eq!(entry.size, data.len() as u64);
+    // list 兜底路径拿到的 fs_id/mtime 有效：reader 可回读。
+    let got = read_all(&driver, &entry).await;
+    assert_eq!(got, data, "兜底 Entry 的句柄可回读全量内容");
+}
