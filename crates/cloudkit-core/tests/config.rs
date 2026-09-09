@@ -236,6 +236,7 @@ fn toml_roundtrip_preserves_full_config() {
         baidu_access_token: None,
         baidu_refresh_token: None,
         local_root: None,
+        volumes_dir: None,
     };
 
     cfg.save_toml(&path).expect("save_toml");

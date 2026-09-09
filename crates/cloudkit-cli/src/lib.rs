@@ -43,7 +43,7 @@ use ck_telegram::config::{
 };
 use ck_telegram::transport::GrammersTransport;
 use cloudkit_core::cache::CacheManager;
-use cloudkit_core::config::{Backend, CyDriveConfig};
+use cloudkit_core::config::{Backend, CyDriveConfig, VolumeConfig};
 use cloudkit_core::credentials::{
     CredentialStore, InMemoryStore, BOT_TOKEN, ENCRYPTION_PASSWORD, SERVICE,
 };
@@ -1952,6 +1952,116 @@ pub fn discover_config_with_store(store: &dyn CredentialStore) -> Result<CyDrive
         "no config found in the current directory: write a config.toml (or a legacy \
          Python config.json) with bot_token and chat_id, then run cydrive again"
     )
+}
+
+/// The [`discover_config_with_volumes`] outcome (Phase 2.5 / MV0):
+/// single-volume mode keeps returning a plain [`CyDriveConfig`]
+/// (byte-identical chain), multi-volume mode returns the process
+/// config plus the discovered volume manifest.
+#[derive(Debug)]
+pub enum DiscoveredConfig {
+    /// `volumes_dir` absent — the one-config-is-one-drive status quo.
+    Single(CyDriveConfig),
+    /// `volumes_dir` set — `process` holds the process-scoped config,
+    /// `volumes` the per-volume files in stable name order.
+    Multi {
+        /// The process-level `config.toml` (process-scoped keys only).
+        process: CyDriveConfig,
+        /// The volume manifest, in file-name order ([`VolumeConfig`]).
+        volumes: Vec<VolumeConfig>,
+    },
+}
+
+/// Volume-aware sibling of [`discover_config`] (Phase 2.5 / MV0): when
+/// the process `config.toml` sets `volumes_dir`, loads and validates the
+/// whole volume set (mixing guard, volumes directory, per-volume parse,
+/// drive-letter conflicts) and returns [`DiscoveredConfig::Multi`];
+/// otherwise the existing single-volume chain applies unchanged.
+pub fn discover_config_with_volumes() -> Result<DiscoveredConfig> {
+    let store: Box<dyn CredentialStore> = match KeyringStore::new() {
+        Ok(store) => Box::new(store),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "OS credential store unavailable; continuing without keyring backfill"
+            );
+            Box::new(InMemoryStore::new())
+        }
+    };
+    discover_config_with_volumes_and_store(store.as_ref())
+}
+
+/// [`discover_config_with_volumes`] with the credential store injected
+/// (tests pass an [`InMemoryStore`]). In multi-volume mode the store
+/// backfill and the `CYDRIVE_*` overrides are **not** applied — the
+/// process config carries no credentials, and global env overrides
+/// would cross-wire volume settings across volumes, so they are ignored
+/// with a tracing note (K28). The per-volume credential resolution
+/// chain (env > file > keyring at driver-resolve time) is unchanged.
+pub fn discover_config_with_volumes_and_store(
+    store: &dyn CredentialStore,
+) -> Result<DiscoveredConfig> {
+    let toml_path = Path::new("config.toml");
+    if toml_path.exists() {
+        let (cfg, raw_keys) = CyDriveConfig::load_toml_with_keys(toml_path)
+            .with_context(|| format!("loading {}", toml_path.display()))?;
+        if let Some(volumes_dir) = cfg.volumes_dir.clone() {
+            tracing::info!(
+                volumes_dir = %volumes_dir,
+                "multi-volume mode: CYDRIVE_* environment overrides are ignored (K28); \
+                 per-volume settings come from the volume files"
+            );
+            cloudkit_core::config::ensure_no_volume_keys_in_process(&raw_keys)
+                .context("multi-volume config.toml mixes process- and volume-scoped keys")?;
+            cfg.validate()
+                .context("invalid process-level configuration")?;
+            let volumes = cloudkit_core::config::load_volumes(Path::new(&volumes_dir))
+                .with_context(|| format!("loading volumes from {volumes_dir:?}"))?;
+            return Ok(DiscoveredConfig::Multi {
+                process: cfg,
+                volumes,
+            });
+        }
+        return Ok(DiscoveredConfig::Single(
+            cfg.with_credential_backfill(store).with_env_overrides(),
+        ));
+    }
+    let legacy_path = Path::new("config.json");
+    if legacy_path.exists() {
+        let cfg = CyDriveConfig::load_legacy_json(legacy_path)
+            .with_context(|| format!("loading legacy {}", legacy_path.display()))?;
+        return Ok(DiscoveredConfig::Single(
+            cfg.with_credential_backfill(store).with_env_overrides(),
+        ));
+    }
+    anyhow::bail!(
+        "no config found in the current directory: write a config.toml (or a legacy \
+         Python config.json) with bot_token and chat_id, then run cydrive again"
+    )
+}
+
+/// MV0 gate for the production `run` flow: multi-volume assembly ships
+/// in MV1, so a multi-volume discovery must fail with an explicit,
+/// actionable error here — never reach the single-volume assembly and
+/// never panic. Single-volume discoveries pass through unchanged.
+pub fn ensure_single_volume(discovered: DiscoveredConfig) -> Result<CyDriveConfig> {
+    match discovered {
+        DiscoveredConfig::Single(cfg) => Ok(cfg),
+        DiscoveredConfig::Multi { process, volumes } => {
+            let names = volumes
+                .iter()
+                .map(|volume| volume.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ");
+            anyhow::bail!(
+                "multi-volume assembly is not enabled in this build (MV1): config.toml sets \
+                 volumes_dir = {:?} with {} volume(s) [{names}] — remove `volumes_dir` to \
+                 run single-volume, or use a build with Phase 2.5 MV1 volume assembly",
+                process.volumes_dir,
+                volumes.len(),
+            )
+        }
+    }
 }
 
 /// The `migrate` subcommand body (M5): import a legacy Python

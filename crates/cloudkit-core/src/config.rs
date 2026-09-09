@@ -24,7 +24,7 @@
 //!   runtime concern elsewhere.
 
 use std::fs;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use crate::credentials::{CredentialStore, BOT_TOKEN, ENCRYPTION_PASSWORD, SERVICE};
 
@@ -61,7 +61,9 @@ pub enum ConfigError {
 /// Every field name [`CyDriveConfig`] accepts in `config.toml` — the
 /// schema-strict key set [`CyDriveConfig::load_toml`] enforces (an unknown
 /// key is a [`ConfigError::Parse`], catching typos in the canonical format).
-const KNOWN_TOML_KEYS: &[&str] = &[
+/// Public (Phase 2.5 / MV0) so the key-partition tests can pin the exact
+/// bipartition into [`PROCESS_SCOPED_KEYS`] and [`VOLUME_SCOPED_KEYS`].
+pub const KNOWN_TOML_KEYS: &[&str] = &[
     "bot_token",
     "chat_id",
     "api_id",
@@ -96,6 +98,7 @@ const KNOWN_TOML_KEYS: &[&str] = &[
     "baidu_access_token",
     "baidu_refresh_token",
     "local_root",
+    "volumes_dir",
 ];
 
 /// Numeric fields for which legacy JSON additionally accepts a numeric
@@ -131,6 +134,7 @@ const LEGACY_REJECTED_KEYS: &[&str] = &[
     "baidu_access_token",
     "baidu_refresh_token",
     "local_root",
+    "volumes_dir",
 ];
 
 /// Client-side encryption container scheme (Batch E / E-4, foundation D7).
@@ -207,6 +211,271 @@ impl Backend {
             Backend::Local => "local",
         }
     }
+}
+
+/// Process-scoped keys (Phase 2.5 / K19): the settings one process
+/// shares across all volumes — the WebDAV/Web UI endpoints, the
+/// dashboard switch and the `volumes_dir` itself. Together with
+/// [`VOLUME_SCOPED_KEYS`] this bipartitions [`KNOWN_TOML_KEYS`] exactly
+/// (no overlap, full coverage — pinned by tests).
+pub const PROCESS_SCOPED_KEYS: &[&str] = &[
+    "volumes_dir",
+    "webdav_host",
+    "webdav_port",
+    "web_ui_host",
+    "web_ui_port",
+    "enable_web_ui",
+];
+
+/// Volume-scoped keys (Phase 2.5 / K19): everything a single storage
+/// volume owns — the backend selector, all driver parameters and
+/// credentials, the encryption group, db/cache/queue tuning, the drive
+/// letter/mount keys and the sync group. Legal in a volume file; a
+/// multi-volume process-level `config.toml` carrying any of them is a
+/// mixing error (see [`ensure_no_volume_keys_in_process`]).
+pub const VOLUME_SCOPED_KEYS: &[&str] = &[
+    "bot_token",
+    "chat_id",
+    "api_id",
+    "api_hash",
+    "storage_path",
+    "cache_path",
+    "db_path",
+    "drive_letter",
+    "auto_mount_drive",
+    "mount_point",
+    "chunk_size_mb",
+    "cache_limit_gb",
+    "upload_workers",
+    "queue_capacity",
+    "hydrate_timeout_secs",
+    "encryption_password",
+    "enable_encryption",
+    "encryption_scheme",
+    "proxy_url",
+    "sync_url",
+    "sync_secret",
+    "sync_interval_secs",
+    "backend",
+    "baidu_root",
+    "baidu_app_key",
+    "baidu_app_secret",
+    "baidu_access_token",
+    "baidu_refresh_token",
+    "local_root",
+];
+
+/// One discovered volume: a `<name>.toml` file under the volumes
+/// directory (Phase 2.5 / K19), parsed through the same strict schema
+/// surface as `config.toml` but restricted to [`VOLUME_SCOPED_KEYS`].
+///
+/// Relative paths inside `settings` (db/cache/local_root/...) stay
+/// **raw** at this layer — no absolutisation happens here. The assembly
+/// layer (MV1 / K21) resolves them against the per-volume directory;
+/// [`Self::base_dir`] (the volume file's own directory, i.e. the
+/// volumes dir) is carried so that resolution has its anchor.
+#[derive(Debug, Clone, PartialEq)]
+pub struct VolumeConfig {
+    /// Volume name — the file stem, validated against
+    /// `^[a-z][a-z0-9_-]{0,31}$`.
+    pub name: String,
+    /// The volume file's path on disk.
+    pub file_path: PathBuf,
+    /// The volume file's directory (the volumes dir) — the anchor for
+    /// the MV1/K21 per-volume path resolution.
+    pub base_dir: PathBuf,
+    /// The volume-scoped key subset, parsed with the same surface and
+    /// defaults as `config.toml` (process-scoped keys are rejected).
+    pub settings: CyDriveConfig,
+}
+
+/// `true` for exactly `^[a-z][a-z0-9_-]{0,31}$` — a lowercase ASCII
+/// letter first, then lowercase letters/digits/`_`/`-`, at most 32
+/// characters (K19; the name doubles as the URL segment, the mount
+/// label and the dashboard tab, so it stays a conservative slug).
+fn is_valid_volume_name(name: &str) -> bool {
+    let bytes = name.as_bytes();
+    match bytes.first() {
+        Some(&first) if first.is_ascii_lowercase() => {}
+        _ => return false,
+    }
+    bytes.len() <= 32
+        && bytes[1..]
+            .iter()
+            .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
+}
+
+/// Loads a single volume file (Phase 2.5 / K19). The volume name is the
+/// file stem; the body accepts exactly the [`VOLUME_SCOPED_KEYS`] subset
+/// of the strict `config.toml` surface (unknown keys rejected with the
+/// same wording) — a process-scoped key is rejected with guidance
+/// pointing back at `config.toml`.
+///
+/// No path absolutisation happens here (see [`VolumeConfig`]); the
+/// settings validate through the same parse-time type checks as
+/// `config.toml` (wrong-typed values, unknown enum variants), while the
+/// full cross-field [`CyDriveConfig::validate`] run belongs to the
+/// assembly layer, after the credential chain has resolved.
+pub fn load_volume_config(path: &Path) -> Result<VolumeConfig, ConfigError> {
+    let path_str = path_as_str(path);
+    let name = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "invalid volume file {path_str}: the file name must be valid UTF-8"
+            ))
+        })?
+        .to_string();
+    if !is_valid_volume_name(&name) {
+        return Err(ConfigError::Invalid(format!(
+            "invalid volume name `{name}`: volume names must match \
+             ^[a-z][a-z0-9_-]{{0,31}}$ (a lowercase letter first, then lowercase \
+             letters/digits/`_`/`-`, at most 32 characters) — rename the volume \
+             file {path_str}"
+        )));
+    }
+    let text = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        path: path_str.clone(),
+        source,
+    })?;
+    let table: toml::Table = toml::from_str(&text).map_err(|err| ConfigError::Parse {
+        path: path_str.clone(),
+        message: err.to_string(),
+    })?;
+    for key in table.keys() {
+        if PROCESS_SCOPED_KEYS.contains(&key.as_str()) {
+            return Err(ConfigError::Parse {
+                path: path_str,
+                message: format!(
+                    "key `{key}` is a process-level setting and belongs in config.toml, \
+                     not in a volume file — remove it from this file"
+                ),
+            });
+        }
+        if !KNOWN_TOML_KEYS.contains(&key.as_str()) {
+            return Err(ConfigError::Parse {
+                path: path_str,
+                message: format!("unknown key `{key}`"),
+            });
+        }
+    }
+    let settings: CyDriveConfig = table.try_into().map_err(|err| ConfigError::Parse {
+        path: path_str,
+        message: err.to_string(),
+    })?;
+    let base_dir = match path.parent() {
+        Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
+        _ => PathBuf::from("."),
+    };
+    Ok(VolumeConfig {
+        name,
+        file_path: path.to_path_buf(),
+        base_dir,
+        settings,
+    })
+}
+
+/// Lists the `*.toml` volume files in `dir` (non-recursive), sorted
+/// stably by file name (K19). A missing directory and a directory with
+/// no volume files are both actionable errors — an empty multi-volume
+/// process has nothing to serve and must not silently degrade.
+pub fn discover_volumes(dir: &Path) -> Result<Vec<PathBuf>, ConfigError> {
+    if !dir.is_dir() {
+        return Err(ConfigError::Invalid(format!(
+            "volumes directory `{dir}` does not exist (or is not a directory): create it \
+             and add one `<name>.toml` file per volume, or remove `volumes_dir` from \
+             config.toml to run single-volume",
+            dir = dir.display(),
+        )));
+    }
+    let mut entries: Vec<(String, PathBuf)> = Vec::new();
+    for entry in fs::read_dir(dir)? {
+        let entry = entry?;
+        if !entry.file_type().map(|t| t.is_file()).unwrap_or(false) {
+            continue; // directories (even `*.toml`-named) and links are not volumes
+        }
+        let path = entry.path();
+        if path.extension().and_then(|ext| ext.to_str()) != Some("toml") {
+            continue;
+        }
+        entries.push((entry.file_name().to_string_lossy().into_owned(), path));
+    }
+    if entries.is_empty() {
+        return Err(ConfigError::Invalid(format!(
+            "volumes directory `{dir}` contains no *.toml volume files: add one \
+             `<name>.toml` per volume, or remove `volumes_dir` from config.toml to \
+             run single-volume",
+            dir = dir.display(),
+        )));
+    }
+    entries.sort_by(|a, b| a.0.cmp(&b.0));
+    Ok(entries.into_iter().map(|(_, path)| path).collect())
+}
+
+/// Canonical comparison form of a drive letter: uppercase without the
+/// optional trailing `':'` (`"v"`, `"V"` and `"V:"` all collide — the
+/// mounter canonicalises the same way). Shape validation stays with
+/// [`CyDriveConfig::validate`]; this only groups spellings for the
+/// conflict check.
+fn normalize_drive_letter(letter: &str) -> String {
+    letter.trim_end_matches(':').to_ascii_uppercase()
+}
+
+/// Loads every volume under `dir` (discovery + per-file parse) and
+/// validates the cross-volume rules: no two volumes may mount the same
+/// `drive_letter` (K27 — spelling differences like `"V"` vs `"v:"`
+/// normalise to the same letter and still collide). The returned order
+/// is the stable file-name order of [`discover_volumes`].
+///
+/// Duplicate volume names cannot occur with the single `.toml`
+/// extension: two files in one directory cannot share a stem. Should a
+/// second extension ever be accepted, name uniqueness needs its own
+/// guard here.
+pub fn load_volumes(dir: &Path) -> Result<Vec<VolumeConfig>, ConfigError> {
+    let mut volumes = Vec::new();
+    let mut mounted: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
+    for path in discover_volumes(dir)? {
+        let volume = load_volume_config(&path)?;
+        let letter = normalize_drive_letter(&volume.settings.drive_letter);
+        if let Some(other) = mounted.get(&letter) {
+            return Err(ConfigError::Invalid(format!(
+                "drive_letter conflict: volumes `{other}` and `{}` both mount drive \
+                 `{letter}` — give each volume its own drive_letter in its volume file \
+                 ({})",
+                volume.name,
+                volume.file_path.display(),
+            )));
+        }
+        mounted.insert(letter, volume.name.clone());
+        volumes.push(volume);
+    }
+    Ok(volumes)
+}
+
+/// Mixing guard (K19): in multi-volume mode the process-level
+/// `config.toml` must carry **no** volume-scoped key. `keys` are the raw
+/// TOML table keys of the process config (presence semantics — an
+/// explicit `backend` counts even though its parsed value has a
+/// default), so `Ok(())` means the process file is clean.
+pub fn ensure_no_volume_keys_in_process(keys: &[String]) -> Result<(), ConfigError> {
+    let offending: Vec<&str> = keys
+        .iter()
+        .map(String::as_str)
+        .filter(|key| VOLUME_SCOPED_KEYS.contains(key))
+        .collect();
+    if offending.is_empty() {
+        return Ok(());
+    }
+    let listed = offending
+        .iter()
+        .map(|key| format!("`{key}`"))
+        .collect::<Vec<_>>()
+        .join(", ");
+    Err(ConfigError::Invalid(format!(
+        "multi-volume config.toml must not contain volume-scoped keys: found {listed} — \
+         move them into the per-volume `<name>.toml` files under the volumes_dir directory"
+    )))
 }
 
 /// Default `upload_workers` (tier-1 contract C6).
@@ -402,6 +671,15 @@ pub struct CyDriveConfig {
     /// inert otherwise. No env route (K17 names env overrides for the
     /// four baidu keys only).
     pub local_root: Option<String>,
+    /// Volumes directory (Phase 2.5 / K19), relative to the process
+    /// working directory: one `<name>.toml` file per storage volume
+    /// (see [`load_volume_config`]). `None` — the default — means
+    /// single-volume mode: every pre-Phase-2.5 behaviour is
+    /// byte-compatible. When set, the process-level `config.toml` may
+    /// carry only [`PROCESS_SCOPED_KEYS`] (mixing is a validation
+    /// error) and the directory must exist and hold at least one
+    /// volume file.
+    pub volumes_dir: Option<String>,
 }
 
 impl Default for CyDriveConfig {
@@ -444,6 +722,7 @@ impl Default for CyDriveConfig {
             baidu_access_token: None,
             baidu_refresh_token: None,
             local_root: None,
+            volumes_dir: None,
         }
     }
 }
@@ -458,6 +737,15 @@ impl CyDriveConfig {
     ///   schema-strict, unlike the legacy JSON).
     /// * Creates nothing, mounts nothing — pure load.
     pub fn load_toml(path: &Path) -> Result<Self, ConfigError> {
+        Self::load_toml_with_keys(path).map(|(config, _keys)| config)
+    }
+
+    /// [`Self::load_toml`] plus the raw key set the file actually
+    /// contains (Phase 2.5 / K19). Presence semantics matter for keys
+    /// whose parsed value carries a default (`backend`, `db_path`, ...):
+    /// the multi-volume mixing guard must see an *explicit* key, which
+    /// the deserialised config alone cannot distinguish from a default.
+    pub fn load_toml_with_keys(path: &Path) -> Result<(Self, Vec<String>), ConfigError> {
         let path_str = path_as_str(path);
         let text = fs::read_to_string(path).map_err(|source| ConfigError::Read {
             path: path_str.clone(),
@@ -478,11 +766,12 @@ impl CyDriveConfig {
                 });
             }
         }
+        let keys: Vec<String> = table.keys().cloned().collect();
         let config: CyDriveConfig = table.try_into().map_err(|err| ConfigError::Parse {
             path: path_str,
             message: err.to_string(),
         })?;
-        Ok(config)
+        Ok((config, keys))
     }
 
     /// Serializes `self` to TOML and writes it to `path`, creating missing

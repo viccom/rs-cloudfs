@@ -24,6 +24,7 @@ use anyhow::{Context, Result};
 use ck_telegram::transport::GrammersTransport;
 use clap::{Parser, Subcommand};
 use cloudkit_cli::discover_config;
+use cloudkit_cli::{discover_config_with_volumes, ensure_single_volume};
 use cloudkit_core::config::CyDriveConfig;
 use cloudkit_core::logging::LogConfig;
 use cloudkit_core::rel_path::RelPath;
@@ -535,7 +536,11 @@ async fn run() -> Result<()> {
         env!("CARGO_PKG_VERSION"),
         cwd.display()
     );
-    let cfg = discover_config().context("config discovery failed")?;
+    // Phase 2.5 / MV0: discovery knows the multi-volume shape; the MV0
+    // build only assembles single-volume configs, so a volumes_dir
+    // config stops here with an explicit MV1 pointer (no panic).
+    let cfg =
+        ensure_single_volume(discover_config_with_volumes().context("config discovery failed")?)?;
     cfg.validate().context("invalid configuration")?;
     if cfg.backend == cloudkit_core::config::Backend::Telegram && !cfg.is_configured() {
         anyhow::bail!(
