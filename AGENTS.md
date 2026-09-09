@@ -16,11 +16,11 @@
 6. `docs/tracking/phase0-1.md` —— 当前任务跟踪单（**开工先读、每批收口更新**）
 
 ## 当前阶段
-**Phase 2.5 执行中（2026-09-09，MV0–MV4 完成）**：多卷启用（Volume Registry，方案一裁决）——MV0 配置/发现（volumes_dir + 每卷一文件，K19）→ MV1 Registry 装配（K21 卷主目录隔离/K22 失败可见/K25 单 stop gate）→ MV2 WebDAV 单端口 `/vol/<name>` 前缀路由 + 逐卷挂载（K20 真机探针过、K27）→ MV3 仪表盘多卷（/api/volumes + 卷 tabs + K23 卷参）→ MV4 CLI 运维面（volumes/doctor/status 逐卷 + setup --multi 骨架）+ 文档联动，K19–K28 入档 decisions。**下一步 = MV5 三卷真机 E2E 硬验收（local+telegram+baidu，V/Y/Z）+ 收口 merge main**。前置 Phase 2（0.9.0）完成，telegram E2E 生产 chat 污染已获负责人明示接受（§7a 例外）。过渡测试包：E:\Rs_Codes\cydrive-0.8.0-testkit（telegram+加密 U:/V:，仓外不入库）。
+**Phase 2.5 完成（2026-09-09，0.10.0）**：多卷启用（Volume Registry，方案一裁决）——MV0 配置/发现（volumes_dir + 每卷一文件，K19）→ MV1 Registry 装配（K21 卷主目录隔离/K22 失败可见/K25 单 stop gate）→ MV2 WebDAV 单端口 `/vol/<name>` 前缀路由 + 逐卷挂载（K20 真机探针过、K27）→ MV3 仪表盘多卷（/api/volumes + 卷 tabs + K23 卷参）→ MV4 CLI 运维面（volumes/doctor/status 逐卷 + setup --multi 骨架）+ 文档联动，K19–K28 入档 decisions。**三卷真机 E2E 全过（单进程 V:local加密+Y:tg+Z:baidu、单端口 /vol/<name>、单仪表盘 tabs/汇总、stop 全停）**，feat/phase2-5 收口 merge main。前置 Phase 2（0.9.0）完成，telegram E2E 生产 chat 污染已获负责人明示接受（§7a 例外）。过渡测试包：E:\Rs_Codes\cydrive-0.8.0-testkit（telegram+加密 U:/V:，仓外不入库）。
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 740 测试（0.9.0+web 适配批；ignored 9 = 真机 3(baidu) + 平台/真机类 6）
+cargo test --workspace --no-fail-fast            # 807 测试（0.10.0+Phase 2.5 多卷批；ignored 9 = 真机/平台类）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 scripts/check_layers                             # R1 层依赖门禁（CI 同款；动 Cargo.toml 依赖后必跑）

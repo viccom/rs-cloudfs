@@ -581,3 +581,29 @@ fn stop_resolves_the_same_process_control_file_in_multi_mode() {
         control.display()
     );
 }
+
+/// `baidu_root` is a backend namespace path (validate demands a leading
+/// `/`), not a filesystem path: on Windows `Path::is_absolute()` is
+/// false for "/apps/x", so the K21 rebase used to mangle it into
+/// `<home>/apps/x` — a baidu volume could never boot. The resolution
+/// must pass it through verbatim while the fs-path keys still rebase.
+#[test]
+fn resolve_volume_settings_keeps_baidu_root_verbatim() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("b.toml"),
+        "backend = \"baidu\"\nbaidu_root = \"/apps/cloudfs-demo\"\n",
+    );
+    let volumes = cloudkit_core::config::load_volumes(dir.path()).expect("load volumes");
+    let resolved = resolve_volume_settings(&volumes[0]).expect("K21 resolution");
+    assert_eq!(
+        resolved.baidu_root, "/apps/cloudfs-demo",
+        "baidu_root is a backend path and never rebases"
+    );
+    // The fs-path keys still land in the volume home (K21).
+    assert!(
+        resolved.db_path.contains("b"),
+        "db rebases: {}",
+        resolved.db_path
+    );
+}

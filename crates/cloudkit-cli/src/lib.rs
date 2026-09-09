@@ -853,12 +853,16 @@ fn resolve_volume_path(home: &Path, raw: &str) -> PathBuf {
 }
 
 /// Resolves a volume spec's path-carrying settings against its home
-/// directory (K21) and creates the home directory when missing: db_path,
-/// cache_path, local_root and baidu_root all rebase onto
+/// directory (K21) and creates the home directory when missing: the
+/// **filesystem** keys (db_path, cache_path, local_root) rebase onto
 /// `<volumes_dir>/<name>/` when the volume file leaves them relative —
 /// the defaults keep their file names but land inside the volume home.
-/// Idempotent: already-absolute paths pass through untouched, so the
-/// production dispatch may resolve first and the assembly resolve again.
+/// `baidu_root` is NOT one of them: it is a backend namespace path
+/// (validate demands a leading `/`), and on Windows
+/// `Path::is_absolute()` is false for "/apps/x", so rebasing would
+/// mangle it into `<home>/apps/x`. Idempotent: already-absolute fs
+/// paths pass through untouched, so the production dispatch may resolve
+/// first and the assembly resolve again.
 pub fn resolve_volume_settings(spec: &VolumeConfig) -> Result<CyDriveConfig> {
     let home = volume_home(spec)?;
     std::fs::create_dir_all(&home)
@@ -877,9 +881,6 @@ pub fn resolve_volume_settings(spec: &VolumeConfig) -> Result<CyDriveConfig> {
                 .into_owned(),
         );
     }
-    settings.baidu_root = resolve_volume_path(&home, &settings.baidu_root)
-        .to_string_lossy()
-        .into_owned();
     Ok(settings)
 }
 
