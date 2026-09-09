@@ -440,3 +440,13 @@
 - **远端卫生**：全轮测试/探针遗留已清（cloudfs-b2 零条目复查）；/apps/privatefs 全程未触碰；cloudfs-b2 保留为测试根空壳。
 - **待负责人**：① 正式 appkey 到位后复测 meta 权限（31300 消失则可回切 meta 直查省流量）；② K10 复核项销账建议（rtype=3 真机通过）。
 - **验证**：workspace 671 passed 0 failed（9 ignored 含真机 3+既有 6）；clippy/fmt/check_layers（11 manifests）/scan_secrets 全过。
+
+## 2026-09-09 Batch B3a+B3b 收口：组合根三后端接线完成（K1–K4/K11/K12/K17/K18 落地）
+
+- **B3a（933f45e 红 → 8f96b07 绿）**：句柄 i32→i64（DB↔transport 同宽直通，narrow_msg_id 删除；ck-telegram 边界 i64::from 上行/try_from 显式收窄下行）+ RemoteHandle.path（hydrate 填 Some，telegram/mock None 零变化）+ delete_remote(&RemoteHandle)。断言漂移审计 = 非机械改动 0（38 处机械面逐项留档）；伴生语义 = mock delete 多 chunk all-or-nothing（单 chunk 与旧语义等价）。
+- **B3b 段一**：Capabilities 第 10 位 remote_delete（local/baidu=true，telegram/mock=false）；双驱动 CloudTransport 面（ck-local 路径寻址 K2/K6、ck-baidu 整文件 4 并发 worker + first_msg_id=fs_id K5 + upload_stream 全缓冲注码 31363 实证）。
+- **B3b 段二a**：K17（backend 枚举缺省 telegram 字节兼容 + 7 键三处同步 + env>file + validate 后端门控文案）；K12（namespace_key_for：telegram 臂黄金向量逐字节钉死护栏、baidu:baidu:uid、local:DefaultHasher 16hex 非安全注码——sync 隔离标识非安全边界且 local 永不启动 sync；is_sync_supported 接线 doctor+任务启动门）；K11（rebuild_from_backend 走 StorageDriver list 面 → upsert is_uploaded=1/chunk_count=1/msg_id 句柄 i64；明文-only 门 + telegram 影子索引拒绝指引 sync；`cydrive rebuild` 子命令）。
+- **B3b 段二b**：K4 删除接线（remote_delete 位门控三面 vfs/webdav/web：先删远端（幂等 NotFound 容错+重试一次）成功后删行+缓存，拒绝保行；telegram/mock false 行为零变化——既有测试原样全绿自证）；dispatch（build_driver 统一收编：telegram GrammersTransport 路径零改动 / baidu factory+TokenStore 桥 CredentialStore（K13 on-arrival）/ local factory；能力横幅九+1 位）；setup baidu 分支（粘贴→refresh_tokens 刷新验证→**新 token 齐备才落 backend 键**（半配置实例防线，段二a 裁决②维持严格 validate）/ local 分支）；doctor（baidu 三态 Alive/NeedsReauth→Fail+setup 指引/Unreachable→Warn+直连提示、local root 检查、K12/K18 尾巴）；K18（baidu/local 恒直连，proxy_url 无效 → 装配日志+doctor 声明）。
+- **WSL 双平台（B3b 单元 6）**：暴露两处 Linux-only lint——linux.rs 未用导入（**继承债**，e6581f9 改名批起，git diff main...HEAD 空自证）与 doctor.rs cfg(windows) 块 mut（cfg_attr 吸收）。WSL 终态 739 passed / 0 failed（win 738+1 平台 cfg 既有差异）+ 双平台 clippy/fmt/check_layers/scan_secrets 全绿。
+- **执行注记**：B3b 段二b 期间子代理额度两次到限切断，进行中实现由主会话接手收尾（clippy 机械修 + doctor 文案补全），实现主体与 TDD 红绿证据链完整。
+- **验证**：workspace win 738 passed / 0 failed / 9 ignored；wsl 739 passed / 0 failed；全门禁绿。
