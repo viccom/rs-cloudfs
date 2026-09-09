@@ -450,3 +450,12 @@
 - **WSL 双平台（B3b 单元 6）**：暴露两处 Linux-only lint——linux.rs 未用导入（**继承债**，e6581f9 改名批起，git diff main...HEAD 空自证）与 doctor.rs cfg(windows) 块 mut（cfg_attr 吸收）。WSL 终态 739 passed / 0 failed（win 738+1 平台 cfg 既有差异）+ 双平台 clippy/fmt/check_layers/scan_secrets 全绿。
 - **执行注记**：B3b 段二b 期间子代理额度两次到限切断，进行中实现由主会话接手收尾（clippy 机械修 + doctor 文案补全），实现主体与 TDD 红绿证据链完整。
 - **验证**：workspace win 738 passed / 0 failed / 9 ignored；wsl 739 passed / 0 failed；全门禁绿。
+
+## 2026-09-09 Batch E2E 收口：baidu/local 硬验收通过 + telegram 腿延后
+
+- **拓扑**：三实例（baidu Z: 8391 / local V: 8393 / baidu 第二实例 8392）+ sync-server 8390，全 OS 临时目录；凭据 env 注入零落盘；/apps/cloudfs-e2e 测试根与 privatefs 隔离（前后列举比对在案）。
+- **全部通过腿**：上传/下载往返（字节等）/Range 半开窗口（字节等）/杀进程续传（200MB 中途 kill：会话 50/50 片落盘、重启 0 重传 + create 收尾、会话作废）/删除→远端消失（K4 真机）/双盘并存/sync 收敛（applied 4 + 墓碑 1；b1↔b2 全字段一致含 msg_id=fs_id——K5 跨实例一致真机实证）/rebuild 等价（D10 ②）。
+- **E2E 检出力**：当场抓出两处装配缺口并修复——① K7 sessions_dir 生产装配漏接（`..Default::default()` 吞掉）；② K12 一次性 `cydrive sync` 没接 baidu 命名空间（周期任务接了一次性命令漏）。均为「测试绿但装配没接」形态——E2E 硬验收的价值实证。
+- **观察项（挂收口/后续）**：① rebuild 与 sync 复制的 chunk_count 簿记差（1 vs 0——upload 队列 persist 对 baidu 单块写 0，rebuild 契约写 1；不影响 hydrate）；② sessions_dir 装配传 `./baidu_state` 与驱动内 `baidu_state/sessions` 拼接形成嵌套路径（功能正确、路径冗余）。
+- **披露**：清理时顺带删除 X:/Y: 两条指向 WebDAV 的历史 net use 死记录（生产实例停机态、记录非数据、run 自动重挂；数据零触碰）。
+- **telegram 腿**：独立测试 chat 未提供 → 延后（tracker 待负责人 #1；非本批失败）。
