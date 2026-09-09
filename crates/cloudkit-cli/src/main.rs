@@ -691,16 +691,28 @@ async fn run_multi_volume(
     let handle = cloudkit_cli::run_multi_with_transports(&process, injections).await?;
     // K29 process-level banner: the volume list with per-volume status;
     // each volume's capability line rides in the boot log (same R-5
-    // declaration as the single-volume banner).
+    // declaration as the single-volume banner). MV2 adds the single
+    // WebDAV endpoint (per-volume path `/vol/<name>`) and the mounted
+    // drive letters (K27) to the same line.
     let listing = handle
         .volumes()
         .iter()
         .map(|(name, status)| format!("{name}:{}", status.as_str()))
         .collect::<Vec<_>>()
         .join(", ");
-    println!(
-        "CyDrive multi-volume is running: {listing}  |  press Ctrl+C to stop  |  or `cydrive stop`"
-    );
+    let mut banner = format!("CyDrive multi-volume is running: {listing}");
+    match handle.webdav_addr() {
+        Some(addr) => banner.push_str(&format!(
+            "  |  WebDAV at http://{addr} (volumes at /vol/<name>)"
+        )),
+        None => banner.push_str("  |  WebDAV unavailable (bind failed; see the log)"),
+    }
+    let letters = handle.mounted_letters();
+    if !letters.is_empty() {
+        banner.push_str(&format!("  |  mounted: {}", letters.join(", ")));
+    }
+    banner.push_str("  |  press Ctrl+C to stop  |  or `cydrive stop`");
+    println!("{banner}");
     let volume_states = handle.volumes();
     let failed: Vec<&(String, VolumeStatus)> = volume_states
         .iter()

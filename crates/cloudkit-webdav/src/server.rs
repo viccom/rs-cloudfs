@@ -16,12 +16,16 @@
 //! - no auth and no principal negotiation — loopback only is the
 //!   contract (production binds 127.0.0.1:8080, compat contract 1).
 
+use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
 use std::sync::Mutex;
 
+use dav_server::body::Body as DavBody;
 use dav_server::fakels::FakeLs;
 use dav_server::{DavHandler, DavMethod, DavMethodSet};
+use http::Request;
+use hyper::body::Incoming;
 use hyper::server::conn::http1;
 use hyper::service::service_fn;
 use hyper_util::rt::TokioIo;
@@ -67,15 +71,41 @@ impl WebDavServer {
             .local_addr()
             .map_err(|source| ServerError::Bind { addr, source })?;
 
-        let handler = DavHandler::builder()
-            .filesystem(Box::new(fs))
-            .locksystem(FakeLs::new())
-            .methods(method_set())
-            .principal("cydrive")
-            .build_handler();
-
         let (shutdown, rx) = watch::channel(false);
-        let task = tokio::task::spawn(accept_loop(listener, handler, rx));
+        let task = tokio::task::spawn(accept_loop(
+            listener,
+            Dispatcher::Single(volume_handler(fs)),
+            rx,
+        ));
+
+        Ok(Self {
+            addr,
+            shutdown,
+            task: Mutex::new(Some(task)),
+        })
+    }
+
+    /// Binds `addr` and serves every volume on that ONE port (Phase 2.5
+    /// / K20): each request dispatches by its `/vol/<name>/` URL prefix
+    /// to that volume's own [`DavHandler`] (own FakeLs). The prefix is a
+    /// process-level concept — the volume's [`CyDriveFs`] only ever sees
+    /// the stripped path (R1). `/vol/<name>` and `/vol/<name>/` both
+    /// address the volume root; anything else (no prefix, `/vol/`, an
+    /// unknown volume) answers 404 without touching any volume.
+    pub async fn serve_volumes(
+        volumes: Vec<(String, CyDriveFs)>,
+        addr: SocketAddr,
+    ) -> Result<Self, ServerError> {
+        let listener = TcpListener::bind(addr)
+            .await
+            .map_err(|source| ServerError::Bind { addr, source })?;
+        let addr = listener
+            .local_addr()
+            .map_err(|source| ServerError::Bind { addr, source })?;
+
+        let router = VolumeRouter::new(volumes);
+        let (shutdown, rx) = watch::channel(false);
+        let task = tokio::task::spawn(accept_loop(listener, Dispatcher::Volumes(router), rx));
 
         Ok(Self {
             addr,
@@ -101,10 +131,13 @@ impl WebDavServer {
 }
 
 /// Accepts connections until `shutdown` fires, serving each on its own
-/// task with graceful connection-level shutdown.
+/// task with graceful connection-level shutdown. `dispatcher` decides,
+/// PER REQUEST, which [`DavHandler`] a request reaches — the
+/// `service_fn` closure runs once per request on a keep-alive
+/// connection, so a single connection may address different volumes.
 async fn accept_loop(
     listener: TcpListener,
-    handler: DavHandler,
+    dispatcher: Dispatcher,
     mut shutdown: watch::Receiver<bool>,
 ) {
     loop {
@@ -115,12 +148,12 @@ async fn accept_loop(
                 Err(_) => break,
             },
         };
-        let handler = handler.clone();
+        let dispatcher = dispatcher.clone();
         let mut conn_shutdown = shutdown.clone();
         tokio::task::spawn(async move {
             let service = service_fn(move |req| {
-                let handler = handler.clone();
-                async move { Ok::<_, Infallible>(handler.handle(req).await) }
+                let dispatcher = dispatcher.clone();
+                async move { Ok::<_, Infallible>(dispatcher.dispatch(req).await) }
             });
             // hyper 1.x graceful shutdown: on the signal, stop
             // keep-alive and let the in-flight request finish.
@@ -135,6 +168,118 @@ async fn accept_loop(
             }
         });
     }
+}
+
+/// The per-request routing decision shared by both serving modes: the
+/// single-volume lock-down stays one `DavHandler` at the root; the
+/// multi-volume mode maps `/vol/<name>/...` to that volume's handler
+/// (Phase 2.5 / K20).
+#[derive(Clone)]
+enum Dispatcher {
+    /// The single-volume mode: every request reaches the one handler.
+    Single(DavHandler),
+    /// The multi-volume mode: per-volume handlers behind `/vol/<name>/`.
+    Volumes(VolumeRouter),
+}
+
+impl Dispatcher {
+    /// Routes one request to its [`DavHandler`] and runs it.
+    async fn dispatch(&self, req: Request<Incoming>) -> http::Response<DavBody> {
+        match self {
+            Dispatcher::Single(handler) => handler.handle(req).await,
+            Dispatcher::Volumes(router) => router.dispatch(req).await,
+        }
+    }
+}
+
+/// The `/vol/<name>/` prefix table (Phase 2.5 / K20): one [`DavHandler`]
+/// per volume — each with its own FakeLs and the same locked-down
+/// method set as the single-volume mode.
+#[derive(Clone)]
+struct VolumeRouter {
+    handlers: HashMap<String, DavHandler>,
+}
+
+impl VolumeRouter {
+    /// Builds one handler per volume (`FakeLs` instances stay
+    /// per-volume).
+    fn new(volumes: Vec<(String, CyDriveFs)>) -> Self {
+        Self {
+            handlers: volumes
+                .into_iter()
+                .map(|(name, fs)| (name, volume_handler(fs)))
+                .collect(),
+        }
+    }
+
+    /// Strips the `/vol/<name>` segment, rebuilds the request URI
+    /// (query preserved) and hands the request to that volume's
+    /// handler; an unroutable path answers 404 without touching any
+    /// volume.
+    async fn dispatch(&self, req: Request<Incoming>) -> http::Response<DavBody> {
+        let path = req.uri().path().to_owned();
+        let Some((name, tail)) = split_volume_segment(&path) else {
+            return not_found();
+        };
+        let Some(handler) = self.handlers.get(name) else {
+            return not_found();
+        };
+        let (mut parts, body) = req.into_parts();
+        // The tail and the query are slices of an already-valid request
+        // URI, so the recombination parses; the 404 arm is defensive.
+        let path_and_query = match parts.uri.query() {
+            Some(query) => format!("{tail}?{query}"),
+            None => tail.to_string(),
+        };
+        match path_and_query.parse::<http::Uri>() {
+            Ok(uri) => {
+                parts.uri = uri;
+                handler.handle(Request::from_parts(parts, body)).await
+            }
+            Err(_) => not_found(),
+        }
+    }
+}
+
+/// The plain 404 for unrouted requests (no volume touched).
+fn not_found() -> http::Response<DavBody> {
+    http::Response::builder()
+        .status(http::StatusCode::NOT_FOUND)
+        .body(DavBody::empty())
+        .expect("static 404 response")
+}
+
+/// Splits `/vol/<name>[/<rest>]` into the volume name and the
+/// volume-relative path (always `/`-rooted: `/vol/a` and `/vol/a/` both
+/// yield the volume root `/`). `None` — the 404 case — for anything
+/// else: no `/vol/` prefix, a bare `/vol` or `/vol/`. The tail keeps the
+/// raw percent-encoded form; [`dav_server::davpath::DavPath`] decodes
+/// per segment, so a prefix split must never decode first.
+fn split_volume_segment(path: &str) -> Option<(&str, &str)> {
+    let rest = path.strip_prefix("/vol/")?;
+    if rest.is_empty() {
+        return None;
+    }
+    let (name, tail) = match rest.find('/') {
+        Some(idx) => (&rest[..idx], &rest[idx..]),
+        None => (rest, "/"),
+    };
+    // An empty name segment (`/vol//x`) is not a volume reference.
+    if name.is_empty() {
+        return None;
+    }
+    Some((name, tail))
+}
+
+/// The locked-down per-volume (and single-volume) handler: same builder
+/// chain the crate has always assembled.
+fn volume_handler(fs: CyDriveFs) -> DavHandler {
+    DavHandler::builder()
+        .filesystem(Box::new(fs))
+        .locksystem(FakeLs::new())
+        .methods(method_set())
+        .principal("cydrive")
+        .build_handler()
 }
 
 /// The locked-down method set. COPY stays allowed so the adapter's
@@ -162,4 +307,36 @@ fn method_set() -> DavMethodSet {
         set.add(method);
     }
     set
+}
+
+#[cfg(test)]
+mod tests {
+    use super::split_volume_segment;
+
+    #[test]
+    fn splits_legal_volume_paths() {
+        assert_eq!(split_volume_segment("/vol/a"), Some(("a", "/")));
+        assert_eq!(split_volume_segment("/vol/a/"), Some(("a", "/")));
+        assert_eq!(split_volume_segment("/vol/a/x.txt"), Some(("a", "/x.txt")));
+        assert_eq!(split_volume_segment("/vol/a/d/f"), Some(("a", "/d/f")));
+        // A longer volume name must not fall apart at its first letter
+        // (`/vol/ab` is volume `ab`, not volume `a` plus `b/x`).
+        assert_eq!(split_volume_segment("/vol/ab/x"), Some(("ab", "/x")));
+        // Percent-encoded tails pass through verbatim (DavPath decodes).
+        assert_eq!(
+            split_volume_segment("/vol/a/%E4%B8%AD.txt"),
+            Some(("a", "/%E4%B8%AD.txt"))
+        );
+    }
+
+    #[test]
+    fn unroutable_paths_are_none() {
+        assert_eq!(split_volume_segment("/"), None);
+        assert_eq!(split_volume_segment("/x.txt"), None);
+        assert_eq!(split_volume_segment("/volume/a/x"), None);
+        assert_eq!(split_volume_segment("/vol"), None);
+        assert_eq!(split_volume_segment("/vol/"), None);
+        // `/vol//x` has an empty volume name segment — not a volume.
+        assert_eq!(split_volume_segment("/vol//x"), None);
+    }
 }

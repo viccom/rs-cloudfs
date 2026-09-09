@@ -890,12 +890,13 @@ struct VolumeStopUnit {
 
 /// The assembled product of [`run_multi_with_transports`]: the volume
 /// registry (statuses for the banner and tests), the ONE stop gate every
-/// volume and the process-level control channel funnel into, the
-/// per-volume periodic sync tasks (aborted at shutdown, same semantics
-/// as [`RunHandle::shutdown`]) and the stop task that owns the
-/// aggregated graceful sequence. WebDAV and the web dashboard are
-/// deliberately absent — they arrive with MV2/MV3; this batch's
-/// multi-volume process runs the volumes' data planes only.
+/// volume and the process-level control channel funnel into, the single
+/// multi-volume WebDAV listener (K20 — `None` when its bind degraded,
+/// see [`MultiVolumeHandle::webdav_addr`]), the drive letters actually
+/// mounted (K27), the per-volume periodic sync tasks (aborted at
+/// shutdown, same semantics as [`RunHandle::shutdown`]) and the stop
+/// task that owns the aggregated graceful sequence. The web dashboard
+/// is deliberately absent — it arrives with MV3.
 pub struct MultiVolumeHandle {
     registry: VolumeRegistry,
     watch: Arc<ShutdownWatch>,
@@ -903,6 +904,12 @@ pub struct MultiVolumeHandle {
     /// The per-volume periodic sync tasks (`None` entries = volumes
     /// without sync configured / failed volumes).
     sync_tasks: Vec<Option<tokio::task::JoinHandle<()>>>,
+    /// The single WebDAV listener's bound address (`None` = the bind
+    /// degraded; the volumes' data planes keep running, K22).
+    webdav_addr: Option<SocketAddr>,
+    /// The drive letters the per-volume mounts actually claimed
+    /// (possibly fewer than configured — a failed mount only warns).
+    mounted_letters: Vec<String>,
 }
 
 impl std::fmt::Debug for MultiVolumeHandle {
@@ -924,6 +931,21 @@ impl MultiVolumeHandle {
     /// The (name, status) list — the K29 banner payload.
     pub fn volumes(&self) -> Vec<(String, VolumeStatus)> {
         self.registry.status_list()
+    }
+
+    /// The single multi-volume WebDAV listener's bound address (K20):
+    /// `None` means the bind degraded (K22 — the volumes' data planes
+    /// kept running; the reason is in the log).
+    pub fn webdav_addr(&self) -> Option<SocketAddr> {
+        self.webdav_addr
+    }
+
+    /// The drive letters the per-volume mounts actually claimed (K27;
+    /// empty when none did — volumes without an explicit
+    /// `drive_letter`, `auto_mount_drive` off, non-Windows, or failed
+    /// mounts that only warned).
+    pub fn mounted_letters(&self) -> &[String] {
+        &self.mounted_letters
     }
 
     /// One arm of the run flow's shutdown wait, the multi-volume analog
@@ -971,17 +993,22 @@ impl MultiVolumeHandle {
 /// / MV1's test seam; the production `run` dispatch builds the same
 /// tuples per volume). One volume core per spec (db + cache + VFS +
 /// requeue + inbound worker, K21-resolved paths), one periodic sync task
-/// per configured volume (K26), and ONE process-level stop gate plus
-/// control channel (K25).
+/// per configured volume (K26), ONE process-level stop gate plus control
+/// channel (K25), and the single multi-volume WebDAV listener routing
+/// `/vol/<name>/` to every RUNNING volume (K20 / MV2 — failed volumes
+/// stay out of the route table; their status is the registry's to
+/// report). Volumes with an explicit `drive_letter` mount through the
+/// process WebDAV port (K27).
 ///
 /// K22 failure policy: a volume that fails to assemble becomes
 /// `Failed{reason}` in the registry (with a `tracing::error`) and the
 /// loop continues — a broken volume must not take healthy siblings down
 /// and must never be silent. Every volume failing returns `Err` (the
-/// process-exits-nonzero semantics).
+/// process-exits-nonzero semantics). A WebDAV bind failure is NOT a
+/// volume failure: it degrades with a `tracing::error` while the
+/// volumes' data planes keep running.
 ///
-/// Scope (MV1): no WebDAV listener, no web dashboard and no mounts —
-/// those arrive with MV2/MV3; this batch logs their absence.
+/// Scope (MV3): the web dashboard is still absent.
 pub async fn run_multi_with_transports(
     process_cfg: &CyDriveConfig,
     volumes: Vec<(VolumeConfig, RunOptions, Arc<dyn CloudTransport>)>,
@@ -990,19 +1017,14 @@ pub async fn run_multi_with_transports(
     let mut runtimes: Vec<VolumeRuntime> = Vec::new();
     let mut stop_units: Vec<VolumeStopUnit> = Vec::new();
     let mut sync_tasks: Vec<Option<tokio::task::JoinHandle<()>>> = Vec::new();
-
-    // MV2/MV3 scope declaration: the multi-volume process runs the
-    // volumes' data planes only in this batch.
-    tracing::info!(
-        "multi-volume mode: the WebDAV server and the web dashboard are not started in \
-         this batch; they will be enabled by the Phase 2.5 MV2/MV3 batches"
-    );
+    let mut volume_fses: Vec<(String, CyDriveFs)> = Vec::new();
 
     for (spec, options, transport) in volumes {
         let name = spec.name.clone();
         match build_volume_runtime(&spec, &options, transport, &watch).await {
-            Ok((runtime, stop_unit, sync_task)) => {
+            Ok((runtime, stop_unit, sync_task, fs)) => {
                 tracing::info!(volume = %name, "volume is running");
+                volume_fses.push((name, fs));
                 runtimes.push(runtime);
                 stop_units.push(stop_unit);
                 sync_tasks.push(sync_task);
@@ -1040,6 +1062,22 @@ pub async fn run_multi_with_transports(
         );
     }
 
+    // The ONE WebDAV listener (K20): `/vol/<name>/` routes to every
+    // running volume. A bind failure degrades (K22, the same policy as
+    // the control channel but with the bigger blast radius spelled
+    // out): the volumes' data planes — queues, sync, inbound — keep
+    // running; the WebDAV face is simply absent.
+    let webdav_server = bind_multi_webdav(process_cfg, volume_fses).await;
+    let webdav_addr = webdav_server.as_ref().map(WebDavServer::local_addr);
+
+    // Per-volume mounts (K27): only volumes that EXPLICITLY set a
+    // drive_letter claim a mount (the parsed default letter is a
+    // placeholder, not a claim); nothing mounts without the listener.
+    let mount_claims = webdav_addr
+        .map(|_| collect_mount_claims(&registry))
+        .unwrap_or_default();
+    let mounted_letters = mount_volumes_if_configured(process_cfg, &mount_claims);
+
     // The process-level control channel (K25): same file name and
     // cwd-anchored location as the single-volume mode (the process
     // config's default db_path anchors the file in the working
@@ -1066,13 +1104,18 @@ pub async fn run_multi_with_transports(
         }
     };
 
-    // The one runner of the aggregated graceful stop sequence: per volume
-    // (queue drain then inbound join, the single-volume order), then the
-    // process-level control file — exactly once for any number of gate
-    // fires.
+    // The one runner of the aggregated graceful stop sequence: the
+    // WebDAV listener stops first (in-flight requests drain), then per
+    // volume (queue drain then inbound join, the single-volume order),
+    // then the process-level control file, then the mounted letters
+    // release — exactly once for any number of gate fires.
     let gate = Arc::clone(&watch);
+    let unmount_letters = mounted_letters.clone();
     let stop_task = tokio::spawn(async move {
         watch.wait().await;
+        if let Some(server) = &webdav_server {
+            server.shutdown().await;
+        }
         for unit in stop_units {
             unit.vfs.shutdown().await;
             unit.inbound.shutdown().await;
@@ -1088,13 +1131,80 @@ pub async fn run_multi_with_transports(
                 }
             }
         }
+        for letter in &unmount_letters {
+            if let Err(e) = cloudkit_platform::windows::unmount_drive(letter) {
+                tracing::warn!(
+                    letter = %letter,
+                    error = %e,
+                    "unmounting the volume's drive failed; continuing the shutdown"
+                );
+            }
+        }
     });
     Ok(MultiVolumeHandle {
         registry,
         watch: gate,
         stop_task,
         sync_tasks,
+        webdav_addr,
+        mounted_letters,
     })
+}
+
+/// Binds the single multi-volume WebDAV listener (K20) or degrades
+/// visibly (K22): an address-parse or bind failure logs an error and
+/// returns `None` — the volumes keep running, only the WebDAV face is
+/// gone. An empty volume set (theoretically unreachable behind the
+/// all-failed gate) also skips the bind.
+async fn bind_multi_webdav(
+    process_cfg: &CyDriveConfig,
+    volumes: Vec<(String, CyDriveFs)>,
+) -> Option<WebDavServer> {
+    if volumes.is_empty() {
+        return None;
+    }
+    let bind = match process_cfg.webdav_host.parse::<IpAddr>() {
+        Ok(host) => SocketAddr::new(host, process_cfg.webdav_port),
+        Err(error) => {
+            tracing::error!(
+                %error,
+                host = %process_cfg.webdav_host,
+                "parsing webdav_host failed; running the volumes without the WebDAV \
+                 server (K22 degrade)"
+            );
+            return None;
+        }
+    };
+    match WebDavServer::serve_volumes(volumes, bind).await {
+        Ok(server) => {
+            tracing::info!(addr = %server.local_addr(), "multi-volume WebDAV listening");
+            Some(server)
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "binding the multi-volume WebDAV server failed; the volumes' data planes \
+                 keep running without WebDAV (K22 degrade)"
+            );
+            None
+        }
+    }
+}
+
+/// The mount claims (K27): every RUNNING volume whose volume file
+/// explicitly set `drive_letter` (presence semantics — the parsed
+/// default is a placeholder that claims nothing).
+fn collect_mount_claims(registry: &VolumeRegistry) -> Vec<(String, String)> {
+    registry
+        .volumes
+        .iter()
+        .filter_map(|volume| match volume {
+            VolumeRuntime::Running { spec, .. } if spec.explicit_drive_letter => {
+                Some((spec.name.clone(), spec.settings.drive_letter.clone()))
+            }
+            _ => None,
+        })
+        .collect()
 }
 
 /// Assembles one volume: resolves its settings against its home dir
@@ -1102,7 +1212,9 @@ pub async fn run_multi_with_transports(
 /// declaration the single-volume banner makes), builds the volume core
 /// and spawns its periodic sync task when configured (K26 — volumes
 /// without `sync_url` or without a sync-capable backend skip it, the
-/// existing gating).
+/// existing gating). Also returns the volume's [`CyDriveFs`] for the
+/// single multi-volume WebDAV listener (same second-cache-handle
+/// construction as the single-volume boot).
 async fn build_volume_runtime(
     spec: &VolumeConfig,
     options: &RunOptions,
@@ -1112,6 +1224,7 @@ async fn build_volume_runtime(
     VolumeRuntime,
     VolumeStopUnit,
     Option<tokio::task::JoinHandle<()>>,
+    CyDriveFs,
 )> {
     let settings = resolve_volume_settings(spec)?;
     // The capability banner per volume (R-5): same one-line declaration
@@ -1131,6 +1244,13 @@ async fn build_volume_runtime(
         core.vfs.sync_notifier(),
         options.sync_namespace.clone(),
     );
+    // The FS adapter's cache handle is path-math only (same root, same
+    // construction as the single-volume boot).
+    let fs = CyDriveFs::new(
+        Arc::clone(&core.vfs),
+        Arc::clone(&core.db),
+        CacheManager::new(core.cache_root.clone(), core.cache_limit),
+    );
     Ok((
         VolumeRuntime::Running {
             spec: spec.clone(),
@@ -1142,6 +1262,7 @@ async fn build_volume_runtime(
             inbound: core.inbound,
         },
         sync_task,
+        fs,
     ))
 }
 
@@ -2274,6 +2395,74 @@ fn mount_if_configured(cfg: &CyDriveConfig) -> (Option<String>, Option<PathBuf>)
 /// Glues the canonical mount URL from the config's WebDAV host/port.
 pub fn default_mount_url(cfg: &CyDriveConfig) -> String {
     format!("http://{}:{}", cfg.webdav_host, cfg.webdav_port)
+}
+
+/// Glues one volume's mount URL (K27): the process WebDAV endpoint plus
+/// the `/vol/<name>` segment the single multi-volume listener routes
+/// (K20). Pure URL construction — the Windows MiniRedir compatibility
+/// of the sub-path mount is the real-machine probe's question, not
+/// this function's.
+pub fn volume_mount_url(process_cfg: &CyDriveConfig, volume_name: &str) -> String {
+    format!("{}/vol/{volume_name}", default_mount_url(process_cfg))
+}
+
+/// Per-volume auto-mount (K27 / MV2, the multi-volume analog of
+/// [`mount_if_configured`]): every claim is a RUNNING volume whose file
+/// explicitly set `drive_letter`, and the mount target is the volume's
+/// `/vol/<name>` path on the process WebDAV port. The process-level
+/// `auto_mount_drive` switch stays the gate (off = mount nothing, the
+/// single-volume semantics). A failed mount only warns — the volume
+/// stays reachable at its WebDAV URL. Returns the letters actually
+/// mounted (the stop sequence releases exactly these).
+///
+/// Unix: K27 adjudicated the Windows drive-letter mounts only; the
+/// single-volume Unix gio→davfs2 chain is a process-level
+/// `mount_point` concept with no per-volume counterpart yet, so
+/// multi-volume mode mounts nothing there (info line, never silent).
+fn mount_volumes_if_configured(cfg: &CyDriveConfig, claims: &[(String, String)]) -> Vec<String> {
+    #[cfg(unix)]
+    {
+        let _ = (cfg, claims);
+        tracing::info!(
+            "multi-volume mode mounts no directories on unix (per-volume drive-letter \
+             mounts are the K27 scope); mount manually: `cydrive mount --path <dir>`"
+        );
+        Vec::new()
+    }
+
+    #[cfg(not(unix))]
+    {
+        if claims.is_empty() {
+            tracing::info!("no volume claimed a drive_letter; skipping the drive mappings");
+            return Vec::new();
+        }
+        if !cfg.auto_mount_drive {
+            tracing::info!("auto_mount_drive is off; skipping the drive mappings");
+            return Vec::new();
+        }
+        if !cfg!(windows) {
+            tracing::info!("drive mapping is Windows-only; skipping");
+            return Vec::new();
+        }
+        let mut mounted = Vec::new();
+        for (name, letter) in claims {
+            let url = volume_mount_url(cfg, name);
+            println!("Mounting volume {name} as drive {letter} -> {url} ...");
+            match cloudkit_platform::windows::mount_drive(letter, &url) {
+                Ok(actual) => {
+                    println!("Drive mounted: {actual} -> {url} (volume {name})");
+                    mounted.push(actual);
+                }
+                Err(error) => {
+                    println!("Auto-mount FAILED for volume {name} ({error}); the volume stays reachable at {url}.");
+                    println!(
+                        "  Hints: run `cydrive fix-reg` in an elevated shell, ensure the WebClient                  service can start, and check that the letter is free (`cydrive doctor`)."
+                    );
+                }
+            }
+        }
+        mounted
+    }
 }
 
 // ------------------------------------------------- status subcommand (C3) ---
