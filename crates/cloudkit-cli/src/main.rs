@@ -707,6 +707,14 @@ async fn run_multi_volume(
         )),
         None => banner.push_str("  |  WebDAV unavailable (bind failed; see the log)"),
     }
+    // MV3 / K24: the single dashboard port (the same line the
+    // single-volume banner prints; absent when off or degraded).
+    match handle.web_ui_addr() {
+        Some(addr) => banner.push_str(&format!("  |  dashboard at http://{addr}")),
+        None => {
+            banner.push_str("  |  dashboard unavailable (disabled or bind failed; see the log)")
+        }
+    }
     let letters = handle.mounted_letters();
     if !letters.is_empty() {
         banner.push_str(&format!("  |  mounted: {}", letters.join(", ")));

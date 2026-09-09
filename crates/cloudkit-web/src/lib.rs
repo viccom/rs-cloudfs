@@ -46,6 +46,34 @@
 //! - `GET /api/queue` — the four upload-queue counters plus the DB
 //!   pending-uploads tally.
 //!
+//! Multi-volume mode (Phase 2.5 / MV3, K23/K24): [`WebUiServer::serve_multi`]
+//! serves ONE dashboard over a volume registry instead of one VFS. Every
+//! volume-scoped route above then takes an optional `?volume=<name>`
+//! query parameter — no parameter answers 400 with the addressable
+//! volume list (there is no default volume — the PCFS "fall back to the
+//! first driver" anti-lesson), an unknown name answers 404, a
+//! known-but-failed volume answers 409 with its reason, and a running
+//! volume answers exactly the frozen per-route shapes above (the 16-key
+//! `/api/stats` contract included, with the identity keys read from that
+//! volume's own registry entry). Two additive routes exist only in this
+//! mode:
+//!
+//! - `GET /api/volumes` — the registry listing (name / backend /
+//!   volume_id / drive_letter / webdav_url / status / status_reason /
+//!   quota / total_files / total_bytes), the numbers read from each
+//!   volume's db metadata — never a backend scan (the PCFS Stats
+//!   anti-lesson).
+//! - `GET /api/stats/summary` — the cross-volume aggregate (Σ files /
+//!   bytes / dirs / uploaded / pending / quota over the RUNNING
+//!   volumes) for the dashboard's summary card. A distinct shape on
+//!   purpose: the frozen 16-key `/api/stats` contract stays a
+//!   per-volume answer.
+//!
+//! Single-volume mode (the `serve` constructor) is untouched: the same
+//! nine-route table, the same bodies, and a stray `?volume=` parameter
+//! is simply ignored (there is exactly one volume — no registry to
+//! route through).
+//!
 //! Production binds `127.0.0.1:8088` (the caller's concern); tests bind
 //! `127.0.0.1:0`.
 
@@ -55,7 +83,7 @@ use std::time::SystemTime;
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Request, State};
-use axum::http::{header, StatusCode};
+use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
@@ -81,7 +109,9 @@ pub struct QuotaSnapshot {
 
 /// Configuration knobs for the dashboard: the source of the
 /// `/api/stats` extra fields plus nothing else — binding goes through
-/// [`WebUiServer::serve`].
+/// [`WebUiServer::serve`]. Clone: a plain value the cli assembly
+/// snapshots per volume (MV3 registry construction).
+#[derive(Debug, Clone)]
 pub struct WebUiConfig {
     /// Windows drive letter reported by `/api/stats` (`"Y:"`).
     pub drive_letter: String,
@@ -113,6 +143,52 @@ pub struct WebUiConfig {
     /// Boot quota snapshot for the storage card (`None` = no quota
     /// concept on this backend, or the informational read failed).
     pub quota: Option<QuotaSnapshot>,
+}
+
+/// One registry entry's assembly status (Phase 2.5 / K22, the web face
+/// of the cli's `VolumeStatus`): a volume either runs, or carries the
+/// reason its assembly failed — never silently absent.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VolumeUiStatus {
+    /// The volume's db/VFS/queue are up and serve traffic.
+    Running,
+    /// The volume failed to assemble; `reason` is the error chain's
+    /// summary, surfaced verbatim by `/api/volumes` and the 409 refusals.
+    Failed {
+        /// The assembly failure's top-level error message.
+        reason: String,
+    },
+}
+
+impl VolumeUiStatus {
+    /// The stable lowercase spelling for `/api/volumes`.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VolumeUiStatus::Running => "running",
+            VolumeUiStatus::Failed { .. } => "failed",
+        }
+    }
+}
+
+/// One volume's dashboard identity plus its pieces (Phase 2.5 / K24):
+/// the per-volume [`WebUiConfig`] face (drive letter, the volume's own
+/// `/vol/<name>` WebDAV URL, backend identity, boot quota snapshot —
+/// assembled by the cli composition root, the web layer reports it
+/// verbatim and invents nothing) with the registry name and status. A
+/// `Failed` entry carries no VFS: its `/api/volumes` row reports the
+/// reason instead of numbers, and volume-scoped routes refuse it.
+#[derive(Clone)]
+pub struct VolumeUiEntry {
+    /// The registry name (the URL segment, mount label and dashboard tab
+    /// all reuse it — K29).
+    pub name: String,
+    /// The volume's assembly status (K22).
+    pub status: VolumeUiStatus,
+    /// The volume's dashboard knobs — the same [`WebUiConfig`] face the
+    /// single-volume boot assembles, per volume.
+    pub config: WebUiConfig,
+    /// The volume's own VFS (`None` for a failed volume).
+    pub vfs: Option<Arc<Vfs>>,
 }
 
 /// Errors from assembling the dashboard.
@@ -161,39 +237,28 @@ pub struct WebUiServer {
 }
 
 impl WebUiServer {
-    /// Binds `addr` and serves the dashboard over `vfs`.
+    /// Binds `addr` and serves the dashboard over `vfs` — the frozen
+    /// single-volume constructor (nine routes; a stray `?volume=` query
+    /// parameter is ignored).
     pub async fn serve(
         vfs: Arc<Vfs>,
         cfg: WebUiConfig,
         addr: SocketAddr,
     ) -> Result<Self, WebUiError> {
-        let listener = TcpListener::bind(addr)
-            .await
-            .map_err(|source| WebUiError::Bind { addr, source })?;
-        let addr = listener
-            .local_addr()
-            .map_err(|source| WebUiError::Bind { addr, source })?;
-
         let app = router(vfs, cfg);
-        let (shutdown, rx) = watch::channel(false);
-        let task = tokio::task::spawn(async move {
-            let server = axum::serve(listener, app).with_graceful_shutdown(async move {
-                let mut rx = rx;
-                let _ = rx.changed().await;
-            });
-            if let Err(error) = server.await {
-                // The accept loop only errors on I/O failure after a
-                // successful bind; there is no caller to surface it to,
-                // so it lands in the logs (mirrors the WebDAV crate).
-                eprintln!("[web-ui] server error: {error}");
-            }
-        });
+        serve_router(app, addr).await
+    }
 
-        Ok(Self {
-            addr,
-            shutdown,
-            task: Mutex::new(Some(task)),
-        })
+    /// Binds `addr` and serves the multi-volume dashboard (Phase 2.5 /
+    /// MV3) over the volume registry: the same nine routes (now taking
+    /// the K23 `?volume=<name>` parameter) plus the two registry routes
+    /// `/api/volumes` and `/api/stats/summary`.
+    pub async fn serve_multi(
+        volumes: Vec<VolumeUiEntry>,
+        addr: SocketAddr,
+    ) -> Result<Self, WebUiError> {
+        let app = multi_router(volumes);
+        serve_router(app, addr).await
     }
 
     /// The actually bound address (`:0` resolves to the real port).
@@ -212,13 +277,40 @@ impl WebUiServer {
     }
 }
 
-/// Assembles the route table over the shared state.
-fn router(vfs: Arc<Vfs>, cfg: WebUiConfig) -> axum::Router {
-    let state = AppState {
-        vfs,
-        cfg: Arc::new(cfg),
-    };
-    axum::Router::new()
+/// The shared bind + accept-loop segment behind both constructors.
+async fn serve_router(app: axum::Router, addr: SocketAddr) -> Result<WebUiServer, WebUiError> {
+    let listener = TcpListener::bind(addr)
+        .await
+        .map_err(|source| WebUiError::Bind { addr, source })?;
+    let addr = listener
+        .local_addr()
+        .map_err(|source| WebUiError::Bind { addr, source })?;
+
+    let (shutdown, rx) = watch::channel(false);
+    let task = tokio::task::spawn(async move {
+        let server = axum::serve(listener, app).with_graceful_shutdown(async move {
+            let mut rx = rx;
+            let _ = rx.changed().await;
+        });
+        if let Err(error) = server.await {
+            // The accept loop only errors on I/O failure after a
+            // successful bind; there is no caller to surface it to,
+            // so it lands in the logs (mirrors the WebDAV crate).
+            eprintln!("[web-ui] server error: {error}");
+        }
+    });
+
+    Ok(WebUiServer {
+        addr,
+        shutdown,
+        task: Mutex::new(Some(task)),
+    })
+}
+
+/// The nine contract routes (shared by both modes); the caller appends
+/// any mode-specific routes and applies `.with_state` last.
+fn contract_routes(router: axum::Router<AppState>) -> axum::Router<AppState> {
+    router
         .route("/", get(index))
         .route("/api/files", get(api_files))
         .route("/api/stats", get(api_stats))
@@ -234,14 +326,123 @@ fn router(vfs: Arc<Vfs>, cfg: WebUiConfig) -> axum::Router {
         .route("/api/queue", get(api_queue))
         .route("/static/{*path}", get(static_asset))
         .layer(DefaultBodyLimit::max(MAX_UPLOAD_BYTES))
+}
+
+/// Assembles the single-volume route table over the shared state — the
+/// frozen nine routes, byte-identical to the pre-MV3 table.
+fn router(vfs: Arc<Vfs>, cfg: WebUiConfig) -> axum::Router {
+    let state = AppState::Single {
+        vfs,
+        cfg: Arc::new(cfg),
+    };
+    contract_routes(axum::Router::new()).with_state(state)
+}
+
+/// Assembles the multi-volume route table: the nine contract routes
+/// (K23 volume-parameter flavour) plus the two registry routes.
+fn multi_router(volumes: Vec<VolumeUiEntry>) -> axum::Router {
+    let state = AppState::Multi {
+        volumes: Arc::new(volumes),
+    };
+    contract_routes(axum::Router::new())
+        .route("/api/volumes", get(api_volumes))
+        .route("/api/stats/summary", get(api_stats_summary))
         .with_state(state)
 }
 
-/// Shared handler state.
+/// Shared handler state: exactly one volume (the frozen single-volume
+/// face) or the volume registry (MV3).
 #[derive(Clone)]
-struct AppState {
-    vfs: Arc<Vfs>,
-    cfg: Arc<WebUiConfig>,
+enum AppState {
+    /// The single-volume boot: one VFS, one config — handlers resolve
+    /// every request to this pair unchanged (a stray `?volume=` query
+    /// parameter is ignored; there is no registry to route through).
+    Single {
+        vfs: Arc<Vfs>,
+        cfg: Arc<WebUiConfig>,
+    },
+    /// The multi-volume boot (K23/K24): one entry per volume; handlers
+    /// resolve the `?volume=<name>` parameter against it.
+    Multi { volumes: Arc<Vec<VolumeUiEntry>> },
+}
+
+/// One request's volume resolution: the `(vfs, config)` pair the frozen
+/// handler bodies run against.
+struct ResolvedVolume<'a> {
+    vfs: &'a Arc<Vfs>,
+    cfg: &'a WebUiConfig,
+}
+
+/// The K23 routing refusals' uniform JSON body: the error message plus
+/// the addressable volume list, so a wrong or missing parameter is
+/// actionable on the spot.
+fn volume_routing_error(
+    status: StatusCode,
+    message: impl Into<String>,
+    volumes: &[String],
+) -> Response {
+    let body = serde_json::json!({ "error": message.into(), "volumes": volumes });
+    (status, Json(body)).into_response()
+}
+
+impl AppState {
+    /// Resolves one request's `?volume=` parameter (K23). Single-volume
+    /// mode ignores the parameter outright (zero drift — there is
+    /// exactly one volume). Multi-volume mode requires it: absent or
+    /// empty answers 400 with the volume list, an unknown name answers
+    /// 404 with the same list, a known-but-failed volume answers 409
+    /// with its reason, and a running volume resolves to its own
+    /// `(vfs, config)` pair.
+    // axum's Response IS the handler currency here (every refusal goes
+    // straight back as the handler's return value); boxing it would
+    // trade a per-request indirection for a lint's byte count.
+    #[allow(clippy::result_large_err)]
+    fn resolve(&self, query: Option<&str>) -> Result<ResolvedVolume<'_>, Response> {
+        match self {
+            AppState::Single { vfs, cfg } => Ok(ResolvedVolume { vfs, cfg }),
+            AppState::Multi { volumes } => {
+                let names: Vec<String> = volumes.iter().map(|v| v.name.clone()).collect();
+                let requested = query
+                    .and_then(|q| query_param(q, "volume"))
+                    .filter(|name| !name.is_empty());
+                let Some(name) = requested else {
+                    return Err(volume_routing_error(
+                        StatusCode::BAD_REQUEST,
+                        "the volume parameter is required in multi-volume mode: add \
+                         ?volume=<name> to the request",
+                        &names,
+                    ));
+                };
+                let Some(entry) = volumes.iter().find(|v| v.name == name) else {
+                    return Err(volume_routing_error(
+                        StatusCode::NOT_FOUND,
+                        format!("unknown volume '{name}'"),
+                        &names,
+                    ));
+                };
+                match (&entry.status, &entry.vfs) {
+                    (VolumeUiStatus::Failed { reason }, _) => Err(volume_routing_error(
+                        StatusCode::CONFLICT,
+                        format!("volume '{name}' is failed and serves no traffic: {reason}"),
+                        &names,
+                    )),
+                    (_, Some(vfs)) => Ok(ResolvedVolume {
+                        vfs,
+                        cfg: &entry.config,
+                    }),
+                    // A running entry without a VFS is an inconsistent
+                    // assembly (unrepresentable through the cli boot);
+                    // refusing with the same conflict shape is the
+                    // honest answer, never a panic.
+                    (_, None) => Err(volume_routing_error(
+                        StatusCode::CONFLICT,
+                        format!("volume '{name}' exposes no vfs"),
+                        &names,
+                    )),
+                }
+            }
+        }
+    }
 }
 
 /// A full-body response with one content type.
@@ -307,9 +508,13 @@ fn file_row_json(row: &FileRecord) -> serde_json::Value {
 }
 
 /// `GET /api/files`: every row, `updated_at DESC` (the DB mirrors the
-/// Python ordering).
-async fn api_files(State(state): State<AppState>) -> Response {
-    match state.vfs.db().list_all_files() {
+/// Python ordering). Multi-volume mode routes by `?volume=` (K23).
+async fn api_files(State(state): State<AppState>, uri: Uri) -> Response {
+    let volume = match state.resolve(uri.query()) {
+        Ok(volume) => volume,
+        Err(response) => return response,
+    };
+    match volume.vfs.db().list_all_files() {
         Ok(rows) => Json(serde_json::Value::Array(
             rows.iter().map(file_row_json).collect(),
         ))
@@ -320,49 +525,58 @@ async fn api_files(State(state): State<AppState>) -> Response {
 
 /// Derives the `(host, port)` pair the Python handler glued on from its
 /// config fields. The frozen [`WebUiConfig`] carries only the URL, so
-/// the pair is parsed back out of it — the URL is always built by the
-/// caller as `http://{host}:{port}`, which this reverses (a URL without
-/// a port degrades to the HTTP default).
+/// the pair is parsed back out of it — the single-volume URL is built
+/// by the caller as `http://{host}:{port}` and the multi-volume one
+/// appends the `/vol/<name>` segment (K27), so the authority ends at
+/// the first path segment (a URL without a port degrades to the HTTP
+/// default).
 fn split_webdav_url(url: &str) -> (String, u16) {
     let rest = url
         .strip_prefix("http://")
         .or_else(|| url.strip_prefix("https://"))
         .unwrap_or(url);
-    match rest.rsplit_once(':') {
+    let authority = rest.split('/').next().unwrap_or(rest);
+    match authority.rsplit_once(':') {
         Some((host, port)) => (host.to_string(), port.parse().unwrap_or(80)),
-        None => (rest.to_string(), 80),
+        None => (authority.to_string(), 80),
     }
 }
 
 /// `GET /api/stats`: the DB aggregates plus the six dashboard fields
 /// the Python handler added on top, and the five backend-identity keys
 /// the multi-backend adapter added on top of those (all additive — the
-/// frozen Python-parity keys are untouched).
-async fn api_stats(State(state): State<AppState>) -> Response {
-    let stats = match state.vfs.db().get_stats() {
+/// frozen Python-parity keys are untouched). Multi-volume mode routes
+/// by `?volume=` (K23) and answers the SAME 16-key contract with the
+/// named volume's own aggregates and identity keys.
+async fn api_stats(State(state): State<AppState>, uri: Uri) -> Response {
+    let volume = match state.resolve(uri.query()) {
+        Ok(volume) => volume,
+        Err(response) => return response,
+    };
+    let stats = match volume.vfs.db().get_stats() {
         Ok(stats) => stats,
         Err(error) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     };
-    let (webdav_host, webdav_port) = split_webdav_url(&state.cfg.webdav_url);
+    let (webdav_host, webdav_port) = split_webdav_url(&volume.cfg.webdav_url);
     Json(serde_json::json!({
         "total_files": stats.total_files,
         "total_bytes": stats.total_bytes,
         "total_dirs": stats.total_dirs,
         "uploaded_files": stats.uploaded_files,
         "pending_uploads": stats.pending_uploads,
-        "drive_letter": state.cfg.drive_letter,
+        "drive_letter": volume.cfg.drive_letter,
         "webdav_host": webdav_host,
         "webdav_port": webdav_port,
-        "webdav_url": state.cfg.webdav_url,
-        "chat_id": state.cfg.chat_id,
-        "is_configured": state.cfg.is_configured,
+        "webdav_url": volume.cfg.webdav_url,
+        "chat_id": volume.cfg.chat_id,
+        "is_configured": volume.cfg.is_configured,
         // Multi-backend identity (the dashboard adapter): reported
         // verbatim from the assembly — the web layer invents nothing.
-        "backend": state.cfg.backend,
-        "volume": state.cfg.volume,
-        "remote_delete": state.cfg.remote_delete,
-        "quota_used": state.cfg.quota.as_ref().map(|quota| quota.used),
-        "quota_total": state.cfg.quota.as_ref().and_then(|quota| quota.total),
+        "backend": volume.cfg.backend,
+        "volume": volume.cfg.volume,
+        "remote_delete": volume.cfg.remote_delete,
+        "quota_used": volume.cfg.quota.as_ref().map(|quota| quota.used),
+        "quota_total": volume.cfg.quota.as_ref().and_then(|quota| quota.total),
     }))
     .into_response()
 }
@@ -379,7 +593,12 @@ fn now_epoch_f64() -> f64 {
 /// only shape the frontend sends and the Python handler reads); its
 /// bytes land in [`Vfs::put`] under `/{filename}` — accepted on the
 /// spot, uploaded by the queue asynchronously (WebDAV-PUT semantics).
-async fn api_upload(State(state): State<AppState>, mut multipart: Multipart) -> Response {
+/// Multi-volume mode routes by `?volume=` (K23) BEFORE any body parsing.
+async fn api_upload(State(state): State<AppState>, uri: Uri, mut multipart: Multipart) -> Response {
+    let volume = match state.resolve(uri.query()) {
+        Ok(volume) => volume,
+        Err(response) => return response,
+    };
     let Some(field) = multipart.next_field().await.unwrap_or(None) else {
         return error_json(StatusCode::BAD_REQUEST, "Invalid upload");
     };
@@ -399,7 +618,7 @@ async fn api_upload(State(state): State<AppState>, mut multipart: Multipart) -> 
     let Ok(rel) = RelPath::new(&format!("/{filename}")) else {
         return error_json(StatusCode::BAD_REQUEST, "Invalid filename");
     };
-    match state.vfs.put(&rel, &bytes, now_epoch_f64()).await {
+    match volume.vfs.put(&rel, &bytes, now_epoch_f64()).await {
         Ok(()) => {
             Json(serde_json::json!({ "success": true, "filename": filename })).into_response()
         }
@@ -426,8 +645,17 @@ async fn api_upload(State(state): State<AppState>, mut multipart: Multipart) -> 
 /// unconditional row delete — the dashboard renders the delete button
 /// on folders too and [`Vfs::remove_file`] refuses directories —
 /// behind the same K4 gate (`Vfs::delete_remote_for_row`); a missing
-/// row answers the baseline's idempotent no-op success.
-async fn api_delete(State(state): State<AppState>, body: Json<serde_json::Value>) -> Response {
+/// row answers the baseline's idempotent no-op success. Multi-volume
+/// mode routes by `?volume=` (K23).
+async fn api_delete(
+    State(state): State<AppState>,
+    uri: Uri,
+    body: Json<serde_json::Value>,
+) -> Response {
+    let volume = match state.resolve(uri.query()) {
+        Ok(volume) => volume,
+        Err(response) => return response,
+    };
     let filename = body
         .0
         .get("filename")
@@ -443,7 +671,7 @@ async fn api_delete(State(state): State<AppState>, body: Json<serde_json::Value>
         // success, and the idempotent answer keeps that shape.
         return delete_success(filename);
     };
-    match state.vfs.remove_file(&rel).await {
+    match volume.vfs.remove_file(&rel).await {
         Ok(()) => delete_success(filename),
         // The pending-upload guard's 409 face, unchanged: the row's
         // local cache copy is the only copy of the bytes.
@@ -463,10 +691,10 @@ async fn api_delete(State(state): State<AppState>, body: Json<serde_json::Value>
         // needed: the row delete rings the db-layer files hook (the
         // chokepoint; deletion = tombstone origin).
         Err(VfsError::IsDirectory(_)) => {
-            if let Err(error) = state.vfs.delete_remote_for_row(&rel).await {
+            if let Err(error) = volume.vfs.delete_remote_for_row(&rel).await {
                 return error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
             }
-            match state.vfs.db().delete_file(&clean_rel) {
+            match volume.vfs.db().delete_file(&clean_rel) {
                 Ok(()) => delete_success(filename),
                 Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
             }
@@ -583,7 +811,9 @@ fn download_response(filename: &str, bytes: Vec<u8>, range: Option<&str>) -> Res
 /// single-range `Range` header when present. Sub-paths resolve as
 /// their virtual RelPath; a missing row, a directory or an unusable
 /// path all land on Python's verbatim 404 body, and other failures
-/// surface as 500 errors.
+/// surface as 500 errors. Multi-volume mode routes by `?volume=`
+/// (K23) — the volume resolution happens after the path validation so
+/// an unusable path keeps the frozen 404 body.
 async fn api_download(
     State(state): State<AppState>,
     Path(filename): Path<String>,
@@ -601,11 +831,15 @@ async fn api_download(
         )
             .into_response();
     };
+    let volume = match state.resolve(request.uri().query()) {
+        Ok(volume) => volume,
+        Err(response) => return response,
+    };
     let range = request
         .headers()
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok());
-    match state.vfs.hydrate(&rel).await {
+    match volume.vfs.hydrate(&rel).await {
         Ok(path) => match std::fs::read(&path) {
             Ok(bytes) => download_response(&filename, bytes, range),
             Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
@@ -686,15 +920,22 @@ fn normalize_list_path(raw: &str) -> Option<String> {
 /// row of its own nor any child 404s, while an existing-but-empty one
 /// answers 200 with `entries: []` (the root of a fully empty drive has
 /// neither, so it 404s under the same rule until anything exists).
+/// Multi-volume mode routes by `?volume=` (K23) — the path validation
+/// keeps its frozen order ahead of the volume resolution.
 async fn api_list(State(state): State<AppState>, request: Request) -> Response {
-    let path = match query_param(request.uri().query().unwrap_or(""), "path") {
+    let query = request.uri().query().unwrap_or("");
+    let path = match query_param(query, "path") {
         None => "/".to_string(),
         Some(raw) => match normalize_list_path(&raw) {
             Some(path) => path,
             None => return error_json(StatusCode::BAD_REQUEST, "Invalid path"),
         },
     };
-    let db = state.vfs.db();
+    let volume = match state.resolve(Some(query)) {
+        Ok(volume) => volume,
+        Err(response) => return response,
+    };
+    let db = volume.vfs.db();
     let mut entries = match db.list_dir(&path) {
         Ok(entries) => entries,
         Err(error) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
@@ -718,10 +959,15 @@ async fn api_list(State(state): State<AppState>, request: Request) -> Response {
 
 /// `GET /api/queue`: the four upload-queue counters
 /// ([`Vfs::queue_stats`]) plus the DB pending-uploads tally
-/// (`get_stats().pending_uploads`).
-async fn api_queue(State(state): State<AppState>) -> Response {
-    let stats = state.vfs.queue_stats();
-    let pending = match state.vfs.db().get_stats() {
+/// (`get_stats().pending_uploads`). Multi-volume mode routes by
+/// `?volume=` (K23).
+async fn api_queue(State(state): State<AppState>, uri: Uri) -> Response {
+    let volume = match state.resolve(uri.query()) {
+        Ok(volume) => volume,
+        Err(response) => return response,
+    };
+    let stats = volume.vfs.queue_stats();
+    let pending = match volume.vfs.db().get_stats() {
         Ok(stats) => stats.pending_uploads,
         Err(error) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     };
@@ -731,6 +977,111 @@ async fn api_queue(State(state): State<AppState>) -> Response {
         "degraded": stats.degraded,
         "retries": stats.retries,
         "pending": pending,
+    }))
+    .into_response()
+}
+
+// ------------------------------------------- MV3: the registry routes (K24) ---
+
+/// `GET /api/volumes` (multi-volume mode only): the registry listing.
+/// The numbers are each volume's OWN db metadata (`get_stats`) — never
+/// a backend scan (the PCFS Stats anti-lesson); a failed volume carries
+/// its reason and null numbers instead of zeros (there is no db to
+/// read, and a zero would read as "empty drive"), and a db read failure
+/// on a running volume degrades that volume's numbers to null rather
+/// than failing the whole listing (the K22 spirit: one broken volume
+/// must not hide its siblings).
+async fn api_volumes(State(state): State<AppState>) -> Response {
+    let AppState::Multi { volumes } = &state else {
+        // Unreachable through the multi router; the single-volume table
+        // never registers this route (its unknown-route 404 IS the
+        // frozen behavior).
+        return error_json(
+            StatusCode::NOT_FOUND,
+            "no volume registry: this dashboard serves a single volume",
+        );
+    };
+    Json(serde_json::Value::Array(
+        volumes.iter().map(volume_summary_json).collect(),
+    ))
+    .into_response()
+}
+
+/// One `/api/volumes` row: the registry identity plus the db metadata
+/// numbers (see [`api_volumes`]).
+fn volume_summary_json(entry: &VolumeUiEntry) -> serde_json::Value {
+    let (total_files, total_bytes) = match (&entry.status, &entry.vfs) {
+        (VolumeUiStatus::Running, Some(vfs)) => match vfs.db().get_stats() {
+            Ok(stats) => (Some(stats.total_files), Some(stats.total_bytes)),
+            Err(_db_read_failed) => (None, None),
+        },
+        _ => (None, None),
+    };
+    let mut body = serde_json::json!({
+        "name": entry.name,
+        "backend": entry.config.backend,
+        "volume_id": entry.config.volume,
+        "drive_letter": entry.config.drive_letter,
+        "webdav_url": entry.config.webdav_url,
+        "status": entry.status.as_str(),
+        "quota_used": entry.config.quota.as_ref().map(|quota| quota.used),
+        "quota_total": entry.config.quota.as_ref().and_then(|quota| quota.total),
+        "total_files": total_files,
+        "total_bytes": total_bytes,
+    });
+    if let VolumeUiStatus::Failed { reason } = &entry.status {
+        body["status_reason"] = serde_json::Value::String(reason.clone());
+    }
+    body
+}
+
+/// `GET /api/stats/summary` (multi-volume mode only): the cross-volume
+/// aggregate for the dashboard's summary card — Σ files / bytes / dirs
+/// / uploaded / pending over the RUNNING volumes' dbs plus the quota
+/// sums over their boot snapshots. A distinct shape on purpose (the
+/// frozen 16-key `/api/stats` contract stays a per-volume answer); a
+/// db read failure on one volume skips its contribution rather than
+/// failing the aggregate.
+async fn api_stats_summary(State(state): State<AppState>) -> Response {
+    let AppState::Multi { volumes } = &state else {
+        return error_json(
+            StatusCode::NOT_FOUND,
+            "no volume registry: this dashboard serves a single volume",
+        );
+    };
+    let mut running = 0u64;
+    let (mut total_files, mut total_bytes, mut total_dirs) = (0i64, 0i64, 0i64);
+    let (mut uploaded_files, mut pending_uploads) = (0i64, 0i64);
+    let mut quota_used: Option<u64> = None;
+    let mut quota_total: Option<u64> = None;
+    for entry in volumes.iter() {
+        if let (VolumeUiStatus::Running, Some(vfs)) = (&entry.status, &entry.vfs) {
+            running += 1;
+            if let Ok(stats) = vfs.db().get_stats() {
+                total_files += stats.total_files;
+                total_bytes += stats.total_bytes;
+                total_dirs += stats.total_dirs;
+                uploaded_files += stats.uploaded_files;
+                pending_uploads += stats.pending_uploads;
+            }
+            if let Some(quota) = &entry.config.quota {
+                *quota_used.get_or_insert(0) += quota.used;
+                if let Some(total) = quota.total {
+                    *quota_total.get_or_insert(0) += total;
+                }
+            }
+        }
+    }
+    Json(serde_json::json!({
+        "volumes": volumes.len(),
+        "running": running,
+        "total_files": total_files,
+        "total_bytes": total_bytes,
+        "total_dirs": total_dirs,
+        "uploaded_files": uploaded_files,
+        "pending_uploads": pending_uploads,
+        "quota_used": quota_used,
+        "quota_total": quota_total,
     }))
     .into_response()
 }

@@ -74,10 +74,15 @@ fn write_file(path: &Path, text: &str) {
 /// The WebDAV port is ephemeral (parallel boots must not contend on the
 /// 8080 default) and auto-mount stays OFF so the offline gate never maps
 /// a real network drive — same reasons as `run_e2e.rs`'s `temp_config`.
+/// `enable_web_ui` is OFF here for the same parallel-port reason (the
+/// 8088 default); the MV3 dashboard tests flip it on with an ephemeral
+/// port through [`process_config_with_web_ui`].
 fn process_config() -> CyDriveConfig {
     CyDriveConfig {
         volumes_dir: Some("volumes".to_string()),
         webdav_port: 0,
+        enable_web_ui: false,
+        web_ui_port: 0,
         auto_mount_drive: false,
         ..CyDriveConfig::default()
     }
@@ -111,13 +116,24 @@ async fn boot_multi(
     specs: Vec<VolumeConfig>,
     mocks: Vec<Arc<MockTransport>>,
 ) -> cloudkit_cli::MultiVolumeHandle {
+    boot_multi_with(process_config(), specs, mocks).await
+}
+
+/// [`boot_multi`] with a caller-owned process config (the MV3 dashboard
+/// tests enable the web UI on an ephemeral port; the degraded-bind test
+/// points it at a squatted one).
+async fn boot_multi_with(
+    cfg: CyDriveConfig,
+    specs: Vec<VolumeConfig>,
+    mocks: Vec<Arc<MockTransport>>,
+) -> cloudkit_cli::MultiVolumeHandle {
     assert_eq!(specs.len(), mocks.len(), "one transport per volume");
     let injections = specs
         .into_iter()
         .zip(mocks)
         .map(|(spec, mock)| (spec, RunOptions::default(), mock as Arc<dyn CloudTransport>))
         .collect();
-    run_multi_with_transports(&process_config(), injections)
+    run_multi_with_transports(&cfg, injections)
         .await
         .expect("multi-volume boot")
 }
@@ -158,6 +174,45 @@ fn status_of(resp: &str) -> u16 {
         .expect("status code token")
         .parse()
         .expect("numeric status code")
+}
+
+/// The response body (everything after the blank line), dechunked when
+/// the server answered `Transfer-Encoding: chunked` (the `web_e2e.rs`
+/// helper).
+fn body_of(resp: &str) -> String {
+    let (head, body) = resp
+        .split_once("\r\n\r\n")
+        .map_or(("", ""), |(head, body)| (head, body));
+    if head
+        .lines()
+        .any(|l| l.eq_ignore_ascii_case("transfer-encoding: chunked"))
+    {
+        dechunk(body)
+    } else {
+        body.to_string()
+    }
+}
+
+/// Decodes a chunked body (size-line / chunk / CRLF ... until a 0
+/// chunk), byte-wise on purpose.
+fn dechunk(mut body: &str) -> String {
+    let mut out = Vec::new();
+    while let Some((size_line, rest)) = body.split_once("\r\n") {
+        let Ok(size) = usize::from_str_radix(size_line.trim(), 16) else {
+            break;
+        };
+        if size == 0 {
+            break;
+        }
+        let bytes = rest.as_bytes();
+        if bytes.len() < size {
+            break;
+        }
+        out.extend_from_slice(&bytes[..size]);
+        body = &rest[size..];
+        body = body.strip_prefix("\r\n").unwrap_or(body);
+    }
+    String::from_utf8_lossy(&out).into_owned()
 }
 
 // ------------------------------------------------- 1. per-volume isolation ---
@@ -737,5 +792,183 @@ async fn explicit_drive_letter_mounts_only_with_the_auto_mount_switch() {
     timeout(Duration::from_secs(30), handle.shutdown())
         .await
         .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+// ------------------------------------------- 7. MV3: multi-volume dashboard ---
+
+/// A process config with the dashboard enabled on an ephemeral port
+/// (the `run_e2e.rs` `web_ui_enabled_serves_dashboard` convention).
+fn process_config_with_web_ui() -> CyDriveConfig {
+    CyDriveConfig {
+        enable_web_ui: true,
+        web_ui_port: 0,
+        ..process_config()
+    }
+}
+
+/// The dashboard port is absent when the web UI is off (the default
+/// offline gate).
+#[tokio::test]
+async fn web_ui_disabled_reports_no_dashboard_address() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    let _guard = chdir(dir.path());
+
+    let handle = boot_multi(load_specs(), vec![mock_transport().await]).await;
+    assert_eq!(
+        handle.web_ui_addr(),
+        None,
+        "enable_web_ui=false boots no dashboard"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+/// MV3 / K24: `enable_web_ui` in multi-volume mode boots ONE dashboard
+/// port serving the volume registry — `/api/volumes` lists both volumes
+/// with their per-volume `/vol/<name>` WebDAV URLs, the volume-scoped
+/// APIs route by `?volume=`, and the aggregated shutdown drains the
+/// dashboard with everything else.
+#[tokio::test]
+async fn multi_boot_serves_volume_aware_dashboard() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    write_file(
+        &dir.path().join("volumes").join("b.toml"),
+        &volume_toml("222:BBB", 222222),
+    );
+    let _guard = chdir(dir.path());
+
+    let specs = load_specs();
+    let handle = boot_multi_with(
+        process_config_with_web_ui(),
+        specs,
+        vec![mock_transport().await, mock_transport().await],
+    )
+    .await;
+
+    let addr = handle
+        .web_ui_addr()
+        .expect("the multi-volume dashboard port is bound");
+    assert_ne!(addr.port(), 0, ":0 must resolve to the real bound port");
+
+    // K24: the registry listing — both volumes, per-volume mount URLs.
+    let resp = send(addr, &request("GET", "/api/volumes", addr, "")).await;
+    assert_eq!(status_of(&resp), 200, "volumes listing: {resp}");
+    let list: serde_json::Value =
+        serde_json::from_str(body_of(&resp).trim()).expect("parse volumes array");
+    let entries = list.as_array().expect("array body");
+    assert_eq!(entries.len(), 2, "one entry per volume");
+    let a = entries
+        .iter()
+        .find(|e| e["name"] == "a")
+        .expect("volume a entry");
+    assert_eq!(a["backend"], "telegram", "the volume file's backend");
+    assert_eq!(a["status"], "running", "assembled volume");
+    assert!(
+        a["webdav_url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("/vol/a")),
+        "the per-volume mount URL (K27): {a}"
+    );
+
+    // K23: a volume-scoped call without the parameter is refused with
+    // the actionable volume list; with it, the frozen 16-key shape.
+    let resp = send(addr, &request("GET", "/api/stats", addr, "")).await;
+    assert_eq!(status_of(&resp), 400, "no default volume: {resp}");
+    let body: serde_json::Value =
+        serde_json::from_str(body_of(&resp).trim()).expect("parse error body");
+    assert_eq!(
+        body["volumes"],
+        serde_json::json!(["a", "b"]),
+        "the body names the addressable volumes: {body}"
+    );
+
+    let resp = send(addr, &request("GET", "/api/stats?volume=a", addr, "")).await;
+    assert_eq!(status_of(&resp), 200, "volume a stats: {resp}");
+    let stats: serde_json::Value =
+        serde_json::from_str(body_of(&resp).trim()).expect("parse stats object");
+    assert_eq!(stats["backend"], "telegram", "volume a's identity");
+    assert!(
+        stats["webdav_url"]
+            .as_str()
+            .is_some_and(|url| url.ends_with("/vol/a")),
+        "the stats card carries the per-volume mount URL: {stats}"
+    );
+
+    // The summary aggregate answers over both volumes.
+    let resp = send(addr, &request("GET", "/api/stats/summary", addr, "")).await;
+    assert_eq!(status_of(&resp), 200, "summary: {resp}");
+    let summary: serde_json::Value =
+        serde_json::from_str(body_of(&resp).trim()).expect("parse summary");
+    assert_eq!(summary["volumes"], 2, "both volumes counted");
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+/// K22 semantics for the dashboard bind: a taken port degrades with an
+/// error (the volumes keep running, `web_ui_addr()` reports `None`) —
+/// a broken dashboard must not take the data planes down.
+#[tokio::test]
+async fn web_ui_bind_failure_degrades_without_failing_volumes() {
+    // Occupy a port first, then boot the multi-volume stack against it.
+    let squatter = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind squatter");
+    let taken = squatter.local_addr().expect("squatter addr");
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    let _guard = chdir(dir.path());
+
+    let cfg = process_config_with_web_ui();
+    let cfg = CyDriveConfig {
+        web_ui_port: taken.port(),
+        ..cfg
+    };
+    let handle = boot_multi_with(cfg, load_specs(), vec![mock_transport().await]).await;
+
+    assert_eq!(
+        handle.volume("a").expect("volume a").status(),
+        VolumeStatus::Running,
+        "the volume is NOT failed by the dashboard bind error"
+    );
+    assert_eq!(
+        handle.web_ui_addr(),
+        None,
+        "no dashboard address is reported after the bind failure"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("the degraded boot still stops cleanly")
         .expect("shutdown joins cleanly");
 }

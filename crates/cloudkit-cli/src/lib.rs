@@ -892,11 +892,12 @@ struct VolumeStopUnit {
 /// registry (statuses for the banner and tests), the ONE stop gate every
 /// volume and the process-level control channel funnel into, the single
 /// multi-volume WebDAV listener (K20 — `None` when its bind degraded,
-/// see [`MultiVolumeHandle::webdav_addr`]), the drive letters actually
+/// see [`MultiVolumeHandle::webdav_addr`]), the single multi-volume
+/// dashboard (K24 / MV3 — `None` when off or degraded, see
+/// [`MultiVolumeHandle::web_ui_addr`]), the drive letters actually
 /// mounted (K27), the per-volume periodic sync tasks (aborted at
 /// shutdown, same semantics as [`RunHandle::shutdown`]) and the stop
-/// task that owns the aggregated graceful sequence. The web dashboard
-/// is deliberately absent — it arrives with MV3.
+/// task that owns the aggregated graceful sequence.
 pub struct MultiVolumeHandle {
     registry: VolumeRegistry,
     watch: Arc<ShutdownWatch>,
@@ -907,6 +908,10 @@ pub struct MultiVolumeHandle {
     /// The single WebDAV listener's bound address (`None` = the bind
     /// degraded; the volumes' data planes keep running, K22).
     webdav_addr: Option<SocketAddr>,
+    /// The single multi-volume dashboard's bound address (`None` =
+    /// `enable_web_ui` off, or the bind degraded per the same K22
+    /// policy).
+    web_ui_addr: Option<SocketAddr>,
     /// The drive letters the per-volume mounts actually claimed
     /// (possibly fewer than configured — a failed mount only warns).
     mounted_letters: Vec<String>,
@@ -938,6 +943,14 @@ impl MultiVolumeHandle {
     /// kept running; the reason is in the log).
     pub fn webdav_addr(&self) -> Option<SocketAddr> {
         self.webdav_addr
+    }
+
+    /// The single multi-volume dashboard's bound address (K24 / MV3):
+    /// `None` means `enable_web_ui` was off or the bind degraded (K22 —
+    /// the volumes keep running without the UI; the reason is in the
+    /// log). A `:0` config port resolves to the real ephemeral one.
+    pub fn web_ui_addr(&self) -> Option<SocketAddr> {
+        self.web_ui_addr
     }
 
     /// The drive letters the per-volume mounts actually claimed (K27;
@@ -1004,11 +1017,13 @@ impl MultiVolumeHandle {
 /// `Failed{reason}` in the registry (with a `tracing::error`) and the
 /// loop continues — a broken volume must not take healthy siblings down
 /// and must never be silent. Every volume failing returns `Err` (the
-/// process-exits-nonzero semantics). A WebDAV bind failure is NOT a
-/// volume failure: it degrades with a `tracing::error` while the
+/// process-exits-nonzero semantics). A WebDAV or web-UI bind failure is
+/// NOT a volume failure: it degrades with a `tracing::error` while the
 /// volumes' data planes keep running.
 ///
-/// Scope (MV3): the web dashboard is still absent.
+/// MV3: with `enable_web_ui` the boot also binds the ONE process-level
+/// dashboard (K24) serving the volume registry — per-volume tabs, the
+/// `/api/volumes` listing and the K23 `?volume=` routing.
 pub async fn run_multi_with_transports(
     process_cfg: &CyDriveConfig,
     volumes: Vec<(VolumeConfig, RunOptions, Arc<dyn CloudTransport>)>,
@@ -1018,13 +1033,38 @@ pub async fn run_multi_with_transports(
     let mut stop_units: Vec<VolumeStopUnit> = Vec::new();
     let mut sync_tasks: Vec<Option<tokio::task::JoinHandle<()>>> = Vec::new();
     let mut volume_fses: Vec<(String, CyDriveFs)> = Vec::new();
+    let mut ui_entries: Vec<cloudkit_web::VolumeUiEntry> = Vec::new();
 
     for (spec, options, transport) in volumes {
         let name = spec.name.clone();
+        // The dashboard identity pieces (K24), captured before the
+        // transport moves into the assembly: the running arm reports
+        // the dispatched truth (RunOptions' volume/quota payload plus
+        // the transport's own capability bits — R4, never hardcoded);
+        // the failed arm degrades to what the volume file declares.
+        let capabilities = transport.capabilities();
+        let ui_config = cloudkit_web::WebUiConfig {
+            drive_letter: spec.settings.drive_letter.clone(),
+            webdav_url: volume_mount_url(process_cfg, &name),
+            chat_id: spec.settings.chat_id,
+            is_configured: spec.settings.is_configured(),
+            backend: spec.settings.backend.as_str().to_string(),
+            volume: options.web_volume.clone(),
+            remote_delete: capabilities.remote_delete,
+            quota: options.web_quota.clone(),
+        };
         match build_volume_runtime(&spec, &options, transport, &watch).await {
             Ok((runtime, stop_unit, sync_task, fs)) => {
                 tracing::info!(volume = %name, "volume is running");
-                volume_fses.push((name, fs));
+                volume_fses.push((name.clone(), fs));
+                ui_entries.push(cloudkit_web::VolumeUiEntry {
+                    name: name.clone(),
+                    status: cloudkit_web::VolumeUiStatus::Running,
+                    config: ui_config,
+                    vfs: Some(Arc::clone(
+                        runtime.vfs().expect("a running volume carries its vfs"),
+                    )),
+                });
                 runtimes.push(runtime);
                 stop_units.push(stop_unit);
                 sync_tasks.push(sync_task);
@@ -1035,6 +1075,14 @@ pub async fn run_multi_with_transports(
                     %error,
                     "assembling the volume failed; continuing with the remaining volumes (K22)"
                 );
+                ui_entries.push(cloudkit_web::VolumeUiEntry {
+                    name: name.clone(),
+                    status: cloudkit_web::VolumeUiStatus::Failed {
+                        reason: error.to_string(),
+                    },
+                    config: ui_config,
+                    vfs: None,
+                });
                 runtimes.push(VolumeRuntime::Failed {
                     spec,
                     reason: error.to_string(),
@@ -1069,6 +1117,13 @@ pub async fn run_multi_with_transports(
     // running; the WebDAV face is simply absent.
     let webdav_server = bind_multi_webdav(process_cfg, volume_fses).await;
     let webdav_addr = webdav_server.as_ref().map(WebDavServer::local_addr);
+
+    // The ONE dashboard (K24 / MV3): a single process-level port serving
+    // the volume registry (per-volume tabs, `/api/volumes` aggregate).
+    // Same K22 degrade policy as the WebDAV bind: a failure only logs
+    // an error — the volumes keep running without the UI.
+    let web_ui = bind_multi_web_ui(process_cfg, ui_entries).await;
+    let web_ui_addr = web_ui.as_ref().map(WebUiServer::local_addr);
 
     // Per-volume mounts (K27): only volumes that EXPLICITLY set a
     // drive_letter claim a mount (the parsed default letter is a
@@ -1105,16 +1160,20 @@ pub async fn run_multi_with_transports(
     };
 
     // The one runner of the aggregated graceful stop sequence: the
-    // WebDAV listener stops first (in-flight requests drain), then per
-    // volume (queue drain then inbound join, the single-volume order),
-    // then the process-level control file, then the mounted letters
-    // release — exactly once for any number of gate fires.
+    // WebDAV listener stops first (in-flight requests drain), then the
+    // dashboard drains the same way (the single-volume order), then per
+    // volume (queue drain then inbound join), then the process-level
+    // control file, then the mounted letters release — exactly once for
+    // any number of gate fires.
     let gate = Arc::clone(&watch);
     let unmount_letters = mounted_letters.clone();
     let stop_task = tokio::spawn(async move {
         watch.wait().await;
         if let Some(server) = &webdav_server {
             server.shutdown().await;
+        }
+        if let Some(web_ui) = &web_ui {
+            web_ui.shutdown().await;
         }
         for unit in stop_units {
             unit.vfs.shutdown().await;
@@ -1147,8 +1206,48 @@ pub async fn run_multi_with_transports(
         stop_task,
         sync_tasks,
         webdav_addr,
+        web_ui_addr,
         mounted_letters,
     })
+}
+
+/// Binds the single multi-volume dashboard (K24 / MV3) or skips it
+/// (`enable_web_ui` off) or degrades visibly (K22): an address-parse
+/// or bind failure logs an error and returns `None` — the volumes keep
+/// running, only the UI face is gone.
+async fn bind_multi_web_ui(
+    process_cfg: &CyDriveConfig,
+    volumes: Vec<cloudkit_web::VolumeUiEntry>,
+) -> Option<WebUiServer> {
+    if !process_cfg.enable_web_ui {
+        tracing::info!("web UI disabled (enable_web_ui = false)");
+        return None;
+    }
+    let bind = match process_cfg.web_ui_host.parse::<IpAddr>() {
+        Ok(host) => SocketAddr::new(host, process_cfg.web_ui_port),
+        Err(error) => {
+            tracing::error!(
+                %error,
+                host = %process_cfg.web_ui_host,
+                "parsing web_ui_host failed; running the volumes without the web UI (K22 degrade)"
+            );
+            return None;
+        }
+    };
+    match WebUiServer::serve_multi(volumes, bind).await {
+        Ok(server) => {
+            tracing::info!(addr = %server.local_addr(), "multi-volume web UI listening");
+            Some(server)
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "binding the multi-volume web UI failed; the volumes keep running without \
+                 the dashboard (K22 degrade)"
+            );
+            None
+        }
+    }
 }
 
 /// Binds the single multi-volume WebDAV listener (K20) or degrades
