@@ -287,6 +287,15 @@ pub struct VolumeConfig {
     /// The volume-scoped key subset, parsed with the same surface and
     /// defaults as `config.toml` (process-scoped keys are rejected).
     pub settings: CyDriveConfig,
+    /// Whether the volume file **explicitly** set `drive_letter`
+    /// (presence semantics — the parsed `settings.drive_letter` always
+    /// carries the single-volume `"Y:"` default and cannot distinguish
+    /// an explicit letter from a defaulted one). The cross-volume
+    /// conflict check (K27) considers explicit letters only: volumes
+    /// that left the letter unset mount nothing by default and never
+    /// collide; what an unset letter means at assembly time is MV2's
+    /// mount decision, not this layer's.
+    pub explicit_drive_letter: bool,
 }
 
 /// `true` for exactly `^[a-z][a-z0-9_-]{0,31}$` — a lowercase ASCII
@@ -360,6 +369,7 @@ pub fn load_volume_config(path: &Path) -> Result<VolumeConfig, ConfigError> {
             });
         }
     }
+    let explicit_drive_letter = table.contains_key("drive_letter");
     let settings: CyDriveConfig = table.try_into().map_err(|err| ConfigError::Parse {
         path: path_str,
         message: err.to_string(),
@@ -372,6 +382,7 @@ pub fn load_volume_config(path: &Path) -> Result<VolumeConfig, ConfigError> {
         name,
         file_path: path.to_path_buf(),
         base_dir,
+        explicit_drive_letter,
         settings,
     })
 }
@@ -423,9 +434,11 @@ fn normalize_drive_letter(letter: &str) -> String {
 }
 
 /// Loads every volume under `dir` (discovery + per-file parse) and
-/// validates the cross-volume rules: no two volumes may mount the same
-/// `drive_letter` (K27 — spelling differences like `"V"` vs `"v:"`
-/// normalise to the same letter and still collide). The returned order
+/// validates the cross-volume rules: no two volumes may explicitly mount
+/// the same `drive_letter` (K27 — spelling differences like `"V"` vs
+/// `"v:"` normalise to the same letter and still collide). A volume that
+/// left `drive_letter` unset participates in no conflict: the parsed
+/// default `"Y:"` is a placeholder, not a mount claim. The returned order
 /// is the stable file-name order of [`discover_volumes`].
 ///
 /// Duplicate volume names cannot occur with the single `.toml`
@@ -437,17 +450,19 @@ pub fn load_volumes(dir: &Path) -> Result<Vec<VolumeConfig>, ConfigError> {
     let mut mounted: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for path in discover_volumes(dir)? {
         let volume = load_volume_config(&path)?;
-        let letter = normalize_drive_letter(&volume.settings.drive_letter);
-        if let Some(other) = mounted.get(&letter) {
-            return Err(ConfigError::Invalid(format!(
-                "drive_letter conflict: volumes `{other}` and `{}` both mount drive \
-                 `{letter}` — give each volume its own drive_letter in its volume file \
-                 ({})",
-                volume.name,
-                volume.file_path.display(),
-            )));
+        if volume.explicit_drive_letter {
+            let letter = normalize_drive_letter(&volume.settings.drive_letter);
+            if let Some(other) = mounted.get(&letter) {
+                return Err(ConfigError::Invalid(format!(
+                    "drive_letter conflict: volumes `{other}` and `{}` both mount drive \
+                     `{letter}` — give each volume its own drive_letter in its volume file \
+                     ({})",
+                    volume.name,
+                    volume.file_path.display(),
+                )));
+            }
+            mounted.insert(letter, volume.name.clone());
         }
-        mounted.insert(letter, volume.name.clone());
         volumes.push(volume);
     }
     Ok(volumes)

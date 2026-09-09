@@ -5,20 +5,20 @@
 //! §3-MV0 — `discover_config_with_volumes_and_store` returns the process
 //! config plus the volume manifest in multi-volume mode (validation
 //! branches surfaced as actionable errors), keeps the single-volume
-//! chain byte-identical otherwise, ignores `CYDRIVE_*` overrides in
-//! volume mode with a tracing note (K28), and `ensure_single_volume`
-//! refuses multi-volume configs with an explicit "MV1" error instead of
-//! panicking in `run`.
+//! chain byte-identical otherwise, and ignores `CYDRIVE_*` overrides in
+//! volume mode with a tracing note (K28). (MV1 replaced the MV0
+//! `ensure_single_volume` gate with the real volume assembly — that
+//! gate's tests were retired with it; the assembly itself is covered by
+//! `multivolume_e2e.rs`.)
 
 use std::fs;
 use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use cloudkit_cli::{
-    discover_config_with_store, discover_config_with_volumes_and_store, ensure_single_volume,
-    DiscoveredConfig,
+    discover_config_with_store, discover_config_with_volumes_and_store, DiscoveredConfig,
 };
-use cloudkit_core::config::{Backend, CyDriveConfig};
+use cloudkit_core::config::Backend;
 use cloudkit_core::credentials::InMemoryStore;
 
 // ------------------------------------------------------------- helpers ---
@@ -202,38 +202,6 @@ fn discover_multi_ignores_cydrive_env_overrides() {
         ),
         DiscoveredConfig::Single(_) => panic!("volumes_dir set means multi-volume discovery"),
     }
-}
-
-#[test]
-fn ensure_single_volume_passes_single_mode_through() {
-    let cfg = CyDriveConfig {
-        bot_token: "1:a".to_string(),
-        chat_id: 7,
-        ..CyDriveConfig::default()
-    };
-    let out = ensure_single_volume(DiscoveredConfig::Single(cfg.clone()))
-        .expect("single-volume configs run as before");
-    assert_eq!(out, cfg);
-}
-
-#[test]
-fn ensure_single_volume_rejects_multi_mode_with_mv1_error() {
-    let dir = multi_volume_dir();
-    let _guard = chdir(dir.path());
-
-    let discovered =
-        discover_config_with_volumes_and_store(&InMemoryStore::new()).expect("multi discovery");
-    let err = ensure_single_volume(discovered)
-        .expect_err("multi-volume configs must fail loudly in this build, not panic");
-    let message = format!("{err:#}");
-    assert!(
-        message.contains("MV1"),
-        "error must say multi-volume assembly arrives in MV1: {message}"
-    );
-    assert!(
-        message.contains("volumes_dir"),
-        "error must point at the config key to remove: {message}"
-    );
 }
 
 #[test]
