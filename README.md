@@ -24,20 +24,25 @@ L1 驱动  telegram │ baidu │ local │ (未来: 115/123/s3…)
 | 基线 | fork 自 rs-CyDrive 0.7.2（527 测试绿，telegram 后端生产可用） | ✅ 完成 |
 | Phase 0 | crate 改名重排（cloudkit-*/ck-*），纯搬迁 + 层检查/秘密扫描 CI 门禁 | ✅ 完成 |
 | Phase 1 | 百度 spike → StorageDriver 抽象落地 → 加密 v2 流式（0.8.0，617+ 测试绿，含真机冒烟两轮） | ✅ 完成 |
-| Phase 2 | ck-local + ck-baidu + 三后端端到端硬验收 | ⬜ 下一步（前置：驱动接入手册） |
+| Phase 2 | ck-local + ck-baidu + 组合根接线 + 端到端硬验收（0.9.0，738 测试绿；baidu/local E2E 通过、telegram 腿待独立测试 chat） | ✅ 完成 |
+| Phase 2.5 | 多卷启用（Registry + 每实例配置 + 多盘挂载，方案一裁决） | ⬜ 下一步（另立计划） |
 | Phase 3 | 115/123/多卷挂载/桌面端/自更新（择机） | ⬜ |
 
 阶段计划与裁决：[docs/plans/2026-09-07-cloudfusion-foundation.md](docs/plans/2026-09-07-cloudfusion-foundation.md) ｜ 历史裁决：[docs/decisions.md](docs/decisions.md)
 
-## 快速开始（当前 = fork 基线，telegram 后端）
+## 快速开始（三后端：telegram / baidu / local，`backend` 配置键分发）
 
 ```powershell
 cargo build --release
-# 或使用既有部署：target/release/cydrive.exe
-./cydrive.exe setup     # bot token(@BotFather) / chat_id / 代理
-./cydrive.exe doctor    # 体检
-./cydrive.exe run       # WebDAV :8080 → 自动挂载 Y: ｜ 仪表盘 :8088 ｜ ctrl+c 或 cydrive stop
+./cydrive.exe setup     # 选后端：telegram(bot token/chat_id) / baidu(appkey+refresh_token) / local(根目录)
+./cydrive.exe doctor    # 体检（baidu：token 探活/直连声明；local：root 可写）
+./cydrive.exe run       # WebDAV :8080 → 自动挂载（默认 Y:；config drive_letter 可改）｜ 仪表盘 :8088 ｜ ctrl+c 或 cydrive stop
 ```
+
+baidu 实例最小配置（config.toml）：`backend = "baidu"` + `baidu_app_key/baidu_app_secret/baidu_refresh_token`（或 env `CYDRIVE_BAIDU_*`，access_token 缺省由 refresh 换取）；`baidu_root` 默认 `/apps/cloudfs`。
+local 实例：`backend = "local"` + `local_root = "<绝对路径>"`。
+权威后端（baidu/local）冷启动可 `cydrive rebuild` 从后端重建索引（明文集；加密实例走 sync）。
+新后端接入指南：[docs/standards/driver-onboarding.md](docs/standards/driver-onboarding.md)（conformance 套件 + 装配点 + E2E 拓扑）。
 
 多机同步（可选）：部署 `cydrive-sync-server`（[部署文档](docs/sync-server-deployment.md)）→ 各机 config.toml 写 `sync_url`/`sync_secret`，上传成功后秒级同步到其他机器。
 

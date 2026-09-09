@@ -459,3 +459,12 @@
 - **观察项（挂收口/后续）**：① rebuild 与 sync 复制的 chunk_count 簿记差（1 vs 0——upload 队列 persist 对 baidu 单块写 0，rebuild 契约写 1；不影响 hydrate）；② sessions_dir 装配传 `./baidu_state` 与驱动内 `baidu_state/sessions` 拼接形成嵌套路径（功能正确、路径冗余）。
 - **披露**：清理时顺带删除 X:/Y: 两条指向 WebDAV 的历史 net use 死记录（生产实例停机态、记录非数据、run 自动重挂；数据零触碰）。
 - **telegram 腿**：独立测试 chat 未提供 → 延后（tracker 待负责人 #1；非本批失败）。
+
+## 2026-09-09 Phase 2 收口（0.9.0）：K1–K18 落地索引 + 观察项销账
+
+- **版本 0.9.0**（workspace 单点）：CloudTransport 破坏性演进（K1/K3）+ 新驱动双 crate（ck-local/ck-baidu）+ Capabilities 第 10 位（K4）；bin 名 cydrive/cydrive-sync-server 不变。
+- **K1–K18 落地索引**（详情见各批次条目）：K1/K2/K3 → B3a（8f96b07）；K4 → 位 0b65311 + 接线 b46f87c（E2E 真机验证删除→远端消失）；K5/K6 → 卷形态（fs_id/路径句柄，E2E 跨实例 fs_id 一致实证）；K7 → 会话表（B2 c6c22de + 装配接线 dcdf8ca + 嵌套修 a92b628；E2E 杀进程 0 重传实证）；K8/K9 → dlink 缓存/下载器（3696fe6）；K10 → rtype=3（真机复核通过，E2E 覆盖无副本）；K11 → rebuild（d10d285 + chunks 对齐 a92b628；E2E D10 ② 等价）；K12 → namespace（58b8cbc + 一次性命令补 41fbb85；E2E sync 收敛）；K13 → oauth on-arrival（41f25e3 + TokenStore 桥 9ffa672）；K14 → 四键 env 链（6b74a19）；K15 → 重试钩子（41f25e3）；K16 → mock axum（9a969ac 起五轮迭代对齐真实）；K17 → 三处同步（6b74a19）；K18 → 直连声明（9ffa672，E2E 全程直连形态）。
+- **E2E 观察项销账（a92b628）**：① sessions_dir 嵌套（装配改传实例 cwd "."，驱动契约不动）② chunk_count 簿记差（receipt 单容器 chunk_msg_ids=[fs_id]/[0] + rebuild 补 chunks 行——upload persist 与 rebuild 完全等价）。
+- **门禁终态**：win 738 passed / 0 failed / 9 ignored（真机 baidu 3 + 既有 6）；wsl 739 passed / 0 failed（+1 平台 cfg 既有差异）；clippy/fmt/check_layers（11 manifests）/scan_secrets 全绿；release 全 workspace 构建通过。
+- **遗留清单**：① telegram E2E 腿（独立测试 chat 待负责人）；② `#[ignore]` 真机套件随真机窗口复跑（baidu 3 已本轮跑过、既有 6 未跑）；③ litmus 套件（挂账）；④ 正式 appkey 到位后复测 meta 权限（31300）与 spike §2 限额；⑤ 下载 4 并发预取优化（当前顺序实现 ~5MB/s，4 并发 transport 面已在）；⑥ K10 复核项建议销账（rtype=3 真机通过）。
+- **不部署生产位**（部署裁决留负责人，0.8.0 先例）。
