@@ -47,6 +47,6 @@ scripts/scan_secrets                             # R3 秘密扫描门禁（CI �
 
 ## 待人工清单
 1. 基线设计 §9-2/9-3/9-4 三项建议待负责人确认（旧仓冻结时点 / bot 分 crate 时点 / R-E 批序）
-2. Phase 2 E2E 前提供 `E:\GitHub\rs-CyDrive\test\` telegram 测试配置（**独立测试 chat**，见 foundation §7a 隔离裁决；baidu token 已验证可用）
+2. **telegram E2E 腿二选一**：telegram 实测配置在 `D:\Tools\rs-CyDrive`（生产实例，bot/chat 即生产命名空间；E:\GitHub\rs-CyDrive\test\ 不存在）——负责人明示接受生产 chat 污染跑 E2E，或提供独立测试 bot/chat（§7a 隔离裁决）；baidu appkey 即负责人本人凭据（PCFS client.go:69-70，decisions 2026-09-09 澄清），meta 31300 若要恢复直查须在百度开放平台为本 key 开 meta 权限
 3. 新仓远端 origin 待建（当前仅 upstream-cydrive 只读、push 已禁用）
 4. 自 rs-CyDrive 继承的挂账——**2026-09-08 修复批后仅剩验证类**：P3 hydrate 快照回写竞态已修（47c4fc2，目标列写 set_cached_flag）；Low×5 已清（sync_url host 校验 f8040aa/模拟器排序 e93433a/SyncClient trait 文档 09fff2c/--help 实证漂移 bc34d43/64MB 并发闸 08fee1d；凭据门槛核实本已统一于 resolve_sync_secret）；gen_compat_fixtures.py 已修（5a3a319，重生成需同步改 database.rs 钉死的 created_at 断言）；deny advisories 已过（`advisories ok`，经 7897 代理拉库——github.com 直连不通的既有限制自此有绕行方案）。**剩余：#[ignore] 真机测试 ×3、litmus 套件（均验证类，随真机窗口跑）**
