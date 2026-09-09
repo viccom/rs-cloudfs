@@ -69,11 +69,12 @@ fn job_for(
 }
 
 /// A handle pointing at the given chunk ids (single-chunk convenience).
-fn handle_for(first_msg_id: i32, total_size: u64) -> RemoteHandle {
+fn handle_for(first_msg_id: i64, total_size: u64) -> RemoteHandle {
     RemoteHandle {
         first_msg_id,
         chunk_msg_ids: vec![first_msg_id],
         total_size,
+        path: None,
     }
 }
 
@@ -100,7 +101,15 @@ async fn operations_before_connect_return_not_connected() {
         "open_range"
     );
 
-    let err = t.delete_remote(1).await.unwrap_err();
+    let err = t
+        .delete_remote(&RemoteHandle {
+            first_msg_id: 1,
+            chunk_msg_ids: vec![1],
+            total_size: 0,
+            path: None,
+        })
+        .await
+        .unwrap_err();
     assert!(
         matches!(err, StorageError::Invalid),
         "delete_remote: {err:?}"
@@ -316,6 +325,7 @@ async fn open_round_trips_full_chunked_file() {
         first_msg_id: receipt.first_msg_id,
         chunk_msg_ids: receipt.chunk_msg_ids.clone(),
         total_size: 7,
+        path: None,
     };
     let bytes = drain(t.open(&handle).await.expect("open"))
         .await
@@ -343,6 +353,7 @@ async fn open_trims_to_the_handle_budget() {
         first_msg_id: receipt.first_msg_id,
         chunk_msg_ids: receipt.chunk_msg_ids.clone(),
         total_size: 4,
+        path: None,
     };
     let bytes = drain(t.open(&handle).await.expect("open"))
         .await
@@ -355,6 +366,7 @@ async fn open_trims_to_the_handle_budget() {
         first_msg_id: receipt.first_msg_id,
         chunk_msg_ids: receipt.chunk_msg_ids.clone(),
         total_size: u64::MAX,
+        path: None,
     };
     let bytes = drain(t.open(&handle).await.expect("open"))
         .await
@@ -390,6 +402,7 @@ async fn open_range_slices_middle_clamps_tail_and_empty_beyond_eof() {
         first_msg_id: receipt.first_msg_id,
         chunk_msg_ids: receipt.chunk_msg_ids.clone(),
         total_size: 7,
+        path: None,
     };
 
     let bytes = drain(t.open_range(&handle, 2, 3).await.expect("open_range"))
@@ -420,7 +433,7 @@ async fn delete_remote_removes_message_and_rejects_unknown_ids() {
     let receipt = t.upload(&job).await.expect("upload");
     let handle = handle_for(receipt.first_msg_id, 9);
 
-    t.delete_remote(receipt.first_msg_id)
+    t.delete_remote(&handle)
         .await
         .expect("delete stored message");
     assert_eq!(t.deleted(), vec![receipt.first_msg_id]);
@@ -430,7 +443,7 @@ async fn delete_remote_removes_message_and_rejects_unknown_ids() {
         "open after delete must fail NotFound"
     );
 
-    let err = t.delete_remote(4242).await.unwrap_err();
+    let err = t.delete_remote(&handle_for(4242, 3)).await.unwrap_err();
     assert!(
         matches!(err, StorageError::NotFound),
         "delete unknown: {err:?}"
@@ -449,6 +462,7 @@ async fn incoming_drains_scripted_events_once_in_order() {
                     first_msg_id: 10,
                     chunk_msg_ids: vec![10],
                     total_size: 42,
+                    path: None,
                 },
             }),
             IncomingEvent::Command {

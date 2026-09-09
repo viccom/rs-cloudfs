@@ -1,0 +1,64 @@
+[package]
+name = "ck-baidu"
+description = "Baidu Pan StorageDriver - skeleton + OAuth state machine + metadata plane (Phase 2 Batch B1)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# StorageDriver trait 为 #[async_trait]，实现侧必须使用同一宏
+# （ck-local/ck-telegram 同款）。
+async-trait = "0.1"
+# L2 契约层是唯一 workspace 依赖——驱动 crate 禁依赖 cloudkit-core 与
+# 任何 L3+ crate（driver-onboarding §1 / R1，scripts/check_layers 拦截）。
+cloudkit-storage = { path = "../../cloudkit-storage" }
+# B2 分片 MD5（precreate block_list）——B1 先声明（计划 §3 Files 清单），
+# 上传路径在 Batch B2 接线使用。
+md-5 = "0.10"
+# HTTP 面：rustls（禁默认 native-tls，对齐 spike/sync 先例）；json=表单与
+# 响应解析、multipart=B2 superfile2、stream=B2 下载（特性集照抄
+# examples/baidu_spike Cargo.toml）。
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "multipart",
+    "rustls-tls",
+    "stream",
+] }
+# ByteStream 产生侧（download.rs 的分片流实现 futures_core::Stream；
+# ck-telegram 同款形态）。
+futures-core = "0.3"
+# transport 面 upload_stream 的帧消费（StreamExt::next；B3b）——与
+# dev-dependencies 同版本（lock 既有），default-features=false 保持
+# 最小面（只取 stream 组合子）。
+futures-util = { version = "0.3", default-features = false }
+# 分片净荷类型（superfile2 multipart part / 下载流帧；cloudkit-storage
+# ByteStream 同源 crate）。
+bytes = "1"
+# 载荷模型（derive 为响应/表单解析结构体备用，B1 绿阶段使用）。
+serde = { version = "1", features = ["derive"] }
+# api/client 层 JSON 载荷（reqwest json 特性同源；显式声明为直接依赖，
+# 计划 §3 五项依赖清单未列——响应解析必需，特此注明）。
+serde_json = "1"
+# token 状态 RwLock（spike Ctx.token 同款形态，刷新整体替换）；
+# time = K15 重试钩子的退避 sleep（client.rs）；rt = B2 下载分片后台任务
+# （download.rs spawn）；fs = K7 会话表落盘（upload.rs 原子写）。
+tokio = { version = "1", features = ["sync", "time", "rt", "fs"] }
+
+[dev-dependencies]
+# mock baidu 内存后端（K16：axum 钉 0.8.9，cloudkit-sync-server 测试同款
+# 特性集——default-features=false 保持与 lock 一致的最小面）。
+axum = { version = "=0.8.9", default-features = false, features = [
+    "http1",
+    "json",
+    "tokio",
+] }
+# mock 监听（net）+ #[tokio::test]（rt/macros）。
+tokio = { version = "1", features = ["rt", "macros", "net"] }
+# B2 下载/续传测试消费 ByteStream（reader 读回比对；cloudkit-storage
+# conformance 套件同款最小特性集）。
+futures-util = { version = "0.3", default-features = false }
+# K7 会话表根目录（upload_resume 差集续传测试注入临时目录）。
+tempfile = "3"

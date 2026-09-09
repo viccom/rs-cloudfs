@@ -1,10 +1,10 @@
-//! 驱动能力位（foundation D3，九种）。
+//! 驱动能力位（foundation D3 九种 + Batch B3b 第十位 `remote_delete`）。
 //!
 //! **R4 红线：能力位必须诚实**——只声明经过 conformance kit（离线套件）
 //! 与真机验证的能力（local 类驱动豁免真机项）。消费方启动时按能力探测
 //! 降级（无 INBOUND → 入站 worker 不启动 + 日志声明），**绝不 panic**。
 
-/// 九个能力位的集合形态。
+/// 十个能力位的集合形态。
 ///
 /// 形态裁决：bool 字段 struct 而非 bitflags——零新依赖、每bit 独立文档
 /// 注释承载 conformance 含义（R4 的「诚实」是逐位的）；判等/子集比较
@@ -35,6 +35,17 @@ pub struct Capabilities {
     pub inbound: bool,
     /// 对话通道（bot 对话式交互）。
     pub chat: bool,
+    /// 远端对象删除原语（Batch B3b / K4，第 10 位）：
+    /// [`crate::transport::CloudTransport::delete_remote`] 可真实删除后端
+    /// 对象（local 按 path / baidu 按 fs_id）。**K4 依据**：权威索引后端
+    /// 删除若只删本地行会造成云端孤儿 + rebuild 复活——driver-onboarding
+    /// §9 勿抄清单明令禁止；消费方（Vfs/webdav/web 删除路径，B3b 段二
+    /// 接线）按本位门控：真 → 先删远端（幂等重试）成功后再删本地行+缓存，
+    /// 失败中止并保留行；假 → 现行为（Python parity：远端对象保留）。
+    /// telegram/mock 声明 false（行为零变化）。该位描述 transport 面的
+    /// 删除原语；[`crate::driver::StorageDriver::delete`] 的「真删后端」
+    /// 语义（9 位时代已如此）不因此位改变。
+    pub remote_delete: bool,
 }
 
 impl Capabilities {
@@ -56,6 +67,7 @@ impl Capabilities {
             change_feed,
             inbound,
             chat,
+            remote_delete,
         } = *other;
         self.range_read >= range_read
             && self.resume >= resume
@@ -66,6 +78,7 @@ impl Capabilities {
             && self.change_feed >= change_feed
             && self.inbound >= inbound
             && self.chat >= chat
+            && self.remote_delete >= remote_delete
     }
 
     /// 是否一个能力位都没有声明。

@@ -16,11 +16,11 @@
 6. `docs/tracking/phase0-1.md` —— 当前任务跟踪单（**开工先读、每批收口更新**）
 
 ## 当前阶段
-**Phase 2 已启动（2026-09-08）**：Phase 0+1 完成（0.8.0，win 625 绿；继承挂账代码项清零）；PCFS 多实例研究入档，多卷启用裁决=方案一（B3 后接 Phase 2.5）；前置任务「驱动接入手册」已交付（docs/standards/driver-onboarding.md）。**下一步 = 写 Phase 2 执行计划（含跟踪单）→ ck-local → ck-baidu B1–B3 → 三后端 E2E 硬验收 → Phase 2.5 多卷**。过渡测试包：E:\Rs_Codes\cydrive-0.8.0-testkit（telegram+加密 U:/V:，仓外不入库）。
+**Phase 2 完成（2026-09-09，0.9.0）**：ck-local + ck-baidu（双面驱动：StorageDriver conformance 全绿 + CloudTransport 运行时面）+ 组合根三后端接线（backend 键/删除语义/rebuild/namespace/setup/doctor）交付；E2E 硬验收 baidu/local 腿通过（往返/Range/杀进程续传/删除/sync 收敛/rebuild 等价/双盘并存），**telegram E2E 腿待独立测试 chat（负责人挂账）**；win 738 / wsl 739 绿。五项百度真网实证入 decisions（uk 字段/precreate 会话锁定 31363/meta 端点 31300 无权限/目录 create 冲突重命名/索引传播延迟）。**下一步 = Phase 2.5 多卷启用（方案一裁决，B3 后立即——另立计划）**。过渡测试包：E:\Rs_Codes\cydrive-0.8.0-testkit（telegram+加密 U:/V:，仓外不入库）。
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 625 测试（0.8.0+修复批；ignored 6 为真机/平台类）
+cargo test --workspace --no-fail-fast            # 738 测试（0.9.0；ignored 9 = 真机 3(baidu) + 平台/真机类 6）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 scripts/check_layers                             # R1 层依赖门禁（CI 同款；动 Cargo.toml 依赖后必跑）
@@ -38,7 +38,9 @@ scripts/scan_secrets                             # R3 秘密扫描门禁（CI �
 ## 已知陷阱（自 rs-CyDrive 继承 + 融合新增）
 - Windows Git Bash：`ls`/`tree`/`du`/`ps` 别名禁用（用 `fd`/`rg`）；wsl.exe 复杂命令须 `.sh` 脚本路线（引号吞噬）
 - 探索子代理拿结论，主会话不整读大文件（hub-and-spoke）
-- 百度 API：强制 IPv4 dial、dlink 须追加 access_token、errno 110/111/-6 三档（详见 multicloud 附录 A）
+- 百度 API：强制 IPv4 dial、errno 110/111/-6 三档（详见 multicloud 附录 A）；**当前第三方 appkey 下 meta 端点全废（31300/31023）——stat/Entry/delete 走 list + fs_id 句柄缓存 + 递归扫描**（decisions 2026-09-08 第四轮）；**目录 create 撞已存在 = errno=0 + 空副本重命名（非 -8）——mkdir/ensure_parents 必须 list 预检**；**precreate 会话锁定全量 block_list（create 不一致重申 → 31363）——流式上传只能「到齐即传」**；**uinfo 用户键 = uk 非 uid**
+- **百度下载三约束（spike §5 矩阵）**：有界 Range ≤4MiB + netdisk UA + 禁全量 GET（违反任一 → 403/31326）；dlink TTL ≥96min 实测、缓存 60min + 两段 fallback（追 token→重取）；**rtype=3 覆盖语义已真机复核**（同路径重传覆盖、无 _2026 副本）
+- **Git Bash 探针教训**：curl 形参中 `/apps/...` 被 MSYS 路径改写污染（→ C:/Program Files/Git/apps/...，百度报 -7 假象）——真网探针必须 `MSYS_NO_PATHCONV=1`
 - **Explorer 上传链路**：空 PUT→LOCK→PUT→PROPPATCH——**PROPPATCH 必须全成功（207）而非 405**，否则 MiniRedir 整单回滚「看似失败实则已传」（rs-CyDrive 2026-09-03 真机首验最贵教训，百度 E2E 直接承重）
 - 实现期陷阱查 `docs/rust-rewrite-design.md`「深度调研补遗」节（axum 2MB body 上限/grammers FloodWait 藏点/dav-server Bytes-Seek 模型/WebClient 4GB-1/挂载 Basic 认证）
 - PCFS 反面教材勿抄：错误类型跨层泄漏、硬编码密钥、纯 CTR 无认证、注释掉的调试日志

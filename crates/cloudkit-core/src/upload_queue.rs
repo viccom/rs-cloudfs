@@ -883,7 +883,8 @@ fn persist_success(
     let file_id = db.upsert_file(&uploaded_upsert(
         row,
         file_size,
-        Some(i64::from(receipt.first_msg_id)),
+        // K1: receipt ids are already the DB's i64 width.
+        Some(receipt.first_msg_id),
         chunk_count,
         sha256,
     ))?;
@@ -895,7 +896,7 @@ fn persist_success(
             // Last chunk (covers the single-chunk case: n-1 == 0).
             receipt.uploaded_bytes as i64 - (job.chunk_size as i64) * (chunk_count - 1)
         };
-        db.upsert_chunk(file_id, index, i64::from(msg_id), size, None)?;
+        db.upsert_chunk(file_id, index, msg_id, size, None)?;
     }
     Ok(())
 }

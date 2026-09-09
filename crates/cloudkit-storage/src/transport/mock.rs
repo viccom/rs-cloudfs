@@ -55,6 +55,7 @@ impl Default for MockState {
             stream_upload_calls: Vec::new(),
             max_stream_frame: 0,
             deleted: Vec::new(),
+            delete_script: VecDeque::new(),
             open_delay: Duration::ZERO,
             sent_texts: Vec::new(),
             sent_documents: Vec::new(),
@@ -80,9 +81,9 @@ fn mock_default_capabilities() -> Capabilities {
 
 struct MockState {
     /// msg_id -> (stored bytes, remote document name, caption).
-    messages: BTreeMap<i32, (Vec<u8>, String, String)>,
+    messages: BTreeMap<i64, (Vec<u8>, String, String)>,
     /// Next msg_id to hand out; ids start at 1 (contract 5).
-    next_msg_id: i32,
+    next_msg_id: i64,
     /// Whether `connect()` has succeeded at least once.
     connected: bool,
     /// Scripted result of the first `connect()` call; `None` means Ok.
@@ -103,7 +104,12 @@ struct MockState {
     /// memory-granularity assertions.
     max_stream_frame: usize,
     /// msg_ids successfully deleted, in order.
-    deleted: Vec<i32>,
+    deleted: Vec<i64>,
+    /// Scripted outcomes of `delete_remote`, consumed in order (B3b / K4
+    /// red tests: an `Err` fails the call BEFORE anything is removed —
+    /// the idempotent-retry contract's "remote refused" leg). An
+    /// exhausted or `Ok` script behaves as the normal deletion.
+    delete_script: VecDeque<Result<(), StorageError>>,
     /// Artificial pre-stream delay injected by `open`/`open_range`
     /// (tests simulate a stalling remote); zero by default.
     open_delay: Duration,
@@ -137,6 +143,7 @@ impl MockTransport {
         MockTransportBuilder {
             connect_result: None,
             upload_script: VecDeque::new(),
+            delete_script: VecDeque::new(),
             incoming_events: Vec::new(),
             open_delay: Duration::ZERO,
             capabilities: mock_default_capabilities(),
@@ -151,7 +158,7 @@ impl MockTransport {
     }
 
     /// Stored bytes of the message `msg_id`, if present.
-    pub fn message(&self, msg_id: i32) -> Option<Vec<u8>> {
+    pub fn message(&self, msg_id: i64) -> Option<Vec<u8>> {
         self.lock()
             .ok()?
             .messages
@@ -210,7 +217,7 @@ impl MockTransport {
     }
 
     /// msg_ids successfully deleted, in order.
-    pub fn deleted(&self) -> Vec<i32> {
+    pub fn deleted(&self) -> Vec<i64> {
         self.lock()
             .map(|state| state.deleted.clone())
             .unwrap_or_default()
@@ -358,18 +365,36 @@ impl CloudTransport for MockTransport {
         Ok(frame_stream(vec![Ok(Bytes::from(data))]))
     }
 
-    async fn delete_remote(&self, msg_id: i32) -> Result<(), StorageError> {
+    /// Deletes every message the handle refers to (K3: the handle's ids,
+    /// in order — `path` is ignored, the mock is id-keyed). Any unknown
+    /// id fails the whole call with [`StorageError::NotFound`] before
+    /// anything is removed (all-or-nothing, mirroring the pre-K3 single
+    /// -message semantics for the single-chunk handles every existing
+    /// test uses).
+    ///
+    /// B3b / K4: a scripted `Err` (see
+    /// [`MockTransportBuilder::delete_action`]) fails the call up front —
+    /// no id is removed — so a consumer's retry sees the SAME scripted
+    /// queue position semantics as the upload script (consumed in order,
+    /// one entry per call).
+    async fn delete_remote(&self, handle: &RemoteHandle) -> Result<(), StorageError> {
         let mut state = self.lock()?;
         if !state.connected {
             return Err(StorageError::Invalid);
         }
-        match state.messages.remove(&msg_id) {
-            Some(_) => {
-                state.deleted.push(msg_id);
-                Ok(())
-            }
-            None => Err(StorageError::NotFound),
+        if let Some(Err(error)) = state.delete_script.pop_front() {
+            return Err(error);
         }
+        for msg_id in &handle.chunk_msg_ids {
+            if !state.messages.contains_key(msg_id) {
+                return Err(StorageError::NotFound);
+            }
+        }
+        for msg_id in &handle.chunk_msg_ids {
+            state.messages.remove(msg_id);
+            state.deleted.push(*msg_id);
+        }
+        Ok(())
     }
 
     /// The declared bits come from the (builder-overridable) state; the
@@ -485,7 +510,7 @@ fn store_chunks(
     data: &[u8],
     total_chunks: usize,
     count: usize,
-) -> Vec<i32> {
+) -> Vec<i64> {
     // Naming source is the virtual path's full basename (extension
     // included), mirroring the Python baseline (telegram_client.py:155).
     let file_name = job.rel_path.name();
@@ -522,7 +547,7 @@ fn store_chunks(
 
 /// Concatenates the stored bytes of `chunk_msg_ids` in order; an unknown
 /// id fails with `NotFound`.
-fn concat_chunks(state: &MockState, chunk_msg_ids: &[i32]) -> Result<Vec<u8>, StorageError> {
+fn concat_chunks(state: &MockState, chunk_msg_ids: &[i64]) -> Result<Vec<u8>, StorageError> {
     let mut data = Vec::new();
     for &msg_id in chunk_msg_ids {
         match state.messages.get(&msg_id) {
@@ -548,6 +573,7 @@ where
 pub struct MockTransportBuilder {
     connect_result: Option<Result<(), StorageError>>,
     upload_script: VecDeque<UploadAction>,
+    delete_script: VecDeque<Result<(), StorageError>>,
     incoming_events: Vec<Result<IncomingEvent, StorageError>>,
     open_delay: Duration,
     capabilities: Capabilities,
@@ -571,6 +597,16 @@ impl MockTransportBuilder {
     /// exhausted scripts behave as [`UploadAction::Ok`].
     pub fn upload_action(mut self, action: UploadAction) -> Self {
         self.upload_script.push_back(action);
+        self
+    }
+
+    /// Appends a scripted `delete_remote` outcome (B3b / K4): an `Err`
+    /// fails the call before anything is removed; `Ok(())` (or an
+    /// exhausted script) performs the normal id-based deletion. Scripts
+    /// are consumed in order, one entry per call — a consumer that
+    /// retries once consumes two entries.
+    pub fn delete_action(mut self, result: Result<(), StorageError>) -> Self {
+        self.delete_script.push_back(result);
         self
     }
 
@@ -606,6 +642,7 @@ impl MockTransportBuilder {
             state: Arc::new(Mutex::new(MockState {
                 connect_result: self.connect_result,
                 upload_script: self.upload_script,
+                delete_script: self.delete_script,
                 incoming_events: self.incoming_events,
                 open_delay: self.open_delay,
                 capabilities: self.capabilities,

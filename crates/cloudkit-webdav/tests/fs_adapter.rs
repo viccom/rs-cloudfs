@@ -24,7 +24,7 @@ use cloudkit_core::cache::CacheManager;
 use cloudkit_core::database::{FileUpsert, MetaDatabase};
 use cloudkit_core::rel_path::RelPath;
 use cloudkit_core::transport::mock::MockTransport;
-use cloudkit_core::transport::{CloudTransport, UploadJob, UploadReceipt};
+use cloudkit_core::transport::{CloudTransport, StorageError, UploadJob, UploadReceipt};
 use cloudkit_core::upload_queue::RetryPolicy;
 use cloudkit_core::vfs::{Vfs, VfsConfig};
 use cloudkit_webdav::CyDriveFs;
@@ -50,6 +50,52 @@ fn test_cfg() -> VfsConfig {
     }
 }
 
+/// The mock's default declared face (mirrors
+/// `mock_default_capabilities`): the three legacy bits.
+fn legacy_caps() -> cloudkit_core::transport::Capabilities {
+    cloudkit_core::transport::Capabilities {
+        range_read: true,
+        inbound: true,
+        chat: true,
+        ..cloudkit_core::transport::Capabilities::none()
+    }
+}
+
+/// The K4 declared face: the legacy bits plus `remote_delete` (a
+/// baidu/local-shaped declaration for the gated delete tests).
+fn remote_delete_caps() -> cloudkit_core::transport::Capabilities {
+    cloudkit_core::transport::Capabilities {
+        remote_delete: true,
+        ..legacy_caps()
+    }
+}
+
+/// A directory row born uploaded + cached carrying a backend handle
+/// (`telegram_msg_id` = the remote object id; the K4 collection gate
+/// consumes exactly this shape).
+fn seed_dir_row_with_handle(db: &Arc<MetaDatabase>, rel: &str, msg_id: i64) {
+    let rel_path = RelPath::new(rel).expect("valid rel path");
+    db.upsert_file(&FileUpsert {
+        rel_path: rel_path.as_str().to_string(),
+        name: rel_path.name().to_string(),
+        parent_dir: rel_path
+            .parent()
+            .map(|parent| parent.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string()),
+        size: 0,
+        mtime: 1_700_000_000.0,
+        sha256: None,
+        is_dir: true,
+        telegram_msg_id: Some(msg_id),
+        is_uploaded: true,
+        is_cached: true,
+        is_encrypted: false,
+        chunk_count: 0,
+        mime_type: None,
+    })
+    .expect("seed dir row with handle");
+}
+
 /// Real temp environment: SQLite db + mirrored cache tree + pre-connected
 /// mock transport + Vfs + the adapter under test. `cache_root` is returned
 /// for path assertions (the Vfs owns its own `CacheManager`).
@@ -63,11 +109,28 @@ async fn test_env(
     Arc<Vfs>,
     CyDriveFs,
 ) {
+    test_env_with_caps(cache_limit, legacy_caps()).await
+}
+
+/// The K4 environment variant (B3b 段二b red tests): same assembly with
+/// the mock's declared capability face injected — a remote_delete=true
+/// declaration stands in for a baidu/local transport.
+async fn test_env_with_caps(
+    cache_limit: u64,
+    caps: cloudkit_core::transport::Capabilities,
+) -> (
+    tempfile::TempDir,
+    Arc<MetaDatabase>,
+    PathBuf,
+    Arc<MockTransport>,
+    Arc<Vfs>,
+    CyDriveFs,
+) {
     let dir = tempfile::tempdir().expect("create temp dir");
     let cache_root = dir.path().join("cache");
     let db = Arc::new(MetaDatabase::open(&dir.path().join("meta.db")).expect("open temp db"));
     let cache = CacheManager::new(cache_root.clone(), cache_limit);
-    let mock = Arc::new(MockTransport::new());
+    let mock = Arc::new(MockTransport::builder().capabilities(caps).build());
     mock.connect().await.expect("pre-connect mock transport");
     let transport: Arc<dyn CloudTransport> = mock.clone();
     let vfs = Arc::new(Vfs::new(db.clone(), cache, transport, test_cfg()));
@@ -144,7 +207,7 @@ fn seed_uploaded_row(
             mtime: 1_700_000_000.0,
             sha256: None,
             is_dir: false,
-            telegram_msg_id: Some(i64::from(receipt.first_msg_id)),
+            telegram_msg_id: Some(receipt.first_msg_id),
             is_uploaded: true,
             is_cached: false,
             is_encrypted: false,
@@ -159,7 +222,7 @@ fn seed_uploaded_row(
         } else {
             size - (chunk_size as i64) * (chunk_count - 1)
         };
-        db.upsert_chunk(file_id, index, i64::from(msg_id), chunk_row_size, None)
+        db.upsert_chunk(file_id, index, msg_id, chunk_row_size, None)
             .expect("seed chunk row");
     }
 }
@@ -742,6 +805,110 @@ async fn remove_dir_empty_ok_non_empty_exists() {
     fs.metadata(&DavPath::new("/full-dir/child.txt").expect("path"))
         .await
         .expect("children untouched");
+}
+
+/// 11a (K4 / B3b 段二b): with the transport declaring `remote_delete`,
+/// the WebDAV DELETE on a file deletes the remote object FIRST, then the
+/// row and the cache copy (the same gate the core `Vfs::remove_file`
+/// carries — the adapter must not be the hole in the three-face wiring).
+#[tokio::test]
+async fn remove_file_gated_remote_delete_removes_remote_first() {
+    let caps = remote_delete_caps();
+    let (_dir, db, cache_root, mock, _vfs, fs) = test_env_with_caps(u64::MAX, caps).await;
+    seed_remote_file(&db, &mock, "/doomed.bin", b"payload", 64).await;
+    let local = seed_local(&cache_root, "/doomed.bin", b"payload");
+    let row = db
+        .get_file("/doomed.bin")
+        .expect("db read")
+        .expect("row exists");
+
+    fs.remove_file(&DavPath::new("/doomed.bin").expect("path"))
+        .await
+        .expect("remove file");
+
+    let err = fs
+        .metadata(&DavPath::new("/doomed.bin").expect("path"))
+        .await
+        .expect_err("row gone");
+    assert_eq!(err, FsError::NotFound);
+    assert!(!local.exists(), "cache copy removed");
+    assert_eq!(
+        mock.deleted(),
+        vec![row.telegram_msg_id.expect("seeded row carries the msg id")],
+        "the remote object died with the row (remote_delete=true)"
+    );
+}
+
+/// 11b (K4): the WebDAV DELETE on a COLLECTION gates the same way — a
+/// dir row that carries a backend handle has its remote object deleted
+/// before the row dies.
+#[tokio::test]
+async fn remove_dir_gated_remote_delete_removes_remote_first() {
+    let caps = remote_delete_caps();
+    let (_dir, db, _cache_root, mock, _vfs, fs) = test_env_with_caps(u64::MAX, caps).await;
+    // A dir row with a remote handle (a backend-materialized directory:
+    // baidu fs_id / a local subtree root). Dir rows are born
+    // uploaded+cached; the handle is what the gate consumes.
+    let receipt = seed_remote(&mock, "/docs", b"dir-marker", 1, 64).await;
+    seed_dir_row_with_handle(&db, "/docs", receipt.first_msg_id);
+
+    fs.remove_dir(&DavPath::new("/docs").expect("path"))
+        .await
+        .expect("remove empty dir with remote handle");
+    assert_eq!(
+        mock.deleted(),
+        vec![receipt.first_msg_id],
+        "the dir's remote object died before the row"
+    );
+    assert!(
+        db.get_file("/docs").expect("db read").is_none(),
+        "the dir row is gone"
+    );
+}
+
+/// 11c (K4): a refused remote dir delete (fails twice — the gate
+/// retries once) aborts the collection delete with the row KEPT.
+#[tokio::test]
+async fn remove_dir_remote_refusal_keeps_row() {
+    let refused = || Err(StorageError::Unavailable("backend down".into()));
+    let caps = remote_delete_caps();
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cache_root = dir.path().join("cache");
+    let db = Arc::new(MetaDatabase::open(&dir.path().join("meta.db")).expect("open temp db"));
+    let mut builder = MockTransport::builder().capabilities(caps);
+    builder = builder.delete_action(refused());
+    builder = builder.delete_action(refused());
+    let mock = Arc::new(builder.build());
+    mock.connect().await.expect("pre-connect mock transport");
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let vfs = Arc::new(Vfs::new(
+        db.clone(),
+        CacheManager::new(cache_root.clone(), u64::MAX),
+        transport,
+        test_cfg(),
+    ));
+    let fs = CyDriveFs::new(
+        vfs.clone(),
+        db.clone(),
+        CacheManager::new(cache_root, u64::MAX),
+    );
+
+    let receipt = seed_remote(&mock, "/stuck", b"dir-marker", 1, 64).await;
+    seed_dir_row_with_handle(&db, "/stuck", receipt.first_msg_id);
+
+    let err = fs
+        .remove_dir(&DavPath::new("/stuck").expect("path"))
+        .await
+        .expect_err("the refused remote dir delete must abort");
+    assert_eq!(
+        err,
+        FsError::GeneralFailure,
+        "the transport refusal maps to the generic failure"
+    );
+    assert!(
+        db.get_file("/stuck").expect("db read").is_some(),
+        "the dir row survives the refused remote delete"
+    );
 }
 
 /// 12. rename (file): row, cache copy and chunk linkage move together —

@@ -93,13 +93,14 @@ async fn worker_env(
 }
 
 /// Builds a single-message `File` event for the scripted transports.
-fn file_event(filename: &str, msg_id: i32, size: u64) -> Result<IncomingEvent, StorageError> {
+fn file_event(filename: &str, msg_id: i64, size: u64) -> Result<IncomingEvent, StorageError> {
     Ok(IncomingEvent::File(InboundFile {
         filename: filename.to_string(),
         handle: RemoteHandle {
             first_msg_id: msg_id,
             chunk_msg_ids: vec![msg_id],
             total_size: size,
+            path: None,
         },
     }))
 }
@@ -134,6 +135,7 @@ async fn inbound_file_indexes_at_root() {
                 first_msg_id: 10,
                 chunk_msg_ids: vec![10],
                 total_size: 42,
+                path: None,
             },
         })
         .await
@@ -170,6 +172,7 @@ async fn same_filename_overwrites() {
             first_msg_id: 11,
             chunk_msg_ids: vec![11],
             total_size: 100,
+            path: None,
         },
     })
     .await
@@ -180,6 +183,7 @@ async fn same_filename_overwrites() {
             first_msg_id: 12,
             chunk_msg_ids: vec![12],
             total_size: 200,
+            path: None,
         },
     })
     .await
@@ -204,6 +208,7 @@ async fn nested_name_forms_nested_path() {
                 first_msg_id: 13,
                 chunk_msg_ids: vec![13],
                 total_size: 7,
+                path: None,
             },
         })
         .await
@@ -227,6 +232,7 @@ async fn invalid_name_falls_back() {
                 first_msg_id: 10,
                 chunk_msg_ids: vec![10],
                 total_size: 5,
+                path: None,
             },
         })
         .await
@@ -246,6 +252,7 @@ async fn invalid_name_falls_back() {
                 first_msg_id: 14,
                 chunk_msg_ids: vec![14],
                 total_size: 5,
+                path: None,
             },
         })
         .await

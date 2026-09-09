@@ -191,12 +191,18 @@ impl GrammersTransport {
         &self.config
     }
 
-    /// Fetches the media of one remote part message by id.
+    /// Fetches the media of one remote part message by id. The handle
+    /// carries i64 ids (K1); grammers message ids are i32, so the id is
+    /// narrowed at this boundary — an id that does not fit is corrupt
+    /// metadata, surfaced as an error rather than lossily truncated.
     ///
     /// [`StorageError::NotFound`] is returned both when the message id is
     /// unknown to the chat and when the message carries no downloadable
     /// media; the transport cannot do anything useful in either case.
-    async fn part_media(&self, msg_id: i32) -> Result<Media, StorageError> {
+    async fn part_media(&self, msg_id: i64) -> Result<Media, StorageError> {
+        let msg_id = i32::try_from(msg_id).map_err(|_| {
+            StorageError::Unavailable(format!("message id {msg_id} does not fit a telegram id"))
+        })?;
         let messages = self
             .client
             .get_messages_by_id(self.chat, &[msg_id])
@@ -297,7 +303,8 @@ impl CloudTransport for GrammersTransport {
                 )
                 .await
                 .map_err(map_invocation_error)?;
-            chunk_msg_ids.push(message.id());
+            // K1: grammers ids are i32; the transport seam speaks i64.
+            chunk_msg_ids.push(i64::from(message.id()));
             uploaded_bytes += send.byte_len;
         }
         Ok(UploadReceipt {
@@ -344,7 +351,8 @@ impl CloudTransport for GrammersTransport {
                 )
                 .await
                 .map_err(map_invocation_error)?;
-            chunk_msg_ids.push(message.id());
+            // K1: grammers ids are i32; the transport seam speaks i64.
+            chunk_msg_ids.push(i64::from(message.id()));
             uploaded_bytes += send.byte_len;
         }
         // Every planned byte was consumed; the stream must now be at EOF.
@@ -440,13 +448,24 @@ impl CloudTransport for GrammersTransport {
         Ok(serve_range(frames.into_iter(), skip_in_first, want))
     }
 
-    /// Deletes one remote message. Telegram reports the count of deleted
-    /// messages; zero (message already gone) surfaces as
-    /// [`StorageError::NotFound`].
-    async fn delete_remote(&self, msg_id: i32) -> Result<(), StorageError> {
+    /// Deletes the remote messages `handle` refers to (K3: the handle's
+    /// chunk ids — the `path` field is None on telegram handles and is
+    /// never read; ids narrow back to grammers' i32 at this boundary).
+    /// Telegram reports the count of deleted messages; zero (every
+    /// message already gone) surfaces as [`StorageError::NotFound`].
+    async fn delete_remote(&self, handle: &RemoteHandle) -> Result<(), StorageError> {
+        let msg_ids: Vec<i32> = handle
+            .chunk_msg_ids
+            .iter()
+            .map(|id| {
+                i32::try_from(*id).map_err(|_| {
+                    StorageError::Unavailable(format!("message id {id} does not fit a telegram id"))
+                })
+            })
+            .collect::<Result<_, _>>()?;
         let deleted = self
             .client
-            .delete_messages(self.chat, &[msg_id])
+            .delete_messages(self.chat, &msg_ids)
             .await
             .map_err(map_invocation_error)?;
         if deleted == 0 {
@@ -473,7 +492,10 @@ impl CloudTransport for GrammersTransport {
     ///   `server_side_move` (no rename primitive wired), `rapid_upload`
     ///   (no content-addressed upload), `authoritative_index` (Telegram
     ///   is a shadow index by design, foundation D4), `change_feed` (no
-    ///   push API consumed).
+    ///   push API consumed), `remote_delete` (K4/B3b: keep declared-off —
+    ///   `delete_remote` exists on this transport but production keeps
+    ///   remote objects on VFS delete per Python parity, so the consumer
+    ///   gate must see false; zero behavior change).
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             range_read: true,
@@ -626,17 +648,20 @@ fn map_update(update: &Update, chat: &grammers_session::types::PeerRef) -> Optio
         Some(Media::Document(document)) => Some(IncomingEvent::File(InboundFile {
             filename: document.name().unwrap_or_default().to_string(),
             handle: RemoteHandle {
-                first_msg_id: msg_id,
-                chunk_msg_ids: vec![msg_id],
+                // K1: widen grammers' i32; K2: telegram has no path.
+                first_msg_id: i64::from(msg_id),
+                chunk_msg_ids: vec![i64::from(msg_id)],
                 total_size: document.size().unwrap_or_default() as u64,
+                path: None,
             },
         })),
         Some(Media::Sticker(sticker)) => Some(IncomingEvent::File(InboundFile {
             filename: sticker.document.name().unwrap_or_default().to_string(),
             handle: RemoteHandle {
-                first_msg_id: msg_id,
-                chunk_msg_ids: vec![msg_id],
+                first_msg_id: i64::from(msg_id),
+                chunk_msg_ids: vec![i64::from(msg_id)],
                 total_size: sticker.document.size().unwrap_or_default() as u64,
+                path: None,
             },
         })),
         Some(Media::Photo(photo)) => Some(IncomingEvent::File(InboundFile {
@@ -644,9 +669,10 @@ fn map_update(update: &Update, chat: &grammers_session::types::PeerRef) -> Optio
             // the empty name triggers the fallback naming in the core.
             filename: String::new(),
             handle: RemoteHandle {
-                first_msg_id: msg_id,
-                chunk_msg_ids: vec![msg_id],
+                first_msg_id: i64::from(msg_id),
+                chunk_msg_ids: vec![i64::from(msg_id)],
                 total_size: photo.size().unwrap_or_default() as u64,
+                path: None,
             },
         })),
         // Other media shapes (contacts, polls, geo...) are not files the

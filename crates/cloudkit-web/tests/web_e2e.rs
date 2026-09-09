@@ -267,6 +267,32 @@ fn seed_row(db: &Arc<MetaDatabase>, rel: &str, is_dir: bool, size: i64, is_uploa
     .expect("seed row");
 }
 
+/// A directory row born uploaded + cached carrying a backend handle
+/// (`telegram_msg_id` = the remote object id — the shape the K4
+/// collection gate consumes; mirrors the fs_adapter helper).
+fn seed_dir_row_with_handle(db: &Arc<MetaDatabase>, rel: &str, msg_id: i64) {
+    let rel_path = RelPath::new(rel).expect("valid rel path");
+    db.upsert_file(&FileUpsert {
+        rel_path: rel_path.as_str().to_string(),
+        name: rel_path.name().to_string(),
+        parent_dir: rel_path
+            .parent()
+            .map(|parent| parent.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string()),
+        size: 0,
+        mtime: 1_700_000_000.0,
+        sha256: None,
+        is_dir: true,
+        telegram_msg_id: Some(msg_id),
+        is_uploaded: true,
+        is_cached: true,
+        is_encrypted: false,
+        chunk_count: 0,
+        mime_type: None,
+    })
+    .expect("seed dir row with handle");
+}
+
 /// Pushes `bytes` to the mock remote as `rel` (split at `chunk_size`).
 async fn seed_remote(
     mock: &Arc<MockTransport>,
@@ -312,7 +338,7 @@ fn seed_uploaded_row(
             mtime: 1_700_000_000.0,
             sha256: None,
             is_dir: false,
-            telegram_msg_id: Some(i64::from(receipt.first_msg_id)),
+            telegram_msg_id: Some(receipt.first_msg_id),
             is_uploaded: true,
             is_cached: false,
             is_encrypted: false,
@@ -327,7 +353,7 @@ fn seed_uploaded_row(
         } else {
             size - (chunk_size as i64) * (chunk_count - 1)
         };
-        db.upsert_chunk(file_id, index, i64::from(msg_id), chunk_row_size, None)
+        db.upsert_chunk(file_id, index, msg_id, chunk_row_size, None)
             .expect("seed chunk row");
     }
 }
@@ -599,8 +625,7 @@ async fn upload_multipart_roundtrip() {
     );
     let msg_id = row.telegram_msg_id.expect("chunk-0 msg id recorded");
     assert_eq!(
-        env.mock
-            .message(i32::try_from(msg_id).expect("narrow msg id")),
+        env.mock.message(msg_id),
         Some(b"web upload body".to_vec()),
         "mock remote stores the exact bytes"
     );
@@ -676,6 +701,137 @@ async fn delete_removes_row_single_call() {
         env.mock.upload_calls().is_empty(),
         "delete enqueues no upload"
     );
+}
+
+/// 7a (K4 / B3b 段二b): with the transport declaring `remote_delete`,
+/// the dashboard's file delete propagates to the remote object (through
+/// the shared `Vfs::remove_file` gate) before the row dies.
+#[tokio::test]
+async fn delete_remote_gated_removes_remote_object() {
+    let mock = Arc::new(
+        MockTransport::builder()
+            .capabilities(cloudkit_core::transport::Capabilities {
+                remote_delete: true,
+                ..cloudkit_core::transport::Capabilities::none()
+            })
+            .build(),
+    );
+    let env = env_with(base_cfg(), mock).await;
+    let addr = env.server.local_addr();
+    let receipt = seed_remote(&env.mock, "/gated.txt", b"payload", 1, 64).await;
+    seed_uploaded_row(&env.db, "/gated.txt", b"payload", &receipt, 64);
+
+    let resp = send(
+        addr,
+        &request(
+            "POST",
+            "/api/delete",
+            addr,
+            &[("Content-Type", "application/json")],
+            r#"{"filename":"gated.txt"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 200, "ok: {resp}");
+    assert!(
+        env.db.get_file("/gated.txt").expect("db read").is_none(),
+        "row gone"
+    );
+    assert_eq!(
+        env.mock.deleted(),
+        vec![receipt.first_msg_id],
+        "the remote object died with the row (remote_delete=true)"
+    );
+
+    env.server.shutdown().await;
+    env.vfs.shutdown().await;
+}
+
+/// 7b (K4): the dashboard's DIRECTORY delete fallback (the baseline's
+/// unconditional dir-row delete) gates the same way — a dir row with a
+/// backend handle has its remote object deleted before the row dies; a
+/// refused remote delete answers 500 with the row kept.
+#[tokio::test]
+async fn delete_dir_remote_gated_and_refusal_keeps_row() {
+    let mock = Arc::new(
+        MockTransport::builder()
+            .capabilities(cloudkit_core::transport::Capabilities {
+                remote_delete: true,
+                ..cloudkit_core::transport::Capabilities::none()
+            })
+            .build(),
+    );
+    let env = env_with(base_cfg(), mock).await;
+    let addr = env.server.local_addr();
+
+    // Gated success leg: a dir row carrying a remote handle.
+    let receipt = seed_remote(&env.mock, "/docs", b"dir-marker", 1, 64).await;
+    seed_dir_row_with_handle(&env.db, "/docs", receipt.first_msg_id);
+    let resp = send(
+        addr,
+        &request(
+            "POST",
+            "/api/delete",
+            addr,
+            &[("Content-Type", "application/json")],
+            r#"{"filename":"docs"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 200, "dir delete ok: {resp}");
+    assert_eq!(
+        env.mock.deleted(),
+        vec![receipt.first_msg_id],
+        "the dir's remote object died before the row"
+    );
+    assert!(
+        env.db.get_file("/docs").expect("db read").is_none(),
+        "the dir row is gone"
+    );
+
+    // Refused leg: two scripted refusals (the gate retries once) keep
+    // the row and answer 500.
+    let refused = || {
+        Err(cloudkit_core::transport::StorageError::Unavailable(
+            "backend down".into(),
+        ))
+    };
+    let mock2 = Arc::new(
+        MockTransport::builder()
+            .capabilities(cloudkit_core::transport::Capabilities {
+                remote_delete: true,
+                ..cloudkit_core::transport::Capabilities::none()
+            })
+            .delete_action(refused())
+            .delete_action(refused())
+            .build(),
+    );
+    let env2 = env_with(base_cfg(), mock2).await;
+    let addr2 = env2.server.local_addr();
+    let receipt2 = seed_remote(&env2.mock, "/stuck", b"dir-marker", 1, 64).await;
+    seed_dir_row_with_handle(&env2.db, "/stuck", receipt2.first_msg_id);
+
+    let resp = send(
+        addr2,
+        &request(
+            "POST",
+            "/api/delete",
+            addr2,
+            &[("Content-Type", "application/json")],
+            r#"{"filename":"stuck"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 500, "the refusal answers 500: {resp}");
+    assert!(
+        env2.db.get_file("/stuck").expect("db read").is_some(),
+        "the dir row survives the refused remote delete"
+    );
+
+    env.server.shutdown().await;
+    env.vfs.shutdown().await;
+    env2.server.shutdown().await;
+    env2.vfs.shutdown().await;
 }
 
 /// 8. GET /api/download hydrates through the VFS and streams the exact

@@ -15,6 +15,7 @@ pub mod crypto;
 pub mod database;
 pub mod inbound;
 pub mod logging;
+pub mod rebuild;
 pub mod rel_path;
 pub mod sync;
 pub mod transport;

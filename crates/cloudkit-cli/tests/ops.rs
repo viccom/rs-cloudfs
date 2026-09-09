@@ -566,3 +566,204 @@ fn persist_setup_headless_writes_secrets_into_config() {
     assert_eq!(discovered.bot_token, "123456789:HEADLESS");
     assert!(discovered.is_configured());
 }
+
+// ---------------------------------- setup: baidu/local wizard branches ---
+
+use cloudkit_cli::setup::{
+    apply_baidu_wizard, apply_local_wizard, validate_baidu_credentials, validate_local_root,
+    BaiduWizardAnswers, LocalWizardAnswers,
+};
+
+/// The baidu wizard's apply: with a VERIFIED token pair in hand the
+/// config gains `backend = "baidu"` and all four K14 keys — the
+/// strict-validate ruling (B3b 段二b): the backend key flips LAST, only
+/// when every required key is present, so no half-configured instance
+/// can boot into a vague connect failure.
+#[test]
+fn baidu_wizard_apply_sets_four_keys_and_backend() {
+    let answers = BaiduWizardAnswers {
+        app_key: "paste-key".to_string(),
+        app_secret: "paste-secret".to_string(),
+        refresh_token: "paste-refresh".to_string(),
+    };
+    let cfg = apply_baidu_wizard(
+        CyDriveConfig::default(),
+        &answers,
+        "verified-access",
+        "verified-refresh",
+    );
+
+    assert_eq!(cfg.backend, cloudkit_core::config::Backend::Baidu);
+    assert_eq!(cfg.baidu_app_key.as_deref(), Some("paste-key"));
+    assert_eq!(cfg.baidu_app_secret.as_deref(), Some("paste-secret"));
+    assert_eq!(cfg.baidu_access_token.as_deref(), Some("verified-access"));
+    assert_eq!(cfg.baidu_refresh_token.as_deref(), Some("verified-refresh"));
+    cfg.validate()
+        .expect("the applied config validates (four keys + root default)");
+}
+
+/// The baidu wizard's validation: every credential must be non-empty
+/// after trimming (the token-shape loop's baidu counterpart).
+#[test]
+fn baidu_wizard_validates_non_empty_credentials() {
+    validate_baidu_credentials(&BaiduWizardAnswers {
+        app_key: "k".to_string(),
+        app_secret: "s".to_string(),
+        refresh_token: "r".to_string(),
+    })
+    .expect("all-present answers validate");
+
+    let empty = BaiduWizardAnswers {
+        app_key: "  ".to_string(),
+        app_secret: "s".to_string(),
+        refresh_token: "r".to_string(),
+    };
+    let err = validate_baidu_credentials(&empty).expect_err("blank app_key refused");
+    assert!(
+        err.contains("app_key"),
+        "the complaint names the field: {err}"
+    );
+}
+
+/// The local wizard: an absolute root flips the backend key; relative
+/// roots are refused with guidance (validate's rule, surfaced at
+/// prompt time instead of boot time).
+#[test]
+fn local_wizard_apply_and_root_validation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let answers = LocalWizardAnswers {
+        local_root: dir.path().to_string_lossy().into_owned(),
+    };
+    let cfg = apply_local_wizard(CyDriveConfig::default(), &answers);
+    assert_eq!(cfg.backend, cloudkit_core::config::Backend::Local);
+    assert_eq!(
+        cfg.local_root.as_deref(),
+        Some(dir.path().to_string_lossy().as_ref())
+    );
+    cfg.validate().expect("absolute root validates");
+
+    let err = validate_local_root("relative/root").expect_err("relative root refused");
+    assert!(
+        err.contains("absolute"),
+        "the complaint explains the absolute-path rule: {err}"
+    );
+}
+
+// ------------------------------------------ doctor: backend checks (B3b) ---
+
+use cloudkit_cli::doctor::backend_checks;
+
+/// The local backend's offline checks: root exists+writable passes; a
+/// root occupied by a FILE fails with guidance.
+#[test]
+fn doctor_local_root_writable_ok_and_file_root_fails() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = CyDriveConfig {
+        backend: cloudkit_core::config::Backend::Local,
+        local_root: Some(dir.path().to_string_lossy().into_owned()),
+        ..CyDriveConfig::default()
+    };
+
+    let checks = backend_checks(&cfg);
+    let root_check = checks
+        .iter()
+        .find(|c| c.name.contains("local root"))
+        .expect("a local-root check exists");
+    assert_eq!(root_check.status, CheckStatus::Ok, "{}", root_check.detail);
+
+    let occupied = dir.path().join("occupied");
+    fs::write(&occupied, b"x").expect("file in the root's way");
+    let cfg = CyDriveConfig {
+        local_root: Some(occupied.to_string_lossy().into_owned()),
+        ..cfg
+    };
+    let checks = backend_checks(&cfg);
+    let root_check = checks
+        .iter()
+        .find(|c| c.name.contains("local root"))
+        .expect("a local-root check exists");
+    assert_eq!(
+        root_check.status,
+        CheckStatus::Fail,
+        "{}",
+        root_check.detail
+    );
+}
+
+/// K12 tail in doctor: local + sync_url surfaces the unsupported-sync
+/// warning; telegram/baidu never do.
+#[test]
+fn doctor_local_sync_warning_only_for_local_with_sync_url() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let local = CyDriveConfig {
+        backend: cloudkit_core::config::Backend::Local,
+        local_root: Some(dir.path().to_string_lossy().into_owned()),
+        sync_url: Some("http://sync.example.org:8290".to_string()),
+        ..CyDriveConfig::default()
+    };
+    let checks = backend_checks(&local);
+    assert!(
+        checks
+            .iter()
+            .any(|c| c.status == CheckStatus::Warn && c.detail.contains("not supported")),
+        "local + sync_url warns: {checks:?}"
+    );
+
+    let local = CyDriveConfig {
+        sync_url: None,
+        ..local
+    };
+    assert!(
+        !backend_checks(&local)
+            .iter()
+            .any(|c| c.detail.contains("not supported")),
+        "no sync_url — no warning"
+    );
+
+    let baidu = CyDriveConfig {
+        backend: cloudkit_core::config::Backend::Baidu,
+        baidu_app_key: Some("k".into()),
+        baidu_app_secret: Some("s".into()),
+        baidu_access_token: Some("a".into()),
+        baidu_refresh_token: Some("r".into()),
+        sync_url: Some("http://sync.example.org:8290".to_string()),
+        ..CyDriveConfig::default()
+    };
+    assert!(
+        !backend_checks(&baidu)
+            .iter()
+            .any(|c| c.detail.contains("not supported")),
+        "baidu syncs — no warning"
+    );
+}
+
+/// K18 tail in doctor: proxy_url on baidu/local surfaces the
+/// ineffective warning; telegram does not.
+#[test]
+fn doctor_proxy_hint_only_for_direct_backends() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let local = CyDriveConfig {
+        backend: cloudkit_core::config::Backend::Local,
+        local_root: Some(dir.path().to_string_lossy().into_owned()),
+        proxy_url: Some("socks5://127.0.0.1:7890".to_string()),
+        ..CyDriveConfig::default()
+    };
+    assert!(
+        backend_checks(&local)
+            .iter()
+            .any(|c| c.status == CheckStatus::Warn && c.detail.contains("direct")),
+        "local + proxy_url declares the direct connection: {:?}",
+        backend_checks(&local)
+    );
+
+    let telegram = CyDriveConfig {
+        proxy_url: Some("socks5://127.0.0.1:7890".to_string()),
+        ..CyDriveConfig::default()
+    };
+    assert!(
+        !backend_checks(&telegram)
+            .iter()
+            .any(|c| c.detail.contains("direct")),
+        "telegram consumes the proxy — no warning"
+    );
+}

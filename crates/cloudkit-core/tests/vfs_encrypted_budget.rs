@@ -96,8 +96,8 @@ impl CloudTransport for BudgetTrimTransport {
         self.inner.open_range(file, off, len).await
     }
 
-    async fn delete_remote(&self, msg_id: i32) -> Result<(), StorageError> {
-        self.inner.delete_remote(msg_id).await
+    async fn delete_remote(&self, handle: &RemoteHandle) -> Result<(), StorageError> {
+        self.inner.delete_remote(handle).await
     }
 
     fn capabilities(&self) -> Capabilities {
@@ -167,7 +167,7 @@ fn remote_bytes(db: &MetaDatabase, mock: &MockTransport, rel: &str) -> Vec<u8> {
     chunks
         .iter()
         .flat_map(|c| {
-            mock.message(i32::try_from(c.telegram_msg_id.expect("msg id")).expect("narrow"))
+            mock.message(c.telegram_msg_id.expect("msg id"))
                 .expect("stored chunk")
         })
         .collect()

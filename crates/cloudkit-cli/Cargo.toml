@@ -24,7 +24,14 @@ clap = { version = "4", features = ["derive"] }
 comfy-table = "8.0.0"
 cloudkit-core = { path = "../cloudkit-core" }
 cloudkit-platform = { path = "../cloudkit-platform" }
+# L2 vocab + StorageDriver face: the rebuild driver assembly types
+# (composition root may name drivers and L2 — R1 exemption).
+cloudkit-storage = { path = "../cloudkit-storage" }
 ck-telegram = { path = "../drivers/ck-telegram" }
+# rebuild 子命令的 build_driver helper 直接调两驱动工厂（B3b 段二a
+# 最小装配；段二b dispatch 单元收编/复用——R1 组合根豁免）。
+ck-baidu = { path = "../drivers/ck-baidu" }
+ck-local = { path = "../drivers/ck-local" }
 cloudkit-web = { path = "../cloudkit-web" }
 cloudkit-webdav = { path = "../cloudkit-webdav" }
 # Sync-lite client (Batch B4): the wire types this CLI maps onto core's

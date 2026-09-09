@@ -239,7 +239,7 @@ fn seed_uploaded_row(
             mtime: 1_700_000_000.0,
             sha256: None,
             is_dir: false,
-            telegram_msg_id: Some(i64::from(receipt.first_msg_id)),
+            telegram_msg_id: Some(receipt.first_msg_id),
             is_uploaded: true,
             is_cached: false,
             is_encrypted: false,
@@ -254,7 +254,7 @@ fn seed_uploaded_row(
         } else {
             size - (chunk_size as i64) * (chunk_count - 1)
         };
-        db.upsert_chunk(file_id, index, i64::from(msg_id), chunk_row_size, None)
+        db.upsert_chunk(file_id, index, msg_id, chunk_row_size, None)
             .expect("seed chunk row");
     }
 }

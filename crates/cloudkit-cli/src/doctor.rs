@@ -316,6 +316,21 @@ fn check_port(name: &str, port: u16) -> CheckResult {
 /// These touch the real OS, so they live outside the offline
 /// [`run_doctor`].
 pub fn platform_checks() -> Vec<CheckResult> {
+    let mut results = webclient_checks();
+    results.push(telegram_connectivity_check());
+    results
+}
+
+/// The OS platform leg shared by every backend (WebClient registry +
+/// service state on Windows; empty elsewhere) — the doctor command
+/// composes it with the configured backend's own advisory
+/// ([`telegram_connectivity_check`] / [`backend_checks`] +
+/// [`baidu_connectivity_check`]), replacing [`platform_checks`]' fixed
+/// telegram tail on non-telegram instances.
+pub fn webclient_checks() -> Vec<CheckResult> {
+    // Windows-only 填充（下方 cfg 块）编译掉时 mut 即 unused——平台差异
+    // 经 cfg_attr 吸收（两平台 clippy -D warnings 同时干净）。
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut results = Vec::new();
     // Attribute gating (not `if cfg!`): both calls are Windows-only items
     // (`webclient_service_check` has no non-Windows stub), so the block must
@@ -328,8 +343,122 @@ pub fn platform_checks() -> Vec<CheckResult> {
         ));
         results.push(webclient_service_check());
     }
-    results.push(telegram_connectivity_check());
     results
+}
+
+/// The backend-specific offline checks (Phase 2 / B3b dispatch unit):
+/// appended by the CLI for baidu/local instances (telegram keeps its
+/// fixed advisory instead). The baidu NETWORK leg (token liveness) is
+/// [`baidu_connectivity_check`] over [`crate::baidu_backend_probe`] —
+/// assembled separately because it dials out.
+///
+/// - **baidu**: the K18 proxy notice (a `proxy_url` has no effect — the
+///   driver always connects directly);
+/// - **local**: the root exists-and-is-writable probe (create + write +
+///   remove, mirroring the cache check) and the K12 sync-unsupported
+///   warning when `sync_url` is set (the task never starts), plus the
+///   K18 proxy notice.
+pub fn backend_checks(cfg: &cloudkit_core::config::CyDriveConfig) -> Vec<CheckResult> {
+    use cloudkit_core::config::Backend;
+    let mut results = Vec::new();
+    if let Some(notice) = crate::proxy_ineffective_warning(cfg) {
+        results.push(CheckResult {
+            name: "proxy_url".to_string(),
+            status: CheckStatus::Warn,
+            detail: notice.to_string(),
+        });
+    }
+    match cfg.backend {
+        Backend::Telegram => {}
+        Backend::Baidu => {}
+        Backend::Local => {
+            if let Some(warning) = crate::local_sync_unsupported_warning(cfg) {
+                results.push(CheckResult {
+                    name: "sync".to_string(),
+                    status: CheckStatus::Warn,
+                    detail: warning.to_string(),
+                });
+            }
+            results.push(check_local_root(cfg.local_root.as_deref()));
+        }
+    }
+    results
+}
+
+/// The local backend's root probe: `None` (no config to read a root
+/// from) is a Warn mirroring the db/cache checks; an existing writable
+/// directory is Ok (create_dir_all + write-and-remove probe file — the
+/// cache check's shape); anything else is a Fail with guidance.
+fn check_local_root(root: Option<&str>) -> CheckResult {
+    let name = "local root".to_string();
+    let Some(root) = root else {
+        return CheckResult {
+            name,
+            status: CheckStatus::Warn,
+            detail: "no local_root to check (no usable config)".to_string(),
+        };
+    };
+    let path = PathBuf::from(root);
+    let probe = path.join(".cydrive-doctor-probe");
+    // create_dir_all mirrors the driver factory's own boot behavior
+    // (LocalDriver::new creates the root) — a deep path that boot would
+    // create must not fail here either.
+    let probe_result = std::fs::create_dir_all(&path)
+        .and_then(|()| std::fs::write(&probe, b"probe"))
+        .and_then(|()| std::fs::remove_file(&probe));
+    match probe_result {
+        Ok(()) => CheckResult {
+            name,
+            status: CheckStatus::Ok,
+            detail: format!("{} exists and is writable", path.display()),
+        },
+        Err(error) => CheckResult {
+            name,
+            status: CheckStatus::Fail,
+            detail: format!(
+                "{} cannot be created or written: {error} — set local_root to a \
+                 directory this user can write (an absolute path)",
+                path.display()
+            ),
+        },
+    }
+}
+
+/// The doctor verdict over the baidu probe's outcome
+/// ([`crate::baidu_backend_probe`]): Alive → Ok (the token-liveness
+/// detail names the read-only probe and where writability IS
+/// discovered); NeedsReauth → Fail with the re-setup guidance (the
+/// human-actionable case); Unreachable → Warn (transient — retry /
+/// check the network path).
+pub fn baidu_connectivity_check(probe: &crate::BackendProbe) -> CheckResult {
+    let name = "baidu connectivity".to_string();
+    match probe {
+        crate::BackendProbe::Alive => CheckResult {
+            name,
+            status: CheckStatus::Ok,
+            detail: "token alive (uinfo + quota answered) and the backend root lists \
+                     read-only; root writability is discovered on the first upload"
+                .to_string(),
+        },
+        crate::BackendProbe::NeedsReauth(reason) => CheckResult {
+            name,
+            status: CheckStatus::Fail,
+            // 人话重授权指引（§7a：凭据失效不得死循环重试——指向 setup）
+            detail: format!(
+                "{reason}; re-run `cydrive setup` with a fresh refresh_token to \
+                 re-authorize this instance"
+            ),
+        },
+        crate::BackendProbe::Unreachable(reason) => CheckResult {
+            name,
+            status: CheckStatus::Warn,
+            detail: format!(
+                "the baidu backend did not answer ({reason}); check the network path \
+                 (baidu connects DIRECTLY — a proxy_url does not apply) and retry `cydrive \
+                 doctor`"
+            ),
+        },
+    }
 }
 
 /// Pure verdict over the two WebClient registry values (the read-only leg

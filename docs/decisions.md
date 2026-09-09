@@ -391,3 +391,80 @@
 
 - **裁决**：Phase 2 维持既定顺序（驱动接入手册 → ck-local → ck-baidu，单卷先行）；**B3 完成后立即接 Phase 2.5 多卷启用批**（Registry + 每实例配置文件 + 每卷加密 + 多盘挂载，PCFS 模式去坑版）。百度加密/不加密双盘的首轮测试用 A4 双进程形态（两目录两 config），不阻塞多卷开发。
 - **附带**：telegram+加密过渡测试包同步交付负责人（release 产物 + 配置模板 + 使用说明，仓外目录不入库——R7）。
+
+## 2026-09-08 Batch L：ck-local 交付（conformance 第一真实公民）
+
+- **TDD 序列**：红 ea57136（Unsupported 骨架接入套件，断言① mkdir 红）→ 绿 04659d1（九方法全实现，①–⑥⑧ 绿、⑦未声明自动跳过）→ 修正 8f257e4（他卷 delete 契约对齐）。测试/实现委派隔离；绿阶段 conformance 既有断言零触碰（diff 审计过）。
+- **K6 落地形态**：BackendHandle = rel_path 字符串（根=空串，可往返）；VolumeId key = `canonicalize` 绝对形态（Windows `\\?\` 前缀，L2 opaque 合法）。delete 空句柄（卷根）→ Invalid（删除卷根无意义且危险）；他卷句柄 → NotFound（trait 契约）。
+- **实现期裁决**（计划授权范围内，可逆）：① staging = 根下 `.cklocal-staging/`（同卷保证 rename 原子），list 过滤该保留名（断言③集合完整性）；② **overwrite 不可见性超集**：chunk_size=1 契约使断言① 出现重复路径，第二次上传时旧已提交对象也须 staging 期不可见——writer 打开时旧文件 stash `.old`（abort/Drop 恢复，close 删）；③ 临时名 `{pid}-{seq}.part` 进程级 AtomicU64；④ **tokio::fs::File::write_all Ok 仅代表入队**后台 blocking 写，close 必须 `flush().await` 后取 metadata 才可信（曾致断言③ flaky，5×500 迭代验证修复）；⑤ 保留字符（`:?*<>|"`）跨平台统一拒绝 Invalid（防「Linux 可建、Windows 不可寻址」条目）；⑥ io 映射表 kind 敏感（NotFound/AlreadyExists/PermissionDenied→Unauthorized{false}/InvalidInput→对应变体，其余 Io）；⑦ rename 目标已存在显式预检 Exists（std::fs::rename 是覆盖语义）；⑧ quota total=None/used=0。
+- **能力位**：range_read/server_side_move/authoritative_index=true（逐位注码）；resume/multipart/rapid_upload/change_feed/inbound/chat=false（注理由）+ 九位精确值静态锁测试。
+- **验证**：`cargo test -p ck-local` 4 passed / 0 failed；workspace 628 passed / 0 failed（625 基线 +3）/ 6 ignored；clippy -D warnings / fmt / check_layers（10 manifests）全过。
+- **止损点未触发**：套件未暴露断言语义缺陷（发现的都是实现侧问题）。
+
+## 2026-09-08 Batch B1：ck-baidu 骨架 + OAuth + errno + 元数据面
+
+- **TDD 序列**：红 9a969ac（12 文件骨架 + MockBaidu axum 内存后端 + 三套件 17 测试全红于 Unsupported）→ 绿 41f25e3（oauth/client/api/driver 六文件 +524/−77）。tests/ 两 commit 间零 diff（假绿检查过）。
+- **黄金参照查证修正**（PCFS 源码否定任务情报中的猜测）：filemanager move filelist = `[{path,dest,newname,ondup:"overwrite"}]` 四键 + form `async=1`（PCFS api.go:829-845）而非 `[{from,to}]`；stat = `method=meta&path=<abs>`（api.go:110-113）非 filelist/fs_ids（fs_ids 是姊妹形态，delete 句柄解析采用，api.go:176-179）。move **不轮询 taskid**（PCFS 从不轮询，两源一致，勿发明）。
+- **K 萁点落地**：K13（110 刷新重放一次/111,-6 零刷新直达 Unauthorized{false}/刷新 on-arrival 持久化——refresh 单飞锁 + 拿锁后陈旧双检，不浪费一次一换的 refresh_token）；K14（BaiduParams 无 appkey 默认值、不 derive Debug 防凭据 dump）；K15（31034/429 → RateLimited{None} + 单点重试一次、退避固定 80ms）；K16（MockBaidu = axum =0.8.9 内存后端 + 请求记录器 + 错误注入队列 + 一次一换 token 轮换）；K5（VolumeId=baidu:<uid> 经 uinfo /xpan/nas；BackendHandle=fs_id 十进制字符串）。
+- **实现裁决**：mock 基建落位 `tests/common/mod.rs`（计划原文 mock_backend.rs——Rust 集成测试共享模块形态限制）；未知 errno → Unavailable 载荷保留 errno=<code>（表外码 47002 钉死）；-8 → Exists 注「mock 建模 + B2 conformance 复核」（PCFS 无处理证据）；list 无分页参数（两源一致）→ driver 内 offset 游标切 Page；mtime=server_mtime（两源一致无 local_mtime）；serde_json 补入依赖（响应解析必需）；R3 三防线（reqwest 错误 without_url/体片段 token 掩码/错误消息不拼参数）。
+- **挂起 B2 复核项**：① rename 的 ondup=overwrite 覆盖语义与 trait「目标已存在 → Exists」的偏离（driver.rs 已显式声明，conformance 断言⑥若覆盖则需裁决）；② -8 映射。
+- **验证**：ck-baidu 17 passed（oauth 4/errno 5/metadata 字节级 8）；workspace 646 passed 0 failed（628→646）/ 6 ignored；clippy/fmt/check_layers（11 manifests）/scan_secrets 全过。
+
+## 2026-09-08 Batch B2 真网实证：precreate 会话锁定全量 block_list——流式策略改「到齐即传」
+
+- **探针证据**（主会话，干净 curl 探针，netdisk UA + MSYS_NO_PATHCONV）：precreate 部分声明 block_list（1 片）errno=0；superfile2 未声明分片照收；create 带全量（3 片）→ **errno=31363**（与 precreate 声明不一致被拒）。spike 未踩此坑因其全量算 md5 后才 precreate。
+- **裁决**：stager 流式策略「write 首块即传（部分 precreate）」→「**到齐即传**」（hint.size 已知且字节到齐 → write 返回前 precreate 全量 + 串行传满块 + 位图落盘；close 传尾块 + create 原样重申）。write 同步落定契约（conformance ⑦）保持；K7 会话恢复三路不变（drop/close-中断后二次 equip 差集补传）。mock create 增建模「block_list 一致性校验」（31363）。
+- **附带实证**：create 目录/rtype=3/deep precreate 均真网可用（errno=0）——K10 rtype=3 复核通过；31363 纳入 errno 码表（Invalid 族——参数与预创建不一致）。
+- **MSYS 教训**：Git Bash 探针中 `path=/apps/...` 形参被路径改写污染（→ C:/Program Files/Git/apps/...，百度报「文件夹 C: 命名不合法」errno=-7）——首批探针全部作废；干净探针（MSYS_NO_PATHCONV=1）推翻了「create 目录恒 -7」「rtype=3 不可用」两个错误中间结论。教训入 AGENTS 陷阱候选。
+
+## 2026-09-08 Batch B2 真网实证（第四轮）：meta 端点在此 appkey 下全废——stat/delete/Entry 构造全面转 list
+
+- **探针证据**（干净 curl，netdisk UA）：meta&path → error_code=31300 "stream type is not authorized"（无权限）；meta&fs_ids → 31023 param error（多编码变体同）；filemanager delete 的 fs_id 形态 → errno=12 不删除（只支持 path）；已传文件对 meta 轮询 10s 不可见（持续无权限非延迟）。PCFS 生产未暴露系其 entryCache 容错；spike 从未测 meta。
+- **裁决**：① stat = list 父目录 + path 精确匹配；② close 的 Entry 构造 = list 父目录 + fs_id 匹配（list_lookup 提为主路径）；③ delete 句柄解析 = fs_id→path 缓存（list/stat/Entry 流量填充，容量 4096）+ 未命中递归 list 扫描兜底；④ meta_by_path/meta_by_fs_id 停用保留（allow(dead_code)，正式 appkey 复测候选）；⑤ mock meta 臂保留无消费者（注释注码）。stat 的「注入 -9 → NotFound」语义在 list 主路径下自动成立（conformance ⑤ / errno_mapping 不弱化）。
+- **连带**：E2E/真机的 stat 可见性即时（list 实证）；K5（handle=fs_id 跨 rename 稳定）不变——缓存只是解析层，path 变更后缓存陈旧条目由递归扫描兜底纠偏（delete 失败时缓存失效重扫一次，注码）。
+- **待负责人**：正式 appkey（个人开发者）到位后复测 meta 权限（31300 是否消失）——若可用可回切 meta 直查（省 list 流量）；此裁决不影响正确性只影响效率。
+
+## 2026-09-08 Batch B2 真网实证（第五轮）：目录 create 冲突 = errno=0 + 空副本重命名——mkdir/ensure_parents 全面转 list 预检
+
+- **探针证据**（干净 curl，netdisk UA）：create isdir=1 对已存在目录返回 errno=0（成功假象），远端保留原目录并生成 `<名>_20260908_212145` 时间戳后缀**空副本**——非 -8。驱动「-8 → Exists」容错永不触发，ensure_parents 每次撞已存在层即产空目录垃圾；conformance ④ 真网必挂。
+- **裁决**：mkdir 与 ensure_parents 全面转 **list 预检**（先 list 父目录：已存在→Exists/跳过，不存在才 create）；-8 分支保留为防御语义。mock create 冲突建模对齐真实（errno=0 + 副本），使「未预检」实现可被离线测试检出。预检 list 流量顺带喂句柄缓存。
+- **残留形态记录**：本轮实证期间产生的远端垃圾（cloudfs-b2 下 10 个测试目录 + /apps 两个 suffixed 副本）已全数清理（filemanager delete 复查 n=0）；/apps/cloudfs-b2 保留为 B2 测试根空壳。
+
+## 2026-09-08 Batch B2 收口：ck-baidu 上传/下载全链交付（五轮真网实证链）
+
+- **TDD 序列**：红 a21114a（16 红：上传表单字节级/差集/dlink 缓存/conformance 接线）→ 绿 3696fe6 → 真网返工 31363（c6c22de + ef821e7）/meta 全废（ddbade4）/目录 create 预检（690834a）。终态 ck-baidu 42 passed（conformance ①–⑧ 全绿含 ⑦差集可观测）+ 真机 3/3。
+- **五项真网实证**（mock 无法预见、PCFS 未覆盖，各自有 decisions 条目）：① uinfo 用户键=uk 非 uid；② precreate 会话锁定全量 block_list（create 不一致重申 → 31363）→ 上传策略「到齐即传」；③ meta 端点在此 appkey 下全废（31300/31023）→ stat/Entry/delete 全面转 list + fs_id 句柄缓存 + 递归扫描；④ 目录 create 冲突 = errno=0 + 空副本重命名（非 -8）→ mkdir/ensure_parents list 预检；⑤ create 后 meta 索引秒级传播延迟（list 即时）。**MSYS 教训**：Git Bash 探针 path 形参被改写致首批探针全废（-7 假象），干净探针（MSYS_NO_PATHCONV）推翻两个错误中间结论——AGENTS 陷阱清单候选。
+- **K 落地**：K7（会话表 (path,size) 定位 + 探活三路 + abort 保留会话）、K8（dlink TTL 60min 默认 + 两段 fallback：追 token→重取 dlink）、K9（4MiB 有界 Range + netdisk UA；下载顺序实现，4 并发预取留 B3b）、K10（rtype=3 真机复核通过——同路径重传覆盖生效无 _2026 副本）、K16（mock axum 建模五轮迭代对齐真实）。
+- **能力位终态**：range_read/resume/multipart/server_side_move/rapid_upload/authoritative_index=true（逐位注码 + 九位静态锁）；conformance ⑦ 场景随「到齐即传」中立化（套件缺陷修复，ef821e7）。
+- **吞吐记录**：100MB 真机往返 up 6.5-6.7 MB/s / down 2.8-5.1 MB/s（顺序分片实现 + 网络波动；spike qps 复跑零拒绝排除限额形态）；串行上传是 conformance ⑦ 确定性契约（write 同步落定）的代价，整文件 4 并发路径在 B3b transport_face 实现。
+- **远端卫生**：全轮测试/探针遗留已清（cloudfs-b2 零条目复查）；/apps/privatefs 全程未触碰；cloudfs-b2 保留为测试根空壳。
+- **待负责人**：① 正式 appkey 到位后复测 meta 权限（31300 消失则可回切 meta 直查省流量）；② K10 复核项销账建议（rtype=3 真机通过）。
+- **验证**：workspace 671 passed 0 failed（9 ignored 含真机 3+既有 6）；clippy/fmt/check_layers（11 manifests）/scan_secrets 全过。
+
+## 2026-09-09 Batch B3a+B3b 收口：组合根三后端接线完成（K1–K4/K11/K12/K17/K18 落地）
+
+- **B3a（933f45e 红 → 8f96b07 绿）**：句柄 i32→i64（DB↔transport 同宽直通，narrow_msg_id 删除；ck-telegram 边界 i64::from 上行/try_from 显式收窄下行）+ RemoteHandle.path（hydrate 填 Some，telegram/mock None 零变化）+ delete_remote(&RemoteHandle)。断言漂移审计 = 非机械改动 0（38 处机械面逐项留档）；伴生语义 = mock delete 多 chunk all-or-nothing（单 chunk 与旧语义等价）。
+- **B3b 段一**：Capabilities 第 10 位 remote_delete（local/baidu=true，telegram/mock=false）；双驱动 CloudTransport 面（ck-local 路径寻址 K2/K6、ck-baidu 整文件 4 并发 worker + first_msg_id=fs_id K5 + upload_stream 全缓冲注码 31363 实证）。
+- **B3b 段二a**：K17（backend 枚举缺省 telegram 字节兼容 + 7 键三处同步 + env>file + validate 后端门控文案）；K12（namespace_key_for：telegram 臂黄金向量逐字节钉死护栏、baidu:baidu:uid、local:DefaultHasher 16hex 非安全注码——sync 隔离标识非安全边界且 local 永不启动 sync；is_sync_supported 接线 doctor+任务启动门）；K11（rebuild_from_backend 走 StorageDriver list 面 → upsert is_uploaded=1/chunk_count=1/msg_id 句柄 i64；明文-only 门 + telegram 影子索引拒绝指引 sync；`cydrive rebuild` 子命令）。
+- **B3b 段二b**：K4 删除接线（remote_delete 位门控三面 vfs/webdav/web：先删远端（幂等 NotFound 容错+重试一次）成功后删行+缓存，拒绝保行；telegram/mock false 行为零变化——既有测试原样全绿自证）；dispatch（build_driver 统一收编：telegram GrammersTransport 路径零改动 / baidu factory+TokenStore 桥 CredentialStore（K13 on-arrival）/ local factory；能力横幅九+1 位）；setup baidu 分支（粘贴→refresh_tokens 刷新验证→**新 token 齐备才落 backend 键**（半配置实例防线，段二a 裁决②维持严格 validate）/ local 分支）；doctor（baidu 三态 Alive/NeedsReauth→Fail+setup 指引/Unreachable→Warn+直连提示、local root 检查、K12/K18 尾巴）；K18（baidu/local 恒直连，proxy_url 无效 → 装配日志+doctor 声明）。
+- **WSL 双平台（B3b 单元 6）**：暴露两处 Linux-only lint——linux.rs 未用导入（**继承债**，e6581f9 改名批起，git diff main...HEAD 空自证）与 doctor.rs cfg(windows) 块 mut（cfg_attr 吸收）。WSL 终态 739 passed / 0 failed（win 738+1 平台 cfg 既有差异）+ 双平台 clippy/fmt/check_layers/scan_secrets 全绿。
+- **执行注记**：B3b 段二b 期间子代理额度两次到限切断，进行中实现由主会话接手收尾（clippy 机械修 + doctor 文案补全），实现主体与 TDD 红绿证据链完整。
+- **验证**：workspace win 738 passed / 0 failed / 9 ignored；wsl 739 passed / 0 failed；全门禁绿。
+
+## 2026-09-09 Batch E2E 收口：baidu/local 硬验收通过 + telegram 腿延后
+
+- **拓扑**：三实例（baidu Z: 8391 / local V: 8393 / baidu 第二实例 8392）+ sync-server 8390，全 OS 临时目录；凭据 env 注入零落盘；/apps/cloudfs-e2e 测试根与 privatefs 隔离（前后列举比对在案）。
+- **全部通过腿**：上传/下载往返（字节等）/Range 半开窗口（字节等）/杀进程续传（200MB 中途 kill：会话 50/50 片落盘、重启 0 重传 + create 收尾、会话作废）/删除→远端消失（K4 真机）/双盘并存/sync 收敛（applied 4 + 墓碑 1；b1↔b2 全字段一致含 msg_id=fs_id——K5 跨实例一致真机实证）/rebuild 等价（D10 ②）。
+- **E2E 检出力**：当场抓出两处装配缺口并修复——① K7 sessions_dir 生产装配漏接（`..Default::default()` 吞掉）；② K12 一次性 `cydrive sync` 没接 baidu 命名空间（周期任务接了一次性命令漏）。均为「测试绿但装配没接」形态——E2E 硬验收的价值实证。
+- **观察项（挂收口/后续）**：① rebuild 与 sync 复制的 chunk_count 簿记差（1 vs 0——upload 队列 persist 对 baidu 单块写 0，rebuild 契约写 1；不影响 hydrate）；② sessions_dir 装配传 `./baidu_state` 与驱动内 `baidu_state/sessions` 拼接形成嵌套路径（功能正确、路径冗余）。
+- **披露**：清理时顺带删除 X:/Y: 两条指向 WebDAV 的历史 net use 死记录（生产实例停机态、记录非数据、run 自动重挂；数据零触碰）。
+- **telegram 腿**：独立测试 chat 未提供 → 延后（tracker 待负责人 #1；非本批失败）。
+
+## 2026-09-09 Phase 2 收口（0.9.0）：K1–K18 落地索引 + 观察项销账
+
+- **版本 0.9.0**（workspace 单点）：CloudTransport 破坏性演进（K1/K3）+ 新驱动双 crate（ck-local/ck-baidu）+ Capabilities 第 10 位（K4）；bin 名 cydrive/cydrive-sync-server 不变。
+- **K1–K18 落地索引**（详情见各批次条目）：K1/K2/K3 → B3a（8f96b07）；K4 → 位 0b65311 + 接线 b46f87c（E2E 真机验证删除→远端消失）；K5/K6 → 卷形态（fs_id/路径句柄，E2E 跨实例 fs_id 一致实证）；K7 → 会话表（B2 c6c22de + 装配接线 dcdf8ca + 嵌套修 a92b628；E2E 杀进程 0 重传实证）；K8/K9 → dlink 缓存/下载器（3696fe6）；K10 → rtype=3（真机复核通过，E2E 覆盖无副本）；K11 → rebuild（d10d285 + chunks 对齐 a92b628；E2E D10 ② 等价）；K12 → namespace（58b8cbc + 一次性命令补 41fbb85；E2E sync 收敛）；K13 → oauth on-arrival（41f25e3 + TokenStore 桥 9ffa672）；K14 → 四键 env 链（6b74a19）；K15 → 重试钩子（41f25e3）；K16 → mock axum（9a969ac 起五轮迭代对齐真实）；K17 → 三处同步（6b74a19）；K18 → 直连声明（9ffa672，E2E 全程直连形态）。
+- **E2E 观察项销账（a92b628）**：① sessions_dir 嵌套（装配改传实例 cwd "."，驱动契约不动）② chunk_count 簿记差（receipt 单容器 chunk_msg_ids=[fs_id]/[0] + rebuild 补 chunks 行——upload persist 与 rebuild 完全等价）。
+- **门禁终态**：win 738 passed / 0 failed / 9 ignored（真机 baidu 3 + 既有 6）；wsl 739 passed / 0 failed（+1 平台 cfg 既有差异）；clippy/fmt/check_layers（11 manifests）/scan_secrets 全绿；release 全 workspace 构建通过。
+- **遗留清单**：① telegram E2E 腿（独立测试 chat 待负责人）；② `#[ignore]` 真机套件随真机窗口复跑（baidu 3 已本轮跑过、既有 6 未跑）；③ litmus 套件（挂账）；④ 正式 appkey 到位后复测 meta 权限（31300）与 spike §2 限额；⑤ 下载 4 并发预取优化（当前顺序实现 ~5MB/s，4 并发 transport 面已在）；⑥ K10 复核项建议销账（rtype=3 真机通过）。
+- **不部署生产位**（部署裁决留负责人，0.8.0 先例）。

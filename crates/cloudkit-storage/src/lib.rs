@@ -10,7 +10,8 @@
 //! - **R2**：所有后端错误在驱动内映射为 [`StorageError`]，L3+ 永远只见它。
 //!
 //! 模块地图：[`vocab`]（词汇类型）→ [`ids`]（VolumeId/EntryId，D6）→
-//! [`capability`]（九能力位，D3）→ [`error`]（分类学，D2）→ [`stager`]
+//! [`capability`]（十能力位 = foundation D3 九位 + B3b `remote_delete`）→
+//! [`error`]（分类学，D2）→ [`stager`]
 //! （commit-on-close）→ [`driver`]（主 trait，D1）→ [`optional`]（可选
 //! trait 骨架）→ [`mock`]（内存后端）→ [`conformance`]（八条断言套件，D9）。
 //! 另有 Phase 1 Batch R 迁入的历史接缝家族：[`transport`]（CloudTransport
