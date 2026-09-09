@@ -113,8 +113,12 @@ pub struct QuotaSnapshot {
 /// snapshots per volume (MV3 registry construction).
 #[derive(Debug, Clone)]
 pub struct WebUiConfig {
-    /// Windows drive letter reported by `/api/stats` (`"Y:"`).
-    pub drive_letter: String,
+    /// Windows drive letter reported by `/api/stats` (`"Y:"`). `None`
+    /// in multi-volume mode for a volume that did not claim a letter
+    /// (an unclaimed volume mounts nothing — reporting the config
+    /// default would be a phantom mount claim); single-volume mode
+    /// always carries `Some`.
+    pub drive_letter: Option<String>,
     /// WebDAV URL reported by `/api/stats` (`"http://127.0.0.1:8080"`).
     /// The handler glue also derives the `webdav_host` / `webdav_port`
     /// keys from this single URL (the frozen config carries no separate

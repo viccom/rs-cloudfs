@@ -78,7 +78,7 @@ fn volume_cfg(
     quota: Option<QuotaSnapshot>,
 ) -> WebUiConfig {
     WebUiConfig {
-        drive_letter: letter.to_string(),
+        drive_letter: Some(letter.to_string()),
         webdav_url: format!("http://127.0.0.1:8080/vol/{url_suffix}"),
         chat_id,
         is_configured,
@@ -864,4 +864,34 @@ async fn single_volume_mode_ignores_volume_param_and_has_no_registry_routes() {
         let resp = send(addr, &request("GET", target, addr, &[], "")).await;
         assert_eq!(status_of(&resp), 404, "{target} absent: {resp}");
     }
+}
+
+/// A volume that claimed no drive letter reports `null` — the config
+/// default "Y:" is a placeholder, not a mount claim, and surfacing it
+/// would tell the dashboard the volume mounts as Y: when it mounts
+/// nothing (K24 honesty; the cli assembly passes `None` for volumes
+/// without an explicit `drive_letter`).
+#[tokio::test]
+async fn unclaimed_drive_letter_reports_null_not_the_default() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let mut cfg = volume_cfg("local", "V:", "free", 0, false, None, false, None);
+    cfg.drive_letter = None;
+    let env = volume_env(dir.path(), "free", cfg).await;
+    seed_row(&env.db, "/f.txt", false, 7, true);
+    let server = multi_server(vec![env.entry.clone()]).await;
+    let addr = server.local_addr();
+
+    let resp = send(addr, &request("GET", "/api/volumes", addr, &[], "")).await;
+    assert_eq!(status_of(&resp), 200, "ok: {resp}");
+    let rows: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse");
+    assert!(rows[0]["drive_letter"].is_null(), "row: {rows}");
+
+    let resp = send(
+        addr,
+        &request("GET", "/api/stats?volume=free", addr, &[], ""),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 200, "ok: {resp}");
+    let stats: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse");
+    assert!(stats["drive_letter"].is_null(), "stats: {stats}");
 }

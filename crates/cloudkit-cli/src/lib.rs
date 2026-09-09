@@ -560,7 +560,9 @@ pub async fn run_with_transport_options(
             .parse()
             .with_context(|| format!("parsing web_ui_host {:?}", cfg.web_ui_host))?;
         let ui_cfg = cloudkit_web::WebUiConfig {
-            drive_letter: cfg.drive_letter.clone(),
+            // Single-volume mode always reports the configured letter
+            // (Some serializes identically to the pre-Option JSON).
+            drive_letter: Some(cfg.drive_letter.clone()),
             webdav_url: default_mount_url(cfg),
             chat_id: cfg.chat_id,
             is_configured: cfg.is_configured(),
@@ -1044,7 +1046,13 @@ pub async fn run_multi_with_transports(
         // the failed arm degrades to what the volume file declares.
         let capabilities = transport.capabilities();
         let ui_config = cloudkit_web::WebUiConfig {
-            drive_letter: spec.settings.drive_letter.clone(),
+            // Only an explicit drive_letter claim reaches the dashboard;
+            // an unclaimed volume mounts nothing and must not report the
+            // config-default letter as a phantom claim (the parsed
+            // default "Y:" is a placeholder, not a mount).
+            drive_letter: spec
+                .explicit_drive_letter
+                .then(|| spec.settings.drive_letter.clone()),
             webdav_url: volume_mount_url(process_cfg, &name),
             chat_id: spec.settings.chat_id,
             is_configured: spec.settings.is_configured(),
