@@ -929,14 +929,27 @@ pub async fn run_sync_command(cfg: &CyDriveConfig, secret: Option<&str>) -> Resu
              \"http://192.168.1.10:8290\""
         );
     };
-    if cfg.bot_token.is_empty() || cfg.chat_id == 0 {
-        anyhow::bail!(
-            "cydrive sync needs bot_token and chat_id to derive the sync namespace: set \
-             them in config.toml (bot_token may come from the OS credential store) and \
-             retry"
-        );
-    }
-    let key = namespace_key(&cfg.bot_token, &cfg.chat_id.to_string());
+    // K12：命名空间按后端推导——telegram 沿 bot_token/chat_id（历史形
+    // 态逐字节不变）；baidu 连接驱动取卷身份 `baidu:<uid>`（与 run 装配
+    // 的周期任务同一推导，main.rs 的 run_options.sync_namespace 先例）；
+    // local 不参与 sync。
+    let key = match cfg.backend {
+        Backend::Telegram => {
+            if cfg.bot_token.is_empty() || cfg.chat_id == 0 {
+                anyhow::bail!(
+                    "cydrive sync needs bot_token and chat_id to derive the sync namespace: set \
+                     them in config.toml (bot_token may come from the OS credential store) and \
+                     retry"
+                );
+            }
+            namespace_key(&cfg.bot_token, &cfg.chat_id.to_string())
+        }
+        Backend::Baidu => build_backend_transport(cfg)
+            .await
+            .context("connecting the baidu backend to derive the sync namespace")?
+            .sync_namespace_key(),
+        Backend::Local => anyhow::bail!("{LOCAL_SYNC_UNSUPPORTED}"),
+    };
 
     let db = MetaDatabase::open(Path::new(&cfg.db_path))
         .with_context(|| format!("opening metadata db {:?}", cfg.db_path))?;
