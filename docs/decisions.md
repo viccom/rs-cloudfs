@@ -468,3 +468,8 @@
 - **门禁终态**：win 738 passed / 0 failed / 9 ignored（真机 baidu 3 + 既有 6）；wsl 739 passed / 0 failed（+1 平台 cfg 既有差异）；clippy/fmt/check_layers（11 manifests）/scan_secrets 全绿；release 全 workspace 构建通过。
 - **遗留清单**：① telegram E2E 腿（独立测试 chat 待负责人）；② `#[ignore]` 真机套件随真机窗口复跑（baidu 3 已本轮跑过、既有 6 未跑）；③ litmus 套件（挂账）；④ 正式 appkey 到位后复测 meta 权限（31300）与 spike §2 限额；⑤ 下载 4 并发预取优化（当前顺序实现 ~5MB/s，4 并发 transport 面已在）；⑥ K10 复核项建议销账（rtype=3 真机通过）。
 - **不部署生产位**（部署裁决留负责人，0.8.0 先例）。
+
+## 2026-09-09 负责人澄清两项：百度 appkey 归属 + telegram 配置位置
+
+- **百度 appkey 即本人正式凭据**（负责人明示）：PCFS client.go:69-70 的 clientID/clientSecret 是负责人本人的（spike 报告「借用的第三方 appkey」表述有误）。连带修正：① spike §2 QPS/限额结论的适用范围 = 负责人自己的 appkey 桶，「正式 appkey 到位后复测」的挂账语义收窄——**没有新 key 要等**；② meta 端点 31300（stream type is not authorized）若需恢复直查路径，行动项 = 负责人在百度网盘开放平台控制台为本 appkey 申请/开启「文件元信息（meta）」接口权限（当前 appkey 已验证具备 upload/download/list/quota/uinfo 权限，独缺 meta 族），**非换 key**；meta 停用代码（allow(dead_code)）保留即为该复测预留。③ ck-baidu R3 注释中「appkey 无代码默认值、PCFS 硬编码是反面教材」的表述维持——那是对「硬编码位置」的批评（凭据不入源码仓库），不涉及 key 归属正当性。
+- **telegram 实测配置实际位置 = D:\Tools\rs-CyDrive**（生产部署实例：config.toml 含 bot_token/chat_id/api_id/api_hash + bot session + 生产 db/cache；E:\GitHub\rs-CyDrive\test\ 不存在）。**§7a 隔离裁决不因此改变**：该 bot/chat 即生产命名空间，跑 E2E 写操作须负责人二选一——明示接受生产 chat 污染（上传的 /_e2e_* 文件会进生产索引、随墓碑清理），或提供独立测试 bot/chat。telegram E2E 腿（tracker #1）等此裁决。
