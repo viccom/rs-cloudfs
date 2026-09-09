@@ -225,6 +225,11 @@ pub const PROCESS_SCOPED_KEYS: &[&str] = &[
     "web_ui_host",
     "web_ui_port",
     "enable_web_ui",
+    // A process-level switch by usage: the multi-volume mount gate reads
+    // it from the process config (per-volume override would leave the
+    // other volumes' mounts ungoverned). Single-volume mode keeps it in
+    // config.toml either way — the partition only governs multi mode.
+    "auto_mount_drive",
 ];
 
 /// Volume-scoped keys (Phase 2.5 / K19): everything a single storage
@@ -242,7 +247,6 @@ pub const VOLUME_SCOPED_KEYS: &[&str] = &[
     "cache_path",
     "db_path",
     "drive_letter",
-    "auto_mount_drive",
     "mount_point",
     "chunk_size_mb",
     "cache_limit_gb",

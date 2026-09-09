@@ -75,8 +75,10 @@ fn key_partition_bipartitions_known_toml_keys_exactly() {
 #[test]
 fn process_scoped_keys_are_the_process_globals() {
     // K19/§2: process-level keys are the web endpoints, the dashboard
-    // switch and the (new) volumes directory — everything a single
-    // process shares across volumes.
+    // switch, the (new) volumes directory and the mount master switch
+    // (auto_mount_drive governs the whole multi-volume mount gate, so a
+    // per-volume spelling would leave sibling mounts ungoverned) —
+    // everything a single process shares across volumes.
     assert_eq!(
         PROCESS_SCOPED_KEYS.to_vec(),
         vec![
@@ -86,6 +88,7 @@ fn process_scoped_keys_are_the_process_globals() {
             "web_ui_host",
             "web_ui_port",
             "enable_web_ui",
+            "auto_mount_drive",
         ],
         "the process-scoped key set must stay deliberate — new keys join \
          exactly one side of the partition"
