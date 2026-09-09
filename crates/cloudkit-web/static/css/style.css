@@ -208,6 +208,93 @@ body {
     display: none;
 }
 
+/* Volume tabs (multi-volume mode, K24): one chip per registry volume —
+   name + backend badge + status dot. Failed volumes dim and disable
+   (the reason rides in the tooltip); the active volume glows cyan. */
+.volume-tabs {
+    display: flex;
+    flex-wrap: wrap;
+    gap: 0.6rem;
+}
+
+.volume-tabs[hidden] {
+    display: none;
+}
+
+.volume-tab {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.55rem 1rem;
+    border-radius: 10px;
+    border: 1px solid var(--border-color);
+    background: var(--bg-card);
+    color: var(--text-muted);
+    font-size: 0.9rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.volume-tab:hover {
+    border-color: rgba(0, 243, 255, 0.35);
+    color: var(--text-main);
+}
+
+.volume-tab.active {
+    background: rgba(0, 243, 255, 0.1);
+    border-color: rgba(0, 243, 255, 0.45);
+    color: #fff;
+    box-shadow: 0 0 12px rgba(0, 243, 255, 0.25);
+}
+
+.volume-tab.failed {
+    opacity: 0.55;
+    cursor: not-allowed;
+    border-color: rgba(255, 51, 102, 0.35);
+}
+
+.volume-backend {
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.1rem 0.45rem;
+    border-radius: 999px;
+    border: 1px solid rgba(0, 243, 255, 0.25);
+    background: rgba(0, 243, 255, 0.08);
+    color: var(--accent-cyan);
+}
+
+.volume-tab.failed .volume-backend {
+    border-color: rgba(255, 51, 102, 0.25);
+    background: rgba(255, 51, 102, 0.08);
+    color: #ff6688;
+}
+
+.volume-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    flex-shrink: 0;
+}
+
+.volume-dot.dot-running {
+    background: var(--accent-green);
+    box-shadow: 0 0 6px rgba(0, 255, 136, 0.7);
+}
+
+.volume-dot.dot-failed {
+    background: #ff3366;
+    box-shadow: 0 0 6px rgba(255, 51, 102, 0.7);
+}
+
+/* The cross-volume summary card (multi-volume mode): same stat-card
+   chassis; the [hidden] rule re-pins against .stat-card's flex. */
+#summary-card[hidden] {
+    display: none;
+}
+
 .storage-card p {
     font-size: 0.75rem;
     color: var(--text-muted);

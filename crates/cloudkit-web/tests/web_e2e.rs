@@ -61,7 +61,7 @@ fn base_cfg() -> VfsConfig {
 /// test overrides them with a baidu-shaped config.
 fn ui_cfg() -> WebUiConfig {
     WebUiConfig {
-        drive_letter: "Y:".to_string(),
+        drive_letter: Some("Y:".to_string()),
         webdav_url: "http://127.0.0.1:8080".to_string(),
         chat_id: 123456789,
         is_configured: true,

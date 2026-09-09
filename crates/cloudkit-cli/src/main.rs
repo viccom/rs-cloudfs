@@ -14,8 +14,10 @@
 //! mount/unmount (drive mapping), fix-reg (WebClient tuning, elevated),
 //! migrate (legacy Python import), stats (drive statistics table),
 //! rebuild (bootstrap the metadata DB from the baidu/local backend's
-//! authoritative index), doctor (offline diagnosis + platform checks)
-//! and setup (interactive first-time wizard).
+//! authoritative index), doctor (offline diagnosis + platform checks),
+//! setup (interactive first-time wizard; `--multi` writes the
+//! multi-volume skeleton) and volumes (the multi-volume manifest
+//! listing).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -23,8 +25,11 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use ck_telegram::transport::GrammersTransport;
 use clap::{Parser, Subcommand};
-use cloudkit_cli::discover_config;
-use cloudkit_core::config::CyDriveConfig;
+use cloudkit_cli::{
+    discover_config, discover_config_with_volumes, BaiduEndpoints, ConfigTokenStore,
+    DiscoveredConfig, VolumeStatus,
+};
+use cloudkit_core::config::{Backend, CyDriveConfig, VolumeConfig};
 use cloudkit_core::logging::LogConfig;
 use cloudkit_core::rel_path::RelPath;
 
@@ -124,7 +129,17 @@ enum Command {
     /// drive letter); secrets go to the OS credential store, or by
     /// explicit choice into config.toml when no credential store is
     /// available (headless).
-    Setup,
+    Setup {
+        /// Write the multi-volume skeleton instead of the wizard: a
+        /// process-scoped config.toml plus one example volume file
+        /// (refuses to overwrite an existing config).
+        #[arg(long)]
+        multi: bool,
+    },
+    /// List the configured volumes (multi-volume mode) with their
+    /// backends, drive letters and metadata DB paths — configuration
+    /// facts only, no running instance is contacted.
+    Volumes,
 }
 
 #[derive(Debug, Subcommand)]
@@ -154,7 +169,8 @@ async fn main() -> Result<()> {
         Command::Stats => stats_cmd(),
         Command::Rebuild => rebuild_cmd().await,
         Command::Doctor => doctor_cmd().await,
-        Command::Setup => setup_cmd().await,
+        Command::Setup { multi } => setup_cmd(multi).await,
+        Command::Volumes => volumes_cmd(),
     }
 }
 
@@ -184,18 +200,41 @@ async fn stop_cmd() -> Result<()> {
 /// `cydrive status`: discover the config (same cwd rule as `run`/`stop`
 /// — the control file resolves from the discovered `db_path`, so an
 /// instance is only detectable from its own working directory), collect
-/// the probes and print the rendered report.
+/// the probes and print the rendered report. Multi-volume mode (Phase
+/// 2.5 / MV4) appends the per-volume db stats section — the reads are
+/// exists-guarded and read-only, so the numbers exist whether or not a
+/// process is running.
 async fn status_cmd() -> Result<()> {
-    let cfg = discover_config().context("config discovery failed")?;
-    let report = cloudkit_cli::collect_status(&cfg).await;
-    println!(
-        "{}",
-        cloudkit_cli::render_status(
-            &report,
-            &cloudkit_cli::default_mount_url(&cfg),
-            cloudkit_cli::dashboard_url(&cfg),
-        )
-    );
+    match discover_config_with_volumes().context("config discovery failed")? {
+        DiscoveredConfig::Single(cfg) => {
+            let report = cloudkit_cli::collect_status(&cfg).await;
+            println!(
+                "{}",
+                cloudkit_cli::render_status(
+                    &report,
+                    &cloudkit_cli::default_mount_url(&cfg),
+                    cloudkit_cli::dashboard_url(&cfg),
+                )
+            );
+        }
+        DiscoveredConfig::Multi { process, volumes } => {
+            // Process-level probes first (the same renderer over the
+            // process config — the control file and ports are
+            // process-level in multi-volume mode too, K25/K20).
+            let report = cloudkit_cli::collect_status(&process).await;
+            println!(
+                "{}",
+                cloudkit_cli::render_status(
+                    &report,
+                    &cloudkit_cli::default_mount_url(&process),
+                    cloudkit_cli::dashboard_url(&process),
+                )
+            );
+            println!();
+            let rows = cloudkit_cli::volumes::collect_volume_stats(&volumes)?;
+            println!("{}", cloudkit_cli::volumes::render_volume_stats(&rows));
+        }
+    }
     Ok(())
 }
 
@@ -432,10 +471,25 @@ async fn rebuild_cmd() -> Result<()> {
 /// root exists-and-writable check and the K12 sync-unsupported warning.
 /// The Windows WebClient leg runs for every backend (the WebDAV mount
 /// surface is backend-independent).
+///
+/// Multi-volume mode (Phase 2.5 / MV4): discovery routes the two shapes
+/// — a `volumes_dir` config runs the multi-volume doctor (process-level
+/// config + ports, then one check group per volume), anything else runs
+/// the frozen single-volume body below unchanged.
 async fn doctor_cmd() -> Result<()> {
-    let discovered = discover_config();
+    let discovered = discover_config_with_volumes();
+    if let Ok(DiscoveredConfig::Multi { process, volumes }) = &discovered {
+        let mut results = cloudkit_cli::doctor::run_doctor_multi(process, volumes);
+        results.extend(cloudkit_cli::doctor::webclient_checks());
+        print!("{}", cloudkit_cli::doctor::render_report(&results));
+        return Ok(());
+    }
     let config_present = discovered.is_ok();
-    let cfg = discovered.unwrap_or_default();
+    let cfg = match discovered {
+        Ok(DiscoveredConfig::Single(cfg)) => cfg,
+        Ok(DiscoveredConfig::Multi { .. }) => unreachable!("handled above"),
+        Err(_) => CyDriveConfig::default(),
+    };
     // The keyring availability probe doubles as the credential store the
     // doctor checks read: a failed constructor becomes an
     // UnavailableKeyring so the credentials check sees the headless
@@ -482,7 +536,18 @@ async fn doctor_cmd() -> Result<()> {
 /// write the secrets into `config.toml` (headless mode) or abort — the
 /// pre-2026-09-04 behavior of silently storing them in a volatile
 /// in-memory fallback reported success while losing the token.
-async fn setup_cmd() -> Result<()> {
+///
+/// `--multi` (Phase 2.5 / MV4) skips the wizard entirely and writes the
+/// multi-volume skeleton (no prompts — the multi-volume layout is files
+/// the user edits directly).
+async fn setup_cmd(multi: bool) -> Result<()> {
+    if multi {
+        print!(
+            "{}",
+            cloudkit_cli::setup::run_setup_multi().context("writing the multi-volume skeleton")?
+        );
+        return Ok(());
+    }
     let store: Option<cloudkit_cli::KeyringStore> = match cloudkit_cli::KeyringStore::new() {
         Ok(store) => Some(store),
         Err(error) => {
@@ -513,6 +578,20 @@ async fn setup_cmd() -> Result<()> {
     .await
 }
 
+/// `cydrive volumes` (Phase 2.5 / MV4): the read-only volume listing —
+/// discover (the same face `run` uses), then either the manifest table
+/// or the single-volume migration hint. Configuration facts only: the
+/// command contacts no running instance, so it never guesses runtime
+/// state (live status is `cydrive status` / the dashboard).
+fn volumes_cmd() -> Result<()> {
+    let discovered = discover_config_with_volumes().context("config discovery failed")?;
+    println!(
+        "{}",
+        cloudkit_cli::volumes::volumes_report(&discovered).context("listing the volumes")?
+    );
+    Ok(())
+}
+
 /// The production run flow; every step here is covered by the library
 /// tests except the transport connect, which needs real Telegram
 /// credentials and is compile-verified only.
@@ -528,6 +607,11 @@ async fn setup_cmd() -> Result<()> {
 /// `backend` key IS telegram — pre-Phase-2 behavior); baidu/local
 /// assemble through the unified [`cloudkit_cli::build_backend_transport`]
 /// and boot with their backend-derived sync namespace (K12).
+///
+/// Phase 2.5 / MV1: discovery routes the two shapes — a plain
+/// single-volume config runs the frozen path below, a `volumes_dir`
+/// config runs [`run_multi_volume`] (per-volume dispatch + the Volume
+/// Registry assembly).
 async fn run() -> Result<()> {
     let cwd = std::env::current_dir().context("resolving the working directory")?;
     println!(
@@ -535,9 +619,19 @@ async fn run() -> Result<()> {
         env!("CARGO_PKG_VERSION"),
         cwd.display()
     );
-    let cfg = discover_config().context("config discovery failed")?;
+    match discover_config_with_volumes().context("config discovery failed")? {
+        DiscoveredConfig::Single(cfg) => run_single_volume(cfg, cwd).await,
+        DiscoveredConfig::Multi { process, volumes } => {
+            run_multi_volume(process, volumes, cwd).await
+        }
+    }
+}
+
+/// The single-volume run flow — the pre-Phase-2.5 behaviour, byte for
+/// byte (only extracted from `run` for the MV1 dispatch).
+async fn run_single_volume(cfg: CyDriveConfig, cwd: std::path::PathBuf) -> Result<()> {
     cfg.validate().context("invalid configuration")?;
-    if cfg.backend == cloudkit_core::config::Backend::Telegram && !cfg.is_configured() {
+    if cfg.backend == Backend::Telegram && !cfg.is_configured() {
         anyhow::bail!(
             "CyDrive is not configured: set bot_token (a \"<id>:<secret>\" BotFather \
              token) and chat_id in config.toml (or a legacy config.json) in the \
@@ -550,40 +644,14 @@ async fn run() -> Result<()> {
 
     let mut run_options = cloudkit_cli::RunOptions::default();
     let transport: Arc<dyn cloudkit_core::transport::CloudTransport> = match cfg.backend {
-        cloudkit_core::config::Backend::Telegram => {
+        Backend::Telegram => {
             // The legacy arm, byte-for-byte: session glue → visible
             // progress line → deadline-bounded connect raced against
             // Ctrl+C → the failure hint on error.
-            let transport_config = cloudkit_cli::transport_config_from(&cfg, &cwd);
-            println!(
-                "Connecting to Telegram (session: {}) ...",
-                transport_config.session_path.display()
-            );
-            let connect = cloudkit_cli::connect_with_deadline(
-                GrammersTransport::connect(transport_config),
-                cloudkit_cli::CONNECT_DEADLINE,
-            );
-            let transport = tokio::select! {
-                result = connect => match result {
-                    Ok(transport) => transport,
-                    Err(error) => {
-                        eprintln!("Error: connecting the Telegram transport");
-                        match &error {
-                            cloudkit_cli::ConnectGuardError::Deadline(_) => {}
-                            cloudkit_cli::ConnectGuardError::Inner(source) => {
-                                eprintln!("Caused by:\n    {source}");
-                            }
-                        }
-                        eprintln!("{}", cloudkit_cli::connect_failure_hint());
-                        std::process::exit(1);
-                    }
-                },
-                _ = tokio::signal::ctrl_c() => {
-                    println!("Interrupted while connecting to Telegram; exiting.");
-                    return Ok(());
-                }
-            };
-            Arc::new(transport)
+            match connect_telegram_volume(&cfg, &cwd).await? {
+                Some(transport) => transport,
+                None => return Ok(()), // Ctrl+C during the connect
+            }
         }
         backend => {
             println!(
@@ -629,4 +697,173 @@ async fn run() -> Result<()> {
     println!("Shutting down (draining uploads, unmounting) ...");
     handle.shutdown().await;
     Ok(())
+}
+
+/// The multi-volume run flow (Phase 2.5 / MV1): per-volume transport
+/// dispatch (the same two arms as the single-volume flow — telegram's
+/// deadline-bounded connect and the unified baidu/local dispatch — keyed
+/// on each volume's settings with K21 volume-home state directories),
+/// then the Volume Registry assembly and ONE process-level stop gate.
+async fn run_multi_volume(
+    process: CyDriveConfig,
+    volumes: Vec<VolumeConfig>,
+    _cwd: std::path::PathBuf,
+) -> Result<()> {
+    // Pretty/INFO on stdout; a parseable RUST_LOG overrides the level.
+    cloudkit_core::logging::init(&LogConfig::default()).context("initializing logging")?;
+    println!("Assembling {} volume(s) ...", volumes.len());
+
+    let mut injections = Vec::new();
+    for spec in volumes {
+        // K21: the volume's home directory anchors its session, baidu
+        // state and (in the assembly) its db/cache paths.
+        let home = cloudkit_cli::volume_home(&spec)?;
+        let settings = cloudkit_cli::resolve_volume_settings(&spec)?;
+        settings
+            .validate()
+            .with_context(|| format!("invalid configuration for volume `{}`", spec.name))?;
+        let mut run_options = cloudkit_cli::RunOptions::default();
+        let transport: Arc<dyn cloudkit_core::transport::CloudTransport> = match settings.backend {
+            Backend::Telegram => {
+                if !settings.is_configured() {
+                    anyhow::bail!(
+                        "volume `{}` is not configured: set bot_token (a \"<id>:<secret>\" \
+                         BotFather token) and chat_id in the volume file {}",
+                        spec.name,
+                        spec.file_path.display()
+                    );
+                }
+                println!("Connecting volume {} to Telegram ...", spec.name);
+                match connect_telegram_volume(&settings, &home).await? {
+                    Some(transport) => transport,
+                    None => return Ok(()), // Ctrl+C during the connect
+                }
+            }
+            backend => {
+                println!(
+                    "Connecting volume {name} to the {backend} backend ...",
+                    name = spec.name,
+                    backend = backend.as_str()
+                );
+                // K13/K21: token rotations write back into the volume's
+                // own file; upload sessions live in the volume home.
+                let token_store = ConfigTokenStore::new(spec.file_path.clone());
+                let dispatched = cloudkit_cli::build_backend_transport_with(
+                    &settings,
+                    &BaiduEndpoints::default(),
+                    Some(Arc::new(token_store)),
+                    &home,
+                )
+                .await?;
+                run_options.sync_namespace = Some(dispatched.sync_namespace_key());
+                run_options.web_volume = Some(dispatched.volume().to_string());
+                run_options.web_quota = dispatched.web_quota_snapshot().await;
+                dispatched.clone_dyn()
+            }
+        };
+        injections.push((spec, run_options, transport));
+    }
+
+    let handle = cloudkit_cli::run_multi_with_transports(&process, injections).await?;
+    // K29 process-level banner: the volume list with per-volume status;
+    // each volume's capability line rides in the boot log (same R-5
+    // declaration as the single-volume banner). MV2 adds the single
+    // WebDAV endpoint (per-volume path `/vol/<name>`) and the mounted
+    // drive letters (K27) to the same line.
+    let listing = handle
+        .volumes()
+        .iter()
+        .map(|(name, status)| format!("{name}:{}", status.as_str()))
+        .collect::<Vec<_>>()
+        .join(", ");
+    let mut banner = format!("CyDrive multi-volume is running: {listing}");
+    match handle.webdav_addr() {
+        Some(addr) => banner.push_str(&format!(
+            "  |  WebDAV at http://{addr} (volumes at /vol/<name>)"
+        )),
+        None => banner.push_str("  |  WebDAV unavailable (bind failed; see the log)"),
+    }
+    // MV3 / K24: the single dashboard port (the same line the
+    // single-volume banner prints; absent when off or degraded).
+    match handle.web_ui_addr() {
+        Some(addr) => banner.push_str(&format!("  |  dashboard at http://{addr}")),
+        None => {
+            banner.push_str("  |  dashboard unavailable (disabled or bind failed; see the log)")
+        }
+    }
+    let letters = handle.mounted_letters();
+    if !letters.is_empty() {
+        banner.push_str(&format!("  |  mounted: {}", letters.join(", ")));
+    }
+    banner.push_str("  |  press Ctrl+C to stop  |  or `cydrive stop`");
+    println!("{banner}");
+    let volume_states = handle.volumes();
+    let failed: Vec<&(String, VolumeStatus)> = volume_states
+        .iter()
+        .filter(|(_, status)| matches!(status, VolumeStatus::Failed { .. }))
+        .collect();
+    if !failed.is_empty() {
+        let names = failed
+            .iter()
+            .map(|(name, _)| name.as_str())
+            .collect::<Vec<_>>()
+            .join(", ");
+        println!("Warning: volume(s) failed to assemble and are NOT running: {names} (see the log for the reasons)");
+    }
+
+    // The three shutdown sources race (same as single-volume): Ctrl+C,
+    // SIGTERM and the ONE control channel's STOP — whichever wins, every
+    // volume drains through the aggregated stop sequence.
+    let stop_source = tokio::select! {
+        _ = tokio::signal::ctrl_c() => "Ctrl+C",
+        _ = cloudkit_cli::sigterm() => "SIGTERM",
+        _ = handle.wait_for_stop_request() => "stop command",
+    };
+    println!("{stop_source} received.");
+    println!("Shutting down (draining every volume's uploads) ...");
+    handle.shutdown().await?;
+    Ok(())
+}
+
+/// The telegram connect arm shared by both run flows (Phase 2.5 / MV1
+/// extracted verbatim from the single-volume path): session glue →
+/// visible progress line → deadline-bounded connect raced against Ctrl+C
+/// → the failure hint on error. `state_base` is the session-state
+/// directory — the process cwd for a single-volume boot, the volume's
+/// home directory in multi-volume mode (K21). Returns `None` when Ctrl+C
+/// won the race (the caller exits cleanly).
+async fn connect_telegram_volume(
+    cfg: &CyDriveConfig,
+    state_base: &std::path::Path,
+) -> Result<Option<Arc<dyn cloudkit_core::transport::CloudTransport>>> {
+    let transport_config = cloudkit_cli::transport_config_from(cfg, state_base);
+    println!(
+        "Connecting to Telegram (session: {}) ...",
+        transport_config.session_path.display()
+    );
+    let connect = cloudkit_cli::connect_with_deadline(
+        GrammersTransport::connect(transport_config),
+        cloudkit_cli::CONNECT_DEADLINE,
+    );
+    let transport = tokio::select! {
+        result = connect => match result {
+            Ok(transport) => transport,
+            Err(error) => {
+                eprintln!("Error: connecting the Telegram transport");
+                match &error {
+                    cloudkit_cli::ConnectGuardError::Deadline(_) => {}
+                    cloudkit_cli::ConnectGuardError::Inner(source) => {
+                        eprintln!("Caused by:\n    {source}");
+                    }
+                }
+                eprintln!("{}", cloudkit_cli::connect_failure_hint());
+                std::process::exit(1);
+            }
+        },
+        _ = tokio::signal::ctrl_c() => {
+            println!("Interrupted while connecting to Telegram; exiting.");
+            return Ok(None);
+        }
+    };
+    Ok(Some(Arc::new(transport)))
 }

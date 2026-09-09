@@ -16,11 +16,11 @@
 6. `docs/tracking/phase0-1.md` —— 当前任务跟踪单（**开工先读、每批收口更新**）
 
 ## 当前阶段
-**Phase 2 完成（2026-09-09，0.9.0）**：ck-local + ck-baidu（双面驱动：StorageDriver conformance 全绿 + CloudTransport 运行时面）+ 组合根三后端接线（backend 键/删除语义/rebuild/namespace/setup/doctor）交付；E2E 硬验收 baidu/local 腿通过（往返/Range/杀进程续传/删除/sync 收敛/rebuild 等价/双盘并存），**telegram E2E 腿待独立测试 chat（负责人挂账）**；win 740 / wsl 741 绿。五项百度真网实证入 decisions（uk 字段/precreate 会话锁定 31363/meta 端点 31300 无权限/目录 create 冲突重命名/索引传播延迟）。**下一步 = Phase 2.5 多卷启用（方案一裁决，B3 后立即——另立计划）**。过渡测试包：E:\Rs_Codes\cydrive-0.8.0-testkit（telegram+加密 U:/V:，仓外不入库）。
+**Phase 2.5 完成（2026-09-09，0.10.0）**：多卷启用（Volume Registry，方案一裁决）——MV0 配置/发现（volumes_dir + 每卷一文件，K19）→ MV1 Registry 装配（K21 卷主目录隔离/K22 失败可见/K25 单 stop gate）→ MV2 WebDAV 单端口 `/vol/<name>` 前缀路由 + 逐卷挂载（K20 真机探针过、K27）→ MV3 仪表盘多卷（/api/volumes + 卷 tabs + K23 卷参）→ MV4 CLI 运维面（volumes/doctor/status 逐卷 + setup --multi 骨架）+ 文档联动，K19–K28 入档 decisions。**三卷真机 E2E 全过（单进程 V:local加密+Y:tg+Z:baidu、单端口 /vol/<name>、单仪表盘 tabs/汇总、stop 全停）**，feat/phase2-5 收口 merge main。前置 Phase 2（0.9.0）完成，telegram E2E 生产 chat 污染已获负责人明示接受（§7a 例外）。过渡测试包：E:\Rs_Codes\cydrive-0.8.0-testkit（telegram+加密 U:/V:，仓外不入库）。
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 740 测试（0.9.0+web 适配批；ignored 9 = 真机 3(baidu) + 平台/真机类 6）
+cargo test --workspace --no-fail-fast            # 807 测试（0.10.0+Phase 2.5 多卷批；ignored 9 = 真机/平台类）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 scripts/check_layers                             # R1 层依赖门禁（CI 同款；动 Cargo.toml 依赖后必跑）
@@ -42,6 +42,8 @@ scripts/scan_secrets                             # R3 秘密扫描门禁（CI �
 - **百度下载三约束（spike §5 矩阵）**：有界 Range ≤4MiB + netdisk UA + 禁全量 GET（违反任一 → 403/31326）；dlink TTL ≥96min 实测、缓存 60min + 两段 fallback（追 token→重取）；**rtype=3 覆盖语义已真机复核**（同路径重传覆盖、无 _2026 副本）
 - **Git Bash 探针教训**：curl 形参中 `/apps/...` 被 MSYS 路径改写污染（→ C:/Program Files/Git/apps/...，百度报 -7 假象）——真网探针必须 `MSYS_NO_PATHCONV=1`
 - **Explorer 上传链路**：空 PUT→LOCK→PUT→PROPPATCH——**PROPPATCH 必须全成功（207）而非 405**，否则 MiniRedir 整单回滚「看似失败实则已传」（rs-CyDrive 2026-09-03 真机首验最贵教训，百度 E2E 直接承重）
+- **Windows 运行中的 release exe 锁文件**：替换构建报 `os error 5`（拒绝访问）——**先 `cydrive stop`/停进程再 rebuild release**（MV3 冒烟实测，MV2 真机探针同源）
+- **多卷模式 `CYDRIVE_*` env 覆盖被忽略**（K28）：全局 env 覆盖会跨卷串味，卷模式 discover 直接跳过并在 tracing 声明；凭据 env>file>keyring 解析链在驱动 resolve 时不变——排查「env 不生效」先看是否卷模式
 - 实现期陷阱查 `docs/rust-rewrite-design.md`「深度调研补遗」节（axum 2MB body 上限/grammers FloodWait 藏点/dav-server Bytes-Seek 模型/WebClient 4GB-1/挂载 Basic 认证）
 - PCFS 反面教材勿抄：错误类型跨层泄漏、硬编码密钥、纯 CTR 无认证、注释掉的调试日志
 

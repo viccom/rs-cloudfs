@@ -43,7 +43,7 @@ use ck_telegram::config::{
 };
 use ck_telegram::transport::GrammersTransport;
 use cloudkit_core::cache::CacheManager;
-use cloudkit_core::config::{Backend, CyDriveConfig};
+use cloudkit_core::config::{Backend, CyDriveConfig, VolumeConfig};
 use cloudkit_core::credentials::{
     CredentialStore, InMemoryStore, BOT_TOKEN, ENCRYPTION_PASSWORD, SERVICE,
 };
@@ -70,6 +70,7 @@ pub mod control;
 pub mod doctor;
 pub mod setup;
 pub mod sync_client;
+pub mod volumes;
 
 pub use keyring_store::KeyringStore;
 pub use signals::sigterm;
@@ -429,15 +430,34 @@ pub struct RunOptions {
     pub web_quota: Option<cloudkit_web::QuotaSnapshot>,
 }
 
-/// [`run_with_transport`] with the backend-derived sync namespace
-/// injected: a baidu boot passes the dispatched transport's
-/// [`BackendTransport::sync_namespace_key`] so the periodic task keys
-/// on the account uid, not on (absent) telegram credentials.
-pub async fn run_with_transport_options(
+/// The per-volume core every boot shares (single-volume and multi-volume
+/// alike): the metadata db, the cache-backed VFS with its upload queue,
+/// the boot-time pending requeue and the inbound indexing worker — the
+/// first segments of the module's boot order, in exactly the
+/// single-volume order. [`run_with_transport_options`] consumes this
+/// verbatim; [`run_multi_with_transports`] builds one per volume.
+struct VolumeCore {
+    /// The metadata db (terminal-state reads; feeds periodic sync).
+    db: Arc<MetaDatabase>,
+    /// The VFS whose upload queue backs the volume.
+    vfs: Arc<Vfs>,
+    /// The cache root (the periodic sync task's own handle needs it).
+    cache_root: PathBuf,
+    /// The cache capacity in bytes (`cache_limit_gb` converted).
+    cache_limit: u64,
+    /// The inbound indexing worker handle (the stop sequence joins it).
+    inbound: cloudkit_core::inbound::InboundWorkerHandle,
+}
+
+/// Assembles one volume's db + cache + VFS (+ queue workers) and runs the
+/// boot-time pending requeue, then spawns the inbound indexing worker.
+/// Extracted verbatim from [`run_with_transport_options`] (Phase 2.5 /
+/// MV1) so the single-volume path and the per-volume multi-volume path
+/// cannot drift.
+async fn build_volume_core(
     cfg: &CyDriveConfig,
     transport: Arc<dyn CloudTransport>,
-    options: RunOptions,
-) -> Result<RunHandle> {
+) -> Result<VolumeCore> {
     let db = Arc::new(
         MetaDatabase::open(Path::new(&cfg.db_path))
             .with_context(|| format!("opening metadata db {:?}", cfg.db_path))?,
@@ -471,6 +491,31 @@ pub async fn run_with_transport_options(
         cfg.drive_letter.clone(),
     );
     tracing::info!("inbound indexing worker spawned");
+    Ok(VolumeCore {
+        db,
+        vfs,
+        cache_root,
+        cache_limit,
+        inbound,
+    })
+}
+
+/// [`run_with_transport`] with the backend-derived sync namespace
+/// injected: a baidu boot passes the dispatched transport's
+/// [`BackendTransport::sync_namespace_key`] so the periodic task keys
+/// on the account uid, not on (absent) telegram credentials.
+pub async fn run_with_transport_options(
+    cfg: &CyDriveConfig,
+    transport: Arc<dyn CloudTransport>,
+    options: RunOptions,
+) -> Result<RunHandle> {
+    let VolumeCore {
+        db,
+        vfs,
+        cache_root,
+        cache_limit,
+        inbound,
+    } = build_volume_core(cfg, Arc::clone(&transport)).await?;
 
     // A second cache handle over the same root backs the FS adapter's
     // path math and cache-copy housekeeping (same construction as the
@@ -516,7 +561,9 @@ pub async fn run_with_transport_options(
             .parse()
             .with_context(|| format!("parsing web_ui_host {:?}", cfg.web_ui_host))?;
         let ui_cfg = cloudkit_web::WebUiConfig {
-            drive_letter: cfg.drive_letter.clone(),
+            // Single-volume mode always reports the configured letter
+            // (Some serializes identically to the pre-Option JSON).
+            drive_letter: Some(cfg.drive_letter.clone()),
             webdav_url: default_mount_url(cfg),
             chat_id: cfg.chat_id,
             is_configured: cfg.is_configured(),
@@ -649,6 +696,685 @@ pub async fn run_with_transport_options(
     })
 }
 
+// ------------------------------------------- Phase 2.5 / MV1: volume registry ---
+
+/// The per-volume state machine (K22): a volume is `Starting` while the
+/// assembly loop builds it, `Running` once its core is up, or `Failed`
+/// with the assembly error's summary — never silently absent (the PCFS
+/// anti-lesson: a failed volume must be visible, not swallowed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum VolumeStatus {
+    /// The assembly loop is still building the volume.
+    Starting,
+    /// The volume's db/VFS/queue/inbound worker are up.
+    Running,
+    /// The volume failed to assemble; `reason` carries the error chain's
+    /// top context for the banner and (MV3) `/api/volumes`.
+    Failed {
+        /// The assembly failure's top-level error message.
+        reason: String,
+    },
+}
+
+impl VolumeStatus {
+    /// The stable lowercase spelling for banners and status lines.
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            VolumeStatus::Starting => "starting",
+            VolumeStatus::Running => "running",
+            VolumeStatus::Failed { .. } => "failed",
+        }
+    }
+}
+
+/// One volume's registry entry (Phase 2.5 / MV1): the parsed spec plus,
+/// for the volumes that assembled, the running pieces. A `Failed` volume
+/// carries its reason instead — the enum shape makes the
+/// status-pieces pairing unrepresentable when inconsistent.
+pub enum VolumeRuntime {
+    /// The volume assembled: spec + injected transport + its own VFS.
+    Running {
+        /// The volume's discovered spec (name, file, base dir, settings).
+        spec: VolumeConfig,
+        /// The volume's transport (the injected / dispatched face).
+        transport: Arc<dyn CloudTransport>,
+        /// The volume's own VFS (db reachable through `vfs.db()`).
+        vfs: Arc<Vfs>,
+    },
+    /// The volume failed to assemble (K22): the spec plus the reason.
+    Failed {
+        /// The volume's discovered spec.
+        spec: VolumeConfig,
+        /// The assembly failure's top-level error message.
+        reason: String,
+    },
+}
+
+impl VolumeRuntime {
+    /// The volume's name (the file stem — URL segment, mount label and
+    /// dashboard tab all reuse it, K29).
+    pub fn name(&self) -> &str {
+        match self {
+            VolumeRuntime::Running { spec, .. } | VolumeRuntime::Failed { spec, .. } => &spec.name,
+        }
+    }
+
+    /// The volume's discovered spec.
+    pub fn spec(&self) -> &VolumeConfig {
+        match self {
+            VolumeRuntime::Running { spec, .. } | VolumeRuntime::Failed { spec, .. } => spec,
+        }
+    }
+
+    /// The volume's status (a snapshot; `Failed` clones its reason).
+    pub fn status(&self) -> VolumeStatus {
+        match self {
+            VolumeRuntime::Running { .. } => VolumeStatus::Running,
+            VolumeRuntime::Failed { reason, .. } => VolumeStatus::Failed {
+                reason: reason.clone(),
+            },
+        }
+    }
+
+    /// The volume's VFS (`None` for a failed volume).
+    pub fn vfs(&self) -> Option<&Arc<Vfs>> {
+        match self {
+            VolumeRuntime::Running { vfs, .. } => Some(vfs),
+            VolumeRuntime::Failed { .. } => None,
+        }
+    }
+}
+
+impl std::fmt::Debug for VolumeRuntime {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The transport face is not Debug; the name/status pair is the
+        // diagnostic surface the banner and the registry report need.
+        f.debug_struct("VolumeRuntime")
+            .field("name", &self.name())
+            .field("status", &self.status())
+            .finish()
+    }
+}
+
+/// The process's volume set (Phase 2.5 / MV1): one [`VolumeRuntime`] per
+/// discovered volume, in discovery (file-name) order. A thin registry by
+/// design — lifecycle lives in [`MultiVolumeHandle`]'s stop task; this
+/// type only answers "what volumes exist and how are they doing".
+#[derive(Debug)]
+pub struct VolumeRegistry {
+    /// The volumes in stable discovery order.
+    pub volumes: Vec<VolumeRuntime>,
+}
+
+impl VolumeRegistry {
+    /// The (name, status) list for banners and (MV3) `/api/volumes`.
+    pub fn status_list(&self) -> Vec<(String, VolumeStatus)> {
+        self.volumes
+            .iter()
+            .map(|volume| (volume.name().to_string(), volume.status()))
+            .collect()
+    }
+
+    /// `true` when not a single volume assembled (the boot's Err gate).
+    pub fn all_failed(&self) -> bool {
+        self.volumes
+            .iter()
+            .all(|volume| matches!(volume, VolumeRuntime::Failed { .. }))
+    }
+}
+
+/// The per-volume home directory (K21): `<volumes_dir>/<name>/` — the
+/// resolution base for every volume-relative path (db/cache/session/
+/// baidu state). The base dir is absolutised against the process cwd so
+/// volume-relative `local_root`s resolve to the absolute paths
+/// [`CyDriveConfig::validate`] demands.
+pub fn volume_home(spec: &VolumeConfig) -> Result<PathBuf> {
+    let base = if spec.base_dir.is_absolute() {
+        spec.base_dir.clone()
+    } else {
+        std::env::current_dir()
+            .context("resolving the working directory")?
+            .join(&spec.base_dir)
+    };
+    Ok(base.join(&spec.name))
+}
+
+/// Resolves one volume-relative path against the volume home (K21):
+/// absolute paths pass through untouched; relative paths (including the
+/// `./`-prefixed defaults) land inside the volume home. A leading `./`
+/// is stripped so joined paths stay lexically clean.
+fn resolve_volume_path(home: &Path, raw: &str) -> PathBuf {
+    let path = Path::new(raw);
+    if path.is_absolute() {
+        return path.to_path_buf();
+    }
+    let cleaned = raw.strip_prefix("./").unwrap_or(raw);
+    home.join(cleaned)
+}
+
+/// Resolves a volume spec's path-carrying settings against its home
+/// directory (K21) and creates the home directory when missing: the
+/// **filesystem** keys (db_path, cache_path, local_root) rebase onto
+/// `<volumes_dir>/<name>/` when the volume file leaves them relative —
+/// the defaults keep their file names but land inside the volume home.
+/// `baidu_root` is NOT one of them: it is a backend namespace path
+/// (validate demands a leading `/`), and on Windows
+/// `Path::is_absolute()` is false for "/apps/x", so rebasing would
+/// mangle it into `<home>/apps/x`. Idempotent: already-absolute fs
+/// paths pass through untouched, so the production dispatch may resolve
+/// first and the assembly resolve again.
+pub fn resolve_volume_settings(spec: &VolumeConfig) -> Result<CyDriveConfig> {
+    let home = volume_home(spec)?;
+    std::fs::create_dir_all(&home)
+        .with_context(|| format!("creating the volume home directory {}", home.display()))?;
+    let mut settings = spec.settings.clone();
+    settings.db_path = resolve_volume_path(&home, &settings.db_path)
+        .to_string_lossy()
+        .into_owned();
+    settings.cache_path = resolve_volume_path(&home, &settings.cache_path)
+        .to_string_lossy()
+        .into_owned();
+    if let Some(root) = settings.local_root.as_deref() {
+        settings.local_root = Some(
+            resolve_volume_path(&home, root)
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
+    Ok(settings)
+}
+
+/// The pieces of one running volume the aggregated stop task owns: each
+/// volume's VFS drain and inbound worker join, released in the same
+/// per-volume order the single-volume stop sequence uses.
+struct VolumeStopUnit {
+    vfs: Arc<Vfs>,
+    inbound: cloudkit_core::inbound::InboundWorkerHandle,
+}
+
+/// The assembled product of [`run_multi_with_transports`]: the volume
+/// registry (statuses for the banner and tests), the ONE stop gate every
+/// volume and the process-level control channel funnel into, the single
+/// multi-volume WebDAV listener (K20 — `None` when its bind degraded,
+/// see [`MultiVolumeHandle::webdav_addr`]), the single multi-volume
+/// dashboard (K24 / MV3 — `None` when off or degraded, see
+/// [`MultiVolumeHandle::web_ui_addr`]), the drive letters actually
+/// mounted (K27), the per-volume periodic sync tasks (aborted at
+/// shutdown, same semantics as [`RunHandle::shutdown`]) and the stop
+/// task that owns the aggregated graceful sequence.
+pub struct MultiVolumeHandle {
+    registry: VolumeRegistry,
+    watch: Arc<ShutdownWatch>,
+    stop_task: tokio::task::JoinHandle<()>,
+    /// The per-volume periodic sync tasks (`None` entries = volumes
+    /// without sync configured / failed volumes).
+    sync_tasks: Vec<Option<tokio::task::JoinHandle<()>>>,
+    /// The single WebDAV listener's bound address (`None` = the bind
+    /// degraded; the volumes' data planes keep running, K22).
+    webdav_addr: Option<SocketAddr>,
+    /// The single multi-volume dashboard's bound address (`None` =
+    /// `enable_web_ui` off, or the bind degraded per the same K22
+    /// policy).
+    web_ui_addr: Option<SocketAddr>,
+    /// The drive letters the per-volume mounts actually claimed
+    /// (possibly fewer than configured — a failed mount only warns).
+    mounted_letters: Vec<String>,
+}
+
+impl std::fmt::Debug for MultiVolumeHandle {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The gate and the raw task handles are not Debug; the volume
+        // list is the diagnostic surface `expect_err` contexts need.
+        f.debug_struct("MultiVolumeHandle")
+            .field("volumes", &self.volumes())
+            .finish()
+    }
+}
+
+impl MultiVolumeHandle {
+    /// One volume's registry entry (name lookup).
+    pub fn volume(&self, name: &str) -> Option<&VolumeRuntime> {
+        self.registry.volumes.iter().find(|v| v.name() == name)
+    }
+
+    /// The (name, status) list — the K29 banner payload.
+    pub fn volumes(&self) -> Vec<(String, VolumeStatus)> {
+        self.registry.status_list()
+    }
+
+    /// The single multi-volume WebDAV listener's bound address (K20):
+    /// `None` means the bind degraded (K22 — the volumes' data planes
+    /// kept running; the reason is in the log).
+    pub fn webdav_addr(&self) -> Option<SocketAddr> {
+        self.webdav_addr
+    }
+
+    /// The single multi-volume dashboard's bound address (K24 / MV3):
+    /// `None` means `enable_web_ui` was off or the bind degraded (K22 —
+    /// the volumes keep running without the UI; the reason is in the
+    /// log). A `:0` config port resolves to the real ephemeral one.
+    pub fn web_ui_addr(&self) -> Option<SocketAddr> {
+        self.web_ui_addr
+    }
+
+    /// The drive letters the per-volume mounts actually claimed (K27;
+    /// empty when none did — volumes without an explicit
+    /// `drive_letter`, `auto_mount_drive` off, non-Windows, or failed
+    /// mounts that only warned).
+    pub fn mounted_letters(&self) -> &[String] {
+        &self.mounted_letters
+    }
+
+    /// One arm of the run flow's shutdown wait, the multi-volume analog
+    /// of [`RunHandle::wait_for_stop_request`]: resolves when the shared
+    /// stop gate fires (control STOP, `shutdown`, Ctrl+C in `run`).
+    pub async fn wait_for_stop_request(&self) {
+        self.watch.wait().await;
+    }
+
+    /// Graceful stop for every volume: fires the ONE gate (a no-op when
+    /// a source already did), aborts each volume's periodic sync task
+    /// (same abort-not-drain choice and rationale as
+    /// [`RunHandle::shutdown`]; a non-cancelled join error there is a
+    /// warn, not a stop-sequence failure), then joins the stop task,
+    /// which drains every running volume's upload queue, joins its
+    /// inbound worker and finally removes the process-level control
+    /// file. The stop task's own join error propagates — a panicked
+    /// stop sequence is a failed shutdown, not a clean one.
+    pub async fn shutdown(self) -> Result<()> {
+        let Self {
+            watch,
+            stop_task,
+            sync_tasks,
+            ..
+        } = self;
+        watch.trigger();
+        for task in sync_tasks.into_iter().flatten() {
+            task.abort();
+            if let Err(error) = task.await {
+                if !error.is_cancelled() {
+                    tracing::warn!(
+                        %error,
+                        "joining a periodic sync task failed after aborting it"
+                    );
+                }
+            }
+        }
+        stop_task
+            .await
+            .context("joining the aggregated stop sequence")
+    }
+}
+
+/// Boots the multi-volume stack with the transports injected (Phase 2.5
+/// / MV1's test seam; the production `run` dispatch builds the same
+/// tuples per volume). One volume core per spec (db + cache + VFS +
+/// requeue + inbound worker, K21-resolved paths), one periodic sync task
+/// per configured volume (K26), ONE process-level stop gate plus control
+/// channel (K25), and the single multi-volume WebDAV listener routing
+/// `/vol/<name>/` to every RUNNING volume (K20 / MV2 — failed volumes
+/// stay out of the route table; their status is the registry's to
+/// report). Volumes with an explicit `drive_letter` mount through the
+/// process WebDAV port (K27).
+///
+/// K22 failure policy: a volume that fails to assemble becomes
+/// `Failed{reason}` in the registry (with a `tracing::error`) and the
+/// loop continues — a broken volume must not take healthy siblings down
+/// and must never be silent. Every volume failing returns `Err` (the
+/// process-exits-nonzero semantics). A WebDAV or web-UI bind failure is
+/// NOT a volume failure: it degrades with a `tracing::error` while the
+/// volumes' data planes keep running.
+///
+/// MV3: with `enable_web_ui` the boot also binds the ONE process-level
+/// dashboard (K24) serving the volume registry — per-volume tabs, the
+/// `/api/volumes` listing and the K23 `?volume=` routing.
+pub async fn run_multi_with_transports(
+    process_cfg: &CyDriveConfig,
+    volumes: Vec<(VolumeConfig, RunOptions, Arc<dyn CloudTransport>)>,
+) -> Result<MultiVolumeHandle> {
+    let watch = Arc::new(ShutdownWatch::new());
+    let mut runtimes: Vec<VolumeRuntime> = Vec::new();
+    let mut stop_units: Vec<VolumeStopUnit> = Vec::new();
+    let mut sync_tasks: Vec<Option<tokio::task::JoinHandle<()>>> = Vec::new();
+    let mut volume_fses: Vec<(String, CyDriveFs)> = Vec::new();
+    let mut ui_entries: Vec<cloudkit_web::VolumeUiEntry> = Vec::new();
+
+    for (spec, options, transport) in volumes {
+        let name = spec.name.clone();
+        // The dashboard identity pieces (K24), captured before the
+        // transport moves into the assembly: the running arm reports
+        // the dispatched truth (RunOptions' volume/quota payload plus
+        // the transport's own capability bits — R4, never hardcoded);
+        // the failed arm degrades to what the volume file declares.
+        let capabilities = transport.capabilities();
+        let ui_config = cloudkit_web::WebUiConfig {
+            // Only an explicit drive_letter claim reaches the dashboard;
+            // an unclaimed volume mounts nothing and must not report the
+            // config-default letter as a phantom claim (the parsed
+            // default "Y:" is a placeholder, not a mount).
+            drive_letter: spec
+                .explicit_drive_letter
+                .then(|| spec.settings.drive_letter.clone()),
+            webdav_url: volume_mount_url(process_cfg, &name),
+            chat_id: spec.settings.chat_id,
+            is_configured: spec.settings.is_configured(),
+            backend: spec.settings.backend.as_str().to_string(),
+            volume: options.web_volume.clone(),
+            remote_delete: capabilities.remote_delete,
+            quota: options.web_quota.clone(),
+        };
+        match build_volume_runtime(&spec, &options, transport, &watch).await {
+            Ok((runtime, stop_unit, sync_task, fs)) => {
+                tracing::info!(volume = %name, "volume is running");
+                volume_fses.push((name.clone(), fs));
+                ui_entries.push(cloudkit_web::VolumeUiEntry {
+                    name: name.clone(),
+                    status: cloudkit_web::VolumeUiStatus::Running,
+                    config: ui_config,
+                    vfs: Some(Arc::clone(
+                        runtime.vfs().expect("a running volume carries its vfs"),
+                    )),
+                });
+                runtimes.push(runtime);
+                stop_units.push(stop_unit);
+                sync_tasks.push(sync_task);
+            }
+            Err(error) => {
+                tracing::error!(
+                    volume = %name,
+                    %error,
+                    "assembling the volume failed; continuing with the remaining volumes (K22)"
+                );
+                ui_entries.push(cloudkit_web::VolumeUiEntry {
+                    name: name.clone(),
+                    status: cloudkit_web::VolumeUiStatus::Failed {
+                        reason: error.to_string(),
+                    },
+                    config: ui_config,
+                    vfs: None,
+                });
+                runtimes.push(VolumeRuntime::Failed {
+                    spec,
+                    reason: error.to_string(),
+                });
+                sync_tasks.push(None);
+            }
+        }
+    }
+
+    if runtimes.is_empty() {
+        anyhow::bail!("multi-volume boot received no volumes to assemble");
+    }
+    let registry = VolumeRegistry { volumes: runtimes };
+    if registry.all_failed() {
+        anyhow::bail!(
+            "every volume failed to assemble ({}): {} — fix the reported volume \
+             configurations and run again",
+            registry.volumes.len(),
+            registry
+                .status_list()
+                .iter()
+                .map(|(name, status)| format!("{name}={}", status.as_str()))
+                .collect::<Vec<_>>()
+                .join(", ")
+        );
+    }
+
+    // The ONE WebDAV listener (K20): `/vol/<name>/` routes to every
+    // running volume. A bind failure degrades (K22, the same policy as
+    // the control channel but with the bigger blast radius spelled
+    // out): the volumes' data planes — queues, sync, inbound — keep
+    // running; the WebDAV face is simply absent.
+    let webdav_server = bind_multi_webdav(process_cfg, volume_fses).await;
+    let webdav_addr = webdav_server.as_ref().map(WebDavServer::local_addr);
+
+    // The ONE dashboard (K24 / MV3): a single process-level port serving
+    // the volume registry (per-volume tabs, `/api/volumes` aggregate).
+    // Same K22 degrade policy as the WebDAV bind: a failure only logs
+    // an error — the volumes keep running without the UI.
+    let web_ui = bind_multi_web_ui(process_cfg, ui_entries).await;
+    let web_ui_addr = web_ui.as_ref().map(WebUiServer::local_addr);
+
+    // Per-volume mounts (K27): only volumes that EXPLICITLY set a
+    // drive_letter claim a mount (the parsed default letter is a
+    // placeholder, not a claim); nothing mounts without the listener.
+    let mount_claims = webdav_addr
+        .map(|_| collect_mount_claims(&registry))
+        .unwrap_or_default();
+    let mounted_letters = mount_volumes_if_configured(process_cfg, &mount_claims);
+
+    // The process-level control channel (K25): same file name and
+    // cwd-anchored location as the single-volume mode (the process
+    // config's default db_path anchors the file in the working
+    // directory), same optional-component degrade.
+    let control_file = match control::ControlServer::bind(process_cfg).await {
+        Ok(server) => {
+            let path = control::control_file_path(process_cfg);
+            tracing::info!(addr = %server.local_addr(), "control channel listening");
+            let gate = Arc::clone(&watch);
+            tokio::spawn(async move {
+                if let Err(error) = server.run(move || gate.trigger()).await {
+                    tracing::warn!(%error, "the control channel accept loop ended");
+                }
+            });
+            Some(path)
+        }
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "binding the control channel failed; `cydrive stop` cannot reach this \
+                 instance (Ctrl+C / SIGTERM still work)"
+            );
+            None
+        }
+    };
+
+    // The one runner of the aggregated graceful stop sequence: the
+    // WebDAV listener stops first (in-flight requests drain), then the
+    // dashboard drains the same way (the single-volume order), then per
+    // volume (queue drain then inbound join), then the process-level
+    // control file, then the mounted letters release — exactly once for
+    // any number of gate fires.
+    let gate = Arc::clone(&watch);
+    let unmount_letters = mounted_letters.clone();
+    let stop_task = tokio::spawn(async move {
+        watch.wait().await;
+        if let Some(server) = &webdav_server {
+            server.shutdown().await;
+        }
+        if let Some(web_ui) = &web_ui {
+            web_ui.shutdown().await;
+        }
+        for unit in stop_units {
+            unit.vfs.shutdown().await;
+            unit.inbound.shutdown().await;
+        }
+        if let Some(path) = &control_file {
+            if let Err(error) = std::fs::remove_file(path) {
+                if error.kind() != std::io::ErrorKind::NotFound {
+                    tracing::warn!(
+                        %error,
+                        path = %path.display(),
+                        "removing the control file failed; continuing the shutdown"
+                    );
+                }
+            }
+        }
+        for letter in &unmount_letters {
+            if let Err(e) = cloudkit_platform::windows::unmount_drive(letter) {
+                tracing::warn!(
+                    letter = %letter,
+                    error = %e,
+                    "unmounting the volume's drive failed; continuing the shutdown"
+                );
+            }
+        }
+    });
+    Ok(MultiVolumeHandle {
+        registry,
+        watch: gate,
+        stop_task,
+        sync_tasks,
+        webdav_addr,
+        web_ui_addr,
+        mounted_letters,
+    })
+}
+
+/// Binds the single multi-volume dashboard (K24 / MV3) or skips it
+/// (`enable_web_ui` off) or degrades visibly (K22): an address-parse
+/// or bind failure logs an error and returns `None` — the volumes keep
+/// running, only the UI face is gone.
+async fn bind_multi_web_ui(
+    process_cfg: &CyDriveConfig,
+    volumes: Vec<cloudkit_web::VolumeUiEntry>,
+) -> Option<WebUiServer> {
+    if !process_cfg.enable_web_ui {
+        tracing::info!("web UI disabled (enable_web_ui = false)");
+        return None;
+    }
+    let bind = match process_cfg.web_ui_host.parse::<IpAddr>() {
+        Ok(host) => SocketAddr::new(host, process_cfg.web_ui_port),
+        Err(error) => {
+            tracing::error!(
+                %error,
+                host = %process_cfg.web_ui_host,
+                "parsing web_ui_host failed; running the volumes without the web UI (K22 degrade)"
+            );
+            return None;
+        }
+    };
+    match WebUiServer::serve_multi(volumes, bind).await {
+        Ok(server) => {
+            tracing::info!(addr = %server.local_addr(), "multi-volume web UI listening");
+            Some(server)
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "binding the multi-volume web UI failed; the volumes keep running without \
+                 the dashboard (K22 degrade)"
+            );
+            None
+        }
+    }
+}
+
+/// Binds the single multi-volume WebDAV listener (K20) or degrades
+/// visibly (K22): an address-parse or bind failure logs an error and
+/// returns `None` — the volumes keep running, only the WebDAV face is
+/// gone. An empty volume set (theoretically unreachable behind the
+/// all-failed gate) also skips the bind.
+async fn bind_multi_webdav(
+    process_cfg: &CyDriveConfig,
+    volumes: Vec<(String, CyDriveFs)>,
+) -> Option<WebDavServer> {
+    if volumes.is_empty() {
+        return None;
+    }
+    let bind = match process_cfg.webdav_host.parse::<IpAddr>() {
+        Ok(host) => SocketAddr::new(host, process_cfg.webdav_port),
+        Err(error) => {
+            tracing::error!(
+                %error,
+                host = %process_cfg.webdav_host,
+                "parsing webdav_host failed; running the volumes without the WebDAV \
+                 server (K22 degrade)"
+            );
+            return None;
+        }
+    };
+    match WebDavServer::serve_volumes(volumes, bind).await {
+        Ok(server) => {
+            tracing::info!(addr = %server.local_addr(), "multi-volume WebDAV listening");
+            Some(server)
+        }
+        Err(error) => {
+            tracing::error!(
+                %error,
+                "binding the multi-volume WebDAV server failed; the volumes' data planes \
+                 keep running without WebDAV (K22 degrade)"
+            );
+            None
+        }
+    }
+}
+
+/// The mount claims (K27): every RUNNING volume whose volume file
+/// explicitly set `drive_letter` (presence semantics — the parsed
+/// default is a placeholder that claims nothing).
+fn collect_mount_claims(registry: &VolumeRegistry) -> Vec<(String, String)> {
+    registry
+        .volumes
+        .iter()
+        .filter_map(|volume| match volume {
+            VolumeRuntime::Running { spec, .. } if spec.explicit_drive_letter => {
+                Some((spec.name.clone(), spec.settings.drive_letter.clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+/// Assembles one volume: resolves its settings against its home dir
+/// (K21), declares the transport's capability line (R-5, the same
+/// declaration the single-volume banner makes), builds the volume core
+/// and spawns its periodic sync task when configured (K26 — volumes
+/// without `sync_url` or without a sync-capable backend skip it, the
+/// existing gating). Also returns the volume's [`CyDriveFs`] for the
+/// single multi-volume WebDAV listener (same second-cache-handle
+/// construction as the single-volume boot).
+async fn build_volume_runtime(
+    spec: &VolumeConfig,
+    options: &RunOptions,
+    transport: Arc<dyn CloudTransport>,
+    watch: &Arc<ShutdownWatch>,
+) -> Result<(
+    VolumeRuntime,
+    VolumeStopUnit,
+    Option<tokio::task::JoinHandle<()>>,
+    CyDriveFs,
+)> {
+    let settings = resolve_volume_settings(spec)?;
+    // The capability banner per volume (R-5): same one-line declaration
+    // as the single-volume boot, keyed by volume name.
+    tracing::info!(
+        volume = %spec.name,
+        capabilities = %transport_capabilities_line(&transport.capabilities()),
+        "transport capabilities declared"
+    );
+    let core = build_volume_core(&settings, Arc::clone(&transport)).await?;
+    let sync_task = spawn_periodic_sync(
+        &settings,
+        Arc::clone(&core.db),
+        core.cache_root.clone(),
+        core.cache_limit,
+        Arc::clone(watch),
+        core.vfs.sync_notifier(),
+        options.sync_namespace.clone(),
+    );
+    // The FS adapter's cache handle is path-math only (same root, same
+    // construction as the single-volume boot).
+    let fs = CyDriveFs::new(
+        Arc::clone(&core.vfs),
+        Arc::clone(&core.db),
+        CacheManager::new(core.cache_root.clone(), core.cache_limit),
+    );
+    Ok((
+        VolumeRuntime::Running {
+            spec: spec.clone(),
+            transport,
+            vfs: Arc::clone(&core.vfs),
+        },
+        VolumeStopUnit {
+            vfs: core.vfs,
+            inbound: core.inbound,
+        },
+        sync_task,
+        fs,
+    ))
+}
+
 /// A one-shot CLI stack (the `push` / `pull` data channel, contract
 /// C11): a connected transport + the db + cache + VFS — and nothing
 /// else. Unlike [`run_with_transport`] this never starts the WebDAV
@@ -678,9 +1404,13 @@ impl Stack {
 
 /// Assembles the [`TransportConfig`] from the application config: the
 /// built-in API constants (compat contract 1), the session file
-/// `{DEFAULT_SESSION_STEM}.session` under `cwd`, and the bot / chat /
-/// proxy credentials (review M2 DRY). Shared by the `run` flow and the
-/// `push` / `pull` data channel so the two assembly sites cannot drift.
+/// `{DEFAULT_SESSION_STEM}.session` under the given base directory, and
+/// the bot / chat / proxy credentials (review M2 DRY). Shared by the
+/// `run` flow and the `push` / `pull` data channel so the two assembly
+/// sites cannot drift. `cwd` is the session-state base directory
+/// (Phase 2.5 / K21): single-volume callers pass the process cwd (the
+/// frozen behaviour), the multi-volume dispatch passes the volume's
+/// home directory so each volume owns its session file.
 pub fn transport_config_from(cfg: &CyDriveConfig, cwd: &Path) -> TransportConfig {
     TransportConfig {
         api_id: DEFAULT_API_ID,
@@ -1059,11 +1789,16 @@ impl Default for BaiduEndpoints {
 /// Assembles the [`BaiduParams`] for a config (the single mapping the
 /// transport dispatch and the rebuild driver assembly share — the two
 /// cannot drift): the four K14 credential keys, the root, the endpoint
-/// set and the K13 persistence callback.
-fn baidu_params(
+/// set, the K13 persistence callback and the instance state directory.
+/// `state_dir` is the baidu upload-session base (Phase 2.5 / K21): the
+/// single-volume boot passes the cwd (`"."`), the multi-volume dispatch
+/// passes the volume's home directory — public so the per-volume
+/// path-resolution stays pinned by tests.
+pub fn baidu_params(
     cfg: &CyDriveConfig,
     endpoints: &BaiduEndpoints,
     token_store: Option<Arc<dyn ck_baidu::TokenStore>>,
+    state_dir: &Path,
 ) -> ck_baidu::BaiduParams {
     ck_baidu::BaiduParams {
         app_key: cfg.baidu_app_key.clone().unwrap_or_default(),
@@ -1075,12 +1810,12 @@ fn baidu_params(
         oauth_base: endpoints.oauth_base.clone(),
         token_store,
         pcs_base: endpoints.pcs_base.clone(),
-        // K7：上传会话表落实例 cwd 状态目录（跨进程差集续传；runtime
-        // 产物不入库——R7，与 .session 文件同惯例；testkit 实例目录即
-        // cwd）。装配只传 cwd 本身——驱动内契约自行拼
-        // `<sessions_dir>/baidu_state/sessions/`，此处再带 baidu_state
-        // 会嵌套成 `./baidu_state/baidu_state/sessions/`（E2E 观察项①）。
-        sessions_dir: Some(std::path::PathBuf::from(".")),
+        // K7：上传会话表落实例状态目录（跨进程差集续传；runtime 产物
+        // 不入库——R7，与 .session 文件同惯例；testkit 实例目录即 cwd；
+        // 多卷模式下即卷主目录，K21）。装配只传目录本身——驱动内契约
+        // 自行拼 `<sessions_dir>/baidu_state/sessions/`，此处再带
+        // baidu_state 会嵌套（E2E 观察项①）。
+        sessions_dir: Some(state_dir.to_path_buf()),
         ..Default::default()
     }
 }
@@ -1182,6 +1917,7 @@ pub async fn build_backend_transport(cfg: &CyDriveConfig) -> Result<BackendTrans
         cfg,
         &BaiduEndpoints::default(),
         Some(Arc::new(ConfigTokenStore::default())),
+        Path::new("."),
     )
     .await?;
     if let Some(warning) = proxy_ineffective_warning(cfg) {
@@ -1190,13 +1926,17 @@ pub async fn build_backend_transport(cfg: &CyDriveConfig) -> Result<BackendTrans
     Ok(dispatched)
 }
 
-/// [`build_backend_transport`] with the endpoint set and the K13
-/// `TokenStore` injected — the test seam (loopback mock backends; a
-/// capturing store).
+/// [`build_backend_transport`] with the endpoint set, the K13
+/// `TokenStore` and the instance state directory injected — the test
+/// seam (loopback mock backends; a capturing store). `state_dir` is the
+/// baidu upload-session base: single-volume callers pass the cwd (`"."`,
+/// the frozen behaviour), the multi-volume dispatch passes the volume's
+/// home directory (K21).
 pub async fn build_backend_transport_with(
     cfg: &CyDriveConfig,
     endpoints: &BaiduEndpoints,
     token_store: Option<Arc<dyn ck_baidu::TokenStore>>,
+    state_dir: &Path,
 ) -> Result<BackendTransport> {
     match cfg.backend {
         Backend::Telegram => anyhow::bail!(
@@ -1205,7 +1945,7 @@ pub async fn build_backend_transport_with(
              (unchanged since pre-Phase-2); a config without the backend key is telegram"
         ),
         Backend::Baidu => {
-            let params = baidu_params(cfg, endpoints, token_store);
+            let params = baidu_params(cfg, endpoints, token_store, state_dir);
             let driver = ck_baidu::factory(&params)
                 .await
                 .map_err(|error| anyhow::anyhow!("connecting the baidu backend: {error}"))?;
@@ -1367,7 +2107,7 @@ pub async fn baidu_backend_probe_with(
         ));
     }
     let probe = async {
-        let params = baidu_params(cfg, endpoints, None);
+        let params = baidu_params(cfg, endpoints, None, Path::new("."));
         let driver = ck_baidu::factory(&params).await?;
         StorageDriver::quota(driver.as_ref()).await?;
         StorageDriver::list(
@@ -1417,6 +2157,7 @@ async fn build_driver(cfg: &CyDriveConfig) -> Result<Arc<dyn StorageDriver>> {
                 cfg,
                 &BaiduEndpoints::default(),
                 Some(Arc::new(ConfigTokenStore::default())),
+                Path::new("."),
             );
             let driver = ck_baidu::factory(&params)
                 .await
@@ -1765,6 +2506,74 @@ pub fn default_mount_url(cfg: &CyDriveConfig) -> String {
     format!("http://{}:{}", cfg.webdav_host, cfg.webdav_port)
 }
 
+/// Glues one volume's mount URL (K27): the process WebDAV endpoint plus
+/// the `/vol/<name>` segment the single multi-volume listener routes
+/// (K20). Pure URL construction — the Windows MiniRedir compatibility
+/// of the sub-path mount is the real-machine probe's question, not
+/// this function's.
+pub fn volume_mount_url(process_cfg: &CyDriveConfig, volume_name: &str) -> String {
+    format!("{}/vol/{volume_name}", default_mount_url(process_cfg))
+}
+
+/// Per-volume auto-mount (K27 / MV2, the multi-volume analog of
+/// [`mount_if_configured`]): every claim is a RUNNING volume whose file
+/// explicitly set `drive_letter`, and the mount target is the volume's
+/// `/vol/<name>` path on the process WebDAV port. The process-level
+/// `auto_mount_drive` switch stays the gate (off = mount nothing, the
+/// single-volume semantics). A failed mount only warns — the volume
+/// stays reachable at its WebDAV URL. Returns the letters actually
+/// mounted (the stop sequence releases exactly these).
+///
+/// Unix: K27 adjudicated the Windows drive-letter mounts only; the
+/// single-volume Unix gio→davfs2 chain is a process-level
+/// `mount_point` concept with no per-volume counterpart yet, so
+/// multi-volume mode mounts nothing there (info line, never silent).
+fn mount_volumes_if_configured(cfg: &CyDriveConfig, claims: &[(String, String)]) -> Vec<String> {
+    #[cfg(unix)]
+    {
+        let _ = (cfg, claims);
+        tracing::info!(
+            "multi-volume mode mounts no directories on unix (per-volume drive-letter \
+             mounts are the K27 scope); mount manually: `cydrive mount --path <dir>`"
+        );
+        Vec::new()
+    }
+
+    #[cfg(not(unix))]
+    {
+        if claims.is_empty() {
+            tracing::info!("no volume claimed a drive_letter; skipping the drive mappings");
+            return Vec::new();
+        }
+        if !cfg.auto_mount_drive {
+            tracing::info!("auto_mount_drive is off; skipping the drive mappings");
+            return Vec::new();
+        }
+        if !cfg!(windows) {
+            tracing::info!("drive mapping is Windows-only; skipping");
+            return Vec::new();
+        }
+        let mut mounted = Vec::new();
+        for (name, letter) in claims {
+            let url = volume_mount_url(cfg, name);
+            println!("Mounting volume {name} as drive {letter} -> {url} ...");
+            match cloudkit_platform::windows::mount_drive(letter, &url) {
+                Ok(actual) => {
+                    println!("Drive mounted: {actual} -> {url} (volume {name})");
+                    mounted.push(actual);
+                }
+                Err(error) => {
+                    println!("Auto-mount FAILED for volume {name} ({error}); the volume stays reachable at {url}.");
+                    println!(
+                        "  Hints: run `cydrive fix-reg` in an elevated shell, ensure the WebClient                  service can start, and check that the letter is free (`cydrive doctor`)."
+                    );
+                }
+            }
+        }
+        mounted
+    }
+}
+
 // ------------------------------------------------- status subcommand (C3) ---
 
 /// The dashboard's canonical URL when `enable_web_ui` is on, `None` when
@@ -1947,6 +2756,92 @@ pub fn discover_config_with_store(store: &dyn CredentialStore) -> Result<CyDrive
         let cfg = CyDriveConfig::load_legacy_json(legacy_path)
             .with_context(|| format!("loading legacy {}", legacy_path.display()))?;
         return Ok(cfg.with_credential_backfill(store).with_env_overrides());
+    }
+    anyhow::bail!(
+        "no config found in the current directory: write a config.toml (or a legacy \
+         Python config.json) with bot_token and chat_id, then run cydrive again"
+    )
+}
+
+/// The [`discover_config_with_volumes`] outcome (Phase 2.5 / MV0):
+/// single-volume mode keeps returning a plain [`CyDriveConfig`]
+/// (byte-identical chain), multi-volume mode returns the process
+/// config plus the discovered volume manifest.
+#[derive(Debug)]
+pub enum DiscoveredConfig {
+    /// `volumes_dir` absent — the one-config-is-one-drive status quo.
+    Single(CyDriveConfig),
+    /// `volumes_dir` set — `process` holds the process-scoped config,
+    /// `volumes` the per-volume files in stable name order.
+    Multi {
+        /// The process-level `config.toml` (process-scoped keys only).
+        process: CyDriveConfig,
+        /// The volume manifest, in file-name order ([`VolumeConfig`]).
+        volumes: Vec<VolumeConfig>,
+    },
+}
+
+/// Volume-aware sibling of [`discover_config`] (Phase 2.5 / MV0): when
+/// the process `config.toml` sets `volumes_dir`, loads and validates the
+/// whole volume set (mixing guard, volumes directory, per-volume parse,
+/// drive-letter conflicts) and returns [`DiscoveredConfig::Multi`];
+/// otherwise the existing single-volume chain applies unchanged.
+pub fn discover_config_with_volumes() -> Result<DiscoveredConfig> {
+    let store: Box<dyn CredentialStore> = match KeyringStore::new() {
+        Ok(store) => Box::new(store),
+        Err(error) => {
+            tracing::warn!(
+                %error,
+                "OS credential store unavailable; continuing without keyring backfill"
+            );
+            Box::new(InMemoryStore::new())
+        }
+    };
+    discover_config_with_volumes_and_store(store.as_ref())
+}
+
+/// [`discover_config_with_volumes`] with the credential store injected
+/// (tests pass an [`InMemoryStore`]). In multi-volume mode the store
+/// backfill and the `CYDRIVE_*` overrides are **not** applied — the
+/// process config carries no credentials, and global env overrides
+/// would cross-wire volume settings across volumes, so they are ignored
+/// with a tracing note (K28). The per-volume credential resolution
+/// chain (env > file > keyring at driver-resolve time) is unchanged.
+pub fn discover_config_with_volumes_and_store(
+    store: &dyn CredentialStore,
+) -> Result<DiscoveredConfig> {
+    let toml_path = Path::new("config.toml");
+    if toml_path.exists() {
+        let (cfg, raw_keys) = CyDriveConfig::load_toml_with_keys(toml_path)
+            .with_context(|| format!("loading {}", toml_path.display()))?;
+        if let Some(volumes_dir) = cfg.volumes_dir.clone() {
+            tracing::info!(
+                volumes_dir = %volumes_dir,
+                "multi-volume mode: CYDRIVE_* environment overrides are ignored (K28); \
+                 per-volume settings come from the volume files"
+            );
+            cloudkit_core::config::ensure_no_volume_keys_in_process(&raw_keys)
+                .context("multi-volume config.toml mixes process- and volume-scoped keys")?;
+            cfg.validate()
+                .context("invalid process-level configuration")?;
+            let volumes = cloudkit_core::config::load_volumes(Path::new(&volumes_dir))
+                .with_context(|| format!("loading volumes from {volumes_dir:?}"))?;
+            return Ok(DiscoveredConfig::Multi {
+                process: cfg,
+                volumes,
+            });
+        }
+        return Ok(DiscoveredConfig::Single(
+            cfg.with_credential_backfill(store).with_env_overrides(),
+        ));
+    }
+    let legacy_path = Path::new("config.json");
+    if legacy_path.exists() {
+        let cfg = CyDriveConfig::load_legacy_json(legacy_path)
+            .with_context(|| format!("loading legacy {}", legacy_path.display()))?;
+        return Ok(DiscoveredConfig::Single(
+            cfg.with_credential_backfill(store).with_env_overrides(),
+        ));
     }
     anyhow::bail!(
         "no config found in the current directory: write a config.toml (or a legacy \

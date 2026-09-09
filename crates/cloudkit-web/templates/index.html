@@ -51,6 +51,10 @@
 
         <!-- Main Content Area -->
         <main class="main-content">
+            <!-- Volume tabs (multi-volume mode only; revealed by app.js
+                 after the boot probe detects a volume registry) -->
+            <div class="volume-tabs" id="volume-tabs" hidden></div>
+
             <!-- Top Bar -->
             <header class="topbar">
                 <div class="search-box">
@@ -96,6 +100,16 @@
                     <div class="stat-info">
                         <h3 id="webdav-endpoint">127.0.0.1:8080</h3>
                         <p>WebDAV Service</p>
+                    </div>
+                </div>
+                <!-- Cross-volume aggregate card (multi-volume mode only;
+                     app.js sums the /api/volumes rows — one request, no
+                     per-volume stats N+1) -->
+                <div class="stat-card" id="summary-card" hidden>
+                    <div class="stat-icon icon-green"><i class="fa-solid fa-layer-group"></i></div>
+                    <div class="stat-info">
+                        <h3 id="summary-size">0 B</h3>
+                        <p id="summary-detail">All volumes</p>
                     </div>
                 </div>
             </section>

@@ -9,6 +9,17 @@ let backendState = {
     configured: false,    // telegram-side credentials present
 };
 
+// Multi-volume mode state (Phase 2.5 / K24): inactive until the boot
+// probe sees the 400-with-volumes reply that marks a registry
+// dashboard. `current` names the selected volume; every volume-scoped
+// fetch then carries `?volume=<name>` (K23 — the server has no default
+// volume).
+let volumeState = {
+    multi: false,
+    volumes: [],   // /api/volumes rows (name/backend/status/...)
+    current: null, // selected volume name
+};
+
 // Display names per backend spelling (the /api/stats `backend` values).
 const BACKEND_LABELS = {
     telegram: 'Telegram MTProto',
@@ -20,7 +31,8 @@ function backendDisplayName(backend) {
     return BACKEND_LABELS[backend] || 'your cloud drive';
 }
 
-document.addEventListener("DOMContentLoaded", () => {
+document.addEventListener("DOMContentLoaded", async () => {
+    await detectMultiVolumeMode();
     loadDriveData();
     setupDropZone();
     setupSearch();
@@ -28,24 +40,151 @@ document.addEventListener("DOMContentLoaded", () => {
     setInterval(loadDriveData, 4000);
 });
 
+// Boot probe: a parameterless /api/stats answers 200 on a single-volume
+// dashboard and 400 + the volume list on a registry dashboard (K23).
+async function detectMultiVolumeMode() {
+    try {
+        const res = await fetch("/api/stats");
+        if (res.status === 400) {
+            const body = await res.json().catch(() => null);
+            if (body && Array.isArray(body.volumes)) {
+                volumeState.multi = true;
+                await refreshVolumes();
+                const first = volumeState.volumes.find(v => v.status === 'running');
+                volumeState.current = first ? first.name : null;
+                renderVolumeTabs();
+                updateSummaryCard();
+            }
+        }
+    } catch (err) {
+        console.error("Mode detection failed:", err);
+    }
+}
+
+// One /api/volumes call carries everything the tabs and the summary
+// card need (server reads db metadata — no per-volume N+1 polling).
+async function refreshVolumes() {
+    try {
+        const res = await fetch("/api/volumes");
+        if (res.ok) {
+            volumeState.volumes = await res.json();
+        }
+    } catch (err) {
+        console.error("Error loading volumes:", err);
+    }
+}
+
+// A volume-scoped API URL for the selected volume (single-volume mode
+// and volume-less edge cases pass the path through untouched).
+function apiUrl(path) {
+    if (!volumeState.multi || !volumeState.current) return path;
+    return path + (path.includes("?") ? "&" : "?") +
+        "volume=" + encodeURIComponent(volumeState.current);
+}
+
 async function loadDriveData() {
     try {
-        const [statsRes, filesRes] = await Promise.all([
-            fetch("/api/stats"),
-            fetch("/api/files")
-        ]);
+        if (volumeState.multi) {
+            const [statsRes, filesRes, volumesRes] = await Promise.all([
+                fetch(apiUrl("/api/stats")),
+                fetch(apiUrl("/api/files")),
+                fetch("/api/volumes")
+            ]);
 
-        if (statsRes.ok) {
-            const stats = await statsRes.json();
-            updateStatsUI(stats);
-        }
+            if (volumesRes.ok) {
+                volumeState.volumes = await volumesRes.json();
+                renderVolumeTabs();
+                updateSummaryCard();
+            }
 
-        if (filesRes.ok) {
-            allFiles = await filesRes.json();
-            applyCurrentFilter();
+            if (statsRes.ok) {
+                const stats = await statsRes.json();
+                updateStatsUI(stats);
+            }
+
+            if (filesRes.ok) {
+                allFiles = await filesRes.json();
+                applyCurrentFilter();
+            }
+        } else {
+            const [statsRes, filesRes] = await Promise.all([
+                fetch("/api/stats"),
+                fetch("/api/files")
+            ]);
+
+            if (statsRes.ok) {
+                const stats = await statsRes.json();
+                updateStatsUI(stats);
+            }
+
+            if (filesRes.ok) {
+                allFiles = await filesRes.json();
+                applyCurrentFilter();
+            }
         }
     } catch (err) {
         console.error("Error loading drive data:", err);
+    }
+}
+
+// The volume switcher: one chip per registry volume — name + backend
+// badge + status dot. Failed volumes are disabled but visible, with
+// the server-reported reason as the tooltip (K22: failures are shown,
+// never silently dropped).
+function renderVolumeTabs() {
+    const bar = document.getElementById("volume-tabs");
+    if (!bar || !volumeState.multi) return;
+    bar.hidden = false;
+    bar.innerHTML = volumeState.volumes.map(v => {
+        const failed = v.status === 'failed';
+        const active = v.name === volumeState.current ? " active" : "";
+        const reason = failed && v.status_reason
+            ? ` title="failed: ${escapeHtml(v.status_reason)}"` : "";
+        const dot = failed
+            ? '<span class="volume-dot dot-failed"></span>'
+            : '<span class="volume-dot dot-running"></span>';
+        const label = `${escapeHtml(v.name)} <span class="volume-backend">${escapeHtml(v.backend || "")}</span> ${dot}`;
+        return failed
+            ? `<button class="volume-tab failed" disabled${reason}>${label}</button>`
+            : `<button class="volume-tab${active}" onclick="switchVolume('${escapeHtml(v.name)}')"${reason}>${label}</button>`;
+    }).join("");
+}
+
+function switchVolume(name) {
+    if (volumeState.current === name) return;
+    volumeState.current = name;
+    renderVolumeTabs();
+    loadDriveData();
+}
+
+// The cross-volume aggregate card: client-side sums over the ONE
+// /api/volumes response (files / bytes / quota where the volumes
+// report them).
+function updateSummaryCard() {
+    const card = document.getElementById("summary-card");
+    if (!card) return;
+    if (!volumeState.multi || !volumeState.volumes.length) {
+        card.hidden = true;
+        return;
+    }
+    card.hidden = false;
+    let files = 0, bytes = 0, quotaUsed = 0, quotaTotal = 0, hasTotal = false;
+    for (const v of volumeState.volumes) {
+        if (typeof v.total_files === "number") files += v.total_files;
+        if (typeof v.total_bytes === "number") bytes += v.total_bytes;
+        if (typeof v.quota_used === "number") quotaUsed += v.quota_used;
+        if (typeof v.quota_total === "number") {
+            quotaTotal += v.quota_total;
+            hasTotal = true;
+        }
+    }
+    const sizeEl = document.getElementById("summary-size");
+    if (sizeEl) sizeEl.innerText = formatBytes(bytes);
+    const detailEl = document.getElementById("summary-detail");
+    if (detailEl) {
+        let detail = `All volumes: ${files} file${files === 1 ? "" : "s"}`;
+        if (hasTotal) detail += ` • ${formatBytes(quotaUsed)} / ${formatBytes(quotaTotal)}`;
+        detailEl.innerText = detail;
     }
 }
 
@@ -233,7 +372,7 @@ function renderFilesTable(files) {
                 <td>${statusBadge}</td>
                 <td>${dateStr}</td>
                 <td>
-                    ${!isDir ? `<a href="/api/download/${encName}" class="action-btn" title="Download"><i class="fa-solid fa-download"></i></a>` : ''}
+                    ${!isDir ? `<a href="${apiUrl(`/api/download/${encName}`)}" class="action-btn" title="Download"><i class="fa-solid fa-download"></i></a>` : ''}
                     ${!isDir && isMedia(file.name) ? `<button class="action-btn" title="Stream Online" onclick="previewMedia('${encName}')"><i class="fa-solid fa-play"></i></button>` : ''}
                     <button class="action-btn btn-delete" title="${deleteTitle}" onclick="deleteFile('${encName}')"><i class="fa-solid fa-trash-can"></i></button>
                 </td>
@@ -278,7 +417,7 @@ function previewMedia(fileName) {
     const modalBody = document.getElementById("modal-body");
 
     modalTitle.innerText = decoded;
-    const url = `/api/download/${fileName}`;
+    const url = apiUrl(`/api/download/${fileName}`);
 
     if (['mp4', 'webm', 'mkv', 'avi'].includes(ext)) {
         modalBody.innerHTML = `<video controls autoplay style="width: 100%; border-radius: 10px; box-shadow: 0 0 25px rgba(0,243,255,0.2);"><source src="${url}"></video>`;
@@ -304,15 +443,18 @@ async function deleteFile(encodedName) {
     // The confirm copy mirrors the server's real delete semantics
     // (/api/stats `remote_delete`): remote-delete backends remove the
     // cloud object, telegram keeps the remote copy (Python parity).
+    // In multi-volume mode the volume name scopes the action (K23).
+    const volumeNote = volumeState.multi && volumeState.current
+        ? ` in volume "${volumeState.current}"` : "";
     const message = backendState.remoteDelete
-        ? `Are you sure you want to delete "${fileName}"? This will also delete the file from the cloud backend.`
-        : `Are you sure you want to remove "${fileName}" from the local index? The cloud copy is kept.`;
+        ? `Are you sure you want to delete "${fileName}"${volumeNote}? This will also delete the file from the cloud backend.`
+        : `Are you sure you want to remove "${fileName}"${volumeNote} from the local index? The cloud copy is kept.`;
     if (!confirm(message)) {
         return;
     }
 
     try {
-        const res = await fetch("/api/delete", {
+        const res = await fetch(apiUrl("/api/delete"), {
             method: "POST",
             headers: { "Content-Type": "application/json" },
             body: JSON.stringify({ filename: fileName })
@@ -379,7 +521,7 @@ async function uploadFiles(files) {
         formData.append("file", file);
 
         try {
-            const res = await fetch("/api/upload", {
+            const res = await fetch(apiUrl("/api/upload"), {
                 method: "POST",
                 body: formData
             });

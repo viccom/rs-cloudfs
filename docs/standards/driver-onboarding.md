@@ -33,7 +33,7 @@
 - config 顶层 `backend = "telegram" | "baidu" | "local" | ...`（缺省 telegram 完全兼容，A4/D5）；驱动专属键命名 `<driver>_<param>`。
 - **新键三处同步**（interfaces §4）：KNOWN_TOML_KEYS + legacy json 拒收清单 + validate()；非法值给可行动文案。
 - **凭据值不入库不入日志**（R3；scripts/scan_secrets CI 闸）；刷新产物走 keyring/OS 临时目录。
-- **前瞻兼容（Phase 2.5 多卷）**：单一 `backend` 键形态将被「每实例一文件」形态叠加而非替换——驱动配置解析器应按「配置 map → 驱动参数结构体」纯函数组织，勿散读全局 config。
+- **多卷形态（Phase 2.5，已落地）**：「每实例一文件」与单一 `backend` 键形态**叠加而非替换**——进程级 config.toml 增 `volumes_dir` 键，每卷一份 `volumes/<name>.toml`（卷作用键子集，含进程级键即拒；卷模式与进程级卷作用键混用即拒，K19 互斥规则）；单卷 config（无 volumes_dir）字节兼容照旧。驱动配置解析器保持「配置 map → 驱动参数结构体」纯函数组织（卷文件与 config.toml 走同一 load 严格校验面，未知键拒收同文案）。
 
 ## 5. 工厂注册与装配点
 

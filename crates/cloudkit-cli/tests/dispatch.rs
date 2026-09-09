@@ -129,9 +129,14 @@ fn local_config(root: &std::path::Path) -> CyDriveConfig {
 #[tokio::test]
 async fn baidu_key_builds_baidu_transport() {
     let (addr, _calls) = spawn_mock_baidu(false).await;
-    let dispatched = build_backend_transport_with(&baidu_config(), &mock_endpoints(addr), None)
-        .await
-        .expect("baidu dispatch assembles");
+    let dispatched = build_backend_transport_with(
+        &baidu_config(),
+        &mock_endpoints(addr),
+        None,
+        std::path::Path::new("."),
+    )
+    .await
+    .expect("baidu dispatch assembles");
     let BackendTransport::Baidu(_) = &dispatched else {
         panic!("the baidu key must dispatch to the BaiduTransport arm");
     };
@@ -210,9 +215,14 @@ async fn default_config_stays_telegram_and_dispatch_refuses_with_guidance() {
 #[tokio::test]
 async fn baidu_sync_namespace_is_the_volume_identity() {
     let (addr, _calls) = spawn_mock_baidu(false).await;
-    let dispatched = build_backend_transport_with(&baidu_config(), &mock_endpoints(addr), None)
-        .await
-        .expect("baidu dispatch assembles");
+    let dispatched = build_backend_transport_with(
+        &baidu_config(),
+        &mock_endpoints(addr),
+        None,
+        std::path::Path::new("."),
+    )
+    .await
+    .expect("baidu dispatch assembles");
     assert_eq!(dispatched.sync_namespace_key(), "baidu:424242");
 }
 
@@ -315,10 +325,14 @@ impl TokenStore for CapturedTokens {
 async fn token_rotation_persists_through_the_dispatch_store() {
     let (addr, uinfo_calls) = spawn_mock_baidu(true).await;
     let store = Arc::new(CapturedTokens::default());
-    let dispatched =
-        build_backend_transport_with(&baidu_config(), &mock_endpoints(addr), Some(store.clone()))
-            .await
-            .expect("the refreshed replay connects");
+    let dispatched = build_backend_transport_with(
+        &baidu_config(),
+        &mock_endpoints(addr),
+        Some(store.clone()),
+        std::path::Path::new("."),
+    )
+    .await
+    .expect("the refreshed replay connects");
     assert_eq!(dispatched.volume(), "baidu:424242");
 
     assert!(

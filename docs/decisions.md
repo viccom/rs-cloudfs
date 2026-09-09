@@ -487,3 +487,16 @@
 - **修复（d3ca0bc）**：process_job 的 0 字节快速路径加 row.size 卫兵（行读取本就新鲜）——非 0 行上的 0 字节任务 = 过期工件，跳过不持久化不删缓存，完整任务接管；真 0 字节文件行为不变。测试 24：门控诚实传输（Notify 门把现场不幸顺序确定性化 + upload 内真实读 local_path 防 mock 慷慨掩盖），红 None≠Some(2) → 绿。
 - **验证**：workspace 741 passed / 0 failed；clippy/fmt 全过；重建产物后三实例真机复验——readme.txt 重传后 baidu 远端 3 文件齐全（API 直查）、telegram readme msg_id=76 真消息落地。
 - **说明**：缺陷继承自 rs-CyDrive 时代（Python parity 的空文件快速路径 + 成功删缓存语义组合），非 Phase 2 引入；修复属 L4 core 单文件卫兵，对 telegram 零行为变化（其快速路径语义保留）。
+
+## 2026-09-09 Phase 2.5 执行期裁决入档：K19–K28 按计划落地（MV0–MV4）
+
+- **内容**：Phase 2.5 多卷启用（计划 docs/plans/2026-09-08-phase2-5-multivolume.md §1）的 K19–K28 裁决按计划落地——K19 配置形态（每卷一文件 + volumes_dir + 键二分互斥）、K20 单 WebDAV 端口 `/vol/<name>` 前缀（真机探针过，K20B 回退案封存不启用）、K21 每卷主目录（db/cache/session 基准）、K22 失败可见降级、K23 无默认卷（卷作用 API 显式带参）、K24 仪表盘契约（/api/volumes + 16 键冻结）、K25 stop=停整进程（进程级聚合控制面）、K26 sync 逐卷、K27 逐卷盘符挂载（显式声明制）、K28 卷模式 CYDRIVE_* env 覆盖忽略、K29 命名统一。K29 与本条一并视为已执行。
+- **执行期修订三项**（均接手期/冒烟实测驱动，可逆）：① drive_letter 冲突检测 presence 化——卷文件未显式写盘符不参与冲突（解析出的默认 "Y:" 是占位非挂载声明），挂载决策归装配；② auto_mount_drive 移入进程级键集（挂载门控读进程配置，原划分使多卷模式无法关闭自动挂载，2fb934d）；③ WebUiConfig.drive_letter 改 Option（未声明盘符卷在 /api/volumes 报 null 而非 Y: 幻影声明，d92b082）。
+- **风险**：无（单卷模式字节兼容由每批「单卷回归零漂移」验收项钉死；MV5 真机三卷 E2E 为最终硬验收）。
+
+## 2026-09-09 Phase 2.5 MV5：三卷真机 E2E 通过 + 失败边界澄清
+
+- **E2E**：单进程三卷（local 加密 V: + telegram Y: + baidu Z:）硬验收全过——三盘符子路径挂载、MiniRedir 写读删全链（PROPPATCH 207）、卷隔离、每卷独立 db、local 卷 at-rest 密文（同进程明文卷混跑）、tg msg_id=77、baidu 云端往返、仪表盘 tabs/汇总/切换（浏览器实截）、无默认卷 400、stop 全停。报告 docs/reports/2026-09-08-phase2-5-e2e.md（脱敏）。
+- **执行期修复**：baidu_root 误重定基（MV1 缺陷，E2E 首启暴露——后端命名空间路径被当 fs 路径拼卷主目录致 baidu 卷拒启动；修复=不参与 K21 重定基，红→绿留证）。
+- **失败边界澄清**（K22 细化）：**dispatch 期配置错误**（validate 拒绝类，如坏 baidu_root）= 大声中止整进程（配置作者修复语义，明确错误信息）；**装配/运行期失败**（db 打不开等）= K22 可见降级不拖死兄弟卷。两级都不静默（PCFS 反训的红线是静默吞错，不是中止）。
+- **凭据执行注记**：多卷模式凭据家=卷文件（K13 ConfigTokenStore 回写闭环）；keyring 回填不适用于卷（单卷专属链）；baidu2.json 静态对已过期，现行对经 spike 工具链缓存维护（onboarding §7 路线复用）。

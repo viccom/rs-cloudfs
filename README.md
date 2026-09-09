@@ -25,7 +25,7 @@ L1 驱动  telegram │ baidu │ local │ (未来: 115/123/s3…)
 | Phase 0 | crate 改名重排（cloudkit-*/ck-*），纯搬迁 + 层检查/秘密扫描 CI 门禁 | ✅ 完成 |
 | Phase 1 | 百度 spike → StorageDriver 抽象落地 → 加密 v2 流式（0.8.0，617+ 测试绿，含真机冒烟两轮） | ✅ 完成 |
 | Phase 2 | ck-local + ck-baidu + 组合根接线 + 端到端硬验收（0.9.0，740 测试绿；baidu/local E2E 通过、telegram 腿待独立测试 chat） | ✅ 完成 |
-| Phase 2.5 | 多卷启用（Registry + 每实例配置 + 多盘挂载，方案一裁决） | ⬜ 下一步（另立计划） |
+| Phase 2.5 | 多卷启用（Registry + 每实例配置 + 多盘挂载，方案一裁决） | ✅ 完成（0.10.0，807 测试绿；单进程三卷真机 E2E：local 加密 V: + tg Y: + baidu Z:，全过） |
 | Phase 3 | 115/123/多卷挂载/桌面端/自更新（择机） | ⬜ |
 
 阶段计划与裁决：[docs/plans/2026-09-07-cloudfusion-foundation.md](docs/plans/2026-09-07-cloudfusion-foundation.md) ｜ 历史裁决：[docs/decisions.md](docs/decisions.md)
@@ -43,6 +43,49 @@ baidu 实例最小配置（config.toml）：`backend = "baidu"` + `baidu_app_key
 local 实例：`backend = "local"` + `local_root = "<绝对路径>"`。
 权威后端（baidu/local）冷启动可 `cydrive rebuild` 从后端重建索引（明文集；加密实例走 sync）。
 新后端接入指南：[docs/standards/driver-onboarding.md](docs/standards/driver-onboarding.md)（conformance 套件 + 装配点 + E2E 拓扑）。
+
+### 多卷模式（一个进程多个存储卷，Phase 2.5）
+
+config.toml 只留进程级键 + `volumes_dir`；每卷一份 `volumes/<name>.toml`（卷名=文件名，卷内相对路径落在各自的 `volumes/<name>/` 主目录）。三卷示例（local + telegram + baidu）：
+
+```toml
+# config.toml（进程级）
+volumes_dir = "volumes"
+webdav_host = "127.0.0.1"
+webdav_port = 8080
+enable_web_ui = true
+web_ui_port = 8088
+```
+
+```toml
+# volumes/local.toml —— 卷作用键（backend/凭据/db_path/drive_letter...）
+backend = "local"
+local_root = "root"          # 相对路径 → volumes/local/root
+drive_letter = "V"           # 显式声明才挂载（auto_mount_drive 门控）
+```
+
+```toml
+# volumes/tg.toml
+backend = "telegram"
+bot_token = "..."            # 凭据照旧不入库（R3）
+chat_id = 123456789
+# encrypt/加密键组与单卷写法相同，按卷独立加解密
+drive_letter = "Y"
+```
+
+```toml
+# volumes/baidu.toml
+backend = "baidu"
+baidu_app_key = "..."
+baidu_app_secret = "..."
+baidu_refresh_token = "..."
+drive_letter = "Z"
+```
+
+- **挂载**：单 WebDAV 端口，每卷一个子路径 `http://127.0.0.1:8080/vol/<name>`（声明了 `drive_letter` 的卷按 `cydrive run` 自动挂载为各自盘符）。
+- **仪表盘**：单端口 `:8088`，卷切换 tabs + 跨卷汇总；API 带 `?volume=<name>`（多卷下无参卷作用 API 返回 400 + 卷清单）。
+- 运维：`cydrive volumes` 列卷清单、`cydrive doctor` 逐卷体检、`cydrive status` 逐卷 db 统计、`cydrive setup --multi` 生成骨架；`cydrive stop` 一次停全部卷。
+- 注意：多卷模式下 `CYDRIVE_*` 配置覆盖 env 被忽略（K28，防跨卷串味）；单卷模式行为与旧版字节兼容。
 
 多机同步（可选）：部署 `cydrive-sync-server`（[部署文档](docs/sync-server-deployment.md)）→ 各机 config.toml 写 `sync_url`/`sync_secret`，上传成功后秒级同步到其他机器。
 
