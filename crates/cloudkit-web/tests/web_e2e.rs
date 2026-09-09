@@ -615,7 +615,10 @@ async fn stats_exposes_backend_identity_and_quota() {
         stats["backend"], "baidu",
         "the active backend's stable config spelling"
     );
-    assert_eq!(stats["volume"], "baidu:42", "the dispatched volume identity");
+    assert_eq!(
+        stats["volume"], "baidu:42",
+        "the dispatched volume identity"
+    );
     assert_eq!(
         stats["remote_delete"], true,
         "the K4 bit the delete-confirm UX gates on"

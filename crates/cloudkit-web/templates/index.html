@@ -22,6 +22,7 @@
                 <div class="brand-text">
                     <h2>CyDrive</h2>
                     <span>v2.0 • CYNET ENGINE</span>
+                    <span id="backend-badge" class="backend-badge" hidden></span>
                 </div>
             </div>
 
@@ -86,13 +87,14 @@
                     <div class="stat-icon icon-green"><i class="fa-solid fa-bolt"></i></div>
                     <div class="stat-info">
                         <h3>Active</h3>
-                        <p>MTProto Telethon Sync</p>
+                        <p id="backend-label">MTProto Telethon Sync</p>
+                        <span id="backend-detail" class="backend-detail" hidden></span>
                     </div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-icon icon-cyan"><i class="fa-solid fa-network-wired"></i></div>
                     <div class="stat-info">
-                        <h3>127.0.0.1:8080</h3>
+                        <h3 id="webdav-endpoint">127.0.0.1:8080</h3>
                         <p>WebDAV Service</p>
                     </div>
                 </div>
@@ -102,7 +104,7 @@
             <section class="drop-zone" id="drop-zone">
                 <i class="fa-solid fa-cloud-arrow-up drop-icon"></i>
                 <h3>Drag & Drop Files Here</h3>
-                <p>Instantly syncs to your Windows Drive & Telegram Cloud</p>
+                <p id="drop-zone-sub">Instantly syncs to your Windows Drive & Telegram Cloud</p>
             </section>
 
             <!-- Files Section -->

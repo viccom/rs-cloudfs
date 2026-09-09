@@ -411,12 +411,22 @@ pub async fn run_with_transport(
 /// pre-derived sync namespace for backends whose identity is NOT the
 /// telegram bot-token pair (baidu: the connected volume `baidu:<uid>`;
 /// [`RunOptions::default`] keeps `None` = the legacy telegram
-/// derivation, byte-identical for every existing caller).
+/// derivation, byte-identical for every existing caller), plus the
+/// dashboard identity pieces that only exist on the dispatched enum
+/// (web adapter).
 #[derive(Debug, Clone, Default)]
 pub struct RunOptions {
     /// The sync namespace key (`None` = derive from
     /// `bot_token`/`chat_id` — the frozen telegram path).
     pub sync_namespace: Option<String>,
+    /// The dispatched volume identity for the dashboard
+    /// (`baidu:<uid>` / `local:<hash>`; `None` = telegram — the
+    /// CloudTransport face has no volume, none is invented).
+    pub web_volume: Option<String>,
+    /// The dashboard storage card's boot quota snapshot (`None` =
+    /// telegram/local, no quota concept — or the informational read
+    /// failed, which only degrades the card to "unlimited").
+    pub web_quota: Option<cloudkit_web::QuotaSnapshot>,
 }
 
 /// [`run_with_transport`] with the backend-derived sync namespace
@@ -493,7 +503,13 @@ pub async fn run_with_transport_options(
     // up before the first client request can arrive (Python parity:
     // the aiohttp dashboard runs alongside WebDAV from boot). The
     // stats extras map straight off the config; `is_configured`
-    // mirrors Python's bot-token check.
+    // mirrors Python's bot-token check. The backend identity is the
+    // web adapter's honesty contract: `backend` names what actually
+    // booted (the config's stable spelling), `remote_delete` is the
+    // transport face's OWN capability declaration — telegram false /
+    // baidu, local true, never hardcoded here (R4) — and the volume /
+    // quota snapshot ride in on the dispatch's RunOptions payload (the
+    // erased CloudTransport face below has neither).
     let web_ui = if cfg.enable_web_ui {
         let host: IpAddr = cfg
             .web_ui_host
@@ -504,6 +520,10 @@ pub async fn run_with_transport_options(
             webdav_url: default_mount_url(cfg),
             chat_id: cfg.chat_id,
             is_configured: cfg.is_configured(),
+            backend: cfg.backend.as_str().to_string(),
+            volume: options.web_volume.clone(),
+            remote_delete: transport.capabilities().remote_delete,
+            quota: options.web_quota.clone(),
         };
         let web_ui = WebUiServer::serve(
             Arc::clone(&vfs),
@@ -1117,6 +1137,33 @@ impl BackendTransport {
         match self {
             BackendTransport::Baidu(t) => t.clone() as Arc<dyn CloudTransport>,
             BackendTransport::Local(t) => t.clone() as Arc<dyn CloudTransport>,
+        }
+    }
+
+    /// The dashboard storage card's boot quota snapshot (web adapter):
+    /// baidu reads the driver quota once at dispatch — informational,
+    /// never a live meter. Local has no quota concept (the card shows
+    /// the indexed bytes on an unbounded disk), and telegram never
+    /// comes through the dispatch. A failed read only downgrades to
+    /// `None` (the card degrades to "unlimited") — it must not block
+    /// the boot.
+    pub async fn web_quota_snapshot(&self) -> Option<cloudkit_web::QuotaSnapshot> {
+        match self {
+            BackendTransport::Baidu(t) => match StorageDriver::quota(t.driver()).await {
+                Ok(quota) => Some(cloudkit_web::QuotaSnapshot {
+                    used: quota.used,
+                    total: quota.total,
+                }),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "baidu quota read failed; the dashboard storage card degrades to \
+                         unlimited"
+                    );
+                    None
+                }
+            },
+            BackendTransport::Local(_) => None,
         }
     }
 }

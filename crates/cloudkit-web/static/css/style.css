@@ -161,6 +161,51 @@ body {
     height: 100%;
     background: linear-gradient(90deg, var(--accent-cyan), var(--accent-purple));
     border-radius: 10px;
+    transition: width 0.4s ease;
+}
+
+/* Idle storage bar (local disk: no quota concept to meter). */
+.progress-fill.muted {
+    background: var(--text-muted);
+    opacity: 0.35;
+}
+
+/* Backend identity pill in the brand block (the active backend's
+   config spelling, server-reported via /api/stats). */
+.backend-badge {
+    display: inline-block;
+    margin-top: 0.3rem;
+    padding: 0.15rem 0.55rem;
+    border-radius: 999px;
+    border: 1px solid rgba(0, 243, 255, 0.25);
+    background: rgba(0, 243, 255, 0.08);
+    color: var(--accent-cyan);
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+}
+
+/* Identity detail pill in the sync stat card (telegram chat id /
+   dispatched volume). */
+.backend-detail {
+    display: inline-block;
+    margin-top: 0.3rem;
+    padding: 0.1rem 0.5rem;
+    border-radius: 999px;
+    border: 1px solid rgba(0, 255, 136, 0.25);
+    background: rgba(0, 255, 136, 0.08);
+    color: var(--accent-green);
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+}
+
+/* The pills start `hidden` until the first stats poll fills them; a
+   display-bearing class beats the UA [hidden] rule, so re-pin it. */
+.backend-badge[hidden],
+.backend-detail[hidden] {
+    display: none;
 }
 
 .storage-card p {
