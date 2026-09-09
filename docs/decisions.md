@@ -479,3 +479,11 @@
 - **裁决**：负责人明示「接受生产 chat 污染」——telegram E2E 腿用 D:\Tools\rs-CyDrive 的生产 bot/chat 跑（tracker #1 的二选一已定）。测试文件一律 `/_e2e_*` 前缀命名（聊天 caption 可辨识）。
 - **污染面与清理责任划分**：① 聊天消息（=telegram 云端文件）**留在生产 chat**，由负责人事后在客户端手动删除（删消息即删媒体；须选「同时删除双方」）——这是接受的污染本体；② 本地索引行由 E2E 实例收尾自动清理（rm → 行删 → 墓碑）；③ **生产 db 零污染**：E2E telegram 实例不配 sync_url（不连 sync-server）——其 db 永不上传，生产实例重启后不会看到任何 /_e2e_* 行，无需墓碑收敛。
 - **运行窗口约束**：E2E 实例与生产实例共用 bot 账号，**不得同时运行**（updates 轮询竞争）；生产实例当前停机态，E2E 结束即停测试实例，生产重启自然恢复。
+
+## 2026-09-09 继承缺陷现场捕获：MiniRedir 空 PUT 工件竞态（幽灵上传 + 缓存误删）
+
+- **现场**：负责人官网核对 demo 时发现 baidu /apps/cloudfs-demo 缺 readme.txt——Z: 盘行显示已传、云端 API 直查只有 2 个文件、db 行 msg_id=None、日志 5× os error 2 后降级。telegram 腿同型（readme 行 msg_id=None，聊天里无消息）；local 腿侥幸存活。**行状态撒谎 + 缓存消失 + 无法自愈**的三重数据完整性缺陷。
+- **根因**：MiniRedir 小文件链「空 PUT → LOCK → 完整 PUT」——空 PUT 的 0 字节任务走快速路径（persist_zero_byte 用行现值标记已上传 + delete_local_copy 删缓存 + 零远端动作）。若它在完整 PUT 更新行之后才被调度：幽灵上传 + 误删完整任务要读的缓存。E2E 多轮 cp 未炸纯属调度运气。**同型竞态第二个受害者面**——sha256 面已修（pre-hash，测试 21 的 field log），本次上传面（测试 24）。
+- **修复（d3ca0bc）**：process_job 的 0 字节快速路径加 row.size 卫兵（行读取本就新鲜）——非 0 行上的 0 字节任务 = 过期工件，跳过不持久化不删缓存，完整任务接管；真 0 字节文件行为不变。测试 24：门控诚实传输（Notify 门把现场不幸顺序确定性化 + upload 内真实读 local_path 防 mock 慷慨掩盖），红 None≠Some(2) → 绿。
+- **验证**：workspace 741 passed / 0 failed；clippy/fmt 全过；重建产物后三实例真机复验——readme.txt 重传后 baidu 远端 3 文件齐全（API 直查）、telegram readme msg_id=76 真消息落地。
+- **说明**：缺陷继承自 rs-CyDrive 时代（Python parity 的空文件快速路径 + 成功删缓存语义组合），非 Phase 2 引入；修复属 L4 core 单文件卫兵，对 telegram 零行为变化（其快速路径语义保留）。
