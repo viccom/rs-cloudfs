@@ -1042,6 +1042,9 @@ fn baidu_params(
         oauth_base: endpoints.oauth_base.clone(),
         token_store,
         pcs_base: endpoints.pcs_base.clone(),
+        // K7：上传会话表落实例 cwd 状态目录（跨进程差集续传；runtime
+        // 产物不入库——R7，与 .session 文件同惯例；testkit 实例目录即 cwd）。
+        sessions_dir: Some(std::path::PathBuf::from("./baidu_state")),
         ..Default::default()
     }
 }
