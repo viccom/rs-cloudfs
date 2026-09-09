@@ -70,6 +70,7 @@ pub mod control;
 pub mod doctor;
 pub mod setup;
 pub mod sync_client;
+pub mod volumes;
 
 pub use keyring_store::KeyringStore;
 pub use signals::sigterm;

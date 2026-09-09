@@ -224,7 +224,14 @@ impl CredentialStore for UnavailableKeyring {
 /// existing path that opens and answers `get_stats` is Ok with the row
 /// count; an existing path that fails to open is a Fail.
 fn check_database(db_path: Option<&PathBuf>) -> CheckResult {
-    let name = "database".to_string();
+    database_check("database", db_path)
+}
+
+/// [`check_database`] with the check name injected — the multi-volume
+/// doctor reports one db check per volume (`"volume <name>: database"`)
+/// over the same verdict semantics.
+fn database_check(name: &str, db_path: Option<&PathBuf>) -> CheckResult {
+    let name = name.to_string();
     let Some(path) = db_path else {
         return CheckResult {
             name,
@@ -557,4 +564,143 @@ pub fn telegram_connectivity_check() -> CheckResult {
         status: CheckStatus::Warn,
         detail: "requires a live run; check via `cydrive run`".to_string(),
     }
+}
+
+// ------------------------------------------------- multi-volume (MV4) ---
+
+/// The multi-volume doctor body (Phase 2.5 / MV4): the process-level
+/// checks — config presence carrying the volume count plus both listen
+/// ports (the same occupancy probes the single-volume doctor runs) — and
+/// one [`volume_checks`] group per discovered volume. Deliberately absent
+/// versus the single-volume [`run_doctor`] are the process-level
+/// db/cache/credentials checks: in multi-volume mode those paths and
+/// secrets belong to the volumes, so they are probed per volume instead
+/// (the process config's default paths would be phantom targets).
+pub fn run_doctor_multi(
+    process: &cloudkit_core::config::CyDriveConfig,
+    volumes: &[cloudkit_core::config::VolumeConfig],
+) -> Vec<CheckResult> {
+    let mut results = vec![
+        CheckResult {
+            name: "config".to_string(),
+            status: CheckStatus::Ok,
+            detail: format!(
+                "multi-volume config.toml with {} volume(s) under {}",
+                volumes.len(),
+                process.volumes_dir.as_deref().unwrap_or("volumes"),
+            ),
+        },
+        check_port("webdav port", process.webdav_port),
+        check_port("web ui port", process.web_ui_port),
+    ];
+    for spec in volumes {
+        results.extend(volume_checks(spec));
+    }
+    results
+}
+
+/// One volume's check group (Phase 2.5 / MV4), each result named
+/// `"volume <name>: <check>"`:
+///
+/// - **config** — the K21-resolved settings pass the same
+///   [`CyDriveConfig::validate`] the multi-volume run flow gates every
+///   volume through (the resolution itself mirrors boot: it creates the
+///   volume home, like the driver factory creates a local root);
+/// - **home** — the volume's home directory is creatable and writable
+///   (the cache check's write-and-remove probe);
+/// - **database** — the resolved db path opens and answers `get_stats`
+///   ([`database_check`]'s semantics: fresh file → Warn, unopenable →
+///   Fail);
+/// - the volume's [`backend_checks`] over the resolved settings (local
+///   root writability, the K18 proxy notice), renamed per volume.
+///
+/// Drive-letter conflicts never appear here: [`load_volumes`] already
+/// refuses them at discovery (K27). All checks run independently — one
+/// broken check must not mask its siblings.
+pub fn volume_checks(spec: &cloudkit_core::config::VolumeConfig) -> Vec<CheckResult> {
+    let prefix = format!("volume {}:", spec.name);
+    let mut results = Vec::new();
+
+    // -- config legality (K21 resolution + validate, the run gate's face)
+    let resolved = crate::resolve_volume_settings(spec);
+    let settings = match &resolved {
+        Ok(settings) => match settings.validate() {
+            Ok(()) => CheckResult {
+                name: format!("{prefix} config"),
+                status: CheckStatus::Ok,
+                detail: format!(
+                    "{} valid ({} backend)",
+                    spec.file_path.display(),
+                    spec.settings.backend.as_str()
+                ),
+            },
+            Err(error) => CheckResult {
+                name: format!("{prefix} config"),
+                status: CheckStatus::Fail,
+                detail: format!("invalid configuration: {error}"),
+            },
+        },
+        Err(error) => CheckResult {
+            name: format!("{prefix} config"),
+            status: CheckStatus::Fail,
+            detail: format!(
+                "resolving the volume's home/settings under {} failed: {error:#}",
+                spec.file_path.display()
+            ),
+        },
+    };
+    results.push(settings);
+
+    // -- home directory creatable/writable
+    match crate::volume_home(spec) {
+        Ok(home) => {
+            let probe = home.join(".cydrive-doctor-probe");
+            let probe_result = std::fs::create_dir_all(&home)
+                .and_then(|()| std::fs::write(&probe, b"probe"))
+                .and_then(|()| std::fs::remove_file(&probe));
+            results.push(match probe_result {
+                Ok(()) => CheckResult {
+                    name: format!("{prefix} home"),
+                    status: CheckStatus::Ok,
+                    detail: format!("{} exists and is writable", home.display()),
+                },
+                Err(error) => CheckResult {
+                    name: format!("{prefix} home"),
+                    status: CheckStatus::Fail,
+                    detail: format!("{} is not writable: {error}", home.display()),
+                },
+            });
+        }
+        Err(error) => results.push(CheckResult {
+            name: format!("{prefix} home"),
+            status: CheckStatus::Fail,
+            detail: format!("resolving the volume home failed: {error:#}"),
+        }),
+    }
+
+    // -- database: the resolved db path when resolution succeeded, the
+    //    read-only re-derivation otherwise (the probe still runs — one
+    //    broken check must not remove its siblings)
+    let db_path = match &resolved {
+        Ok(settings) => Some(PathBuf::from(&settings.db_path)),
+        Err(_) => crate::volume_home(spec)
+            .ok()
+            .map(|home| crate::resolve_volume_path(&home, &spec.settings.db_path)),
+    };
+    results.push(database_check(
+        &format!("{prefix} database"),
+        db_path.as_ref(),
+    ));
+
+    // -- the volume's backend-specific offline checks, renamed per volume
+    if let Ok(settings) = &resolved {
+        for check in backend_checks(settings) {
+            results.push(CheckResult {
+                name: format!("{prefix} {}", check.name),
+                status: check.status,
+                detail: check.detail,
+            });
+        }
+    }
+    results
 }

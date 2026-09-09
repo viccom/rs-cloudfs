@@ -14,8 +14,10 @@
 //! mount/unmount (drive mapping), fix-reg (WebClient tuning, elevated),
 //! migrate (legacy Python import), stats (drive statistics table),
 //! rebuild (bootstrap the metadata DB from the baidu/local backend's
-//! authoritative index), doctor (offline diagnosis + platform checks)
-//! and setup (interactive first-time wizard).
+//! authoritative index), doctor (offline diagnosis + platform checks),
+//! setup (interactive first-time wizard; `--multi` writes the
+//! multi-volume skeleton) and volumes (the multi-volume manifest
+//! listing).
 
 use std::path::PathBuf;
 use std::sync::Arc;
@@ -127,7 +129,17 @@ enum Command {
     /// drive letter); secrets go to the OS credential store, or by
     /// explicit choice into config.toml when no credential store is
     /// available (headless).
-    Setup,
+    Setup {
+        /// Write the multi-volume skeleton instead of the wizard: a
+        /// process-scoped config.toml plus one example volume file
+        /// (refuses to overwrite an existing config).
+        #[arg(long)]
+        multi: bool,
+    },
+    /// List the configured volumes (multi-volume mode) with their
+    /// backends, drive letters and metadata DB paths — configuration
+    /// facts only, no running instance is contacted.
+    Volumes,
 }
 
 #[derive(Debug, Subcommand)]
@@ -157,7 +169,8 @@ async fn main() -> Result<()> {
         Command::Stats => stats_cmd(),
         Command::Rebuild => rebuild_cmd().await,
         Command::Doctor => doctor_cmd().await,
-        Command::Setup => setup_cmd().await,
+        Command::Setup { multi } => setup_cmd(multi).await,
+        Command::Volumes => volumes_cmd(),
     }
 }
 
@@ -187,18 +200,41 @@ async fn stop_cmd() -> Result<()> {
 /// `cydrive status`: discover the config (same cwd rule as `run`/`stop`
 /// — the control file resolves from the discovered `db_path`, so an
 /// instance is only detectable from its own working directory), collect
-/// the probes and print the rendered report.
+/// the probes and print the rendered report. Multi-volume mode (Phase
+/// 2.5 / MV4) appends the per-volume db stats section — the reads are
+/// exists-guarded and read-only, so the numbers exist whether or not a
+/// process is running.
 async fn status_cmd() -> Result<()> {
-    let cfg = discover_config().context("config discovery failed")?;
-    let report = cloudkit_cli::collect_status(&cfg).await;
-    println!(
-        "{}",
-        cloudkit_cli::render_status(
-            &report,
-            &cloudkit_cli::default_mount_url(&cfg),
-            cloudkit_cli::dashboard_url(&cfg),
-        )
-    );
+    match discover_config_with_volumes().context("config discovery failed")? {
+        DiscoveredConfig::Single(cfg) => {
+            let report = cloudkit_cli::collect_status(&cfg).await;
+            println!(
+                "{}",
+                cloudkit_cli::render_status(
+                    &report,
+                    &cloudkit_cli::default_mount_url(&cfg),
+                    cloudkit_cli::dashboard_url(&cfg),
+                )
+            );
+        }
+        DiscoveredConfig::Multi { process, volumes } => {
+            // Process-level probes first (the same renderer over the
+            // process config — the control file and ports are
+            // process-level in multi-volume mode too, K25/K20).
+            let report = cloudkit_cli::collect_status(&process).await;
+            println!(
+                "{}",
+                cloudkit_cli::render_status(
+                    &report,
+                    &cloudkit_cli::default_mount_url(&process),
+                    cloudkit_cli::dashboard_url(&process),
+                )
+            );
+            println!();
+            let rows = cloudkit_cli::volumes::collect_volume_stats(&volumes)?;
+            println!("{}", cloudkit_cli::volumes::render_volume_stats(&rows));
+        }
+    }
     Ok(())
 }
 
@@ -435,10 +471,25 @@ async fn rebuild_cmd() -> Result<()> {
 /// root exists-and-writable check and the K12 sync-unsupported warning.
 /// The Windows WebClient leg runs for every backend (the WebDAV mount
 /// surface is backend-independent).
+///
+/// Multi-volume mode (Phase 2.5 / MV4): discovery routes the two shapes
+/// — a `volumes_dir` config runs the multi-volume doctor (process-level
+/// config + ports, then one check group per volume), anything else runs
+/// the frozen single-volume body below unchanged.
 async fn doctor_cmd() -> Result<()> {
-    let discovered = discover_config();
+    let discovered = discover_config_with_volumes();
+    if let Ok(DiscoveredConfig::Multi { process, volumes }) = &discovered {
+        let mut results = cloudkit_cli::doctor::run_doctor_multi(process, volumes);
+        results.extend(cloudkit_cli::doctor::webclient_checks());
+        print!("{}", cloudkit_cli::doctor::render_report(&results));
+        return Ok(());
+    }
     let config_present = discovered.is_ok();
-    let cfg = discovered.unwrap_or_default();
+    let cfg = match discovered {
+        Ok(DiscoveredConfig::Single(cfg)) => cfg,
+        Ok(DiscoveredConfig::Multi { .. }) => unreachable!("handled above"),
+        Err(_) => CyDriveConfig::default(),
+    };
     // The keyring availability probe doubles as the credential store the
     // doctor checks read: a failed constructor becomes an
     // UnavailableKeyring so the credentials check sees the headless
@@ -485,7 +536,18 @@ async fn doctor_cmd() -> Result<()> {
 /// write the secrets into `config.toml` (headless mode) or abort — the
 /// pre-2026-09-04 behavior of silently storing them in a volatile
 /// in-memory fallback reported success while losing the token.
-async fn setup_cmd() -> Result<()> {
+///
+/// `--multi` (Phase 2.5 / MV4) skips the wizard entirely and writes the
+/// multi-volume skeleton (no prompts — the multi-volume layout is files
+/// the user edits directly).
+async fn setup_cmd(multi: bool) -> Result<()> {
+    if multi {
+        print!(
+            "{}",
+            cloudkit_cli::setup::run_setup_multi().context("writing the multi-volume skeleton")?
+        );
+        return Ok(());
+    }
     let store: Option<cloudkit_cli::KeyringStore> = match cloudkit_cli::KeyringStore::new() {
         Ok(store) => Some(store),
         Err(error) => {
@@ -514,6 +576,20 @@ async fn setup_cmd() -> Result<()> {
             .map(|s| s as &dyn cloudkit_core::credentials::CredentialStore),
     )
     .await
+}
+
+/// `cydrive volumes` (Phase 2.5 / MV4): the read-only volume listing —
+/// discover (the same face `run` uses), then either the manifest table
+/// or the single-volume migration hint. Configuration facts only: the
+/// command contacts no running instance, so it never guesses runtime
+/// state (live status is `cydrive status` / the dashboard).
+fn volumes_cmd() -> Result<()> {
+    let discovered = discover_config_with_volumes().context("config discovery failed")?;
+    println!(
+        "{}",
+        cloudkit_cli::volumes::volumes_report(&discovered).context("listing the volumes")?
+    );
+    Ok(())
 }
 
 /// The production run flow; every step here is covered by the library
