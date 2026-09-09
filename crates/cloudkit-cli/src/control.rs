@@ -199,6 +199,41 @@ pub async fn send_ping(addr: SocketAddr) -> io::Result<String> {
     exchange_line(addr, b"PING\n").await
 }
 
+/// The double-start guard (Phase 2.5, run-flow front door): a boot over
+/// a LIVE instance in the same working directory is refused — a second
+/// boot would overwrite the first instance's control file and orphan
+/// its stop handle (the live trap: the first instance keeps running but
+/// `cydrive stop` can no longer reach it). A stale file pointing at a
+/// dead address is removed so [`ControlServer::bind`] writes a fresh
+/// one; no file at all is a clean start.
+pub async fn ensure_not_running(cfg: &CyDriveConfig) -> anyhow::Result<()> {
+    let control_file = control_file_path(cfg);
+    let addr = match read_control_addr(cfg) {
+        Ok(addr) => addr,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(()),
+        Err(error) => {
+            return Err(error)
+                .with_context(|| format!("reading the control file {}", control_file.display()));
+        }
+    };
+    if send_ping(addr).await.is_ok() {
+        anyhow::bail!(
+            "another CyDrive instance is already running in this directory (control {addr}) — \
+             stop it first (`cydrive stop`) before starting another"
+        );
+    }
+    match std::fs::remove_file(&control_file) {
+        Ok(()) => tracing::warn!(%addr, "removed the stale control file of a dead instance"),
+        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!("removing the stale control file {}", control_file.display())
+            });
+        }
+    }
+    Ok(())
+}
+
 /// Reads the running instance's control address off the port file (the
 /// `stop` discovery step): trim, parse as a [`SocketAddr`]. A missing
 /// file is the plain io `NotFound` the caller maps to the actionable

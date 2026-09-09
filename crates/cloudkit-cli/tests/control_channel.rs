@@ -265,3 +265,43 @@ async fn ping_replies_version_without_stopping() {
         tokio::task::yield_now().await;
     }
 }
+
+// -------------------------------------------------- double-start guard ---
+
+/// The double-start guard: a boot over a LIVE instance in the same
+/// working directory must refuse (a second boot overwrites the control
+/// file and orphans the first instance's stop handle — the live trap
+/// this guard exists for); a stale file pointing at a dead address is
+/// removed and the boot proceeds; no file at all just proceeds.
+#[tokio::test]
+async fn ensure_not_running_refuses_live_removes_stale_and_passes_clean() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cfg = temp_config(dir.path());
+
+    // No file at all: clean to boot.
+    cloudkit_cli::control::ensure_not_running(&cfg)
+        .await
+        .expect("no control file is a clean start");
+
+    // A live instance: the guard must refuse, naming the situation.
+    let server = ControlServer::bind(&cfg).await.expect("bind live server");
+    spawn_run(server, || {});
+    cloudkit_cli::control::ensure_not_running(&cfg)
+        .await
+        .expect_err("a live instance must refuse a second boot");
+
+    // Stale file (nothing listens at the written address): the guard
+    // removes it and lets the boot proceed.
+    let dead = std::net::TcpListener::bind("127.0.0.1:0").expect("grab a port");
+    let dead_addr = dead.local_addr().expect("addr");
+    drop(dead); // the address is now closed — nothing answers there
+    std::fs::write(control_file_path(&cfg), format!("{dead_addr}\n"))
+        .expect("write the stale control file");
+    cloudkit_cli::control::ensure_not_running(&cfg)
+        .await
+        .expect("a stale control file must not block the boot");
+    assert!(
+        !control_file_path(&cfg).exists(),
+        "the guard removes the stale control file"
+    );
+}

@@ -509,6 +509,10 @@ pub async fn run_with_transport_options(
     transport: Arc<dyn CloudTransport>,
     options: RunOptions,
 ) -> Result<RunHandle> {
+    // The double-start guard runs before any assembly: a second boot
+    // over a live instance would clobber the control file and orphan
+    // the first instance's stop handle.
+    control::ensure_not_running(cfg).await?;
     let VolumeCore {
         db,
         vfs,
@@ -1032,6 +1036,9 @@ pub async fn run_multi_with_transports(
     process_cfg: &CyDriveConfig,
     volumes: Vec<(VolumeConfig, RunOptions, Arc<dyn CloudTransport>)>,
 ) -> Result<MultiVolumeHandle> {
+    // The double-start guard (see the single-volume call site): refuse a
+    // second boot over a live instance before touching any volume.
+    control::ensure_not_running(process_cfg).await?;
     let watch = Arc::new(ShutdownWatch::new());
     let mut runtimes: Vec<VolumeRuntime> = Vec::new();
     let mut stop_units: Vec<VolumeStopUnit> = Vec::new();
