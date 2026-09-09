@@ -594,6 +594,12 @@ async fn run() -> Result<()> {
             // K12: the periodic sync task keys on the backend's own
             // identity (baidu's account uid), not on telegram creds.
             run_options.sync_namespace = Some(dispatched.sync_namespace_key());
+            // Dashboard identity (web adapter): the volume label and the
+            // boot quota snapshot exist only on the dispatched enum —
+            // past this point the run flow sees the erased
+            // CloudTransport face, which carries neither.
+            run_options.web_volume = Some(dispatched.volume().to_string());
+            run_options.web_quota = dispatched.web_quota_snapshot().await;
             dispatched.clone_dyn()
         }
     };

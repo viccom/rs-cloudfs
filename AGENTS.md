@@ -16,11 +16,11 @@
 6. `docs/tracking/phase0-1.md` —— 当前任务跟踪单（**开工先读、每批收口更新**）
 
 ## 当前阶段
-**Phase 2 完成（2026-09-09，0.9.0）**：ck-local + ck-baidu（双面驱动：StorageDriver conformance 全绿 + CloudTransport 运行时面）+ 组合根三后端接线（backend 键/删除语义/rebuild/namespace/setup/doctor）交付；E2E 硬验收 baidu/local 腿通过（往返/Range/杀进程续传/删除/sync 收敛/rebuild 等价/双盘并存），**telegram E2E 腿待独立测试 chat（负责人挂账）**；win 738 / wsl 739 绿。五项百度真网实证入 decisions（uk 字段/precreate 会话锁定 31363/meta 端点 31300 无权限/目录 create 冲突重命名/索引传播延迟）。**下一步 = Phase 2.5 多卷启用（方案一裁决，B3 后立即——另立计划）**。过渡测试包：E:\Rs_Codes\cydrive-0.8.0-testkit（telegram+加密 U:/V:，仓外不入库）。
+**Phase 2 完成（2026-09-09，0.9.0）**：ck-local + ck-baidu（双面驱动：StorageDriver conformance 全绿 + CloudTransport 运行时面）+ 组合根三后端接线（backend 键/删除语义/rebuild/namespace/setup/doctor）交付；E2E 硬验收 baidu/local 腿通过（往返/Range/杀进程续传/删除/sync 收敛/rebuild 等价/双盘并存），**telegram E2E 腿待独立测试 chat（负责人挂账）**；win 740 / wsl 741 绿。五项百度真网实证入 decisions（uk 字段/precreate 会话锁定 31363/meta 端点 31300 无权限/目录 create 冲突重命名/索引传播延迟）。**下一步 = Phase 2.5 多卷启用（方案一裁决，B3 后立即——另立计划）**。过渡测试包：E:\Rs_Codes\cydrive-0.8.0-testkit（telegram+加密 U:/V:，仓外不入库）。
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 738 测试（0.9.0；ignored 9 = 真机 3(baidu) + 平台/真机类 6）
+cargo test --workspace --no-fail-fast            # 740 测试（0.9.0+web 适配批；ignored 9 = 真机 3(baidu) + 平台/真机类 6）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 scripts/check_layers                             # R1 层依赖门禁（CI 同款；动 Cargo.toml 依赖后必跑）

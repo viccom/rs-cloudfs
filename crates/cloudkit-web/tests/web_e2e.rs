@@ -52,14 +52,23 @@ fn base_cfg() -> VfsConfig {
     }
 }
 
-/// The dashboard knobs: the four `/api/stats` extra fields the frontend
+/// The dashboard knobs: the `/api/stats` extra fields the frontend
 /// reads (`drive_letter`) plus the URL glue Python derives from config.
+/// The identity fields carry the test transport's own semantics
+/// (`backend = "mock"` — the offline harness's MockTransport; no
+/// volume on the CloudTransport face; the mock declares
+/// `remote_delete = false`; no quota concept) — the backend-identity
+/// test overrides them with a baidu-shaped config.
 fn ui_cfg() -> WebUiConfig {
     WebUiConfig {
         drive_letter: "Y:".to_string(),
         webdav_url: "http://127.0.0.1:8080".to_string(),
         chat_id: 123456789,
         is_configured: true,
+        backend: "mock".to_string(),
+        volume: None,
+        remote_delete: false,
+        quota: None,
     }
 }
 
@@ -77,6 +86,12 @@ struct Env {
 /// Environment with caller-owned knobs (chunk split / retry policy /
 /// scripted mock), pre-connecting the transport.
 async fn env_with(cfg: VfsConfig, mock: Arc<MockTransport>) -> Env {
+    env_with_ui(cfg, mock, ui_cfg()).await
+}
+
+/// [`env_with`] with caller-owned dashboard knobs — the backend-identity
+/// contract test drives a baidu-shaped config through the same stack.
+async fn env_with_ui(cfg: VfsConfig, mock: Arc<MockTransport>, ui: WebUiConfig) -> Env {
     let dir = tempfile::tempdir().expect("create temp dir");
     let cache_root = dir.path().join("cache");
     let db = Arc::new(MetaDatabase::open(&dir.path().join("meta.db")).expect("open temp db"));
@@ -88,7 +103,7 @@ async fn env_with(cfg: VfsConfig, mock: Arc<MockTransport>) -> Env {
         transport,
         cfg,
     ));
-    let server = WebUiServer::serve(vfs.clone(), ui_cfg(), SocketAddr::from(([127, 0, 0, 1], 0)))
+    let server = WebUiServer::serve(vfs.clone(), ui, SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
         .expect("serve on an ephemeral loopback port");
     Env {
@@ -393,10 +408,12 @@ const FILE_ROW_KEYS: [&str; 16] = [
 ];
 
 /// The exact key set of `/api/stats`: Python `get_stats()` plus the six
-/// fields the handler glues on (`webdav_host`/`webdav_port` included —
+/// handler-glued dashboard fields (`webdav_host`/`webdav_port` included —
 /// the Python response carries them even though app.js never reads
-/// them; shape parity is the contract).
-const STATS_KEYS: [&str; 11] = [
+/// them; shape parity is the contract) and the five multi-backend
+/// identity keys the dashboard adapter added on top (`webdav_url` was
+/// already in the frozen set; it is now actually rendered).
+const STATS_KEYS: [&str; 16] = [
     "total_files",
     "total_bytes",
     "total_dirs",
@@ -408,6 +425,11 @@ const STATS_KEYS: [&str; 11] = [
     "webdav_url",
     "chat_id",
     "is_configured",
+    "backend",
+    "volume",
+    "remote_delete",
+    "quota_used",
+    "quota_total",
 ];
 
 // ------------------------------------------------------------ scenarios ---
@@ -559,6 +581,78 @@ async fn api_stats_shape_with_extra_fields() {
     assert_eq!(stats["webdav_url"], "http://127.0.0.1:8080");
     assert_eq!(stats["chat_id"], 123456789);
     assert_eq!(stats["is_configured"], true, "driven by WebUiConfig");
+}
+
+/// 4b. GET /api/stats exposes the active backend's identity — the
+///     `backend` / `volume` / `remote_delete` / `quota_used` /
+///     `quota_total` keys the multi-backend dashboard renders (the
+///     frozen eleven keys above are untouched; this is the adapter's
+///     additive contract). The baidu shape here is test-fixed values
+///     through the mock transport — no live baidu connection; the web
+///     layer reports the config verbatim (the per-backend assembly is
+///     the run flow's concern, cli side).
+#[tokio::test]
+async fn stats_exposes_backend_identity_and_quota() {
+    let ui = WebUiConfig {
+        backend: "baidu".to_string(),
+        volume: Some("baidu:42".to_string()),
+        remote_delete: true,
+        quota: Some(cloudkit_web::QuotaSnapshot {
+            used: 5,
+            total: Some(10),
+        }),
+        ..ui_cfg()
+    };
+    let env = env_with_ui(base_cfg(), Arc::new(MockTransport::new()), ui).await;
+    let addr = env.server.local_addr();
+
+    let resp = send(addr, &request("GET", "/api/stats", addr, &[], "")).await;
+    assert_eq!(status_of(&resp), 200, "ok: {resp}");
+
+    let stats: serde_json::Value =
+        serde_json::from_str(&body_of(&resp)).expect("parse stats object");
+    assert_eq!(
+        stats["backend"], "baidu",
+        "the active backend's stable config spelling"
+    );
+    assert_eq!(
+        stats["volume"], "baidu:42",
+        "the dispatched volume identity"
+    );
+    assert_eq!(
+        stats["remote_delete"], true,
+        "the K4 bit the delete-confirm UX gates on"
+    );
+    assert_eq!(stats["quota_used"], 5, "boot quota snapshot, used bytes");
+    assert_eq!(stats["quota_total"], 10, "boot quota snapshot, total bytes");
+    assert_eq!(
+        stats["webdav_url"], "http://127.0.0.1:8080",
+        "frozen key, now actually rendered by the WebDAV card"
+    );
+}
+
+/// 4c. The absent-identity face of the same contract: a config without
+///     volume and quota serializes those as JSON `null` (not missing
+///     keys — the exact key set above stays stable across backends), so
+///     the frontend's "unlimited" branch keys off real nulls.
+#[tokio::test]
+async fn stats_volume_and_quota_null_when_absent() {
+    let env = test_env().await;
+    let addr = env.server.local_addr();
+
+    let resp = send(addr, &request("GET", "/api/stats", addr, &[], "")).await;
+    assert_eq!(status_of(&resp), 200, "ok: {resp}");
+
+    let stats: serde_json::Value =
+        serde_json::from_str(&body_of(&resp)).expect("parse stats object");
+    assert_eq!(stats["backend"], "mock", "test transport's own semantics");
+    assert!(
+        stats["volume"].is_null(),
+        "no volume on the CloudTransport face: null, not missing"
+    );
+    assert_eq!(stats["remote_delete"], false, "mock declares the bit off");
+    assert!(stats["quota_used"].is_null(), "no snapshot: null");
+    assert!(stats["quota_total"].is_null(), "no snapshot: null");
 }
 
 /// 5. POST /api/upload (multipart field `file`) answers the Python

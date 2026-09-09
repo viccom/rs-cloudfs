@@ -1,6 +1,25 @@
 let allFiles = [];
 let currentFilter = 'all';
 
+// The active backend's identity, refreshed from every /api/stats poll
+// (server-reported — the UI never guesses which backend is running).
+let backendState = {
+    backend: null,        // 'telegram' | 'baidu' | 'local' | ...
+    remoteDelete: false,  // true: a delete removes the cloud object too
+    configured: false,    // telegram-side credentials present
+};
+
+// Display names per backend spelling (the /api/stats `backend` values).
+const BACKEND_LABELS = {
+    telegram: 'Telegram MTProto',
+    baidu: 'Baidu Netdisk',
+    local: 'Local Disk',
+};
+
+function backendDisplayName(backend) {
+    return BACKEND_LABELS[backend] || 'your cloud drive';
+}
+
 document.addEventListener("DOMContentLoaded", () => {
     loadDriveData();
     setupDropZone();
@@ -33,31 +52,101 @@ async function loadDriveData() {
 function updateStatsUI(stats) {
     const totalFilesEl = document.getElementById("stat-total-files");
     if (totalFilesEl) totalFilesEl.innerText = stats.total_files || 0;
-    
+
     const bytes = stats.total_bytes || 0;
     const mb = (bytes / (1024 * 1024)).toFixed(1);
     const gb = (bytes / (1024 * 1024 * 1024)).toFixed(2);
     const sizeStr = bytes > (1024 * 1024 * 1024) ? `${gb} GB` : `${mb} MB`;
-    
+
     const sizeEl = document.getElementById("stat-total-size");
     if (sizeEl) sizeEl.innerText = sizeStr;
 
-    const storageDetailEl = document.getElementById("storage-detail");
-    if (storageDetailEl) storageDetailEl.innerText = `${sizeStr} / Unlimited`;
-    
-    // Calculate storage percentage (relative visual gauge, min 5%, up to realistic quota)
-    const storageBar = document.getElementById("storage-bar");
-    const storagePercent = document.getElementById("storage-percent");
-    if (storageBar && storagePercent) {
-        // Visual indicator of active drive
-        const pct = Math.min(100, Math.max(3, Math.round((bytes / (100 * 1024 * 1024 * 1024)) * 100)));
-        storageBar.style.width = `${pct}%`;
-        storagePercent.innerText = `${pct}%`;
-    }
+    // The backend identity drives every copy line below.
+    backendState.backend = stats.backend || null;
+    backendState.remoteDelete = stats.remote_delete === true;
+    backendState.configured = stats.is_configured === true;
+
+    updateStorageCard(stats, sizeStr);
+    updateBackendUI(stats);
 
     if (stats.drive_letter) {
         const letterEl = document.getElementById("drive-letter");
         if (letterEl) letterEl.innerText = stats.drive_letter;
+    }
+}
+
+function updateStorageCard(stats, indexedStr) {
+    const detailEl = document.getElementById("storage-detail");
+    const barEl = document.getElementById("storage-bar");
+    const percentEl = document.getElementById("storage-percent");
+    if (!detailEl || !barEl || !percentEl) return;
+
+    barEl.classList.remove("muted");
+
+    // Local disk: no quota concept — the number is what the drive
+    // indexes, the bar rests as a dim idle strip.
+    if (backendState.backend === 'local') {
+        detailEl.innerText = `${indexedStr} on local disk`;
+        percentEl.innerText = '—';
+        barEl.style.width = '100%';
+        barEl.classList.add('muted');
+        return;
+    }
+
+    // A real backend ceiling: the ratio is the true used/total share
+    // (boot snapshot from /api/stats — informational, not live).
+    if (Number.isFinite(stats.quota_total) && stats.quota_total > 0) {
+        const used = stats.quota_used || 0;
+        const pct = Math.min(100, Math.round((used / stats.quota_total) * 100));
+        detailEl.innerText = `${formatBytes(used)} / ${formatBytes(stats.quota_total)}`;
+        percentEl.innerText = `${pct}%`;
+        barEl.style.width = `${pct}%`;
+        return;
+    }
+
+    // Unlimited (telegram) or the quota snapshot is unavailable: there
+    // is no honest ratio to show, so the bar rests empty.
+    detailEl.innerText = `${indexedStr} / Unlimited`;
+    percentEl.innerText = '∞';
+    barEl.style.width = '0%';
+}
+
+function updateBackendUI(stats) {
+    const label = backendDisplayName(backendState.backend);
+
+    // Brand badge: the backend spelling, verbatim.
+    const badge = document.getElementById("backend-badge");
+    if (badge && backendState.backend) {
+        badge.innerText = backendState.backend;
+        badge.hidden = false;
+    }
+
+    // Sync stat card: the backend display name, with the identity
+    // detail as a pill (telegram: the chat id once configured;
+    // baidu/local: the dispatched volume).
+    const labelEl = document.getElementById("backend-label");
+    if (labelEl) labelEl.innerText = label;
+
+    const detailEl = document.getElementById("backend-detail");
+    if (detailEl) {
+        let detail = '';
+        if (backendState.backend === 'telegram') {
+            if (backendState.configured && stats.chat_id) detail = `chat ${stats.chat_id}`;
+        } else if (stats.volume) {
+            detail = stats.volume;
+        }
+        detailEl.innerText = detail;
+        detailEl.hidden = detail === '';
+    }
+
+    // WebDAV card: the actually bound URL from the server.
+    const webdavEl = document.getElementById("webdav-endpoint");
+    if (webdavEl && stats.webdav_url) webdavEl.innerText = stats.webdav_url;
+
+    // Drop zone copy: name the real destination.
+    const dropSub = document.getElementById("drop-zone-sub");
+    if (dropSub && backendState.backend) {
+        dropSub.innerText = `Instantly syncs to your Windows Drive & ${label}`;
     }
 }
 
@@ -101,11 +190,14 @@ function renderFilesTable(files) {
     if (countLabel) countLabel.innerText = `${files.length} items`;
 
     if (!files || files.length === 0) {
+        const target = backendState.backend
+            ? backendDisplayName(backendState.backend)
+            : 'your cloud drive';
         tbody.innerHTML = `
             <tr>
                 <td colspan="5" style="text-align: center; color: var(--text-muted); padding: 3rem;">
                     <i class="fa-solid fa-folder-open" style="font-size: 2.2rem; margin-bottom: 0.8rem; display: block; color: var(--accent-cyan); opacity: 0.6;"></i>
-                    No files found in this view. Drag and drop files above to sync to Telegram Cloud!
+                    No files found in this view. Drag and drop files above to sync to ${escapeHtml(target)}!
                 </td>
             </tr>
         `;
@@ -122,6 +214,12 @@ function renderFilesTable(files) {
 
         const isDir = Boolean(file.is_dir);
         const encName = encodeURIComponent(file.name);
+        // The delete semantics are server-declared (K4): a remote-delete
+        // backend really removes the cloud object, telegram only drops
+        // the local row.
+        const deleteTitle = backendState.remoteDelete
+            ? 'Delete from Cloud'
+            : 'Remove from local index';
 
         return `
             <tr>
@@ -137,7 +235,7 @@ function renderFilesTable(files) {
                 <td>
                     ${!isDir ? `<a href="/api/download/${encName}" class="action-btn" title="Download"><i class="fa-solid fa-download"></i></a>` : ''}
                     ${!isDir && isMedia(file.name) ? `<button class="action-btn" title="Stream Online" onclick="previewMedia('${encName}')"><i class="fa-solid fa-play"></i></button>` : ''}
-                    <button class="action-btn btn-delete" title="Delete from Cloud" onclick="deleteFile('${encName}')"><i class="fa-solid fa-trash-can"></i></button>
+                    <button class="action-btn btn-delete" title="${deleteTitle}" onclick="deleteFile('${encName}')"><i class="fa-solid fa-trash-can"></i></button>
                 </td>
             </tr>
         `;
@@ -203,7 +301,13 @@ function closeModal() {
 
 async function deleteFile(encodedName) {
     const fileName = decodeURIComponent(encodedName);
-    if (!confirm(`Are you sure you want to delete "${fileName}" from CyDrive Cloud?`)) {
+    // The confirm copy mirrors the server's real delete semantics
+    // (/api/stats `remote_delete`): remote-delete backends remove the
+    // cloud object, telegram keeps the remote copy (Python parity).
+    const message = backendState.remoteDelete
+        ? `Are you sure you want to delete "${fileName}"? This will also delete the file from the cloud backend.`
+        : `Are you sure you want to remove "${fileName}" from the local index? The cloud copy is kept.`;
+    if (!confirm(message)) {
         return;
     }
 

@@ -14,7 +14,11 @@
 //! - `GET /api/files` — `list_all_files()` rows serialized like
 //!   sqlite's `SELECT *` (all 16 columns, `is_*` flags as 0/1 ints).
 //! - `GET /api/stats` — `get_stats()` plus the six handler-added
-//!   dashboard fields.
+//!   dashboard fields, plus the five backend-identity keys the
+//!   multi-backend adapter reports from its config (`backend`,
+//!   `volume`, `remote_delete`, `quota_used`, `quota_total` — absent
+//!   identity serializes as `null`; the frozen eleven keys are
+//!   untouched).
 //! - `POST /api/upload` — multipart field `file` staged through
 //!   [`Vfs::put`] (accepted ≠ uploaded; the queue uploads async).
 //! - `POST /api/delete` — `{"filename": ...}`, a single delete call
@@ -63,6 +67,18 @@ use cloudkit_core::database::FileRecord;
 use cloudkit_core::rel_path::RelPath;
 use cloudkit_core::vfs::{Vfs, VfsError};
 
+/// A boot-time quota snapshot for the dashboard's storage card, read
+/// once at assembly by the caller (informational — never a live meter;
+/// the baidu leg snapshots `StorageDriver::quota` at dispatch). The
+/// web layer only reports it verbatim.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct QuotaSnapshot {
+    /// Bytes used at snapshot time.
+    pub used: u64,
+    /// Bytes of the quota ceiling; `None` = unknown/unlimited.
+    pub total: Option<u64>,
+}
+
 /// Configuration knobs for the dashboard: the source of the
 /// `/api/stats` extra fields plus nothing else — binding goes through
 /// [`WebUiServer::serve`].
@@ -79,6 +95,24 @@ pub struct WebUiConfig {
     /// Whether the Telegram side is configured (drives the stats flag;
     /// Python: `bool(bot_token and bot_token != "NOT_CONFIGURED")`).
     pub is_configured: bool,
+    /// The active backend's stable config spelling (`"telegram" |
+    /// "baidu" | "local"` — `Backend::as_str`); the dashboard derives
+    /// its labels and copy from this. Sourced from the config at
+    /// assembly, so it names the backend that actually booted.
+    pub backend: String,
+    /// The dispatched volume identity (`baidu:<uid>` / `local:<hash>`);
+    /// `None` = the backend has no volume on the CloudTransport face
+    /// (telegram — the face simply has no volume, none is invented).
+    pub volume: Option<String>,
+    /// The K4 gate the delete UX echoes: `true` = a dashboard delete
+    /// really deletes the cloud object (baidu/local); `false` = only
+    /// the local row goes and the remote copy stays (telegram, Python
+    /// parity). Sourced from the transport's own `capabilities()` —
+    /// never hardcoded (R4 honesty).
+    pub remote_delete: bool,
+    /// Boot quota snapshot for the storage card (`None` = no quota
+    /// concept on this backend, or the informational read failed).
+    pub quota: Option<QuotaSnapshot>,
 }
 
 /// Errors from assembling the dashboard.
@@ -95,7 +129,8 @@ pub enum WebUiError {
 }
 
 /// The embedded `static/` tree (copied verbatim from the Python
-/// dashboard; zero frontend changes is the acceptance bar).
+/// dashboard; the multi-backend adapter edits only its copy — the
+/// served bytes are whatever this folder holds at compile time).
 #[derive(RustEmbed)]
 #[folder = "static/"]
 struct StaticAssets;
@@ -300,7 +335,9 @@ fn split_webdav_url(url: &str) -> (String, u16) {
 }
 
 /// `GET /api/stats`: the DB aggregates plus the six dashboard fields
-/// the Python handler added on top.
+/// the Python handler added on top, and the five backend-identity keys
+/// the multi-backend adapter added on top of those (all additive — the
+/// frozen Python-parity keys are untouched).
 async fn api_stats(State(state): State<AppState>) -> Response {
     let stats = match state.vfs.db().get_stats() {
         Ok(stats) => stats,
@@ -319,6 +356,13 @@ async fn api_stats(State(state): State<AppState>) -> Response {
         "webdav_url": state.cfg.webdav_url,
         "chat_id": state.cfg.chat_id,
         "is_configured": state.cfg.is_configured,
+        // Multi-backend identity (the dashboard adapter): reported
+        // verbatim from the assembly — the web layer invents nothing.
+        "backend": state.cfg.backend,
+        "volume": state.cfg.volume,
+        "remote_delete": state.cfg.remote_delete,
+        "quota_used": state.cfg.quota.as_ref().map(|quota| quota.used),
+        "quota_total": state.cfg.quota.as_ref().and_then(|quota| quota.total),
     }))
     .into_response()
 }
