@@ -473,3 +473,9 @@
 
 - **百度 appkey 即本人正式凭据**（负责人明示）：PCFS client.go:69-70 的 clientID/clientSecret 是负责人本人的（spike 报告「借用的第三方 appkey」表述有误）。连带修正：① spike §2 QPS/限额结论的适用范围 = 负责人自己的 appkey 桶，「正式 appkey 到位后复测」的挂账语义收窄——**没有新 key 要等**；② meta 端点 31300（stream type is not authorized）若需恢复直查路径，行动项 = 负责人在百度网盘开放平台控制台为本 appkey 申请/开启「文件元信息（meta）」接口权限（当前 appkey 已验证具备 upload/download/list/quota/uinfo 权限，独缺 meta 族），**非换 key**；meta 停用代码（allow(dead_code)）保留即为该复测预留。③ ck-baidu R3 注释中「appkey 无代码默认值、PCFS 硬编码是反面教材」的表述维持——那是对「硬编码位置」的批评（凭据不入源码仓库），不涉及 key 归属正当性。
 - **telegram 实测配置实际位置 = D:\Tools\rs-CyDrive**（生产部署实例：config.toml 含 bot_token/chat_id/api_id/api_hash + bot session + 生产 db/cache；E:\GitHub\rs-CyDrive\test\ 不存在）。**§7a 隔离裁决不因此改变**：该 bot/chat 即生产命名空间，跑 E2E 写操作须负责人二选一——明示接受生产 chat 污染（上传的 /_e2e_* 文件会进生产索引、随墓碑清理），或提供独立测试 bot/chat。telegram E2E 腿（tracker #1）等此裁决。
+
+## 2026-09-09 telegram E2E 隔离裁决：负责人明示接受生产 chat 污染（§7a 例外）
+
+- **裁决**：负责人明示「接受生产 chat 污染」——telegram E2E 腿用 D:\Tools\rs-CyDrive 的生产 bot/chat 跑（tracker #1 的二选一已定）。测试文件一律 `/_e2e_*` 前缀命名（聊天 caption 可辨识）。
+- **污染面与清理责任划分**：① 聊天消息（=telegram 云端文件）**留在生产 chat**，由负责人事后在客户端手动删除（删消息即删媒体；须选「同时删除双方」）——这是接受的污染本体；② 本地索引行由 E2E 实例收尾自动清理（rm → 行删 → 墓碑）；③ **生产 db 零污染**：E2E telegram 实例不配 sync_url（不连 sync-server）——其 db 永不上传，生产实例重启后不会看到任何 /_e2e_* 行，无需墓碑收敛。
+- **运行窗口约束**：E2E 实例与生产实例共用 bot 账号，**不得同时运行**（updates 轮询竞争）；生产实例当前停机态，E2E 结束即停测试实例，生产重启自然恢复。
