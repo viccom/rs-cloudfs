@@ -75,6 +75,13 @@ async fn rebuild_writes_rows_into_the_instance_db() {
         .expect("row exists");
     assert_eq!(row.size, 5);
     assert!(row.is_uploaded);
+    // K11 single-container chunks row (bookkeeping parity with an
+    // upload persist's one-element receipt).
+    let chunks = db.get_chunks_by_file_id(row.id).expect("read chunks");
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].chunk_index, 0);
+    assert_eq!(chunks[0].telegram_msg_id, row.telegram_msg_id);
+    assert_eq!(chunks[0].size, 5);
 }
 
 #[tokio::test]

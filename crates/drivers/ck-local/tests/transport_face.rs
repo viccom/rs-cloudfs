@@ -2,8 +2,9 @@
 //! 是 StorageDriver 的薄壳（K2 path 寻址 + K6 msg_id=0 占位）。
 //!
 //! 观测面（对照 telegram 时代的 transport 契约）：
-//! - receipt：`first_msg_id == 0`（K6 不语义化占位）、`chunk_msg_ids` 空
-//!   （local 无消息模型）、`uploaded_bytes == 文件字节数`；
+//! - receipt：`first_msg_id == 0`（K6 不语义化占位）、`chunk_msg_ids == [0]`
+//!   （单 chunk 占位——K11 簿记：upload persist 计数 chunk_count=1，与
+//!   rebuild 契约一致）、`uploaded_bytes == 文件字节数`；
 //! - 句柄寻址：`RemoteHandle.path`（K2）→ 卷内路径；`path = None` 的句柄
 //!   不可寻址 → `Invalid`；
 //! - 删除幂等形态：telegram 先例（deleted==0 → NotFound）——路径缺失 →
@@ -88,7 +89,11 @@ async fn upload_roundtrip_via_path_handle() {
     transport.connect().await.expect("connect 探活");
     let receipt = transport.upload(&j).await.expect("upload");
     assert_eq!(receipt.first_msg_id, 0, "K6：msg_id 恒 0 占位（不语义化）");
-    assert!(receipt.chunk_msg_ids.is_empty(), "K6：local 无消息模型");
+    assert_eq!(
+        receipt.chunk_msg_ids,
+        vec![0],
+        "K11：单 chunk 占位——chunk 簿记与 rebuild 契约一致"
+    );
     assert_eq!(receipt.uploaded_bytes, data.len() as u64);
 
     // StorageDriver 面同真相：卷内路径出现同尺寸条目。
@@ -199,7 +204,7 @@ async fn delete_remote_then_open_not_found() {
     // K2 防御：无 path 的句柄在本地后端不可寻址。
     let pathless = RemoteHandle {
         first_msg_id: 0,
-        chunk_msg_ids: vec![],
+        chunk_msg_ids: vec![0],
         total_size: 1,
         path: None,
     };
@@ -230,7 +235,7 @@ async fn upload_stream_roundtrip() {
         .await
         .expect("upload_stream");
     assert_eq!(receipt.first_msg_id, 0);
-    assert!(receipt.chunk_msg_ids.is_empty());
+    assert_eq!(receipt.chunk_msg_ids, vec![0]);
     assert_eq!(receipt.uploaded_bytes, data.len() as u64);
 
     let got = read_all(

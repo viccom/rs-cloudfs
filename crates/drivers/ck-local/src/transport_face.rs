@@ -5,7 +5,8 @@
 //! 复任何协议逻辑——两面差异只在句柄语义：
 //!
 //! - **句柄**（K2/K6）：本地后端无消息模型，`first_msg_id`/`chunk_msg_ids`
-//!   是不语义化的占位（receipt 恒 0 / 空）；寻址全部经
+//!   是不语义化的占位（receipt 恒 0 / `[0]`——单 chunk 占位，K11 簿记
+//!   与 rebuild 契约一致）；寻址全部经
 //!   [`RemoteHandle::path`](cloudkit_storage::transport::RemoteHandle::path)
 //!   （vpath 形态）——`path = None` 的句柄不可寻址 → `Invalid`；
 //! - **chunk 计划**：`UploadJob` 的 chunk_count/chunk_size 对无分块原语
@@ -161,7 +162,8 @@ impl CloudTransport for LocalTransport {
     }
 
     /// 整文件复制上传：读盘 → writer + write 全量 + close。receipt 遵循
-    /// K6（`first_msg_id = 0` 占位、`chunk_msg_ids` 空）；`job.size` 作为
+    /// K6（`first_msg_id = 0` 占位、`chunk_msg_ids = [0]` 单 chunk 占位
+    /// ——K11 簿记与 rebuild 契约一致）；`job.size` 作为
     /// WriteHint 承诺由 close 校验。
     async fn upload(&self, job: &UploadJob) -> Result<UploadReceipt, StorageError> {
         let rel = vocab_rel(&job.rel_path)?;
@@ -264,11 +266,14 @@ impl LocalTransport {
     }
 }
 
-/// K6 receipt 形态：msg_id 恒 0 占位（不语义化）、无消息 id 列表。
+/// K6 receipt 形态：msg_id 恒 0 占位（不语义化）。
 fn receipt_of(uploaded_bytes: u64) -> UploadReceipt {
     UploadReceipt {
         first_msg_id: 0,
-        chunk_msg_ids: Vec::new(),
+        // K11 单 chunk 占位：`[0]`（msg_id=0 不语义化），upload persist
+        // 以此计数 chunk_count=1 并写 chunks 行——chunk 簿记与 rebuild
+        // 契约一致优先于空列表形态（E2E 观察项②）。
+        chunk_msg_ids: vec![0],
         uploaded_bytes,
     }
 }

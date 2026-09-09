@@ -14,7 +14,10 @@
 //!   `0` placeholder), `mtime = Entry.mtime`. Directory rows follow the
 //!   `create_dir` parity (size 0, `chunk_count = 0`, `msg_id = NULL`,
 //!   `is_cached = 1`). `sha256`/`mime_type` stay `NULL` (coalescing
-//!   keeps any stored value on re-rebuild).
+//!   keeps any stored value on re-rebuild). Every file row also writes
+//!   one single-container `chunks` row (index 0, the row's msg_id, the
+//!   whole size, no sha — K11 bookkeeping parity with an upload
+//!   persist's one-element receipt); directory rows write none.
 //! - Plaintext-only semantics (K11): an instance with
 //!   `enable_encryption = true` is refused up front with an actionable
 //!   error pointing at `cydrive sync` — the backend only sees
@@ -100,6 +103,18 @@ async fn rebuild_walks_the_backend_tree_into_db_rows() {
     assert_eq!(hello.name, "hello.txt");
     assert_eq!(hello.parent_dir, "/");
 
+    // Chunks rows (K11 single-container parity): index 0, the row's
+    // msg_id, the whole size, no sha — the upload-persist shape for a
+    // one-element receipt.
+    let hello_chunks = db
+        .get_chunks_by_file_id(hello.id)
+        .expect("read hello chunks");
+    assert_eq!(hello_chunks.len(), 1, "one single-container chunk row");
+    assert_eq!(hello_chunks[0].chunk_index, 0);
+    assert_eq!(hello_chunks[0].telegram_msg_id, Some(hello_id));
+    assert_eq!(hello_chunks[0].size, 5);
+    assert_eq!(hello_chunks[0].sha256, None);
+
     let big = db.get_file("/big.bin").expect("read big").expect("row");
     assert_eq!(big.size, 100);
     assert_eq!(big.telegram_msg_id, Some(big_id));
@@ -113,13 +128,20 @@ async fn rebuild_walks_the_backend_tree_into_db_rows() {
     assert_eq!(readme.telegram_msg_id, Some(readme_id));
     assert_eq!(readme.parent_dir, "/docs");
 
-    // Directory row: create_dir parity (0-size, 0 chunks, NULL msg_id).
+    // Directory row: create_dir parity (0-size, 0 chunks, NULL msg_id)
+    // — and no chunks rows.
     let docs = db.get_file("/docs").expect("read docs").expect("row");
     assert!(docs.is_dir);
     assert_eq!(docs.size, 0);
     assert_eq!(docs.chunk_count, 0);
     assert_eq!(docs.telegram_msg_id, None);
     assert!(docs.is_uploaded);
+    assert!(
+        db.get_chunks_by_file_id(docs.id)
+            .expect("read docs chunks")
+            .is_empty(),
+        "directories carry no chunks rows"
+    );
 }
 
 #[tokio::test]
@@ -134,22 +156,27 @@ async fn rebuild_upserts_over_stale_rows_and_reports_counts() {
     // a ghost row for a file the backend no longer has — the rebuild
     // refreshes the first and leaves the second untouched (K11 scope:
     // bootstrap rows from the backend, no pruning).
-    db.upsert_file(&cloudkit_core::database::FileUpsert {
-        rel_path: "/a.txt".to_string(),
-        name: "a.txt".to_string(),
-        parent_dir: "/".to_string(),
-        size: 3,
-        mtime: 1.0,
-        sha256: Some("stale-hash".to_string()),
-        is_dir: false,
-        telegram_msg_id: Some(999),
-        is_uploaded: false,
-        is_cached: true,
-        is_encrypted: false,
-        chunk_count: 1,
-        mime_type: None,
-    })
-    .expect("seed stale row");
+    let stale_id = db
+        .upsert_file(&cloudkit_core::database::FileUpsert {
+            rel_path: "/a.txt".to_string(),
+            name: "a.txt".to_string(),
+            parent_dir: "/".to_string(),
+            size: 3,
+            mtime: 1.0,
+            sha256: Some("stale-hash".to_string()),
+            is_dir: false,
+            telegram_msg_id: Some(999),
+            is_uploaded: false,
+            is_cached: true,
+            is_encrypted: false,
+            chunk_count: 1,
+            mime_type: None,
+        })
+        .expect("seed stale row");
+    // A stale chunk row rides the stale files row (msg_id 999) — the
+    // refresh must rewrite it to the backend's handle.
+    db.upsert_chunk(stale_id, 0, 999, 3, None)
+        .expect("seed stale chunk");
     db.upsert_file(&cloudkit_core::database::FileUpsert {
         rel_path: "/ghost.txt".to_string(),
         name: "ghost.txt".to_string(),
@@ -182,6 +209,16 @@ async fn rebuild_upserts_over_stale_rows_and_reports_counts() {
         Some("stale-hash"),
         "coalesce keeps sha"
     );
+    // The stale chunk row is refreshed too (same upsert semantics).
+    let a_chunks = db.get_chunks_by_file_id(a.id).expect("read a chunks");
+    assert_eq!(a_chunks.len(), 1);
+    assert_eq!(a_chunks[0].chunk_index, 0);
+    assert_eq!(
+        a_chunks[0].telegram_msg_id,
+        Some(a_id),
+        "stale chunk msg_id refreshed to the backend handle"
+    );
+    assert_eq!(a_chunks[0].size, 3);
 
     // Ghost row untouched (no pruning in K11).
     let ghost = db.get_file("/ghost.txt").expect("read ghost").expect("row");

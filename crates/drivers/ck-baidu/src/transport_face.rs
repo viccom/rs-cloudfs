@@ -9,10 +9,13 @@
 //!
 //! - **句柄**（K5）：`RemoteHandle.first_msg_id` = fs_id（十进制即
 //!   StorageDriver 面 BackendHandle，跨 rename 稳定）；
-//!   `chunk_msg_ids` 空（单对象后端无分片消息）；`path` 顺带携带但不
-//!   参与寻址（fs_id 已完备）；
-//! - **receipt**（K5）：`first_msg_id = create 返回的 fs_id`，
-//!   `uploaded_bytes = 整文件字节数`；
+//!   `chunk_msg_ids` 不参与寻址（fs_id 已完备；receipt 派生句柄携带
+//!   单元素列表，见下）；`path` 顺带携带但不参与寻址；
+//! - **receipt**（K5/K11）：`first_msg_id = create 返回的 fs_id`，
+//!   `chunk_msg_ids = [fs_id]`（单容器单 chunk——K11 簿记：upload
+//!   persist 以 receipt 计数 chunk/写 chunks 行，单元素形态使
+//!   `chunk_count=1` 且 chunks 行 msg_id 与 files 行主字段同值，
+//!   与 rebuild 契约一致）、`uploaded_bytes = 整文件字节数`；
 //! - **connect**：quota 轻量探活——构造（factory→uinfo）即已连接，
 //!   本调用断言 token 仍有效（失效按 errno 映射表上抛）；
 //! - **upload_stream**：流式全缓冲到 staging 文件（OS 临时目录）后走
@@ -281,7 +284,11 @@ impl BaiduTransport {
         })?;
         Ok(UploadReceipt {
             first_msg_id: fs_id,
-            chunk_msg_ids: Vec::new(),
+            // K11 单容器单 chunk：chunk_msg_ids = [fs_id]——upload
+            // persist 以此计数 chunk_count=1 并写 chunks 行（msg_id 与
+            // files 行 telegram_msg_id 主字段同值），与 rebuild 契约
+            // 对齐（E2E 观察项②）。
+            chunk_msg_ids: vec![fs_id],
             uploaded_bytes: entry.size,
         })
     }

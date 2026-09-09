@@ -1056,8 +1056,11 @@ fn baidu_params(
         token_store,
         pcs_base: endpoints.pcs_base.clone(),
         // K7：上传会话表落实例 cwd 状态目录（跨进程差集续传；runtime
-        // 产物不入库——R7，与 .session 文件同惯例；testkit 实例目录即 cwd）。
-        sessions_dir: Some(std::path::PathBuf::from("./baidu_state")),
+        // 产物不入库——R7，与 .session 文件同惯例；testkit 实例目录即
+        // cwd）。装配只传 cwd 本身——驱动内契约自行拼
+        // `<sessions_dir>/baidu_state/sessions/`，此处再带 baidu_state
+        // 会嵌套成 `./baidu_state/baidu_state/sessions/`（E2E 观察项①）。
+        sessions_dir: Some(std::path::PathBuf::from(".")),
         ..Default::default()
     }
 }

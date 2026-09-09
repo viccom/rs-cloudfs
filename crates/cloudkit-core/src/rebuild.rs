@@ -14,6 +14,12 @@
 //!   path), `size`/`mtime` from the [`Entry`]; `sha256`/`mime_type`
 //!   stay `NULL` so [`MetaDatabase::upsert_file`]'s coalesce keeps any
 //!   stored value on a re-rebuild;
+//! - chunks (per file row): one single-container row — index 0, the
+//!   row's `msg_id`, the whole size, no sha. This is the exact shape
+//!   [`persist_success`](crate::upload_queue) writes for a one-element
+//!   `chunk_msg_ids` receipt, so a rebuilt file is row/chunks-
+//!   equivalent to a sync-copied one (K11 bookkeeping parity).
+//!   Directory rows write no chunks rows;
 //! - directories: `create_dir` parity (`size = 0`, `chunk_count = 0`,
 //!   `msg_id = NULL`, `is_uploaded = 1`, `is_cached = 1`).
 //!
@@ -161,7 +167,7 @@ fn upsert_entry(
             // parse directly; path-shaped local handles cannot occupy
             // the i64 column and degrade to the K6 0 placeholder.
             let msg_id = entry.id.handle.as_str().parse::<i64>().unwrap_or(0);
-            db.upsert_file(&FileUpsert {
+            let file_id = db.upsert_file(&FileUpsert {
                 rel_path,
                 name,
                 parent_dir,
@@ -176,6 +182,12 @@ fn upsert_entry(
                 chunk_count: 1,
                 mime_type: None,
             })?;
+            // Single-container chunks row (K11): index 0 carrying the
+            // row's msg_id and the whole size — the exact shape an
+            // upload persist writes for a one-element receipt, so a
+            // rebuilt file is row/chunks-equivalent to a sync-copied
+            // one.
+            db.upsert_chunk(file_id, 0, msg_id, entry.size as i64, None)?;
             outcome.files += 1;
         }
         EntryKind::Dir => {

@@ -3,8 +3,10 @@
 //! api.go:440-479 的 4 并发形态；stager 流式路径的串行契约不变）。
 //!
 //! 观测面：
-//! - receipt（K5）：`first_msg_id == fs_id`（句柄即 fs_id，跨 rename 稳定）、
-//!   `chunk_msg_ids` 空（单对象后端无分片消息）、`uploaded_bytes == 字节数`；
+//! - receipt（K5/K11）：`first_msg_id == fs_id`（句柄即 fs_id，跨 rename
+//!   稳定）、`chunk_msg_ids == [fs_id]`（单容器单 chunk——K11 簿记：
+//!   upload persist 计数 chunk_count=1、chunks 行 msg_id 与主字段同值，
+//!   与 rebuild 契约一致）、`uploaded_bytes == 字节数`；
 //! - 整文件路径：mock superfile2 收满全量分片（partseq 齐集）+ create
 //!   组装 → fs_id；
 //! - open/open_range：fs_id → 下载链路（dlink + 4MiB 有界窗口）字节等；
@@ -61,7 +63,7 @@ fn source_file(tag: &str, data: &[u8]) -> std::path::PathBuf {
 fn handle_for(job: &UploadJob, first_msg_id: i64, total: u64) -> RemoteHandle {
     RemoteHandle {
         first_msg_id,
-        chunk_msg_ids: vec![],
+        chunk_msg_ids: vec![first_msg_id],
         total_size: total,
         path: Some(job.rel_path.clone()),
     }
@@ -98,7 +100,11 @@ async fn upload_whole_file_receipt_is_fs_id() {
     let receipt = transport.upload(&j).await.expect("upload");
 
     // K5：receipt.first_msg_id = fs_id（与 StorageDriver 面 stat 句柄一致）。
-    assert!(receipt.chunk_msg_ids.is_empty(), "单对象后端无分片消息");
+    assert_eq!(
+        receipt.chunk_msg_ids,
+        vec![receipt.first_msg_id],
+        "K11：单容器单 chunk 簿记——chunks 行 msg_id = fs_id 与主字段同值"
+    );
     assert_eq!(receipt.uploaded_bytes, data.len() as u64);
     let entry = transport
         .driver()
@@ -153,6 +159,11 @@ async fn upload_stream_same_path() {
         .await
         .expect("upload_stream");
     assert!(receipt.first_msg_id > 0, "K5：fs_id 而非 0 占位");
+    assert_eq!(
+        receipt.chunk_msg_ids,
+        vec![receipt.first_msg_id],
+        "K11：upload_stream 同路同 receipt 形态"
+    );
     assert_eq!(receipt.uploaded_bytes, data.len() as u64);
 
     let handle = handle_for(&j, receipt.first_msg_id, receipt.uploaded_bytes);
