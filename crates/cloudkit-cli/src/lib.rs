@@ -51,7 +51,9 @@ use cloudkit_core::database::MetaDatabase;
 use cloudkit_core::inbound::spawn_inbound_worker;
 use cloudkit_core::rebuild;
 use cloudkit_core::rel_path::RelPath;
-use cloudkit_core::sync::{namespace_key, sync_once, SyncOutcome};
+use cloudkit_core::sync::{
+    namespace_key, namespace_key_for, sync_once, NamespaceIdentity, SyncOutcome,
+};
 use cloudkit_core::transport::Capabilities;
 use cloudkit_core::transport::CloudTransport;
 use cloudkit_core::vfs::{Vfs, VfsConfig, VfsError};
@@ -390,7 +392,8 @@ pub fn transport_capabilities_line(caps: &Capabilities) -> String {
 }
 
 /// Boots the full stack with an injected transport (tests pass a
-/// `MockTransport`; the `run` subcommand passes a `GrammersTransport`).
+/// `MockTransport`; the `run` subcommand passes a `GrammersTransport`
+/// for the telegram backend or the dispatched baidu/local transport).
 ///
 /// Start order: DB + cache → Vfs → pending requeue → WebDAV serve. The
 /// returned handle answers [`RunHandle::local_addr`] with the bound
@@ -400,6 +403,30 @@ pub fn transport_capabilities_line(caps: &Capabilities) -> String {
 pub async fn run_with_transport(
     cfg: &CyDriveConfig,
     transport: Arc<dyn CloudTransport>,
+) -> Result<RunHandle> {
+    run_with_transport_options(cfg, transport, RunOptions::default()).await
+}
+
+/// Per-boot options the backend dispatch contributes (B3b 段二b): the
+/// pre-derived sync namespace for backends whose identity is NOT the
+/// telegram bot-token pair (baidu: the connected volume `baidu:<uid>`;
+/// [`RunOptions::default`] keeps `None` = the legacy telegram
+/// derivation, byte-identical for every existing caller).
+#[derive(Debug, Clone, Default)]
+pub struct RunOptions {
+    /// The sync namespace key (`None` = derive from
+    /// `bot_token`/`chat_id` — the frozen telegram path).
+    pub sync_namespace: Option<String>,
+}
+
+/// [`run_with_transport`] with the backend-derived sync namespace
+/// injected: a baidu boot passes the dispatched transport's
+/// [`BackendTransport::sync_namespace_key`] so the periodic task keys
+/// on the account uid, not on (absent) telegram credentials.
+pub async fn run_with_transport_options(
+    cfg: &CyDriveConfig,
+    transport: Arc<dyn CloudTransport>,
+    options: RunOptions,
 ) -> Result<RunHandle> {
     let db = Arc::new(
         MetaDatabase::open(Path::new(&cfg.db_path))
@@ -531,6 +558,7 @@ pub async fn run_with_transport(
         cache_limit,
         Arc::clone(&watch),
         vfs.sync_notifier(),
+        options.sync_namespace,
     );
 
     let (mounted_letter, mounted_point) = mount_if_configured(cfg);
@@ -970,30 +998,360 @@ pub async fn run_rebuild_with_driver(
         .context("rebuilding the index from the backend")
 }
 
-/// The backend-key driver assembly for `rebuild` (B3b 段二a minimal
-/// form): telegram → the shadow-index refusal; baidu/local → the
-/// drivers' `factory`s behind `Arc<dyn StorageDriver>` (the rebuild
-/// walk needs the StorageDriver face — list/stat; the CloudTransport
-/// face carries no listing).
+// ------------------------------- backend dispatch (B3b 段二b unit 5) ---
+
+/// The baidu endpoint set the dispatch assembles [`ck_baidu::BaiduParams`]
+/// with. Defaults are the production constants; tests inject a loopback
+/// mock (`build_backend_transport_with`).
+#[derive(Debug, Clone)]
+pub struct BaiduEndpoints {
+    /// xpan API base (`pan.baidu.com`).
+    pub api_base: String,
+    /// OAuth base (`openapi.baidu.com`).
+    pub oauth_base: String,
+    /// superfile2 PCS base (`None` = the production `d.pcs.baidu.com`).
+    pub pcs_base: Option<String>,
+}
+
+impl Default for BaiduEndpoints {
+    fn default() -> Self {
+        BaiduEndpoints {
+            api_base: ck_baidu::DEFAULT_API_BASE.to_string(),
+            oauth_base: ck_baidu::DEFAULT_OAUTH_BASE.to_string(),
+            pcs_base: None,
+        }
+    }
+}
+
+/// Assembles the [`BaiduParams`] for a config (the single mapping the
+/// transport dispatch and the rebuild driver assembly share — the two
+/// cannot drift): the four K14 credential keys, the root, the endpoint
+/// set and the K13 persistence callback.
+fn baidu_params(
+    cfg: &CyDriveConfig,
+    endpoints: &BaiduEndpoints,
+    token_store: Option<Arc<dyn ck_baidu::TokenStore>>,
+) -> ck_baidu::BaiduParams {
+    ck_baidu::BaiduParams {
+        app_key: cfg.baidu_app_key.clone().unwrap_or_default(),
+        app_secret: cfg.baidu_app_secret.clone().unwrap_or_default(),
+        access_token: cfg.baidu_access_token.clone(),
+        refresh_token: cfg.baidu_refresh_token.clone(),
+        root: cfg.baidu_root.clone(),
+        api_base: endpoints.api_base.clone(),
+        oauth_base: endpoints.oauth_base.clone(),
+        token_store,
+        pcs_base: endpoints.pcs_base.clone(),
+        ..Default::default()
+    }
+}
+
+/// The dispatch product of [`build_backend_transport`]: one concrete arm
+/// per non-telegram backend (the enum IS the type assertion surface —
+/// tests pin that `backend = "baidu"` lands the `Baidu` arm). Telegram
+/// is deliberately NOT an arm: its assembly is the run flow's dedicated
+/// deadline-bounded Grammers connect (zero change — the dispatch only
+/// routes around it).
+pub enum BackendTransport {
+    /// The baidu transport face over the factory-connected driver.
+    Baidu(Arc<ck_baidu::BaiduTransport>),
+    /// The local transport face over the factory-initialised driver.
+    Local(Arc<ck_local::LocalTransport>),
+}
+
+impl BackendTransport {
+    /// The assembled volume identity (`baidu:<uid>` / `local:<root>`).
+    pub fn volume(&self) -> &str {
+        match self {
+            BackendTransport::Baidu(t) => StorageDriver::volume(t.driver()).as_str(),
+            BackendTransport::Local(t) => StorageDriver::volume(t.driver()).as_str(),
+        }
+    }
+
+    /// The transport face's declared capabilities (the driver's bits
+    /// plus the K4 `remote_delete` the faces declare).
+    pub fn caps(&self) -> Capabilities {
+        match self {
+            BackendTransport::Baidu(t) => CloudTransport::capabilities(t.as_ref()),
+            BackendTransport::Local(t) => CloudTransport::capabilities(t.as_ref()),
+        }
+    }
+
+    /// The K12 sync-namespace key this backend derives: baidu — the
+    /// raw volume identity `baidu:<uid>` (a stable, non-secret account
+    /// id); local — `local:<digest>` over the driver-normalized root
+    /// (the raw path never ships to the server; local never starts the
+    /// sync task anyway — [`is_sync_supported`]).
+    pub fn sync_namespace_key(&self) -> String {
+        match self {
+            BackendTransport::Baidu(_) => self.volume().to_string(),
+            BackendTransport::Local(t) => namespace_key_for(&NamespaceIdentity::Local {
+                root: &t.driver().root_path().to_string_lossy(),
+            }),
+        }
+    }
+
+    /// The same transport behind the run flow's `Arc<dyn
+    /// CloudTransport>` seam (a clone of the shared Arc — the enum arm
+    /// stays usable).
+    pub fn clone_dyn(&self) -> Arc<dyn CloudTransport> {
+        match self {
+            BackendTransport::Baidu(t) => t.clone() as Arc<dyn CloudTransport>,
+            BackendTransport::Local(t) => t.clone() as Arc<dyn CloudTransport>,
+        }
+    }
+}
+
+/// The unified backend-key transport dispatch (B3b 段二b): production
+/// endpoints, the K13 config write-back store, and the K18 proxy
+/// declaration (a `proxy_url` on a baidu instance is logged
+/// ineffective — the driver always connects directly).
 ///
-/// **B3b 段二b 收编点**: the full `backend` dispatch (transport faces,
-/// capability banner, proxy declaration) lands in the dispatch unit and
-/// is expected to absorb or replace this helper — keep it minimal.
-/// Known gap until then: the baidu params carry `token_store: None`,
-/// so a rotated refresh token is not persisted (K13 persistence is the
-/// setup/dispatch unit's wiring).
+/// Telegram is refused with guidance: the legacy arm's assembly is the
+/// run flow's own deadline-bounded Grammers connect, kept byte-for-
+/// byte (the absent `backend` key IS telegram — pre-Phase-2 configs
+/// never reach this function's error).
+pub async fn build_backend_transport(cfg: &CyDriveConfig) -> Result<BackendTransport> {
+    let dispatched = build_backend_transport_with(
+        cfg,
+        &BaiduEndpoints::default(),
+        Some(Arc::new(ConfigTokenStore::default())),
+    )
+    .await?;
+    if let Some(warning) = proxy_ineffective_warning(cfg) {
+        tracing::warn!("{warning}");
+    }
+    Ok(dispatched)
+}
+
+/// [`build_backend_transport`] with the endpoint set and the K13
+/// `TokenStore` injected — the test seam (loopback mock backends; a
+/// capturing store).
+pub async fn build_backend_transport_with(
+    cfg: &CyDriveConfig,
+    endpoints: &BaiduEndpoints,
+    token_store: Option<Arc<dyn ck_baidu::TokenStore>>,
+) -> Result<BackendTransport> {
+    match cfg.backend {
+        Backend::Telegram => anyhow::bail!(
+            "the telegram backend does not assemble through the backend dispatch: the run \
+             flow connects it through its own deadline-bounded GrammersTransport path \
+             (unchanged since pre-Phase-2); a config without the backend key is telegram"
+        ),
+        Backend::Baidu => {
+            let params = baidu_params(cfg, endpoints, token_store);
+            let driver = ck_baidu::factory(&params)
+                .await
+                .map_err(|error| anyhow::anyhow!("connecting the baidu backend: {error}"))?;
+            Ok(BackendTransport::Baidu(Arc::new(
+                ck_baidu::BaiduTransport::new(driver),
+            )))
+        }
+        Backend::Local => {
+            // validate() guarantees Some + absolute when backend=local.
+            let root = cfg.local_root.clone().unwrap_or_default();
+            let driver = ck_local::factory(&ck_local::LocalParams {
+                root: PathBuf::from(root),
+            })
+            .await
+            .map_err(|error| anyhow::anyhow!("initialising the local backend: {error}"))?;
+            Ok(BackendTransport::Local(Arc::new(
+                ck_local::LocalTransport::new(driver),
+            )))
+        }
+    }
+}
+
+/// The K13 persistence adapter bridging ck-baidu's [`TokenStore`] to
+/// the instance's config.toml: a rotation (refresh_token is one-use —
+/// the new pair is the ONLY live value) writes the two token keys back
+/// into the target file. K14's ruling allows plaintext token keys in
+/// config (the sync_secret precedent); there is deliberately no
+/// keyring leg — the core credential schema carries no baidu keys, and
+/// inventing them is out of the dispatch unit's scope.
+///
+/// Failure policy: WARN, never propagate — the refresh itself already
+/// succeeded and the request path must not crash on a file problem; a
+/// missing/unparsable file means the credentials arrived via env
+/// (`CYDRIVE_BAIDU_*` outrank the file anyway — the operator owns that
+/// rotation), which the warning names.
+pub struct ConfigTokenStore {
+    path: PathBuf,
+}
+
+impl ConfigTokenStore {
+    /// Targets `path` (production: `config.toml` in the cwd —
+    /// [`ConfigTokenStore::default`]; tests inject a temp file).
+    pub fn new(path: PathBuf) -> Self {
+        ConfigTokenStore { path }
+    }
+}
+
+impl Default for ConfigTokenStore {
+    fn default() -> Self {
+        ConfigTokenStore {
+            path: PathBuf::from("config.toml"),
+        }
+    }
+}
+
+impl ck_baidu::TokenStore for ConfigTokenStore {
+    fn save_tokens(&self, access_token: &str, refresh_token: &str) {
+        // Light single-file I/O on the refresh path (a few KiB) — the
+        // same weight class as the config writes setup/migrate already
+        // do inline.
+        let report = |message: String| {
+            tracing::warn!(
+                path = %self.path.display(),
+                "{message}"
+            );
+        };
+        let Ok(mut cfg) = CyDriveConfig::load_toml(&self.path) else {
+            report(
+                "rotated baidu tokens were NOT persisted: no readable config.toml — the \
+                 credentials likely came from CYDRIVE_BAIDU_* env (update them there); \
+                 the new refresh_token is now the only live value"
+                    .to_string(),
+            );
+            return;
+        };
+        cfg.baidu_access_token = Some(access_token.to_string());
+        cfg.baidu_refresh_token = Some(refresh_token.to_string());
+        if let Err(error) = cfg.save_toml(&self.path) {
+            report(format!(
+                "rotated baidu tokens were NOT persisted (write failed: {error}); the \
+                 new refresh_token is now the only live value"
+            ));
+        }
+    }
+}
+
+// -------------------------------------------- K12 / K18 warning helpers ---
+
+/// K18: `proxy_url` has no effect on the baidu/local backends (their
+/// drivers always connect directly — no_proxy + forced IPv4); the
+/// assembly logs this warning and doctor repeats it. `None` on
+/// telegram (the proxy is a live setting there) or when no proxy is
+/// configured.
+pub fn proxy_ineffective_warning(cfg: &CyDriveConfig) -> Option<&'static str> {
+    let effective =
+        cfg.proxy_url.as_deref().is_some_and(|p| !p.is_empty()) && cfg.backend != Backend::Telegram;
+    effective.then_some(PROXY_DIRECT_BACKEND_NOTICE)
+}
+
+/// The K18 declaration text shared by the assembly log and doctor.
+pub const PROXY_DIRECT_BACKEND_NOTICE: &str =
+    "proxy_url is set but has no effect on this backend: baidu/local always connect \
+     directly (no_proxy + forced IPv4); the proxy only serves the telegram transport";
+
+/// K12: a local instance cannot run the metadata-sync task (the local
+/// root IS the source of truth); a `sync_url` on such an instance is a
+/// misconfiguration surfaced as this warning (the sync task's start
+/// gate and doctor share the text). `None` for every other shape.
+pub fn local_sync_unsupported_warning(cfg: &CyDriveConfig) -> Option<&'static str> {
+    (cfg.sync_url.is_some() && !cloudkit_core::sync::is_sync_supported(&cfg.backend))
+        .then_some(LOCAL_SYNC_UNSUPPORTED)
+}
+
+/// The K12 warning text shared by the sync-start gate and doctor.
+pub const LOCAL_SYNC_UNSUPPORTED: &str =
+    "sync is not supported for the local backend: the periodic sync task stays off and \
+     the sync_url key has no effect";
+
+// -------------------------------------------- doctor: baidu probe (B3b) ---
+
+/// The doctor baidu probe's structured outcome ([`baidu_backend_probe`]):
+/// the verdict mapper ([`doctor::baidu_connectivity_check`]) turns each
+/// shape into one check result.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum BackendProbe {
+    /// uinfo (factory) + quota + a root list all answered — the token
+    /// is alive and the backend reachable.
+    Alive,
+    /// Re-authorization is needed (invalid/expired refresh token or
+    /// incomplete credentials) — re-run `cydrive setup`.
+    NeedsReauth(String),
+    /// Transient (network / rate limit / backend 5xx) — retry later.
+    Unreachable(String),
+}
+
+/// The doctor baidu leg (production endpoints): assemble the driver
+/// (uinfo = the token liveness probe — a 110 refreshes once mid-probe,
+/// exactly the runtime behavior) → quota (the lightest xpan call) →
+/// one root list. Read-only by design: root WRITABILITY is not probed
+/// (no probe artifacts in the user's drive); it is discovered on the
+/// first upload after setup. Bounded by 45s so a dead network cannot
+/// hang an interactive doctor run.
+pub async fn baidu_backend_probe(cfg: &CyDriveConfig) -> BackendProbe {
+    baidu_backend_probe_with(cfg, &BaiduEndpoints::default()).await
+}
+
+/// [`baidu_backend_probe`] with the endpoint set injected (tests point
+/// it at a loopback mock).
+pub async fn baidu_backend_probe_with(
+    cfg: &CyDriveConfig,
+    endpoints: &BaiduEndpoints,
+) -> BackendProbe {
+    // Incomplete credentials never reach the network: a clear
+    // misconfiguration verdict beats a confusing connect failure.
+    if let Err(error) = cfg.validate() {
+        return BackendProbe::NeedsReauth(format!(
+            "the baidu configuration is incomplete ({error}); re-run `cydrive setup` or set \
+             the four baidu_* keys (config.toml or CYDRIVE_BAIDU_* env)"
+        ));
+    }
+    let probe = async {
+        let params = baidu_params(cfg, endpoints, None);
+        let driver = ck_baidu::factory(&params).await?;
+        StorageDriver::quota(driver.as_ref()).await?;
+        StorageDriver::list(
+            driver.as_ref(),
+            &cloudkit_storage::RelPath::root(),
+            cloudkit_storage::Page::default(),
+        )
+        .await?;
+        Ok::<(), cloudkit_storage::StorageError>(())
+    };
+    match tokio::time::timeout(Duration::from_secs(45), probe).await {
+        Ok(Ok(())) => BackendProbe::Alive,
+        Ok(Err(cloudkit_storage::StorageError::Unauthorized { recoverable: false })) => {
+            BackendProbe::NeedsReauth(
+                "the baidu refresh token is no longer valid; re-run `cydrive setup` and \
+                 paste a fresh refresh_token"
+                    .to_string(),
+            )
+        }
+        Ok(Err(cloudkit_storage::StorageError::Invalid)) => BackendProbe::NeedsReauth(
+            "the baidu credentials are incomplete (access/refresh token missing); re-run \
+             `cydrive setup`"
+                .to_string(),
+        ),
+        Ok(Err(error)) => BackendProbe::Unreachable(error.to_string()),
+        Err(_elapsed) => BackendProbe::Unreachable(
+            "the probe did not finish within 45s (network path to pan.baidu.com?)".to_string(),
+        ),
+    }
+}
+
+/// The backend-key driver assembly for `rebuild` (B3b 段二a minimal
+/// form, consolidated by the dispatch unit): telegram → the
+/// shadow-index refusal; baidu/local → the drivers' `factory`s behind
+/// `Arc<dyn StorageDriver>` (the rebuild walk needs the StorageDriver
+/// face — list/stat; the CloudTransport face carries no listing).
+///
+/// The baidu arm shares [`baidu_params`] with the transport dispatch
+/// (single mapping, no drift) and carries the K13 write-back store —
+/// a refresh triggered mid-walk must persist its rotated pair or the
+/// next boot reads a dead refresh_token.
 async fn build_driver(cfg: &CyDriveConfig) -> Result<Arc<dyn StorageDriver>> {
     match cfg.backend {
         Backend::Telegram => anyhow::bail!("{TELEGRAM_REBUILD_REFUSAL}"),
         Backend::Baidu => {
-            let params = ck_baidu::BaiduParams {
-                app_key: cfg.baidu_app_key.clone().unwrap_or_default(),
-                app_secret: cfg.baidu_app_secret.clone().unwrap_or_default(),
-                access_token: cfg.baidu_access_token.clone(),
-                refresh_token: cfg.baidu_refresh_token.clone(),
-                root: cfg.baidu_root.clone(),
-                ..Default::default()
-            };
+            let params = baidu_params(
+                cfg,
+                &BaiduEndpoints::default(),
+                Some(Arc::new(ConfigTokenStore::default())),
+            );
             let driver = ck_baidu::factory(&params)
                 .await
                 .map_err(|error| anyhow::anyhow!("connecting the baidu backend: {error}"))?;
@@ -1122,11 +1480,17 @@ pub fn spawn_sync_doorbell(
 /// every local files-table change (the VFS doorbell `wake`, rung by the
 /// put/remove/create/inbound hooks and the upload queue's success
 /// persist) and of every remote change (the SSE doorbell task). Returns
-/// `None` when `sync_url` is unset (the feature is off) or the namespace
-/// identity is missing (a warn, never a boot failure). Every pass
-/// failure only warns — the served stack is unaffected. The task exits
-/// on its own when the shared stop gate fires; [`RunHandle::shutdown`]
-/// additionally aborts it so a pass in flight cannot delay the exit.
+/// `None` when `sync_url` is unset (the feature is off), the backend
+/// cannot sync at all (K12: local — a warn, never a boot failure), or
+/// the namespace identity is missing (a warn, never a boot failure).
+/// Every pass failure only warns — the served stack is unaffected. The
+/// task exits on its own when the shared stop gate fires;
+/// [`RunHandle::shutdown`] additionally aborts it so a pass in flight
+/// cannot delay the exit.
+///
+/// `namespace` (B3b 段二b): the backend-dispatched namespace key
+/// (baidu's `baidu:<uid>`); `None` keeps the frozen telegram derivation
+/// and its `is_configured` gate.
 fn spawn_periodic_sync(
     cfg: &CyDriveConfig,
     db: Arc<MetaDatabase>,
@@ -1134,15 +1498,29 @@ fn spawn_periodic_sync(
     cache_limit: u64,
     watch: Arc<ShutdownWatch>,
     wake: Arc<Notify>,
+    namespace: Option<String>,
 ) -> Option<tokio::task::JoinHandle<()>> {
     let url = cfg.sync_url.clone()?;
-    if !cfg.is_configured() {
-        tracing::warn!(
-            "sync_url is set but bot_token/chat_id are missing; periodic sync stays off"
-        );
+    // K12 gate: the local backend never runs the sync task — the local
+    // root IS the source of truth; doctor repeats this warning offline.
+    if let Some(warning) = local_sync_unsupported_warning(cfg) {
+        tracing::warn!("{warning}");
         return None;
     }
-    let key = namespace_key(&cfg.bot_token, &cfg.chat_id.to_string());
+    let key = match namespace {
+        // A backend-derived key (baidu volume) bypasses the telegram
+        // credential gate — the identity is the account, not a bot.
+        Some(key) => key,
+        None => {
+            if !cfg.is_configured() {
+                tracing::warn!(
+                    "sync_url is set but bot_token/chat_id are missing; periodic sync stays off"
+                );
+                return None;
+            }
+            namespace_key(&cfg.bot_token, &cfg.chat_id.to_string())
+        }
+    };
     let secret = resolve_sync_secret(cfg);
     // The per-database stable identity: the doorbell's origin-skip (and
     // the access log's client tag) key on it. A read failure only warns

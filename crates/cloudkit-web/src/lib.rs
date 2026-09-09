@@ -420,10 +420,7 @@ async fn api_delete(State(state): State<AppState>, body: Json<serde_json::Value>
         // chokepoint; deletion = tombstone origin).
         Err(VfsError::IsDirectory(_)) => {
             if let Err(error) = state.vfs.delete_remote_for_row(&rel).await {
-                return error_json(
-                    StatusCode::INTERNAL_SERVER_ERROR,
-                    error.to_string(),
-                );
+                return error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string());
             }
             match state.vfs.db().delete_file(&clean_rel) {
                 Ok(()) => delete_success(filename),

@@ -824,11 +824,7 @@ impl Vfs {
     /// object — the only remaining shape is the ghost pending row
     /// (bytes neither local nor remote), which skips the gate and stays
     /// deletable.
-    async fn delete_remote_gated(
-        &self,
-        rel: &RelPath,
-        row: &FileRecord,
-    ) -> Result<(), VfsError> {
+    async fn delete_remote_gated(&self, rel: &RelPath, row: &FileRecord) -> Result<(), VfsError> {
         if !self.transport.capabilities().remote_delete {
             return Ok(());
         }

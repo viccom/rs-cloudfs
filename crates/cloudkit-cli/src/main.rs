@@ -23,7 +23,7 @@ use std::sync::Arc;
 use anyhow::{Context, Result};
 use ck_telegram::transport::GrammersTransport;
 use clap::{Parser, Subcommand};
-use cloudkit_cli::{discover_config, run_with_transport};
+use cloudkit_cli::discover_config;
 use cloudkit_core::config::CyDriveConfig;
 use cloudkit_core::logging::LogConfig;
 use cloudkit_core::rel_path::RelPath;
@@ -153,8 +153,8 @@ async fn main() -> Result<()> {
         Command::Migrate => migrate_cmd(),
         Command::Stats => stats_cmd(),
         Command::Rebuild => rebuild_cmd().await,
-        Command::Doctor => doctor_cmd(),
-        Command::Setup => setup_cmd(),
+        Command::Doctor => doctor_cmd().await,
+        Command::Setup => setup_cmd().await,
     }
 }
 
@@ -425,7 +425,14 @@ async fn rebuild_cmd() -> Result<()> {
 /// with the default ports), then the platform/remote checks, all merged
 /// into one report. Never fails on an unhealthy installation; the report
 /// is the answer.
-fn doctor_cmd() -> Result<()> {
+///
+/// Backend legs (Phase 2 / B3b): telegram keeps the fixed manual-run
+/// advisory; baidu adds the offline K18 proxy notice plus the LIVE
+/// token probe (uinfo + quota + a root list, read-only); local adds the
+/// root exists-and-writable check and the K12 sync-unsupported warning.
+/// The Windows WebClient leg runs for every backend (the WebDAV mount
+/// surface is backend-independent).
+async fn doctor_cmd() -> Result<()> {
     let discovered = discover_config();
     let config_present = discovered.is_ok();
     let cfg = discovered.unwrap_or_default();
@@ -450,7 +457,21 @@ fn doctor_cmd() -> Result<()> {
         credential_store,
     };
     let mut results = cloudkit_cli::doctor::run_doctor(&ctx);
-    results.extend(cloudkit_cli::doctor::platform_checks());
+    results.extend(cloudkit_cli::doctor::webclient_checks());
+    match cfg.backend {
+        cloudkit_core::config::Backend::Telegram => {
+            results.push(cloudkit_cli::doctor::telegram_connectivity_check());
+        }
+        cloudkit_core::config::Backend::Baidu => {
+            results.extend(cloudkit_cli::doctor::backend_checks(&cfg));
+            results.push(cloudkit_cli::doctor::baidu_connectivity_check(
+                &cloudkit_cli::baidu_backend_probe(&cfg).await,
+            ));
+        }
+        cloudkit_core::config::Backend::Local => {
+            results.extend(cloudkit_cli::doctor::backend_checks(&cfg));
+        }
+    }
     print!("{}", cloudkit_cli::doctor::render_report(&results));
     Ok(())
 }
@@ -461,7 +482,7 @@ fn doctor_cmd() -> Result<()> {
 /// write the secrets into `config.toml` (headless mode) or abort — the
 /// pre-2026-09-04 behavior of silently storing them in a volatile
 /// in-memory fallback reported success while losing the token.
-fn setup_cmd() -> Result<()> {
+async fn setup_cmd() -> Result<()> {
     let store: Option<cloudkit_cli::KeyringStore> = match cloudkit_cli::KeyringStore::new() {
         Ok(store) => Some(store),
         Err(error) => {
@@ -489,6 +510,7 @@ fn setup_cmd() -> Result<()> {
             .as_ref()
             .map(|s| s as &dyn cloudkit_core::credentials::CredentialStore),
     )
+    .await
 }
 
 /// The production run flow; every step here is covered by the library
@@ -500,6 +522,12 @@ fn setup_cmd() -> Result<()> {
 /// deadline-bounded (90s) with a human-readable diagnosis on failure,
 /// and Ctrl+C during the connect phase exits cleanly instead of
 /// hard-killing the process with no output.
+///
+/// Backend dispatch (Phase 2 / B3b): telegram keeps its dedicated
+/// deadline-bounded Grammers connect below VERBATIM (the absent
+/// `backend` key IS telegram — pre-Phase-2 behavior); baidu/local
+/// assemble through the unified [`cloudkit_cli::build_backend_transport`]
+/// and boot with their backend-derived sync namespace (K12).
 async fn run() -> Result<()> {
     let cwd = std::env::current_dir().context("resolving the working directory")?;
     println!(
@@ -509,7 +537,7 @@ async fn run() -> Result<()> {
     );
     let cfg = discover_config().context("config discovery failed")?;
     cfg.validate().context("invalid configuration")?;
-    if !cfg.is_configured() {
+    if cfg.backend == cloudkit_core::config::Backend::Telegram && !cfg.is_configured() {
         anyhow::bail!(
             "CyDrive is not configured: set bot_token (a \"<id>:<secret>\" BotFather \
              token) and chat_id in config.toml (or a legacy config.json) in the \
@@ -520,37 +548,57 @@ async fn run() -> Result<()> {
     // Pretty/INFO on stdout; a parseable RUST_LOG overrides the level.
     cloudkit_core::logging::init(&LogConfig::default()).context("initializing logging")?;
 
-    let transport_config = cloudkit_cli::transport_config_from(&cfg, &cwd);
-    println!(
-        "Connecting to Telegram (session: {}) ...",
-        transport_config.session_path.display()
-    );
-    let connect = cloudkit_cli::connect_with_deadline(
-        GrammersTransport::connect(transport_config),
-        cloudkit_cli::CONNECT_DEADLINE,
-    );
-    let transport = tokio::select! {
-        result = connect => match result {
-            Ok(transport) => transport,
-            Err(error) => {
-                eprintln!("Error: connecting the Telegram transport");
-                match &error {
-                    cloudkit_cli::ConnectGuardError::Deadline(_) => {}
-                    cloudkit_cli::ConnectGuardError::Inner(source) => {
-                        eprintln!("Caused by:\n    {source}");
+    let mut run_options = cloudkit_cli::RunOptions::default();
+    let transport: Arc<dyn cloudkit_core::transport::CloudTransport> = match cfg.backend {
+        cloudkit_core::config::Backend::Telegram => {
+            // The legacy arm, byte-for-byte: session glue → visible
+            // progress line → deadline-bounded connect raced against
+            // Ctrl+C → the failure hint on error.
+            let transport_config = cloudkit_cli::transport_config_from(&cfg, &cwd);
+            println!(
+                "Connecting to Telegram (session: {}) ...",
+                transport_config.session_path.display()
+            );
+            let connect = cloudkit_cli::connect_with_deadline(
+                GrammersTransport::connect(transport_config),
+                cloudkit_cli::CONNECT_DEADLINE,
+            );
+            let transport = tokio::select! {
+                result = connect => match result {
+                    Ok(transport) => transport,
+                    Err(error) => {
+                        eprintln!("Error: connecting the Telegram transport");
+                        match &error {
+                            cloudkit_cli::ConnectGuardError::Deadline(_) => {}
+                            cloudkit_cli::ConnectGuardError::Inner(source) => {
+                                eprintln!("Caused by:\n    {source}");
+                            }
+                        }
+                        eprintln!("{}", cloudkit_cli::connect_failure_hint());
+                        std::process::exit(1);
                     }
+                },
+                _ = tokio::signal::ctrl_c() => {
+                    println!("Interrupted while connecting to Telegram; exiting.");
+                    return Ok(());
                 }
-                eprintln!("{}", cloudkit_cli::connect_failure_hint());
-                std::process::exit(1);
-            }
-        },
-        _ = tokio::signal::ctrl_c() => {
-            println!("Interrupted while connecting to Telegram; exiting.");
-            return Ok(());
+            };
+            Arc::new(transport)
+        }
+        backend => {
+            println!(
+                "Connecting to the {backend} backend ...",
+                backend = backend.as_str()
+            );
+            let dispatched = cloudkit_cli::build_backend_transport(&cfg).await?;
+            // K12: the periodic sync task keys on the backend's own
+            // identity (baidu's account uid), not on telegram creds.
+            run_options.sync_namespace = Some(dispatched.sync_namespace_key());
+            dispatched.clone_dyn()
         }
     };
 
-    let handle = run_with_transport(&cfg, Arc::new(transport)).await?;
+    let handle = cloudkit_cli::run_with_transport_options(&cfg, transport, run_options).await?;
     println!(
         "CyDrive is running: WebDAV at http://{}  |  dashboard at http://127.0.0.1:{}  |  press Ctrl+C to stop  |  or `cydrive stop`",
         handle.local_addr(),

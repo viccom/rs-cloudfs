@@ -130,11 +130,7 @@ async fn test_env_with_caps(
     let cache_root = dir.path().join("cache");
     let db = Arc::new(MetaDatabase::open(&dir.path().join("meta.db")).expect("open temp db"));
     let cache = CacheManager::new(cache_root.clone(), cache_limit);
-    let mock = Arc::new(
-        MockTransport::builder()
-            .capabilities(caps)
-            .build(),
-    );
+    let mock = Arc::new(MockTransport::builder().capabilities(caps).build());
     mock.connect().await.expect("pre-connect mock transport");
     let transport: Arc<dyn CloudTransport> = mock.clone();
     let vfs = Arc::new(Vfs::new(db.clone(), cache, transport, test_cfg()));

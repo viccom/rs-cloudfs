@@ -144,3 +144,29 @@ impl BaiduParams {
 pub async fn factory(params: &BaiduParams) -> Result<Arc<BaiduDriver>, StorageError> {
     Ok(Arc::new(BaiduDriver::connect(params).await?))
 }
+
+/// setup 验证流（B3b dispatch 单元）：用粘贴的 refresh_token 执行一次
+/// 标准刷新（K18 直连 client + [`oauth::refresh_grant`]），返回新 token
+/// 对。**一次一换语义**（K13）：返回的 refresh_token 已是唯一活值——
+/// 调用方（setup）必须与 access_token 一起落盘，否则旧值作废后实例
+/// 下次启动即 Unauthorized。
+///
+/// 不构造驱动（BaiduClient 要求双 token 齐备，setup 起点只有
+/// refresh_token）；错误归一同 oauth 面：`Unauthorized{false}` = 重授权
+/// 指引，`Unavailable` = 暂时性网络/协议异常。
+pub async fn refresh_tokens(params: &BaiduParams) -> Result<(String, String), StorageError> {
+    let refresh = params
+        .refresh_token
+        .as_deref()
+        .ok_or(StorageError::Invalid)?;
+    let client = client::direct_api_client()?;
+    let pair = oauth::refresh_grant(
+        &client,
+        &params.oauth_base,
+        &params.app_key,
+        &params.app_secret,
+        refresh,
+    )
+    .await?;
+    Ok((pair.access, pair.refresh))
+}

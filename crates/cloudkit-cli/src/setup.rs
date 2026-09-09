@@ -72,6 +72,97 @@ fn normalize_wizard_letter(input: &str) -> String {
     }
 }
 
+/// The baidu wizard branch's collected answers (Phase 2 / B3b dispatch
+/// unit): the three pasted credentials. The access token is NOT asked
+/// for — the branch refreshes with the pasted refresh_token and stores
+/// the verified pair ([`apply_baidu_wizard`]).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BaiduWizardAnswers {
+    /// Baidu app key (K14; no code default exists).
+    pub app_key: String,
+    /// Baidu app secret (K14).
+    pub app_secret: String,
+    /// A live refresh token (paste from the authorization flow).
+    pub refresh_token: String,
+}
+
+/// Validates the baidu answers: every credential non-empty after
+/// trimming (the complaint names the offending field, the token-shape
+/// loop's baidu counterpart).
+pub fn validate_baidu_credentials(answers: &BaiduWizardAnswers) -> Result<(), String> {
+    for (name, value) in [
+        ("app_key", &answers.app_key),
+        ("app_secret", &answers.app_secret),
+        ("refresh_token", &answers.refresh_token),
+    ] {
+        if value.trim().is_empty() {
+            return Err(format!("{name} cannot be empty"));
+        }
+    }
+    Ok(())
+}
+
+/// Applies the baidu wizard's outcome onto `cfg` (pure): sets the four
+/// K14 keys and flips `backend = "baidu"`.
+///
+/// **Strict-validate ruling (B3b 段二b)**: call this ONLY with a
+/// refresh-VERIFIED pair (`ck_baidu::refresh_tokens` succeeded) — the
+/// backend key flips LAST, when all four keys are in hand, so no
+/// half-configured baidu instance can be written and a later boot
+/// fails in validate with a naming-what's-missing message instead of
+/// deep inside the connect. (The alternative — writing
+/// `backend = "baidu"` first and back-filling tokens — was rejected:
+/// validate's four-key rule would refuse the half-written config with
+/// a MORE actionable message than a mid-connect Invalid, so strictness
+/// costs nothing and prevents the foot-gun.)
+pub fn apply_baidu_wizard(
+    mut cfg: CyDriveConfig,
+    answers: &BaiduWizardAnswers,
+    access_token: &str,
+    refresh_token: &str,
+) -> CyDriveConfig {
+    cfg.backend = cloudkit_core::config::Backend::Baidu;
+    cfg.baidu_app_key = Some(answers.app_key.trim().to_string());
+    cfg.baidu_app_secret = Some(answers.app_secret.trim().to_string());
+    cfg.baidu_access_token = Some(access_token.to_string());
+    cfg.baidu_refresh_token = Some(refresh_token.to_string());
+    cfg
+}
+
+/// The local wizard branch's collected answers: the drive's root
+/// directory.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalWizardAnswers {
+    /// The absolute path serving as the drive root (K6: the local
+    /// backend's identity IS its root).
+    pub local_root: String,
+}
+
+/// Validates a local root: non-empty after trimming and absolute
+/// (validate's rule surfaced at prompt time instead of boot time —
+/// both Windows `C:\...` and Unix `/...` shapes pass).
+pub fn validate_local_root(root: &str) -> Result<(), String> {
+    let trimmed = root.trim();
+    if trimmed.is_empty() {
+        return Err("local_root cannot be empty".to_string());
+    }
+    if !std::path::Path::new(trimmed).is_absolute() {
+        return Err(format!(
+            "local_root must be an absolute path (e.g. \"C:\\data\\cloudfs\" or \
+             \"/srv/cloudfs\"), got {trimmed:?}"
+        ));
+    }
+    Ok(())
+}
+
+/// Applies the local wizard's outcome onto `cfg` (pure): sets
+/// `local_root` and flips `backend = "local"` (no secrets involved).
+pub fn apply_local_wizard(mut cfg: CyDriveConfig, answers: &LocalWizardAnswers) -> CyDriveConfig {
+    cfg.backend = cloudkit_core::config::Backend::Local;
+    cfg.local_root = Some(answers.local_root.trim().to_string());
+    cfg
+}
+
 /// Applies the answers onto `cfg`: fills the three wizard fields (the
 /// letter normalised) and returns the config; nothing is written to
 /// disk and every other field passes through untouched.
@@ -121,19 +212,44 @@ pub fn persist_setup(cfg: &CyDriveConfig, store: Option<&dyn CredentialStore>) -
 /// The interactive wizard against the injected credential store.
 /// `Some(store)` = credential-vault mode; `None` = headless mode (the
 /// secrets land in `config.toml`, banner and final message say so).
-/// Prompts:
-/// bot token (validated in a red-on-error loop), chat ID (numeric loop —
-/// dialoguer re-asks on a parse failure), drive letter (Windows only,
-/// defaulting to the platform's best pick; off Windows the question is
-/// skipped and the config default `"Y:"` applies, per the frozen spec).
-/// Then apply + persist + the run guidance.
-pub fn run_setup_interactive(store: Option<&dyn CredentialStore>) -> Result<()> {
-    use dialoguer::Input;
+///
+/// First question is the storage backend (Phase 2 / B3b dispatch unit;
+/// default telegram — the frozen legacy flow, byte-identical):
+///
+/// - **telegram** — the frozen prompts: bot token (validated in a
+///   red-on-error loop), chat ID (numeric loop), drive letter
+///   (Windows only, defaulting to the platform's best pick);
+/// - **baidu** — paste app key / secret / refresh token; the refresh
+///   runs against the OAuth endpoint (verification — an invalid
+///   refresh_token refuses the wizard instead of writing a dead
+///   config), and the VERIFIED pair plus the pasted credentials land
+///   in `config.toml` (K14 allows plaintext token keys there — the
+///   vault flow scrubs only the telegram token/password/secret; the
+///   baidu keys have no credential-schema keyring entries);
+/// - **local** — one absolute-path prompt (validated), no secrets.
+///
+/// Then apply + persist + the run guidance. (Async: the baidu branch's
+/// refresh-verification dials the OAuth endpoint.)
+pub async fn run_setup_interactive(store: Option<&dyn CredentialStore>) -> Result<()> {
+    use dialoguer::{Input, Select};
 
     println!("CyDrive first-time setup");
     match store {
         Some(_) => println!("Secrets are stored in the OS credential manager, never in the config file."),
         None => println!("No OS credential store is available (headless); secrets will be written into config.toml."),
+    }
+
+    let backends = ["telegram", "baidu", "local (a directory on this machine)"];
+    let backend = Select::new()
+        .with_prompt("Storage backend")
+        .items(backends)
+        .default(0)
+        .interact()
+        .context("asking for the storage backend")?;
+    match backend {
+        1 => return run_setup_baidu(store).await,
+        2 => return run_setup_local(),
+        _ => {}
     }
 
     let bot_token: String = Input::new()
@@ -178,5 +294,110 @@ pub fn run_setup_interactive(store: Option<&dyn CredentialStore>) -> Result<()> 
         None => println!("Configuration saved to ./config.toml (secrets are IN the file — headless mode; keep it private)."),
     }
     println!("Run `cydrive run` to start CyDrive, or `cydrive doctor` to verify the setup.");
+    Ok(())
+}
+
+/// The baidu branch of the wizard (Phase 2 / B3b): paste the three
+/// credentials → refresh-verify (a live network call; a failure
+/// refuses the wizard with the actionable message instead of writing
+/// a dead config) → persist the verified four keys + `backend=baidu`.
+///
+/// Token persistence is `config.toml` in BOTH store modes (K14: the
+/// token keys are config-domain; the scrubbed write keeps them — only
+/// the telegram token/password/sync-secret are scrubbed).
+async fn run_setup_baidu(store: Option<&dyn CredentialStore>) -> Result<()> {
+    use dialoguer::Input;
+
+    println!("Baidu netdisk backend: paste the app credentials and a refresh token.");
+    println!("  (The refresh token rotates on every refresh — this wizard verifies it once and stores the NEW pair.)");
+
+    let answers = loop {
+        let app_key: String = Input::new()
+            .with_prompt("Baidu App Key")
+            .interact_text()
+            .context("reading the app key")?;
+        let app_secret: String = Input::new()
+            .with_prompt("Baidu App Secret")
+            .interact_text()
+            .context("reading the app secret")?;
+        let refresh_token: String = Input::new()
+            .with_prompt("Baidu Refresh Token")
+            .interact_text()
+            .context("reading the refresh token")?;
+        let answers = BaiduWizardAnswers {
+            app_key,
+            app_secret,
+            refresh_token,
+        };
+        match validate_baidu_credentials(&answers) {
+            Ok(()) => break answers,
+            Err(complaint) => println!("{complaint}"),
+        }
+    };
+
+    // Refresh-verify (production OAuth endpoint; K18 direct client —
+    // no proxy). One-time-use semantics: the response's pair is the
+    // only live value from here on.
+    let params = ck_baidu::BaiduParams {
+        app_key: answers.app_key.trim().to_string(),
+        app_secret: answers.app_secret.trim().to_string(),
+        refresh_token: Some(answers.refresh_token.trim().to_string()),
+        ..Default::default()
+    };
+    println!("Verifying the refresh token against Baidu OAuth ...");
+    let (access, refresh) = match ck_baidu::refresh_tokens(&params).await {
+        Ok(pair) => pair,
+        Err(cloudkit_storage::StorageError::Unauthorized { recoverable: false }) => {
+            anyhow::bail!(
+                "the refresh token was refused (invalid or expired) — nothing was written; \
+                 re-authorize the app to obtain a fresh refresh token and re-run \
+                 `cydrive setup`"
+            );
+        }
+        Err(error) => {
+            anyhow::bail!(
+                "verifying the refresh token failed ({error}) — nothing was written; check \
+                 the network (baidu connects directly, no proxy) and re-run `cydrive setup`"
+            );
+        }
+    };
+
+    let cfg = apply_baidu_wizard(CyDriveConfig::default(), &answers, &access, &refresh);
+    persist_setup(&cfg, store)?;
+    println!(
+        "Configuration saved to ./config.toml (backend = baidu; the four baidu_* keys are in \
+         the file — K14 allows plaintext token keys there, keep it private)."
+    );
+    println!("Run `cydrive doctor` to probe the token, or `cydrive run` to start.");
+    Ok(())
+}
+
+/// The local branch of the wizard (Phase 2 / B3b): one absolute-path
+/// prompt (validated; the directory is created on first run by the
+/// driver factory — doctor probes writability on demand). No secrets.
+fn run_setup_local() -> Result<()> {
+    use dialoguer::Input;
+
+    println!("Local backend: the drive is one directory on this machine.");
+
+    let answers = loop {
+        let local_root: String = Input::new()
+            .with_prompt("Local drive root (absolute path)")
+            .interact_text()
+            .context("reading the local root")?;
+        let answers = LocalWizardAnswers { local_root };
+        match validate_local_root(&answers.local_root) {
+            Ok(()) => break answers,
+            Err(complaint) => println!("{complaint}"),
+        }
+    };
+
+    let cfg = apply_local_wizard(CyDriveConfig::default(), &answers);
+    persist_setup(&cfg, None)?;
+    println!(
+        "Configuration saved to ./config.toml (backend = local; no secrets involved). The \
+         root directory is created on the first `cydrive run`."
+    );
+    println!("Run `cydrive doctor` to check the root, or `cydrive run` to start.");
     Ok(())
 }

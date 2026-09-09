@@ -25,12 +25,12 @@ use std::sync::Arc;
 
 use axum::routing::get;
 use axum::Router;
+use ck_baidu::TokenStore;
 use cloudkit_cli::{
     build_backend_transport, build_backend_transport_with, local_sync_unsupported_warning,
-    proxy_ineffective_warning, BaiduEndpoints, BackendProbe, BackendTransport,
+    proxy_ineffective_warning, BackendProbe, BackendTransport, BaiduEndpoints,
 };
 use cloudkit_core::config::{Backend, CyDriveConfig};
-use ck_baidu::TokenStore;
 
 // ------------------------------------------------------ mock xpan backend ---
 
@@ -188,9 +188,10 @@ async fn local_key_builds_local_transport() {
 async fn default_config_stays_telegram_and_dispatch_refuses_with_guidance() {
     let default = CyDriveConfig::default();
     assert_eq!(default.backend, Backend::Telegram, "absent key = telegram");
-    let err = build_backend_transport(&default)
-        .await
-        .expect_err("the telegram arm is not this dispatch's product");
+    let err = match build_backend_transport(&default).await {
+        Ok(_) => panic!("the telegram arm is not this dispatch's product"),
+        Err(err) => err,
+    };
     let message = err.to_string();
     assert!(
         message.contains("telegram"),
@@ -238,8 +239,7 @@ async fn local_sync_namespace_is_a_path_digest() {
 fn local_sync_unsupported_warning_gates_on_backend_and_sync_url() {
     let mut cfg = local_config(std::path::Path::new("C:/ignored"));
     cfg.sync_url = Some("http://sync.example.org:8290".to_string());
-    let warning =
-        local_sync_unsupported_warning(&cfg).expect("local + sync_url must warn");
+    let warning = local_sync_unsupported_warning(&cfg).expect("local + sync_url must warn");
     assert!(
         warning.contains("local") && warning.contains("not supported"),
         "the warning names the local backend and the unsupported sync: {warning}"
@@ -273,12 +273,17 @@ fn proxy_ineffective_warning_gates_on_backend() {
         "the warning states the direct connection: {warning}"
     );
 
-    let mut local = local_config(std::path::Path::new("C:/ignored"));
-    local.proxy_url = Some("socks5://127.0.0.1:7890".to_string());
+    let local = {
+        let mut c = local_config(std::path::Path::new("C:/ignored"));
+        c.proxy_url = Some("socks5://127.0.0.1:7890".to_string());
+        c
+    };
     assert!(proxy_ineffective_warning(&local).is_some());
 
-    let mut telegram = CyDriveConfig::default();
-    telegram.proxy_url = Some("socks5://127.0.0.1:7890".to_string());
+    let telegram = CyDriveConfig {
+        proxy_url: Some("socks5://127.0.0.1:7890".to_string()),
+        ..CyDriveConfig::default()
+    };
     assert!(
         proxy_ineffective_warning(&telegram).is_none(),
         "telegram consumes proxy_url — no warning"
@@ -327,10 +332,7 @@ async fn token_rotation_persists_through_the_dispatch_store() {
         .clone();
     assert_eq!(
         saved,
-        vec![(
-            "rotated-access".to_string(),
-            "rotated-refresh".to_string()
-        )],
+        vec![("rotated-access".to_string(), "rotated-refresh".to_string())],
         "the rotated pair was persisted on arrival"
     );
 }
@@ -342,7 +344,7 @@ async fn token_rotation_persists_through_the_dispatch_store() {
 async fn config_token_store_updates_the_two_token_keys() {
     let dir = tempfile::tempdir().expect("temp dir");
     let path = dir.path().join("config.toml");
-    let mut cfg = baidu_config();
+    let cfg = baidu_config();
     cfg.save_toml(&path).expect("seed config.toml");
     let store = cloudkit_cli::ConfigTokenStore::new(path.clone());
 
@@ -362,8 +364,8 @@ async fn config_token_store_updates_the_two_token_keys() {
 #[tokio::test]
 async fn baidu_backend_probe_alive_against_mock() {
     let (addr, _calls) = spawn_mock_baidu(false).await;
-    let probe = cloudkit_cli::baidu_backend_probe_with(&baidu_config(), &mock_endpoints(addr))
-        .await;
+    let probe =
+        cloudkit_cli::baidu_backend_probe_with(&baidu_config(), &mock_endpoints(addr)).await;
     assert!(
         matches!(probe, BackendProbe::Alive),
         "the healthy mock answers Alive, got: {probe:?}"

@@ -151,9 +151,10 @@ impl LocalDriver {
         })
     }
 
-    /// 规范化卷根绝对路径（transport 面 connect 探针的落点；pub(crate)，
-    /// B3b）。
-    pub(crate) fn root_path(&self) -> &std::path::Path {
+    /// 规范化卷根绝对路径（transport 面 connect 探针的落点；组合根取
+    /// 它做 K12 local 命名空间的摘要输入——B3b dispatch 单元跨 crate
+    /// 消费故 pub）。
+    pub fn root_path(&self) -> &std::path::Path {
         &self.root
     }
 

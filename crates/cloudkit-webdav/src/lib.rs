@@ -280,7 +280,10 @@ impl DavFileSystem for CyDriveFs {
             // (idempotent retry; refusal keeps the row). Bit off
             // (telegram/mock) is a no-op and the legacy row delete
             // proceeds unchanged.
-            self.vfs.delete_remote_for_row(&rel).await.map_err(vfs_err)?;
+            self.vfs
+                .delete_remote_for_row(&rel)
+                .await
+                .map_err(vfs_err)?;
             self.db.delete_file(rel.as_str()).map_err(db_err)?;
             // No manual doorbell: the row delete above rang the db-layer
             // files hook (the chokepoint) — deletion is the tombstone's
@@ -314,7 +317,10 @@ impl DavFileSystem for CyDriveFs {
             // refusal aborts with the row kept. Bit off
             // (telegram/mock) is a no-op (Python parity: the remote
             // messages stay).
-            self.vfs.delete_remote_for_row(&rel).await.map_err(vfs_err)?;
+            self.vfs
+                .delete_remote_for_row(&rel)
+                .await
+                .map_err(vfs_err)?;
             self.db.delete_file(rel.as_str()).map_err(db_err)?;
             // No manual doorbell: the row delete above rang the db-layer
             // files hook (the chokepoint) — deletion is the tombstone's

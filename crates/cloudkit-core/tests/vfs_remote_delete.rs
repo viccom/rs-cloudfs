@@ -76,20 +76,12 @@ async fn test_env(
     let cache_root = dir.path().join("cache");
     let db = Arc::new(MetaDatabase::open(&dir.path().join("meta.db")).expect("open temp db"));
     let cache = CacheManager::new(cache_root.clone(), u64::MAX);
-    let mock = Arc::new(
-        MockTransport::builder()
-            .capabilities(caps)
-            .build(),
-    );
+    let mock = Arc::new(MockTransport::builder().capabilities(caps).build());
     mock.connect().await.expect("pre-connect mock transport");
     (dir, db, cache, cache_root, mock)
 }
 
-fn build_vfs(
-    db: &Arc<MetaDatabase>,
-    cache: CacheManager,
-    mock: &Arc<MockTransport>,
-) -> Vfs {
+fn build_vfs(db: &Arc<MetaDatabase>, cache: CacheManager, mock: &Arc<MockTransport>) -> Vfs {
     let transport: Arc<dyn CloudTransport> = mock.clone();
     Vfs::new(db.clone(), cache, transport, test_cfg())
 }
@@ -133,12 +125,7 @@ async fn wait_for_drained_uploads(vfs: &Vfs, paths: &CacheManager, rel: &RelPath
 
 /// Puts one file, drains the upload and re-hydrates, leaving the
 /// canonical deletable state: an uploaded row owning a cache copy.
-async fn uploaded_file(
-    vfs: &Vfs,
-    paths: &CacheManager,
-    rel: &RelPath,
-    bytes: &[u8],
-) {
+async fn uploaded_file(vfs: &Vfs, paths: &CacheManager, rel: &RelPath, bytes: &[u8]) {
     vfs.put(rel, bytes, 1_700_000_000.0)
         .await
         .expect("put accepted");
@@ -186,7 +173,10 @@ async fn remote_delete_not_found_is_tolerated_as_success() {
     uploaded_file(&vfs, &paths, &rel, b"payload").await;
     // Remove the remote object out-of-band (e.g. another client deleted
     // it): the row's handle now points at nothing.
-    let row = db.get_file("/pre-removed.bin").expect("db read").expect("row");
+    let row = db
+        .get_file("/pre-removed.bin")
+        .expect("db read")
+        .expect("row");
     let handle = RemoteHandle {
         first_msg_id: row.telegram_msg_id.expect("uploaded row carries the id"),
         chunk_msg_ids: Vec::new(),
@@ -197,9 +187,9 @@ async fn remote_delete_not_found_is_tolerated_as_success() {
         .await
         .expect("out-of-band remote delete");
 
-    vfs.remove_file(&rel).await.expect(
-        "remove_file must tolerate the already-gone remote object (idempotent end state)",
-    );
+    vfs.remove_file(&rel)
+        .await
+        .expect("remove_file must tolerate the already-gone remote object (idempotent end state)");
     assert!(
         db.get_file("/pre-removed.bin").expect("db read").is_none(),
         "the row is gone despite the remote NotFound"

@@ -87,6 +87,19 @@ pub(crate) struct BaiduClient {
     refresh_lock: tokio::sync::Mutex<()>,
 }
 
+/// K18 直连 api client（redirect none + 60s 超时；[`BaiduClient::new`]
+/// 与 [`crate::refresh_tokens`] 共用——一处构造形态，两处消费）。
+pub(crate) fn direct_api_client() -> Result<reqwest::Client, StorageError> {
+    reqwest::Client::builder()
+        .no_proxy() // K18：直连，绕过本机代理
+        .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)) // K18：强制 IPv4 dial
+        .user_agent(UA)
+        .redirect(reqwest::redirect::Policy::none())
+        .timeout(Duration::from_secs(60))
+        .build()
+        .map_err(|e| StorageError::Io(format!("baidu api client build: {e}")))
+}
+
 impl BaiduClient {
     /// 构造双 client 并装载 token 状态。
     ///
@@ -96,24 +109,16 @@ impl BaiduClient {
         let (Some(access), Some(refresh)) = (&params.access_token, &params.refresh_token) else {
             return Err(StorageError::Invalid);
         };
-        let base = || {
-            reqwest::Client::builder()
-                .no_proxy() // K18：直连，绕过本机代理
-                .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)) // K18：强制 IPv4 dial
-                .user_agent(UA)
-        };
-        let api = base()
-            .redirect(reqwest::redirect::Policy::none())
-            .timeout(Duration::from_secs(60))
-            .build()
-            .map_err(|e| StorageError::Io(format!("baidu api client build: {e}")))?;
-        let stream = base()
+        let stream = reqwest::Client::builder()
+            .no_proxy() // K18：直连，绕过本机代理
+            .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED)) // K18：强制 IPv4 dial
+            .user_agent(UA)
             .redirect(reqwest::redirect::Policy::none())
             .connect_timeout(Duration::from_secs(20))
             .build()
             .map_err(|e| StorageError::Io(format!("baidu stream client build: {e}")))?;
         Ok(BaiduClient {
-            api,
+            api: direct_api_client()?,
             stream,
             api_base: params.api_base.clone(),
             oauth_base: params.oauth_base.clone(),

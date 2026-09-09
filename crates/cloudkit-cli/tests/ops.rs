@@ -598,7 +598,8 @@ fn baidu_wizard_apply_sets_four_keys_and_backend() {
     assert_eq!(cfg.baidu_app_secret.as_deref(), Some("paste-secret"));
     assert_eq!(cfg.baidu_access_token.as_deref(), Some("verified-access"));
     assert_eq!(cfg.baidu_refresh_token.as_deref(), Some("verified-refresh"));
-    cfg.validate().expect("the applied config validates (four keys + root default)");
+    cfg.validate()
+        .expect("the applied config validates (four keys + root default)");
 }
 
 /// The baidu wizard's validation: every credential must be non-empty
@@ -657,9 +658,11 @@ use cloudkit_cli::doctor::backend_checks;
 #[test]
 fn doctor_local_root_writable_ok_and_file_root_fails() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut cfg = CyDriveConfig::default();
-    cfg.backend = cloudkit_core::config::Backend::Local;
-    cfg.local_root = Some(dir.path().to_string_lossy().into_owned());
+    let cfg = CyDriveConfig {
+        backend: cloudkit_core::config::Backend::Local,
+        local_root: Some(dir.path().to_string_lossy().into_owned()),
+        ..CyDriveConfig::default()
+    };
 
     let checks = backend_checks(&cfg);
     let root_check = checks
@@ -670,13 +673,21 @@ fn doctor_local_root_writable_ok_and_file_root_fails() {
 
     let occupied = dir.path().join("occupied");
     fs::write(&occupied, b"x").expect("file in the root's way");
-    cfg.local_root = Some(occupied.to_string_lossy().into_owned());
+    let cfg = CyDriveConfig {
+        local_root: Some(occupied.to_string_lossy().into_owned()),
+        ..cfg
+    };
     let checks = backend_checks(&cfg);
     let root_check = checks
         .iter()
         .find(|c| c.name.contains("local root"))
         .expect("a local-root check exists");
-    assert_eq!(root_check.status, CheckStatus::Fail, "{}", root_check.detail);
+    assert_eq!(
+        root_check.status,
+        CheckStatus::Fail,
+        "{}",
+        root_check.detail
+    );
 }
 
 /// K12 tail in doctor: local + sync_url surfaces the unsupported-sync
@@ -684,10 +695,12 @@ fn doctor_local_root_writable_ok_and_file_root_fails() {
 #[test]
 fn doctor_local_sync_warning_only_for_local_with_sync_url() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut local = CyDriveConfig::default();
-    local.backend = cloudkit_core::config::Backend::Local;
-    local.local_root = Some(dir.path().to_string_lossy().into_owned());
-    local.sync_url = Some("http://sync.example.org:8290".to_string());
+    let local = CyDriveConfig {
+        backend: cloudkit_core::config::Backend::Local,
+        local_root: Some(dir.path().to_string_lossy().into_owned()),
+        sync_url: Some("http://sync.example.org:8290".to_string()),
+        ..CyDriveConfig::default()
+    };
     let checks = backend_checks(&local);
     assert!(
         checks
@@ -696,7 +709,10 @@ fn doctor_local_sync_warning_only_for_local_with_sync_url() {
         "local + sync_url warns: {checks:?}"
     );
 
-    local.sync_url = None;
+    let local = CyDriveConfig {
+        sync_url: None,
+        ..local
+    };
     assert!(
         !backend_checks(&local)
             .iter()
@@ -704,13 +720,15 @@ fn doctor_local_sync_warning_only_for_local_with_sync_url() {
         "no sync_url — no warning"
     );
 
-    let mut baidu = CyDriveConfig::default();
-    baidu.backend = cloudkit_core::config::Backend::Baidu;
-    baidu.baidu_app_key = Some("k".into());
-    baidu.baidu_app_secret = Some("s".into());
-    baidu.baidu_access_token = Some("a".into());
-    baidu.baidu_refresh_token = Some("r".into());
-    baidu.sync_url = Some("http://sync.example.org:8290".to_string());
+    let baidu = CyDriveConfig {
+        backend: cloudkit_core::config::Backend::Baidu,
+        baidu_app_key: Some("k".into()),
+        baidu_app_secret: Some("s".into()),
+        baidu_access_token: Some("a".into()),
+        baidu_refresh_token: Some("r".into()),
+        sync_url: Some("http://sync.example.org:8290".to_string()),
+        ..CyDriveConfig::default()
+    };
     assert!(
         !backend_checks(&baidu)
             .iter()
@@ -724,10 +742,12 @@ fn doctor_local_sync_warning_only_for_local_with_sync_url() {
 #[test]
 fn doctor_proxy_hint_only_for_direct_backends() {
     let dir = tempfile::tempdir().expect("tempdir");
-    let mut local = CyDriveConfig::default();
-    local.backend = cloudkit_core::config::Backend::Local;
-    local.local_root = Some(dir.path().to_string_lossy().into_owned());
-    local.proxy_url = Some("socks5://127.0.0.1:7890".to_string());
+    let local = CyDriveConfig {
+        backend: cloudkit_core::config::Backend::Local,
+        local_root: Some(dir.path().to_string_lossy().into_owned()),
+        proxy_url: Some("socks5://127.0.0.1:7890".to_string()),
+        ..CyDriveConfig::default()
+    };
     assert!(
         backend_checks(&local)
             .iter()
@@ -736,8 +756,10 @@ fn doctor_proxy_hint_only_for_direct_backends() {
         backend_checks(&local)
     );
 
-    let mut telegram = CyDriveConfig::default();
-    telegram.proxy_url = Some("socks5://127.0.0.1:7890".to_string());
+    let telegram = CyDriveConfig {
+        proxy_url: Some("socks5://127.0.0.1:7890".to_string()),
+        ..CyDriveConfig::default()
+    };
     assert!(
         !backend_checks(&telegram)
             .iter()
