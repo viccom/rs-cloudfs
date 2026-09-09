@@ -583,6 +583,26 @@ async fn process_job(
 
     // Contract 6: 0-byte uploads never touch the remote.
     if job.size == 0 {
+        // MiniRedir's small-file chain opens with an empty PUT artifact
+        // (empty PUT → LOCK → full PUT). When that artifact's job is
+        // processed after a superseding full PUT has already updated the
+        // row, `row` no longer describes an empty file: fast-pathing here
+        // would mark the row uploaded without any remote artifact AND
+        // delete the cache copy the superseding job still has to read
+        // (field log 2026-09-09: baidu demo readme.txt — the full job died
+        // 5× os error 2, the row phantom-uploaded with no msg id, the
+        // remote stayed empty). The row above is read fresh, so `row.size`
+        // is the current truth: a 0-byte job over a non-empty row is a
+        // stale artifact — skip it entirely; the superseding job owns the
+        // outcome.
+        if row.size != 0 {
+            tracing::debug!(
+                rel_path = %job.rel_path,
+                row_size = row.size,
+                "stale empty-PUT artifact skipped: the row was superseded by a full PUT"
+            );
+            return;
+        }
         match persist_zero_byte(db, &row, sha256) {
             Ok(()) => {
                 delete_local_copy(&job.local_path);

@@ -13,6 +13,7 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -1113,4 +1114,135 @@ async fn degrade_notification_failure_is_swallowed() {
         .expect("row exists");
     assert!(!row.is_uploaded, "row stays pending");
     assert!(local.exists(), "local copy kept");
+}
+
+// ---------------------------------------------------------------------------
+// 24. MiniRedir 空 PUT 工件竞态（field log 2026-09-09，baidu demo
+//     readme.txt）。Explorer/cp 的 MiniRedir 小文件链以「空 PUT → LOCK →
+//     完整 PUT」开路：空 PUT 的 0 字节任务若在完整 PUT 更新行**之后**才被
+//     worker 处理，persist_zero_byte 会用行的现值（已非 0）把行标记为已
+//     上传——而远端什么都没有（幽灵上传），且 delete_local_copy 把完整
+//     任务还要读的缓存副本删掉（现场日志：5× os error 2 后降级，无法
+//     自愈）。process_job 顶部的行读取是新鲜的，row.size 即当前真相：
+//     非 0 行上的 0 字节任务是过期工件，必须跳过——不持久化、不删缓存。
+//     Harness：门控诚实传输——首个 upload 停在 Notify 门上（保证两个 PUT
+//     都在任何 0 字节任务被处理前落定，把现场的不幸顺序变成确定性），
+//     upload 内真实读取 local_path（真后端全体如此；mock 的慷慨会掩盖
+//     缓存被删）。
+// ---------------------------------------------------------------------------
+
+struct GatedHonestUploadTransport {
+    inner: Arc<MockTransport>,
+    gate: Arc<tokio::sync::Notify>,
+    entered: tokio::sync::mpsc::UnboundedSender<()>,
+    first_upload_seen: AtomicBool,
+}
+
+#[async_trait::async_trait]
+impl CloudTransport for GatedHonestUploadTransport {
+    async fn connect(&self) -> Result<(), StorageError> {
+        self.inner.connect().await
+    }
+
+    async fn upload(&self, job: &UploadJob) -> Result<UploadReceipt, StorageError> {
+        if !self
+            .first_upload_seen
+            .swap(true, std::sync::atomic::Ordering::SeqCst)
+        {
+            let _ = self.entered.send(());
+            self.gate.notified().await;
+        }
+        // 真实后端（baidu/telegram/local）都读本地缓存副本；诚实读取
+        // 让「缓存已被工件任务删除」以 io 错误浮出，而非被 mock 掩盖。
+        std::fs::read(&job.local_path).map_err(|e| StorageError::Io(e.to_string()))?;
+        self.inner.upload(job).await
+    }
+
+    async fn open(
+        &self,
+        file: &cloudkit_core::transport::RemoteHandle,
+    ) -> Result<cloudkit_core::transport::ByteStream, StorageError> {
+        self.inner.open(file).await
+    }
+
+    async fn open_range(
+        &self,
+        file: &cloudkit_core::transport::RemoteHandle,
+        off: u64,
+        len: u64,
+    ) -> Result<cloudkit_core::transport::ByteStream, StorageError> {
+        self.inner.open_range(file, off, len).await
+    }
+
+    async fn delete_remote(
+        &self,
+        handle: &cloudkit_core::transport::RemoteHandle,
+    ) -> Result<(), StorageError> {
+        self.inner.delete_remote(handle).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn as_inbound(&self) -> Option<&dyn InboundCap> {
+        self.inner.as_inbound()
+    }
+
+    fn as_chat(&self) -> Option<&dyn ChatCap> {
+        self.inner.as_chat()
+    }
+}
+
+#[tokio::test]
+async fn stale_empty_put_artifact_neither_phantom_uploads_nor_deletes_cache() {
+    let (_dir, db, cache, mock) = test_env().await;
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let transport: Arc<dyn CloudTransport> = Arc::new(GatedHonestUploadTransport {
+        inner: mock.clone(),
+        gate: gate.clone(),
+        entered: entered_tx,
+        first_upload_seen: AtomicBool::new(false),
+    });
+    let handle = spawn_queue(db.clone(), transport, test_cfg(64));
+
+    // 任务 1：无关真实上传——worker 停在门上，后续任务全部排队。
+    seed_pending(&db, &cache, "/busy.bin", b"busy!", 1);
+    handle
+        .enqueue(job_for(&cache, "/busy.bin", 5, 1, 64))
+        .await
+        .expect("enqueue busy");
+    entered_rx.recv().await.expect("worker entered the gate");
+
+    // MiniRedir 空 PUT 工件：行(size 0) + 空缓存副本 + 任务 A。
+    let f_local = seed_pending(&db, &cache, "/f.bin", b"", 1);
+    handle
+        .enqueue(job_for(&cache, "/f.bin", 0, 1, 64))
+        .await
+        .expect("enqueue artifact");
+
+    // 完整 PUT：缓存重写 + 行 size 0→3（pending）+ 任务 B。
+    std::fs::write(&f_local, b"abc").expect("rewrite cache copy");
+    seed_row(&db, "/f.bin", 3, 1, false, None);
+    handle
+        .enqueue(job_for(&cache, "/f.bin", 3, 1, 64))
+        .await
+        .expect("enqueue full");
+
+    gate.notify_waiters();
+    handle.shutdown().await;
+
+    let row = db.get_file("/f.bin").expect("db read").expect("row exists");
+    assert!(row.is_uploaded, "the full PUT must land");
+    assert_eq!(
+        row.telegram_msg_id,
+        Some(2),
+        "stale artifact must not phantom-upload: the row is identified by the \
+         REAL job's receipt (busy=1, full=2); None means the 0-byte job marked \
+         it uploaded without any remote artifact"
+    );
+    let chunks = db.get_chunks_by_file_id(row.id).expect("read chunks");
+    assert_eq!(chunks.len(), 1, "the real job's chunk row exists");
+    assert_eq!(chunks[0].telegram_msg_id, Some(2));
 }
