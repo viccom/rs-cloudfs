@@ -26,7 +26,7 @@ use cloudkit_cli::{
     discover_config, discover_config_with_volumes_and_store, resolve_volume_settings,
     DiscoveredConfig,
 };
-use cloudkit_core::config::VolumeConfig;
+use cloudkit_core::config::{load_volumes, VolumeConfig};
 use cloudkit_core::credentials::InMemoryStore;
 use cloudkit_core::database::{FileUpsert, MetaDatabase};
 
@@ -606,4 +606,73 @@ fn resolve_volume_settings_keeps_baidu_root_verbatim() {
         "db rebases: {}",
         resolved.db_path
     );
+}
+
+/// Multi-volume rebuild (the fresh-instance bootstrap): each rebuildable
+/// volume's index is rebuilt from its OWN backend into its OWN volume
+/// home db (K21), and telegram volumes are skipped (shadow index — the
+/// index lives in the db/sync, the backend has nothing to walk). A fresh
+/// multi-volume install therefore serves listings only after this pass —
+/// the WebDAV/dashboard listing surface is db-indexed by design.
+#[tokio::test]
+async fn rebuild_multi_populates_each_volume_home_db_and_skips_telegram() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("one.toml"),
+        "backend = \"local\"\nlocal_root = \"root\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("chat.toml"),
+        "backend = \"telegram\"\nbot_token = \"1:x\"\nchat_id = 5\n",
+    );
+    // The backend truth: two files + one directory on disk, none in the
+    // db. The relative local_root rebases into the VOLUME HOME (K21:
+    // volumes/one/root), so that is where the files must be.
+    let root = dir.path().join("volumes").join("one").join("root");
+    std::fs::create_dir_all(root.join("docs")).expect("seed dir");
+    write_file(&root.join("readme.txt"), "hello rebuild");
+    write_file(&root.join("docs").join("n.txt"), "n");
+    let _guard = chdir(dir.path());
+
+    let volumes = load_volumes(Path::new("volumes")).expect("load volume specs");
+    let results = cloudkit_cli::run_rebuild_multi(&volumes)
+        .await
+        .expect("multi rebuild");
+
+    assert_eq!(results.len(), 2, "one report per volume");
+    let one = results
+        .iter()
+        .find(|(n, _)| n == "one")
+        .expect("one reported");
+    let outcome = match &one.1 {
+        Ok(outcome) => outcome,
+        Err(error) => panic!("volume one must rebuild: {error:#}"),
+    };
+    assert_eq!(outcome.files, 2, "two file rows: {outcome:?}");
+    assert_eq!(outcome.dirs, 1, "one directory row: {outcome:?}");
+
+    let chat = results
+        .iter()
+        .find(|(n, _)| n == "chat")
+        .expect("chat reported");
+    assert!(
+        matches!(&chat.1, Err(message) if message.contains("telegram")),
+        "telegram volumes are skipped with the refusal: {:?}",
+        chat.1.as_ref().err()
+    );
+
+    // The rows landed in the VOLUME HOME db (K21), not the process cwd.
+    let db = MetaDatabase::open(
+        &dir.path()
+            .join("volumes")
+            .join("one")
+            .join("cydrive_meta.db"),
+    )
+    .expect("open the volume home db");
+    assert!(db.get_file("/readme.txt").expect("read").is_some());
+    assert!(db.get_file("/docs/n.txt").expect("read").is_some());
 }

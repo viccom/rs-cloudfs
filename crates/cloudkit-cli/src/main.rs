@@ -446,16 +446,33 @@ fn stats_cmd() -> Result<()> {
 /// the instance db resolves from the discovered `db_path`), assemble
 /// the driver from the `backend` key and bootstrap the index. One-shot
 /// command: no tracing subscriber, its own output (the stats/doctor
-/// convention).
+/// convention). Multi-volume mode rebuilds every rebuildable volume
+/// from its own backend (telegram volumes skip — shadow index).
 async fn rebuild_cmd() -> Result<()> {
-    let cfg = discover_config().context("config discovery failed")?;
-    let outcome = cloudkit_cli::run_rebuild_command(&cfg).await?;
-    println!(
-        "rebuild complete: {} file row(s), {} directory row(s) rebuilt from the {} backend",
-        outcome.files,
-        outcome.dirs,
-        cfg.backend.as_str()
-    );
+    match discover_config_with_volumes().context("config discovery failed")? {
+        DiscoveredConfig::Single(cfg) => {
+            let outcome = cloudkit_cli::run_rebuild_command(&cfg).await?;
+            println!(
+                "rebuild complete: {} file row(s), {} directory row(s) rebuilt from the {} backend",
+                outcome.files,
+                outcome.dirs,
+                cfg.backend.as_str()
+            );
+        }
+        DiscoveredConfig::Multi { volumes, .. } => {
+            let reports = cloudkit_cli::run_rebuild_multi(&volumes).await?;
+            for (name, result) in reports {
+                match result {
+                    Ok(outcome) => println!(
+                        "volume {name}: rebuilt {} file row(s), {} directory row(s)",
+                        outcome.files, outcome.dirs
+                    ),
+                    Err(message) => println!("volume {name}: NOT rebuilt — {message}"),
+                }
+            }
+            println!("multi-volume rebuild pass complete");
+        }
+    }
     Ok(())
 }
 

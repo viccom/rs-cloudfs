@@ -1738,6 +1738,38 @@ pub async fn run_rebuild_command(cfg: &CyDriveConfig) -> Result<rebuild::Rebuild
     run_rebuild_with_driver(cfg, driver.as_ref()).await
 }
 
+/// [`run_rebuild_command`] for the multi-volume mode (Phase 2.5): one
+/// bootstrap pass over every volume, each rebuilt from its OWN backend
+/// into its OWN volume-home db (K21, via
+/// [`resolve_volume_settings`]). Telegram volumes are skipped with the
+/// [`TELEGRAM_REBUILD_REFUSAL`] as their error — the shadow index has
+/// no backend walk, so "rebuild" is meaningless there; a fresh
+/// telegram volume legitimately serves an empty listing until files
+/// arrive through it or sync replicates the index.
+///
+/// Per-volume outcomes are reported, not fail-fast: one broken volume
+/// must not stop the others' bootstrap (the K22 spirit, offline
+/// edition). The caller prints the per-volume report.
+pub async fn run_rebuild_multi(
+    volumes: &[VolumeConfig],
+) -> Result<Vec<(String, Result<rebuild::RebuildOutcome, String>)>> {
+    let mut reports = Vec::new();
+    for spec in volumes {
+        let name = spec.name.clone();
+        let result = async {
+            let settings = resolve_volume_settings(spec)?;
+            if settings.backend == Backend::Telegram {
+                anyhow::bail!("{TELEGRAM_REBUILD_REFUSAL}");
+            }
+            run_rebuild_command(&settings).await
+        }
+        .await
+        .map_err(|error| format!("{error:#}"));
+        reports.push((name, result));
+    }
+    Ok(reports)
+}
+
 /// [`run_rebuild_command`] with the driver injected — the test seam
 /// (tests seed a `MockStorageDriver`; production feeds the
 /// backend-key assembly). Gates in order, all before any backend
