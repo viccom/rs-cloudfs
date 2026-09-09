@@ -18,9 +18,8 @@
 use std::path::Path;
 
 use crate::{
-    davfs_mount_command, davfs_pid_file_path, davfs_unmount_command, detect_mount_backend,
-    fusermount_unmount_command, gio_mount_command, parse_davfs_pid_file_hint,
-    parse_proc_mounts_davfs, PlatformError,
+    davfs_mount_command, davfs_unmount_command, detect_mount_backend, fusermount_unmount_command,
+    gio_mount_command, parse_davfs_pid_file_hint, parse_proc_mounts_davfs, PlatformError,
 };
 
 /// Mounts the WebDAV endpoint at `url`, creating `mount_point` first

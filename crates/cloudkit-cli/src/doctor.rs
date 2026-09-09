@@ -328,6 +328,9 @@ pub fn platform_checks() -> Vec<CheckResult> {
 /// [`baidu_connectivity_check`]), replacing [`platform_checks`]' fixed
 /// telegram tail on non-telegram instances.
 pub fn webclient_checks() -> Vec<CheckResult> {
+    // Windows-only 填充（下方 cfg 块）编译掉时 mut 即 unused——平台差异
+    // 经 cfg_attr 吸收（两平台 clippy -D warnings 同时干净）。
+    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut results = Vec::new();
     // Attribute gating (not `if cfg!`): both calls are Windows-only items
     // (`webclient_service_check` has no non-Windows stub), so the block must
