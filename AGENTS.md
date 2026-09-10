@@ -23,6 +23,7 @@
 cargo test --workspace --no-fail-fast            # 807 测试（0.10.0+Phase 2.5 多卷批；ignored 9 = 真机/平台类）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
+cargo build -p cloudkit-cli --no-default-features --features local,baidu   # 驱动裁剪构建（K30 三 feature）；缺驱动构建运行期报可行动错误（K31 rebuild 指引），cydrive --version 显示驱动清单（K32）
 scripts/check_layers                             # R1 层依赖门禁（CI 同款；动 Cargo.toml 依赖后必跑）
 scripts/scan_secrets                             # R3 秘密扫描门禁（CI 同款；本地模式=全树扫描）
 ```

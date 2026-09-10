@@ -11,6 +11,7 @@
 - 路径 `crates/drivers/ck-<name>/`，lib 名 `ck_<name>`；**只允许依赖 cloudkit-storage（L2）与外部 crate**，禁止依赖 cloudkit-core 及任何 L3+ crate（R1；`scripts/check_layers` 机械拦截——组合根 cloudkit-cli 是唯一豁免）。
 - 模块建议（参照 ck-telegram）：`transport.rs`（协议适配）/`client.rs` 或 `api.rs`（HTTP/协议面）/`oauth.rs`（鉴权状态机，如适用）/`lib.rs`（导出 + 工厂函数）。
 - 二进制不许出现在驱动 crate（bin 只在 cloudkit-cli / cloudkit-sync-server）。
+- **组合根 feature 门控三件套（K30，telegram/baidu/local 先例）**：新驱动接入时在 `crates/cloudkit-cli/Cargo.toml` 声明 optional 依赖（`ck-<name> = { path = ..., optional = true }`）+ 同名 feature（`<name> = ["dep:ck-<name>"]`）+ `default` 追加 `<name>`；并在 `crates/cloudkit-cli/src/lib.rs` 补 K31 文案常量 `<NAME>_DRIVER_REQUIRED`（三段式：缺驱动声明 + rebuild 命令 + backend 改法）与 K32 `compiled_drivers()` 清单臂（顺序固定追加 + cfg 门控断言测试）。裁剪组合随 CI feature 矩阵腿验收（ci.yml `features` job：clippy×单驱动子集 + workspace `--no-default-features` test）。
 
 ## 2. StorageDriver 实现义务（D1/§2 契约摘要）
 

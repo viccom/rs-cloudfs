@@ -26,7 +26,13 @@ use cloudkit_cli::{
     discover_config, discover_config_with_volumes_and_store, resolve_volume_settings,
     DiscoveredConfig,
 };
-use cloudkit_core::config::{load_volumes, VolumeConfig};
+use cloudkit_core::config::VolumeConfig;
+// The bare `load_volumes` import has a single consumer — the local-gated
+// multi-volume rebuild test below (every other call site qualifies the
+// path) — so it rides the same gate (FT4: the CI feature-matrix clippy
+// legs reject the dead import on non-local builds).
+#[cfg(feature = "local")]
+use cloudkit_core::config::load_volumes;
 use cloudkit_core::credentials::InMemoryStore;
 use cloudkit_core::database::{FileUpsert, MetaDatabase};
 

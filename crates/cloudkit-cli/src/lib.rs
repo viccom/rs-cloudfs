@@ -106,6 +106,31 @@ pub const LOCAL_DRIVER_REQUIRED: &str = "this binary was built without the local
      rebuild with `cargo build --features local`, or set `backend = \"telegram\"` / \
      `backend = \"baidu\"` in config.toml";
 
+/// The driver list the binary was compiled with (K32,
+/// docs/plans/2026-09-09-driver-feature-gates.md) — the `(drivers: ...)`
+/// segment of the `--version` banner. A compile-time constant in
+/// substance: every arm is a literal selected by the feature set at
+/// compile time, in the fixed order telegram, baidu, local; a build
+/// with every driver feature off reports `none`. Pinned by
+/// `tests::compiled_drivers_lists_the_feature_set_in_fixed_order`
+/// (cfg-gated arms — one assertion per build).
+pub const fn compiled_drivers() -> &'static str {
+    match (
+        cfg!(feature = "telegram"),
+        cfg!(feature = "baidu"),
+        cfg!(feature = "local"),
+    ) {
+        (true, true, true) => "telegram, baidu, local",
+        (true, true, false) => "telegram, baidu",
+        (true, false, true) => "telegram, local",
+        (false, true, true) => "baidu, local",
+        (true, false, false) => "telegram",
+        (false, true, false) => "baidu",
+        (false, false, true) => "local",
+        (false, false, false) => "none",
+    }
+}
+
 /// Failure modes of [`connect_with_deadline`].
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectGuardError<E> {
@@ -3251,4 +3276,36 @@ pub fn run_migrate(store: &dyn CredentialStore) -> Result<String> {
          for a one-time sign-in"
     );
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compiled_drivers_lists_the_feature_set_in_fixed_order() {
+        // K32: the `--version` banner's `(drivers: ...)` segment. Every
+        // arm is a cfg-gated literal — no runtime feature probing — so
+        // exactly one assertion is compiled per build and it pins the
+        // expected list for that feature combination: fixed order
+        // telegram, baidu, local; the all-off build reports `none`.
+        let drivers = compiled_drivers();
+
+        #[cfg(all(feature = "telegram", feature = "baidu", feature = "local"))]
+        assert_eq!(drivers, "telegram, baidu, local");
+        #[cfg(all(feature = "telegram", feature = "baidu", not(feature = "local")))]
+        assert_eq!(drivers, "telegram, baidu");
+        #[cfg(all(feature = "telegram", not(feature = "baidu"), feature = "local"))]
+        assert_eq!(drivers, "telegram, local");
+        #[cfg(all(not(feature = "telegram"), feature = "baidu", feature = "local"))]
+        assert_eq!(drivers, "baidu, local");
+        #[cfg(all(feature = "telegram", not(feature = "baidu"), not(feature = "local")))]
+        assert_eq!(drivers, "telegram");
+        #[cfg(all(not(feature = "telegram"), feature = "baidu", not(feature = "local")))]
+        assert_eq!(drivers, "baidu");
+        #[cfg(all(not(feature = "telegram"), not(feature = "baidu"), feature = "local"))]
+        assert_eq!(drivers, "local");
+        #[cfg(not(any(feature = "telegram", feature = "baidu", feature = "local")))]
+        assert_eq!(drivers, "none");
+    }
 }

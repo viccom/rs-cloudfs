@@ -69,3 +69,43 @@ jobs:
 
       - name: cargo test
         run: cargo test --workspace
+
+  # Driver feature gates (K30–K32,
+  # docs/plans/2026-09-09-driver-feature-gates.md): the features live
+  # only in cloudkit-cli, so the matrix clippy-checks the composition
+  # root alone — the all-off build plus each single-driver subset — and
+  # runs the workspace test suite once with the default features off.
+  # The default-feature legs are the `check` job above; one OS suffices
+  # here because feature selection is OS-independent.
+  features:
+    name: feature gates (${{ matrix.label }})
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - label: none
+            features: ""
+          - label: telegram
+            features: "--features telegram"
+          - label: baidu
+            features: "--features baidu"
+          - label: local
+            features: "--features local"
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+
+      - uses: Swatinem/rust-cache@v2
+
+      - name: cargo clippy (-p cloudkit-cli --no-default-features ${{ matrix.features }})
+        run: cargo clippy -p cloudkit-cli --no-default-features ${{ matrix.features }} --all-targets -- -D warnings
+
+      # The all-off build doubles as the feature-matrix test leg: the
+      # whole workspace suite against a build with every driver feature
+      # off (driver-gated tests cfg out; everything else stays green).
+      - name: cargo test --workspace --no-default-features
+        if: matrix.label == 'none'
+        run: cargo test --workspace --no-default-features

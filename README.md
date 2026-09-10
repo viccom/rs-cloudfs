@@ -44,6 +44,18 @@ local 实例：`backend = "local"` + `local_root = "<绝对路径>"`。
 权威后端（baidu/local）冷启动可 `cydrive rebuild` 从后端重建索引（明文集；加密实例走 sync）。
 新后端接入指南：[docs/standards/driver-onboarding.md](docs/standards/driver-onboarding.md)（conformance 套件 + 装配点 + E2E 拓扑）。
 
+### 按需裁剪驱动（feature 门控）
+
+三个驱动都是可选依赖（feature：`telegram` / `baidu` / `local`，默认全开 = 默认构建行为不变）：
+
+```powershell
+cargo build --release                                              # 全量（默认三驱动）
+cargo build --release --no-default-features --features local       # 纯本地
+cargo build --release --no-default-features --features local,baidu # 本地+百度
+```
+
+缺驱动的二进制运行到对应表面时得到可行动报错（给出 rebuild 命令与 backend 改法，而非隐藏命令）；`cydrive --version` 显示本构建的驱动清单，如 `cydrive 0.10.0 (drivers: telegram, baidu, local)`，全关构建显示 `(drivers: none)`。
+
 ### 多卷模式（一个进程多个存储卷，Phase 2.5）
 
 config.toml 只留进程级键 + `volumes_dir`；每卷一份 `volumes/<name>.toml`（卷名=文件名，卷内相对路径落在各自的 `volumes/<name>/` 主目录）。三卷示例（local + telegram + baidu）：

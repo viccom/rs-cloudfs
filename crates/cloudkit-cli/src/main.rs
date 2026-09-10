@@ -38,10 +38,29 @@ use cloudkit_core::rel_path::RelPath;
 
 /// CyDrive — Telegram as an unlimited cloud drive, served over WebDAV.
 #[derive(Debug, Parser)]
-#[command(name = "cydrive", version, about)]
+#[command(name = "cydrive", version = version_line(), about)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+/// The `--version` payload (K32): the crate version plus the
+/// compiled-in driver list — e.g. `0.10.0 (drivers: telegram, baidu,
+/// local)`; a build with every driver feature off reports
+/// `(drivers: none)`. Serves both `-V` and `--version` through clap's
+/// `version` attribute. The `&'static str` return keeps clap's
+/// non-`string`-feature `From<&'static str>` path; the once-built line
+/// lives in the static.
+fn version_line() -> &'static str {
+    static LINE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LINE.get_or_init(|| {
+        format!(
+            "{} (drivers: {})",
+            env!("CARGO_PKG_VERSION"),
+            cloudkit_cli::compiled_drivers()
+        )
+    })
+    .as_str()
 }
 
 #[derive(Debug, Subcommand)]
