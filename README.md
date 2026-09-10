@@ -58,7 +58,7 @@ cargo build --release --no-default-features --features local,baidu # 本地+百�
 
 ### 流式读（视频直接播放）
 
-非加密文件 + 支持 Range 的后端（baidu/local/telegram）的读取走 **Range 直通**：请求哪段拉哪段（4MiB 窗口），不再整文件下载后才能播放——764MiB 视频首字节 <1ms、1MiB 片段 ~0.2s。生效面：WebDAV 盘符、仪表盘播放器、`/api/download` URL（可直接喂 PotPlayer/VLC）。加密文件与不支持 Range 的后端自动回退整文件模式。
+非加密文件 + 支持 Range 的后端（baidu/local/telegram）的读取走 **Range 直通**：请求哪段拉哪段（4MiB 窗口），不再整文件下载后才能播放——764MiB 视频首字节 <1ms、1MiB 片段 ~0.2s。生效面：WebDAV 盘符、仪表盘播放器、`/api/download` URL（可直接喂 PotPlayer/VLC）。`aead_v2` 加密文件同样支持 Range 流式读（按需拉密文窗口实时解密，逐 chunk AEAD 验签）；gcm v1 加密文件与不支持 Range 的后端仍自动回退整文件模式。
 
 > **盘符路径播放大视频的固有限制**：Windows 的 WebDAV 重定向器对播放器打开的大文件会先整文件缓存（实测读 4MB 实际拉全文件），764MB 视频会以全速下载十几秒后可能触发客户端 RPC 故障。**大视频请用 URL 直喂播放器**（PotPlayer/VLC 打开 URL：`http://127.0.0.1:8485/vol/baidu/<文件名>`，真流式秒开）；盘符适合常规文件操作。
 
