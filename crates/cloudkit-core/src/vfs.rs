@@ -16,6 +16,7 @@ use tokio::sync::Notify;
 use crate::cache::CacheManager;
 use crate::crypto::{self, CryptoError};
 use crate::database::{DbError, FileRecord, FileUpsert, MetaDatabase};
+use crate::enc_stream::DecryptingTransport;
 use crate::rel_path::RelPath;
 use crate::transport::{CloudTransport, InboundFile, RemoteHandle, StorageError, UploadJob};
 use crate::upload_queue::{
@@ -252,23 +253,32 @@ enum HandlePolicy {
 /// decide how to serve the fallback.
 pub enum StreamSource {
     /// Range streaming admitted (K33: plaintext row, transport declares
-    /// `range_read`, non-zero size).
+    /// `range_read`, non-zero size; K47: additionally `aead_v2`-encrypted
+    /// rows in the same shape, wrapped in a decrypting transport).
     Stream {
         /// Locates the remote object (chunks-first assembly, K2 path
-        /// carried).
+        /// carried). Encrypted rows keep the `u64::MAX` ciphertext
+        /// sentinel as `total_size` — size math belongs to the plaintext
+        /// field below.
         handle: RemoteHandle,
         /// Authoritative total length (K35: the plaintext row's size —
         /// rebuild derived it from the backend listing — fit for
-        /// Content-Length / Range math).
+        /// Content-Length / Range math). For encrypted rows this is the
+        /// PLAINTEXT length and `transport` decrypts windows on the way
+        /// out, so the faces stay encryption-unaware.
         total_size: u64,
-        /// The VFS's transport, for bounded-window `open_range` calls —
-        /// the caller never re-reaches into the VFS per window.
+        /// The transport for bounded-window `open_range` calls — the
+        /// caller never re-reaches into the VFS per window. The shared
+        /// VFS transport for plaintext rows; a
+        /// [`DecryptingTransport`] wrapper for `aead_v2` rows (K47).
         transport: Arc<dyn CloudTransport>,
     },
     /// Serve the row through the existing full-hydrate path (R-5):
-    /// encrypted row (whole-file AEAD can never be range-sliced),
-    /// transport without `range_read`, or a 0-byte row (hydrate
-    /// materializes the empty copy).
+    /// encrypted rows outside the K47 stream shape (`gcm` whole-file
+    /// AEAD, unknown schemes, 0-byte rows), transports without
+    /// `range_read`, 0-byte plaintext rows, or any row with a cached
+    /// local copy (WF0/K42 — the hydrate arm then serves the local
+    /// plaintext with zero remote traffic).
     Hydrate,
 }
 
@@ -688,14 +698,22 @@ impl Vfs {
     /// Gate order mirrors `hydrate`: row lookup (`NotFound` /
     /// `IsDirectory`), then the password gate — an encrypted row with
     /// no configured password is `MissingPassword`, an actionable
-    /// error, never a fallback — then the K33 triple gate: an encrypted
-    /// row (whole-file AEAD can never be range-sliced), a transport
-    /// without `range_read`, or a 0-byte row all answer `Hydrate`.
-    /// Everything else streams with the row's remote handle, its
-    /// authoritative size (K35) and the shared transport for bounded
-    /// `open_range` windows.
+    /// error, never a fallback — then the cache probe (WF0/K42), then
+    /// the admission split (K33+K47):
     ///
-    /// Cache-first (WF0 / K42): ahead of the triple gate, a row whose
+    /// - plaintext rows stream when the transport declares `range_read`
+    ///   and the size is non-zero;
+    /// - encrypted rows stream only in the K47 shape: `aead_v2` scheme +
+    ///   `range_read` + non-zero size — through a
+    ///   [`DecryptingTransport`] wrapper with `total_size` = the
+    ///   plaintext row size (K35; the handle itself keeps the u64::MAX
+    ///   ciphertext sentinel);
+    /// - everything else — `gcm` (v1 whole-file AEAD can never be
+    ///   range-sliced), unknown schemes (dispatch belongs to the hydrate
+    ///   path with its actionable error), range-incapable transports and
+    ///   0-byte rows — answers `Hydrate`.
+    ///
+    /// Cache-first (WF0 / K42): ahead of the admission split, a row whose
     /// cached copy exists on disk routes to `Hydrate` — the hydrate arm
     /// then serves the local plaintext with zero remote traffic and
     /// records the LRU access there (this seam stays a pure routing
@@ -726,17 +744,45 @@ impl Vfs {
         if self.cache.is_cached(rel) {
             return Ok(StreamSource::Hydrate);
         }
-        // K33 triple gate: whole-file-AEAD rows, range-incapable
-        // transports and 0-byte rows all serve through the full hydrate
-        // path (R-5).
-        if row.is_encrypted || !self.transport.capabilities().range_read || row.size == 0 {
+        // K33+K47 admission split (R-5 + encrypted range streaming).
+        let range_capable = self.transport.capabilities().range_read;
+        if row.is_encrypted {
+            let streamable = row.encryption_scheme == crate::config::SCHEME_AEAD_V2
+                && range_capable
+                && row.size > 0;
+            if !streamable {
+                return Ok(StreamSource::Hydrate);
+            }
+        } else if !range_capable || row.size == 0 {
             return Ok(StreamSource::Hydrate);
         }
         let handle = self.remote_handle_for(rel, &row, HandlePolicy::Read)?;
+        if !row.is_encrypted {
+            return Ok(StreamSource::Stream {
+                total_size: handle.total_size,
+                handle,
+                transport: Arc::clone(&self.transport),
+            });
+        }
+        // K47 encrypted stream arm: the password gate above guarantees
+        // the configured password; an absent value here is unreachable
+        // and surfaces as the same actionable error rather than a
+        // silent fallthrough.
+        let password = match self.cfg.encryption_password.clone() {
+            Some(password) => password,
+            None => return Err(VfsError::MissingPassword),
+        };
+        let plain_len = row.size.max(0) as u64;
+        let transport: Arc<dyn CloudTransport> = Arc::new(DecryptingTransport::new(
+            Arc::clone(&self.transport),
+            handle.clone(),
+            plain_len,
+            password,
+        ));
         Ok(StreamSource::Stream {
-            total_size: handle.total_size,
+            total_size: plain_len,
             handle,
-            transport: Arc::clone(&self.transport),
+            transport,
         })
     }
 

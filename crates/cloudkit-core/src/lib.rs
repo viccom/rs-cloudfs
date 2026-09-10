@@ -13,6 +13,7 @@ pub mod config;
 pub mod credentials;
 pub mod crypto;
 pub mod database;
+pub mod enc_stream;
 pub mod inbound;
 pub mod logging;
 pub mod rebuild;

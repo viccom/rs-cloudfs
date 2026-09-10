@@ -10,6 +10,13 @@
 //! hydrate arm ahead of the triple gate (the hydrate path then serves the
 //! local file with zero remote traffic); the password gate still fires
 //! first, and admission itself never hydrates as a side effect.
+//!
+//! K47 amendment (Phase 3.5-a): the encrypted branch of the gate splits —
+//! `aead_v2` rows over a range-capable transport with a non-zero size
+//! stream through a [`DecryptingTransport`] wrapper (`total_size` = the
+//! plaintext row size, K35), while `gcm` rows, unknown schemes and 0-byte
+//! encrypted rows keep the full-hydrate fallback. The password gate and
+//! the cache probe keep their order.
 
 use std::fs;
 use std::path::{Path, PathBuf};
@@ -249,10 +256,11 @@ async fn open_read_streams_plaintext_row_with_window_capable_handle() {
     assert!(mock.open_calls().is_empty(), "no full open ran");
 }
 
-/// 2. An encrypted row always falls back (K33: v1 GCM whole-file AEAD
-///    can never be range-sliced; v2 likewise stays whole-file on the
-///    read path). The password is configured, so this is a genuine
-///    fallback signal, not the MissingPassword error.
+/// 2. An encrypted row whose scheme is not streamable falls back (K33:
+///    v1 GCM whole-file AEAD can never be range-sliced). The row here
+///    carries the column default `"gcm"` (pre-E-4 writers), so the K47
+///    split keeps it on the hydrate path. The password is configured, so
+///    this is a genuine fallback signal, not the MissingPassword error.
 #[tokio::test]
 async fn open_read_falls_back_for_encrypted_row() {
     let (_dir, db, cache, _cache_root, mock) = test_env().await;
@@ -523,4 +531,249 @@ async fn open_read_encrypted_cached_row_without_password_is_missing_password() {
         mock.open_calls().is_empty() && mock.open_range_calls().is_empty(),
         "the password gate fires before any remote work"
     );
+}
+
+// ---------------------------------------------- K47 gate matrix (E2) -----
+
+/// Uploads a REAL aead_v2 container of `plain_len` plaintext bytes
+/// (64 KiB crypto chunks — the format guardrail floor, password `"pw"`
+/// matching [`test_cfg`]) and seeds an encrypted `files` row with the
+/// given `encryption_scheme`. Returns the plaintext for window equality.
+async fn seed_encrypted_container(
+    db: &Arc<MetaDatabase>,
+    mock: &Arc<MockTransport>,
+    rel: &str,
+    plain_len: usize,
+    scheme: &str,
+) -> Vec<u8> {
+    let plain: Vec<u8> = (0..plain_len).map(|i| (i % 251) as u8).collect();
+    let ct = cloudkit_crypto::AeadV2::with_chunk_size(64 * 1024)
+        .expect("64 KiB is the format guardrail floor")
+        .encrypt("pw", &plain);
+    let receipt = seed_remote(mock, rel, &ct, 1, ct.len() as u64).await;
+    let rel_path = RelPath::new(rel).expect("valid rel path");
+    db.upsert_file_scheme(
+        &FileUpsert {
+            rel_path: rel_path.as_str().to_string(),
+            name: rel_path.name().to_string(),
+            parent_dir: rel_path
+                .parent()
+                .expect("non-root path")
+                .as_str()
+                .to_string(),
+            size: plain_len as i64,
+            mtime: 1_700_000_000.0,
+            sha256: None,
+            is_dir: false,
+            telegram_msg_id: Some(receipt.first_msg_id),
+            is_uploaded: true,
+            is_cached: false,
+            is_encrypted: true,
+            chunk_count: 1,
+            mime_type: None,
+        },
+        scheme,
+    )
+    .expect("seed encrypted files row");
+    plain
+}
+
+/// 12. K47: an `aead_v2` row over a range-capable transport with a
+///     configured password streams — with the PLAINTEXT row size as
+///     `total_size` (K35; the handle itself carries the u64::MAX
+///     ciphertext sentinel) and a decrypting transport whose windows
+///     return plaintext slices (the first inner read is the 34-byte
+///     header, per the wrapper's own coordinate tests).
+#[tokio::test]
+async fn open_read_streams_aead_v2_row_with_plaintext_total_and_decrypting_transport() {
+    let (_dir, db, cache, _cache_root, mock) = test_env().await;
+    let plain = seed_encrypted_container(
+        &db,
+        &mock,
+        "/v2.bin",
+        150_000,
+        cloudkit_core::config::SCHEME_AEAD_V2,
+    )
+    .await;
+    let vfs = build_vfs(&db, cache, &mock, test_cfg(Some("pw")));
+    let rel = RelPath::new("/v2.bin").expect("valid rel path");
+
+    let StreamSource::Stream {
+        handle,
+        total_size,
+        transport,
+    } = vfs.open_read(&rel).await.expect("aead_v2 row streams")
+    else {
+        panic!("aead_v2 + range_read + size>0 must stream (K47)");
+    };
+    assert_eq!(total_size, 150_000, "plaintext size is the authority (K35)");
+    assert_eq!(
+        handle.total_size,
+        u64::MAX,
+        "ciphertext sentinel preserved on the handle"
+    );
+
+    // A cross-chunk window through the carried transport returns
+    // plaintext (64 KiB chunks: [60_000, 80_000) spans chunks 0/1).
+    let window = drain(
+        transport
+            .open_range(&handle, 60_000, 20_000)
+            .await
+            .expect("open encrypted window"),
+    )
+    .await
+    .expect("window bytes");
+    assert_eq!(window, plain[60_000..80_000], "decrypted cross-chunk slice");
+    assert_eq!(
+        mock.open_range_calls()[0],
+        (0, 34),
+        "the first inner read is the container header"
+    );
+    assert!(mock.open_calls().is_empty(), "no full-file open ever ran");
+}
+
+/// 13. K47 matrix: a `gcm` row (the frozen v1 whole-file AEAD) keeps the
+///     hydrate fallback even over a range-capable transport.
+#[tokio::test]
+async fn open_read_gcm_row_falls_back() {
+    let (_dir, db, cache, _cache_root, mock) = test_env().await;
+    seed_encrypted_container(
+        &db,
+        &mock,
+        "/v1.bin",
+        150_000,
+        cloudkit_core::config::SCHEME_GCM,
+    )
+    .await;
+    let vfs = build_vfs(&db, cache, &mock, test_cfg(Some("pw")));
+    let rel = RelPath::new("/v1.bin").expect("valid rel path");
+
+    assert!(
+        matches!(vfs.open_read(&rel).await, Ok(StreamSource::Hydrate)),
+        "gcm rows keep the hydrate fallback (K47)"
+    );
+    assert!(mock.open_calls().is_empty() && mock.open_range_calls().is_empty());
+}
+
+/// 14. K47 matrix: an unknown scheme (stored by a newer build) never
+///     streams — the hydrate path owns scheme dispatch and its
+///     actionable error.
+#[tokio::test]
+async fn open_read_unknown_scheme_row_falls_back() {
+    let (_dir, db, cache, _cache_root, mock) = test_env().await;
+    seed_encrypted_container(&db, &mock, "/odd.bin", 150_000, "rot13").await;
+    let vfs = build_vfs(&db, cache, &mock, test_cfg(Some("pw")));
+    let rel = RelPath::new("/odd.bin").expect("valid rel path");
+
+    assert!(
+        matches!(vfs.open_read(&rel).await, Ok(StreamSource::Hydrate)),
+        "unknown schemes keep the hydrate fallback (K47)"
+    );
+    assert!(mock.open_calls().is_empty() && mock.open_range_calls().is_empty());
+}
+
+/// 15. K47 matrix: `aead_v2` over a transport WITHOUT `range_read` falls
+///     back — the wrapper cannot invent windows the inner transport
+///     cannot serve.
+#[tokio::test]
+async fn open_read_aead_v2_row_without_range_capability_falls_back() {
+    let caps = Capabilities {
+        range_read: false,
+        ..Capabilities::none()
+    };
+    let (_dir, db, cache, _cache_root, mock) =
+        test_env_with_mock(MockTransport::builder().capabilities(caps).build()).await;
+    seed_encrypted_container(
+        &db,
+        &mock,
+        "/norange2.bin",
+        150_000,
+        cloudkit_core::config::SCHEME_AEAD_V2,
+    )
+    .await;
+    let vfs = build_vfs(&db, cache, &mock, test_cfg(Some("pw")));
+    let rel = RelPath::new("/norange2.bin").expect("valid rel path");
+
+    assert!(
+        matches!(vfs.open_read(&rel).await, Ok(StreamSource::Hydrate)),
+        "aead_v2 without range_read falls back (K47)"
+    );
+}
+
+/// 16. K47 matrix: a 0-byte `aead_v2` row falls back — the hydrate path
+///     materializes the empty copy, and no remote face is consulted.
+#[tokio::test]
+async fn open_read_aead_v2_zero_byte_row_falls_back() {
+    let (_dir, db, cache, _cache_root, mock) = test_env().await;
+    seed_encrypted_container(
+        &db,
+        &mock,
+        "/empty2.bin",
+        0,
+        cloudkit_core::config::SCHEME_AEAD_V2,
+    )
+    .await;
+    let vfs = build_vfs(&db, cache, &mock, test_cfg(Some("pw")));
+    let rel = RelPath::new("/empty2.bin").expect("valid rel path");
+
+    assert!(
+        matches!(vfs.open_read(&rel).await, Ok(StreamSource::Hydrate)),
+        "0-byte aead_v2 rows fall back (K47)"
+    );
+    assert!(mock.open_calls().is_empty() && mock.open_range_calls().is_empty());
+}
+
+/// 17. K47 x WF0: a cached `aead_v2` copy still wins over the decrypting
+///     stream — the cache probe stays ahead of the gate split.
+#[tokio::test]
+async fn open_read_cached_aead_v2_row_serves_locally() {
+    let (_dir, db, cache, cache_root, mock) = test_env().await;
+    seed_encrypted_container(
+        &db,
+        &mock,
+        "/warm2.bin",
+        150_000,
+        cloudkit_core::config::SCHEME_AEAD_V2,
+    )
+    .await;
+    let cached = seed_cache_copy(&cache_root, "/warm2.bin", b"cached-local-copy");
+    let vfs = build_vfs(&db, cache, &mock, test_cfg(Some("pw")));
+    let rel = RelPath::new("/warm2.bin").expect("valid rel path");
+
+    assert!(
+        matches!(vfs.open_read(&rel).await, Ok(StreamSource::Hydrate)),
+        "a cached aead_v2 row serves locally (WF0 unchanged)"
+    );
+    assert_eq!(
+        fs::read(&cached).expect("read cache copy"),
+        b"cached-local-copy",
+        "the local plaintext is untouched"
+    );
+    assert!(mock.open_calls().is_empty() && mock.open_range_calls().is_empty());
+}
+
+/// 18. K47 ordering: the password gate fires for `aead_v2` rows too — a
+///     streaming-eligible row without a configured password is the
+///     actionable `MissingPassword`, never a Hydrate retry loop.
+#[tokio::test]
+async fn open_read_aead_v2_row_without_password_is_missing_password() {
+    let (_dir, db, cache, _cache_root, mock) = test_env().await;
+    seed_encrypted_container(
+        &db,
+        &mock,
+        "/nopw2.bin",
+        150_000,
+        cloudkit_core::config::SCHEME_AEAD_V2,
+    )
+    .await;
+    let vfs = build_vfs(&db, cache, &mock, test_cfg(None));
+    let rel = RelPath::new("/nopw2.bin").expect("valid rel path");
+
+    let err = vfs
+        .open_read(&rel)
+        .await
+        .err()
+        .expect("aead_v2 row without a password is an error");
+    assert!(matches!(err, VfsError::MissingPassword), "{err:?}");
+    assert!(mock.open_calls().is_empty() && mock.open_range_calls().is_empty());
 }
