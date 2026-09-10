@@ -53,9 +53,11 @@ use cloudkit_core::database::MetaDatabase;
 use cloudkit_core::inbound::spawn_inbound_worker;
 use cloudkit_core::rebuild;
 use cloudkit_core::rel_path::RelPath;
-use cloudkit_core::sync::{
-    namespace_key, namespace_key_for, sync_once, NamespaceIdentity, SyncOutcome,
-};
+use cloudkit_core::sync::{namespace_key, sync_once, SyncOutcome};
+// Local-arm-only sync vocab (FT3): the K12 local namespace derivation
+// exists only with the `local` feature.
+#[cfg(feature = "local")]
+use cloudkit_core::sync::{namespace_key_for, NamespaceIdentity};
 use cloudkit_core::transport::Capabilities;
 use cloudkit_core::transport::CloudTransport;
 use cloudkit_core::vfs::{Vfs, VfsConfig, VfsError};
@@ -94,6 +96,15 @@ pub const TELEGRAM_DRIVER_REQUIRED: &str = "this binary was built without the te
 pub const BAIDU_DRIVER_REQUIRED: &str = "this binary was built without the baidu driver; \
      rebuild with `cargo build --features baidu`, or set `backend = \"telegram\"` / \
      `backend = \"local\"` in config.toml";
+
+/// The actionable message every local surface carries when the binary
+/// was built without the local driver (K31, FT3 — same shape as
+/// [`TELEGRAM_DRIVER_REQUIRED`] / [`BAIDU_DRIVER_REQUIRED`]): name the
+/// rebuild command, then name the backend switch. Pinned by the
+/// off-feature test in `tests/dispatch.rs`.
+pub const LOCAL_DRIVER_REQUIRED: &str = "this binary was built without the local driver; \
+     rebuild with `cargo build --features local`, or set `backend = \"telegram\"` / \
+     `backend = \"baidu\"` in config.toml";
 
 /// Failure modes of [`connect_with_deadline`].
 #[derive(Debug, thiserror::Error)]
@@ -1931,7 +1942,9 @@ pub fn baidu_params(
 /// tests pin that `backend = "baidu"` lands the `Baidu` arm). Telegram
 /// is deliberately NOT an arm: its assembly is the run flow's dedicated
 /// deadline-bounded Grammers connect (zero change — the dispatch only
-/// routes around it).
+/// routes around it). With every driver gated out the enum is
+/// uninhabited — the dispatch always refuses, so no value of this type
+/// can ever exist.
 pub enum BackendTransport {
     /// The baidu transport face over the factory-connected driver.
     /// Exists only with the `baidu` feature (FT2): a binary without the
@@ -1940,6 +1953,10 @@ pub enum BackendTransport {
     #[cfg(feature = "baidu")]
     Baidu(Arc<ck_baidu::BaiduTransport>),
     /// The local transport face over the factory-initialised driver.
+    /// Exists only with the `local` feature (FT3): a binary without the
+    /// driver cannot assemble this arm (the dispatch refuses with
+    /// [`LOCAL_DRIVER_REQUIRED`] instead).
+    #[cfg(feature = "local")]
     Local(Arc<ck_local::LocalTransport>),
 }
 
@@ -1949,7 +1966,14 @@ impl BackendTransport {
         match self {
             #[cfg(feature = "baidu")]
             BackendTransport::Baidu(t) => StorageDriver::volume(t.driver()).as_str(),
+            #[cfg(feature = "local")]
             BackendTransport::Local(t) => StorageDriver::volume(t.driver()).as_str(),
+            // Every driver gated out: the enum is uninhabited — no
+            // value can exist. The empty match over the dereferenced
+            // place is the never-taken arm a reference scrutinee needs
+            // (a reference alone counts as inhabited, E0004).
+            #[cfg(not(any(feature = "baidu", feature = "local")))]
+            _ => match *self {},
         }
     }
 
@@ -1959,7 +1983,10 @@ impl BackendTransport {
         match self {
             #[cfg(feature = "baidu")]
             BackendTransport::Baidu(t) => CloudTransport::capabilities(t.as_ref()),
+            #[cfg(feature = "local")]
             BackendTransport::Local(t) => CloudTransport::capabilities(t.as_ref()),
+            #[cfg(not(any(feature = "baidu", feature = "local")))]
+            _ => match *self {},
         }
     }
 
@@ -1972,9 +1999,12 @@ impl BackendTransport {
         match self {
             #[cfg(feature = "baidu")]
             BackendTransport::Baidu(_) => self.volume().to_string(),
+            #[cfg(feature = "local")]
             BackendTransport::Local(t) => namespace_key_for(&NamespaceIdentity::Local {
                 root: &t.driver().root_path().to_string_lossy(),
             }),
+            #[cfg(not(any(feature = "baidu", feature = "local")))]
+            _ => match *self {},
         }
     }
 
@@ -1985,7 +2015,10 @@ impl BackendTransport {
         match self {
             #[cfg(feature = "baidu")]
             BackendTransport::Baidu(t) => t.clone() as Arc<dyn CloudTransport>,
+            #[cfg(feature = "local")]
             BackendTransport::Local(t) => t.clone() as Arc<dyn CloudTransport>,
+            #[cfg(not(any(feature = "baidu", feature = "local")))]
+            _ => match *self {},
         }
     }
 
@@ -2013,7 +2046,10 @@ impl BackendTransport {
                     None
                 }
             },
+            #[cfg(feature = "local")]
             BackendTransport::Local(_) => None,
+            #[cfg(not(any(feature = "baidu", feature = "local")))]
+            _ => match *self {},
         }
     }
 }
@@ -2047,9 +2083,11 @@ pub async fn build_backend_transport(cfg: &CyDriveConfig) -> Result<BackendTrans
     Ok(dispatched)
 }
 
-/// The local dispatch arm, shared verbatim by both feature states of
-/// [`build_backend_transport_with`] (the local driver is an
-/// unconditional dependency until FT3).
+/// The local dispatch arm, shared by the `local`-feature states of
+/// [`build_backend_transport_with`] (FT3): the factory assembly over
+/// the config's root. Exists only with the `local` feature — a binary
+/// without the driver refuses in the dispatch arm (K31) instead.
+#[cfg(feature = "local")]
 async fn build_local_transport(cfg: &CyDriveConfig) -> Result<BackendTransport> {
     // validate() guarantees Some + absolute when backend=local.
     let root = cfg.local_root.clone().unwrap_or_default();
@@ -2105,15 +2143,28 @@ pub async fn build_backend_transport_with(
                 ck_baidu::BaiduTransport::new(driver),
             )))
         }
-        Backend::Local => build_local_transport(cfg).await,
+        Backend::Local => {
+            // With the driver: the factory assembly sharing
+            // [`build_local_transport`] (validate() guarantees Some +
+            // absolute when backend=local). Without it: the actionable
+            // rebuild message (K31).
+            #[cfg(feature = "local")]
+            {
+                build_local_transport(cfg).await
+            }
+            #[cfg(not(feature = "local"))]
+            {
+                anyhow::bail!("{LOCAL_DRIVER_REQUIRED}")
+            }
+        }
     }
 }
 
 /// The no-driver twin (K31 / FT2): the baidu arm carries the actionable
 /// rebuild message — the binary cannot assemble a baidu transport —
 /// while the telegram arm keeps its [`build_backend_transport_with`]
-/// guidance pair and the local arm assembles unchanged (a driver-less
-/// binary still serves `backend = "local"`).
+/// guidance pair and the local arm follows the `local` feature (FT3:
+/// the factory assembly on, the K31 rebuild message off).
 #[cfg(not(feature = "baidu"))]
 pub async fn build_backend_transport_with(cfg: &CyDriveConfig) -> Result<BackendTransport> {
     match cfg.backend {
@@ -2132,7 +2183,16 @@ pub async fn build_backend_transport_with(cfg: &CyDriveConfig) -> Result<Backend
             }
         }
         Backend::Baidu => anyhow::bail!("{BAIDU_DRIVER_REQUIRED}"),
-        Backend::Local => build_local_transport(cfg).await,
+        Backend::Local => {
+            #[cfg(feature = "local")]
+            {
+                build_local_transport(cfg).await
+            }
+            #[cfg(not(feature = "local"))]
+            {
+                anyhow::bail!("{LOCAL_DRIVER_REQUIRED}")
+            }
+        }
     }
 }
 
@@ -2353,6 +2413,11 @@ async fn build_driver(cfg: &CyDriveConfig) -> Result<Arc<dyn StorageDriver>> {
         }
         #[cfg(not(feature = "baidu"))]
         Backend::Baidu => anyhow::bail!("{BAIDU_DRIVER_REQUIRED}"),
+        // With the driver: the factory assembly (validate() guarantees
+        // Some + absolute when backend=local). Without it: the
+        // actionable rebuild message (K31) — `rebuild` cannot walk a
+        // volume the binary cannot index.
+        #[cfg(feature = "local")]
         Backend::Local => {
             // validate() guarantees Some + absolute when backend=local.
             let root = cfg.local_root.clone().unwrap_or_default();
@@ -2363,6 +2428,8 @@ async fn build_driver(cfg: &CyDriveConfig) -> Result<Arc<dyn StorageDriver>> {
             .map_err(|error| anyhow::anyhow!("initialising the local backend: {error}"))?;
             Ok(driver)
         }
+        #[cfg(not(feature = "local"))]
+        Backend::Local => anyhow::bail!("{LOCAL_DRIVER_REQUIRED}"),
     }
 }
 

@@ -18,14 +18,15 @@ path = "src/main.rs"
 
 # Driver feature gates (K30, docs/plans/2026-09-09-driver-feature-gates.md):
 # the default set is all-on — byte-identical behavior to the pre-gate
-# binary. `telegram` (FT1) and `baidu` (FT2) are wired to their
-# dependencies; `local` is a placeholder until FT3 gates the still
-# unconditional ck-local dependency.
+# binary. `telegram` (FT1), `baidu` (FT2) and `local` (FT3) are wired to
+# their dependencies; a build without a driver feature produces a binary
+# that refuses that driver's surfaces at runtime with the actionable
+# rebuild message (K31).
 [features]
 default = ["telegram", "baidu", "local"]
 telegram = ["dep:ck-telegram"]
 baidu = ["dep:ck-baidu"]
-local = []
+local = ["dep:ck-local"]
 
 [dependencies]
 anyhow = "1"
@@ -52,7 +53,11 @@ ck-telegram = { path = "../drivers/ck-telegram", optional = true }
 # rebuild 子命令的 build_driver helper 直接调两驱动工厂（B3b 段二a
 # 最小装配；段二b dispatch 单元收编/复用——R1 组合根豁免）。
 ck-baidu = { path = "../drivers/ck-baidu", optional = true }
-ck-local = { path = "../drivers/ck-local" }
+# The local driver is feature-gated (K30, FT3): `default` keeps it on,
+# so the released binary is unchanged; a build without `local` produces
+# a binary that refuses local surfaces at runtime with the actionable
+# rebuild message (K31, `cloudkit_cli::LOCAL_DRIVER_REQUIRED`).
+ck-local = { path = "../drivers/ck-local", optional = true }
 cloudkit-web = { path = "../cloudkit-web" }
 cloudkit-webdav = { path = "../cloudkit-webdav" }
 # Sync-lite client (Batch B4): the wire types this CLI maps onto core's
