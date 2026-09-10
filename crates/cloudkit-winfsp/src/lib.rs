@@ -31,6 +31,8 @@ pub mod error;
 #[cfg(all(windows, feature = "winfsp"))]
 pub mod fs;
 #[cfg(all(windows, feature = "winfsp"))]
+pub mod mount;
+#[cfg(all(windows, feature = "winfsp"))]
 pub mod reader;
 #[cfg(all(windows, feature = "winfsp"))]
 pub mod writer;

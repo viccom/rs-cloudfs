@@ -56,6 +56,30 @@ pub enum PlatformError {
     Io(#[from] std::io::Error),
 }
 
+/// A located WinFsp installation (Phase 3 / WF4, the read-only `doctor`
+/// leg): the registry `InstallDir` plus the runtime DLL inside it.
+///
+/// `dll` is `None` when the directory is there but `<dir>\bin\winfsp-x64.dll`
+/// is not — a half install, which `doctor` reports as a broken install
+/// rather than "not installed". The probe is a pure registry + file read:
+/// it needs no WinFsp SDK, no feature flag and no load attempt, so it is
+/// safe on any machine (and on the machines that have nothing installed).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct WinFspInstall {
+    /// The registry `InstallDir` value.
+    pub install_dir: std::path::PathBuf,
+    /// The runtime DLL (`<install_dir>\bin\winfsp-x64.dll`) when present.
+    pub dll: Option<std::path::PathBuf>,
+}
+
+/// Registry subkeys probed for `InstallDir`, in order: the 32-bit view
+/// first (the standard installer writes `WOW6432Node` even on x64 — this
+/// machine's own layout), then the native key (ARM64 installers).
+pub const WINFSP_REG_KEYS: [&str; 2] = [r"SOFTWARE\WOW6432Node\WinFsp", r"SOFTWARE\WinFsp"];
+
+/// The x64 WinFsp runtime DLL name (this workspace ships x86_64 Windows).
+pub const WINFSP_X64_DLL: &str = "winfsp-x64.dll";
+
 /// Lenient canonicalisation shared by every entry point: trim, uppercase,
 /// ensure the trailing colon. Unlike [`normalize_drive_letter`] this never
 /// rejects — the Python baseline fed whatever it got straight to `net use`

@@ -103,8 +103,10 @@ enum Command {
     /// environment variable or the config.toml sync_secret key (the
     /// variable wins).
     Sync,
-    /// Mount the WebDAV server: a drive letter on Windows (`net use`),
-    /// a directory on Linux (gio → davfs2).
+    /// Mount the drive: a drive letter on Windows (`net use`, or an
+    /// in-process WinFsp mount when `mount_backend = "winfsp"` — the
+    /// latter stays in the foreground until Ctrl+C), a directory on Linux
+    /// (gio → davfs2).
     Mount {
         /// WebDAV URL (default: glued from the config's host/port).
         #[arg(long)]
@@ -118,7 +120,9 @@ enum Command {
         path: Option<PathBuf>,
     },
     /// Unmount: release the drive letter (Windows) or the mount point
-    /// directory (Unix).
+    /// directory (Unix). An in-process WinFsp mount cannot be released
+    /// from another process — this command says so instead of pretending
+    /// (stop that process instead).
     Unmount {
         /// Drive letter (default: the config's `drive_letter`) —
         /// Windows only.
@@ -398,12 +402,107 @@ async fn mount_cmd(
         if path.is_some() {
             anyhow::bail!("--path applies to Unix mounts only; Windows uses drive letters");
         }
+        // K40's decision, with the same shape as the boot's: a winfsp
+        // request that cannot be honoured degrades visibly to the WebDAV
+        // mapping (never a refusal), and the reason is printed first.
+        let decision = cloudkit_cli::choose_mount_backend(
+            cfg.mount_backend,
+            &cloudkit_cli::winfsp_capability(),
+        );
+        match &decision {
+            cloudkit_cli::MountBackendDecision::WebDav => {}
+            cloudkit_cli::MountBackendDecision::WebDavFallback(reason) => {
+                tracing::error!(backend = "winfsp", %reason, "the winfsp mount backend is \
+                     unavailable for `cydrive mount`; falling back to the WebDAV drive \
+                     mapping (K40)");
+                println!("{}", cloudkit_cli::winfsp_fallback_notice(reason));
+            }
+            cloudkit_cli::MountBackendDecision::WinFsp => {
+                return mount_cmd_winfsp(cfg, url, letter).await;
+            }
+        }
         let (letter, url) = cloudkit_cli::resolve_mount_params(&cfg, url, letter);
         let mounted = cloudkit_platform::windows::mount_drive(&letter, &url)
             .with_context(|| format!("mounting {url} at {letter}"))?;
         println!("CyDrive mounted at {mounted} -> {url}");
         Ok(())
     }
+}
+
+/// `cydrive mount` with the in-process WinFsp backend (Phase 3 / WF4):
+/// build the configured volume's stack, mount it on its drive letter and
+/// stay in the foreground until Ctrl+C, then unmount — rclone-mount
+/// shaped, because an in-process mount lives exactly as long as the
+/// process that owns it (there is no cross-process unmount to offer).
+///
+/// `--url` is refused: it names a WebDAV endpoint, and this path never
+/// speaks WebDAV (the mount is a direct VFS adapter).
+#[cfg(all(windows, feature = "winfsp"))]
+async fn mount_cmd_winfsp(
+    cfg: CyDriveConfig,
+    url: Option<String>,
+    letter: Option<String>,
+) -> Result<()> {
+    if url.is_some() {
+        anyhow::bail!(
+            "--url applies to the WebDAV drive mapping; `mount_backend = \"winfsp\"` mounts \
+             the configured volume in-process (set mount_backend = \"webdav\" to map a URL)"
+        );
+    }
+    let letter = letter.unwrap_or_else(|| cfg.drive_letter.clone());
+    let cwd = std::env::current_dir().context("resolving the working directory")?;
+    let mut dispatch_options = cloudkit_cli::RunOptions::default();
+    let Some(transport) =
+        connect_single_volume_transport(&cfg, &cwd, &mut dispatch_options).await?
+    else {
+        return Ok(()); // Ctrl+C during the connect
+    };
+    let stack = cloudkit_cli::build_stack(&cfg, transport).await?;
+    let label = cfg.drive_letter.clone();
+    let vfs = Arc::clone(&stack.vfs);
+    let rt = tokio::runtime::Handle::current();
+    let mount_point = letter.clone();
+    let mounted = tokio::task::spawn_blocking(move || {
+        cloudkit_winfsp::mount::mount(vfs, rt, &mount_point, &label)
+    })
+    .await
+    .context("the winfsp mount task failed to complete")?
+    .with_context(|| format!("mounting the configured volume at {letter} through winfsp"))?;
+    if let Err(error) = &mounted.readiness {
+        println!("Warning: the drive did not appear yet ({error}); it may still come up.");
+    }
+    println!(
+        "CyDrive is mounted at {} (winfsp, in-process). Press Ctrl+C to unmount and exit.",
+        mounted.handle.mount_point()
+    );
+    let mut handle = mounted.handle;
+    tokio::signal::ctrl_c()
+        .await
+        .context("waiting for Ctrl+C")?;
+    println!("Ctrl+C received; unmounting ...");
+    let unmounted = tokio::task::spawn_blocking(move || handle.unmount())
+        .await
+        .context("the winfsp unmount task failed to complete")?;
+    if let Err(error) = unmounted {
+        println!("Unmount reported a problem: {error}");
+    } else {
+        println!("Unmounted.");
+    }
+    stack.shutdown().await;
+    Ok(())
+}
+
+/// The no-feature twin: unreachable in practice (the decision above only
+/// answers [`cloudkit_cli::MountBackendDecision::WinFsp`] when the feature
+/// is compiled in) — kept as an actionable refusal so a future refactor
+/// cannot silently ignore a winfsp request.
+#[cfg(not(all(windows, feature = "winfsp")))]
+async fn mount_cmd_winfsp(
+    _cfg: CyDriveConfig,
+    _url: Option<String>,
+    _letter: Option<String>,
+) -> Result<()> {
+    anyhow::bail!("{}", cloudkit_cli::WINFSP_FEATURE_REQUIRED)
 }
 
 /// `cydrive unmount`: release the mapping for the resolved letter
@@ -425,6 +524,15 @@ async fn unmount_cmd(letter: Option<String>, path: Option<PathBuf>) -> Result<()
     {
         if path.is_some() {
             anyhow::bail!("--path applies to Unix mounts only; Windows uses drive letters");
+        }
+        // K40 / WF4: an in-process winfsp mount belongs to the process
+        // that created it — WinFsp offers no cross-process unmount. Say so
+        // instead of running `net use /delete` (which would either fail or
+        // delete a mapping that is none of our business) and reporting a
+        // success that never happened.
+        if let Some(note) = cloudkit_cli::winfsp_unmount_note(&cfg) {
+            println!("{note}");
+            return Ok(());
         }
         let letter = cloudkit_cli::resolve_unmount_letter(&cfg, letter);
         cloudkit_platform::windows::unmount_drive(&letter)
@@ -549,6 +657,9 @@ async fn doctor_cmd() -> Result<()> {
     if let Ok(DiscoveredConfig::Multi { process, volumes }) = &discovered {
         let mut results = cloudkit_cli::doctor::run_doctor_multi(process, volumes);
         results.extend(cloudkit_cli::doctor::webclient_checks());
+        // Phase 3 / WF4: the winfsp install probe rides the platform leg
+        // (Warn when absent — the webdav default needs nothing).
+        results.extend(cloudkit_cli::doctor::winfsp_checks());
         print!("{}", cloudkit_cli::doctor::render_report(&results));
         return Ok(());
     }
@@ -580,6 +691,9 @@ async fn doctor_cmd() -> Result<()> {
     };
     let mut results = cloudkit_cli::doctor::run_doctor(&ctx);
     results.extend(cloudkit_cli::doctor::webclient_checks());
+    // Phase 3 / WF4: the winfsp install probe (Warn when absent — never a
+    // Fail: the webdav default needs nothing installed).
+    results.extend(cloudkit_cli::doctor::winfsp_checks());
     match cfg.backend {
         cloudkit_core::config::Backend::Telegram => {
             results.push(cloudkit_cli::doctor::telegram_connectivity_check());
@@ -715,33 +829,9 @@ async fn run_single_volume(cfg: CyDriveConfig, cwd: std::path::PathBuf) -> Resul
     cloudkit_core::logging::init(&LogConfig::default()).context("initializing logging")?;
 
     let mut run_options = cloudkit_cli::RunOptions::default();
-    let transport: Arc<dyn cloudkit_core::transport::CloudTransport> = match cfg.backend {
-        Backend::Telegram => {
-            // The legacy arm, byte-for-byte: session glue → visible
-            // progress line → deadline-bounded connect raced against
-            // Ctrl+C → the failure hint on error.
-            match connect_telegram_volume(&cfg, &cwd).await? {
-                Some(transport) => transport,
-                None => return Ok(()), // Ctrl+C during the connect
-            }
-        }
-        backend => {
-            println!(
-                "Connecting to the {backend} backend ...",
-                backend = backend.as_str()
-            );
-            let dispatched = cloudkit_cli::build_backend_transport(&cfg).await?;
-            // K12: the periodic sync task keys on the backend's own
-            // identity (baidu's account uid), not on telegram creds.
-            run_options.sync_namespace = Some(dispatched.sync_namespace_key());
-            // Dashboard identity (web adapter): the volume label and the
-            // boot quota snapshot exist only on the dispatched enum —
-            // past this point the run flow sees the erased
-            // CloudTransport face, which carries neither.
-            run_options.web_volume = Some(dispatched.volume().to_string());
-            run_options.web_quota = dispatched.web_quota_snapshot().await;
-            dispatched.clone_dyn()
-        }
+    let Some(transport) = connect_single_volume_transport(&cfg, &cwd, &mut run_options).await?
+    else {
+        return Ok(()); // Ctrl+C during the connect
     };
 
     let handle = cloudkit_cli::run_with_transport_options(&cfg, transport, run_options).await?;
@@ -871,9 +961,24 @@ async fn run_multi_volume(
             banner.push_str("  |  dashboard unavailable (disabled or bind failed; see the log)")
         }
     }
-    let letters = handle.mounted_letters();
-    if !letters.is_empty() {
-        banner.push_str(&format!("  |  mounted: {}", letters.join(", ")));
+    // K40 / WF4: every mount names its backend — `V: winfsp`,
+    // `Y: webdav`, `Z: webdav (fallback: …)` — so a degraded winfsp
+    // request is visible in the door line, not just in the log.
+    let mounts = handle.mounted_volumes();
+    if !mounts.is_empty() {
+        let listing = mounts
+            .iter()
+            .map(|mount| {
+                format!(
+                    "{} {} ({})",
+                    mount.letter,
+                    mount.volume,
+                    mount.backend.label()
+                )
+            })
+            .collect::<Vec<_>>()
+            .join(", ");
+        banner.push_str(&format!("  |  mounted: {listing}"));
     }
     banner.push_str("  |  press Ctrl+C to stop  |  or `cydrive stop`");
     println!("{banner}");
@@ -903,6 +1008,45 @@ async fn run_multi_volume(
     println!("Shutting down (draining every volume's uploads) ...");
     handle.shutdown().await?;
     Ok(())
+}
+
+/// The single-volume transport dispatch shared by `run` and the in-process
+/// winfsp `mount` path (Phase 3 / WF4 extraction; the body is the
+/// pre-WF4 `run_single_volume` arm verbatim): telegram's deadline-bounded
+/// connect raced against Ctrl+C, or the unified baidu/local dispatch which
+/// also fills the dashboard identity into `options`. `Ok(None)` means
+/// Ctrl+C won the connect race (the caller exits cleanly).
+async fn connect_single_volume_transport(
+    cfg: &CyDriveConfig,
+    cwd: &std::path::Path,
+    options: &mut cloudkit_cli::RunOptions,
+) -> Result<Option<Arc<dyn cloudkit_core::transport::CloudTransport>>> {
+    match cfg.backend {
+        Backend::Telegram => {
+            // The legacy arm, byte-for-byte: session glue → visible
+            // progress line → deadline-bounded connect raced against
+            // Ctrl+C → the failure hint on error.
+            let transport = connect_telegram_volume(cfg, cwd).await?;
+            Ok(transport)
+        }
+        backend => {
+            println!(
+                "Connecting to the {backend} backend ...",
+                backend = backend.as_str()
+            );
+            let dispatched = cloudkit_cli::build_backend_transport(cfg).await?;
+            // K12: the periodic sync task keys on the backend's own
+            // identity (baidu's account uid), not on telegram creds.
+            options.sync_namespace = Some(dispatched.sync_namespace_key());
+            // Dashboard identity (web adapter): the volume label and the
+            // boot quota snapshot exist only on the dispatched enum —
+            // past this point the run flow sees the erased
+            // CloudTransport face, which carries neither.
+            options.web_volume = Some(dispatched.volume().to_string());
+            options.web_quota = dispatched.web_quota_snapshot().await;
+            Ok(Some(dispatched.clone_dyn()))
+        }
+    }
 }
 
 /// The telegram connect arm shared by both run flows (Phase 2.5 / MV1

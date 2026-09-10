@@ -45,7 +45,7 @@ use ck_telegram::config::{
 #[cfg(feature = "telegram")]
 use ck_telegram::transport::GrammersTransport;
 use cloudkit_core::cache::CacheManager;
-use cloudkit_core::config::{Backend, CyDriveConfig, VolumeConfig};
+use cloudkit_core::config::{Backend, CyDriveConfig, MountBackend, VolumeConfig};
 use cloudkit_core::credentials::{
     CredentialStore, InMemoryStore, BOT_TOKEN, ENCRYPTION_PASSWORD, SERVICE,
 };
@@ -867,6 +867,12 @@ pub struct VolumeRegistry {
 }
 
 impl VolumeRegistry {
+    /// One volume's registry entry by name (`None` for an unknown name) —
+    /// the lookup the mount pass resolves each claim's VFS with.
+    pub fn volume(&self, name: &str) -> Option<&VolumeRuntime> {
+        self.volumes.iter().find(|volume| volume.name() == name)
+    }
+
     /// The (name, status) list for banners and (MV3) `/api/volumes`.
     pub fn status_list(&self) -> Vec<(String, VolumeStatus)> {
         self.volumes
@@ -979,6 +985,9 @@ pub struct MultiVolumeHandle {
     /// The drive letters the per-volume mounts actually claimed
     /// (possibly fewer than configured — a failed mount only warns).
     mounted_letters: Vec<String>,
+    /// The same mounts with the backend that carried each one (K40's
+    /// per-volume banner annotation).
+    mounted_volumes: Vec<MountedVolume>,
 }
 
 impl std::fmt::Debug for MultiVolumeHandle {
@@ -994,7 +1003,7 @@ impl std::fmt::Debug for MultiVolumeHandle {
 impl MultiVolumeHandle {
     /// One volume's registry entry (name lookup).
     pub fn volume(&self, name: &str) -> Option<&VolumeRuntime> {
-        self.registry.volumes.iter().find(|v| v.name() == name)
+        self.registry.volume(name)
     }
 
     /// The (name, status) list — the K29 banner payload.
@@ -1023,6 +1032,13 @@ impl MultiVolumeHandle {
     /// mounts that only warned).
     pub fn mounted_letters(&self) -> &[String] {
         &self.mounted_letters
+    }
+
+    /// The mounts with the backend that carried each one (Phase 3 / WF4):
+    /// the banner annotates every letter with it, so a degraded winfsp
+    /// request is visible at a glance (`webdav (fallback: …)`).
+    pub fn mounted_volumes(&self) -> &[MountedVolume] {
+        &self.mounted_volumes
     }
 
     /// One arm of the run flow's shutdown wait, the multi-volume analog
@@ -1198,13 +1214,45 @@ pub async fn run_multi_with_transports(
     let web_ui = bind_multi_web_ui(process_cfg, ui_entries).await;
     let web_ui_addr = web_ui.as_ref().map(WebUiServer::local_addr);
 
-    // Per-volume mounts (K27): only volumes that EXPLICITLY set a
+    // Per-volume mounts (K27 + K40): only volumes that EXPLICITLY set a
     // drive_letter claim a mount (the parsed default letter is a
-    // placeholder, not a claim); nothing mounts without the listener.
-    let mount_claims = webdav_addr
-        .map(|_| collect_mount_claims(&registry))
-        .unwrap_or_default();
-    let mounted_letters = mount_volumes_if_configured(process_cfg, &mount_claims);
+    // placeholder, not a claim). The WebDAV backend needs the listener
+    // (its mount target is the `/vol/<name>` URL); the in-process winfsp
+    // backend does not — its claims are collected even when the bind
+    // degraded, and a fallback that has no endpoint to land on says so.
+    let mount_claims = match (
+        webdav_addr.is_some(),
+        process_cfg.mount_backend == MountBackend::Winfsp,
+    ) {
+        (true, _) | (false, true) => collect_mount_claims(&registry),
+        (false, false) => Vec::new(),
+    };
+    let runtime_handle = tokio::runtime::Handle::current();
+    let mounts = mount_volumes_if_configured(&MountPlan {
+        process_cfg,
+        claims: &mount_claims,
+        registry: &registry,
+        rt: &runtime_handle,
+        webdav_available: webdav_addr.is_some(),
+        winfsp: winfsp_capability(),
+    })
+    .await;
+    let mounted_letters: Vec<String> = mounts
+        .mounted
+        .iter()
+        .map(|mount| mount.letter.clone())
+        .collect();
+    let mounted_volumes = mounts.mounted;
+    let winfsp_mounts = mounts.winfsp;
+    // The stop loop's `net use /delete` releases mappings, and only the
+    // WebDAV arm creates mappings — a winfsp-mounted letter carries none,
+    // so deleting it would only log a failure (the letter is already
+    // gone by then; see `winfsp_mounts.release()` below).
+    let webdav_letters: Vec<String> = mounted_volumes
+        .iter()
+        .filter(|mount| mount.backend.as_str() == "webdav")
+        .map(|mount| mount.letter.clone())
+        .collect();
 
     // The process-level control channel (K25): same file name and
     // cwd-anchored location as the single-volume mode (the process
@@ -1239,7 +1287,7 @@ pub async fn run_multi_with_transports(
     // control file, then the mounted letters release — exactly once for
     // any number of gate fires.
     let gate = Arc::clone(&watch);
-    let unmount_letters = mounted_letters.clone();
+    let unmount_letters = webdav_letters;
     let stop_task = tokio::spawn(async move {
         watch.wait().await;
         if let Some(server) = &webdav_server {
@@ -1248,6 +1296,14 @@ pub async fn run_multi_with_transports(
         if let Some(web_ui) = &web_ui {
             web_ui.shutdown().await;
         }
+        // The in-process winfsp mounts come down BEFORE the volumes' VFS
+        // workers: their callbacks call into the Vfs, so the host must be
+        // gone first — the same ordering rule the WebDAV listener above
+        // follows. Each unmount is a blocking WinFsp call (plus the
+        // drive-letter disappearance poll) on the blocking pool, and a
+        // failure only warns: a stuck letter must never block the exit
+        // (rclone's "unmount has no force" reality).
+        winfsp_mounts.release().await;
         for unit in stop_units {
             unit.vfs.shutdown().await;
             unit.inbound.shutdown().await;
@@ -1281,6 +1337,7 @@ pub async fn run_multi_with_transports(
         webdav_addr,
         web_ui_addr,
         mounted_letters,
+        mounted_volumes,
     })
 }
 
@@ -1530,7 +1587,16 @@ pub async fn connect_stack_with_deadline(cfg: &CyDriveConfig, deadline: Duration
             .context("connecting the Telegram transport")
             .context(connect_failure_hint())?,
     );
+    build_stack(cfg, transport).await
+}
 
+/// The second half of the `connect_stack` family, over an
+/// already-connected transport (Phase 3 / WF4 extraction): open the
+/// metadata db, build the cache and the VFS, and bundle the three. Kept
+/// public so the winfsp `mount` path — whose transport comes from the
+/// unified backend dispatch rather than the telegram connect — assembles
+/// exactly the same stack as `run`.
+pub async fn build_stack(cfg: &CyDriveConfig, transport: Arc<dyn CloudTransport>) -> Result<Stack> {
     let db = Arc::new(
         MetaDatabase::open(Path::new(&cfg.db_path))
             .with_context(|| format!("opening metadata db {:?}", cfg.db_path))?,
@@ -2691,6 +2757,552 @@ fn spawn_periodic_sync(
     }))
 }
 
+// ------------------------------------------- mount backends (Phase 3 / WF4) ---
+//
+// K40: `mount_backend = "webdav" | "winfsp"` selects how a volume becomes
+// a Windows drive letter. `webdav` (the default) is the `net use` mapping
+// onto the process WebDAV endpoint — byte-identical to the Python
+// baseline. `winfsp` mounts the volume in-process through the native API
+// and needs two things the config cannot guarantee: a binary built with
+// `--features winfsp` (K38's GPL isolation keeps the feature off by
+// default) and an installed WinFsp runtime. When either is missing the
+// mount flow **degrades visibly to WebDAV** — an error log, a printed
+// notice and a per-volume banner label — and never refuses to start.
+//
+// The decision is a pure function of the config and the capability, which
+// is what makes it testable in both build legs (`tests/mount_backend.rs`).
+
+/// The rebuild/switch hint a winfsp request gets from a binary built
+/// without the feature (the K31 driver-message precedent: name the rebuild
+/// command, then name the way out). Pinned by `tests/mount_backend.rs`
+/// in the default leg, where it is what the user actually sees.
+pub const WINFSP_FEATURE_REQUIRED: &str = "this binary was built without the winfsp mount \
+     backend; rebuild with `cargo build -p cloudkit-cli --features winfsp`, or set \
+     `mount_backend = \"webdav\"` in config.toml";
+
+/// Whether this build *and* this machine can mount through WinFsp — K40's
+/// decision input, assembled once per boot.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WinFspCapability {
+    /// Compiled with the feature and the runtime is ready (the registry
+    /// found an install, its DLL loaded, `winfsp_init` answered Ok).
+    Ready,
+    /// Built without `--features winfsp`: no code path can mount (K38).
+    NotCompiled,
+    /// Compiled in, but the machine cannot serve it; the string is the
+    /// runtime probe's actionable reason.
+    Unavailable(String),
+}
+
+/// What the mount flow will actually do (K40's pure decision).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountBackendDecision {
+    /// Mount in-process through WinFsp.
+    WinFsp,
+    /// Map the WebDAV endpoint with `net use` (the default, and what an
+    /// inherited config without the key gets).
+    WebDav,
+    /// `mount_backend = "winfsp"` was asked for and cannot be honoured;
+    /// the reason is user-facing and the WebDAV mapping runs instead.
+    WebDavFallback(String),
+}
+
+impl MountBackendDecision {
+    /// `true` for [`MountBackendDecision::WinFsp`].
+    pub fn is_winfsp(&self) -> bool {
+        matches!(self, MountBackendDecision::WinFsp)
+    }
+
+    /// The banner/status spelling: the backend that runs, plus the reason
+    /// when it is a fallback (never a silent downgrade).
+    pub fn label(&self) -> String {
+        match self {
+            MountBackendDecision::WinFsp => "winfsp".to_string(),
+            MountBackendDecision::WebDav => "webdav".to_string(),
+            MountBackendDecision::WebDavFallback(reason) => {
+                format!("webdav (winfsp unavailable: {reason})")
+            }
+        }
+    }
+}
+
+/// How a volume actually ended up mounted — the per-volume banner payload
+/// (`MultiVolumeHandle::mounted_volumes`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum MountedBackend {
+    /// In-process WinFsp mount.
+    WinFsp,
+    /// `net use` mapping (the requested backend, or the default).
+    WebDav,
+    /// A winfsp request that landed on WebDAV; the reason says why
+    /// (runtime unavailable, feature missing, or this volume's own mount
+    /// failure).
+    WebDavFallback {
+        /// User-facing degradation reason.
+        reason: String,
+    },
+}
+
+impl MountedBackend {
+    /// The stable lowercase backend name (`"winfsp"` / `"webdav"`).
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            MountedBackend::WinFsp => "winfsp",
+            MountedBackend::WebDav | MountedBackend::WebDavFallback { .. } => "webdav",
+        }
+    }
+
+    /// The banner spelling: the backend, plus `(fallback: …)` whenever the
+    /// config asked for something else.
+    pub fn label(&self) -> String {
+        match self {
+            MountedBackend::WinFsp => "winfsp".to_string(),
+            MountedBackend::WebDav => "webdav".to_string(),
+            MountedBackend::WebDavFallback { reason } => {
+                format!("webdav (fallback: {reason})")
+            }
+        }
+    }
+}
+
+/// K40's pure decision: the config's request against what this
+/// build/machine can do. `webdav` is never upgraded; `winfsp` lands on
+/// WebDAV (with a reason) whenever it cannot run.
+pub fn choose_mount_backend(
+    backend: MountBackend,
+    capability: &WinFspCapability,
+) -> MountBackendDecision {
+    match backend {
+        MountBackend::Webdav => MountBackendDecision::WebDav,
+        MountBackend::Winfsp => match capability {
+            WinFspCapability::Ready => MountBackendDecision::WinFsp,
+            WinFspCapability::NotCompiled => {
+                MountBackendDecision::WebDavFallback(WINFSP_FEATURE_REQUIRED.to_string())
+            }
+            WinFspCapability::Unavailable(reason) => {
+                MountBackendDecision::WebDavFallback(reason.clone())
+            }
+        },
+    }
+}
+
+/// This build's + machine's WinFsp capability. With the feature it probes
+/// the real runtime ([`cloudkit_winfsp::mount::winfsp_status`], whose
+/// verdict is cached for the process); without it — or off Windows, where
+/// the crate compiles to an empty library — the answer is
+/// [`WinFspCapability::NotCompiled`], which is what makes the degradation
+/// path the *default* outcome of asking for winfsp.
+#[cfg(all(windows, feature = "winfsp"))]
+pub fn winfsp_capability() -> WinFspCapability {
+    match cloudkit_winfsp::mount::winfsp_status() {
+        cloudkit_winfsp::mount::WinFspStatus::Ready { .. } => WinFspCapability::Ready,
+        cloudkit_winfsp::mount::WinFspStatus::Unavailable(reason) => {
+            WinFspCapability::Unavailable(reason)
+        }
+    }
+}
+
+/// [`winfsp_capability`] for every build that cannot mount through WinFsp
+/// (no feature, or not Windows — the mount is Windows-only).
+#[cfg(not(all(windows, feature = "winfsp")))]
+pub fn winfsp_capability() -> WinFspCapability {
+    WinFspCapability::NotCompiled
+}
+
+/// The one-line notice a degraded winfsp boot prints (and logs at error
+/// level) before the WebDAV mapping takes over: the backend, the reason,
+/// the fallback that runs and the fact that nothing was blocked.
+pub fn winfsp_fallback_notice(reason: &str) -> String {
+    format!(
+        "winfsp mount backend unavailable ({reason}); falling back to the WebDAV drive \
+         mapping (net use) — nothing is blocked, and the volumes stay reachable"
+    )
+}
+
+/// Single-volume mode's scope note (WF4 ruling, records in the tracker):
+/// the in-process backend is wired into the multi-volume flow, where every
+/// volume carries its own explicit `drive_letter` claim (K27). A
+/// single-volume config that asked for `winfsp` gets the WebDAV mapping
+/// and this note — degradation stays visible (K40), never silent.
+pub fn single_volume_winfsp_note(cfg: &CyDriveConfig) -> Option<&'static str> {
+    (cfg.mount_backend == MountBackend::Winfsp).then_some(
+        "mount_backend = \"winfsp\" applies to the multi-volume flow (one in-process mount per \
+         volume claim); this single-volume instance keeps the WebDAV drive mapping — split the \
+         instance into `volumes_dir` volumes for the winfsp backend, or set mount_backend = \
+         \"webdav\"",
+    )
+}
+
+/// `cydrive unmount`'s answer for a winfsp-backed instance (Phase 3 /
+/// WF4): an in-process mount lives exactly as long as the process that
+/// created it, and WinFsp has no cross-process unmount — so there is
+/// nothing this command can release, and it must not pretend otherwise (a
+/// `net use /delete` on the configured letter would target a mapping that
+/// is not ours). `None` for the WebDAV backend, whose mapping *is*
+/// cross-process.
+pub fn winfsp_unmount_note(cfg: &CyDriveConfig) -> Option<&'static str> {
+    (cfg.mount_backend == MountBackend::Winfsp).then_some(
+        "nothing to unmount: `mount_backend = \"winfsp\"` mounts the volume in-process, and an \
+         in-process mount is released when its process exits — WinFsp has no cross-process \
+         unmount. Stop that process instead (Ctrl+C in its console, or `cydrive stop`). No \
+         `net use` mapping is created by the winfsp backend; if the letter carries one you \
+         mapped yourself, remove it with `net use <letter> /delete`.",
+    )
+}
+
+/// One volume's completed mount (K27 + K40): the name, the drive letter
+/// it claimed and the backend that actually carried it — the banner
+/// annotates every volume with the last two.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct MountedVolume {
+    /// The volume name (the file stem, K19).
+    pub volume: String,
+    /// The drive letter actually mounted (`"Q:"`).
+    pub letter: String,
+    /// Which backend carried it (and, when degraded, why).
+    pub backend: MountedBackend,
+}
+
+/// The live in-process WinFsp mounts a boot must release, as this build
+/// can hold them.
+///
+/// With the feature it wraps
+/// [`cloudkit_winfsp::mount::MountHandle`]s; without it the set is
+/// necessarily empty (the arm degrades to WebDAV before a handle could
+/// exist) — the type itself stays the same so the boot and stop code paths
+/// are written once, and [`WinFspHandles::release`] carries the cfg.
+#[cfg(all(windows, feature = "winfsp"))]
+#[derive(Default)]
+pub struct WinFspHandles(Vec<cloudkit_winfsp::mount::MountHandle>);
+
+/// The no-feature twin: nothing to hold, ever (see the feature'd type).
+#[cfg(not(all(windows, feature = "winfsp")))]
+#[derive(Default)]
+pub struct WinFspHandles;
+
+#[cfg(all(windows, feature = "winfsp"))]
+impl WinFspHandles {
+    /// Parks one live mount for the stop sequence.
+    fn push(&mut self, handle: cloudkit_winfsp::mount::MountHandle) {
+        self.0.push(handle);
+    }
+
+    /// `true` when no mount was parked.
+    pub fn is_empty(&self) -> bool {
+        self.0.is_empty()
+    }
+
+    /// Releases every in-process mount: unmount + dispatcher stop + the
+    /// drive letter's disappearance poll, each on the blocking pool (these
+    /// are synchronous WinFsp calls — see `cloudkit_winfsp::mount`'s
+    /// threading notes). Failures warn; the shutdown always continues.
+    pub async fn release(self) {
+        for handle in self.0 {
+            let letter = handle.mount_point().to_string();
+            let outcome = tokio::task::spawn_blocking(move || {
+                let mut handle = handle;
+                handle.unmount().map_err(|error| error.to_string())
+            })
+            .await;
+            match outcome {
+                Ok(Ok(())) => {
+                    tracing::info!(letter = %letter, "released the in-process winfsp mount")
+                }
+                Ok(Err(error)) => tracing::warn!(
+                    letter = %letter,
+                    %error,
+                    "releasing the winfsp mount reported a problem; continuing the shutdown"
+                ),
+                Err(error) => tracing::warn!(
+                    letter = %letter,
+                    %error,
+                    "joining the winfsp unmount task failed; continuing the shutdown"
+                ),
+            }
+        }
+    }
+}
+
+#[cfg(not(all(windows, feature = "winfsp")))]
+impl WinFspHandles {
+    /// `true` when no mount was parked — always, in this build.
+    pub fn is_empty(&self) -> bool {
+        true
+    }
+
+    /// Nothing to release: this build cannot mount through WinFsp (the
+    /// arm degrades to WebDAV), so the set is empty by construction.
+    pub async fn release(self) {
+        let Self = self;
+    }
+}
+
+/// What one boot's mount pass produced: the per-volume report (banner,
+/// `mounted_letters`) plus the live in-process mounts the stop sequence
+/// must release before the volumes' VFS workers go down.
+#[derive(Default)]
+pub struct VolumeMounts {
+    /// The volumes that mounted, in claim order.
+    pub mounted: Vec<MountedVolume>,
+    /// The in-process WinFsp mounts still live (empty otherwise).
+    pub winfsp: WinFspHandles,
+}
+
+/// Everything the per-volume mount dispatch reads (K27's claims plus K40's
+/// decision inputs), bundled so the signature stays readable.
+struct MountPlan<'a> {
+    /// The process-level config (the `mount_backend` policy and the
+    /// `auto_mount_drive` gate).
+    process_cfg: &'a CyDriveConfig,
+    /// The `(volume, letter)` claims: volumes that explicitly set a
+    /// `drive_letter` (K27).
+    claims: &'a [(String, String)],
+    /// The registry, for each claim's own VFS (the winfsp arm mounts it).
+    ///
+    /// Only the winfsp arm reads this pair: without the feature that arm
+    /// is a cfg'd no-op, so the fields are legitimately unread there — the
+    /// `allow` keeps a `-D warnings` build honest about the *other* legs.
+    #[cfg_attr(not(all(windows, feature = "winfsp")), allow(dead_code))]
+    registry: &'a VolumeRegistry,
+    /// The process runtime handle the adapters bridge their async core on.
+    #[cfg_attr(not(all(windows, feature = "winfsp")), allow(dead_code))]
+    rt: &'a tokio::runtime::Handle,
+    /// Whether the single WebDAV listener bound — the webdav arm's target
+    /// and the fallback's only possible landing spot.
+    webdav_available: bool,
+    /// This build's + machine's WinFsp capability.
+    winfsp: WinFspCapability,
+}
+
+/// The per-volume mount pass (K27 / MV2 + K40): `webdav` maps every claim
+/// through `net use`, `winfsp` mounts every claim in-process, and every
+/// way the second can fail lands on the first with the reason printed —
+/// a failed mount only warns, exactly like the pre-WF4 behaviour.
+async fn mount_volumes_if_configured(plan: &MountPlan<'_>) -> VolumeMounts {
+    #[cfg(unix)]
+    {
+        let _ = plan;
+        tracing::info!(
+            "multi-volume mode mounts no directories on unix (per-volume drive-letter \
+             mounts are the K27 scope); mount manually: `cydrive mount --path <dir>`"
+        );
+        VolumeMounts::default()
+    }
+
+    #[cfg(not(unix))]
+    {
+        if plan.claims.is_empty() {
+            tracing::info!("no volume claimed a drive_letter; skipping the drive mappings");
+            return VolumeMounts::default();
+        }
+        if !plan.process_cfg.auto_mount_drive {
+            tracing::info!("auto_mount_drive is off; skipping the drive mappings");
+            return VolumeMounts::default();
+        }
+        if !cfg!(windows) {
+            tracing::info!("drive mapping is Windows-only; skipping");
+            return VolumeMounts::default();
+        }
+        match choose_mount_backend(plan.process_cfg.mount_backend, &plan.winfsp) {
+            MountBackendDecision::WebDav => VolumeMounts {
+                mounted: mount_claims_via_webdav(
+                    plan.process_cfg,
+                    plan.claims,
+                    plan.webdav_available,
+                    |_| MountedBackend::WebDav,
+                ),
+                ..VolumeMounts::default()
+            },
+            // K40's visible degradation: error log + printed notice, then
+            // the same WebDAV pass, annotated per volume.
+            MountBackendDecision::WebDavFallback(reason) => {
+                tracing::error!(
+                    backend = "winfsp",
+                    %reason,
+                    "the winfsp mount backend is unavailable; falling back to the WebDAV \
+                     drive mapping (K40 — visible degradation, the boot continues)"
+                );
+                println!("{}", winfsp_fallback_notice(&reason));
+                VolumeMounts {
+                    mounted: mount_claims_via_webdav(
+                        plan.process_cfg,
+                        plan.claims,
+                        plan.webdav_available,
+                        |_| MountedBackend::WebDavFallback {
+                            reason: reason.clone(),
+                        },
+                    ),
+                    ..VolumeMounts::default()
+                }
+            }
+            MountBackendDecision::WinFsp => mount_claims_via_winfsp(plan).await,
+        }
+    }
+}
+
+/// The WebDAV arm: every claim is mapped with `net use` onto the volume's
+/// `/vol/<name>` endpoint (K27). A failed mount only warns — the volume
+/// stays reachable at its URL. `backend` labels what the caller will
+/// record (the plain backend, or the degradation that landed here).
+#[cfg(not(unix))]
+fn mount_claims_via_webdav(
+    process_cfg: &CyDriveConfig,
+    claims: &[(String, String)],
+    webdav_available: bool,
+    backend: impl Fn(&str) -> MountedBackend,
+) -> Vec<MountedVolume> {
+    if !webdav_available {
+        tracing::warn!(
+            "the WebDAV listener is not bound; the drive mappings have no endpoint to \
+             mount (the volumes keep running)"
+        );
+        return Vec::new();
+    }
+    let mut mounted = Vec::new();
+    for (name, letter) in claims {
+        let url = volume_mount_url(process_cfg, name);
+        println!("Mounting volume {name} as drive {letter} -> {url} ...");
+        match cloudkit_platform::windows::mount_drive(letter, &url) {
+            Ok(actual) => {
+                println!("Drive mounted: {actual} -> {url} (volume {name})");
+                mounted.push(MountedVolume {
+                    volume: name.clone(),
+                    letter: actual,
+                    backend: backend(name),
+                });
+            }
+            Err(error) => {
+                println!(
+                    "Auto-mount FAILED for volume {name} ({error}); the volume stays \
+                     reachable at {url}."
+                );
+                println!(
+                    "  Hints: run `cydrive fix-reg` in an elevated shell, ensure the \
+                     WebClient                  service can start, and check that the letter \
+                     is free (`cydrive doctor`)."
+                );
+            }
+        }
+    }
+    mounted
+}
+
+/// The WinFsp arm: every claim is mounted in-process through the native
+/// adapter. Each mount runs on the blocking pool (the bring-up and the
+/// readiness poll are synchronous WinFsp calls), and every failure
+/// degrades per volume exactly like the whole-arm fallback: log, print,
+/// then the WebDAV mapping for that claim — except an occupied letter,
+/// where the WebDAV mapping would `net use /delete` whatever holds the
+/// letter, so it is reported and skipped instead.
+#[cfg(all(windows, feature = "winfsp"))]
+async fn mount_claims_via_winfsp(plan: &MountPlan<'_>) -> VolumeMounts {
+    use cloudkit_winfsp::mount::MountError;
+
+    let mut mounted = Vec::new();
+    let mut handles = WinFspHandles::default();
+    for (name, letter) in plan.claims {
+        let Some(vfs) = plan
+            .registry
+            .volume(name)
+            .and_then(VolumeRuntime::vfs)
+            .cloned()
+        else {
+            tracing::error!(
+                volume = %name,
+                "the volume has no running VFS; skipping its winfsp mount"
+            );
+            println!("WinFsp mount skipped for volume {name}: the volume is not running.");
+            continue;
+        };
+        let rt = plan.rt.clone();
+        let label = name.clone();
+        let requested = letter.clone();
+        let outcome = tokio::task::spawn_blocking(move || {
+            cloudkit_winfsp::mount::mount(vfs, rt, &requested, &label)
+        })
+        .await;
+        match outcome {
+            Ok(Ok(landed)) => {
+                let letter = landed.handle.mount_point().to_string();
+                if let Err(error) = &landed.readiness {
+                    // The mount is up but the letter did not answer: kept
+                    // (see the adapter's rationale), reported here.
+                    tracing::error!(
+                        volume = %name,
+                        %error,
+                        "the winfsp mount point did not appear; the mount is kept"
+                    );
+                    println!(
+                        "Warning: volume {name} is mounted through winfsp at {letter}, but \
+                         the drive did not appear yet ({error})."
+                    );
+                }
+                println!("Volume {name} mounted in-process at {letter} (winfsp).");
+                handles.push(landed.handle);
+                mounted.push(MountedVolume {
+                    volume: name.clone(),
+                    letter,
+                    backend: MountedBackend::WinFsp,
+                });
+            }
+            Ok(Err(error)) => {
+                tracing::error!(
+                    volume = %name,
+                    %error,
+                    "winfsp mounting failed; falling back to the WebDAV drive mapping (K40)"
+                );
+                println!("winfsp mounting FAILED for volume {name} ({error}).");
+                // An occupied letter is the one failure where the WebDAV
+                // arm must NOT run: `mount_drive` clears the letter first
+                // (`net use /delete`), which would take over whatever
+                // holds it. Everything else falls back per claim.
+                if !matches!(error, MountError::LetterInUse { .. }) {
+                    if plan.webdav_available {
+                        println!("Falling back to the WebDAV drive mapping for volume {name}.");
+                        mounted.extend(mount_claims_via_webdav(
+                            plan.process_cfg,
+                            std::slice::from_ref(&(name.clone(), letter.clone())),
+                            plan.webdav_available,
+                            |_| MountedBackend::WebDavFallback {
+                                reason: format!("winfsp mounting failed: {error}"),
+                            },
+                        ));
+                    } else {
+                        println!(
+                            "No fallback for volume {name}: the WebDAV listener is not bound."
+                        );
+                    }
+                }
+            }
+            Err(error) => {
+                tracing::error!(
+                    volume = %name,
+                    %error,
+                    "the winfsp mount task failed to complete; skipping this volume"
+                );
+            }
+        }
+    }
+    VolumeMounts {
+        mounted,
+        winfsp: handles,
+    }
+}
+
+/// The WinFsp arm of a build without the feature: `choose_mount_backend`
+/// cannot answer [`MountBackendDecision::WinFsp`] here (the capability is
+/// always `NotCompiled`), so this arm is unreachable — kept as a loud
+/// no-op rather than an `unreachable!()` so a future refactor that breaks
+/// that invariant cannot mount nothing in silence.
+#[cfg(not(all(windows, feature = "winfsp")))]
+async fn mount_claims_via_winfsp(_plan: &MountPlan<'_>) -> VolumeMounts {
+    tracing::error!(
+        "the winfsp mount backend is not compiled into this binary: {}",
+        WINFSP_FEATURE_REQUIRED
+    );
+    VolumeMounts::default()
+}
+
 /// Auto-mount step (unit D; the Unix leg is status plan C5): with
 /// `auto_mount_drive`, Windows maps the best available drive letter to
 /// the config's WebDAV URL, while Unix mounts the auto-mount target
@@ -2764,6 +3376,14 @@ fn mount_if_configured(cfg: &CyDriveConfig) -> (Option<String>, Option<PathBuf>)
             tracing::info!("drive mapping is Windows-only; skipping");
             return (None, None);
         }
+        // WF4 scope ruling: the in-process backend is wired into the
+        // multi-volume flow (one mount per K27 claim). A single-volume
+        // config asking for it gets the note and the WebDAV mapping —
+        // visible degradation, never a silent ignore.
+        if let Some(note) = single_volume_winfsp_note(cfg) {
+            tracing::warn!(backend = "winfsp", "{note}");
+            println!("{note}");
+        }
         let url = default_mount_url(cfg);
         println!("Mounting drive letter {} -> {} ...", cfg.drive_letter, url);
         match cloudkit_platform::windows::mount_drive(&cfg.drive_letter, &url) {
@@ -2794,65 +3414,6 @@ pub fn default_mount_url(cfg: &CyDriveConfig) -> String {
 /// this function's.
 pub fn volume_mount_url(process_cfg: &CyDriveConfig, volume_name: &str) -> String {
     format!("{}/vol/{volume_name}", default_mount_url(process_cfg))
-}
-
-/// Per-volume auto-mount (K27 / MV2, the multi-volume analog of
-/// [`mount_if_configured`]): every claim is a RUNNING volume whose file
-/// explicitly set `drive_letter`, and the mount target is the volume's
-/// `/vol/<name>` path on the process WebDAV port. The process-level
-/// `auto_mount_drive` switch stays the gate (off = mount nothing, the
-/// single-volume semantics). A failed mount only warns — the volume
-/// stays reachable at its WebDAV URL. Returns the letters actually
-/// mounted (the stop sequence releases exactly these).
-///
-/// Unix: K27 adjudicated the Windows drive-letter mounts only; the
-/// single-volume Unix gio→davfs2 chain is a process-level
-/// `mount_point` concept with no per-volume counterpart yet, so
-/// multi-volume mode mounts nothing there (info line, never silent).
-fn mount_volumes_if_configured(cfg: &CyDriveConfig, claims: &[(String, String)]) -> Vec<String> {
-    #[cfg(unix)]
-    {
-        let _ = (cfg, claims);
-        tracing::info!(
-            "multi-volume mode mounts no directories on unix (per-volume drive-letter \
-             mounts are the K27 scope); mount manually: `cydrive mount --path <dir>`"
-        );
-        Vec::new()
-    }
-
-    #[cfg(not(unix))]
-    {
-        if claims.is_empty() {
-            tracing::info!("no volume claimed a drive_letter; skipping the drive mappings");
-            return Vec::new();
-        }
-        if !cfg.auto_mount_drive {
-            tracing::info!("auto_mount_drive is off; skipping the drive mappings");
-            return Vec::new();
-        }
-        if !cfg!(windows) {
-            tracing::info!("drive mapping is Windows-only; skipping");
-            return Vec::new();
-        }
-        let mut mounted = Vec::new();
-        for (name, letter) in claims {
-            let url = volume_mount_url(cfg, name);
-            println!("Mounting volume {name} as drive {letter} -> {url} ...");
-            match cloudkit_platform::windows::mount_drive(letter, &url) {
-                Ok(actual) => {
-                    println!("Drive mounted: {actual} -> {url} (volume {name})");
-                    mounted.push(actual);
-                }
-                Err(error) => {
-                    println!("Auto-mount FAILED for volume {name} ({error}); the volume stays reachable at {url}.");
-                    println!(
-                        "  Hints: run `cydrive fix-reg` in an elevated shell, ensure the WebClient                  service can start, and check that the letter is free (`cydrive doctor`)."
-                    );
-                }
-            }
-        }
-        mounted
-    }
 }
 
 // ------------------------------------------------- status subcommand (C3) ---

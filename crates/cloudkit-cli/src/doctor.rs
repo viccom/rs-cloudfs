@@ -353,6 +353,81 @@ pub fn webclient_checks() -> Vec<CheckResult> {
     results
 }
 
+/// The WinFsp installation checks (Phase 3 / WF4, K40): a **Warn** — never
+/// a Fail — when WinFsp is absent, because the default `mount_backend =
+/// "webdav"` needs nothing installed and the winfsp request degrades
+/// visibly instead of refusing to start. The detection is a pure
+/// registry + file read ([`cloudkit_platform::windows::winfsp_install`]),
+/// so it needs no `winfsp` feature, no DLL load and no SDK — and it is
+/// exactly the information the operator needs *before* setting
+/// `mount_backend = "winfsp"`. Empty off Windows (the probe cannot
+/// mean anything there), like [`webclient_checks`].
+pub fn winfsp_checks() -> Vec<CheckResult> {
+    // Attribute gating (not `if cfg!`), the `webclient_checks` precedent:
+    // on unix the Windows-only symbols must not even compile. Each arm is
+    // a whole expression, which also keeps clippy's `vec_init_then_push`
+    // quiet on Windows (one check per platform shape, written literally).
+    #[cfg(windows)]
+    {
+        vec![evaluate_winfsp_install(
+            cloudkit_platform::windows::winfsp_install().as_ref(),
+        )]
+    }
+    #[cfg(not(windows))]
+    Vec::new()
+}
+
+/// Pure verdict over the WinFsp install probe (the read-only leg is
+/// `platform::windows::winfsp_install`):
+///
+/// * `None` — not installed (or the registry is unreadable) → **Warn**
+///   with the install pointer *and* the reassurance that the WebDAV
+///   backend needs nothing (the default stays workable);
+/// * `Some` with the runtime DLL → Ok, naming the install directory and
+///   what a winfsp mount additionally needs (a `--features winfsp`
+///   build);
+/// * `Some` without the DLL — a half install → Warn (the winfsp mount
+///   would fail at the preload; the operator should reinstall).
+pub fn evaluate_winfsp_install(install: Option<&cloudkit_platform::WinFspInstall>) -> CheckResult {
+    let name = "winfsp".to_string();
+    match install {
+        None => CheckResult {
+            name,
+            status: CheckStatus::Warn,
+            detail: "WinFsp is not installed (or its `InstallDir` registry value is \
+                     unreadable); install it from https://winfsp.dev/install/ to use \
+                     `mount_backend = \"winfsp\"` — the default `mount_backend = \"webdav\"` \
+                     needs nothing installed"
+                .to_string(),
+        },
+        Some(install) if install.dll.is_none() => CheckResult {
+            name,
+            status: CheckStatus::Warn,
+            detail: format!(
+                "{} exists but {} is missing — the installation looks incomplete; reinstall \
+                 from https://winfsp.dev/install/ (the WebDAV backend keeps working \
+                 meanwhile)",
+                install.install_dir.display(),
+                cloudkit_platform::WINFSP_X64_DLL,
+            ),
+        },
+        Some(install) => CheckResult {
+            name,
+            status: CheckStatus::Ok,
+            detail: format!(
+                "WinFsp installed at {} ({}) — `mount_backend = \"winfsp\"` additionally needs \
+                 a `--features winfsp` build",
+                install.install_dir.display(),
+                install
+                    .dll
+                    .as_ref()
+                    .map(|dll| dll.display().to_string())
+                    .unwrap_or_default(),
+            ),
+        },
+    }
+}
+
 /// The backend-specific offline checks (Phase 2 / B3b dispatch unit):
 /// appended by the CLI for baidu/local instances (telegram keeps its
 /// fixed advisory instead). The baidu NETWORK leg (token liveness) is

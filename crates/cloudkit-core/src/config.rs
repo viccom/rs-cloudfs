@@ -78,6 +78,7 @@ pub const KNOWN_TOML_KEYS: &[&str] = &[
     "enable_web_ui",
     "drive_letter",
     "auto_mount_drive",
+    "mount_backend",
     "mount_point",
     "chunk_size_mb",
     "cache_limit_gb",
@@ -123,6 +124,7 @@ const LEGACY_REJECTED_KEYS: &[&str] = &[
     "queue_capacity",
     "hydrate_timeout_secs",
     "mount_point",
+    "mount_backend",
     "encryption_scheme",
     "sync_url",
     "sync_secret",
@@ -213,6 +215,43 @@ impl Backend {
     }
 }
 
+/// How a volume is exposed as a Windows drive letter (Phase 3 / K40).
+///
+/// The wire names are the stable `config.toml` spellings
+/// (`mount_backend = "webdav" | "winfsp"`). The default —
+/// [`MountBackend::Webdav`] — is the full-compatibility contract: a
+/// config without the key keeps the Python baseline's `net use` drive
+/// mapping, byte for byte. Value validation is exhaustive at parse time
+/// (the field is a typed enum — an unknown variant is a
+/// [`ConfigError::Parse`] naming all accepted values and never reaches
+/// `validate`, which therefore adds no rule for the key). *Availability*
+/// is deliberately not a config concern: `"winfsp"` on a machine without
+/// WinFsp (or in a binary built without the feature) is a legal config
+/// that the mount flow degrades visibly from (K40's fallback back to
+/// WebDAV — never a parse or validation error, never a refusal to boot).
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum MountBackend {
+    /// `net use` drive mapping onto the process WebDAV endpoint (the
+    /// Python baseline behavior; the default, and the fallback arm every
+    /// degraded winfsp mount lands on).
+    #[default]
+    Webdav,
+    /// In-process WinFsp native mount (Phase 3, K38/K39) — needs a
+    /// `--features winfsp` build and an installed WinFsp runtime.
+    Winfsp,
+}
+
+impl MountBackend {
+    /// Stable `config.toml` spelling of this backend.
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            MountBackend::Webdav => "webdav",
+            MountBackend::Winfsp => "winfsp",
+        }
+    }
+}
+
 /// Process-scoped keys (Phase 2.5 / K19): the settings one process
 /// shares across all volumes — the WebDAV/Web UI endpoints, the
 /// dashboard switch and the `volumes_dir` itself. Together with
@@ -230,6 +269,11 @@ pub const PROCESS_SCOPED_KEYS: &[&str] = &[
     // other volumes' mounts ungoverned). Single-volume mode keeps it in
     // config.toml either way — the partition only governs multi mode.
     "auto_mount_drive",
+    // Same ruling for the mount backend (Phase 3 / K40): the mount
+    // policy is read once per process and applied to every volume's
+    // claim, so a per-volume spelling would leave sibling mounts under a
+    // different backend with no single place to reason about them.
+    "mount_backend",
 ];
 
 /// Volume-scoped keys (Phase 2.5 / K19): everything a single storage
@@ -597,6 +641,17 @@ pub struct CyDriveConfig {
     pub drive_letter: String,
     /// Whether to auto-mount the drive on startup.
     pub auto_mount_drive: bool,
+    /// How to expose the drive on Windows (Phase 3 / K40):
+    /// [`MountBackend::Webdav`] (the default — the `net use` mapping the
+    /// Python baseline used) or [`MountBackend::Winfsp`] (the in-process
+    /// WinFsp native mount; needs a `--features winfsp` build and an
+    /// installed WinFsp runtime — when either is missing the mount flow
+    /// logs, says so on the banner and falls back to WebDAV instead of
+    /// refusing to start). A **process-scoped** key (K19 partition): it
+    /// governs every volume's mount in one process. Value validation is
+    /// exhaustive at parse time (typed enum — see [`MountBackend`]).
+    #[serde(default)]
+    pub mount_backend: MountBackend,
     /// Linux mount point for `cydrive mount` / startup auto-mount
     /// (absolute path; `None` = the `$HOME/CyDrive` default). Windows
     /// ignores this key — drive letters are its mount surface.
@@ -721,6 +776,7 @@ impl Default for CyDriveConfig {
             enable_web_ui: true,
             drive_letter: "Y:".to_string(),
             auto_mount_drive: true,
+            mount_backend: MountBackend::default(),
             mount_point: None,
             chunk_size_mb: 1900,
             cache_limit_gb: 20,
@@ -1060,6 +1116,10 @@ impl CyDriveConfig {
     /// * `sync_secret`: no format constraint — any non-empty string is a
     ///   legal secret, and a value that trims to empty reads as unset at
     ///   the CLI resolution layer (never a validation error).
+    /// * `mount_backend` value: no rule here either — the typed enum
+    ///   rejects unknown values at parse time (see [`MountBackend`]), and
+    ///   whether WinFsp is *usable* is a runtime fact the mount flow
+    ///   degrades from (K40), never a validation error.
     /// * `backend` value: no rule here — the typed enum rejects unknown
     ///   values at parse time (see [`Backend`]). Cross-field rules do
     ///   live here: `backend = "baidu"` requires all four K14 credential

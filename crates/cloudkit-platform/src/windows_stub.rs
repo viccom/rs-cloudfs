@@ -5,7 +5,7 @@
 //!
 //! [`windows`]: crate::windows
 
-use crate::PlatformError;
+use crate::{PlatformError, WinFspInstall};
 
 /// The single message every stub returns.
 const UNSUPPORTED: &str = "windows-only mount/registry";
@@ -34,6 +34,14 @@ pub fn read_webclient_params() -> Option<(u32, u32)> {
 /// Stub: [`unsupported`].
 pub fn optimize_webdav_registry() -> Result<(), PlatformError> {
     unsupported()
+}
+
+/// Stub: no Windows registry exists here, so no WinFsp install can be
+/// found (`None` — the same answer the real probe gives on a machine
+/// without WinFsp, and what makes the `doctor` check degrade to its
+/// "not applicable on this platform" verdict).
+pub fn winfsp_install() -> Option<WinFspInstall> {
+    None
 }
 
 /// Stub: [`unsupported`].

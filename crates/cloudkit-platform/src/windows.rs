@@ -12,7 +12,7 @@ use std::process::Output;
 
 use crate::{
     canonical_letter, mount_command, pick_drive_letter, unmount_command, PlatformError,
-    BASIC_AUTH_LEVEL, FILE_SIZE_LIMIT_BYTES, WEBCLIENT_REG_PATH,
+    WinFspInstall, BASIC_AUTH_LEVEL, FILE_SIZE_LIMIT_BYTES, WEBCLIENT_REG_PATH,
 };
 
 /// Occupied drive letters, probed as `A:\` … `Z:\` root-path existence.
@@ -84,6 +84,36 @@ pub fn read_webclient_params() -> Option<(u32, u32)> {
     let limit: u32 = key.get_value("FileSizeLimitInBytes").ok()?;
     let auth: u32 = key.get_value("BasicAuthLevel").ok()?;
     Some((limit, auth))
+}
+
+/// Locates the installed WinFsp runtime (Phase 3 / WF4): the registry
+/// `InstallDir` under either [`WINFSP_REG_KEYS`] subkey, plus the runtime
+/// DLL when it is there.
+///
+/// Read-only by design (`doctor`'s leg): no load, no `winfsp_init`, no
+/// feature flag — a machine without WinFsp simply gets `None`, which is
+/// the `[WARN]` the doctor renders. `None` also covers "the registry key
+/// is unreadable", which is indistinguishable from "not installed" for
+/// diagnosis purposes.
+pub fn winfsp_install() -> Option<WinFspInstall> {
+    use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
+
+    let hklm = winreg::RegKey::predef(HKEY_LOCAL_MACHINE);
+    for subkey in crate::WINFSP_REG_KEYS {
+        let Ok(key) = hklm.open_subkey_with_flags(subkey, KEY_READ) else {
+            continue;
+        };
+        let Ok(dir) = key.get_value::<String, _>("InstallDir") else {
+            continue;
+        };
+        let install_dir = std::path::PathBuf::from(dir);
+        let dll = install_dir.join("bin").join(crate::WINFSP_X64_DLL);
+        return Some(WinFspInstall {
+            dll: dll.exists().then_some(dll),
+            install_dir,
+        });
+    }
+    None
 }
 
 /// Maps the WebDAV endpoint at `url` to a drive letter and returns the

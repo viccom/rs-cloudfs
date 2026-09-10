@@ -9,7 +9,7 @@
 use std::fs;
 use std::sync::{Mutex, MutexGuard};
 
-use cloudkit_core::config::{Backend, ConfigError, CyDriveConfig, EncryptionScheme};
+use cloudkit_core::config::{Backend, ConfigError, CyDriveConfig, EncryptionScheme, MountBackend};
 
 // ------------------------------------------------------------- helpers ---
 
@@ -214,6 +214,8 @@ fn toml_roundtrip_preserves_full_config() {
         enable_web_ui: false,
         drive_letter: "Z:".to_string(),
         auto_mount_drive: false,
+        // Phase 3 / K40: the mount backend round-trips too.
+        mount_backend: MountBackend::Winfsp,
         mount_point: None,
         chunk_size_mb: 2000,
         cache_limit_gb: 7,
