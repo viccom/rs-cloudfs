@@ -211,6 +211,37 @@ impl Harness {
         receipt
     }
 
+    /// The K47 streaming precondition (Phase 3.5-a E3): the ciphertext
+    /// CONTAINER rides the remote, the row carries the PLAINTEXT size
+    /// (K35), `is_encrypted` and the explicit `aead_v2` scheme column —
+    /// the exact shape the K47 stream gate consumes.
+    fn seed_aead_v2_file(&self, rel: &str, plaintext: &[u8], password: &str) -> UploadReceipt {
+        let container = cloudkit_core::crypto::AeadV2::new().encrypt(password, plaintext);
+        let receipt = self.seed_remote(rel, &container);
+        let rel_path = RelPath::new(rel).expect("valid rel path");
+        self.db
+            .upsert_file_scheme(
+                &FileUpsert {
+                    rel_path: rel_path.as_str().to_string(),
+                    name: rel_path.name().to_string(),
+                    parent_dir: "/".to_string(),
+                    size: plaintext.len() as i64,
+                    mtime: 1_700_000_000.0,
+                    sha256: None,
+                    is_dir: false,
+                    telegram_msg_id: Some(receipt.first_msg_id),
+                    is_uploaded: true,
+                    is_cached: false,
+                    is_encrypted: true,
+                    chunk_count: 1,
+                    mime_type: None,
+                },
+                "aead_v2",
+            )
+            .expect("seed aead_v2 row");
+        receipt
+    }
+
     /// One directory row.
     fn seed_dir(&self, rel: &str) {
         let rel_path = RelPath::new(rel).expect("valid rel path");
@@ -686,5 +717,125 @@ fn a_transport_failure_maps_to_io_device_error_and_logs() {
             .iter()
             .any(|line| line.starts_with("ERROR") && line.contains("STATUS_IO_DEVICE_ERROR")),
         "the EIO fallback must log: {events:?}"
+    );
+}
+
+// --------------------------------------------- K47 (Phase 3.5-a E3) ------
+
+/// aead_v2 container geometry: the [`cloudkit_core::crypto::AeadV2::new`]
+/// default crypto chunk (1 MiB), the 16-byte GCM tag per chunk and the
+/// 34-byte container header. The seeded plaintext spans 2 full chunks
+/// plus a non-exact tail (3 chunks), so windowed reads cross
+/// crypto-chunk boundaries by construction (the 16-byte face windows are
+/// tiny NEXT to the crypto chunks — the two window layers are
+/// independent by design).
+const V2_CHUNK: u64 = 1024 * 1024;
+const V2_TAG: u64 = 16;
+const V2_HEADER: u64 = 34;
+const V2_TAIL: u64 = 700_000;
+
+/// K47: an aead_v2 row over a range-capable transport opens as the
+/// WINDOW streaming handle — the behavioral proof the K33 gate used for
+/// the plaintext arm, now on the encrypted arm: reads are byte-exact
+/// across crypto-chunk boundaries, every inner call is the 34-byte
+/// header pull or a bounded ciphertext span, and the full-open face is
+/// never touched (hydrate answers with the same bytes — the call shape
+/// is the stream/hydrate discriminator).
+#[test]
+fn aead_v2_rows_stream_windows_across_crypto_chunks() {
+    let h = Harness::with(
+        MockTransport::builder().capabilities(range_caps()).build(),
+        Some("pw"),
+        TEST_WINDOW,
+        TEST_GRACE,
+        TEST_CAPACITY,
+    );
+    let plain_len = (2 * V2_CHUNK + V2_TAIL) as usize;
+    let plaintext = pattern(plain_len);
+    h.seed_aead_v2_file("/vault.bin", &plaintext, "pw");
+
+    let handle = h.open("\\vault.bin").expect("open the aead_v2 row");
+
+    // ① The first read: byte-exact, and the inner calls are exactly the
+    //    wrapper's header pull + the one-chunk ciphertext span.
+    assert_eq!(h.read(&handle, 0, 8).expect("read"), &plaintext[0..8]);
+    let chunk = V2_CHUNK + V2_TAG;
+    assert_eq!(
+        h.mock.open_range_calls(),
+        vec![(0, V2_HEADER), (V2_HEADER, chunk)],
+        "streaming shape: header first, then the chunk-0 span"
+    );
+    assert!(
+        h.mock.open_calls().is_empty(),
+        "the window arm must never full-open (hydrate discriminator)"
+    );
+
+    // ② A read crossing the crypto-chunk boundary (offset CS-8, 40 bytes
+    //    spanning into chunk 1): byte-exact across the seam, served by
+    //    three 16-byte face windows whose spans cover chunks 0..=1 then
+    //    chunk 1 twice — no re-pulled header, no whole-container pull.
+    assert_eq!(
+        h.read(&handle, V2_CHUNK - 8, 40).expect("cross-chunk read"),
+        &plaintext[(V2_CHUNK - 8) as usize..(V2_CHUNK + 32) as usize],
+        "byte-exact across the crypto-chunk boundary"
+    );
+    assert_eq!(
+        h.mock.open_range_calls(),
+        vec![
+            (0, V2_HEADER),
+            (V2_HEADER, chunk),
+            (V2_HEADER, 2 * chunk),
+            (V2_HEADER + chunk, chunk),
+            (V2_HEADER + chunk, chunk),
+        ],
+        "cross-chunk shape: one span per face window, coordinates in the \
+         ciphertext container"
+    );
+    assert!(h.mock.open_calls().is_empty());
+}
+
+/// K47 on the K41 grace path: open → close → immediate reopen reuses the
+/// parked read state, so the reopened handle serves without a single new
+/// inner call — the 34-byte header (and its PBKDF2 derivation) is pulled
+/// exactly once across the churn. The exact-call-vector assert is what
+/// makes this fail under a hydrate regression: there the vector is empty
+/// AND the full-open face fires instead.
+#[test]
+fn aead_v2_grace_reopen_reuses_the_parked_state_header_pulled_once() {
+    let h = Harness::with(
+        MockTransport::builder().capabilities(range_caps()).build(),
+        Some("pw"),
+        TEST_WINDOW,
+        TEST_GRACE,
+        TEST_CAPACITY,
+    );
+    let plain_len = (2 * V2_CHUNK + V2_TAIL) as usize;
+    let plaintext = pattern(plain_len);
+    h.seed_aead_v2_file("/vault.bin", &plaintext, "pw");
+
+    let first = h.open("\\vault.bin").expect("open");
+    assert_eq!(h.read(&first, 0, 8).expect("read"), &plaintext[0..8]);
+    let chunk = V2_CHUNK + V2_TAG;
+    assert_eq!(
+        h.mock.open_range_calls(),
+        vec![(0, V2_HEADER), (V2_HEADER, chunk)],
+        "the first read pulls the header exactly once + one span"
+    );
+    h.fs.close(first);
+
+    let second = h.open("\\vault.bin").expect("reopen inside the grace");
+    assert_eq!(
+        h.read(&second, 0, 8).expect("read after reopen"),
+        &plaintext[0..8]
+    );
+    assert_eq!(
+        h.mock.open_range_calls(),
+        vec![(0, V2_HEADER), (V2_HEADER, chunk)],
+        "the grace reopen must reuse the parked state — no new header \
+         pull, no new span"
+    );
+    assert!(
+        h.mock.open_calls().is_empty(),
+        "the reopened handle still never hydrates"
     );
 }

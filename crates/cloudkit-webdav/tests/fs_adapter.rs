@@ -126,6 +126,40 @@ async fn test_env_with_caps(
     Arc<Vfs>,
     CyDriveFs,
 ) {
+    assemble_env(cache_limit, caps, None).await
+}
+
+/// The K47 environment (Phase 3.5-a E3): same assembly with an
+/// encryption password configured — the aead_v2 streaming-read
+/// precondition (the read path dispatches on the row's scheme column,
+/// never on the config's, so the config scheme stays the default).
+async fn test_env_with_password(
+    cache_limit: u64,
+    password: &str,
+) -> (
+    tempfile::TempDir,
+    Arc<MetaDatabase>,
+    PathBuf,
+    Arc<MockTransport>,
+    Arc<Vfs>,
+    CyDriveFs,
+) {
+    assemble_env(cache_limit, legacy_caps(), Some(password.to_string())).await
+}
+
+/// The shared environment assembly behind the two variants above.
+async fn assemble_env(
+    cache_limit: u64,
+    caps: cloudkit_core::transport::Capabilities,
+    password: Option<String>,
+) -> (
+    tempfile::TempDir,
+    Arc<MetaDatabase>,
+    PathBuf,
+    Arc<MockTransport>,
+    Arc<Vfs>,
+    CyDriveFs,
+) {
     let dir = tempfile::tempdir().expect("create temp dir");
     let cache_root = dir.path().join("cache");
     let db = Arc::new(MetaDatabase::open(&dir.path().join("meta.db")).expect("open temp db"));
@@ -133,7 +167,11 @@ async fn test_env_with_caps(
     let mock = Arc::new(MockTransport::builder().capabilities(caps).build());
     mock.connect().await.expect("pre-connect mock transport");
     let transport: Arc<dyn CloudTransport> = mock.clone();
-    let vfs = Arc::new(Vfs::new(db.clone(), cache, transport, test_cfg()));
+    let cfg = VfsConfig {
+        encryption_password: password,
+        ..test_cfg()
+    };
+    let vfs = Arc::new(Vfs::new(db.clone(), cache, transport, cfg));
     // The adapter's cache handle is path-math only (same root).
     let fs = CyDriveFs::new(
         vfs.clone(),
@@ -858,6 +896,124 @@ async fn open_read_cached_row_serves_local_copy_without_transport() {
     assert!(
         mock.open_calls().is_empty() && mock.open_range_calls().is_empty(),
         "a cached row never touches the transport"
+    );
+}
+
+/// aead_v2 container geometry for the K47 face tests (Phase 3.5-a E3):
+/// the [`AeadV2::new`] default crypto chunk (1 MiB), the 16-byte GCM tag
+/// per chunk and the 34-byte container header. The plaintext spans 2
+/// full chunks plus a non-exact tail (3 chunks) so range reads cross
+/// crypto-chunk boundaries by construction.
+const V2_CHUNK: u64 = 1024 * 1024;
+const V2_TAG: u64 = 16;
+const V2_HEADER: u64 = 34;
+const V2_TAIL: u64 = 700_000;
+
+/// 6h (K47, Phase 3.5-a E3): an aead_v2 encrypted row over a
+/// range-capable transport streams Range GETs — the `Range:
+/// bytes=100-299` body is the exact plaintext slice (dav-server turns
+/// seek+read into the 206), the whole-file GET reassembles the plaintext
+/// byte-exactly, and BOTH arrive through the decrypting wrapper's ranged
+/// inner reads (34-byte header first, then ciphertext spans) and never
+/// through a whole-file hydrate. The transport call SHAPE is the
+/// stream/hydrate discriminator: hydrate answers with correct bytes too,
+/// but only through `open` (whole container) — never through ranged
+/// `open_range` calls.
+#[tokio::test]
+async fn encrypted_range_get_streams_without_full_hydrate() {
+    let (_dir, db, _cache_root, mock, _vfs, fs) = test_env_with_password(u64::MAX, "pw").await;
+
+    let plain_len = (2 * V2_CHUNK + V2_TAIL) as usize;
+    let plaintext = pattern(plain_len);
+    let container = cloudkit_core::crypto::AeadV2::new().encrypt("pw", &plaintext);
+    let container_len = container.len() as u64;
+    assert_eq!(
+        container_len,
+        V2_HEADER + 2 * (V2_CHUNK + V2_TAG) + V2_TAIL + V2_TAG,
+        "seed sanity: one header, one tag per crypto chunk"
+    );
+    let receipt = seed_remote(&mock, "/vault.bin", &container, 1, container_len).await;
+    let rel = RelPath::new("/vault.bin").expect("valid rel path");
+    db.upsert_file_scheme(
+        &FileUpsert {
+            size: plain_len as i64,
+            telegram_msg_id: Some(receipt.first_msg_id),
+            is_encrypted: true,
+            ..shape_upsert(&rel, false, plain_len as i64, 1_700_000_123.0)
+        },
+        "aead_v2",
+    )
+    .expect("seed aead_v2 row");
+
+    // ① The ranged GET: seek(100) + one 200-byte read = the
+    //    `Range: bytes=100-299` body — the exact plaintext slice, in a
+    //    single 4 KiB window (bigger than the range, smaller than a
+    //    crypto chunk).
+    let fs = fs.with_stream_window(4096);
+    let mut file = fs
+        .open(&DavPath::new("/vault.bin").expect("path"), read_options())
+        .await
+        .expect("open the aead_v2 row");
+    let meta = file.metadata().await.expect("file metadata");
+    assert_eq!(
+        meta.len(),
+        plain_len as u64,
+        "Content-Length is the PLAINTEXT total (K35), not the container"
+    );
+    file.seek(std::io::SeekFrom::Start(100))
+        .await
+        .expect("seek to the range start");
+    assert_eq!(
+        file.read_bytes(200).await.expect("range body"),
+        plaintext[100..300],
+        "the range body is the byte-exact plaintext slice"
+    );
+    let chunk = V2_CHUNK + V2_TAG;
+    assert_eq!(
+        mock.open_range_calls(),
+        vec![(0, V2_HEADER), (V2_HEADER, chunk)],
+        "streaming shape: the header pull first, then exactly the one \
+         ciphertext span covering chunk 0 — never a whole-container open"
+    );
+    assert!(
+        mock.open_calls().is_empty(),
+        "a ranged GET must not hydrate (no whole-file open)"
+    );
+
+    // ② The whole-file GET: a fresh open (a fresh handle re-pulls the
+    //    wrapper header — the K41 grace table is what amortizes that
+    //    across Explorer's open/close churn) reassembles the full
+    //    plaintext through one window that spans all three crypto
+    //    chunks. Byte equality over the whole file subsumes the hash
+    //    check.
+    let fs = fs.with_stream_window(plain_len as u64);
+    let mut file = fs
+        .open(&DavPath::new("/vault.bin").expect("path"), read_options())
+        .await
+        .expect("reopen for the whole-file GET");
+    let mut body = Vec::new();
+    loop {
+        let frame = file.read_bytes(1 << 20).await.expect("body frame");
+        if frame.is_empty() {
+            break;
+        }
+        body.extend_from_slice(&frame);
+    }
+    assert_eq!(body, plaintext, "the whole-file GET is byte-exact");
+    assert_eq!(
+        mock.open_range_calls(),
+        vec![
+            (0, V2_HEADER),
+            (V2_HEADER, chunk),
+            (0, V2_HEADER),
+            (V2_HEADER, 2 * chunk + V2_TAIL + V2_TAG),
+        ],
+        "the whole-file GET added header + one whole-container span — \
+         still zero hydrate arms"
+    );
+    assert!(
+        mock.open_calls().is_empty(),
+        "neither leg ever downloaded through the whole-file face"
     );
 }
 
