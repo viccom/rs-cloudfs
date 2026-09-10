@@ -91,7 +91,10 @@ pub struct UploadReceipt {
 }
 
 /// Reference to a file stored on the remote backend.
-#[derive(Debug)]
+///
+/// `Clone` since SR0: the mock's `open_calls()` observation face
+/// snapshots whole handles (the `upload_calls()` pattern).
+#[derive(Debug, Clone)]
 pub struct RemoteHandle {
     /// msg_id of chunk 0.
     pub first_msg_id: i64,

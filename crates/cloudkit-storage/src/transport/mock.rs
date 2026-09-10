@@ -54,6 +54,8 @@ impl Default for MockState {
             upload_calls: Vec::new(),
             stream_upload_calls: Vec::new(),
             max_stream_frame: 0,
+            open_calls: Vec::new(),
+            open_range_calls: Vec::new(),
             deleted: Vec::new(),
             delete_script: VecDeque::new(),
             open_delay: Duration::ZERO,
@@ -103,6 +105,15 @@ struct MockState {
     /// (0 = no stream upload ran) — the observable behind the v2 wiring's
     /// memory-granularity assertions.
     max_stream_frame: usize,
+    /// Snapshot of every `open()` call's handle, in call order (SR0
+    /// observation face — recorded even when the connect gate rejects
+    /// the call, mirroring `upload_calls`).
+    open_calls: Vec<RemoteHandle>,
+    /// Snapshot of every `open_range()` call's REQUESTED window
+    /// `(off, len)` (pre-clamp), in call order — the streaming-read
+    /// tests assert "bounded windows were asked for" against this, not
+    /// the served bytes.
+    open_range_calls: Vec<(u64, u64)>,
     /// msg_ids successfully deleted, in order.
     deleted: Vec<i64>,
     /// Scripted outcomes of `delete_remote`, consumed in order (B3b / K4
@@ -216,6 +227,28 @@ impl MockTransport {
         self.lock().map(|state| state.max_stream_frame).unwrap_or(0)
     }
 
+    /// Snapshot of every `open()` call's handle, in call order — the
+    /// streaming-read observation face for "a FULL object was
+    /// requested" assertions (SR0). Calls rejected by the connect gate
+    /// are recorded too (mirrors [`MockTransport::upload_calls`]).
+    pub fn open_calls(&self) -> Vec<RemoteHandle> {
+        self.lock()
+            .map(|state| state.open_calls.clone())
+            .unwrap_or_default()
+    }
+
+    /// Snapshot of every `open_range()` call's REQUESTED window
+    /// `(off, len)`, in call order — the pre-clamp ask, not the served
+    /// slice, so window-boundary assertions see what the consumer
+    /// actually asked for. Full opens and windows record on separate
+    /// faces (a test can pin "bounded windows only, never a full
+    /// `open`").
+    pub fn open_range_calls(&self) -> Vec<(u64, u64)> {
+        self.lock()
+            .map(|state| state.open_range_calls.clone())
+            .unwrap_or_default()
+    }
+
     /// msg_ids successfully deleted, in order.
     pub fn deleted(&self) -> Vec<i64> {
         self.lock()
@@ -314,7 +347,11 @@ impl CloudTransport for MockTransport {
 
     async fn open(&self, file: &RemoteHandle) -> Result<ByteStream, StorageError> {
         let (delay, mut data) = {
-            let state = self.lock()?;
+            let mut state = self.lock()?;
+            // Recorded before the connect gate — same observability rule
+            // as `upload_calls` (the call happened; the recorder must
+            // not depend on the gate outcome).
+            state.open_calls.push(file.clone());
             if !state.connected {
                 return Err(StorageError::Invalid);
             }
@@ -346,7 +383,10 @@ impl CloudTransport for MockTransport {
         len: u64,
     ) -> Result<ByteStream, StorageError> {
         let (delay, data) = {
-            let state = self.lock()?;
+            let mut state = self.lock()?;
+            // Pre-clamp request window, recorded before the connect gate
+            // (see the `open_calls` note).
+            state.open_range_calls.push((off, len));
             if !state.connected {
                 return Err(StorageError::Invalid);
             }
