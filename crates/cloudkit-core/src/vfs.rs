@@ -695,11 +695,16 @@ impl Vfs {
     /// authoritative size (K35) and the shared transport for bounded
     /// `open_range` windows.
     ///
-    /// Cache non-interaction (K34): this entry never touches the cache
-    /// — no `is_cached` probe, no hydration side effect, no access
-    /// recorded; a cached row still streams from the remote. Cache
-    /// coordination for streaming reads is deliberately out of scope
-    /// for this seam.
+    /// Cache-first (WF0 / K42): ahead of the triple gate, a row whose
+    /// cached copy exists on disk routes to `Hydrate` — the hydrate arm
+    /// then serves the local plaintext with zero remote traffic and
+    /// records the LRU access there (this seam stays a pure routing
+    /// probe: no hydration side effect, no eviction, no access entry).
+    /// Cold rows are untouched: they still stream (or fall back) exactly
+    /// as before. The password gate deliberately stays ahead of the
+    /// cache probe (hydrate parity, order pinned by tests): an encrypted
+    /// row without a configured password must surface the actionable
+    /// error, never silently serve a decrypted local copy.
     pub async fn open_read(&self, rel: &RelPath) -> Result<StreamSource, VfsError> {
         let row = self
             .db
@@ -714,6 +719,12 @@ impl Vfs {
         // blindly retry.
         if row.is_encrypted && self.cfg.encryption_password.is_none() {
             return Err(VfsError::MissingPassword);
+        }
+        // WF0 cache-first: the cached copy is local plaintext and wins
+        // over the remote (byte truth = hydrate's cache-first leg, which
+        // re-probes and records the access).
+        if self.cache.is_cached(rel) {
+            return Ok(StreamSource::Hydrate);
         }
         // K33 triple gate: whole-file-AEAD rows, range-incapable
         // transports and 0-byte rows all serve through the full hydrate

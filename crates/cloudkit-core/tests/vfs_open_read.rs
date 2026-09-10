@@ -4,11 +4,15 @@
 //! [`StreamSource::Hydrate`] fallback signal; the `Stream` arm carries the
 //! row -> handle assembly (chunks first / row id fallback) with the
 //! authoritative total size and the shared transport for bounded-window
-//! reads. Streaming reads never touch the cache (K34): no hydration
-//! happens as a side effect.
+//! reads.
+//!
+//! WF0 / K42 cache-first amendment: a cached plaintext copy routes to the
+//! hydrate arm ahead of the triple gate (the hydrate path then serves the
+//! local file with zero remote traffic); the password gate still fires
+//! first, and admission itself never hydrates as a side effect.
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -166,6 +170,17 @@ async fn seed_remote_file(
             .expect("seed chunk row");
     }
     receipt
+}
+
+/// Writes a plaintext copy of `rel` straight into the mirrored cache tree
+/// (WF0 precondition: `CacheManager::is_cached` sees a non-empty file).
+/// Returns the on-disk path.
+fn seed_cache_copy(cache_root: &Path, rel: &str, bytes: &[u8]) -> PathBuf {
+    let rel_path = RelPath::new(rel).expect("valid rel path");
+    let local = CacheManager::new(cache_root.to_path_buf(), 1 << 20).local_path(&rel_path);
+    fs::create_dir_all(local.parent().expect("cache parent dir")).expect("create cache dirs");
+    fs::write(&local, bytes).expect("write cache copy");
+    local
 }
 
 /// Concatenates every chunk of a byte stream; propagates the first error.
@@ -375,31 +390,41 @@ async fn open_read_row_msg_id_fallback_when_no_chunk_rows() {
     assert_eq!(handle.first_msg_id, receipt.first_msg_id);
 }
 
-/// 8. Cache non-interaction (K34): a cached row still streams (the
-///    streaming path serves straight from the remote), and an uncached
-///    row never hydrates as a side effect — no cache file appears and
-///    the mock never sees a full `open`.
+/// 8. WF0 cache-first (K42) supersedes the K34 no-cache clause for the
+///    cached leg: a cached plaintext row routes to the hydrate arm (the
+///    local plaintext then serves the read), while the cold row still
+///    streams — and admission itself never hydrates as a side effect (no
+///    cache copy appears, the mock sees no full `open`).
 #[tokio::test]
-async fn open_read_never_hydrates_or_serves_from_cache() {
+async fn open_read_cache_first_cached_serves_locally_cold_stays_cold() {
     let (_dir, db, cache, cache_root, mock) = test_env().await;
     seed_remote_file(&db, &mock, "/cached.bin", b"0123456789A", 4).await;
     seed_remote_file(&db, &mock, "/cold.bin", b"ABCDEFGHIJK", 4).await;
 
     // Pre-seed a local copy for /cached.bin (is_cached on disk).
     let cached_rel = RelPath::new("/cached.bin").expect("valid rel path");
-    let cached_local = CacheManager::new(cache_root.clone(), 1 << 20).local_path(&cached_rel);
-    fs::write(&cached_local, b"stale-local-bytes").expect("seed cache copy");
+    let cached_local = seed_cache_copy(&cache_root, "/cached.bin", b"stale-local-bytes");
 
     let vfs = build_vfs(&db, cache, &mock, test_cfg(None));
     let cold_rel = RelPath::new("/cold.bin").expect("valid rel path");
 
-    // Cached row streams anyway (remote truth, not the cache copy).
+    // Cached row: cache-first admission (WF0/K42) — the hydrate arm is
+    // the local plaintext serve, with the remote never consulted.
     assert!(
-        matches!(
-            vfs.open_read(&cached_rel).await,
-            Ok(StreamSource::Stream { .. })
-        ),
-        "cached row still streams (K34: cache coordination is out of scope)"
+        matches!(vfs.open_read(&cached_rel).await, Ok(StreamSource::Hydrate)),
+        "cached row falls back to the local plaintext (WF0 cache-first)"
+    );
+    assert_eq!(
+        vfs.hydrate(&cached_rel)
+            .await
+            .expect("hydrate serves the cache copy"),
+        cached_local,
+        "the hydrate arm answers the cached path"
+    );
+    assert_eq!(
+        fs::read(&cached_local).expect("read cache copy"),
+        b"stale-local-bytes",
+        "cache-first is a pure routing probe — the copy is untouched"
     );
     // Cold row: streaming admission must not hydrate.
     assert!(
@@ -413,7 +438,89 @@ async fn open_read_never_hydrates_or_serves_from_cache() {
         !CacheManager::new(cache_root.clone(), 1 << 20)
             .local_path(&cold_rel)
             .exists(),
-        "no cache copy materialized (K34)"
+        "no cache copy materialized for the cold row (admission stays side-effect free)"
     );
-    assert!(mock.open_calls().is_empty(), "no full open ran");
+    assert!(
+        mock.open_calls().is_empty() && mock.open_range_calls().is_empty(),
+        "cached and cold admission consult no remote face"
+    );
+}
+
+/// 9. WF0 cache-first (K42): a cached plaintext row that would otherwise
+///    qualify for streaming (RANGE_READ on, non-zero size) still routes to
+///    hydrate — the local copy wins over the remote, byte-verbatim.
+#[tokio::test]
+async fn open_read_cached_plaintext_row_routes_to_local_copy() {
+    let (_dir, db, cache, cache_root, mock) = test_env().await;
+    seed_remote_file(&db, &mock, "/warm.bin", b"remote-version", 4).await;
+    let cached = seed_cache_copy(&cache_root, "/warm.bin", b"cached-local-copy");
+    let vfs = build_vfs(&db, cache, &mock, test_cfg(None));
+    let rel = RelPath::new("/warm.bin").expect("valid rel path");
+
+    assert!(
+        matches!(vfs.open_read(&rel).await, Ok(StreamSource::Hydrate)),
+        "a cached plaintext row serves locally (WF0 cache-first)"
+    );
+    assert_eq!(
+        fs::read(&cached).expect("read cache copy"),
+        b"cached-local-copy",
+        "the local plaintext is the served byte truth"
+    );
+    assert!(
+        mock.open_calls().is_empty() && mock.open_range_calls().is_empty(),
+        "cache-first must consult no remote face"
+    );
+}
+
+/// 10. Regression pin: the same plaintext row WITHOUT a cached copy keeps
+///     streaming (WF0 must not swallow the cold case), and the two rows
+///     differ only in the cache probe — the remote never saw either
+///     admission.
+#[tokio::test]
+async fn open_read_uncached_plaintext_row_still_streams() {
+    let (_dir, db, cache, _cache_root, mock) = test_env().await;
+    seed_remote_file(&db, &mock, "/cold.bin", b"0123456789A", 4).await;
+    let vfs = build_vfs(&db, cache, &mock, test_cfg(None));
+    let rel = RelPath::new("/cold.bin").expect("valid rel path");
+
+    assert!(
+        matches!(vfs.open_read(&rel).await, Ok(StreamSource::Stream { .. })),
+        "an uncached plaintext row still streams (cold regression pin)"
+    );
+    assert!(
+        mock.open_calls().is_empty() && mock.open_range_calls().is_empty(),
+        "admission itself performs no remote I/O"
+    );
+}
+
+/// 11. WF0 ordering red line: the password gate fires BEFORE the cache
+///     probe — an encrypted row without a configured password stays
+///     `MissingPassword` even though a decrypted copy sits in the cache;
+///     the local plaintext never becomes an unauthenticated backdoor.
+#[tokio::test]
+async fn open_read_encrypted_cached_row_without_password_is_missing_password() {
+    let (_dir, db, cache, cache_root, mock) = test_env().await;
+    let receipt = seed_remote(&mock, "/encached.bin", b"ciphertext-bytes", 1, 64).await;
+    seed_uploaded_row(
+        &db,
+        "/encached.bin",
+        17,
+        1,
+        Some(receipt.first_msg_id),
+        true,
+    );
+    seed_cache_copy(&cache_root, "/encached.bin", b"decrypted-local-copy");
+
+    let vfs = build_vfs(&db, cache, &mock, test_cfg(None));
+    let rel = RelPath::new("/encached.bin").expect("valid rel path");
+    let err = vfs
+        .open_read(&rel)
+        .await
+        .err()
+        .expect("encrypted row without a password stays an error");
+    assert!(matches!(err, VfsError::MissingPassword), "{err:?}");
+    assert!(
+        mock.open_calls().is_empty() && mock.open_range_calls().is_empty(),
+        "the password gate fires before any remote work"
+    );
 }

@@ -996,9 +996,10 @@ fn download_not_found() -> Response {
 
 /// `GET /api/download/{filename}`: streams ranges straight off the
 /// remote when the row admits it (SR2 / K36 — a plaintext row on a
-/// `range_read` transport with a non-zero size), otherwise hydrates
-/// through the VFS and answers the local copy (R-5 fallback: encrypted
-/// rows, range-incapable transports, 0-byte rows). A single-range
+/// `range_read` transport with a non-zero size and no cached copy, WF0
+/// cache-first), otherwise hydrates through the VFS and answers the local
+/// copy (R-5 fallback: encrypted rows, range-incapable transports, 0-byte
+/// rows). A single-range
 /// `Range` header is honored on both faces; sub-paths resolve as their
 /// virtual RelPath; a missing row, a directory or an unusable path all
 /// land on Python's verbatim 404 body, and other failures surface as

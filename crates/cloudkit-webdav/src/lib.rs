@@ -144,7 +144,10 @@ impl DavFileSystem for CyDriveFs {
                 // K33 dispatch (SR1): a plaintext, non-zero row on a
                 // transport that declares RANGE_READ streams through
                 // [`RangeFile`] — bounded `open_range` windows, no
-                // hydrate, no disk cache (K34). Everything else serves
+                // hydrate, no disk cache (K34) — UNLESS a cached copy
+                // exists: then `open_read`'s WF0 cache-first arm answers
+                // Hydrate and the local plaintext serves below.
+                // Everything else serves
                 // through the ORIGINAL whole-file hydrate path below:
                 // `StreamSource::Hydrate` (encrypted row — whole-file
                 // AEAD can never be range-sliced; capability off; 0-byte

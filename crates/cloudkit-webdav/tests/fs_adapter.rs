@@ -835,6 +835,32 @@ async fn open_read_maps_vanished_remote_to_not_found() {
     );
 }
 
+/// 6g. WF0 cache-first at the adapter: a plaintext row that would
+///     otherwise stream (RANGE_READ on, non-zero size) serves the LOCAL
+///     bytes when the cache copy exists — the response body comes from
+///     disk, the transport is never consulted.
+#[tokio::test]
+async fn open_read_cached_row_serves_local_copy_without_transport() {
+    let (_dir, db, cache_root, mock, _vfs, fs) = test_env(u64::MAX).await;
+    seed_remote_file(&db, &mock, "/warm.bin", &pattern(300), 64).await;
+    // Divergent local bytes: any remote arrival is observable in the body.
+    seed_local(&cache_root, "/warm.bin", b"stale-local-bytes");
+
+    let mut file = fs
+        .open(&DavPath::new("/warm.bin").expect("path"), read_options())
+        .await
+        .expect("open cached row");
+    assert_eq!(
+        file.read_bytes(100).await.expect("read"),
+        b"stale-local-bytes".as_slice(),
+        "the cached copy is the served byte truth (WF0 cache-first)"
+    );
+    assert!(
+        mock.open_calls().is_empty() && mock.open_range_calls().is_empty(),
+        "a cached row never touches the transport"
+    );
+}
+
 /// 7. open write: bytes land in a `.{name}.tmp` staging sibling, flush
 ///    commits them — pending row, atomic rename onto the cache path, no
 ///    `.tmp` residue — and the drained queue uploads to the mock remote.
