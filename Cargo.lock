@@ -759,6 +759,7 @@ name = "cloudkit-winfsp"
 version = "0.10.0"
 dependencies = [
  "cloudkit-core",
+ "futures-util",
  "tempfile",
  "tokio",
  "tracing",

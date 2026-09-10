@@ -1,16 +1,14 @@
-//! `CloudFs` — the WinFsp `FileSystemContext` adapter (WF1: the readonly
-//! metadata face).
+//! `CloudFs` — the WinFsp `FileSystemContext` adapter.
 //!
-//! Scope of this batch (plan §3-WF1): `get_security_by_name`, `open`,
-//! `close`, `get_file_info`, `read_directory`, `get_volume_info`. All of
-//! them answer from the local SQLite rows plus the assembly-time volume
-//! snapshot (K44) — a metadata walk must never open a socket, which
-//! `tests/metadata.rs` pins against the mock transport's call log.
+//! Scope of this batch (plan §3-WF1 + WF2): `get_security_by_name`,
+//! `open`, `close`, `get_file_info`, `read_directory`, `get_volume_info`
+//! (WF1: all answered from the local SQLite rows plus the assembly-time
+//! volume snapshot — K44, zero network) and the read path (WF2: K33's
+//! triple-gate dispatch into the bounded `open_range` window model, the
+//! zero-side-effect `flush` and the K41 handle grace period).
 //!
 //! Deliberately NOT implemented here (the trait defaults answer
 //! `STATUS_INVALID_DEVICE_REQUEST`):
-//! - **WF2** fills `read` (the K33 triple gate -> windowed `RangeFile`
-//!   reads) and the handle grace period;
 //! - **WF3** fills `write` / `create` / `cleanup` / `rename` / `set_*`
 //!   (staged commits) and `set_volume_label`;
 //! - **WF4** owns `winfsp_init`, the host mount/unmount and the K40
@@ -24,12 +22,21 @@
 //! until a case-folding layer is decided (WF2/WF4 open question, not
 //! invented here).
 
+use std::collections::HashMap;
 use std::ffi::c_void;
 use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::{Duration, Instant};
+// The read state is locked ACROSS an await (a window fetch runs under it,
+// so two reads of one reused handle serialize instead of interleaving
+// fills) — hence the await-aware lock, the same choice ck-baidu's token
+// refresh lock makes. Everything else here is a plain `std` mutex: the
+// enumeration buffer and the grace table are only ever held
+// synchronously.
+use tokio::sync::Mutex as AsyncMutex;
 
 use cloudkit_core::database::FileRecord;
 use cloudkit_core::rel_path::RelPath;
-use cloudkit_core::vfs::{Vfs, VfsError};
+use cloudkit_core::vfs::{StreamSource, Vfs, VfsError};
 use windows::Win32::Foundation::{STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND};
 use winfsp::filesystem::{
     DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo,
@@ -39,6 +46,7 @@ use winfsp::{FspError, Result, U16CStr};
 
 use crate::bridge::AsyncBridge;
 use crate::error::{fsp_error, invalid_name};
+use crate::reader::{LocalReader, ReadHandle, WindowReader};
 
 /// Compat contract 6 (Python `get_available_bytes`): the virtual cloud
 /// headroom reported on top of what the rows already hold. Shared with
@@ -140,16 +148,21 @@ impl DirEntry {
 /// One open handle: what the FSD hangs off its file object between
 /// `open` and `close`.
 ///
-/// WF1 keeps the metadata snapshot taken at open time plus the directory
-/// enumeration buffer; the read/write payload state (window position,
-/// staged file) arrives with WF2/WF3. `DirBuffer` is interior-mutable by
+/// The metadata snapshot is taken at open time (K44 — `get_file_info`
+/// never re-reads the db), the read state (WF2) is the K33 dispatch
+/// result for files, and the directory enumeration buffer arrives on the
+/// first fresh `read_directory`. `DirBuffer` is interior-mutable by
 /// design (winfsp-rs hands out `&FileContext` from several threads), so
 /// the framework's shared reference is all this needs.
 pub struct Handle {
     rel: RelPath,
     meta: Meta,
+    /// The read state of a file handle (K41: shared with the grace table,
+    /// so a reopen inside the grace window reuses the live window buffer
+    /// instead of rebuilding it). `None` for directories.
+    read: Option<Arc<AsyncMutex<ReadHandle>>>,
     /// Directory enumeration buffer, created on the first fresh
-    /// `read_directory` — the only WinFsp DLL call this batch makes
+    /// `read_directory` — the only WinFsp DLL call this adapter makes
     /// (`DirBuffer`'s acquire/fill/read/delete are DLL exports, and its
     /// `Drop` is one too). Lazy on purpose: a handle that is only ever
     /// stat'ed must not touch the DLL, which is also what lets the
@@ -173,6 +186,18 @@ impl Handle {
         self.meta.is_dir
     }
 
+    /// The read state slot (files only; `read` serves through it).
+    fn read_state(&self) -> Option<&Arc<AsyncMutex<ReadHandle>>> {
+        self.read.as_ref()
+    }
+
+    /// Destructures a closing handle: its path plus the read state the
+    /// grace table takes back (WF3's cleanup reads the same two).
+    fn into_grace_parts(self) -> (RelPath, Option<Arc<AsyncMutex<ReadHandle>>>) {
+        let Handle { rel, read, .. } = self;
+        (rel, read)
+    }
+
     /// The enumeration buffer slot (poison recovery per code-style §2).
     fn dir_buffer(&self) -> MutexGuard<'_, Option<DirBuffer>> {
         self.dir_buffer
@@ -180,12 +205,86 @@ impl Handle {
             .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 
-    fn new(rel: RelPath, meta: Meta) -> Self {
+    fn new(rel: RelPath, meta: Meta, read: Option<Arc<AsyncMutex<ReadHandle>>>) -> Self {
         Self {
             rel,
             meta,
+            read,
             dir_buffer: Mutex::new(None),
         }
+    }
+}
+
+/// One entry of the K41 grace table: the read state of a closed handle
+/// plus the moment it stops being reusable.
+struct GraceEntry {
+    /// The closed handle's read state (shared, never rebuilt on reuse).
+    read: Arc<AsyncMutex<ReadHandle>>,
+    /// `Instant` after which a reopen must build a fresh state.
+    expires_at: Instant,
+}
+
+/// The handle grace table (K41), keyed by path.
+///
+/// Semantics straight from rclone's `--vfs-handle-caching 5s`
+/// (`vfscache/item.go:703-752`): closing a handle does not tear its read
+/// state down; the state is parked here, and a reopen within the grace
+/// window reuses it — the cure for a player or an antivirus scanner that
+/// closes and immediately reopens the same file.
+///
+/// Expiry is LAZY (checked whenever the table is touched), not
+/// timer-driven: a reopen is the only event that can observe expiry, so a
+/// background sweeper per close would add spawned tasks and test
+/// nondeterminism for no observable difference. The bound on retained
+/// state is the capacity, applied on insert (oldest close evicted
+/// first), so the table cannot grow without limit even when nothing ever
+/// expires it.
+#[derive(Default)]
+struct GraceTable {
+    entries: HashMap<RelPath, GraceEntry>,
+}
+
+impl GraceTable {
+    /// Drops every entry whose grace window has passed.
+    fn prune_expired(&mut self, now: Instant) {
+        self.entries.retain(|_, entry| now < entry.expires_at);
+    }
+
+    /// Parks `read` under `rel`, sweeping expired entries and keeping
+    /// the table within `capacity` (the entry closest to expiry — the
+    /// oldest close — goes first).
+    fn park(
+        &mut self,
+        rel: RelPath,
+        read: Arc<AsyncMutex<ReadHandle>>,
+        expires_at: Instant,
+        now: Instant,
+        capacity: usize,
+    ) {
+        self.prune_expired(now);
+        self.entries.insert(rel, GraceEntry { read, expires_at });
+        while self.entries.len() > capacity.max(1) {
+            let victim = self
+                .entries
+                .iter()
+                .min_by_key(|(_, entry)| entry.expires_at)
+                .map(|(rel, _)| rel.clone());
+            match victim {
+                Some(rel) => {
+                    self.entries.remove(&rel);
+                }
+                // Unreachable while the table is over capacity; the loop
+                // guard keeps a hand-edited capacity from spinning.
+                None => break,
+            }
+        }
+    }
+
+    /// Takes the live entry for `rel`, if any (expired entries are
+    /// dropped, never handed out).
+    fn take_live(&mut self, rel: &RelPath, now: Instant) -> Option<Arc<AsyncMutex<ReadHandle>>> {
+        self.prune_expired(now);
+        self.entries.remove(rel).map(|entry| entry.read)
     }
 }
 
@@ -194,7 +293,30 @@ pub struct CloudFs {
     vfs: Arc<Vfs>,
     bridge: AsyncBridge,
     volume: VolumeSnapshot,
+    /// Streaming-read window for new fetches (K34; [`crate::reader::DEFAULT_READ_WINDOW`]
+    /// in production, shrinkable through [`CloudFs::with_stream_window`]).
+    stream_window: u64,
+    /// The K41 grace table: read states of closed handles, keyed by path.
+    grace: Mutex<GraceTable>,
+    /// How long a closed handle's read state stays reusable (K41).
+    grace_period: Duration,
+    /// Upper bound on grace table entries.
+    grace_capacity: usize,
 }
+
+/// K41 default grace period: rclone's `--vfs-handle-caching 5s`, chosen
+/// for exactly the same failure mode (a player or a scanner that closes
+/// and immediately reopens the same file).
+pub const DEFAULT_HANDLE_GRACE: Duration = Duration::from_secs(5);
+
+/// Upper bound on parked read states. Each one may hold up to one
+/// [`crate::reader::DEFAULT_READ_WINDOW`] of buffered bytes (only once it
+/// has actually been read through), so the table's worst case is
+/// capacity × window = 256 MiB; 64 is rclone's own order of magnitude for
+/// "files recently touched" and is far more than a desktop workload
+/// keeps closing at once. Expired entries are swept on every touch
+/// (open/close), so the table drains as soon as any handle moves.
+pub const DEFAULT_GRACE_CAPACITY: usize = 64;
 
 impl CloudFs {
     /// Assembles the adapter over an already-built VFS.
@@ -223,10 +345,38 @@ impl CloudFs {
                 free_size: VOLUME_HEADROOM,
                 label: label.into(),
             },
+            stream_window: crate::reader::DEFAULT_READ_WINDOW,
+            grace: Mutex::new(GraceTable::default()),
+            grace_period: DEFAULT_HANDLE_GRACE,
+            grace_capacity: DEFAULT_GRACE_CAPACITY,
         }
     }
 
-    /// The injected async bridge (WF2's read path awaits on it).
+    /// Overrides the streaming-read window (a testing seam, same shape as
+    /// the WebDAV adapter's `with_stream_window`: small windows turn
+    /// multi-window read sequences observable without multi-megabyte
+    /// fixtures; production keeps [`crate::reader::DEFAULT_READ_WINDOW`]).
+    pub fn with_stream_window(mut self, window: u64) -> Self {
+        self.stream_window = window.max(1);
+        self
+    }
+
+    /// Overrides the K41 handle grace period (production: [`DEFAULT_HANDLE_GRACE`];
+    /// tests inject milliseconds so "inside the window" and "after it"
+    /// are cheap to pin).
+    pub fn with_handle_grace(mut self, grace: Duration) -> Self {
+        self.grace_period = grace;
+        self
+    }
+
+    /// Overrides the grace table capacity (production: [`DEFAULT_GRACE_CAPACITY`];
+    /// tests shrink it to pin the eviction order).
+    pub fn with_grace_capacity(mut self, capacity: usize) -> Self {
+        self.grace_capacity = capacity.max(1);
+        self
+    }
+
+    /// The injected async bridge (the read path awaits on it).
     pub fn bridge(&self) -> &AsyncBridge {
         &self.bridge
     }
@@ -288,11 +438,84 @@ impl CloudFs {
             .ok_or_else(|| STATUS_OBJECT_NAME_NOT_FOUND.into())
     }
 
-    /// Opens one path: `get_file_info` and `read_directory` then work off
-    /// the returned handle alone.
+    /// Opens one path's metadata: `get_file_info` and `read_directory`
+    /// then work off the returned handle alone. No read state and no
+    /// remote work (WF1's DLL-free seam, still used by enumerations).
     pub fn open_handle(&self, rel: &RelPath) -> std::result::Result<Handle, FspError> {
         let meta = self.meta_for(rel)?;
-        Ok(Handle::new(rel.clone(), meta))
+        Ok(Handle::new(rel.clone(), meta, None))
+    }
+
+    /// The FSD's `open`: the metadata snapshot plus, for files, the K33
+    /// read state (WF2).
+    ///
+    /// The dispatch is `Vfs::open_read`'s triple gate, resolved here into
+    /// a live reader:
+    ///
+    /// - `Stream` → [`WindowReader`] (bounded `open_range` windows);
+    /// - `Hydrate` → [`LocalReader`] over `Vfs::hydrate`'s local path —
+    ///   the arm WF0's cache-first probe routes cache hits into, so a
+    ///   warm file opens with zero remote traffic;
+    /// - `Err` → the K45 table, so `MissingPassword` is
+    ///   `STATUS_ACCESS_DENIED` at open.
+    ///
+    /// The error arm is not softened into a hydrate fallback (the WebDAV
+    /// adapter's shape): `open_read` already probed the cache and the
+    /// row, so the hydrate path would re-derive the same failure — an
+    /// unreadable file should fail its open, not its first read.
+    fn open_with_read(&self, rel: &RelPath) -> std::result::Result<Handle, FspError> {
+        let meta = self.meta_for(rel)?;
+        let read = if meta.is_dir {
+            // Directories have no read state; their handle only ever
+            // serves metadata and enumeration.
+            None
+        } else {
+            Some(self.acquire_read(rel)?)
+        };
+        Ok(Handle::new(rel.clone(), meta, read))
+    }
+
+    /// The read state for one file open: the parked one when the K41
+    /// grace table still holds it, otherwise a fresh K33 dispatch.
+    fn acquire_read(
+        &self,
+        rel: &RelPath,
+    ) -> std::result::Result<Arc<AsyncMutex<ReadHandle>>, FspError> {
+        let now = Instant::now();
+        if let Some(parked) = self
+            .grace
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .take_live(rel, now)
+        {
+            return Ok(parked);
+        }
+        let source = self
+            .bridge
+            .block_on(self.vfs.open_read(rel))
+            .map_err(|error| fsp_error(&error))?;
+        let read = match source {
+            StreamSource::Stream {
+                handle,
+                total_size,
+                transport,
+            } => ReadHandle::Window(WindowReader::new(
+                handle,
+                total_size,
+                transport,
+                self.stream_window,
+            )),
+            StreamSource::Hydrate => {
+                let local = self
+                    .bridge
+                    .block_on(self.vfs.hydrate(rel))
+                    .map_err(|error| fsp_error(&error))?;
+                let reader =
+                    LocalReader::open(&local).map_err(|error| fsp_error(&VfsError::Io(error)))?;
+                ReadHandle::Local(reader)
+            }
+        };
+        Ok(Arc::new(AsyncMutex::new(read)))
     }
 }
 
@@ -394,17 +617,39 @@ impl FileSystemContext for CloudFs {
         file_info: &mut OpenFileInfo,
     ) -> Result<Self::FileContext> {
         let rel = rel_from_winfsp(file_name)?;
-        let handle = self.open_handle(&rel)?;
+        let handle = self.open_with_read(&rel)?;
         // The FSD uses this FileInfo for the create/open response — it
         // must be filled here, not left for a later get_file_info.
         fill_file_info(file_info.as_mut(), handle.meta());
         Ok(handle)
     }
 
-    fn close(&self, _context: Self::FileContext) {
-        // Dropping the handle drops its DirBuffer (the DLL's own delete
-        // hook) — the whole teardown this batch needs. WF2 adds the grace
-        // period bookkeeping here (K41).
+    fn close(&self, context: Self::FileContext) {
+        // K41 grace: a file handle's read state is PARKED, not torn down
+        // — a reopen inside `grace_period` reuses the live window buffer
+        // (rclone's `--vfs-handle-caching`, which exists for the player /
+        // antivirus "closed it, open it again" pattern). Expiry is lazy
+        // (checked on every table touch) and the table is capacity
+        // bounded, so parking cannot grow without limit. Directory
+        // handles have no read state, and their DirBuffer drops with the
+        // handle as always (that drop is the DLL's own delete hook).
+        let (rel, read) = context.into_grace_parts();
+        let Some(read) = read else { return };
+        let now = Instant::now();
+        self.grace
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .park(rel, read, now + self.grace_period, now, self.grace_capacity);
+    }
+
+    fn flush(&self, _context: Option<&Self::FileContext>, _file_info: &mut FileInfo) -> Result<()> {
+        // K41, rclone's rule (`read_write.go:189-198`: "Flush can be
+        // called multiple times"): Windows, players and scanners flush
+        // constantly, and the read path has nothing to persist. Success
+        // with zero side effects — no window dropped, no fetch, no state
+        // touched. WF3 hangs the write commit off cleanup/Release, never
+        // off flush.
+        Ok(())
     }
 
     fn get_file_info(&self, context: &Self::FileContext, file_info: &mut FileInfo) -> Result<()> {
@@ -413,6 +658,31 @@ impl FileSystemContext for CloudFs {
         // (K44). WF3 refreshes the snapshot after a commit.
         fill_file_info(file_info, context.meta());
         Ok(())
+    }
+
+    fn read(&self, context: &Self::FileContext, buffer: &mut [u8], offset: u64) -> Result<u32> {
+        let Some(state) = context.read_state() else {
+            // Only directory handles have no read state: `read` on a
+            // directory is a caller error, not a device failure.
+            return Err(STATUS_NOT_A_DIRECTORY.into());
+        };
+        // The dispatcher thread blocks on the read: the window fetch (or
+        // the local file read) runs on the injected runtime, exactly like
+        // every other VFS call from this adapter (WF1's bridge). The read
+        // state's lock is held across that fetch on purpose — a second
+        // handle sharing this state (the K41 grace reuse) must serialize
+        // behind the window rather than interleave fills into one buffer.
+        let filled = self
+            .bridge
+            .block_on(async {
+                let mut read = state.lock().await;
+                read.read_at(offset, buffer).await
+            })
+            .map_err(|error| fsp_error(&error))?;
+        // WinFsp's transfer sizes are u32-addressed (the buffer came from
+        // the FSD), so the narrowing cannot lose; clamp defensively so a
+        // programming error can never report more than was written.
+        Ok(filled.min(u32::MAX as usize) as u32)
     }
 
     fn read_directory(

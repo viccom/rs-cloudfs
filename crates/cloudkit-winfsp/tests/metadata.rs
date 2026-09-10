@@ -108,6 +108,11 @@ impl Harness {
     }
 
     /// Inserts one row of any shape; returns its rowid (the file index).
+    ///
+    /// File rows carry a locatable remote id because WF2's `open` now
+    /// resolves its read source there (the row-id fallback in
+    /// `remote_handle_for`): the metadata face stays network-free, but a
+    /// file row without any handle would (correctly) refuse to open.
     fn seed(&self, rel: &str, is_dir: bool, size: i64, mtime: f64) -> i64 {
         let rel_path = RelPath::new(rel).expect("valid rel path");
         self.db
@@ -122,7 +127,7 @@ impl Harness {
                 mtime,
                 sha256: None,
                 is_dir,
-                telegram_msg_id: None,
+                telegram_msg_id: (!is_dir).then_some(1),
                 is_uploaded: true,
                 is_cached: false,
                 is_encrypted: false,

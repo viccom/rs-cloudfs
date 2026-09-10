@@ -15,14 +15,19 @@ workspace = true
 # `cargo build -p cloudkit-cli --features winfsp` crosses that line, and
 # that artifact is currently private to this repository.
 [features]
-winfsp = ["dep:winfsp", "dep:windows"]
+winfsp = ["dep:winfsp", "dep:windows", "dep:futures-util"]
 
 [dependencies]
 cloudkit-core = { path = "../cloudkit-core" }
-# tokio::runtime::Handle — the async bridge (bridge.rs). `rt` alone is
-# enough: the adapter never builds a runtime, it borrows the process one
-# (the mount assembly in WF4 owns it).
-tokio = { version = "1", features = ["rt"] }
+# `ByteStream` aggregation in the window reader (StreamExt::next). Feature-
+# gated with the rest of the read path so the default graph gains nothing.
+futures-util = { version = "0.3", optional = true }
+# tokio::runtime::Handle — the async bridge (bridge.rs) — plus the
+# await-aware read lock (fs.rs: a window fetch holds it across an await,
+# the same shape as ck-baidu's refresh single-flight lock). `rt` + `sync`
+# alone are enough: the adapter never builds a runtime, it borrows the
+# process one (the mount assembly in WF4 owns it).
+tokio = { version = "1", features = ["rt", "sync"] }
 tracing = "0.1"
 
 # WinFsp bindings (winfsp-rs) plus the windows-rs facade it speaks.
