@@ -517,3 +517,9 @@
 - **真机验收（764MiB 真视频）**：API 流式首字节 <1ms、1MiB 全程 159ms、文件中部 seek（600MB 偏移）1MiB 163ms、字节与 WebDAV 路径一致；WebDAV 端口 206 326ms；mp4 ftyp 头合法。
 - **客户端发现（非本仓缺陷）**：Windows WebClient 服务 FileSizeLimitInBytes 默认 50MB——Z: 盘上 >50MB 文件 open 即失败（0.4MB 开成功/68.8MB 失败实证）；PotPlayer 经 Z: 盘播大视频需机器级注册表调整（reg add ...\WebClient\Parameters /v FileSizeLimitInBytes /d 0xffffffff + 重启 WebClient 服务），rclone/alist 用户同样必做；URL 路径（PotPlayer 喂 URL/前端播放器）不受此限。
 - **测试**：workspace 841 passed / 0 failed（810 基线 + 31 新增，断言零漂移）；R-5 回退钉测试原样绿。
+
+## 2026-09-10 真机发现：net use 盘符上播放器触发 Windows 重定向器整文件缓存（客户端限制，服务端无解）
+
+- **现场**：负责人 cydrive 重启后从 Z: 盘用 PotPlayer 打开 764MiB 视频——网络 20MB/s 持续拉取 10+s 后报「RPC服务器不可用」，V:/Y: 映射同时掉、WebClient 服务无崩溃记录（瞬态故障）。服务端 run.log 全程零错误。
+- **判定实验（决定性证据）**：Z: 盘顺序读 68.8MB 文件的**4MB**——期间网络实际接收 **70.3MB**（整文件），读完后 4s 后台流量 0.1MB。即 Windows WebClient/MiniRedir 对播放器型打开模式（随机访问语义）选择**先整文件缓存到本地 TfsStore 再供读**；流式服务器只是按客户端请求的全量顺序读以线速供给（服务端流式机制工作正常——客户端要的是整个文件）。
+- **结论与对策**：盘符路径（net use）+ 大视频 + 播放器 = 客户端整文件缓存，服务端无法改变客户端的打开模式（rclone 社区同样结论：net use 挂载不适合大媒体，WinFsp 挂载才行）。**推荐播放路径 = URL 直喂播放器**（`http://127.0.0.1:<webdav_port>/vol/<name>/<file>` 或 `http://.../api/download/<file>?volume=<name>`——两者都实测流式 206/<1ms 首字节）；盘符路径适合小中文件与 Explorer 操作。已在 README 流式节补记此限制。

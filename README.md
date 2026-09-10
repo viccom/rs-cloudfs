@@ -60,6 +60,8 @@ cargo build --release --no-default-features --features local,baidu # 本地+百�
 
 非加密文件 + 支持 Range 的后端（baidu/local/telegram）的读取走 **Range 直通**：请求哪段拉哪段（4MiB 窗口），不再整文件下载后才能播放——764MiB 视频首字节 <1ms、1MiB 片段 ~0.2s。生效面：WebDAV 盘符、仪表盘播放器、`/api/download` URL（可直接喂 PotPlayer/VLC）。加密文件与不支持 Range 的后端自动回退整文件模式。
 
+> **盘符路径播放大视频的固有限制**：Windows 的 WebDAV 重定向器对播放器打开的大文件会先整文件缓存（实测读 4MB 实际拉全文件），764MB 视频会以全速下载十几秒后可能触发客户端 RPC 故障。**大视频请用 URL 直喂播放器**（PotPlayer/VLC 打开 URL：`http://127.0.0.1:8485/vol/baidu/<文件名>`，真流式秒开）；盘符适合常规文件操作。
+
 > Windows 挂载盘符（Z: 等）播放 >50MB 视频需一次性调整 WebClient 服务限制（机器级，rclone/alist 用户同样需要）：
 > ```
 > reg add HKLM\SYSTEM\CurrentControlSet\Services\WebClient\Parameters /v FileSizeLimitInBytes /t REG_DWORD /d 0xffffffff /f
