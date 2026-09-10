@@ -19,6 +19,30 @@ use std::pin::Pin;
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
+/// Scripted outcome of one `open_range` call (SR2 / the streaming-read
+/// failure legs): the full `open` face is deliberately unscripted — a
+/// full-open failure is reachable today only through vanished chunks
+/// (`concat_chunks` -> `NotFound`), which needs no script.
+pub enum OpenRangeAction {
+    /// Serve the requested window normally.
+    Ok,
+    /// Fail the call itself with `error` before any frame is served.
+    Fail {
+        /// Error to return.
+        error: StorageError,
+    },
+    /// Stream the leading `bytes` bytes of the window as one Ok frame,
+    /// then fail with `error` — the mid-stream disconnect leg (a
+    /// consumer that answers from the stream sees a truncated body, not
+    /// a failed call).
+    FailAfterBytes {
+        /// Leading bytes to serve before the failure.
+        bytes: u64,
+        /// Error to surface after the prefix frame.
+        error: StorageError,
+    },
+}
+
 /// Scripted outcome of one `upload` call.
 pub enum UploadAction {
     /// Upload all chunks and store them.
@@ -56,6 +80,7 @@ impl Default for MockState {
             max_stream_frame: 0,
             open_calls: Vec::new(),
             open_range_calls: Vec::new(),
+            open_range_script: VecDeque::new(),
             deleted: Vec::new(),
             delete_script: VecDeque::new(),
             open_delay: Duration::ZERO,
@@ -114,6 +139,9 @@ struct MockState {
     /// tests assert "bounded windows were asked for" against this, not
     /// the served bytes.
     open_range_calls: Vec<(u64, u64)>,
+    /// Scripted outcomes of `open_range`, consumed in order (one entry
+    /// per call; an exhausted or `Ok` script serves the window normally).
+    open_range_script: VecDeque<OpenRangeAction>,
     /// msg_ids successfully deleted, in order.
     deleted: Vec<i64>,
     /// Scripted outcomes of `delete_remote`, consumed in order (B3b / K4
@@ -154,6 +182,7 @@ impl MockTransport {
         MockTransportBuilder {
             connect_result: None,
             upload_script: VecDeque::new(),
+            open_range_script: VecDeque::new(),
             delete_script: VecDeque::new(),
             incoming_events: Vec::new(),
             open_delay: Duration::ZERO,
@@ -382,7 +411,7 @@ impl CloudTransport for MockTransport {
         off: u64,
         len: u64,
     ) -> Result<ByteStream, StorageError> {
-        let (delay, data) = {
+        let (delay, frames) = {
             let mut state = self.lock()?;
             // Pre-clamp request window, recorded before the connect gate
             // (see the `open_calls` note).
@@ -391,18 +420,24 @@ impl CloudTransport for MockTransport {
                 return Err(StorageError::Invalid);
             }
             let data = concat_chunks(&state, &file.chunk_msg_ids)?;
-            let total = data.len() as u64;
-            let slice = if off >= total {
-                Vec::new()
-            } else {
-                let end = off.saturating_add(len).min(total);
-                data[off as usize..end as usize].to_vec()
+            // Consumed in order; an exhausted script behaves as Ok.
+            let frames = match state.open_range_script.pop_front() {
+                Some(OpenRangeAction::Fail { error }) => return Err(error),
+                // The prefix is clamped to the leading `bytes` of the
+                // REQUESTED window (a cap tighter than the window itself).
+                Some(OpenRangeAction::FailAfterBytes { bytes, error }) => {
+                    let asked = bytes.min(len);
+                    vec![Ok(Bytes::from(window_slice(&data, off, asked))), Err(error)]
+                }
+                Some(OpenRangeAction::Ok) | None => {
+                    vec![Ok(Bytes::from(window_slice(&data, off, len)))]
+                }
             };
-            (state.open_delay, slice)
+            (state.open_delay, frames)
         };
         // Guard dropped before sleeping: locks never span an await.
         tokio::time::sleep(delay).await;
-        Ok(frame_stream(vec![Ok(Bytes::from(data))]))
+        Ok(frame_stream(frames))
     }
 
     /// Deletes every message the handle refers to (K3: the handle's ids,
@@ -598,6 +633,18 @@ fn concat_chunks(state: &MockState, chunk_msg_ids: &[i64]) -> Result<Vec<u8>, St
     Ok(data)
 }
 
+/// The `[off, min(off + len, EOF))` slice of `data` (an offset at/past
+/// EOF is the empty slice) — the `open_range` window math in one place
+/// for both the normal and the scripted-prefix serving paths.
+fn window_slice(data: &[u8], off: u64, len: u64) -> Vec<u8> {
+    let total = data.len() as u64;
+    if off >= total {
+        return Vec::new();
+    }
+    let end = off.saturating_add(len).min(total);
+    data[off as usize..end as usize].to_vec()
+}
+
 /// Wraps fully-buffered frames into the boxed stream shapes used by
 /// [`ByteStream`] and [`IncomingStream`].
 fn frame_stream<T>(
@@ -613,6 +660,7 @@ where
 pub struct MockTransportBuilder {
     connect_result: Option<Result<(), StorageError>>,
     upload_script: VecDeque<UploadAction>,
+    open_range_script: VecDeque<OpenRangeAction>,
     delete_script: VecDeque<Result<(), StorageError>>,
     incoming_events: Vec<Result<IncomingEvent, StorageError>>,
     open_delay: Duration,
@@ -637,6 +685,17 @@ impl MockTransportBuilder {
     /// exhausted scripts behave as [`UploadAction::Ok`].
     pub fn upload_action(mut self, action: UploadAction) -> Self {
         self.upload_script.push_back(action);
+        self
+    }
+
+    /// Appends a scripted `open_range` outcome (SR2): scripts are consumed
+    /// in order, one entry per call, and an exhausted script serves the
+    /// window normally — the same queue-position semantics as
+    /// [`MockTransportBuilder::upload_action`]. Only `open_range` is
+    /// scriptable; the full `open` face keeps its single failure mode
+    /// (vanished chunks -> `NotFound`).
+    pub fn open_range_action(mut self, action: OpenRangeAction) -> Self {
+        self.open_range_script.push_back(action);
         self
     }
 
@@ -682,6 +741,7 @@ impl MockTransportBuilder {
             state: Arc::new(Mutex::new(MockState {
                 connect_result: self.connect_result,
                 upload_script: self.upload_script,
+                open_range_script: self.open_range_script,
                 delete_script: self.delete_script,
                 incoming_events: self.incoming_events,
                 open_delay: self.open_delay,

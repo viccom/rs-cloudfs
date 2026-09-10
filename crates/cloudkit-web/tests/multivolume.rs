@@ -193,6 +193,14 @@ fn status_of(resp: &str) -> u16 {
         .expect("numeric status code")
 }
 
+/// Case-insensitive header lookup (headers end at the first empty line).
+fn header<'a>(resp: &'a str, name: &str) -> Option<&'a str> {
+    resp.lines().take_while(|l| !l.is_empty()).find_map(|l| {
+        let (key, value) = l.split_once(':')?;
+        key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
 /// The response body (everything after the blank line), dechunked when
 /// the server answered `Transfer-Encoding: chunked`.
 fn body_of(resp: &str) -> String {
@@ -759,6 +767,49 @@ async fn download_routes_by_volume() {
         body_of(&resp),
         "File not found in CyDrive cloud",
         "the Python 404 body is the frozen one"
+    );
+}
+
+/// K23 + SR2: a range GET streams through the NAMED volume's transport
+/// — volume a's mock sees exactly the requested window, and volume b's
+/// remote is never touched (not even for a name that exists on a).
+#[tokio::test]
+async fn download_range_streams_by_volume() {
+    let (_dir, server, a, b) = two_volume_env().await;
+    let addr = server.local_addr();
+    // ASCII so the String-decoded body comparison is lossless; 40 bytes
+    // fits the single-chunk seed helper.
+    let content: Vec<u8> = (0..40).map(|index| b'a' + (index % 26) as u8).collect();
+    let receipt = seed_remote(&a.mock, "/a-stream.bin", &content).await;
+    seed_uploaded_row(&a.db, "/a-stream.bin", &content, &receipt);
+
+    let resp = send(
+        addr,
+        &request(
+            "GET",
+            "/api/download/a-stream.bin?volume=a",
+            addr,
+            &[("Range", "bytes=10-29")],
+            "",
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 206, "partial content: {resp}");
+    assert_eq!(header(&resp, "content-range"), Some("bytes 10-29/40"));
+    assert_eq!(header(&resp, "content-length"), Some("20"));
+    assert_eq!(
+        body_of(&resp),
+        String::from_utf8_lossy(&content[10..30]).into_owned(),
+        "volume a's exact slice"
+    );
+    assert!(
+        a.mock.open_calls().is_empty(),
+        "a streams, never full-opens"
+    );
+    assert_eq!(a.mock.open_range_calls(), vec![(10, 20)]);
+    assert!(
+        b.mock.open_calls().is_empty() && b.mock.open_range_calls().is_empty(),
+        "volume b's remote is never touched"
     );
 }
 

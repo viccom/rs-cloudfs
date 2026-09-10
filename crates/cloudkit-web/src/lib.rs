@@ -25,9 +25,12 @@
 //!   through the VFS (fixing the Python double-call defect per the
 //!   design doc; review High-2 routes files through
 //!   [`Vfs::remove_file`]).
-//! - `GET /api/download/{filename}` — hydrate through the VFS and
-//!   answer the bytes with Python's inline disposition; unknown files
-//!   get Python's verbatim 404 body.
+//! - `GET /api/download/{filename}` — stream off the remote (SR2 / K36:
+//!   a plaintext row on a `range_read` transport answers from bounded
+//!   `open_range` windows, never a hydrated local copy) or hydrate
+//!   through the VFS for the rows that cannot (R-5), answering with
+//!   Python's inline disposition; unknown files get Python's verbatim
+//!   404 body.
 //!
 //! Three incremental routes (no Python baseline; frozen by the Rust
 //! design doc, all additive — the six routes above are untouched):
@@ -42,7 +45,10 @@
 //!   satisfiable range answers 206 with an exact slice and
 //!   `Content-Range`; an unsatisfiable start answers 416 with
 //!   `Content-Range: bytes */size`; malformed or multi-range headers
-//!   are ignored and the full body is served with 200.
+//!   are ignored and the full body is served with 200. Since SR2 both
+//!   the streaming and the hydrate faces serve these semantics (the
+//!   streaming one decides off the authoritative row size, K35, with
+//!   no remote call for the 416).
 //! - `GET /api/queue` — the four upload-queue counters plus the DB
 //!   pending-uploads tally.
 //!
@@ -78,7 +84,9 @@
 //! `127.0.0.1:0`.
 
 use std::net::SocketAddr;
+use std::pin::Pin;
 use std::sync::{Arc, Mutex};
+use std::task::{Context, Poll};
 use std::time::SystemTime;
 
 use axum::body::Body;
@@ -87,13 +95,16 @@ use axum::http::{header, StatusCode, Uri};
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
+use bytes::Bytes;
+use futures_core::Stream;
 use rust_embed::RustEmbed;
 use tokio::net::TcpListener;
 use tokio::sync::watch;
 
 use cloudkit_core::database::FileRecord;
 use cloudkit_core::rel_path::RelPath;
-use cloudkit_core::vfs::{Vfs, VfsError};
+use cloudkit_core::transport::{ByteStream, CloudTransport, RemoteHandle, StorageError};
+use cloudkit_core::vfs::{StreamSource, Vfs, VfsError};
 
 /// A boot-time quota snapshot for the dashboard's storage card, read
 /// once at assembly by the caller (informational — never a live meter;
@@ -763,15 +774,26 @@ fn resolve_byte_range(spec: ByteRange, size: u64) -> Option<(u64, u64)> {
     }
 }
 
-/// A hydrated download: Python's inline disposition, a mime guessed
-/// from the name (`mimetypes.guess_type` analog) and the exact bytes
-/// (which sets the Content-Length). A present-and-parseable `Range`
-/// header narrows the answer to one slice: 206 + `Content-Range` when
-/// satisfiable, 416 + `Content-Range: bytes */size` when not; anything
-/// the parser rejects falls through to the full 200 body.
-fn download_response(filename: &str, bytes: Vec<u8>, range: Option<&str>) -> Response {
+/// The download routes' content-header pair: a mime guessed from the
+/// name (`mimetypes.guess_type` analog) and Python's inline
+/// disposition. Shared by the hydrated fallback
+/// ([`download_response`]) and the streaming branch
+/// ([`streaming_download_response`]) so both faces answer
+/// byte-identical headers.
+fn download_content_headers(filename: &str) -> (String, String) {
     let mime = mime_guess::from_path(filename).first_or_octet_stream();
     let disposition = format!("inline; filename=\"{filename}\"");
+    (mime.as_ref().to_string(), disposition)
+}
+
+/// A hydrated download (the R-5 fallback of [`api_download`]): the
+/// exact bytes in one `Body` (which sets the Content-Length). A
+/// present-and-parseable `Range` header narrows the answer to one
+/// slice: 206 + `Content-Range` when satisfiable, 416 +
+/// `Content-Range: bytes */size` when not; anything the parser rejects
+/// falls through to the full 200 body.
+fn download_response(filename: &str, bytes: Vec<u8>, range: Option<&str>) -> Response {
+    let (mime, disposition) = download_content_headers(filename);
     if let Some(spec) = range.and_then(parse_byte_range) {
         return match resolve_byte_range(spec, bytes.len() as u64) {
             Some((start, end)) => {
@@ -779,12 +801,13 @@ fn download_response(filename: &str, bytes: Vec<u8>, range: Option<&str>) -> Res
                 (
                     StatusCode::PARTIAL_CONTENT,
                     [
-                        (header::CONTENT_TYPE, mime.as_ref().to_string()),
+                        (header::CONTENT_TYPE, mime),
                         (header::CONTENT_DISPOSITION, disposition),
                         (
                             header::CONTENT_RANGE,
                             format!("bytes {start}-{end}/{}", bytes.len()),
                         ),
+                        (header::ACCEPT_RANGES, "bytes".to_string()),
                     ],
                     Body::from(slice.to_vec()),
                 )
@@ -802,22 +825,186 @@ fn download_response(filename: &str, bytes: Vec<u8>, range: Option<&str>) -> Res
     }
     (
         [
-            (header::CONTENT_TYPE, mime.as_ref().to_string()),
+            (header::CONTENT_TYPE, mime),
             (header::CONTENT_DISPOSITION, disposition),
+            (header::ACCEPT_RANGES, "bytes".to_string()),
         ],
         Body::from(bytes),
     )
         .into_response()
 }
 
-/// `GET /api/download/{filename}`: hydrate through the VFS (cache hit
-/// or remote pull with LRU eviction) and answer the bytes, honoring a
-/// single-range `Range` header when present. Sub-paths resolve as
-/// their virtual RelPath; a missing row, a directory or an unusable
-/// path all land on Python's verbatim 404 body, and other failures
-/// surface as 500 errors. Multi-volume mode routes by `?volume=`
-/// (K23) — the volume resolution happens after the path validation so
-/// an unusable path keeps the frozen 404 body.
+/// The streaming branch of a download (SR2 / K36): one bounded
+/// `open_range` window per response, served through
+/// [`Body::from_stream`] instead of a hydrated local copy. The Range
+/// math reuses [`parse_byte_range`] / [`resolve_byte_range`] verbatim,
+/// decided against the authoritative row size (K35) — never against
+/// bytes already read.
+///
+/// Header contract: 200 and 206 both carry an EXPLICIT Content-Length
+/// (`Body::from_stream` has no length of its own — without the header
+/// the answer would degrade to chunked framing) and
+/// `Accept-Ranges: bytes`. An unsatisfiable range answers 416 +
+/// `bytes */size` with an empty body and no remote call at all; a
+/// multi-range header is ignored wholesale (a 200 full-body stream),
+/// matching the lenient fallback of [`download_response`].
+///
+/// Failure semantics: a transport error mid-stream surfaces as a body
+/// `Err` after the head may already be on the wire — HTTP cannot
+/// change the status code after the first byte, so the body truncates
+/// short of the promised Content-Length (the connection ends; the
+/// client retries). The route never fabricates content to fill the
+/// promise (PCFS parity).
+fn streaming_download_response(
+    filename: &str,
+    handle: RemoteHandle,
+    total_size: u64,
+    transport: Arc<dyn CloudTransport>,
+    range: Option<&str>,
+) -> Response {
+    let (mime, disposition) = download_content_headers(filename);
+    if let Some(spec) = range.and_then(parse_byte_range) {
+        return match resolve_byte_range(spec, total_size) {
+            Some((start, end)) => {
+                let len = end - start + 1;
+                (
+                    StatusCode::PARTIAL_CONTENT,
+                    [
+                        (header::CONTENT_TYPE, mime),
+                        (header::CONTENT_DISPOSITION, disposition),
+                        (
+                            header::CONTENT_RANGE,
+                            format!("bytes {start}-{end}/{total_size}"),
+                        ),
+                        (header::CONTENT_LENGTH, len.to_string()),
+                        (header::ACCEPT_RANGES, "bytes".to_string()),
+                    ],
+                    Body::from_stream(RangeBody::new(transport, handle, start, len)),
+                )
+                    .into_response()
+            }
+            // Decided off the row size alone: no remote call is made.
+            None => (
+                StatusCode::RANGE_NOT_SATISFIABLE,
+                [(header::CONTENT_RANGE, format!("bytes */{total_size}"))],
+                Body::empty(),
+            )
+                .into_response(),
+        };
+    }
+    // Full-body stream: the one window IS the whole object (the
+    // transport slices it into bounded frames on its own, so memory
+    // stays frame-granular, never file-granular).
+    (
+        [
+            (header::CONTENT_TYPE, mime),
+            (header::CONTENT_DISPOSITION, disposition),
+            (header::CONTENT_LENGTH, total_size.to_string()),
+            (header::ACCEPT_RANGES, "bytes".to_string()),
+        ],
+        Body::from_stream(RangeBody::new(transport, handle, 0, total_size)),
+    )
+        .into_response()
+}
+
+/// Response-body side of one `open_range` window (the SSE `FramePipe`
+/// precedent shape): the [`Stream`] impl awaits the transport call,
+/// then forwards the transport's frames to [`Body::from_stream`]
+/// verbatim. The transport error type satisfies `Into<BoxError>`
+/// directly, so no re-mapping layer is needed.
+struct RangeBody {
+    state: RangeBodyState,
+}
+
+/// Lifecycle of a [`RangeBody`]: the `open_range` call in flight, its
+/// frame stream flowing, or terminal after an error.
+enum RangeBodyState {
+    /// The `open_range` future (owned `handle`/`transport`, so the
+    /// boxed future is `'static`).
+    Opening(Pin<Box<dyn std::future::Future<Output = Result<ByteStream, StorageError>> + Send>>),
+    /// The window's frames.
+    Streaming(ByteStream),
+    /// After an error frame: nothing more, ever.
+    Done,
+}
+
+impl RangeBody {
+    fn new(transport: Arc<dyn CloudTransport>, handle: RemoteHandle, off: u64, len: u64) -> Self {
+        Self {
+            state: RangeBodyState::Opening(Box::pin(async move {
+                transport.open_range(&handle, off, len).await
+            })),
+        }
+    }
+}
+
+impl Stream for RangeBody {
+    type Item = Result<Bytes, StorageError>;
+
+    fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if let RangeBodyState::Opening(future) = &mut this.state {
+            match future.as_mut().poll(cx) {
+                Poll::Pending => return Poll::Pending,
+                Poll::Ready(Ok(stream)) => this.state = RangeBodyState::Streaming(stream),
+                Poll::Ready(Err(error)) => {
+                    this.state = RangeBodyState::Done;
+                    return Poll::Ready(Some(Err(error)));
+                }
+            }
+        }
+        match &mut this.state {
+            RangeBodyState::Streaming(stream) => stream.as_mut().poll_next(cx),
+            RangeBodyState::Done => Poll::Ready(None),
+            // Transitioned (or returned) in the Opening arm above.
+            RangeBodyState::Opening(_) => unreachable!("the Opening arm always transitions"),
+        }
+    }
+}
+
+/// The R-5 fallback body of [`api_download`] (verbatim pre-SR2
+/// behavior): hydrate through the VFS, read the whole local copy and
+/// answer through [`download_response`].
+async fn hydrate_download(
+    vfs: &Vfs,
+    rel: &RelPath,
+    filename: &str,
+    range: Option<&str>,
+) -> Response {
+    match vfs.hydrate(rel).await {
+        Ok(path) => match std::fs::read(&path) {
+            Ok(bytes) => download_response(filename, bytes, range),
+            Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+        },
+        Err(VfsError::NotFound(_)) | Err(VfsError::IsDirectory(_)) => download_not_found(),
+        Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
+    }
+}
+
+/// The frozen 404 body of the download routes (Python's verbatim
+/// plain-text answer).
+fn download_not_found() -> Response {
+    (
+        StatusCode::NOT_FOUND,
+        content_response(
+            "text/plain; charset=utf-8",
+            DOWNLOAD_NOT_FOUND.as_bytes().to_vec(),
+        ),
+    )
+        .into_response()
+}
+
+/// `GET /api/download/{filename}`: streams ranges straight off the
+/// remote when the row admits it (SR2 / K36 — a plaintext row on a
+/// `range_read` transport with a non-zero size), otherwise hydrates
+/// through the VFS and answers the local copy (R-5 fallback: encrypted
+/// rows, range-incapable transports, 0-byte rows). A single-range
+/// `Range` header is honored on both faces; sub-paths resolve as their
+/// virtual RelPath; a missing row, a directory or an unusable path all
+/// land on Python's verbatim 404 body, and other failures surface as
+/// 500 errors. Multi-volume mode routes by `?volume=` (K23) — the
+/// volume resolution happens after the path validation so an unusable
+/// path keeps the frozen 404 body.
 async fn api_download(
     State(state): State<AppState>,
     Path(filename): Path<String>,
@@ -843,19 +1030,17 @@ async fn api_download(
         .headers()
         .get(header::RANGE)
         .and_then(|value| value.to_str().ok());
-    match volume.vfs.hydrate(&rel).await {
-        Ok(path) => match std::fs::read(&path) {
-            Ok(bytes) => download_response(&filename, bytes, range),
-            Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
-        },
-        Err(VfsError::NotFound(_)) | Err(VfsError::IsDirectory(_)) => (
-            StatusCode::NOT_FOUND,
-            content_response(
-                "text/plain; charset=utf-8",
-                DOWNLOAD_NOT_FOUND.as_bytes().to_vec(),
-            ),
-        )
-            .into_response(),
+    match volume.vfs.open_read(&rel).await {
+        Ok(StreamSource::Stream {
+            handle,
+            total_size,
+            transport,
+        }) => streaming_download_response(&filename, handle, total_size, transport, range),
+        // The fallback signal and every error keep the pre-SR2 path:
+        // hydrate (with its own NotFound/IsDirectory mapping) or the
+        // frozen 404/500 answers.
+        Ok(StreamSource::Hydrate) => hydrate_download(volume.vfs, &rel, &filename, range).await,
+        Err(VfsError::NotFound(_)) | Err(VfsError::IsDirectory(_)) => download_not_found(),
         Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
 }
