@@ -16,14 +16,15 @@
 6. `docs/tracking/phase0-1.md` —— 当前任务跟踪单（**开工先读、每批收口更新**）
 
 ## 当前阶段
-**Phase 2.5 完成（2026-09-09，0.10.0）**：多卷启用（Volume Registry，方案一裁决）——MV0 配置/发现（volumes_dir + 每卷一文件，K19）→ MV1 Registry 装配（K21 卷主目录隔离/K22 失败可见/K25 单 stop gate）→ MV2 WebDAV 单端口 `/vol/<name>` 前缀路由 + 逐卷挂载（K20 真机探针过、K27）→ MV3 仪表盘多卷（/api/volumes + 卷 tabs + K23 卷参）→ MV4 CLI 运维面（volumes/doctor/status 逐卷 + setup --multi 骨架）+ 文档联动，K19–K28 入档 decisions。**三卷真机 E2E 全过（单进程 V:local加密+Y:tg+Z:baidu、单端口 /vol/<name>、单仪表盘 tabs/汇总、stop 全停）**，feat/phase2-5 收口 merge main。前置 Phase 2（0.9.0）完成，telegram E2E 生产 chat 污染已获负责人明示接受（§7a 例外）。过渡测试包：E:\Rs_Codes\cydrive-0.8.0-testkit（telegram+加密 U:/V:，仓外不入库）。
+**Phase 3 完成（2026-09-10）**：WinFsp 类本地盘挂载（WF0–WF5 六批，K38–K46 入档 decisions）——新 L5 crate `cloudkit-winfsp`（feature `winfsp` 默认关，K38 许可隔离）做 native 薄适配器（winfsp-rs 0.13 sync trait + tokio Handle::block_on 桥，K39），读写语义核心三面共享（open_read 三重门+cache-first / RangeFile 4MiB 窗口 / StagedFile→put_staged，K42/K43），K40 加法集成+可见降级（`mount_backend` 进程级键，未装/未编译回退 webdav 不拒启）+ K41 生命周期三件套；执行期修复 FSD 大小写形态（rename/delete 名字大写送达→resolve_row 父目录扫描回退，6b25ede）。**真机验收矩阵七项全过**（三卷单进程 winfsp 原生挂载 V:local加密+Y:tg+Z:baidu、文件操作矩阵、写链冷读回逐字匹配、stop 全停、回退腿实证；764MB 视频 open 55.4s→7-11ms）。feat/winfsp 收口 merge main 由主会话执行。前置 Phase 2.5（0.10.0）完成；过渡测试包：E:\Rs_Codes\cydrive-0.8.0-testkit（telegram+加密 U:/V:，仓外不入库）。
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 810 测试（0.10.0+Phase 2.5 多卷批；ignored 9 = 真机/平台类）
+cargo test --workspace --no-fail-fast            # 867 测试（Phase 3 WinFsp 批；ignored 9 = 真机/平台类）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo build -p cloudkit-cli --no-default-features --features local,baidu   # 驱动裁剪构建（K30 三 feature）；缺驱动构建运行期报可行动错误（K31 rebuild 指引），cydrive --version 显示驱动清单（K32）
+LIBCLANG_PATH=D:/Python312/Lib/site-packages/clang/native cargo test -p cloudkit-winfsp --features winfsp   # winfsp 腿（92 测试，ignored 1 = 真机挂载；需 libclang+MSVC，见已知陷阱）
 scripts/check_layers                             # R1 层依赖门禁（CI 同款；动 Cargo.toml 依赖后必跑）
 scripts/scan_secrets                             # R3 秘密扫描门禁（CI 同款；本地模式=全树扫描）
 ```
@@ -45,6 +46,8 @@ scripts/scan_secrets                             # R3 秘密扫描门禁（CI �
 - **Explorer 上传链路**：空 PUT→LOCK→PUT→PROPPATCH——**PROPPATCH 必须全成功（207）而非 405**，否则 MiniRedir 整单回滚「看似失败实则已传」（rs-CyDrive 2026-09-03 真机首验最贵教训，百度 E2E 直接承重）
 - **Windows 运行中的 release exe 锁文件**：替换构建报 `os error 5`（拒绝访问）——**先 `cydrive stop`/停进程再 rebuild release**（MV3 冒烟实测，MV2 真机探针同源）
 - **多卷模式 `CYDRIVE_*` env 覆盖被忽略**（K28）：全局 env 覆盖会跨卷串味，卷模式 discover 直接跳过并在 tracing 声明；凭据 env>file>keyring 解析链在驱动 resolve 时不变——排查「env 不生效」先看是否卷模式
+- **winfsp 腿构建需 libclang + MSVC**：winfsp-sys 的 bindgen 依赖 libclang（本机 pip 包装于 `D:/Python312/Lib/site-packages/clang/native`，构建时 `LIBCLANG_PATH` 指它）；winfsp-sys 对 gnu 工具链 panic——只能 MSVC 构建
+- **FSD 大小写形态（K45 执行期实证）**：winfsp 回调里 rename 源名与 cleanup 删除名会以**大写**送达（FSD 大小写不敏感解析的归一形态）——适配层 resolve_row 精确命中 + 父目录扫描回退（歧义保持 miss），6b25ede 修复
 - 实现期陷阱查 `docs/rust-rewrite-design.md`「深度调研补遗」节（axum 2MB body 上限/grammers FloodWait 藏点/dav-server Bytes-Seek 模型/WebClient 4GB-1/挂载 Basic 认证）
 - PCFS 反面教材勿抄：错误类型跨层泄漏、硬编码密钥、纯 CTR 无认证、注释掉的调试日志
 
