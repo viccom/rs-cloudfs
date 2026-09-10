@@ -19,18 +19,27 @@
 //!   token pair through the config write-back store;
 //! - **doctor**: the baidu probe verdicts over the mock backend.
 
-use std::net::SocketAddr;
-use std::sync::atomic::{AtomicU32, Ordering};
-use std::sync::Arc;
-
-use axum::routing::get;
-use axum::Router;
-use ck_baidu::TokenStore;
 use cloudkit_cli::{
-    build_backend_transport, build_backend_transport_with, local_sync_unsupported_warning,
-    proxy_ineffective_warning, BackendProbe, BackendTransport, BaiduEndpoints,
+    build_backend_transport, local_sync_unsupported_warning, proxy_ineffective_warning,
+    BackendProbe, BackendTransport,
 };
+// Baidu-gated surface (FT2): the mock backend, the injected dispatch
+// seam and the driver trait only exist with the `baidu` feature.
+#[cfg(feature = "baidu")]
+use axum::routing::get;
+#[cfg(feature = "baidu")]
+use axum::Router;
+#[cfg(feature = "baidu")]
+use ck_baidu::TokenStore;
+#[cfg(feature = "baidu")]
+use cloudkit_cli::{build_backend_transport_with, BaiduEndpoints};
 use cloudkit_core::config::{Backend, CyDriveConfig};
+#[cfg(feature = "baidu")]
+use std::net::SocketAddr;
+#[cfg(feature = "baidu")]
+use std::sync::atomic::{AtomicU32, Ordering};
+#[cfg(feature = "baidu")]
+use std::sync::Arc;
 
 // ------------------------------------------------------ mock xpan backend ---
 
@@ -38,6 +47,7 @@ use cloudkit_core::config::{Backend, CyDriveConfig};
 /// `rotate` is set, then a healthy uk), the xpan file family (quota +
 /// list share one union body), and the oauth refresh endpoint. The
 /// returned counter tracks uinfo calls for the rotation assertions.
+#[cfg(feature = "baidu")]
 async fn spawn_mock_baidu(rotate: bool) -> (SocketAddr, Arc<AtomicU32>) {
     let uinfo_calls = Arc::new(AtomicU32::new(0));
     let uinfo = Arc::clone(&uinfo_calls);
@@ -90,6 +100,7 @@ async fn spawn_mock_baidu(rotate: bool) -> (SocketAddr, Arc<AtomicU32>) {
 }
 
 /// Endpoints pointing at the loopback mock.
+#[cfg(feature = "baidu")]
 fn mock_endpoints(addr: SocketAddr) -> BaiduEndpoints {
     let base = format!("http://{addr}");
     BaiduEndpoints {
@@ -126,6 +137,7 @@ fn local_config(root: &std::path::Path) -> CyDriveConfig {
 /// type, the volume identity is `baidu:<uk>` (uinfo's uk), the
 /// capability face is the driver's plus `remote_delete`, and the dyn
 /// coercion answers the same bits.
+#[cfg(feature = "baidu")]
 #[tokio::test]
 async fn baidu_key_builds_baidu_transport() {
     let (addr, _calls) = spawn_mock_baidu(false).await;
@@ -169,9 +181,10 @@ async fn local_key_builds_local_transport() {
     let dispatched = build_backend_transport(&local_config(dir.path()))
         .await
         .expect("local dispatch assembles");
-    let BackendTransport::Local(_) = &dispatched else {
-        panic!("the local key must dispatch to the LocalTransport arm");
-    };
+    assert!(
+        matches!(&dispatched, BackendTransport::Local(_)),
+        "the local key must dispatch to the Local arm"
+    );
     assert!(
         dispatched.volume().starts_with("local:"),
         "the local volume identity is its root (K6): {}",
@@ -230,10 +243,28 @@ async fn missing_telegram_driver_refuses_with_the_rebuild_message() {
     );
 }
 
+/// Off-feature pin (FT2 / K31): in a binary built without the baidu
+/// driver, the dispatch's baidu arm carries the actionable rebuild
+/// message — not a connect attempt (there is no driver to connect).
+#[cfg(not(feature = "baidu"))]
+#[tokio::test]
+async fn missing_baidu_driver_refuses_with_the_rebuild_message() {
+    let err = match build_backend_transport(&baidu_config()).await {
+        Ok(_) => panic!("a driver-less binary cannot assemble the baidu arm"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains(cloudkit_cli::BAIDU_DRIVER_REQUIRED),
+        "the off-feature refusal is the K31 rebuild message: {message}"
+    );
+}
+
 // ------------------------------------------------- K12: sync namespace ---
 
 /// The dispatched baidu transport's sync namespace IS its volume
 /// identity (K12: the uid is a stable non-secret account id).
+#[cfg(feature = "baidu")]
 #[tokio::test]
 async fn baidu_sync_namespace_is_the_volume_identity() {
     let (addr, _calls) = spawn_mock_baidu(false).await;
@@ -326,10 +357,12 @@ fn proxy_ineffective_warning_gates_on_backend() {
 
 /// A capturing TokenStore for the persistence assertions.
 #[derive(Default)]
+#[cfg(feature = "baidu")]
 struct CapturedTokens {
     saved: std::sync::Mutex<Vec<(String, String)>>,
 }
 
+#[cfg(feature = "baidu")]
 impl TokenStore for CapturedTokens {
     fn save_tokens(&self, access: &str, refresh: &str) {
         self.saved
@@ -343,6 +376,7 @@ impl TokenStore for CapturedTokens {
 /// the rotated pair reaches the TokenStore (K13: on-arrival persistence
 /// — the new refresh_token is the only live value) and the replay
 /// connects.
+#[cfg(feature = "baidu")]
 #[tokio::test]
 async fn token_rotation_persists_through_the_dispatch_store() {
     let (addr, uinfo_calls) = spawn_mock_baidu(true).await;
@@ -376,6 +410,7 @@ async fn token_rotation_persists_through_the_dispatch_store() {
 /// The production write-back store: a rotation updates exactly the two
 /// token keys in the target config.toml (K14 — plaintext token keys in
 /// config are allowed; the sync_secret precedent).
+#[cfg(feature = "baidu")]
 #[tokio::test]
 async fn config_token_store_updates_the_two_token_keys() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -397,6 +432,7 @@ async fn config_token_store_updates_the_two_token_keys() {
 
 /// The doctor probe against the healthy mock: Alive (uinfo at factory,
 /// quota + a root list — all read-only).
+#[cfg(feature = "baidu")]
 #[tokio::test]
 async fn baidu_backend_probe_alive_against_mock() {
     let (addr, _calls) = spawn_mock_baidu(false).await;

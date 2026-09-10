@@ -26,10 +26,11 @@ use anyhow::{Context, Result};
 #[cfg(feature = "telegram")]
 use ck_telegram::transport::GrammersTransport;
 use clap::{Parser, Subcommand};
-use cloudkit_cli::{
-    discover_config, discover_config_with_volumes, BaiduEndpoints, ConfigTokenStore,
-    DiscoveredConfig, VolumeStatus,
-};
+use cloudkit_cli::{discover_config, discover_config_with_volumes, DiscoveredConfig, VolumeStatus};
+// Baidu-only run-flow glue (FT2): the endpoint set and the K13
+// write-back store exist only with the driver.
+#[cfg(feature = "baidu")]
+use cloudkit_cli::{BaiduEndpoints, ConfigTokenStore};
 use cloudkit_core::config::{Backend, CyDriveConfig, VolumeConfig};
 use cloudkit_core::logging::LogConfig;
 #[cfg(feature = "telegram")]
@@ -566,6 +567,10 @@ async fn doctor_cmd() -> Result<()> {
         }
         cloudkit_core::config::Backend::Baidu => {
             results.extend(cloudkit_cli::doctor::backend_checks(&cfg));
+            // The live token probe needs the driver (FT2 / K31): a
+            // binary without it skips the liveness leg instead of
+            // reporting a fake Unreachable.
+            #[cfg(feature = "baidu")]
             results.push(cloudkit_cli::doctor::baidu_connectivity_check(
                 &cloudkit_cli::baidu_backend_probe(&cfg).await,
             ));
@@ -793,16 +798,24 @@ async fn run_multi_volume(
                     name = spec.name,
                     backend = backend.as_str()
                 );
-                // K13/K21: token rotations write back into the volume's
-                // own file; upload sessions live in the volume home.
-                let token_store = ConfigTokenStore::new(spec.file_path.clone());
-                let dispatched = cloudkit_cli::build_backend_transport_with(
-                    &settings,
-                    &BaiduEndpoints::default(),
-                    Some(Arc::new(token_store)),
-                    &home,
-                )
-                .await?;
+                // With the driver: K13/K21 — token rotations write back
+                // into the volume's own file; upload sessions live in
+                // the volume home. Without it: the reduced twin (K31 —
+                // a baidu volume refuses with the rebuild message; a
+                // local volume assembles unchanged).
+                #[cfg(feature = "baidu")]
+                let dispatched = {
+                    let token_store = ConfigTokenStore::new(spec.file_path.clone());
+                    cloudkit_cli::build_backend_transport_with(
+                        &settings,
+                        &BaiduEndpoints::default(),
+                        Some(Arc::new(token_store)),
+                        &home,
+                    )
+                    .await?
+                };
+                #[cfg(not(feature = "baidu"))]
+                let dispatched = cloudkit_cli::build_backend_transport_with(&settings).await?;
                 run_options.sync_namespace = Some(dispatched.sync_namespace_key());
                 run_options.web_volume = Some(dispatched.volume().to_string());
                 run_options.web_quota = dispatched.web_quota_snapshot().await;

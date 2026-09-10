@@ -86,6 +86,15 @@ pub const TELEGRAM_DRIVER_REQUIRED: &str = "this binary was built without the te
      rebuild with `cargo build --features telegram`, or set `backend = \"local\"` / \
      `backend = \"baidu\"` in config.toml";
 
+/// The actionable message every baidu surface carries when the binary
+/// was built without the baidu driver (K31, FT2 — same shape as
+/// [`TELEGRAM_DRIVER_REQUIRED`]): name the rebuild command, then name
+/// the backend switch. Pinned by the off-feature test in
+/// `tests/dispatch.rs`.
+pub const BAIDU_DRIVER_REQUIRED: &str = "this binary was built without the baidu driver; \
+     rebuild with `cargo build --features baidu`, or set `backend = \"telegram\"` / \
+     `backend = \"local\"` in config.toml";
+
 /// Failure modes of [`connect_with_deadline`].
 #[derive(Debug, thiserror::Error)]
 pub enum ConnectGuardError<E> {
@@ -1840,9 +1849,10 @@ pub async fn run_rebuild_with_driver(
 
 // ------------------------------- backend dispatch (B3b 段二b unit 5) ---
 
-/// The baidu endpoint set the dispatch assembles [`ck_baidu::BaiduParams`]
-/// with. Defaults are the production constants; tests inject a loopback
-/// mock (`build_backend_transport_with`).
+/// The baidu endpoint set the dispatch assembles the driver params
+/// with. Defaults are the production constants (empty inert strings in
+/// a binary without the driver — [`Default::default`]); tests inject a
+/// loopback mock (`build_backend_transport_with`).
 #[derive(Debug, Clone)]
 pub struct BaiduEndpoints {
     /// xpan API base (`pan.baidu.com`).
@@ -1854,10 +1864,25 @@ pub struct BaiduEndpoints {
 }
 
 impl Default for BaiduEndpoints {
+    #[cfg(feature = "baidu")]
     fn default() -> Self {
         BaiduEndpoints {
             api_base: ck_baidu::DEFAULT_API_BASE.to_string(),
             oauth_base: ck_baidu::DEFAULT_OAUTH_BASE.to_string(),
+            pcs_base: None,
+        }
+    }
+
+    /// Inert placeholders (K31 / FT2): the struct stays because the
+    /// dispatch and run signatures name it, but in a binary without the
+    /// driver no baidu surface consumes these values — every consumer
+    /// refuses with [`BAIDU_DRIVER_REQUIRED`] before any endpoint is
+    /// read.
+    #[cfg(not(feature = "baidu"))]
+    fn default() -> Self {
+        BaiduEndpoints {
+            api_base: String::new(),
+            oauth_base: String::new(),
             pcs_base: None,
         }
     }
@@ -1871,6 +1896,10 @@ impl Default for BaiduEndpoints {
 /// single-volume boot passes the cwd (`"."`), the multi-volume dispatch
 /// passes the volume's home directory — public so the per-volume
 /// path-resolution stays pinned by tests.
+///
+/// Exists only with the `baidu` feature (FT2): every caller sits inside
+/// a gated region, and the return type names the driver's params.
+#[cfg(feature = "baidu")]
 pub fn baidu_params(
     cfg: &CyDriveConfig,
     endpoints: &BaiduEndpoints,
@@ -1905,6 +1934,10 @@ pub fn baidu_params(
 /// routes around it).
 pub enum BackendTransport {
     /// The baidu transport face over the factory-connected driver.
+    /// Exists only with the `baidu` feature (FT2): a binary without the
+    /// driver cannot assemble this arm (the dispatch refuses with
+    /// [`BAIDU_DRIVER_REQUIRED`] instead).
+    #[cfg(feature = "baidu")]
     Baidu(Arc<ck_baidu::BaiduTransport>),
     /// The local transport face over the factory-initialised driver.
     Local(Arc<ck_local::LocalTransport>),
@@ -1914,6 +1947,7 @@ impl BackendTransport {
     /// The assembled volume identity (`baidu:<uid>` / `local:<root>`).
     pub fn volume(&self) -> &str {
         match self {
+            #[cfg(feature = "baidu")]
             BackendTransport::Baidu(t) => StorageDriver::volume(t.driver()).as_str(),
             BackendTransport::Local(t) => StorageDriver::volume(t.driver()).as_str(),
         }
@@ -1923,6 +1957,7 @@ impl BackendTransport {
     /// plus the K4 `remote_delete` the faces declare).
     pub fn caps(&self) -> Capabilities {
         match self {
+            #[cfg(feature = "baidu")]
             BackendTransport::Baidu(t) => CloudTransport::capabilities(t.as_ref()),
             BackendTransport::Local(t) => CloudTransport::capabilities(t.as_ref()),
         }
@@ -1935,6 +1970,7 @@ impl BackendTransport {
     /// sync task anyway — [`is_sync_supported`]).
     pub fn sync_namespace_key(&self) -> String {
         match self {
+            #[cfg(feature = "baidu")]
             BackendTransport::Baidu(_) => self.volume().to_string(),
             BackendTransport::Local(t) => namespace_key_for(&NamespaceIdentity::Local {
                 root: &t.driver().root_path().to_string_lossy(),
@@ -1947,6 +1983,7 @@ impl BackendTransport {
     /// stays usable).
     pub fn clone_dyn(&self) -> Arc<dyn CloudTransport> {
         match self {
+            #[cfg(feature = "baidu")]
             BackendTransport::Baidu(t) => t.clone() as Arc<dyn CloudTransport>,
             BackendTransport::Local(t) => t.clone() as Arc<dyn CloudTransport>,
         }
@@ -1961,6 +1998,7 @@ impl BackendTransport {
     /// the boot.
     pub async fn web_quota_snapshot(&self) -> Option<cloudkit_web::QuotaSnapshot> {
         match self {
+            #[cfg(feature = "baidu")]
             BackendTransport::Baidu(t) => match StorageDriver::quota(t.driver()).await {
                 Ok(quota) => Some(cloudkit_web::QuotaSnapshot {
                     used: quota.used,
@@ -1990,6 +2028,10 @@ impl BackendTransport {
 /// byte (the absent `backend` key IS telegram — pre-Phase-2 configs
 /// never reach this function's error).
 pub async fn build_backend_transport(cfg: &CyDriveConfig) -> Result<BackendTransport> {
+    // With the driver: production endpoints, the K13 config write-back
+    // store and the single-volume cwd state base. Without it: the
+    // reduced twin (no driver-typed parameters exist to pass).
+    #[cfg(feature = "baidu")]
     let dispatched = build_backend_transport_with(
         cfg,
         &BaiduEndpoints::default(),
@@ -1997,10 +2039,28 @@ pub async fn build_backend_transport(cfg: &CyDriveConfig) -> Result<BackendTrans
         Path::new("."),
     )
     .await?;
+    #[cfg(not(feature = "baidu"))]
+    let dispatched = build_backend_transport_with(cfg).await?;
     if let Some(warning) = proxy_ineffective_warning(cfg) {
         tracing::warn!("{warning}");
     }
     Ok(dispatched)
+}
+
+/// The local dispatch arm, shared verbatim by both feature states of
+/// [`build_backend_transport_with`] (the local driver is an
+/// unconditional dependency until FT3).
+async fn build_local_transport(cfg: &CyDriveConfig) -> Result<BackendTransport> {
+    // validate() guarantees Some + absolute when backend=local.
+    let root = cfg.local_root.clone().unwrap_or_default();
+    let driver = ck_local::factory(&ck_local::LocalParams {
+        root: PathBuf::from(root),
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("initialising the local backend: {error}"))?;
+    Ok(BackendTransport::Local(Arc::new(
+        ck_local::LocalTransport::new(driver),
+    )))
 }
 
 /// [`build_backend_transport`] with the endpoint set, the K13
@@ -2008,7 +2068,9 @@ pub async fn build_backend_transport(cfg: &CyDriveConfig) -> Result<BackendTrans
 /// seam (loopback mock backends; a capturing store). `state_dir` is the
 /// baidu upload-session base: single-volume callers pass the cwd (`"."`,
 /// the frozen behaviour), the multi-volume dispatch passes the volume's
-/// home directory (K21).
+/// home directory (K21). Exists only with the `baidu` feature (FT2 —
+/// the injected types live in the driver).
+#[cfg(feature = "baidu")]
 pub async fn build_backend_transport_with(
     cfg: &CyDriveConfig,
     endpoints: &BaiduEndpoints,
@@ -2043,18 +2105,34 @@ pub async fn build_backend_transport_with(
                 ck_baidu::BaiduTransport::new(driver),
             )))
         }
-        Backend::Local => {
-            // validate() guarantees Some + absolute when backend=local.
-            let root = cfg.local_root.clone().unwrap_or_default();
-            let driver = ck_local::factory(&ck_local::LocalParams {
-                root: PathBuf::from(root),
-            })
-            .await
-            .map_err(|error| anyhow::anyhow!("initialising the local backend: {error}"))?;
-            Ok(BackendTransport::Local(Arc::new(
-                ck_local::LocalTransport::new(driver),
-            )))
+        Backend::Local => build_local_transport(cfg).await,
+    }
+}
+
+/// The no-driver twin (K31 / FT2): the baidu arm carries the actionable
+/// rebuild message — the binary cannot assemble a baidu transport —
+/// while the telegram arm keeps its [`build_backend_transport_with`]
+/// guidance pair and the local arm assembles unchanged (a driver-less
+/// binary still serves `backend = "local"`).
+#[cfg(not(feature = "baidu"))]
+pub async fn build_backend_transport_with(cfg: &CyDriveConfig) -> Result<BackendTransport> {
+    match cfg.backend {
+        Backend::Telegram => {
+            #[cfg(feature = "telegram")]
+            {
+                anyhow::bail!(
+                    "the telegram backend does not assemble through the backend dispatch: the run \
+                     flow connects it through its own deadline-bounded GrammersTransport path \
+                     (unchanged since pre-Phase-2); a config without the backend key is telegram"
+                )
+            }
+            #[cfg(not(feature = "telegram"))]
+            {
+                anyhow::bail!("{TELEGRAM_DRIVER_REQUIRED}")
+            }
         }
+        Backend::Baidu => anyhow::bail!("{BAIDU_DRIVER_REQUIRED}"),
+        Backend::Local => build_local_transport(cfg).await,
     }
 }
 
@@ -2071,10 +2149,16 @@ pub async fn build_backend_transport_with(
 /// missing/unparsable file means the credentials arrived via env
 /// (`CYDRIVE_BAIDU_*` outrank the file anyway — the operator owns that
 /// rotation), which the warning names.
+///
+/// Exists only with the `baidu` feature (FT2): its behavior IS the
+/// driver's [`ck_baidu::TokenStore`] seam — a binary without the driver
+/// has no token rotation to persist.
+#[cfg(feature = "baidu")]
 pub struct ConfigTokenStore {
     path: PathBuf,
 }
 
+#[cfg(feature = "baidu")]
 impl ConfigTokenStore {
     /// Targets `path` (production: `config.toml` in the cwd —
     /// [`ConfigTokenStore::default`]; tests inject a temp file).
@@ -2083,6 +2167,7 @@ impl ConfigTokenStore {
     }
 }
 
+#[cfg(feature = "baidu")]
 impl Default for ConfigTokenStore {
     fn default() -> Self {
         ConfigTokenStore {
@@ -2091,6 +2176,7 @@ impl Default for ConfigTokenStore {
     }
 }
 
+#[cfg(feature = "baidu")]
 impl ck_baidu::TokenStore for ConfigTokenStore {
     fn save_tokens(&self, access_token: &str, refresh_token: &str) {
         // Light single-file I/O on the refresh path (a few KiB) — the
@@ -2178,12 +2264,18 @@ pub enum BackendProbe {
 /// (no probe artifacts in the user's drive); it is discovered on the
 /// first upload after setup. Bounded by 45s so a dead network cannot
 /// hang an interactive doctor run.
+///
+/// Exists only with the `baidu` feature (FT2 / K31): a binary without
+/// the driver has no token to probe — doctor skips the baidu liveness
+/// leg entirely instead of reporting a fake Unreachable.
+#[cfg(feature = "baidu")]
 pub async fn baidu_backend_probe(cfg: &CyDriveConfig) -> BackendProbe {
     baidu_backend_probe_with(cfg, &BaiduEndpoints::default()).await
 }
 
 /// [`baidu_backend_probe`] with the endpoint set injected (tests point
 /// it at a loopback mock).
+#[cfg(feature = "baidu")]
 pub async fn baidu_backend_probe_with(
     cfg: &CyDriveConfig,
     endpoints: &BaiduEndpoints,
@@ -2242,6 +2334,11 @@ pub async fn baidu_backend_probe_with(
 async fn build_driver(cfg: &CyDriveConfig) -> Result<Arc<dyn StorageDriver>> {
     match cfg.backend {
         Backend::Telegram => anyhow::bail!("{TELEGRAM_REBUILD_REFUSAL}"),
+        // With the driver: the factory assembly sharing [`baidu_params`]
+        // with the transport dispatch. Without it: the actionable
+        // rebuild message (K31) — `rebuild` cannot walk a backend the
+        // binary cannot talk to.
+        #[cfg(feature = "baidu")]
         Backend::Baidu => {
             let params = baidu_params(
                 cfg,
@@ -2254,6 +2351,8 @@ async fn build_driver(cfg: &CyDriveConfig) -> Result<Arc<dyn StorageDriver>> {
                 .map_err(|error| anyhow::anyhow!("connecting the baidu backend: {error}"))?;
             Ok(driver)
         }
+        #[cfg(not(feature = "baidu"))]
+        Backend::Baidu => anyhow::bail!("{BAIDU_DRIVER_REQUIRED}"),
         Backend::Local => {
             // validate() guarantees Some + absolute when backend=local.
             let root = cfg.local_root.clone().unwrap_or_default();
