@@ -7,6 +7,22 @@
 # (keyring windows-native / sync-secret-service, winreg, ...) are covered.
 all-features = true
 
+# K38 license isolation (docs/plans/2026-09-10-phase3-winfsp.md §1): the
+# `winfsp` feature is off by default, but `all-features = true` above
+# means this check would otherwise drag the GPL-3.0 winfsp-rs bindings
+# into the graph. The two crates are excluded from the *license* graph by
+# name — deliberately both, so the exclusion is exactly as wide as the
+# GPL edge: winfsp (the bindings) and winfsp-sys (bindgen output + the
+# vendored DLL import lib). Everything they pull in (bytemuck,
+# parking_lot, paste, static_assertions, widestring, windows) stays in
+# the graph and is checked as usual; nothing else is exempted, so the
+# default tree remains MIT-only. The mechanical half of the isolation —
+# "the default feature graph contains no winfsp at all" — lives in CI
+# (.github/workflows/ci.yml, the `cargo tree --prefix none --format
+# "{lib}"` step), because a dependency edge of an *enabled* feature is
+# not something cargo-deny can assert.
+exclude = ["winfsp", "winfsp-sys"]
+
 [licenses]
 # Version of SPDX spec to use.
 version = 2

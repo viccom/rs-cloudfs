@@ -9,6 +9,7 @@ members = [
     "crates/cloudkit-platform",
     "crates/cloudkit-web",
     "crates/cloudkit-webdav",
+    "crates/cloudkit-winfsp",
     "crates/drivers/ck-telegram",
     "crates/drivers/ck-local",
     "crates/drivers/ck-baidu",

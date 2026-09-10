@@ -1,0 +1,54 @@
+[package]
+name = "cloudkit-winfsp"
+description = "WinFsp native-mount adapter over the VFS (L5; the GPL-3.0 bindings are feature-gated, K38)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+# K38 (docs/plans/2026-09-10-phase3-winfsp.md §1): OFF by default. The
+# feature pulls winfsp-rs (GPL-3.0) into the dependency graph, so the
+# default build — and every release artifact that does not opt in — stays
+# GPL-free (deny.toml MIT-only is not weakened). Only
+# `cargo build -p cloudkit-cli --features winfsp` crosses that line, and
+# that artifact is currently private to this repository.
+[features]
+winfsp = ["dep:winfsp", "dep:windows"]
+
+[dependencies]
+cloudkit-core = { path = "../cloudkit-core" }
+# tokio::runtime::Handle — the async bridge (bridge.rs). `rt` alone is
+# enough: the adapter never builds a runtime, it borrows the process one
+# (the mount assembly in WF4 owns it).
+tokio = { version = "1", features = ["rt"] }
+tracing = "0.1"
+
+# WinFsp bindings (winfsp-rs) plus the windows-rs facade it speaks.
+# Target-gated on purpose: the Linux CI leg must never even resolve
+# them, even with the feature on. Both are optional — see `[features]`.
+#
+# windows must stay on the same 0.61 line winfsp depends on, otherwise
+# the two NTSTATUS types are distinct and every error return stops
+# compiling (spike lesson 12).
+[target.'cfg(windows)'.dependencies]
+winfsp = { version = "0.13.1", optional = true }
+windows = { version = "0.61", optional = true, features = [
+    "Win32_Foundation",
+    "Win32_System_LibraryLoader",
+    "Win32_System_Registry",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+# The integration tests assemble a real Vfs (whose upload queue spawns
+# tasks) and drive the async bridge, so they need the multi-thread
+# runtime + time.
+tokio = { version = "1", features = [
+    "rt",
+    "rt-multi-thread",
+    "time",
+    "sync",
+    "macros",
+] }

@@ -27,6 +27,13 @@ default = ["telegram", "baidu", "local"]
 telegram = ["dep:ck-telegram"]
 baidu = ["dep:ck-baidu"]
 local = ["dep:ck-local"]
+# WinFsp mount backend (Phase 3, K38/K40): OFF by default and it must
+# stay out of `default` — enabling it pulls the GPL-3.0 winfsp-rs
+# bindings into the graph, and the release artifacts must stay GPL-free.
+# WF4 wires the actual `mount_backend = "winfsp"` dispatch; WF1 lands the
+# dependency edge, the feature forwarding, and build.rs' delay-load link
+# args (the shipped exe is the artifact that needs them).
+winfsp = ["dep:cloudkit-winfsp", "cloudkit-winfsp/winfsp"]
 
 [dependencies]
 anyhow = "1"
@@ -60,6 +67,9 @@ ck-baidu = { path = "../drivers/ck-baidu", optional = true }
 ck-local = { path = "../drivers/ck-local", optional = true }
 cloudkit-web = { path = "../cloudkit-web" }
 cloudkit-webdav = { path = "../cloudkit-webdav" }
+# WinFsp native mount adapter (Phase 3, L5). Optional and feature-gated
+# (K38): the default build does not resolve it, let alone link it.
+cloudkit-winfsp = { path = "../cloudkit-winfsp", optional = true }
 # Sync-lite client (Batch B4): the wire types this CLI maps onto core's
 # sync engine at runtime.
 cloudkit-sync-server = { path = "../cloudkit-sync-server" }
