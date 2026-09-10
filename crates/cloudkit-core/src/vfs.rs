@@ -992,6 +992,19 @@ impl Vfs {
         std::fs::metadata(self.cache.local_path(rel)).is_ok()
     }
 
+    /// The mirrored local cache path of `rel` — the file [`Vfs::hydrate`]
+    /// serves and [`Vfs::put_staged`] commits into.
+    ///
+    /// The write surfaces stage their bytes in a sibling of this path
+    /// before committing (the WebDAV PUT writer and the WinFsp staged
+    /// writer both do), and the WinFsp adapter holds no `CacheManager` of
+    /// its own, so this accessor is the seam that keeps the staging
+    /// sibling next to the final location without duplicating the
+    /// mirroring rules.
+    pub fn local_path(&self, rel: &RelPath) -> PathBuf {
+        self.cache.local_path(rel)
+    }
+
     /// Empties the cache of **uploaded** files (the root itself survives)
     /// and clears the `is_cached` flag on those rows only, returning the
     /// number of flags cleared. Pending uploads (`is_uploaded = 0`) keep

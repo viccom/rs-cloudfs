@@ -1,16 +1,17 @@
 //! `CloudFs` — the WinFsp `FileSystemContext` adapter.
 //!
-//! Scope of this batch (plan §3-WF1 + WF2): `get_security_by_name`,
+//! Scope of this batch (plan §3-WF1 + WF2 + WF3): `get_security_by_name`,
 //! `open`, `close`, `get_file_info`, `read_directory`, `get_volume_info`
 //! (WF1: all answered from the local SQLite rows plus the assembly-time
-//! volume snapshot — K44, zero network) and the read path (WF2: K33's
+//! volume snapshot — K44, zero network); the read path (WF2: K33's
 //! triple-gate dispatch into the bounded `open_range` window model, the
-//! zero-side-effect `flush` and the K41 handle grace period).
+//! zero-side-effect `flush` and the K41 handle grace period); and the
+//! write path plus the filesystem operations (WF3: the K43
+//! disposition→intent matrix, `create`, staged writes committed exactly
+//! once by `cleanup`, `overwrite`/`set_file_size`/`set_basic_info`,
+//! `rename`, `set_delete`, `set_volume_label`).
 //!
-//! Deliberately NOT implemented here (the trait defaults answer
-//! `STATUS_INVALID_DEVICE_REQUEST`):
-//! - **WF3** fills `write` / `create` / `cleanup` / `rename` / `set_*`
-//!   (staged commits) and `set_volume_label`;
+//! Deliberately NOT implemented here:
 //! - **WF4** owns `winfsp_init`, the host mount/unmount and the K40
 //!   WebDAV fallback; the DLL preload and mount-point rules live there,
 //!   not here.
@@ -19,25 +20,33 @@
 //! the `/`-separated rows (`RelPath`'s contract). Windows sends the names
 //! it saw in `read_directory`, so Explorer's own navigation matches, but
 //! a program typed-`\DOCS\README.TXT` miss is a `STATUS_OBJECT_NAME_NOT_FOUND`
-//! until a case-folding layer is decided (WF2/WF4 open question, not
+//! until a case-folding layer is decided (WF4 open question, not
 //! invented here).
 
 use std::collections::HashMap;
 use std::ffi::c_void;
+use std::path::Path;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::{Duration, Instant};
 // The read state is locked ACROSS an await (a window fetch runs under it,
 // so two reads of one reused handle serialize instead of interleaving
 // fills) — hence the await-aware lock, the same choice ck-baidu's token
 // refresh lock makes. Everything else here is a plain `std` mutex: the
-// enumeration buffer and the grace table are only ever held
-// synchronously.
+// enumeration buffer, the grace table, the open-time stat snapshot and
+// the staged write state are only ever held synchronously (the staged
+// writer's commit is taken OUT of its slot before the bridge blocks).
 use tokio::sync::Mutex as AsyncMutex;
 
 use cloudkit_core::database::FileRecord;
 use cloudkit_core::rel_path::RelPath;
 use cloudkit_core::vfs::{StreamSource, Vfs, VfsError};
-use windows::Win32::Foundation::{STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_NOT_FOUND};
+use windows::Win32::Foundation::{
+    STATUS_ACCESS_DENIED, STATUS_DIRECTORY_NOT_EMPTY, STATUS_INVALID_DEVICE_REQUEST,
+    STATUS_INVALID_PARAMETER, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_COLLISION,
+    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+};
+use winfsp::constants::FspCleanupFlags;
 use winfsp::filesystem::{
     DirBuffer, DirInfo, DirMarker, FileInfo, FileSecurity, FileSystemContext, OpenFileInfo,
     VolumeInfo, WideNameInfo,
@@ -47,6 +56,7 @@ use winfsp::{FspError, Result, U16CStr};
 use crate::bridge::AsyncBridge;
 use crate::error::{fsp_error, invalid_name};
 use crate::reader::{LocalReader, ReadHandle, WindowReader};
+use crate::writer::StagedWriter;
 
 /// Compat contract 6 (Python `get_available_bytes`): the virtual cloud
 /// headroom reported on top of what the rows already hold. Shared with
@@ -58,6 +68,154 @@ pub const VOLUME_HEADROOM: u64 = 10 * 1024 * 1024 * 1024 * 1024;
 /// feature surface the FSD needs).
 const FILE_ATTRIBUTE_DIRECTORY: u32 = 0x0010;
 const FILE_ATTRIBUTE_ARCHIVE: u32 = 0x0020;
+
+/// `NtCreateFile` create-option bits the FSD carries in
+/// `create_options`'s low 24 bits. Values cross-checked against
+/// `windows::Win32::Wdk::Storage::FileSystem` (the WDK module is not
+/// enabled in this crate's `windows` feature set — same reasoning as the
+/// attribute bits above) and against WinFsp's own headers.
+const FILE_DIRECTORY_FILE: u32 = 0x0000_0001;
+/// Rejected in combination with `FILE_DIRECTORY_FILE` — the FSD's kernel
+/// side does the same (`src/sys/create.c:393`); it also drives
+/// `FspFileSystemOpCreate_CollisionCheck`, which rewrites a create
+/// collision into `STATUS_FILE_IS_A_DIRECTORY` when the caller asked for
+/// a file and found a directory (the only reason that answer differs
+/// from the raw collision this adapter returns).
+const FILE_NON_DIRECTORY_FILE: u32 = 0x0000_0040;
+
+/// `create_options`'s disposition byte lives in the HIGH 8 bits — WinFsp
+/// declares it verbatim (`fsctl.h:351`: "Disposition: high 8 bits;
+/// Options: low 24 bits") and dispatches on exactly that
+/// (`src/dll/fsop.c:918`, the `FspFileSystemOpCreate` switch).
+const DISPOSITION_SHIFT: u32 = 24;
+
+/// The `CreateDisposition` the FSD asks for, in `NtCreateFile` terms
+/// (the Win32 `CreateFile` names in the comments are what the API layer
+/// above turns into these). The discriminants ARE the ABI bytes the FSD
+/// shifts into `create_options`'s high byte — `Disposition::Create as u32 == 2`
+/// is a pinned fact, not a coincidence.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum Disposition {
+    /// `FILE_SUPERSEDE` (0): replace the file — content and attributes —
+    /// or create it. Win32 `CREATE_ALWAYS`' supersede sibling.
+    Supersede = 0,
+    /// `FILE_OPEN` (1): the file must exist (Win32 `OPEN_EXISTING`, and
+    /// the first half of `TRUNCATE_EXISTING`).
+    Open = 1,
+    /// `FILE_CREATE` (2): the file must not exist (Win32 `CREATE_NEW`).
+    Create = 2,
+    /// `FILE_OPEN_IF` (3): open it, create it when absent (Win32
+    /// `OPEN_ALWAYS`).
+    OpenIf = 3,
+    /// `FILE_OVERWRITE` (4): the file must exist and its content is
+    /// replaced.
+    Overwrite = 4,
+    /// `FILE_OVERWRITE_IF` (5): overwrite it, create it when absent
+    /// (Win32 `CREATE_ALWAYS`).
+    OverwriteIf = 5,
+}
+
+impl Disposition {
+    /// Reads the disposition out of the raw `create_options`; `None` for
+    /// a byte outside the six values above — the FSD itself answers
+    /// `STATUS_INVALID_PARAMETER` for those (`fsop.c:933`), so this is a
+    /// defensive arm, not a reachable one.
+    pub fn from_create_options(create_options: u32) -> Option<Self> {
+        match (create_options >> DISPOSITION_SHIFT) & 0xff {
+            0 => Some(Self::Supersede),
+            1 => Some(Self::Open),
+            2 => Some(Self::Create),
+            3 => Some(Self::OpenIf),
+            4 => Some(Self::Overwrite),
+            5 => Some(Self::OverwriteIf),
+            _ => None,
+        }
+    }
+}
+
+/// What the caller is asking for: a file or a directory.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum CreateKind {
+    /// A regular file (the staged write path).
+    File,
+    /// A directory (a `files` row, `Vfs::create_dir`).
+    Directory,
+}
+
+/// The K43 disposition→intent table: one row per disposition, with the
+/// three decisions the adapter actually needs spelled out.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub struct CreateIntent {
+    /// File or directory.
+    pub kind: CreateKind,
+    /// The disposition this intent was derived from.
+    pub disposition: Disposition,
+    /// The name must not exist yet (an existing entry is a collision) —
+    /// `FILE_CREATE` only.
+    pub create_new: bool,
+    /// The name may be created when it does not exist (`FILE_OPEN_IF` /
+    /// `FILE_OVERWRITE_IF` / `FILE_SUPERSEDE`).
+    pub create_if_missing: bool,
+    /// The name must exist (`FILE_OPEN` / `FILE_OVERWRITE`).
+    pub must_exist: bool,
+    /// The content is replaced rather than extended in place
+    /// (`FILE_SUPERSEDE` / `FILE_OVERWRITE` / `FILE_OVERWRITE_IF`).
+    /// Windows implements this by posting a separate **Overwrite**
+    /// transaction after the create/open response said
+    /// `FILE_OVERWRITTEN` (`src/sys/create.c:1172-1228`), i.e. it lands
+    /// in [`FileSystemContext::overwrite`], never in `create`.
+    pub truncate: bool,
+}
+
+/// The K43 matrix, as a pure function of the two raw callback arguments.
+///
+/// Error contract: an unknown disposition byte is
+/// `STATUS_INVALID_PARAMETER` (WinFsp's own answer for it), and a
+/// directory request that also carries `FILE_NON_DIRECTORY_FILE` is
+/// rejected as invalid, mirroring the FSD's kernel-side check
+/// (`src/sys/create.c:393`: "if (FILE_NON_DIRECTORY_FILE && FILE_DIRECTORY_FILE) → invalid").
+///
+/// Kind determination (probed, not guessed): the FSD's kernel side
+/// clears `FILE_ATTRIBUTE_NORMAL|DIRECTORY|REPARSE_POINT` from
+/// `FileAttributes` and then sets `FILE_ATTRIBUTE_DIRECTORY` exactly when
+/// `FILE_DIRECTORY_FILE` is in `CreateOptions`
+/// (`src/sys/create.c:576-579`) — so **in `create` the two bits agree by
+/// construction** and either one is authoritative. In `open` they do not:
+/// the spike observed the same directory open arriving as `0x01004021`
+/// (directory bit set) and `0x01204000` (no directory bit at all, both
+/// disposition `FILE_OPEN`), which is why the open path resolves dir vs.
+/// file from the row and never from these bits (`open_with_read`).
+pub fn create_intent(
+    create_options: u32,
+    file_attributes: u32,
+) -> std::result::Result<CreateIntent, FspError> {
+    let disposition = Disposition::from_create_options(create_options)
+        .ok_or_else(|| FspError::from(STATUS_INVALID_PARAMETER))?;
+    let directory_bit = create_options & FILE_DIRECTORY_FILE != 0;
+    let directory_attribute = file_attributes & FILE_ATTRIBUTE_DIRECTORY != 0;
+    if directory_bit && create_options & FILE_NON_DIRECTORY_FILE != 0 {
+        return Err(STATUS_INVALID_PARAMETER.into());
+    }
+    let kind = if directory_bit || directory_attribute {
+        CreateKind::Directory
+    } else {
+        CreateKind::File
+    };
+    Ok(CreateIntent {
+        kind,
+        disposition,
+        create_new: matches!(disposition, Disposition::Create),
+        create_if_missing: matches!(
+            disposition,
+            Disposition::OpenIf | Disposition::OverwriteIf | Disposition::Supersede
+        ),
+        must_exist: matches!(disposition, Disposition::Open | Disposition::Overwrite),
+        truncate: matches!(
+            disposition,
+            Disposition::Supersede | Disposition::Overwrite | Disposition::OverwriteIf
+        ),
+    })
+}
 
 /// 100 ns ticks between the Windows epoch (1601-01-01) and the Unix
 /// epoch — the FILETIME conversion offset every Win32 consumer expects.
@@ -96,6 +254,19 @@ impl Meta {
             is_dir: true,
             size: 0,
             mtime: 0.0,
+            index_number: 0,
+        }
+    }
+
+    /// The stat of a file that exists only in its staged bytes (no row
+    /// yet): zero bytes at the create moment, index 0 — the db assigns
+    /// the real rowid at commit, and until then the handle reports the
+    /// staged length through `Handle::current_meta`.
+    pub fn staged(mtime: f64) -> Self {
+        Self {
+            is_dir: false,
+            size: 0,
+            mtime,
             index_number: 0,
         }
     }
@@ -146,21 +317,45 @@ impl DirEntry {
 }
 
 /// One open handle: what the FSD hangs off its file object between
-/// `open` and `close`.
+/// `open`/`create` and `close`.
 ///
-/// The metadata snapshot is taken at open time (K44 — `get_file_info`
-/// never re-reads the db), the read state (WF2) is the K33 dispatch
-/// result for files, and the directory enumeration buffer arrives on the
-/// first fresh `read_directory`. `DirBuffer` is interior-mutable by
-/// design (winfsp-rs hands out `&FileContext` from several threads), so
-/// the framework's shared reference is all this needs.
+/// The metadata snapshot is taken at open/create time (K44 —
+/// `get_file_info` never re-reads the db) and refreshed once a staged
+/// write commits, the read state (WF2) is the K33 dispatch result for
+/// files, the write state (WF3) is the staged commit target, and the
+/// directory enumeration buffer arrives on the first fresh
+/// `read_directory`. `DirBuffer` is interior-mutable by design
+/// (winfsp-rs hands out `&FileContext` from several threads), so the
+/// framework's shared reference is all this needs — the same reason the
+/// stat snapshot, the read slot, the write slot and the delete mark are
+/// interior-mutable too.
 pub struct Handle {
     rel: RelPath,
-    meta: Meta,
+    /// The stat snapshot every `FileInfo` renders from, refreshed after a
+    /// commit. Behind a mutex because `cleanup` (and the lazy read
+    /// acquisition) mutate it through `&self`, which is all WinFsp gives
+    /// a callback.
+    meta: Mutex<Meta>,
     /// The read state of a file handle (K41: shared with the grace table,
     /// so a reopen inside the grace window reuses the live window buffer
-    /// instead of rebuilding it). `None` for directories.
-    read: Option<Arc<AsyncMutex<ReadHandle>>>,
+    /// instead of rebuilding it). `None` for directories and for a
+    /// freshly created file (the committed bytes do not exist yet) —
+    /// `read` acquires it lazily.
+    read: Mutex<Option<Arc<AsyncMutex<ReadHandle>>>>,
+    /// The staged write state of a file handle (WF3/K43): `Some` while
+    /// uncommitted bytes are staged. Created by `create`/`overwrite` (and
+    /// lazily by the first `write`/`set_file_size` of a handle Windows
+    /// opened for writing), taken exactly once by the cleanup commit or
+    /// the delete-on-close abort. Deliberately NOT an `Arc` shared with
+    /// any table (unlike the read state): a commit is destructive and
+    /// must happen exactly once, for this handle only.
+    write: Mutex<Option<StagedWriter>>,
+    /// The delete-on-close mark (`set_delete`). Bookkeeping only: the
+    /// authority for the delete at cleanup is the FSD's own
+    /// `FspCleanupDelete` flag, which it derives from the file object's
+    /// delete disposition (`src/sys/cleanup.c:92`, `Delete = CleanupFlags & 1`) —
+    /// this mark is what `set_delete(false)` clears and what tests observe.
+    delete_pending: AtomicBool,
     /// Directory enumeration buffer, created on the first fresh
     /// `read_directory` — the only WinFsp DLL call this adapter makes
     /// (`DirBuffer`'s acquire/fill/read/delete are DLL exports, and its
@@ -176,25 +371,114 @@ impl Handle {
         &self.rel
     }
 
-    /// The stat snapshot taken at open time.
-    pub fn meta(&self) -> &Meta {
-        &self.meta
+    /// The stat snapshot taken at open time (the committed state; a
+    /// pending staged write is visible through [`Handle::current_meta`]).
+    pub fn meta(&self) -> Meta {
+        self.meta
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// The live stat: the open-time snapshot with the staged writer's
+    /// length and requested mtime applied while uncommitted bytes exist.
+    /// Every `FileInfo` a write-path callback returns comes from here, so
+    /// Explorer's copy progress sees the bytes it just wrote.
+    fn current_meta(&self) -> Meta {
+        let mut meta = self.meta();
+        if let Some(writer) = self
+            .write
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .as_ref()
+        {
+            if let Ok(len) = writer.len() {
+                meta.size = len;
+            }
+            if let Some(mtime) = writer.mtime() {
+                meta.mtime = mtime;
+            }
+        }
+        meta
+    }
+
+    /// Replaces the stat snapshot (post-commit refresh, K44's "one db
+    /// read per open" rule extended to "plus one after a commit").
+    fn set_meta(&self, meta: Meta) {
+        *self
+            .meta
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = meta;
     }
 
     /// Directory handle? (`read_directory` refuses files.)
     pub fn is_dir(&self) -> bool {
-        self.meta.is_dir
+        self.meta().is_dir
     }
 
-    /// The read state slot (files only; `read` serves through it).
-    fn read_state(&self) -> Option<&Arc<AsyncMutex<ReadHandle>>> {
-        self.read.as_ref()
+    /// The read state slot, cloned out (files only; `read` serves through
+    /// it). Cloning the `Arc` — not holding the mutex — is what lets the
+    /// read path take the async read lock without ever nesting the two
+    /// locks.
+    fn read_state(&self) -> Option<Arc<AsyncMutex<ReadHandle>>> {
+        self.read
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
+    }
+
+    /// Installs a lazily acquired read state (the `read` path's slow arm).
+    fn set_read_state(&self, read: Option<Arc<AsyncMutex<ReadHandle>>>) {
+        *self
+            .read
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner()) = read;
+    }
+
+    /// The staged write slot (WF3: `write`/`overwrite`/`set_file_size`
+    /// stage through it; `cleanup` commits from it).
+    fn write_state(&self) -> MutexGuard<'_, Option<StagedWriter>> {
+        self.write
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Installs a staged writer (the create/overwrite constructor shape).
+    fn set_write(&self, writer: StagedWriter) {
+        *self.write_state() = Some(writer);
+    }
+
+    /// Takes the staged writer out of the handle: the commit (and the
+    /// delete abort) happen exactly once because this can only succeed
+    /// once.
+    fn take_write(&self) -> Option<StagedWriter> {
+        self.write_state().take()
+    }
+
+    /// Whether uncommitted staged bytes are still owned by this handle
+    /// (`rename` refuses to move a path that has them, `delete` discards
+    /// them).
+    pub fn has_pending_write(&self) -> bool {
+        self.write_state().is_some()
+    }
+
+    /// The delete-on-close mark (`set_delete`).
+    pub fn delete_mark(&self) -> bool {
+        self.delete_pending.load(Ordering::Relaxed)
+    }
+
+    /// Sets/clears the delete-on-close mark (`set_delete`).
+    fn mark_delete(&self, pending: bool) {
+        self.delete_pending.store(pending, Ordering::Relaxed);
     }
 
     /// Destructures a closing handle: its path plus the read state the
     /// grace table takes back (WF3's cleanup reads the same two).
     fn into_grace_parts(self) -> (RelPath, Option<Arc<AsyncMutex<ReadHandle>>>) {
         let Handle { rel, read, .. } = self;
+        let read = read
+            .into_inner()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
         (rel, read)
     }
 
@@ -208,8 +492,10 @@ impl Handle {
     fn new(rel: RelPath, meta: Meta, read: Option<Arc<AsyncMutex<ReadHandle>>>) -> Self {
         Self {
             rel,
-            meta,
-            read,
+            meta: Mutex::new(meta),
+            read: Mutex::new(read),
+            write: Mutex::new(None),
+            delete_pending: AtomicBool::new(false),
             dir_buffer: Mutex::new(None),
         }
     }
@@ -292,7 +578,10 @@ impl GraceTable {
 pub struct CloudFs {
     vfs: Arc<Vfs>,
     bridge: AsyncBridge,
-    volume: VolumeSnapshot,
+    /// The volume numbers behind `get_volume_info` (K44) — behind a mutex
+    /// because `set_volume_label` renames the volume in place
+    /// (process-level, K44: the label is not persisted anywhere).
+    volume: Mutex<VolumeSnapshot>,
     /// Streaming-read window for new fetches (K34; [`crate::reader::DEFAULT_READ_WINDOW`]
     /// in production, shrinkable through [`CloudFs::with_stream_window`]).
     stream_window: u64,
@@ -340,11 +629,11 @@ impl CloudFs {
         Self {
             vfs,
             bridge: AsyncBridge::new(rt),
-            volume: VolumeSnapshot {
+            volume: Mutex::new(VolumeSnapshot {
                 total_size: used + VOLUME_HEADROOM,
                 free_size: VOLUME_HEADROOM,
                 label: label.into(),
-            },
+            }),
             stream_window: crate::reader::DEFAULT_READ_WINDOW,
             grace: Mutex::new(GraceTable::default()),
             grace_period: DEFAULT_HANDLE_GRACE,
@@ -381,9 +670,13 @@ impl CloudFs {
         &self.bridge
     }
 
-    /// The assembly-time volume snapshot behind `get_volume_info`.
-    pub fn volume(&self) -> &VolumeSnapshot {
-        &self.volume
+    /// The assembly-time volume snapshot behind `get_volume_info` (a
+    /// clone — `set_volume_label` may replace it at any time).
+    pub fn volume(&self) -> VolumeSnapshot {
+        self.volume
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone()
     }
 
     /// Lists one directory off the rows (dirs first, then name-ascending
@@ -517,6 +810,418 @@ impl CloudFs {
         };
         Ok(Arc::new(AsyncMutex::new(read)))
     }
+
+    // ------------------------------------------------------------ rows ---
+
+    /// One `files` row, or `None` (`get_security_by_name` renders the
+    /// 0-byte descriptor for absent names itself).
+    fn row(&self, rel: &RelPath) -> std::result::Result<Option<FileRecord>, FspError> {
+        self.vfs
+            .db()
+            .get_file(rel.as_str())
+            .map_err(|error| fsp_error(&VfsError::Db(error)))
+    }
+
+    /// The parent gate for a create or a rename destination.
+    ///
+    /// `Vfs::create_dir` carries this check for directories, but nothing
+    /// does for files: staging bytes for a path whose parent row does not
+    /// exist would scatter cache directories for a path that can never
+    /// commit. The root needs no row and always passes.
+    fn require_dir_parent(&self, rel: &RelPath) -> std::result::Result<(), FspError> {
+        match rel.parent() {
+            Some(parent) if !parent.is_root() => match self.row(&parent)? {
+                Some(row) if row.is_dir => Ok(()),
+                _ => Err(STATUS_OBJECT_PATH_NOT_FOUND.into()),
+            },
+            _ => Ok(()),
+        }
+    }
+
+    // -------------------------------------------------- write staging ---
+
+    /// The K43 create half, DLL-free (the callback past it only fills the
+    /// reply's `FileInfo`): the disposition matrix, then a directory row
+    /// or a staged write handle.
+    ///
+    /// A file create stages an EMPTY sibling and never seeds from
+    /// existing content, because `create` is only reached for a name that
+    /// is being created: FILE_CREATE directly, and the
+    /// OPEN_IF/OVERWRITE_IF arms only after `Open` answered
+    /// `STATUS_OBJECT_NAME_NOT_FOUND` (`src/dll/fsop.c:918-941`). An
+    /// existing name in `create` (the FILE_CREATE collision) is reported
+    /// as a collision — which the FSD may rewrite into
+    /// `STATUS_FILE_IS_A_DIRECTORY` when the caller asked for a file and
+    /// found a directory (`FspFileSystemOpCreate_CollisionCheck`).
+    /// Existing content is replaced through the separate Overwrite
+    /// transaction, never here (`src/sys/create.c:1172-1228`).
+    pub fn prepare_create(
+        &self,
+        rel: &RelPath,
+        create_options: u32,
+        file_attributes: u32,
+    ) -> std::result::Result<Handle, FspError> {
+        let intent = create_intent(create_options, file_attributes)?;
+        if self.row(rel)?.is_some() {
+            return Err(STATUS_OBJECT_NAME_COLLISION.into());
+        }
+        match intent.kind {
+            CreateKind::Directory => {
+                self.vfs
+                    .create_dir(rel)
+                    .map_err(|error| fsp_error(&error))?;
+                // `create_dir` published the row: read the real stat back
+                // (ids, mtime) instead of synthesizing one.
+                let meta = self.meta_for(rel)?;
+                Ok(Handle::new(rel.clone(), meta, None))
+            }
+            CreateKind::File => {
+                self.require_dir_parent(rel)?;
+                let writer = StagedWriter::create_empty(rel.clone(), &self.vfs.local_path(rel))
+                    .map_err(io_error)?;
+                let handle = Handle::new(rel.clone(), Meta::staged(unix_now()), None);
+                handle.set_write(writer);
+                Ok(handle)
+            }
+        }
+    }
+
+    /// The staged writer of `handle`, materialised on first use, with the
+    /// write slot's lock held for the caller.
+    ///
+    /// A handle Windows opened for writing without an overwrite
+    /// (`FILE_OPEN_IF` on an existing file, `TRUNCATE_EXISTING`, or plain
+    /// `OPEN_EXISTING` + `WriteFile`) has no writer yet: the bytes that
+    /// follow must not lose the existing content, so the staging sibling
+    /// starts as a copy of the plaintext the hydrate arm serves
+    /// (`Vfs::hydrate`; WF0's cache-first probe makes a warm file free,
+    /// and `put_staged` uploads the whole file anyway, so a partial
+    /// update needs the whole content staged regardless).
+    ///
+    /// The slot's lock is held across the hydrate call on purpose: it is
+    /// a plain `std` guard (never taken by the awaited future) and two
+    /// dispatcher threads writing one handle must not each materialise a
+    /// staging copy.
+    fn writer_slot<'a>(
+        &self,
+        handle: &'a Handle,
+    ) -> std::result::Result<MutexGuard<'a, Option<StagedWriter>>, FspError> {
+        let mut slot = handle.write_state();
+        if slot.is_none() {
+            let rel = handle.rel();
+            let source = self
+                .bridge
+                .block_on(self.vfs.hydrate(rel))
+                .map_err(|error| fsp_error(&error))?;
+            let writer =
+                StagedWriter::create_seeded(rel.clone(), &self.vfs.local_path(rel), &source)
+                    .map_err(io_error)?;
+            *slot = Some(writer);
+        }
+        Ok(slot)
+    }
+
+    /// The DLL-free half of `write`: stage `buffer` at `offset` (or at the
+    /// staged EOF when the FSD set `write_to_eof`, its `Offset == -1`
+    /// convention — `src/dll/fsop.c:1053`).
+    ///
+    /// `constrained_io` means "must not extend the file" (winfsp.h:460):
+    /// the write is clamped to the staged EOF and a shorter count is
+    /// reported, which is the short-write semantics the FSD expects.
+    pub fn write_into(
+        &self,
+        handle: &Handle,
+        buffer: &[u8],
+        offset: u64,
+        write_to_eof: bool,
+        constrained_io: bool,
+    ) -> std::result::Result<usize, FspError> {
+        if handle.is_dir() {
+            // The I/O manager never grants write access to a directory
+            // handle; this is the defensive answer, not a reachable path.
+            return Err(STATUS_INVALID_DEVICE_REQUEST.into());
+        }
+        let mut slot = self.writer_slot(handle)?;
+        let Some(writer) = slot.as_mut() else {
+            // `writer_slot` just guaranteed a writer; never reachable.
+            return Err(STATUS_INVALID_DEVICE_REQUEST.into());
+        };
+        let staged_len = writer.len().map_err(io_error)?;
+        let position = if write_to_eof { staged_len } else { offset };
+        let mut data = buffer;
+        if constrained_io {
+            let room = staged_len.saturating_sub(position);
+            if room < data.len() as u64 {
+                data = &data[..room as usize];
+            }
+        }
+        writer.write_at(position, data).map_err(io_error)
+    }
+
+    /// The DLL-free half of `overwrite` (the FSD's Overwrite transaction,
+    /// posted after every create/open whose response said
+    /// FILE_OVERWRITTEN/FILE_SUPERSEDED — `src/sys/create.c:1172-1228`):
+    /// the content is REPLACED, so nothing is seeded and any writer
+    /// already staged is discarded first. `allocation_size` is the
+    /// caller's requested length for the new content (0 in the common
+    /// CREATE_ALWAYS case) — the FSD sends the separate SetFileSize
+    /// requests for anything more precise.
+    pub fn overwrite_staged(
+        &self,
+        handle: &Handle,
+        allocation_size: u64,
+    ) -> std::result::Result<(), FspError> {
+        if handle.is_dir() {
+            return Err(STATUS_INVALID_DEVICE_REQUEST.into());
+        }
+        if let Some(staged) = handle.take_write() {
+            staged.abort();
+        }
+        let mut writer =
+            StagedWriter::create_empty(handle.rel().clone(), &self.vfs.local_path(handle.rel()))
+                .map_err(io_error)?;
+        if allocation_size > 0 {
+            writer.set_len(allocation_size).map_err(io_error)?;
+        }
+        handle.set_write(writer);
+        Ok(())
+    }
+
+    /// The DLL-free half of `set_file_size`.
+    ///
+    /// File-size sets (`set_allocation_size = false`) resize the staged
+    /// bytes exactly: a truncation to 0 rebuilds the staging sibling
+    /// empty (nothing to copy — that is Win32 `TRUNCATE_EXISTING`'s
+    /// shape), every other resize materialises the staged copy first when
+    /// the handle has none. Allocation-size sets are the hint WinFsp
+    /// documents (winfsp.h's SetFileSize rules): they never move the EOF,
+    /// so they are a no-op unless the new allocation is smaller than the
+    /// current file, in which case the file is truncated to it.
+    ///
+    /// Redundant sizes are no-ops too, so a `SetEndOfFile(same size)`
+    /// costs neither a hydrate nor a commit.
+    pub fn resize_staged(
+        &self,
+        handle: &Handle,
+        new_size: u64,
+        set_allocation_size: bool,
+    ) -> std::result::Result<(), FspError> {
+        if handle.is_dir() {
+            return Err(STATUS_INVALID_DEVICE_REQUEST.into());
+        }
+        let current = handle.current_meta().size;
+        if set_allocation_size && new_size >= current {
+            return Ok(());
+        }
+        if !set_allocation_size && new_size == current {
+            return Ok(());
+        }
+        if !set_allocation_size && new_size == 0 {
+            return self.overwrite_staged(handle, 0);
+        }
+        let mut slot = self.writer_slot(handle)?;
+        let Some(writer) = slot.as_mut() else {
+            return Err(STATUS_INVALID_DEVICE_REQUEST.into());
+        };
+        writer.set_len(new_size).map_err(io_error)
+    }
+
+    /// The `files` row's committed mtime becomes this writer's, when the
+    /// FSD asked for one (`set_basic_info`'s last-write time). A
+    /// committed row's mtime cannot be updated through this adapter:
+    /// `MetaDatabase` exposes no mtime setter and the column is
+    /// upload-owned (the same limitation the WebDAV PROPPATCH handler
+    /// documents) — accepted and dropped rather than refused, so Explorer
+    /// keeps its copy.
+    pub fn stage_mtime(&self, handle: &Handle, last_write_time: u64) {
+        let Some(mtime) = filetime_to_unix(last_write_time) else {
+            return;
+        };
+        let mut slot = handle.write_state();
+        if let Some(writer) = slot.as_mut() {
+            writer.set_mtime(mtime);
+        }
+    }
+
+    // ---------------------------------------------------------- delete ---
+
+    /// The delete gate (`CanDelete`'s job): the FSD's `SetDelete`
+    /// callback is the only reportable one — winfsp-rs 0.13 does not
+    /// expose `CanDelete`, and winfsp.h says "If both CanDelete and
+    /// SetDelete are defined, SetDelete takes precedence" — so both
+    /// `set_delete` and the cleanup delete run this.
+    ///
+    /// Refusals:
+    /// - a directory that still has children: `STATUS_DIRECTORY_NOT_EMPTY`
+    ///   (what `RemoveDirectory` reports; the WebDAV adapter's `Exists`
+    ///   for the same case);
+    /// - a **pending upload whose local copy still exists**: the shared
+    ///   adjudication (`Vfs::remove_file`, the WebDAV adapter's
+    ///   `remove_file`) — that copy is the only copy of the bytes, so
+    ///   deleting it would orphan the queued job. `VfsError::UploadPending`
+    ///   rides the K45 table to `STATUS_SHARING_VIOLATION` ("file in use").
+    ///
+    /// An absent row is deletable: a file that only exists in its staged
+    /// bytes has nothing published to delete (and its staging sibling is
+    /// discarded by the cleanup's abort).
+    pub fn can_delete(&self, rel: &RelPath) -> std::result::Result<(), FspError> {
+        let Some(row) = self.row(rel)? else {
+            return Ok(());
+        };
+        if row.is_dir {
+            let children = self
+                .vfs
+                .db()
+                .list_dir(rel.as_str())
+                .map_err(|error| fsp_error(&VfsError::Db(error)))?;
+            if !children.is_empty() {
+                return Err(STATUS_DIRECTORY_NOT_EMPTY.into());
+            }
+            return Ok(());
+        }
+        if !row.is_uploaded && self.vfs.local_copy_exists(rel) {
+            return Err(fsp_error(&VfsError::UploadPending(
+                rel.as_str().to_string(),
+            )));
+        }
+        Ok(())
+    }
+
+    /// Deletes one entry through the shared VFS seams: files go through
+    /// [`Vfs::remove_file`] (its own pending guard, the K4 remote gate,
+    /// the row and the cache copy), directories through the K4 gate
+    /// ([`Vfs::delete_remote_for_row`]) and then the row — the WebDAV
+    /// adapter's `remove_dir` shape.
+    async fn delete_entry(&self, rel: &RelPath) -> std::result::Result<(), VfsError> {
+        match self.vfs.db().get_file(rel.as_str())? {
+            None => Ok(()),
+            Some(row) if row.is_dir => {
+                self.vfs.delete_remote_for_row(rel).await?;
+                self.vfs.db().delete_file(rel.as_str())?;
+                Ok(())
+            }
+            Some(_) => self.vfs.remove_file(rel).await,
+        }
+    }
+
+    /// The delete arm of `cleanup`: best-effort, because cleanup cannot
+    /// report failure (winfsp.h). The guard runs again here — the
+    /// `set_delete` call that normally precedes it is skipped entirely by
+    /// the FILE_DELETE_ON_CLOSE shape — and a refusal keeps the file and
+    /// lands in the log.
+    ///
+    /// `file_name` is the FSD's name for the entry ("Sent only when a
+    /// Delete is requested", winfsp.h); the handle's own path is the
+    /// fallback.
+    fn delete_after_cleanup(&self, context: &Handle, file_name: Option<&U16CStr>) {
+        let rel = match file_name {
+            Some(name) => match rel_from_winfsp(name) {
+                Ok(rel) => rel,
+                Err(error) => {
+                    tracing::error!(
+                        %error,
+                        "winfsp: cleanup delete with an unrepresentable name; kept"
+                    );
+                    return;
+                }
+            },
+            None => context.rel().clone(),
+        };
+        if let Err(error) = self.can_delete(&rel) {
+            tracing::error!(
+                rel_path = %rel,
+                %error,
+                "winfsp: cleanup delete refused; the entry was kept"
+            );
+            return;
+        }
+        if let Err(error) = self.bridge.block_on(self.delete_entry(&rel)) {
+            tracing::error!(
+                rel_path = %rel,
+                %error,
+                "winfsp: cleanup delete failed; the entry was kept"
+            );
+        }
+    }
+
+    /// Moves `from` to `to`, porting the WebDAV adapter's `rename`
+    /// (`cloudkit-webdav` src/lib.rs:388-431) with the WinFsp API's
+    /// extras:
+    ///
+    /// - `from == to` is refused (the WebDAV adapter's `Forbidden`; the
+    ///   OS never posts a same-name rename);
+    /// - the destination is replaced only when the FSD says
+    ///   `replace_if_exists` (Win32 `ReplaceIfExists`) — without it an
+    ///   existing destination is `STATUS_OBJECT_NAME_COLLISION`;
+    /// - a directory on EITHER side is a collision (the WebDAV
+    ///   `FsError::Exists`), the destination's parent must exist;
+    /// - the row moves in place (`id`/chunk linkage preserved, the remote
+    ///   messages stay — no re-upload, no delete) and the cache copy
+    ///   follows (`move_tree_best_effort` for subtrees);
+    /// - **guards run before anything is mutated**: a handle with
+    ///   uncommitted staged bytes is refused (the staging sibling has no
+    ///   new name to follow), and both endpoints refuse while their bytes
+    ///   are only local — the queue resolves a job by `rel_path`
+    ///   (`upload_queue.rs:561`), so moving a pending row would orphan
+    ///   its upload, and deleting a pending destination would drop the
+    ///   only copy of the bytes. Both ride `UploadPending` →
+    ///   `STATUS_SHARING_VIOLATION`.
+    pub fn rename_entry(
+        &self,
+        handle: &Handle,
+        from: &RelPath,
+        to: &RelPath,
+        replace_if_exists: bool,
+    ) -> std::result::Result<(), FspError> {
+        if from == to {
+            return Err(STATUS_ACCESS_DENIED.into());
+        }
+        if handle.has_pending_write() {
+            return Err(fsp_error(&VfsError::UploadPending(
+                from.as_str().to_string(),
+            )));
+        }
+        let row = self
+            .row(from)?
+            .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
+        self.require_dir_parent(to)?;
+        if !row.is_uploaded && self.vfs.local_copy_exists(from) {
+            return Err(fsp_error(&VfsError::UploadPending(
+                from.as_str().to_string(),
+            )));
+        }
+        if let Some(dest) = self.row(to)? {
+            if dest.is_dir || row.is_dir {
+                return Err(STATUS_OBJECT_NAME_COLLISION.into());
+            }
+            if !replace_if_exists || (!dest.is_uploaded && self.vfs.local_copy_exists(to)) {
+                return Err(STATUS_OBJECT_NAME_COLLISION.into());
+            }
+            self.vfs
+                .db()
+                .delete_file(to.as_str())
+                .map_err(|error| fsp_error(&VfsError::Db(error)))?;
+            let dest_local = self.vfs.local_path(to);
+            if dest_local.exists() {
+                let _ = std::fs::remove_file(&dest_local);
+            }
+        }
+        self.vfs
+            .db()
+            .rename_path(from.as_str(), to.as_str())
+            .map_err(|error| fsp_error(&VfsError::Db(error)))?;
+        let from_local = self.vfs.local_path(from);
+        let to_local = self.vfs.local_path(to);
+        if row.is_dir {
+            move_tree_best_effort(&from_local, &to_local);
+        } else if from_local.exists() {
+            if let Some(parent) = to_local.parent() {
+                let _ = std::fs::create_dir_all(parent);
+            }
+            let _ = std::fs::rename(&from_local, &to_local);
+        }
+        Ok(())
+    }
 }
 
 /// Converts an FSD path (`\dir\file`, root `\`, no trailing slash on the
@@ -545,6 +1250,52 @@ pub fn unix_to_filetime(seconds: f64) -> u64 {
         return WINDOWS_EPOCH_OFFSET;
     }
     WINDOWS_EPOCH_OFFSET + (seconds * 10_000_000.0).floor() as u64
+}
+
+/// FILETIME -> Unix seconds, the inverse of [`unix_to_filetime`].
+///
+/// `None` for the FSD's "do not change" encoding (a zero time,
+/// winfsp.h's SetBasicInfo contract) and for anything before the Unix
+/// epoch — the rows have no room for a 1601 timestamp.
+pub fn filetime_to_unix(filetime: u64) -> Option<f64> {
+    let ticks = filetime.checked_sub(WINDOWS_EPOCH_OFFSET)?;
+    Some(ticks as f64 / 10_000_000.0)
+}
+
+/// Current wall-clock time as fractional Unix seconds (the timestamp
+/// source for rows this adapter commits outside the db layer).
+fn unix_now() -> f64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap_or_default()
+        .as_secs_f64()
+}
+
+/// A local I/O failure rides the K45 table as the EIO fallback class.
+fn io_error(error: std::io::Error) -> FspError {
+    fsp_error(&VfsError::Io(error))
+}
+
+/// Best-effort recursive move of a cached directory subtree (cache misses
+/// simply re-hydrate later) — the WebDAV adapter's helper, same name and
+/// semantics (`cloudkit-webdav` src/lib.rs:924).
+fn move_tree_best_effort(from: &Path, to: &Path) {
+    if !from.is_dir() {
+        return;
+    }
+    let _ = std::fs::create_dir_all(to);
+    if let Ok(entries) = std::fs::read_dir(from) {
+        for entry in entries.flatten() {
+            let source = entry.path();
+            let dest = to.join(entry.file_name());
+            if source.is_dir() {
+                move_tree_best_effort(&source, &dest);
+            } else {
+                let _ = std::fs::rename(&source, &dest);
+            }
+        }
+    }
+    let _ = std::fs::remove_dir(from);
 }
 
 /// Renders one stat block into the FSD's `FileInfo`.
@@ -620,7 +1371,25 @@ impl FileSystemContext for CloudFs {
         let handle = self.open_with_read(&rel)?;
         // The FSD uses this FileInfo for the create/open response — it
         // must be filled here, not left for a later get_file_info.
-        fill_file_info(file_info.as_mut(), handle.meta());
+        fill_file_info(file_info.as_mut(), &handle.meta());
+        Ok(handle)
+    }
+
+    fn create(
+        &self,
+        file_name: &U16CStr,
+        create_options: u32,
+        _granted_access: u32,
+        file_attributes: u32,
+        _security_descriptor: Option<&[c_void]>,
+        _allocation_size: u64,
+        _extra_buffer: Option<&[u8]>,
+        _extra_buffer_is_reparse_point: bool,
+        file_info: &mut OpenFileInfo,
+    ) -> Result<Self::FileContext> {
+        let rel = rel_from_winfsp(file_name)?;
+        let handle = self.prepare_create(&rel, create_options, file_attributes)?;
+        fill_file_info(file_info.as_mut(), &handle.current_meta());
         Ok(handle)
     }
 
@@ -633,6 +1402,10 @@ impl FileSystemContext for CloudFs {
         // bounded, so parking cannot grow without limit. Directory
         // handles have no read state, and their DirBuffer drops with the
         // handle as always (that drop is the DLL's own delete hook).
+        //
+        // A staged writer that never reached `cleanup` (WinFsp always
+        // posts one, so this is the never-reached safety net) drops with
+        // the handle and removes its staging sibling.
         let (rel, read) = context.into_grace_parts();
         let Some(read) = read else { return };
         let now = Instant::now();
@@ -642,29 +1415,199 @@ impl FileSystemContext for CloudFs {
             .park(rel, read, now + self.grace_period, now, self.grace_capacity);
     }
 
+    fn cleanup(&self, context: &Self::FileContext, file_name: Option<&U16CStr>, flags: u32) {
+        // The commit point (K41/K43). `take_write` can only succeed once,
+        // so a repeated cleanup — and any cleanup after the first — is a
+        // no-op, which IS the "commit exactly once" contract.
+        let writer = context.take_write();
+        let delete = FspCleanupFlags::FspCleanupDelete.is_flagged(flags);
+        match writer {
+            // Delete-on-close discards the staged bytes: the name is going
+            // away, there is nothing to publish.
+            Some(staged) if delete => staged.abort(),
+            Some(staged) => {
+                let mtime = staged.mtime().unwrap_or_else(unix_now);
+                match self.bridge.block_on(staged.commit(&self.vfs, mtime)) {
+                    Ok(()) => {
+                        // Refresh the snapshot: the FSD may still query
+                        // this handle before Close ("The file system must
+                        // be ready to receive additional operations until
+                        // close time" — winfsp.h's Cleanup docs).
+                        if let Ok(meta) = self.meta_for(context.rel()) {
+                            context.set_meta(meta);
+                        }
+                    }
+                    // Cleanup cannot report failure (winfsp.h: "There is
+                    // no way to report failure of this operation"), and
+                    // the writer already removed the staging sibling on a
+                    // failed commit — the log is the only trace the write
+                    // happened at all.
+                    Err(error) => tracing::error!(
+                        rel_path = %context.rel(),
+                        %error,
+                        "winfsp: staged commit failed at cleanup; the write was discarded"
+                    ),
+                }
+            }
+            None => {}
+        }
+        if delete {
+            self.delete_after_cleanup(context, file_name);
+        }
+    }
+
+    fn overwrite(
+        &self,
+        context: &Self::FileContext,
+        _file_attributes: u32,
+        _replace_file_attributes: bool,
+        allocation_size: u64,
+        _extra_buffer: Option<&[u8]>,
+        file_info: &mut FileInfo,
+    ) -> Result<()> {
+        self.overwrite_staged(context, allocation_size)?;
+        fill_file_info(file_info, &context.current_meta());
+        Ok(())
+    }
+
+    fn rename(
+        &self,
+        context: &Self::FileContext,
+        file_name: &U16CStr,
+        new_file_name: &U16CStr,
+        replace_if_exists: bool,
+    ) -> Result<()> {
+        let from = rel_from_winfsp(file_name)?;
+        let to = rel_from_winfsp(new_file_name)?;
+        self.rename_entry(context, &from, &to, replace_if_exists)
+    }
+
+    fn set_basic_info(
+        &self,
+        context: &Self::FileContext,
+        _file_attributes: u32,
+        _creation_time: u64,
+        _last_access_time: u64,
+        last_write_time: u64,
+        _last_change_time: u64,
+        file_info: &mut FileInfo,
+    ) -> Result<()> {
+        // Attributes and the other three times have no column in the rows
+        // (the Python schema carries a single mtime): accepted and
+        // dropped, the same white lie the WebDAV PROPPATCH handler tells
+        // — Explorer rolls a whole copy back when a metadata write on it
+        // fails. The last-write time is the one that lands: on the staged
+        // writer now, in the row at the commit.
+        self.stage_mtime(context, last_write_time);
+        fill_file_info(file_info, &context.current_meta());
+        Ok(())
+    }
+
+    fn set_delete(
+        &self,
+        context: &Self::FileContext,
+        file_name: &U16CStr,
+        delete_file: bool,
+    ) -> Result<()> {
+        // Never delete here (winfsp.h's SetDelete contract): mark the
+        // handle and let cleanup do it. The guard is the only status
+        // channel this path has — see `CloudFs::can_delete`.
+        let rel = rel_from_winfsp(file_name)?;
+        if !delete_file {
+            context.mark_delete(false);
+            return Ok(());
+        }
+        self.can_delete(&rel)?;
+        context.mark_delete(true);
+        Ok(())
+    }
+
+    fn set_file_size(
+        &self,
+        context: &Self::FileContext,
+        new_size: u64,
+        set_allocation_size: bool,
+        file_info: &mut FileInfo,
+    ) -> Result<()> {
+        self.resize_staged(context, new_size, set_allocation_size)?;
+        fill_file_info(file_info, &context.current_meta());
+        Ok(())
+    }
+
+    fn write(
+        &self,
+        context: &Self::FileContext,
+        buffer: &[u8],
+        offset: u64,
+        write_to_eof: bool,
+        constrained_io: bool,
+        file_info: &mut FileInfo,
+    ) -> Result<u32> {
+        let written = self.write_into(context, buffer, offset, write_to_eof, constrained_io)?;
+        // The FSD feeds this back into the file node, and Explorer's copy
+        // progress reads it: it carries the live staged length.
+        fill_file_info(file_info, &context.current_meta());
+        Ok(written.min(u32::MAX as usize) as u32)
+    }
+
+    fn set_volume_label(&self, volume_label: &U16CStr, volume_info: &mut VolumeInfo) -> Result<()> {
+        // K44: the label is process-level — this mount's own name, not a
+        // persisted volume property (no other surface of this project has
+        // one either). The rename lives in the in-memory snapshot, and
+        // winfsp-rs truncates it to 32 wide chars when rendering.
+        let label = volume_label.to_string().map_err(|_| invalid_name())?;
+        self.volume
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .label = label;
+        self.get_volume_info(volume_info)
+    }
+
     fn flush(&self, _context: Option<&Self::FileContext>, _file_info: &mut FileInfo) -> Result<()> {
         // K41, rclone's rule (`read_write.go:189-198`: "Flush can be
         // called multiple times"): Windows, players and scanners flush
-        // constantly, and the read path has nothing to persist. Success
-        // with zero side effects — no window dropped, no fetch, no state
-        // touched. WF3 hangs the write commit off cleanup/Release, never
-        // off flush.
+        // constantly, and neither the read path nor the staged write path
+        // has anything to persist — the commit belongs to cleanup/Release
+        // alone. Success with zero side effects: no window dropped, no
+        // fetch, no commit, no enqueue, no state touched.
         Ok(())
     }
 
     fn get_file_info(&self, context: &Self::FileContext, file_info: &mut FileInfo) -> Result<()> {
         // The open-time snapshot: one db read per open, none per stat —
         // Explorer's attribute polling is the hottest metadata path
-        // (K44). WF3 refreshes the snapshot after a commit.
-        fill_file_info(file_info, context.meta());
+        // (K44) — with the staged writer's live size/mtime applied while
+        // uncommitted bytes exist. The snapshot itself is refreshed once,
+        // after a commit.
+        fill_file_info(file_info, &context.current_meta());
         Ok(())
     }
 
     fn read(&self, context: &Self::FileContext, buffer: &mut [u8], offset: u64) -> Result<u32> {
-        let Some(state) = context.read_state() else {
-            // Only directory handles have no read state: `read` on a
-            // directory is a caller error, not a device failure.
+        if context.is_dir() {
+            // A directory handle has no read state: `read` on one is a
+            // caller error, not a device failure.
             return Err(STATUS_NOT_A_DIRECTORY.into());
+        }
+        // Read-your-own-writes: while bytes are staged, the staging file
+        // IS this handle's view of the file (nothing is published until
+        // the commit).
+        if let Some(writer) = context.write_state().as_ref() {
+            let filled = writer.read_at(offset, buffer).map_err(io_error)?;
+            return Ok(filled.min(u32::MAX as usize) as u32);
+        }
+        let state = match context.read_state() {
+            Some(state) => state,
+            None => {
+                // A create handle starts without a read state (there was
+                // no row to dispatch on). Acquiring it lazily is what
+                // makes a post-cleanup read on the same handle work —
+                // WF0's cache-first probe makes the just-committed copy
+                // the local arm.
+                let state = self.acquire_read(context.rel())?;
+                context.set_read_state(Some(Arc::clone(&state)));
+                state
+            }
         };
         // The dispatcher thread blocks on the read: the window fetch (or
         // the local file read) runs on the injected runtime, exactly like
@@ -712,10 +1655,11 @@ impl FileSystemContext for CloudFs {
     }
 
     fn get_volume_info(&self, out_volume_info: &mut VolumeInfo) -> Result<()> {
-        out_volume_info.total_size = self.volume.total_size;
-        out_volume_info.free_size = self.volume.free_size;
+        let volume = self.volume();
+        out_volume_info.total_size = volume.total_size;
+        out_volume_info.free_size = volume.free_size;
         // winfsp-rs truncates to 32 wide chars itself.
-        out_volume_info.set_volume_label(self.volume.label.as_str());
+        out_volume_info.set_volume_label(volume.label.as_str());
         Ok(())
     }
 }
