@@ -6,10 +6,15 @@
 //!
 //! - metadata / listings answer straight off the SQLite rows (PROPFIND
 //!   never touches the network);
-//! - reads hydrate through [`Vfs::hydrate`] (cache first, remote
-//!   download + optional decrypt second) — the remote always sees a
-//!   whole-file `open`, so Range requests slice the local cached copy
-//!   and never depend on the transport's RANGE_READ bit (R-5);
+//! - reads dispatch by the K33 triple gate (SR1): a plaintext, non-zero
+//!   row on a transport that declares RANGE_READ streams through
+//!   [`RangeFile`] — bounded `open_range` windows (K34), never a
+//!   whole-file download; every other row (encrypted / capability off /
+//!   0-byte / unlocatable) hydrates through [`Vfs::hydrate`] (cache
+//!   first, remote download + optional decrypt second), so Range
+//!   requests on a range-incapable transport still slice the local
+//!   cached copy (R-5) — pinned by the smoke test
+//!   `get_range_without_range_read_capability_still_slices`;
 //! - writes stage into a `.{name}.tmp` sibling of the cache path and
 //!   commit on `flush` — fsync, atomic rename, pending row, enqueued
 //!   upload — never reading the payload back into memory;
@@ -47,11 +52,17 @@ use tokio::io::{AsyncReadExt as _, AsyncSeekExt as _};
 use cloudkit_core::cache::CacheManager;
 use cloudkit_core::database::{DbError, FileRecord, FileUpsert, MetaDatabase};
 use cloudkit_core::rel_path::RelPath;
-use cloudkit_core::vfs::{Vfs, VfsError};
+use cloudkit_core::transport::{CloudTransport, RemoteHandle, StorageError};
+use cloudkit_core::vfs::{StreamSource, Vfs, VfsError};
 
 /// Virtual cloud headroom reported by the quota (compat contract 6:
 /// Python `get_available_bytes` = 10 TiB).
 const TEN_TB: u64 = 10 * 1024 * 1024 * 1024 * 1024;
+
+/// Streaming-read window (K34): every `open_range` asks for at most
+/// this many bytes — the baidu bounded-slice ceiling — and dav-server's
+/// 16 KiB `read_bytes` calls slice the buffered window.
+const STREAM_WINDOW: u64 = 4 * 1024 * 1024;
 
 /// The CyDrive virtual filesystem as a dav-server backend. Cheap to
 /// clone (all interior state is shared).
@@ -61,6 +72,10 @@ pub struct CyDriveFs {
     /// Cache handle over the same root as the VFS's cache, used for
     /// path math and cache-copy housekeeping.
     cache: Arc<CacheManager>,
+    /// Streaming-read window (K34); [`STREAM_WINDOW`] in production,
+    /// shrinkable so tests exercise multi-window sequences without
+    /// multi-megabyte fixtures.
+    stream_window: u64,
 }
 
 impl Clone for CyDriveFs {
@@ -69,6 +84,7 @@ impl Clone for CyDriveFs {
             vfs: Arc::clone(&self.vfs),
             db: Arc::clone(&self.db),
             cache: Arc::clone(&self.cache),
+            stream_window: self.stream_window,
         }
     }
 }
@@ -81,7 +97,16 @@ impl CyDriveFs {
             vfs,
             db,
             cache: Arc::new(cache),
+            stream_window: STREAM_WINDOW,
         }
+    }
+
+    /// Overrides the streaming-read window (a testing seam: small
+    /// windows turn multi-window read sequences observable without
+    /// multi-megabyte fixtures; production keeps [`STREAM_WINDOW`]).
+    pub fn with_stream_window(mut self, window: u64) -> Self {
+        self.stream_window = window.max(1);
+        self
     }
 
     /// Row at `rel`, or `None`.
@@ -114,23 +139,43 @@ impl DavFileSystem for CyDriveFs {
         Box::pin(async move {
             let rel = dav_to_rel(path)?;
             if options.read && !options.write {
-                // Read state: the row must be a file; hydrate then wrap.
+                // Read state: the row must be a file.
                 //
-                // R-5 capability note: Range requests never reach the
-                // transport — hydration always streams the WHOLE file
-                // through `Vfs::hydrate` (`CloudTransport::open`, never
+                // K33 dispatch (SR1): a plaintext, non-zero row on a
+                // transport that declares RANGE_READ streams through
+                // [`RangeFile`] — bounded `open_range` windows, no
+                // hydrate, no disk cache (K34). Everything else serves
+                // through the ORIGINAL whole-file hydrate path below:
+                // `StreamSource::Hydrate` (encrypted row — whole-file
+                // AEAD can never be range-sliced; capability off; 0-byte
+                // row) and every `open_read` error (the password gate's
+                // MissingPassword, an unlocatable row) — the hydrate path
+                // re-derives and surfaces the same error/semantics, so
+                // the fallback is safe for all of them. The
+                // range-incapable leg keeps R-5 behavior byte-for-byte:
+                // hydration always streams the WHOLE file through
+                // `Vfs::hydrate` (`CloudTransport::open`, never
                 // `open_range`) and dav-server then slices the local
-                // cached copy via `HydratedFile` seeks. A transport that
-                // declares no RANGE_READ therefore serves byte-identical
-                // Range behavior (interfaces §1: degrade, never a panic);
-                // pinned by the smoke test
-                // `get_range_without_range_read_capability_still_slices`.
-                // Any future remote-Range forwarding MUST first check
-                // `capabilities().range_read` and fall back to this
-                // whole-file path when the bit is off.
+                // cached copy — pinned by the smoke tests
+                // `get_range_without_range_read_capability_still_slices`
+                // and `get_range_capability_off_hydrates_without_open_range`.
                 let row = self.row(&rel)?.ok_or(FsError::NotFound)?;
                 if row.is_dir {
                     return Err(FsError::Forbidden);
+                }
+                if let Ok(StreamSource::Stream {
+                    handle,
+                    total_size,
+                    transport,
+                }) = self.vfs.open_read(&rel).await
+                {
+                    return Ok(Box::new(RangeFile::new(
+                        handle,
+                        total_size,
+                        transport,
+                        RowMetaData::from_row(&row),
+                        self.stream_window,
+                    )) as Box<dyn DavFile>);
                 }
                 let local = self.vfs.hydrate(&rel).await.map_err(vfs_err)?;
                 let file = tokio::fs::File::open(&local).await.map_err(io_err)?;
@@ -465,6 +510,193 @@ impl DavFile for HydratedFile {
     }
 }
 
+/// Read-state [`DavFile`] for the streaming path (SR1 / K33-K34): serves
+/// `read_bytes` out of bounded `open_range` windows instead of a
+/// hydrated local copy.
+///
+/// One RangeFile serves one DAV request: dav-server's GET sequence is
+/// `metadata` (Content-Length off the row, K35) → `seek(range.start)`
+/// (lazy here — position math only, no network) → a `read_bytes` loop
+/// (16 KiB per call by default) that slices the buffered window and
+/// opens the next one once the position leaves it. "Opening a window is
+/// the prefetch" (K34): there is no speculative read-ahead, and the
+/// streaming path never touches the disk cache (no is_cached probe, no
+/// eviction, no access record). Dropping the file mid-stream simply
+/// stops consuming the transport stream — a cancelled request cancels
+/// the fetch, so Drop needs no cleanup.
+///
+/// Backpressure (K34): a window is aggregated in full before its first
+/// byte is served — memory is bounded by the window size (4 MiB in
+/// production; the transport-side bounded slices keep each fetch
+/// bounded). Deeper chunk-buffering/prefetch is deliberately out of
+/// scope for this batch.
+///
+/// Error mapping for window fetches: [`StorageError::NotFound`] surfaces
+/// as [`FsError::NotFound`] (404); every other transport failure
+/// (Unauthorized / RateLimited / Unavailable / Io / ...) is
+/// [`FsError::GeneralFailure`] (500) — the table lives on
+/// [`storage_err`].
+struct RangeFile {
+    /// Remote locator (chunks-first assembly, SR0's `open_read`).
+    handle: RemoteHandle,
+    /// Authoritative total length (K35) — also the EOF read bound.
+    total_size: u64,
+    /// The VFS's transport for bounded-window `open_range` fetches.
+    transport: Arc<dyn CloudTransport>,
+    /// Row metadata for `metadata()` (Content-Length / ETag parity with
+    /// the hydrate path).
+    meta: RowMetaData,
+    /// Window size for new fetches (K34; injectable for tests through
+    /// [`CyDriveFs::with_stream_window`]).
+    window: u64,
+    /// Logical position — the single source of truth; `seek` only moves
+    /// it (and drops a window that no longer covers the target).
+    pos: u64,
+    /// The current window buffer, if any: the logical bytes
+    /// `[start, start + data.len())`. `consumed` is derived
+    /// (`pos - start`) so it can never desync from the position.
+    buf: Option<Window>,
+}
+
+/// One aggregated `open_range` window.
+struct Window {
+    /// Logical offset of `data[0]`.
+    start: u64,
+    /// Window bytes (`data.len()` ≤ the configured window size).
+    data: Bytes,
+}
+
+impl std::fmt::Debug for RangeFile {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("RangeFile")
+            .field("total_size", &self.total_size)
+            .field("pos", &self.pos)
+            .field("window", &self.window)
+            .finish_non_exhaustive()
+    }
+}
+
+impl RangeFile {
+    fn new(
+        handle: RemoteHandle,
+        total_size: u64,
+        transport: Arc<dyn CloudTransport>,
+        meta: RowMetaData,
+        window: u64,
+    ) -> Self {
+        Self {
+            handle,
+            total_size,
+            transport,
+            meta,
+            // A 0-byte window could never make progress.
+            window: window.max(1),
+            pos: 0,
+            buf: None,
+        }
+    }
+
+    /// Whether the current window already covers `p` with at least one
+    /// unread byte.
+    fn covers(&self, p: u64) -> bool {
+        match &self.buf {
+            Some(w) => p >= w.start && p - w.start < w.data.len() as u64,
+            None => false,
+        }
+    }
+
+    /// Fetches `[pos, pos + window)` (clamped to EOF) into the buffer,
+    /// replacing whatever window was there.
+    async fn fill_window(&mut self) -> FsResult<()> {
+        let len = self.window.min(self.total_size - self.pos);
+        let mut stream = self
+            .transport
+            .open_range(&self.handle, self.pos, len)
+            .await
+            .map_err(storage_err)?;
+        let mut data = Vec::with_capacity(len as usize);
+        // Aggregate the whole bounded window before serving any of it
+        // (K34's deliberate backpressure shape).
+        while let Some(frame) = stream.next().await {
+            data.extend_from_slice(&frame.map_err(storage_err)?);
+        }
+        self.buf = Some(Window {
+            start: self.pos,
+            data: Bytes::from(data),
+        });
+        Ok(())
+    }
+}
+
+impl DavFile for RangeFile {
+    fn metadata(&'_ mut self) -> FsFuture<'_, Box<dyn DavMetaData>> {
+        Box::pin(std::future::ready(Ok(
+            Box::new(self.meta.clone()) as Box<dyn DavMetaData>
+        )))
+    }
+
+    fn write_buf(&'_ mut self, _buf: Box<dyn Buf + Send>) -> FsFuture<'_, ()> {
+        Box::pin(std::future::ready(Err(FsError::Forbidden)))
+    }
+
+    fn write_bytes(&'_ mut self, _buf: Bytes) -> FsFuture<'_, ()> {
+        Box::pin(std::future::ready(Err(FsError::Forbidden)))
+    }
+
+    fn read_bytes(&'_ mut self, count: usize) -> FsFuture<'_, Bytes> {
+        Box::pin(async move {
+            if self.pos >= self.total_size {
+                // EOF signal: dav-server's GET loop stops on the empty
+                // payload.
+                return Ok(Bytes::new());
+            }
+            if !self.covers(self.pos) {
+                self.fill_window().await?;
+            }
+            let window = self.buf.as_ref().expect("window filled above");
+            let consumed = (self.pos - window.start) as usize;
+            let avail = window.data.len() - consumed;
+            // Short reads are fine (dav-server keeps reading); never
+            // serve past EOF even if a backend over-delivers a window.
+            let n = count.min(avail).min((self.total_size - self.pos) as usize);
+            let out = window.data.slice(consumed..consumed + n);
+            self.pos += n as u64;
+            Ok(out)
+        })
+    }
+
+    fn seek(&'_ mut self, pos: std::io::SeekFrom) -> FsFuture<'_, u64> {
+        Box::pin(async move {
+            // Lazy seek (K34): position math only, std::io semantics —
+            // Start(n) / Current(d) / End(d) against total_size. A
+            // negative target is an error (dav-server turns seek errors
+            // into 416s) and leaves the position untouched.
+            let base = match pos {
+                std::io::SeekFrom::Start(n) => n as i128,
+                std::io::SeekFrom::Current(d) => self.pos as i128 + d as i128,
+                std::io::SeekFrom::End(d) => self.total_size as i128 + d as i128,
+            };
+            let new_pos = match u64::try_from(base) {
+                Ok(p) => p,
+                Err(_) => return Err(FsError::GeneralFailure),
+            };
+            // Same-position repeats are a pure no-op (dav-server seeks
+            // before every range body — the repeat must stay free); a
+            // window that no longer covers the target is dropped and the
+            // next read reopens one AT the target.
+            if !self.covers(new_pos) {
+                self.buf = None;
+            }
+            self.pos = new_pos;
+            Ok(new_pos)
+        })
+    }
+
+    fn flush(&'_ mut self) -> FsFuture<'_, ()> {
+        Box::pin(std::future::ready(Ok(())))
+    }
+}
+
 /// Write-state [`DavFile`] (PUT): a `.{name}.tmp` sibling of the final
 /// cache path. `flush` is the PUT completion point — fsync, hand the
 /// staged file to [`Vfs::put_staged`] (atomic rename + pending row +
@@ -755,4 +987,61 @@ fn io_err(error: std::io::Error) -> FsError {
 
 fn db_err(_error: DbError) -> FsError {
     FsError::GeneralFailure
+}
+
+/// Maps a streaming window-fetch failure onto the DAV error surface
+/// (SR1 / [`RangeFile`]):
+///
+/// | `StorageError`                          | `FsError`        | DAV |
+/// |-----------------------------------------|------------------|-----|
+/// | `NotFound`                              | `NotFound`       | 404 |
+/// | `Unauthorized` / `RateLimited` /        | `GeneralFailure` | 500 |
+/// | `QuotaExceeded` / `Invalid` /           |                  |     |
+/// | `Unsupported` / `Io` / `Unavailable`    |                  |     |
+///
+/// Only NotFound has a more precise DAV code; the rest are
+/// transport-level failures this layer cannot translate more finely
+/// (the status text keeps them distinguishable server-side).
+fn storage_err(error: StorageError) -> FsError {
+    match error {
+        StorageError::NotFound => FsError::NotFound,
+        _ => FsError::GeneralFailure,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// The SR1 mapping table: NotFound keeps its 404; every other
+    /// transport failure lands on GeneralFailure (500).
+    #[test]
+    fn storage_error_mapping_table() {
+        assert_eq!(storage_err(StorageError::NotFound), FsError::NotFound);
+        assert_eq!(
+            storage_err(StorageError::Unauthorized { recoverable: true }),
+            FsError::GeneralFailure
+        );
+        assert_eq!(
+            storage_err(StorageError::RateLimited { retry_after: None }),
+            FsError::GeneralFailure
+        );
+        assert_eq!(
+            storage_err(StorageError::QuotaExceeded),
+            FsError::GeneralFailure
+        );
+        assert_eq!(storage_err(StorageError::Invalid), FsError::GeneralFailure);
+        assert_eq!(
+            storage_err(StorageError::Unsupported),
+            FsError::GeneralFailure
+        );
+        assert_eq!(
+            storage_err(StorageError::Io("read".into())),
+            FsError::GeneralFailure
+        );
+        assert_eq!(
+            storage_err(StorageError::Unavailable("dlink expired".into())),
+            FsError::GeneralFailure
+        );
+    }
 }

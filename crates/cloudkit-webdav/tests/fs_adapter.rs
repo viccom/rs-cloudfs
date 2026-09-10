@@ -509,6 +509,332 @@ async fn open_read_rejects_missing_and_dir() {
     assert_eq!(err, FsError::Forbidden);
 }
 
+/// Deterministic content pattern for the streaming tests (period 251
+/// keeps byte values distinct across the small fixtures used here).
+fn pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+/// 6a. SR1 streaming reads: with the transport's RANGE_READ bit on (the
+///     mock's default face) a plaintext uploaded row opens as a
+///     RangeFile — sequential reads reassemble the file through bounded
+///     `open_range` windows (never a whole-file `open`), the last window
+///     clamped to the row size.
+#[tokio::test]
+async fn open_read_streams_sequential_reads_through_bounded_windows() {
+    let (_dir, db, _cache_root, mock, _vfs, fs) = test_env(u64::MAX).await;
+    let content = pattern(300);
+    seed_remote_file(&db, &mock, "/stream.bin", &content, 64).await;
+    let fs = fs.with_stream_window(64);
+
+    let mut file = fs
+        .open(&DavPath::new("/stream.bin").expect("path"), read_options())
+        .await
+        .expect("open for read");
+    let meta = file.metadata().await.expect("file metadata");
+    assert_eq!(meta.len(), 300, "metadata carries the row size (K35)");
+
+    let mut read_back = Vec::new();
+    loop {
+        let frame = file.read_bytes(7).await.expect("read frame");
+        if frame.is_empty() {
+            break;
+        }
+        read_back.extend_from_slice(&frame);
+    }
+    assert_eq!(read_back, content, "windowed reads reassemble the file");
+    assert!(
+        mock.open_calls().is_empty(),
+        "the streaming path never asks for a whole-file open"
+    );
+    assert_eq!(
+        mock.open_range_calls(),
+        vec![(0, 64), (64, 64), (128, 64), (192, 64), (256, 44)],
+        "bounded windows in sequence, the last clamped to EOF"
+    );
+}
+
+/// 6b. SR1 streaming reads: seeks are lazy (never touch the transport),
+///     a seek outside the current window drops it and the next read
+///     opens a window AT the target position (K34: windows anchor at
+///     the read position, not at fixed boundaries), a read spanning the
+///     window edge shortens at the edge, and repeated same-position
+///     seeks open no new window (dav-server seeks before every range
+///     body — the repeat must stay free).
+#[tokio::test]
+async fn open_read_lazy_seek_crosses_and_reuses_windows() {
+    let (_dir, db, _cache_root, mock, _vfs, fs) = test_env(u64::MAX).await;
+    let content = pattern(300);
+    seed_remote_file(&db, &mock, "/stream.bin", &content, 64).await;
+    let fs = fs.with_stream_window(64);
+
+    let mut file = fs
+        .open(&DavPath::new("/stream.bin").expect("path"), read_options())
+        .await
+        .expect("open for read");
+    assert_eq!(
+        file.read_bytes(10).await.expect("read at 0"),
+        content[..10],
+        "first read opens the window [0, 64)"
+    );
+    // A read spanning the window edge shortens at the edge (short reads
+    // are legal DavFile semantics); the next read opens the next window
+    // at its own position.
+    assert_eq!(
+        file.seek(std::io::SeekFrom::Start(60)).await.expect("seek"),
+        60
+    );
+    assert_eq!(
+        file.read_bytes(8).await.expect("edge-spanning read"),
+        content[60..64],
+        "short read at the window edge"
+    );
+    assert_eq!(
+        file.read_bytes(8).await.expect("continuation read"),
+        content[64..72],
+        "the next window continues the stream"
+    );
+    // A seek outside the window drops it; the read refetches AT the
+    // target position (K34's position-anchored windows).
+    assert_eq!(
+        file.seek(std::io::SeekFrom::Start(200))
+            .await
+            .expect("seek"),
+        200
+    );
+    assert_eq!(
+        file.read_bytes(10).await.expect("read at 200"),
+        content[200..210],
+        "the window reopens at the seek target"
+    );
+    assert_eq!(
+        file.seek(std::io::SeekFrom::Start(5)).await.expect("seek"),
+        5
+    );
+    assert_eq!(
+        file.read_bytes(10).await.expect("read at 5"),
+        content[5..15],
+        "seeking back reopens an earlier region"
+    );
+    assert_eq!(
+        mock.open_range_calls(),
+        vec![(0, 64), (64, 64), (200, 64), (5, 64)],
+        "window sequence: initial, edge continuation, forward seek, back seek"
+    );
+    assert!(mock.open_calls().is_empty());
+
+    // Repeated same-position and in-window seeks stay free: the position
+    // sits inside the current window [5, 69), so no fetch happens.
+    let calls_before = mock.open_range_calls().len();
+    assert_eq!(
+        file.seek(std::io::SeekFrom::Current(10))
+            .await
+            .expect("current-relative seek"),
+        25,
+        "Current math off the live position"
+    );
+    file.seek(std::io::SeekFrom::Start(25))
+        .await
+        .expect("repeated seek to the same position");
+    assert_eq!(
+        file.read_bytes(5).await.expect("read after repeats"),
+        content[25..30]
+    );
+    assert_eq!(
+        mock.open_range_calls().len(),
+        calls_before,
+        "same-position seeks and in-window reads open no new window"
+    );
+}
+
+/// 6c. SR1 streaming reads: `SeekFrom::End` math, EOF and past-EOF reads
+///     answer empty without touching the transport, and a seek that
+///     would land before byte 0 is an error (dav-server turns seek
+///     errors into 416s).
+#[tokio::test]
+async fn open_read_seek_eof_and_negative_semantics() {
+    let (_dir, db, _cache_root, mock, _vfs, fs) = test_env(u64::MAX).await;
+    let content = pattern(300);
+    seed_remote_file(&db, &mock, "/stream.bin", &content, 64).await;
+    let fs = fs.with_stream_window(64);
+
+    let mut file = fs
+        .open(&DavPath::new("/stream.bin").expect("path"), read_options())
+        .await
+        .expect("open for read");
+    assert_eq!(
+        file.seek(std::io::SeekFrom::End(0))
+            .await
+            .expect("seek EOF"),
+        300
+    );
+    assert!(
+        file.read_bytes(10).await.expect("read at EOF").is_empty(),
+        "reads at EOF return empty"
+    );
+    assert!(
+        mock.open_range_calls().is_empty(),
+        "an EOF read opens no window"
+    );
+    assert_eq!(
+        file.seek(std::io::SeekFrom::End(-5))
+            .await
+            .expect("seek EOF-5"),
+        295
+    );
+    assert_eq!(
+        file.read_bytes(100).await.expect("EOF-clamped read"),
+        content[295..],
+        "the last window clamps to the file end"
+    );
+    assert_eq!(
+        mock.open_range_calls(),
+        vec![(295, 5)],
+        "EOF-relative reads still use bounded windows"
+    );
+    // Past EOF is a legal position; reads there stay empty and free.
+    assert_eq!(
+        file.seek(std::io::SeekFrom::Start(400))
+            .await
+            .expect("seek past EOF"),
+        400
+    );
+    assert!(file.read_bytes(10).await.expect("read past EOF").is_empty());
+    // A negative target (before byte 0) is an error, and the failed
+    // seek leaves the position untouched.
+    assert_eq!(
+        file.seek(std::io::SeekFrom::Current(-1000))
+            .await
+            .expect_err("negative target"),
+        FsError::GeneralFailure
+    );
+    assert_eq!(
+        file.seek(std::io::SeekFrom::Current(4))
+            .await
+            .expect("current-relative seek after the failure"),
+        404,
+        "the refused seek did not move the position"
+    );
+    assert!(
+        mock.open_calls().is_empty(),
+        "seek math never triggers a whole-file open"
+    );
+}
+
+/// 6d. SR1 dispatch fallbacks (R-5 legs at the adapter): a 0-byte row
+///     and a pending-upload row (bytes only local) serve through the
+///     hydrate path — the transport sees neither `open` nor
+///     `open_range`.
+#[tokio::test]
+async fn open_read_fallback_rows_stay_on_hydrate_path() {
+    let (_dir, db, cache_root, mock, _vfs, fs) = test_env(u64::MAX).await;
+
+    // 0-byte uploaded row: hydrate materializes the empty local copy.
+    seed_row(&db, "/empty.bin", false, 0);
+    let mut file = fs
+        .open(&DavPath::new("/empty.bin").expect("path"), read_options())
+        .await
+        .expect("open 0-byte row");
+    assert!(file
+        .read_bytes(10)
+        .await
+        .expect("read 0-byte row")
+        .is_empty());
+
+    // Pending upload whose only copy is local: hydrate's cache hit
+    // serves it; open_read's handle assembly would say NotFound and the
+    // dispatch must fall back instead of surfacing it.
+    let pending = RelPath::new("/pending.bin").expect("valid rel path");
+    db.upsert_file(&FileUpsert {
+        is_uploaded: false,
+        is_cached: true,
+        ..shape_upsert(&pending, false, 10, 1_700_000_123.0)
+    })
+    .expect("seed pending row");
+    seed_local(&cache_root, "/pending.bin", b"local-only");
+    let mut file = fs
+        .open(&DavPath::new("/pending.bin").expect("path"), read_options())
+        .await
+        .expect("open pending row");
+    assert_eq!(
+        file.read_bytes(10).await.expect("read pending row"),
+        b"local-only".as_slice(),
+        "the local-only copy serves the read"
+    );
+
+    assert!(
+        mock.open_range_calls().is_empty(),
+        "fallback rows never stream"
+    );
+    assert!(
+        mock.open_calls().is_empty(),
+        "neither fallback leg reached a whole-file download"
+    );
+}
+
+/// 6e. SR1 dispatch: an encrypted row never streams even with RANGE_READ
+///     on — `open_read` answers Hydrate and hydrate's password gate
+///     refuses before any transport call (Forbidden, R-5).
+#[tokio::test]
+async fn open_read_encrypted_row_without_password_is_forbidden() {
+    let (_dir, db, _cache_root, mock, _vfs, fs) = test_env(u64::MAX).await;
+    let rel = RelPath::new("/secret.bin").expect("valid rel path");
+    db.upsert_file(&FileUpsert {
+        telegram_msg_id: Some(1),
+        is_encrypted: true,
+        ..shape_upsert(&rel, false, 10, 1_700_000_123.0)
+    })
+    .expect("seed encrypted row");
+
+    let err = fs
+        .open(&DavPath::new("/secret.bin").expect("path"), read_options())
+        .await
+        .expect_err("encrypted row without a password");
+    assert_eq!(err, FsError::Forbidden);
+    assert!(
+        mock.open_range_calls().is_empty(),
+        "an encrypted row never streams"
+    );
+    assert!(
+        mock.open_calls().is_empty(),
+        "the password gate fires before any download work"
+    );
+}
+
+/// 6f. SR1 error mapping: a row whose remote object has vanished maps
+///     the window fetch's `StorageError::NotFound` to `FsError::NotFound`
+///     (dav-server 404); the streaming path surfaces transport
+///     failures, it never fabricates content.
+#[tokio::test]
+async fn open_read_maps_vanished_remote_to_not_found() {
+    let (_dir, db, _cache_root, mock, _vfs, fs) = test_env(u64::MAX).await;
+    let content = pattern(100);
+    let receipt = seed_remote(&mock, "/ghost.bin", &content, 2, 64).await;
+    seed_uploaded_row(&db, "/ghost.bin", &content, &receipt, 64);
+    // The remote object dies; the row stays.
+    let handle = cloudkit_core::transport::RemoteHandle {
+        first_msg_id: receipt.first_msg_id,
+        chunk_msg_ids: receipt.chunk_msg_ids.clone(),
+        total_size: content.len() as u64,
+        path: None,
+    };
+    mock.delete_remote(&handle)
+        .await
+        .expect("delete the remote object");
+
+    let mut file = fs
+        .open(&DavPath::new("/ghost.bin").expect("path"), read_options())
+        .await
+        .expect("open still resolves off the row");
+    assert_eq!(
+        file.read_bytes(10)
+            .await
+            .expect_err("the window fetch fails"),
+        FsError::NotFound,
+        "StorageError::NotFound maps to FsError::NotFound"
+    );
+}
+
 /// 7. open write: bytes land in a `.{name}.tmp` staging sibling, flush
 ///    commits them — pending row, atomic rename onto the cache path, no
 ///    `.tmp` residue — and the drained queue uploads to the mock remote.

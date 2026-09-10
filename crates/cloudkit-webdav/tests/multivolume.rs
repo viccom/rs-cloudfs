@@ -24,9 +24,10 @@ use tokio::net::TcpStream;
 use tokio::time::sleep;
 
 use cloudkit_core::cache::CacheManager;
-use cloudkit_core::database::MetaDatabase;
+use cloudkit_core::database::{FileUpsert, MetaDatabase};
+use cloudkit_core::rel_path::RelPath;
 use cloudkit_core::transport::mock::MockTransport;
-use cloudkit_core::transport::CloudTransport;
+use cloudkit_core::transport::{CloudTransport, UploadJob};
 use cloudkit_core::upload_queue::RetryPolicy;
 use cloudkit_core::vfs::{Vfs, VfsConfig};
 use cloudkit_webdav::{CyDriveFs, WebDavServer};
@@ -191,6 +192,20 @@ fn status_of(resp: &str) -> u16 {
         .expect("status code token")
         .parse()
         .expect("numeric status code")
+}
+
+/// Case-insensitive header lookup (headers end at the first empty line).
+fn header_of<'a>(resp: &'a str, name: &str) -> Option<&'a str> {
+    resp.lines().take_while(|l| !l.is_empty()).find_map(|l| {
+        let (key, value) = l.split_once(':')?;
+        key.trim().eq_ignore_ascii_case(name).then(|| value.trim())
+    })
+}
+
+/// The response body (everything after the blank line; `Connection:
+/// close` framing serves it till EOF).
+fn body_of(resp: &str) -> &str {
+    resp.split_once("\r\n\r\n").map_or("", |(_, body)| body)
 }
 
 /// A `Depth: 1` PROPFIND (the `Connection: close` shape).
@@ -422,6 +437,94 @@ async fn the_volume_prefix_never_reaches_the_transport() {
         mock_b.upload_calls().is_empty(),
         "volume b's transport must stay untouched"
     );
+}
+
+/// SR1 regression: a Range GET under the `/vol` prefix serves the exact
+/// 206 slice through the streaming path — the volume's transport sees
+/// one bounded `open_range` window (never a whole-file `open`) and the
+/// other volume stays untouched (RangeFile works behind the prefix
+/// router).
+#[tokio::test]
+async fn volume_get_range_streams_bounded_window() {
+    let vol_a = volume_env().await;
+    let vol_b = volume_env().await;
+    let server = serve_two(vol_a.fs.clone(), vol_b.fs.clone()).await;
+    let addr = server.local_addr();
+
+    // Remote bytes + uploaded row in volume a (single-message row: the
+    // handle falls back to the row's telegram_msg_id).
+    let scratch = tempfile::tempdir().expect("seed scratch dir");
+    let rel = RelPath::new("/stream.txt").expect("valid rel path");
+    let local_path = scratch.path().join("stream.txt");
+    std::fs::write(&local_path, b"hello world").expect("write seed file");
+    let receipt = vol_a
+        .mock
+        .upload(&UploadJob {
+            rel_path: rel.clone(),
+            local_path,
+            size: 11,
+            chunk_count: 1,
+            chunk_size: 64,
+        })
+        .await
+        .expect("seed upload to volume a's remote");
+    vol_a
+        .db
+        .upsert_file(&FileUpsert {
+            rel_path: rel.as_str().to_string(),
+            name: rel.name().to_string(),
+            parent_dir: "/".to_string(),
+            size: 11,
+            mtime: 1_700_000_000.0,
+            sha256: None,
+            is_dir: false,
+            telegram_msg_id: Some(receipt.first_msg_id),
+            is_uploaded: true,
+            is_cached: false,
+            is_encrypted: false,
+            chunk_count: 1,
+            mime_type: None,
+        })
+        .expect("seed files row in volume a");
+
+    let resp = send(
+        addr,
+        &request(
+            "GET",
+            "/vol/a/stream.txt",
+            addr,
+            &[("Range", "bytes=2-4")],
+            "",
+        ),
+    )
+    .await;
+
+    assert_eq!(status_of(&resp), 206, "partial content: {resp}");
+    assert_eq!(
+        header_of(&resp, "content-range"),
+        Some("bytes 2-4/11"),
+        "slice bounds over the row size: {resp}"
+    );
+    assert_eq!(body_of(&resp), "llo");
+    assert!(
+        vol_a.mock.open_calls().is_empty(),
+        "the streaming path never asks for a whole-file open"
+    );
+    assert_eq!(
+        vol_a.mock.open_range_calls(),
+        vec![(2, 9)],
+        "one bounded window at the range start"
+    );
+    assert!(
+        vol_b.mock.upload_calls().is_empty()
+            && vol_b.mock.open_calls().is_empty()
+            && vol_b.mock.open_range_calls().is_empty(),
+        "volume b's transport stays untouched"
+    );
+
+    server.shutdown().await;
+    vol_a.shutdown().await;
+    vol_b.shutdown().await;
 }
 
 // ------------------------------------------------------- 6. graceful stop ---
