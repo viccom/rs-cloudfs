@@ -5,9 +5,9 @@
 
 | 任务 | 内容 | 状态 | 完成情况 | 证据 |
 |---|---|---|---|---|
-| SR0 | MockTransport 观测面 + RemoteHandle helper + Vfs::open_read 接缝 | ⬜ | — | — |
-| SR1 | WebDAV RangeFile + 窗口聚合 + 三重门分派 | ⬜ | — | — |
-| SR2 | /api/download 流式 Body + 头语义 | ⬜ | — | — |
+| SR0 | MockTransport 观测面 + RemoteHandle helper + Vfs::open_read 接缝 | ✅ 完成 | commit 72879d5：open_calls/open_range_calls 观测面（connect 门拒调也记录）；HandlePolicy{Read,Delete} 集中 hydrate/delete_remote_gated 四处差异去重（语义逐字保留）；StreamSource::{Stream{handle,total_size,transport},Hydrate} + open_read 三重门（加密/能力关/0 字节→Hydrate；缺密码→MissingPassword 与 hydrate 一致）；mock capabilities 旋钮复用现有 builder 无新面 | 新测试 11（vfs_open_read 8+transport 3）；workspace 821 passed/0 failed（810 基线零漂移）；clippy/fmt clean |
+| SR1 | WebDAV RangeFile + 窗口聚合 + 三重门分派 | ✅ 完成 | commit 8a71dd1：RangeFile（Window{start,Bytes} 缓冲+pos 单事实源；seek 惰性同位 no-op；read_bytes 按需 open_range(pos,min(4MiB,total-pos)) 整窗聚合零拷贝切片；EOF 空读零网络；write Forbidden）；open 读态 K33 分派（Stream→RangeFile，Hydrate/Err→原 hydrate 路径）；storage_err 映射表（NotFound→404 其余→500）+with_stream_window 测试旋钮 | 新测试 12（fs_adapter 6/smoke 4/multivolume 1+单测 1）；workspace 833 passed/0 failed（821+12）；R-5 回退钉测试原样绿；clippy/fmt/check_layers/scan_secrets clean |
+| SR2 | /api/download 流式 Body + 头语义 | ✅ 完成 | commit cfeedc1：api_download 走 open_read 分派（Stream→流式：200/206 显式 Content-Length+Accept-Ranges+Body::from_stream 三态 RangeBody；416 基于 total_size 零远端调用；Hydrate→hydrate_download 原路径 verbatim 搬移）；回退路径 download_response 补 Accept-Ranges；MockTransport 增 OpenRangeAction 脚本面（Ok/Fail/FailAfterBytes） | 新测试 8（web_e2e 6/multivolume 1/transport_traits 1）；workspace 841 passed/0 failed（833+8）；既有 download_range_serves_206_slice 零改动兼容；clippy/fmt/check_layers/scan_secrets clean |
 | SR3 | 真机验收（PotPlayer/仪表盘/前端）+ 收口 | ⬜ | — | — |
 
 ## 批次日志
