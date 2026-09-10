@@ -721,14 +721,49 @@ impl CloudFs {
         if rel.is_root() {
             return Ok(Meta::root());
         }
-        let row = self
-            .vfs
-            .db()
-            .get_file(rel.as_str())
-            .map_err(|error| fsp_error(&VfsError::Db(error)))?;
-        row.as_ref()
+        self.resolve_row(rel)?
+            .as_ref()
             .map(Meta::from_record)
             .ok_or_else(|| STATUS_OBJECT_NAME_NOT_FOUND.into())
+    }
+
+    /// The row for `rel` under Windows case semantics: the exact
+    /// spelling first, then a case-insensitive scan of the parent's
+    /// listing. The FSD resolves names case-insensitively and may hand
+    /// the adapter another case form — rename sources notably arrive
+    /// upcased, and Win32 apps pass arbitrary spellings — so every
+    /// lookup goes through here. An ambiguous parent (two rows
+    /// differing only by case) keeps the exact-miss result rather than
+    /// guessing.
+    fn resolve_row(&self, rel: &RelPath) -> std::result::Result<Option<FileRecord>, FspError> {
+        let db = self.vfs.db();
+        if let Some(record) = db
+            .get_file(rel.as_str())
+            .map_err(|error| fsp_error(&VfsError::Db(error)))?
+        {
+            return Ok(Some(record));
+        }
+        if rel.is_root() {
+            return Ok(None);
+        }
+        let parent_dir = rel
+            .parent()
+            .map(|parent| parent.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        let entries = db
+            .list_dir(&parent_dir)
+            .map_err(|error| fsp_error(&VfsError::Db(error)))?;
+        let wanted = rel.name().to_lowercase();
+        let mut hit = None;
+        for record in entries {
+            if record.name.to_lowercase() == wanted {
+                if hit.is_some() {
+                    return Ok(None);
+                }
+                hit = Some(record);
+            }
+        }
+        Ok(hit)
     }
 
     /// Opens one path's metadata: `get_file_info` and `read_directory`
@@ -757,15 +792,26 @@ impl CloudFs {
     /// row, so the hydrate path would re-derive the same failure — an
     /// unreadable file should fail its open, not its first read.
     fn open_with_read(&self, rel: &RelPath) -> std::result::Result<Handle, FspError> {
-        let meta = self.meta_for(rel)?;
+        if rel.is_root() {
+            return Ok(Handle::new(rel.clone(), Meta::root(), None));
+        }
+        // Resolve to the canonical spelling up front (case-insensitive
+        // Windows semantics): the read state, grace key and cleanup
+        // commit all key off the handle's rel, so they must never carry
+        // a caller's case variant.
+        let record = self
+            .resolve_row(rel)?
+            .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
+        let canonical = RelPath::new(&record.rel_path).expect("db rows carry canonical rel paths");
+        let meta = Meta::from_record(&record);
         let read = if meta.is_dir {
             // Directories have no read state; their handle only ever
             // serves metadata and enumeration.
             None
         } else {
-            Some(self.acquire_read(rel)?)
+            Some(self.acquire_read(&canonical)?)
         };
-        Ok(Handle::new(rel.clone(), meta, read))
+        Ok(Handle::new(canonical, meta, read))
     }
 
     /// The read state for one file open: the parked one when the K41
@@ -816,10 +862,7 @@ impl CloudFs {
     /// One `files` row, or `None` (`get_security_by_name` renders the
     /// 0-byte descriptor for absent names itself).
     fn row(&self, rel: &RelPath) -> std::result::Result<Option<FileRecord>, FspError> {
-        self.vfs
-            .db()
-            .get_file(rel.as_str())
-            .map_err(|error| fsp_error(&VfsError::Db(error)))
+        self.resolve_row(rel)
     }
 
     /// The parent gate for a create or a rename destination.
@@ -1127,6 +1170,24 @@ impl CloudFs {
             },
             None => context.rel().clone(),
         };
+        // The FSD's delete name may be upcased (case-insensitive
+        // resolution, same as rename sources): map it onto the canonical
+        // row before the guard and the delete — `delete_entry`'s
+        // not-found arm is a deliberate silent success, so an unresolved
+        // spelling would delete nothing while reporting none of it.
+        let rel = match self.resolve_row(&rel) {
+            Ok(Some(record)) => {
+                RelPath::new(&record.rel_path).expect("db rows carry valid rel paths")
+            }
+            Ok(None) => rel,
+            Err(error) => {
+                tracing::error!(
+                    %error,
+                    "winfsp: cleanup delete lookup failed; the entry was kept"
+                );
+                return;
+            }
+        };
         if let Err(error) = self.can_delete(&rel) {
             tracing::error!(
                 rel_path = %rel,
@@ -1184,8 +1245,12 @@ impl CloudFs {
         let row = self
             .row(from)?
             .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
+        // The FSD may deliver the source upcased (case-insensitive
+        // resolution): everything downstream keys off the canonical
+        // spelling the row carries.
+        let from = RelPath::new(&row.rel_path).expect("db rows carry valid rel paths");
         self.require_dir_parent(to)?;
-        if !row.is_uploaded && self.vfs.local_copy_exists(from) {
+        if !row.is_uploaded && self.vfs.local_copy_exists(&from) {
             return Err(fsp_error(&VfsError::UploadPending(
                 from.as_str().to_string(),
             )));
@@ -1210,7 +1275,7 @@ impl CloudFs {
             .db()
             .rename_path(from.as_str(), to.as_str())
             .map_err(|error| fsp_error(&VfsError::Db(error)))?;
-        let from_local = self.vfs.local_path(from);
+        let from_local = self.vfs.local_path(&from);
         let to_local = self.vfs.local_path(to);
         if row.is_dir {
             move_tree_best_effort(&from_local, &to_local);
