@@ -16,6 +16,17 @@ path = "src/lib.rs"
 name = "cydrive"
 path = "src/main.rs"
 
+# Driver feature gates (K30, docs/plans/2026-09-09-driver-feature-gates.md):
+# the default set is all-on — byte-identical behavior to the pre-gate
+# binary. `telegram` is wired to its dependency now (FT1); `baidu` /
+# `local` are placeholders until their batches (FT2/FT3) gate the still
+# unconditional ck-baidu / ck-local dependencies.
+[features]
+default = ["telegram", "baidu", "local"]
+telegram = ["dep:ck-telegram"]
+baidu = []
+local = []
+
 [dependencies]
 anyhow = "1"
 # Implementing core's #[async_trait] SyncClient seam for the HTTP client.
@@ -27,7 +38,12 @@ cloudkit-platform = { path = "../cloudkit-platform" }
 # L2 vocab + StorageDriver face: the rebuild driver assembly types
 # (composition root may name drivers and L2 — R1 exemption).
 cloudkit-storage = { path = "../cloudkit-storage" }
-ck-telegram = { path = "../drivers/ck-telegram" }
+# The telegram driver is feature-gated (K30): `default` keeps it on, so
+# the released binary is unchanged; `--no-default-features` (or a
+# `default-features = false` build without `telegram`) produces a binary
+# that refuses telegram surfaces at runtime with the actionable rebuild
+# message (K31, `cloudkit_cli::TELEGRAM_DRIVER_REQUIRED`).
+ck-telegram = { path = "../drivers/ck-telegram", optional = true }
 # rebuild 子命令的 build_driver helper 直接调两驱动工厂（B3b 段二a
 # 最小装配；段二b dispatch 单元收编/复用——R1 组合根豁免）。
 ck-baidu = { path = "../drivers/ck-baidu" }

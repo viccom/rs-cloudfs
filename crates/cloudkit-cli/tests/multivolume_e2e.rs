@@ -17,9 +17,11 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use cloudkit_cli::control::{control_file_path, read_control_addr, send_stop};
+#[cfg(feature = "telegram")]
+use cloudkit_cli::transport_config_from;
 use cloudkit_cli::{
-    baidu_params, run_multi_with_transports, transport_config_from, volume_mount_url,
-    BaiduEndpoints, RunOptions, VolumeStatus,
+    baidu_params, run_multi_with_transports, volume_mount_url, BaiduEndpoints, RunOptions,
+    VolumeStatus,
 };
 use cloudkit_core::config::{load_volumes, CyDriveConfig, VolumeConfig};
 use cloudkit_core::database::MetaDatabase;
@@ -534,6 +536,7 @@ async fn one_control_stop_stops_every_volume() {
 /// The telegram session path follows the injected base directory (the
 /// `cwd` parameter IS the per-volume home in multi-volume mode; two
 /// different bases yield two different session files).
+#[cfg(feature = "telegram")]
 #[test]
 fn telegram_session_path_follows_the_volume_home() {
     let dir_a = tempfile::tempdir().expect("tempdir a");

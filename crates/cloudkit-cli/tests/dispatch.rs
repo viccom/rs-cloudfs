@@ -188,7 +188,9 @@ async fn local_key_builds_local_transport() {
 /// The absent `backend` key is telegram (byte-compat), and the dispatch
 /// refuses it with guidance naming the dedicated connect path — the
 /// legacy arm stays exactly where it was (main.rs's GrammersTransport
-/// block), never reassembled here.
+/// block), never reassembled here. On-feature only: without the driver
+/// the arm carries the K31 rebuild message instead (pinned below).
+#[cfg(feature = "telegram")]
 #[tokio::test]
 async fn default_config_stays_telegram_and_dispatch_refuses_with_guidance() {
     let default = CyDriveConfig::default();
@@ -205,6 +207,26 @@ async fn default_config_stays_telegram_and_dispatch_refuses_with_guidance() {
     assert!(
         message.contains("run"),
         "the refusal points at the run flow's dedicated connect path: {message}"
+    );
+}
+
+/// Off-feature pin (FT1 / K31): in a binary built without the telegram
+/// driver, the dispatch's telegram arm carries the actionable rebuild
+/// message — not the legacy run-flow guidance (the run flow cannot
+/// connect it either).
+#[cfg(not(feature = "telegram"))]
+#[tokio::test]
+async fn missing_telegram_driver_refuses_with_the_rebuild_message() {
+    let default = CyDriveConfig::default();
+    assert_eq!(default.backend, Backend::Telegram, "absent key = telegram");
+    let err = match build_backend_transport(&default).await {
+        Ok(_) => panic!("the telegram arm is not this dispatch's product"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains(cloudkit_cli::TELEGRAM_DRIVER_REQUIRED),
+        "the off-feature refusal is the K31 rebuild message: {message}"
     );
 }
 

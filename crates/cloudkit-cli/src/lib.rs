@@ -38,9 +38,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+#[cfg(feature = "telegram")]
 use ck_telegram::config::{
     TransportConfig, DEFAULT_API_HASH, DEFAULT_API_ID, DEFAULT_SESSION_STEM,
 };
+#[cfg(feature = "telegram")]
 use ck_telegram::transport::GrammersTransport;
 use cloudkit_core::cache::CacheManager;
 use cloudkit_core::config::{Backend, CyDriveConfig, VolumeConfig};
@@ -74,6 +76,15 @@ pub mod volumes;
 
 pub use keyring_store::KeyringStore;
 pub use signals::sigterm;
+
+/// The actionable message every telegram surface carries when the binary
+/// was built without the telegram driver (K31,
+/// docs/plans/2026-09-09-driver-feature-gates.md): name the rebuild
+/// command, then name the backend switch. Pinned by the off-feature test
+/// in `tests/dispatch.rs`.
+pub const TELEGRAM_DRIVER_REQUIRED: &str = "this binary was built without the telegram driver; \
+     rebuild with `cargo build --features telegram`, or set `backend = \"local\"` / \
+     `backend = \"baidu\"` in config.toml";
 
 /// Failure modes of [`connect_with_deadline`].
 #[derive(Debug, thiserror::Error)]
@@ -1418,6 +1429,11 @@ impl Stack {
 /// (Phase 2.5 / K21): single-volume callers pass the process cwd (the
 /// frozen behaviour), the multi-volume dispatch passes the volume's
 /// home directory so each volume owns its session file.
+///
+/// Exists only with the `telegram` feature: the config maps onto the
+/// driver's `TransportConfig`, so a binary without the driver has no
+/// use for it (its callers are all gated too).
+#[cfg(feature = "telegram")]
 pub fn transport_config_from(cfg: &CyDriveConfig, cwd: &Path) -> TransportConfig {
     TransportConfig {
         api_id: DEFAULT_API_ID,
@@ -1440,13 +1456,26 @@ pub fn transport_config_from(cfg: &CyDriveConfig, cwd: &Path) -> TransportConfig
 /// (review H1): a silent proxy surfaces "connect did not finish
 /// within ..." plus the [`connect_failure_hint`] diagnosis instead of
 /// hanging the subcommand without output.
+#[cfg(feature = "telegram")]
 pub async fn connect_stack(cfg: &CyDriveConfig) -> Result<Stack> {
     connect_stack_with_deadline(cfg, CONNECT_DEADLINE).await
+}
+
+/// The no-driver twin of [`connect_stack`] (K31): the one-shot data
+/// channel is telegram-only, so a binary built without the driver
+/// refuses at runtime with [`TELEGRAM_DRIVER_REQUIRED`] — the `push` /
+/// `pull` entries stay compilable (and their Vfs-level helpers fully
+/// tested) while the connect reports the actionable rebuild message.
+#[cfg(not(feature = "telegram"))]
+pub async fn connect_stack(cfg: &CyDriveConfig) -> Result<Stack> {
+    let _ = cfg;
+    anyhow::bail!("{TELEGRAM_DRIVER_REQUIRED}")
 }
 
 /// [`connect_stack`] with the connect deadline injected — the tests
 /// shrink the budget to prove the guard wins; everything else about the
 /// assembly is identical.
+#[cfg(feature = "telegram")]
 pub async fn connect_stack_with_deadline(cfg: &CyDriveConfig, deadline: Duration) -> Result<Stack> {
     let cwd = std::env::current_dir().context("resolving the working directory")?;
     let transport_config = transport_config_from(cfg, &cwd);
@@ -1469,6 +1498,15 @@ pub async fn connect_stack_with_deadline(cfg: &CyDriveConfig, deadline: Duration
         vfs_config(cfg),
     ));
     Ok(Stack { db, vfs, transport })
+}
+
+/// The no-driver twin of the deadline-injected assembly: same refusal
+/// contract as [`connect_stack`] (the deadline never comes into play —
+/// there is no connect to bound without the driver).
+#[cfg(not(feature = "telegram"))]
+pub async fn connect_stack_with_deadline(cfg: &CyDriveConfig, deadline: Duration) -> Result<Stack> {
+    let _ = (cfg, deadline);
+    anyhow::bail!("{TELEGRAM_DRIVER_REQUIRED}")
 }
 
 /// The `push` body (contract C11): stream `local` into the drive at
@@ -1978,11 +2016,24 @@ pub async fn build_backend_transport_with(
     state_dir: &Path,
 ) -> Result<BackendTransport> {
     match cfg.backend {
-        Backend::Telegram => anyhow::bail!(
-            "the telegram backend does not assemble through the backend dispatch: the run \
-             flow connects it through its own deadline-bounded GrammersTransport path \
-             (unchanged since pre-Phase-2); a config without the backend key is telegram"
-        ),
+        Backend::Telegram => {
+            // With the driver: the legacy arm's guidance — the run flow
+            // owns the connect (byte-for-byte since pre-Phase-2).
+            // Without the driver: the run flow cannot connect it either,
+            // so the arm carries the actionable rebuild message (K31).
+            #[cfg(feature = "telegram")]
+            {
+                anyhow::bail!(
+                    "the telegram backend does not assemble through the backend dispatch: the run \
+                     flow connects it through its own deadline-bounded GrammersTransport path \
+                     (unchanged since pre-Phase-2); a config without the backend key is telegram"
+                )
+            }
+            #[cfg(not(feature = "telegram"))]
+            {
+                anyhow::bail!("{TELEGRAM_DRIVER_REQUIRED}")
+            }
+        }
         Backend::Baidu => {
             let params = baidu_params(cfg, endpoints, token_store, state_dir);
             let driver = ck_baidu::factory(&params)
