@@ -26,7 +26,7 @@ L1 驱动  telegram │ baidu │ local │ (未来: 115/123/s3…)
 | Phase 1 | 百度 spike → StorageDriver 抽象落地 → 加密 v2 流式（0.8.0，617+ 测试绿，含真机冒烟两轮） | ✅ 完成 |
 | Phase 2 | ck-local + ck-baidu + 组合根接线 + 端到端硬验收（0.9.0，740 测试绿；baidu/local E2E 通过、telegram 腿待独立测试 chat） | ✅ 完成 |
 | Phase 2.5 | 多卷启用（Registry + 每实例配置 + 多盘挂载，方案一裁决） | ✅ 完成（0.10.0，810 测试绿；单进程三卷真机 E2E：local 加密 V: + tg Y: + baidu Z:，全过） |
-| Phase 3 | 115/123/多卷挂载/桌面端/自更新（择机） | ⬜ |
+| Phase 3 | WinFsp 类本地盘挂载（WF0–WF5，K38–K46）+ 115/123/桌面端/自更新（择机） | 🟨 WinFsp 挂载完成（867 测试绿；三卷真机验收七项全过，764MB 视频 open 55.4s→7-11ms；其余项择机） |
 
 阶段计划与裁决：[docs/plans/2026-09-07-cloudfusion-foundation.md](docs/plans/2026-09-07-cloudfusion-foundation.md) ｜ 历史裁决：[docs/decisions.md](docs/decisions.md)
 
