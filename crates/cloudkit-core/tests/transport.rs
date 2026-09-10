@@ -521,3 +521,79 @@ async fn upload_calls_snapshot_records_job_fields() {
     assert_eq!(calls[0].chunk_count, 1);
     assert_eq!(calls[0].chunk_size, 64);
 }
+
+/// 14. open_calls() snapshots every open() call's handle fields (the
+///     streaming-read observation face: tests assert WHICH object was
+///     requested in full).
+#[tokio::test]
+async fn open_calls_snapshot_records_handle_fields() {
+    let (_dir, path) = write_temp_file("obs.bin", b"0123456789");
+    let t = MockTransport::new();
+    t.connect().await.expect("connect");
+    let receipt = t
+        .upload(&job_for("/obs.bin", path, 10, 1, 64))
+        .await
+        .expect("upload");
+
+    let handle = RemoteHandle {
+        first_msg_id: receipt.first_msg_id,
+        chunk_msg_ids: receipt.chunk_msg_ids.clone(),
+        total_size: 10,
+        path: Some(RelPath::new("/obs.bin").unwrap()),
+    };
+    drop(t.open(&handle).await.expect("open"));
+
+    let calls = t.open_calls();
+    assert_eq!(calls.len(), 1);
+    assert_eq!(calls[0].first_msg_id, receipt.first_msg_id);
+    assert_eq!(calls[0].chunk_msg_ids, receipt.chunk_msg_ids);
+    assert_eq!(calls[0].total_size, 10);
+    assert_eq!(calls[0].path.as_ref().map(|p| p.as_str()), Some("/obs.bin"));
+    assert!(t.open_range_calls().is_empty(), "no open_range ran");
+}
+
+/// 15. open_range_calls() snapshots every window REQUEST (off, len) in
+///     call order — the pre-clamp ask, not the served slice — and full
+///     opens and windows are recorded on separate faces (a test can pin
+///     "only bounded windows, never a full open").
+#[tokio::test]
+async fn open_range_calls_snapshot_records_windows_in_order() {
+    let (_dir, path) = write_temp_file("win.bin", b"0123456789");
+    let t = MockTransport::new();
+    t.connect().await.expect("connect");
+    let receipt = t
+        .upload(&job_for("/win.bin", path, 10, 1, 64))
+        .await
+        .expect("upload");
+    let handle = handle_for(receipt.first_msg_id, 10);
+
+    drop(t.open_range(&handle, 0, 4).await.expect("first window"));
+    // Tail ask overshoots EOF (6 + 100 > 10); the recorder keeps the ask.
+    drop(t.open_range(&handle, 6, 100).await.expect("second window"));
+
+    assert_eq!(t.open_range_calls(), vec![(0, 4), (6, 100)]);
+    assert!(t.open_calls().is_empty(), "no full open ran");
+}
+
+/// 16. open/open_range record even when the connect gate rejects the
+///     call — same as upload_calls (the call HAPPENED; observability
+///     must not depend on the gate outcome).
+#[tokio::test]
+async fn open_calls_record_even_when_not_connected() {
+    let t = MockTransport::new();
+
+    assert!(
+        matches!(t.open(&handle_for(1, 7)).await, Err(StorageError::Invalid)),
+        "open before connect"
+    );
+    assert!(
+        matches!(
+            t.open_range(&handle_for(1, 7), 0, 3).await,
+            Err(StorageError::Invalid)
+        ),
+        "open_range before connect"
+    );
+
+    assert_eq!(t.open_calls().len(), 1, "unconnected open still recorded");
+    assert_eq!(t.open_range_calls(), vec![(0, 3)]);
+}

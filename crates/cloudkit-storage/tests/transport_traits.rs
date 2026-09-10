@@ -363,3 +363,67 @@ async fn handle_ids_are_i64_and_delete_remote_takes_the_handle() {
     assert_eq!(t.deleted(), vec![receipt.first_msg_id]);
     assert!(t.message(receipt.first_msg_id).is_none(), "message gone");
 }
+
+/// 11. SR2 mock face: the `open_range` script injects both failure
+///     shapes — an up-front `Fail` errors the call itself (after the
+///     window is recorded), `FailAfterBytes` serves a leading prefix as
+///     one Ok frame and then a mid-stream `Err` — and an exhausted (or
+///     absent) script serves the window normally.
+#[tokio::test]
+async fn open_range_script_pins_the_failure_faces() {
+    use cloudkit_storage::transport::mock::OpenRangeAction;
+
+    let t = MockTransport::builder()
+        .open_range_action(OpenRangeAction::Fail {
+            error: StorageError::Unavailable("scripted refusal".to_string()),
+        })
+        .open_range_action(OpenRangeAction::FailAfterBytes {
+            bytes: 3,
+            error: StorageError::Unavailable("scripted mid-stream disconnect".to_string()),
+        })
+        .build();
+    t.connect().await.expect("connect");
+    let receipt = stream_upload_bytes(&t, "/script.bin", b"0123456789").await;
+    let handle = RemoteHandle {
+        first_msg_id: receipt.first_msg_id,
+        chunk_msg_ids: receipt.chunk_msg_ids.clone(),
+        total_size: receipt.uploaded_bytes,
+        path: None,
+    };
+
+    // Call 1: the scripted refusal fails the call up front.
+    match t.open_range(&handle, 0, 10).await {
+        Err(StorageError::Unavailable(message)) => {
+            assert_eq!(message, "scripted refusal");
+        }
+        Err(other) => panic!("scripted Fail must be Unavailable, got {other:?}"),
+        Ok(_) => panic!("scripted Fail must error the call"),
+    }
+    // The window is recorded even for the refused call (the observation
+    // face must not depend on the gate/script outcome).
+    assert_eq!(t.open_range_calls(), vec![(0, 10)]);
+
+    // Call 2: the call succeeds, three prefix bytes flow, then the
+    // stream errors — the mid-stream disconnect leg.
+    let mut stream = t
+        .open_range(&handle, 2, 5)
+        .await
+        .expect("FailAfterBytes errors the stream, not the call");
+    match stream.next().await {
+        Some(Ok(frame)) => assert_eq!(&frame[..], b"234", "three leading window bytes"),
+        other => panic!("prefix frame must be Ok: {other:?}"),
+    }
+    match stream.next().await {
+        Some(Err(StorageError::Unavailable(message))) => {
+            assert_eq!(message, "scripted mid-stream disconnect");
+        }
+        other => panic!("the frame after the prefix must be Err: {other:?}"),
+    }
+
+    // Script exhausted: normal service resumes.
+    assert_eq!(
+        drain(t.open_range(&handle, 2, 5).await.expect("normal window")).await,
+        b"23456".to_vec(),
+        "an exhausted script serves the window"
+    );
+}

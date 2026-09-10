@@ -24,6 +24,6 @@ pub use cloudkit_storage::Capabilities;
 /// Shared in-memory test transport (re-exported from L2).
 pub mod mock {
     pub use cloudkit_storage::transport::mock::{
-        MockTransport, MockTransportBuilder, UploadAction,
+        MockTransport, MockTransportBuilder, OpenRangeAction, UploadAction,
     };
 }

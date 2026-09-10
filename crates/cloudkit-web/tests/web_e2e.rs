@@ -25,7 +25,7 @@ use std::time::Duration;
 use cloudkit_core::cache::CacheManager;
 use cloudkit_core::database::{FileUpsert, MetaDatabase};
 use cloudkit_core::rel_path::RelPath;
-use cloudkit_core::transport::mock::{MockTransport, UploadAction};
+use cloudkit_core::transport::mock::{MockTransport, OpenRangeAction, UploadAction};
 use cloudkit_core::transport::{CloudTransport, StorageError, UploadJob, UploadReceipt};
 use cloudkit_core::upload_queue::RetryPolicy;
 use cloudkit_core::vfs::{Vfs, VfsConfig};
@@ -1229,6 +1229,233 @@ async fn download_range_out_of_bounds_416_and_malformed_ignored() {
         assert_eq!(body_of(&resp), "payload", "full body on ignored Range");
         assert_eq!(header(&resp, "content-length"), Some("7"));
     }
+}
+
+/// 15a. SR2 streaming: a single-range GET on a streamable row answers
+///      206 straight out of one bounded `open_range` window — the mock
+///      never sees a full `open`, and the window it does see is exactly
+///      the requested slice (the transport slices further on its own;
+///      the web layer asks for the whole range).
+#[tokio::test]
+async fn download_range_streams_the_window_not_the_file() {
+    let env = test_env().await;
+    let addr = env.server.local_addr();
+    let content = ascii_pattern(100);
+    seed_remote_file(&env.db, &env.mock, "/stream.bin", &content, 64).await;
+
+    let resp = send(
+        addr,
+        &request(
+            "GET",
+            "/api/download/stream.bin",
+            addr,
+            &[("Range", "bytes=10-29")],
+            "",
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 206, "partial content: {resp}");
+    assert_eq!(header(&resp, "content-range"), Some("bytes 10-29/100"));
+    assert_eq!(header(&resp, "content-length"), Some("20"));
+    assert_eq!(header(&resp, "accept-ranges"), Some("bytes"));
+    assert_eq!(
+        header(&resp, "content-disposition"),
+        Some("inline; filename=\"stream.bin\"")
+    );
+    assert_eq!(
+        body_of(&resp),
+        String::from_utf8_lossy(&content[10..30]).into_owned(),
+        "exact slice bytes[10..=29]"
+    );
+    assert!(
+        env.mock.open_calls().is_empty(),
+        "the streaming path never asks for a full open"
+    );
+    assert_eq!(
+        env.mock.open_range_calls(),
+        vec![(10, 20)],
+        "one window: exactly the requested range"
+    );
+}
+
+/// 15b. SR2 streaming: a plain GET streams the whole file as one
+///      `(0, total)` window with an explicit Content-Length
+///      (`Body::from_stream` carries no length of its own).
+#[tokio::test]
+async fn download_without_range_streams_full_window() {
+    let env = test_env().await;
+    let addr = env.server.local_addr();
+    let content = ascii_pattern(100);
+    seed_remote_file(&env.db, &env.mock, "/stream.bin", &content, 64).await;
+
+    let resp = send(
+        addr,
+        &request("GET", "/api/download/stream.bin", addr, &[], ""),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 200, "ok: {resp}");
+    assert_eq!(header(&resp, "content-length"), Some("100"));
+    assert_eq!(header(&resp, "accept-ranges"), Some("bytes"));
+    assert_eq!(
+        body_of(&resp),
+        String::from_utf8_lossy(&content).into_owned(),
+        "full body streamed"
+    );
+    assert!(env.mock.open_calls().is_empty(), "no full open");
+    assert_eq!(
+        env.mock.open_range_calls(),
+        vec![(0, 100)],
+        "one full-length window"
+    );
+}
+
+/// 15c. SR2 streaming: an unsatisfiable Range answers 416 with the
+///      `bytes */size` Content-Range and never reaches the remote —
+///      neither a full open nor a window.
+#[tokio::test]
+async fn download_unsatisfiable_range_416_touches_no_remote() {
+    let env = test_env().await;
+    let addr = env.server.local_addr();
+    let content = ascii_pattern(100);
+    seed_remote_file(&env.db, &env.mock, "/stream.bin", &content, 64).await;
+
+    let resp = send(
+        addr,
+        &request(
+            "GET",
+            "/api/download/stream.bin",
+            addr,
+            &[("Range", "bytes=100-")],
+            "",
+        ),
+    )
+    .await;
+    assert_eq!(
+        status_of(&resp),
+        416,
+        "start == size is unsatisfiable: {resp}"
+    );
+    assert_eq!(header(&resp, "content-range"), Some("bytes */100"));
+    assert!(
+        env.mock.open_calls().is_empty() && env.mock.open_range_calls().is_empty(),
+        "the 416 is decided off the row size alone — zero remote calls"
+    );
+}
+
+/// 15d. SR2 fallback (R-5): an encrypted row never streams — the
+///      download serves through the full hydrate path, and the mock's
+///      observation face shows the contrast with 15a/15b: a full `open`,
+///      never a window.
+#[tokio::test]
+async fn download_encrypted_row_hydrates_through_full_open() {
+    let mut cfg = base_cfg();
+    cfg.encryption_password = Some("secret".to_string());
+    let env = env_with(cfg, Arc::new(MockTransport::new())).await;
+    let addr = env.server.local_addr();
+    let rel = RelPath::new("/enc.bin").expect("valid rel path");
+    env.vfs
+        .put(&rel, b"plaintext secret", 1_700_000_000.0)
+        .await
+        .expect("stage the encrypted upload");
+    // Drain the queue: the row uploads, and the successful upload drops
+    // the local plaintext copy, so the download must hydrate remotely.
+    env.vfs.shutdown().await;
+
+    let resp = send(
+        addr,
+        &request("GET", "/api/download/enc.bin", addr, &[], ""),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 200, "decrypted ok: {resp}");
+    assert_eq!(body_of(&resp), "plaintext secret", "decrypted plaintext");
+    assert_eq!(
+        env.mock.open_calls().len(),
+        1,
+        "encrypted row hydrates through one full open"
+    );
+    assert!(
+        env.mock.open_range_calls().is_empty(),
+        "encrypted row never serves through a window"
+    );
+}
+
+/// 15e. SR2 fallback: a 0-byte row (hydrate materializes the empty
+///      copy) answers 200 with an empty body — and never touches the
+///      remote at all.
+#[tokio::test]
+async fn download_zero_byte_row_hydrates_empty_200() {
+    let env = test_env().await;
+    let addr = env.server.local_addr();
+    seed_remote_file(&env.db, &env.mock, "/empty.bin", b"", 64).await;
+
+    let resp = send(
+        addr,
+        &request("GET", "/api/download/empty.bin", addr, &[], ""),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 200, "ok: {resp}");
+    assert_eq!(header(&resp, "content-length"), Some("0"));
+    assert_eq!(body_of(&resp), "", "empty body");
+    assert!(
+        env.mock.open_calls().is_empty() && env.mock.open_range_calls().is_empty(),
+        "a 0-byte row has no remote bytes to fetch"
+    );
+}
+
+/// 15f. SR2 streaming failure mode: a mid-stream transport error (the
+///      mock's `FailAfterBytes` script) truncates the body — the head
+///      and the leading bytes were already served, so HTTP cannot
+///      change the status; the connection just ends short of the
+///      promised Content-Length.
+#[tokio::test]
+async fn download_mid_stream_error_truncates_the_body() {
+    let mock = Arc::new(
+        MockTransport::builder()
+            .open_range_action(OpenRangeAction::FailAfterBytes {
+                bytes: 3,
+                error: StorageError::Unavailable("scripted mid-stream disconnect".to_string()),
+            })
+            .build(),
+    );
+    let env = env_with(base_cfg(), mock).await;
+    let addr = env.server.local_addr();
+    let content = ascii_pattern(100);
+    seed_remote_file(&env.db, &env.mock, "/stream.bin", &content, 64).await;
+
+    let resp = send(
+        addr,
+        &request("GET", "/api/download/stream.bin", addr, &[], ""),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 200, "the head was already sent: {resp}");
+    assert_eq!(
+        header(&resp, "content-length"),
+        Some("100"),
+        "the promise stands at the total"
+    );
+    // What arrives is a strict prefix of the file — 0..=3 bytes; hyper
+    // may or may not flush the buffered prefix frame before the abort,
+    // and both are the same contract: truncated, never fabricated.
+    let body = body_of(&resp);
+    assert!(
+        body.len() < 100
+            && body
+                .as_bytes()
+                .iter()
+                .zip(content.iter())
+                .all(|(got, want)| got == want),
+        "body truncated short of the promised 100 bytes (got {}), prefix-consistent",
+        body.len()
+    );
+    assert_eq!(env.mock.open_range_calls(), vec![(0, 100)]);
+    assert!(env.mock.open_calls().is_empty());
+}
+
+/// A deterministic ASCII pattern (`a`-z cycling): every byte survives
+/// the harness's String-based body decoding losslessly, unlike a binary
+/// pattern whose high bytes would round-trip through lossy UTF-8.
+fn ascii_pattern(len: usize) -> Vec<u8> {
+    (0..len).map(|index| b'a' + (index % 26) as u8).collect()
 }
 
 /// 16. GET /api/queue reports the four upload-queue counters plus the

@@ -56,6 +56,16 @@ cargo build --release --no-default-features --features local,baidu # 本地+百�
 
 缺驱动的二进制运行到对应表面时得到可行动报错（给出 rebuild 命令与 backend 改法，而非隐藏命令）；`cydrive --version` 显示本构建的驱动清单，如 `cydrive 0.10.0 (drivers: telegram, baidu, local)`，全关构建显示 `(drivers: none)`。
 
+### 流式读（视频直接播放）
+
+非加密文件 + 支持 Range 的后端（baidu/local/telegram）的读取走 **Range 直通**：请求哪段拉哪段（4MiB 窗口），不再整文件下载后才能播放——764MiB 视频首字节 <1ms、1MiB 片段 ~0.2s。生效面：WebDAV 盘符、仪表盘播放器、`/api/download` URL（可直接喂 PotPlayer/VLC）。加密文件与不支持 Range 的后端自动回退整文件模式。
+
+> Windows 挂载盘符（Z: 等）播放 >50MB 视频需一次性调整 WebClient 服务限制（机器级，rclone/alist 用户同样需要）：
+> ```
+> reg add HKLM\SYSTEM\CurrentControlSet\Services\WebClient\Parameters /v FileSizeLimitInBytes /t REG_DWORD /d 0xffffffff /f
+> net stop webclient && net start webclient
+> ```
+
 ### 多卷模式（一个进程多个存储卷，Phase 2.5）
 
 config.toml 只留进程级键 + `volumes_dir`；每卷一份 `volumes/<name>.toml`（卷名=文件名，卷内相对路径落在各自的 `volumes/<name>/` 主目录）。三卷示例（local + telegram + baidu）：

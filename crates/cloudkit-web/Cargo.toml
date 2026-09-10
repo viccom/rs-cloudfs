@@ -18,6 +18,11 @@ axum = { version = "=0.8.9", default-features = false, features = [
     "tokio",
 ] }
 cloudkit-core = { path = "../cloudkit-core" }
+# Streaming download body (SR2 / K36): Body::from_stream takes any
+# futures-core Stream, and the frames are bytes::Bytes — the same
+# lock-tree versions the transport seam already uses.
+bytes = "1"
+futures-core = "0.3"
 mime_guess = "2"
 rust-embed = "8"
 serde_json = "1"

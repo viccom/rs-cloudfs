@@ -226,6 +226,52 @@ fn map_queue_error(error: QueueError) -> VfsError {
     }
 }
 
+/// How [`Vfs::remote_handle_for`] treats a row whose id set is unusable
+/// — the read and delete sites share the assembly (chunks first / row
+/// id fallback) but differ in failure policy.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum HandlePolicy {
+    /// Read path (`hydrate`, `open_read`): a chunk row without a remote
+    /// id is an `Unavailable` error and an id-less row is `NotFound` —
+    /// the bytes cannot be located. `total_size` follows the E-5
+    /// encrypted-container budget (see [`Vfs::remote_handle_for`]).
+    Read,
+    /// Delete path (`delete_remote_gated`): id-less chunk rows are
+    /// skipped; a row with no ids at all yields the empty placeholder
+    /// handle (`first_msg_id = 0`) — the K2 path carries the locator
+    /// for path-addressed backends (local), id-keyed backends answer
+    /// the tolerated NotFound. `total_size` is the row size (deletion
+    /// never transfers bytes).
+    Delete,
+}
+
+/// Outcome of [`Vfs::open_read`] — the K33 triple gate either admits a
+/// row to range streaming or explicitly routes it back to the existing
+/// full-hydrate path. An enum (not an error variant / internal
+/// fallback) so every caller sees both arms at compile time and must
+/// decide how to serve the fallback.
+pub enum StreamSource {
+    /// Range streaming admitted (K33: plaintext row, transport declares
+    /// `range_read`, non-zero size).
+    Stream {
+        /// Locates the remote object (chunks-first assembly, K2 path
+        /// carried).
+        handle: RemoteHandle,
+        /// Authoritative total length (K35: the plaintext row's size —
+        /// rebuild derived it from the backend listing — fit for
+        /// Content-Length / Range math).
+        total_size: u64,
+        /// The VFS's transport, for bounded-window `open_range` calls —
+        /// the caller never re-reaches into the VFS per window.
+        transport: Arc<dyn CloudTransport>,
+    },
+    /// Serve the row through the existing full-hydrate path (R-5):
+    /// encrypted row (whole-file AEAD can never be range-sliced),
+    /// transport without `range_read`, or a 0-byte row (hydrate
+    /// materializes the empty copy).
+    Hydrate,
+}
+
 /// The virtual filesystem: metadata DB + LRU cache + upload queue +
 /// transport, fronting `put` / `hydrate`. Interior state is private.
 pub struct Vfs {
@@ -436,32 +482,11 @@ impl Vfs {
             return Ok(local);
         }
 
-        // Remote handle: per-chunk rows first (already index-ordered),
-        // else the row's chunk-0 msg id covers single-chunk files.
-        // Ids are i64 end-to-end since Batch B3a (K1) — the DB column
-        // and the transport seam speak the same width, no narrowing.
-        let chunks = self.db.get_chunks_by_file_id(row.id)?;
-        let mut msg_ids = Vec::with_capacity(chunks.len());
-        for chunk in &chunks {
-            let id = chunk.telegram_msg_id.ok_or_else(|| {
-                VfsError::Transport(StorageError::Unavailable(format!(
-                    "chunk {} of {} has no remote message id",
-                    chunk.chunk_index, row.rel_path
-                )))
-            })?;
-            msg_ids.push(id);
-        }
-        if msg_ids.is_empty() {
-            msg_ids.push(
-                // Pending upload whose local copy vanished: the bytes
-                // live neither locally nor remotely.
-                row.telegram_msg_id
-                    .ok_or_else(|| VfsError::NotFound(row.rel_path.clone()))?,
-            );
-        }
-        // Non-empty by construction: chunk rows yielded ids, or the
-        // fallback above pushed one (else we already returned).
-        let first_msg_id = msg_ids[0];
+        // Remote handle: the shared row -> handle assembly (chunks
+        // first / row id fallback; id widths and the E-5 budget notes
+        // live in `remote_handle_for`). Assembled before eviction so a
+        // lookup failure never leaves evicted victims behind.
+        let handle = self.remote_handle_for(rel, &row, HandlePolicy::Read)?;
 
         // Make room before filling: every evicted row keeps all fields
         // except the cached flag.
@@ -484,39 +509,10 @@ impl Vfs {
         // the WebDAV thread's `future.result(timeout=180)` cap). Cache
         // hits and the LRU bookkeeping above are local fast paths and
         // stay outside the bound.
-        // Download budget (E-5, adjudicated plan B): the row's `size` is
-        // the PLAINTEXT length under the Python contract (R6), but for
-        // encrypted rows the remote artifact is the ciphertext container
-        // (v1: salt + nonce + plaintext + tag; v2: header + plaintext +
-        // one tag per crypto chunk) — always LONGER than the plaintext. A
-        // budget-honest transport treats `total_size` as a hard cap (the
-        // telegram `open()` serves through `serve_range(…, 0, total_size)`),
-        // so budgeting an encrypted row by `row.size` trims the ciphertext
-        // and the final AEAD tag check fails — the real-machine E-5 defect
-        // (2621440 B plaintext budget vs 2621522 B container, 82 bytes
-        // short; the v1 path carries the same latent defect, merely never
-        // exercised on a real machine before E-5). Encrypted containers
-        // are self-describing and AEAD-authenticated: the decryptor itself
-        // validates completeness and integrity, so the budget is not a
-        // correctness source — encrypted rows download unbounded (the
-        // telegram `open()` already pulls every part document in full, so
-        // u64::MAX is a pure pass-through with zero extra I/O). Plaintext
-        // rows keep the row-size budget unchanged. Alternative semantics
-        // (row size stores the ciphertext length — plan A) recorded in
-        // decisions.md as pending-owner-review.
-        let handle = RemoteHandle {
-            first_msg_id,
-            chunk_msg_ids: msg_ids,
-            total_size: if row.is_encrypted {
-                u64::MAX
-            } else {
-                row.size.max(0) as u64
-            },
-            // K2: the hydrate site owns the row's rel_path, so the
-            // handle carries it — a path-addressed backend (local) can
-            // locate the object by it; id-keyed backends ignore it.
-            path: Some(rel.clone()),
-        };
+        // Download budget (E-5): encrypted rows hydrate through a
+        // `total_size` of u64::MAX — the full rationale (plaintext vs
+        // container length, AEAD self-validation) lives with the budget
+        // decision in `remote_handle_for`.
         let staged = tmp_sibling(&local);
         if let Some(parent) = local.parent() {
             std::fs::create_dir_all(parent)?;
@@ -605,6 +601,132 @@ impl Vfs {
         }
         self.cache.record_access(rel);
         Ok(local)
+    }
+
+    /// Assembles the row's [`RemoteHandle`] (SR0 dedup — `hydrate` and
+    /// `delete_remote_gated` previously carried the same inline block):
+    /// per-chunk rows first (already index-ordered), else the row's own
+    /// chunk-0 msg id covers single-chunk files. Ids are i64
+    /// end-to-end since Batch B3a (K1) — the DB column and the
+    /// transport seam speak the same width, no narrowing. K2: the
+    /// caller's rel path rides along so path-addressed backends (local)
+    /// can locate the object by it; id-keyed backends ignore it.
+    ///
+    /// Download budget (E-5, adjudicated plan B — the Read policy): the
+    /// row's `size` is the PLAINTEXT length under the Python contract
+    /// (R6), but for encrypted rows the remote artifact is the
+    /// ciphertext container (v1: salt + nonce + plaintext + tag; v2:
+    /// header + plaintext + one tag per crypto chunk) — always LONGER
+    /// than the plaintext. A budget-honest transport treats
+    /// `total_size` as a hard cap (the telegram `open()` serves through
+    /// `serve_range(…, 0, total_size)`), so budgeting an encrypted row
+    /// by `row.size` trims the ciphertext and the final AEAD tag check
+    /// fails — the real-machine E-5 defect (2621440 B plaintext budget
+    /// vs 2621522 B container, 82 bytes short; the v1 path carries the
+    /// same latent defect, merely never exercised on a real machine
+    /// before E-5). Encrypted containers are self-describing and
+    /// AEAD-authenticated: the decryptor itself validates completeness
+    /// and integrity, so the budget is not a correctness source —
+    /// encrypted rows download unbounded (the telegram `open()` already
+    /// pulls every part document in full, so u64::MAX is a pure
+    /// pass-through with zero extra I/O). Plaintext rows keep the
+    /// row-size budget unchanged. Alternative semantics (row size
+    /// stores the ciphertext length — plan A) recorded in decisions.md
+    /// as pending-owner-review.
+    fn remote_handle_for(
+        &self,
+        rel: &RelPath,
+        row: &FileRecord,
+        policy: HandlePolicy,
+    ) -> Result<RemoteHandle, VfsError> {
+        let chunks = self.db.get_chunks_by_file_id(row.id)?;
+        let mut msg_ids = Vec::with_capacity(chunks.len());
+        for chunk in &chunks {
+            match chunk.telegram_msg_id {
+                Some(id) => msg_ids.push(id),
+                // Read: an id-less chunk row means the bytes cannot be
+                // located. Delete (the pre-helper filter_map): skip it.
+                None if policy == HandlePolicy::Read => {
+                    return Err(VfsError::Transport(StorageError::Unavailable(format!(
+                        "chunk {} of {} has no remote message id",
+                        chunk.chunk_index, row.rel_path
+                    ))));
+                }
+                None => {}
+            }
+        }
+        if msg_ids.is_empty() {
+            match row.telegram_msg_id {
+                Some(id) => msg_ids.push(id),
+                // Read: a pending upload whose local copy vanished —
+                // the bytes live neither locally nor remotely. Delete:
+                // keep the empty placeholder (first_msg_id = 0 below).
+                None if policy == HandlePolicy::Read => {
+                    return Err(VfsError::NotFound(row.rel_path.clone()));
+                }
+                None => {}
+            }
+        }
+        Ok(RemoteHandle {
+            // Read rows are non-empty by construction (chunk ids or the
+            // row id above); Delete keeps the pre-helper placeholder 0
+            // for id-less rows.
+            first_msg_id: msg_ids.first().copied().unwrap_or(0),
+            chunk_msg_ids: msg_ids,
+            total_size: match policy {
+                HandlePolicy::Read if row.is_encrypted => u64::MAX,
+                _ => row.size.max(0) as u64,
+            },
+            path: Some(rel.clone()),
+        })
+    }
+
+    /// Streaming-read entry (SR0 / K33): resolves `rel` to a
+    /// range-streaming source ([`StreamSource::Stream`]) or an explicit
+    /// fallback signal ([`StreamSource::Hydrate`]).
+    ///
+    /// Gate order mirrors `hydrate`: row lookup (`NotFound` /
+    /// `IsDirectory`), then the password gate — an encrypted row with
+    /// no configured password is `MissingPassword`, an actionable
+    /// error, never a fallback — then the K33 triple gate: an encrypted
+    /// row (whole-file AEAD can never be range-sliced), a transport
+    /// without `range_read`, or a 0-byte row all answer `Hydrate`.
+    /// Everything else streams with the row's remote handle, its
+    /// authoritative size (K35) and the shared transport for bounded
+    /// `open_range` windows.
+    ///
+    /// Cache non-interaction (K34): this entry never touches the cache
+    /// — no `is_cached` probe, no hydration side effect, no access
+    /// recorded; a cached row still streams from the remote. Cache
+    /// coordination for streaming reads is deliberately out of scope
+    /// for this seam.
+    pub async fn open_read(&self, rel: &RelPath) -> Result<StreamSource, VfsError> {
+        let row = self
+            .db
+            .get_file(rel.as_str())?
+            .ok_or_else(|| VfsError::NotFound(rel.as_str().to_string()))?;
+        if row.is_dir {
+            return Err(VfsError::IsDirectory(row.rel_path));
+        }
+        // Password gate before the fallback decision (hydrate parity):
+        // an encrypted row without a password must surface the
+        // actionable error, not a Hydrate signal the caller would
+        // blindly retry.
+        if row.is_encrypted && self.cfg.encryption_password.is_none() {
+            return Err(VfsError::MissingPassword);
+        }
+        // K33 triple gate: whole-file-AEAD rows, range-incapable
+        // transports and 0-byte rows all serve through the full hydrate
+        // path (R-5).
+        if row.is_encrypted || !self.transport.capabilities().range_read || row.size == 0 {
+            return Ok(StreamSource::Hydrate);
+        }
+        let handle = self.remote_handle_for(rel, &row, HandlePolicy::Read)?;
+        Ok(StreamSource::Stream {
+            total_size: handle.total_size,
+            handle,
+            transport: Arc::clone(&self.transport),
+        })
     }
 
     /// Snapshot of the upload queue counters.
@@ -831,27 +953,12 @@ impl Vfs {
         if !row.is_uploaded {
             return Ok(());
         }
-        // The handle mirrors hydrate's: per-chunk rows first (already
-        // index-ordered), else the row's own chunk-0 id. A row with no
-        // id at all still carries the path (K2) — path-addressed
-        // backends (local) resolve by it, and id-keyed backends answer
-        // NotFound for the placeholder (tolerated above).
-        let chunks = self.db.get_chunks_by_file_id(row.id)?;
-        let mut msg_ids: Vec<i64> = chunks
-            .iter()
-            .filter_map(|chunk| chunk.telegram_msg_id)
-            .collect();
-        if msg_ids.is_empty() {
-            if let Some(id) = row.telegram_msg_id {
-                msg_ids.push(id);
-            }
-        }
-        let handle = RemoteHandle {
-            first_msg_id: msg_ids.first().copied().unwrap_or(0),
-            chunk_msg_ids: msg_ids,
-            total_size: row.size.max(0) as u64,
-            path: Some(rel.clone()),
-        };
+        // The handle mirrors hydrate's assembly (chunks first / row id
+        // fallback, K2 path always carried); the Delete policy keeps
+        // this site's looser id handling — id-less chunk rows skipped,
+        // an id-less row yields the path-only placeholder (id-keyed
+        // backends answer the NotFound tolerated above).
+        let handle = self.remote_handle_for(rel, row, HandlePolicy::Delete)?;
         match self.transport.delete_remote(&handle).await {
             Ok(()) | Err(StorageError::NotFound) => Ok(()),
             Err(first) => match self.transport.delete_remote(&handle).await {

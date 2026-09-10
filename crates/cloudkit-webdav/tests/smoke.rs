@@ -275,16 +275,20 @@ async fn seed_remote_file(
 /// Writes a row of any shape straight into the DB.
 fn seed_row(db: &Arc<MetaDatabase>, rel: &str, is_dir: bool, size: i64) {
     let rel_path = RelPath::new(rel).expect("valid rel path");
-    let parent_dir = match rel_path.parent() {
-        Some(parent) => parent.as_str().to_string(),
-        None => "/".to_string(),
-    };
-    db.upsert_file(&FileUpsert {
-        rel_path: rel_path.as_str().to_string(),
-        name: rel_path.name().to_string(),
-        parent_dir,
+    db.upsert_file(&shape_upsert(&rel_path, is_dir, size, 1_700_000_123.0))
+        .expect("seed row");
+}
+
+/// A plain uploaded row of `size` bytes (overridable field by field).
+fn shape_upsert(rel: &RelPath, is_dir: bool, size: i64, mtime: f64) -> FileUpsert {
+    FileUpsert {
+        rel_path: rel.as_str().to_string(),
+        name: rel.name().to_string(),
+        parent_dir: rel
+            .parent()
+            .map_or("/".to_string(), |p| p.as_str().to_string()),
         size,
-        mtime: 1_700_000_123.0,
+        mtime,
         sha256: None,
         is_dir,
         telegram_msg_id: None,
@@ -293,8 +297,7 @@ fn seed_row(db: &Arc<MetaDatabase>, rel: &str, is_dir: bool, size: i64) {
         is_encrypted: false,
         chunk_count: if is_dir { 0 } else { 1 },
         mime_type: None,
-    })
-    .expect("seed row");
+    }
 }
 
 /// 1. PROPFIND Depth:1 answers 207 with a multistatus body naming the
@@ -405,6 +408,175 @@ async fn get_range_without_range_read_capability_still_slices() {
         "inclusive slice bounds over the full length: {resp}"
     );
     assert_eq!(body_of(&resp), "llo");
+}
+
+/// Same environment as [`test_env_for`] but with a shrunk streaming
+/// window — the SR1 multi-window observables (a full GET producing a
+/// window SEQUENCE) without multi-megabyte fixtures.
+async fn test_env_small_window_for(mock: Arc<MockTransport>, window: u64) -> Env {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let cache_root = dir.path().join("cache");
+    let db = Arc::new(MetaDatabase::open(&dir.path().join("meta.db")).expect("open temp db"));
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let vfs = Arc::new(Vfs::new(
+        db.clone(),
+        CacheManager::new(cache_root.clone(), u64::MAX),
+        transport,
+        test_cfg(),
+    ));
+    let fs = CyDriveFs::new(
+        vfs.clone(),
+        db.clone(),
+        CacheManager::new(cache_root.clone(), u64::MAX),
+    )
+    .with_stream_window(window);
+    let server = WebDavServer::serve(fs, SocketAddr::from(([127, 0, 0, 1], 0)))
+        .await
+        .expect("serve on an ephemeral loopback port");
+    Env {
+        _dir: dir,
+        server,
+        db,
+        mock,
+        vfs,
+        cache_root,
+    }
+}
+
+/// 3c. SR1: with RANGE_READ declared (the mock's default face) a Range
+///     GET serves the exact 206 slice through ONE bounded `open_range`
+///     window at the range start — the remote never sees a whole-file
+///     `open` (K33/K34 dispatch pin through the live server).
+#[tokio::test]
+async fn get_range_streams_one_bounded_window() {
+    let env = test_env().await;
+    let addr = env.server.local_addr();
+    seed_remote_file(&env.db, &env.mock, "/docs/hello.txt", b"hello world", 64).await;
+
+    let resp = send(
+        addr,
+        &request(
+            "GET",
+            "/docs/hello.txt",
+            addr,
+            &[("Range", "bytes=2-4")],
+            "",
+        ),
+    )
+    .await;
+
+    assert_eq!(status_of(&resp), 206, "partial content: {resp}");
+    assert_eq!(
+        header(&resp, "content-range"),
+        Some("bytes 2-4/11"),
+        "slice bounds over the row size: {resp}"
+    );
+    assert_eq!(body_of(&resp), "llo");
+    assert!(
+        env.mock.open_calls().is_empty(),
+        "the streaming path never asks for a whole-file open"
+    );
+    assert_eq!(
+        env.mock.open_range_calls(),
+        vec![(2, 9)],
+        "one window at the range start, clamped to EOF"
+    );
+}
+
+/// 3d. SR1: a full GET (no Range) on the streaming path reads the file
+///     through a sequence of bounded windows — window after window, not
+///     a whole-file open.
+#[tokio::test]
+async fn get_full_read_serves_a_window_sequence() {
+    let mock = Arc::new(MockTransport::new());
+    mock.connect().await.expect("pre-connect mock transport");
+    let env = test_env_small_window_for(mock, 4).await;
+    let addr = env.server.local_addr();
+    seed_remote_file(&env.db, &env.mock, "/docs/hello.txt", b"hello world", 64).await;
+
+    let resp = send(addr, &request("GET", "/docs/hello.txt", addr, &[], "")).await;
+
+    assert_eq!(status_of(&resp), 200, "full read: {resp}");
+    assert_eq!(header(&resp, "content-length"), Some("11"));
+    assert_eq!(body_of(&resp), "hello world");
+    assert!(
+        env.mock.open_calls().is_empty(),
+        "the full read streams, it never hydrates"
+    );
+    assert_eq!(
+        env.mock.open_range_calls(),
+        vec![(0, 4), (4, 4), (8, 3)],
+        "the whole file arrives as a window sequence, last clamped to EOF"
+    );
+}
+
+/// 3e. SR1 symmetric pin (R-5's mirror image): with RANGE_READ OFF the
+///     same Range GET hydrates the whole file — exactly one `open`, ZERO
+///     `open_range` — so the capability gate is observable from the
+///     transport face in both directions.
+#[tokio::test]
+async fn get_range_capability_off_hydrates_without_open_range() {
+    let mock = Arc::new(
+        MockTransport::builder()
+            .capabilities(Capabilities::none())
+            .build(),
+    );
+    mock.connect().await.expect("pre-connect storage-only mock");
+    let env = test_env_for(mock).await;
+    let addr = env.server.local_addr();
+    seed_remote_file(&env.db, &env.mock, "/docs/hello.txt", b"hello world", 64).await;
+
+    let resp = send(
+        addr,
+        &request(
+            "GET",
+            "/docs/hello.txt",
+            addr,
+            &[("Range", "bytes=2-4")],
+            "",
+        ),
+    )
+    .await;
+
+    assert_eq!(status_of(&resp), 206, "partial content: {resp}");
+    assert_eq!(body_of(&resp), "llo");
+    assert_eq!(
+        env.mock.open_calls().len(),
+        1,
+        "the fallback hydrated the whole file once"
+    );
+    assert!(
+        env.mock.open_range_calls().is_empty(),
+        "a range-incapable transport is never asked for a range"
+    );
+}
+
+/// 3f. SR1: an encrypted row never streams even with RANGE_READ on —
+///     hydrate's password gate refuses (403) before any transport call.
+#[tokio::test]
+async fn get_encrypted_row_without_password_never_streams() {
+    let env = test_env().await;
+    let addr = env.server.local_addr();
+    let rel = RelPath::new("/docs/secret.txt").expect("valid rel path");
+    env.db
+        .upsert_file(&FileUpsert {
+            telegram_msg_id: Some(1),
+            is_encrypted: true,
+            ..shape_upsert(&rel, false, 11, 1_700_000_123.0)
+        })
+        .expect("seed encrypted row");
+
+    let resp = send(addr, &request("GET", "/docs/secret.txt", addr, &[], "")).await;
+
+    assert_eq!(status_of(&resp), 403, "missing password refuses: {resp}");
+    assert!(
+        env.mock.open_range_calls().is_empty(),
+        "an encrypted row never reaches open_range"
+    );
+    assert!(
+        env.mock.open_calls().is_empty(),
+        "the password gate fires before any download work"
+    );
 }
 
 /// 4. PUT lands the Explorer-style write (2xx), GET reads it back, and

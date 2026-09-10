@@ -508,3 +508,12 @@
 - **FT1–FT3 实现取舍要点**：① 孪生 dispatch 函数——`connect_stack`/`connect_stack_with_deadline` 每个都成对（cfg on 臂真装配 + cfg off 臂 K31 早退，签名/文档对齐，调用面零分支）；② `BackendTransport` 变体 cfg 门控（`#[cfg(feature)] Baidu/Local`）+ `_ => match *self {}` 不可达兜底臂——feature 全关时枚举非空、match 仍穷尽，编译期保证无幽灵臂；③ setup 菜单按 cfg 驱动集合动态生成（缺驱动的选项不出现，而非出现后报错）。
 - **FT4 收口**：CI 增 `features` job（clippy 四腿 none/telegram/baidu/local + workspace `--no-default-features` test 腿，ubuntu 单 OS——feature 选择与 OS 无关，default 腿归 `check` job）；现场捕获 FT3 遗留一处死导入（multivolume_ops.rs 裸 `load_volumes` 仅 local 门控测试消费，非 local 组合 clippy `--all-targets` 红）——同门 cfg 吸收修复，CI 矩阵腿首跑即立功。
 - **验证（FT4 批实测）**：`cargo test --workspace --no-fail-fast` default 810/0；`-p cloudkit-cli --no-default-features` 134/0；clippy 四腿+workspace、fmt、check_layers（11 manifests）、scan_secrets 全绿；`--version` 三组合实跑——`cydrive 0.10.0 (drivers: telegram, baidu, local)` / `(drivers: local)` / `(drivers: none)`。
+
+## 2026-09-10 流式读（Range 直通）落地：K33–K37 + 三轮研究入档
+
+- **背景**：负责人反馈百度卷视频不可流播——所有读路径（WebDAV 盘符 / /api/download）均为「整文件水合后供本地文件」（Python parity 继承），764MiB 视频 = 首帧前全量下载 ~38s+，Z: 盘撞 MiniRedir 超时直接失败。
+- **三轮研究**：① PCFS 机制=驱动句柄 Seek 重发 Range、HTTP 层 Seek+LimitReader+io.Copy、零落盘零预取 128KB 缓冲；其 baidu 每次 Seek 重走 302+新建 client 是反面教材（本仓 dlink 缓存+有界窗口更优，保留）。② 本仓接缝：open_range 三驱动就绪、dav-server 读契约（metadata 定长→seek→read_bytes 16KiB 循环）与 RangeFile 天然契合、R-5 注释即预留能力位门、sync-server 有 Body::from_stream 先例。③ 互联网验证：rclone 10MB Range 上限/JuiceFS readahead/alist 本地代理——4MiB 窗口+顺序预取与社区实践一致。
+- **裁决**：K33 流式=能力位门控直通（range_read 且非加密行；v1 GCM 整文件 AEAD 永不直通；Hydrate 回退语义链等价，R-5 钉测试保绿）；K34 4MiB 按 pos 锚定窗口+整窗聚合+惰性 seek+同位 no-op，流式读不进磁盘缓存（is_cached/evict 零触碰，DlinkCache 兜底重复开窗）；K35 row.size（权威索引）即 Content-Length；K36 /api/download 流式 200/206 显式 CL+Accept-Ranges+三态 RangeBody，416 零远端调用；K37 非目标：bot /get、pull、块缓存/投机预取（挂账）。
+- **真机验收（764MiB 真视频）**：API 流式首字节 <1ms、1MiB 全程 159ms、文件中部 seek（600MB 偏移）1MiB 163ms、字节与 WebDAV 路径一致；WebDAV 端口 206 326ms；mp4 ftyp 头合法。
+- **客户端发现（非本仓缺陷）**：Windows WebClient 服务 FileSizeLimitInBytes 默认 50MB——Z: 盘上 >50MB 文件 open 即失败（0.4MB 开成功/68.8MB 失败实证）；PotPlayer 经 Z: 盘播大视频需机器级注册表调整（reg add ...\WebClient\Parameters /v FileSizeLimitInBytes /d 0xffffffff + 重启 WebClient 服务），rclone/alist 用户同样必做；URL 路径（PotPlayer 喂 URL/前端播放器）不受此限。
+- **测试**：workspace 841 passed / 0 failed（810 基线 + 31 新增，断言零漂移）；R-5 回退钉测试原样绿。
