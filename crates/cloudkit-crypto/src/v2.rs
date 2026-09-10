@@ -508,6 +508,118 @@ impl AeadV2 {
     }
 }
 
+/// A keyed chunk-window reader over an aead_v2 container (K47): parses
+/// the 34-byte header and derives the key once, then answers per-chunk
+/// authenticated decrypt requests and the container layout arithmetic
+/// random-access consumers need to translate plaintext windows into
+/// ciphertext spans. Created via [`AeadV2::window_reader`].
+pub struct AeadV2Window {
+    cipher: Aes256Gcm,
+    header_bytes: [u8; HEADER_SIZE],
+    chunk_size: usize,
+}
+
+// Compile-time contract for the core decrypting-transport wrapper, which
+// shares one window across concurrent face reads.
+const _: fn() = || {
+    fn assert_send_sync<T: Send + Sync>() {}
+    assert_send_sync::<AeadV2Window>();
+};
+
+impl AeadV2 {
+    /// Opens a chunk-window reader over the fixed 34-byte header of a
+    /// container: parses and validates the header and runs the PBKDF2
+    /// key derivation exactly once — every later window decrypt reuses
+    /// the derived key.
+    pub fn window_reader(
+        &self,
+        password: &str,
+        header: &[u8],
+    ) -> Result<AeadV2Window, CryptoError> {
+        AeadV2Window::open(password, header)
+    }
+}
+
+impl AeadV2Window {
+    /// Parses the header (at least [`HEADER_SIZE`] bytes; only the first
+    /// 34 are read) and derives the key once.
+    pub fn open(password: &str, header: &[u8]) -> Result<Self, CryptoError> {
+        let header = Header::parse(header)?;
+        let cipher = Aes256Gcm::new(&Key::<Aes256Gcm>::from(header.derive_key(password)));
+        Ok(Self {
+            cipher,
+            header_bytes: header.bytes,
+            chunk_size: header.chunk_size,
+        })
+    }
+
+    /// The container's plaintext chunk size in bytes (header field).
+    pub const fn chunk_size(&self) -> usize {
+        self.chunk_size
+    }
+
+    /// Number of chunks a plaintext of `plain_len` bytes spans — the
+    /// encoder's rule: ceiling division, with the empty file one empty
+    /// final chunk and an exact multiple NO trailing empty chunk.
+    pub fn n_chunks_for_plain(&self, plain_len: u64) -> u64 {
+        plain_len.div_ceil(self.chunk_size as u64).max(1)
+    }
+
+    /// Plaintext length of the final chunk for a `plain_len`-byte file
+    /// (0 only for the empty file; a full `chunk_size` on exact
+    /// multiples).
+    pub fn plain_tail(&self, plain_len: u64) -> usize {
+        if plain_len == 0 {
+            return 0;
+        }
+        let rem = (plain_len % self.chunk_size as u64) as usize;
+        if rem == 0 {
+            self.chunk_size
+        } else {
+            rem
+        }
+    }
+
+    /// Ciphertext `(offset, length)` covering chunks `first..=last` of a
+    /// `plain_len`-byte container, header included — the coordinates a
+    /// random-access consumer forwards to storage (`open_range(off,
+    /// len)`), and the slice bounds within the whole container bytes.
+    pub fn ciphertext_span(&self, first: u64, last: u64, plain_len: u64) -> (u64, u64) {
+        let n = self.n_chunks_for_plain(plain_len);
+        debug_assert!(first <= last && last < n, "chunk range outside the file");
+        let stride = (self.chunk_size + TAG_SIZE) as u64;
+        let offset = HEADER_SIZE as u64 + first * stride;
+        // The final chunk carries plain_tail + tag bytes; every earlier
+        // chunk is full-width.
+        let last_len = if last + 1 == n {
+            self.plain_tail(plain_len) as u64 + TAG_SIZE as u64
+        } else {
+            stride
+        };
+        (offset, (last - first) * stride + last_len)
+    }
+
+    /// Decrypts and authenticates one chunk (`ct` = ciphertext + tag
+    /// exactly as addressed by [`AeadV2Window::ciphertext_span`]).
+    /// Tampering, a wrong index/finality or a wrong password is
+    /// [`CryptoError::AuthFailed`] — never wrong plaintext.
+    pub fn decrypt_chunk(
+        &self,
+        index: u64,
+        is_last: bool,
+        ct: &[u8],
+    ) -> Result<Vec<u8>, CryptoError> {
+        debug_assert!(index < MAX_CHUNKS, "chunk index beyond nonce capacity");
+        decrypt_chunk(
+            &self.cipher,
+            &self.header_bytes,
+            index as usize,
+            is_last,
+            ct,
+        )
+    }
+}
+
 /// Decrypts one authenticated chunk under the header AAD.
 fn decrypt_chunk(
     cipher: &Aes256Gcm,
