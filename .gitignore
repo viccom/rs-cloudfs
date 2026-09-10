@@ -29,3 +29,4 @@ test/
 
 # ZCode session-local tooling artifacts
 .zcode/
+/target-winfsp/
