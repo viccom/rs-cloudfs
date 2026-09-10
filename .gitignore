@@ -26,3 +26,6 @@ downloads/
 Thumbs.db
 cydrive.control
 test/
+
+# ZCode session-local tooling artifacts
+.zcode/
