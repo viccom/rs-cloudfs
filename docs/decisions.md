@@ -500,3 +500,11 @@
 - **执行期修复**：baidu_root 误重定基（MV1 缺陷，E2E 首启暴露——后端命名空间路径被当 fs 路径拼卷主目录致 baidu 卷拒启动；修复=不参与 K21 重定基，红→绿留证）。
 - **失败边界澄清**（K22 细化）：**dispatch 期配置错误**（validate 拒绝类，如坏 baidu_root）= 大声中止整进程（配置作者修复语义，明确错误信息）；**装配/运行期失败**（db 打不开等）= K22 可见降级不拖死兄弟卷。两级都不静默（PCFS 反训的红线是静默吞错，不是中止）。
 - **凭据执行注记**：多卷模式凭据家=卷文件（K13 ConfigTokenStore 回写闭环）；keyring 回填不适用于卷（单卷专属链）；baidu2.json 静态对已过期，现行对经 spike 工具链缓存维护（onboarding §7 路线复用）。
+
+## 2026-09-10 驱动编译开关落地：K30–K32 入档（FT1–FT4，计划 docs/plans/2026-09-09-driver-feature-gates.md）
+
+- **裁决按计划落地**：K30 feature 落点=组合根 cloudkit-cli（`[features] telegram/baidu/local`，default 全开，驱动 crate 零改动）；K31 缺驱动=编译期裁剪+运行期可行动报错——`{TELEGRAM,BAIDU,LOCAL}_DRIVER_REQUIRED` 三常量（缺驱动声明 + rebuild 命令 + backend 改法三段式），push/pull 命令保留不隐藏、off 态 connect 早退报错，doctor 缺驱动跳过对应探活；K32 `--version` 增 `(drivers: ...)` 清单——`cloudkit_cli::compiled_drivers()` 编译期常量风格（cfg 三分支拼字面量，顺序固定 telegram, baidu, local，全关显示 `none`），clap `version` 属性经 `OnceLock` 拼 `&'static str`（clap 的 `string` feature 不为此单开——`From<String> for Str` 是 feature 门控的）。
+- **六组合矩阵实证**：build+clippy（`-p cloudkit-cli --no-default-features [--features X] --all-targets -D warnings`）×6 全过；全量 test：default=810 passed（既有 809 断言零漂移 + K32 新测试）、none=801 passed / 0 failed（驱动门控测试 cfg 摘除，断言零改动）；`[patch.crates-io] grammers-session` 无消费者警告未出现（no-default 构建零 warning 实证，计划风险预判销账）。
+- **FT1–FT3 实现取舍要点**：① 孪生 dispatch 函数——`connect_stack`/`connect_stack_with_deadline` 每个都成对（cfg on 臂真装配 + cfg off 臂 K31 早退，签名/文档对齐，调用面零分支）；② `BackendTransport` 变体 cfg 门控（`#[cfg(feature)] Baidu/Local`）+ `_ => match *self {}` 不可达兜底臂——feature 全关时枚举非空、match 仍穷尽，编译期保证无幽灵臂；③ setup 菜单按 cfg 驱动集合动态生成（缺驱动的选项不出现，而非出现后报错）。
+- **FT4 收口**：CI 增 `features` job（clippy 四腿 none/telegram/baidu/local + workspace `--no-default-features` test 腿，ubuntu 单 OS——feature 选择与 OS 无关，default 腿归 `check` job）；现场捕获 FT3 遗留一处死导入（multivolume_ops.rs 裸 `load_volumes` 仅 local 门控测试消费，非 local 组合 clippy `--all-targets` 红）——同门 cfg 吸收修复，CI 矩阵腿首跑即立功。
+- **验证（FT4 批实测）**：`cargo test --workspace --no-fail-fast` default 810/0；`-p cloudkit-cli --no-default-features` 134/0；clippy 四腿+workspace、fmt、check_layers（11 manifests）、scan_secrets 全绿；`--version` 三组合实跑——`cydrive 0.10.0 (drivers: telegram, baidu, local)` / `(drivers: local)` / `(drivers: none)`。

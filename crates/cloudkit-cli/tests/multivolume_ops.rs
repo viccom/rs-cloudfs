@@ -26,7 +26,13 @@ use cloudkit_cli::{
     discover_config, discover_config_with_volumes_and_store, resolve_volume_settings,
     DiscoveredConfig,
 };
-use cloudkit_core::config::{load_volumes, VolumeConfig};
+use cloudkit_core::config::VolumeConfig;
+// The bare `load_volumes` import has a single consumer — the local-gated
+// multi-volume rebuild test below (every other call site qualifies the
+// path) — so it rides the same gate (FT4: the CI feature-matrix clippy
+// legs reject the dead import on non-local builds).
+#[cfg(feature = "local")]
+use cloudkit_core::config::load_volumes;
 use cloudkit_core::credentials::InMemoryStore;
 use cloudkit_core::database::{FileUpsert, MetaDatabase};
 
@@ -614,6 +620,12 @@ fn resolve_volume_settings_keeps_baidu_root_verbatim() {
 /// index lives in the db/sync, the backend has nothing to walk). A fresh
 /// multi-volume install therefore serves listings only after this pass —
 /// the WebDAV/dashboard listing surface is db-indexed by design.
+///
+/// Local-gated (FT3): the local volume's rebuild assembly IS the local
+/// driver (`build_driver`) — without the feature that volume refuses
+/// with the K31 rebuild message instead, so the contract is only
+/// assertable with the driver compiled in.
+#[cfg(feature = "local")]
 #[tokio::test]
 async fn rebuild_multi_populates_each_volume_home_db_and_skips_telegram() {
     let dir = tempfile::tempdir().expect("tempdir");

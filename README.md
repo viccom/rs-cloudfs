@@ -25,7 +25,7 @@ L1 驱动  telegram │ baidu │ local │ (未来: 115/123/s3…)
 | Phase 0 | crate 改名重排（cloudkit-*/ck-*），纯搬迁 + 层检查/秘密扫描 CI 门禁 | ✅ 完成 |
 | Phase 1 | 百度 spike → StorageDriver 抽象落地 → 加密 v2 流式（0.8.0，617+ 测试绿，含真机冒烟两轮） | ✅ 完成 |
 | Phase 2 | ck-local + ck-baidu + 组合根接线 + 端到端硬验收（0.9.0，740 测试绿；baidu/local E2E 通过、telegram 腿待独立测试 chat） | ✅ 完成 |
-| Phase 2.5 | 多卷启用（Registry + 每实例配置 + 多盘挂载，方案一裁决） | ✅ 完成（0.10.0，807 测试绿；单进程三卷真机 E2E：local 加密 V: + tg Y: + baidu Z:，全过） |
+| Phase 2.5 | 多卷启用（Registry + 每实例配置 + 多盘挂载，方案一裁决） | ✅ 完成（0.10.0，810 测试绿；单进程三卷真机 E2E：local 加密 V: + tg Y: + baidu Z:，全过） |
 | Phase 3 | 115/123/多卷挂载/桌面端/自更新（择机） | ⬜ |
 
 阶段计划与裁决：[docs/plans/2026-09-07-cloudfusion-foundation.md](docs/plans/2026-09-07-cloudfusion-foundation.md) ｜ 历史裁决：[docs/decisions.md](docs/decisions.md)
@@ -43,6 +43,18 @@ baidu 实例最小配置（config.toml）：`backend = "baidu"` + `baidu_app_key
 local 实例：`backend = "local"` + `local_root = "<绝对路径>"`。
 权威后端（baidu/local）冷启动可 `cydrive rebuild` 从后端重建索引（明文集；加密实例走 sync）。
 新后端接入指南：[docs/standards/driver-onboarding.md](docs/standards/driver-onboarding.md)（conformance 套件 + 装配点 + E2E 拓扑）。
+
+### 按需裁剪驱动（feature 门控）
+
+三个驱动都是可选依赖（feature：`telegram` / `baidu` / `local`，默认全开 = 默认构建行为不变）：
+
+```powershell
+cargo build --release                                              # 全量（默认三驱动）
+cargo build --release --no-default-features --features local       # 纯本地
+cargo build --release --no-default-features --features local,baidu # 本地+百度
+```
+
+缺驱动的二进制运行到对应表面时得到可行动报错（给出 rebuild 命令与 backend 改法，而非隐藏命令）；`cydrive --version` 显示本构建的驱动清单，如 `cydrive 0.10.0 (drivers: telegram, baidu, local)`，全关构建显示 `(drivers: none)`。
 
 ### 多卷模式（一个进程多个存储卷，Phase 2.5）
 

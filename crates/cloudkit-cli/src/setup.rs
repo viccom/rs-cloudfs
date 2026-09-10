@@ -231,8 +231,12 @@ pub fn persist_setup(cfg: &CyDriveConfig, store: Option<&dyn CredentialStore>) -
 ///
 /// Then apply + persist + the run guidance. (Async: the baidu branch's
 /// refresh-verification dials the OAuth endpoint.)
+///
+/// The menu lists exactly the compiled-in drivers (K30 / FT2): a binary
+/// built without a driver offers no menu entry and no wizard branch for
+/// it — setup never produces a config its own binary refuses.
 pub async fn run_setup_interactive(store: Option<&dyn CredentialStore>) -> Result<()> {
-    use dialoguer::{Input, Select};
+    use dialoguer::Select;
 
     println!("CyDrive first-time setup");
     match store {
@@ -240,18 +244,67 @@ pub async fn run_setup_interactive(store: Option<&dyn CredentialStore>) -> Resul
         None => println!("No OS credential store is available (headless); secrets will be written into config.toml."),
     }
 
-    let backends = ["telegram", "baidu", "local (a directory on this machine)"];
-    let backend = Select::new()
+    let mut choices = backend_menu();
+    if choices.is_empty() {
+        anyhow::bail!(
+            "no storage backend is compiled into this binary: rebuild with at least one \
+             driver feature (`cargo build --features telegram|baidu|local`)"
+        );
+    }
+    let backends: Vec<&str> = choices.iter().map(|(_, label)| *label).collect();
+    let picked = Select::new()
         .with_prompt("Storage backend")
-        .items(backends)
+        .items(&backends)
         .default(0)
         .interact()
         .context("asking for the storage backend")?;
-    match backend {
-        1 => return run_setup_baidu(store).await,
-        2 => return run_setup_local(),
-        _ => {}
+    match choices.remove(picked).0 {
+        #[cfg(feature = "telegram")]
+        WizardBackend::Telegram => run_setup_telegram(store).await,
+        #[cfg(feature = "baidu")]
+        WizardBackend::Baidu => run_setup_baidu(store).await,
+        #[cfg(feature = "local")]
+        WizardBackend::Local => run_setup_local(),
     }
+}
+
+/// One variant per compiled-in driver (K30): a driver absent from the
+/// binary has no menu entry and no wizard branch.
+#[derive(Clone, Copy)]
+enum WizardBackend {
+    #[cfg(feature = "telegram")]
+    Telegram,
+    #[cfg(feature = "baidu")]
+    Baidu,
+    #[cfg(feature = "local")]
+    Local,
+}
+
+/// The backend menu entries: one per compiled-in driver, in boot order.
+///
+/// The pushes are cfg-gated per driver, so this cannot be a `vec![]`
+/// literal — and in the no-driver degenerate build nothing is pushed at
+/// all (the caller refuses instead of showing an empty menu).
+#[allow(clippy::vec_init_then_push, unused_mut)]
+fn backend_menu() -> Vec<(WizardBackend, &'static str)> {
+    let mut choices: Vec<(WizardBackend, &str)> = Vec::new();
+    #[cfg(feature = "telegram")]
+    choices.push((WizardBackend::Telegram, "telegram"));
+    #[cfg(feature = "baidu")]
+    choices.push((WizardBackend::Baidu, "baidu"));
+    #[cfg(feature = "local")]
+    choices.push((WizardBackend::Local, "local (a directory on this machine)"));
+    choices
+}
+
+/// The telegram branch of the wizard (the frozen M5-2 flow): bot token
+/// (validated in a red-on-error loop), chat id, drive letter.
+///
+/// Exists only with the `telegram` feature (FT2): gated with its driver
+/// like the baidu/local branches — the menu rule.
+#[cfg(feature = "telegram")]
+async fn run_setup_telegram(store: Option<&dyn CredentialStore>) -> Result<()> {
+    use dialoguer::Input;
 
     let bot_token: String = Input::new()
         .with_prompt("Telegram Bot Token (from @BotFather)")
@@ -306,6 +359,12 @@ pub async fn run_setup_interactive(store: Option<&dyn CredentialStore>) -> Resul
 /// Token persistence is `config.toml` in BOTH store modes (K14: the
 /// token keys are config-domain; the scrubbed write keeps them — only
 /// the telegram token/password/sync-secret are scrubbed).
+///
+/// Exists only with the `baidu` feature (FT2): the branch is also
+/// hidden from the backend menu without the driver — a binary that
+/// cannot boot baidu must not write a `backend = "baidu"` config
+/// (setup never produces a config its own binary refuses).
+#[cfg(feature = "baidu")]
 async fn run_setup_baidu(store: Option<&dyn CredentialStore>) -> Result<()> {
     use dialoguer::Input;
 
@@ -376,6 +435,10 @@ async fn run_setup_baidu(store: Option<&dyn CredentialStore>) -> Result<()> {
 /// The local branch of the wizard (Phase 2 / B3b): one absolute-path
 /// prompt (validated; the directory is created on first run by the
 /// driver factory — doctor probes writability on demand). No secrets.
+///
+/// Exists only with the `local` feature (FT2 — the menu rule; FT3 wires
+/// the feature to the ck-local dependency).
+#[cfg(feature = "local")]
 fn run_setup_local() -> Result<()> {
     use dialoguer::Input;
 

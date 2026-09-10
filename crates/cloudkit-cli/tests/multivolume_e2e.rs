@@ -17,10 +17,13 @@ use std::sync::{Arc, Mutex, MutexGuard};
 use std::time::Duration;
 
 use cloudkit_cli::control::{control_file_path, read_control_addr, send_stop};
-use cloudkit_cli::{
-    baidu_params, run_multi_with_transports, transport_config_from, volume_mount_url,
-    BaiduEndpoints, RunOptions, VolumeStatus,
-};
+// Baidu-gated surface (FT2): the params mapping and the endpoint set
+// exist only with the `baidu` feature.
+#[cfg(feature = "telegram")]
+use cloudkit_cli::transport_config_from;
+#[cfg(feature = "baidu")]
+use cloudkit_cli::{baidu_params, BaiduEndpoints};
+use cloudkit_cli::{run_multi_with_transports, volume_mount_url, RunOptions, VolumeStatus};
 use cloudkit_core::config::{load_volumes, CyDriveConfig, VolumeConfig};
 use cloudkit_core::database::MetaDatabase;
 use cloudkit_core::rel_path::RelPath;
@@ -534,6 +537,7 @@ async fn one_control_stop_stops_every_volume() {
 /// The telegram session path follows the injected base directory (the
 /// `cwd` parameter IS the per-volume home in multi-volume mode; two
 /// different bases yield two different session files).
+#[cfg(feature = "telegram")]
 #[test]
 fn telegram_session_path_follows_the_volume_home() {
     let dir_a = tempfile::tempdir().expect("tempdir a");
@@ -562,6 +566,7 @@ fn telegram_session_path_follows_the_volume_home() {
 /// The baidu upload-session directory follows the injected state base
 /// (the per-volume home in multi-volume mode; "." keeps the single-volume
 /// cwd behaviour).
+#[cfg(feature = "baidu")]
 #[test]
 fn baidu_sessions_dir_follows_the_state_base() {
     let dir = tempfile::tempdir().expect("tempdir");

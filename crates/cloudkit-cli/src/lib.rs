@@ -38,9 +38,11 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
+#[cfg(feature = "telegram")]
 use ck_telegram::config::{
     TransportConfig, DEFAULT_API_HASH, DEFAULT_API_ID, DEFAULT_SESSION_STEM,
 };
+#[cfg(feature = "telegram")]
 use ck_telegram::transport::GrammersTransport;
 use cloudkit_core::cache::CacheManager;
 use cloudkit_core::config::{Backend, CyDriveConfig, VolumeConfig};
@@ -51,9 +53,11 @@ use cloudkit_core::database::MetaDatabase;
 use cloudkit_core::inbound::spawn_inbound_worker;
 use cloudkit_core::rebuild;
 use cloudkit_core::rel_path::RelPath;
-use cloudkit_core::sync::{
-    namespace_key, namespace_key_for, sync_once, NamespaceIdentity, SyncOutcome,
-};
+use cloudkit_core::sync::{namespace_key, sync_once, SyncOutcome};
+// Local-arm-only sync vocab (FT3): the K12 local namespace derivation
+// exists only with the `local` feature.
+#[cfg(feature = "local")]
+use cloudkit_core::sync::{namespace_key_for, NamespaceIdentity};
 use cloudkit_core::transport::Capabilities;
 use cloudkit_core::transport::CloudTransport;
 use cloudkit_core::vfs::{Vfs, VfsConfig, VfsError};
@@ -74,6 +78,58 @@ pub mod volumes;
 
 pub use keyring_store::KeyringStore;
 pub use signals::sigterm;
+
+/// The actionable message every telegram surface carries when the binary
+/// was built without the telegram driver (K31,
+/// docs/plans/2026-09-09-driver-feature-gates.md): name the rebuild
+/// command, then name the backend switch. Pinned by the off-feature test
+/// in `tests/dispatch.rs`.
+pub const TELEGRAM_DRIVER_REQUIRED: &str = "this binary was built without the telegram driver; \
+     rebuild with `cargo build --features telegram`, or set `backend = \"local\"` / \
+     `backend = \"baidu\"` in config.toml";
+
+/// The actionable message every baidu surface carries when the binary
+/// was built without the baidu driver (K31, FT2 — same shape as
+/// [`TELEGRAM_DRIVER_REQUIRED`]): name the rebuild command, then name
+/// the backend switch. Pinned by the off-feature test in
+/// `tests/dispatch.rs`.
+pub const BAIDU_DRIVER_REQUIRED: &str = "this binary was built without the baidu driver; \
+     rebuild with `cargo build --features baidu`, or set `backend = \"telegram\"` / \
+     `backend = \"local\"` in config.toml";
+
+/// The actionable message every local surface carries when the binary
+/// was built without the local driver (K31, FT3 — same shape as
+/// [`TELEGRAM_DRIVER_REQUIRED`] / [`BAIDU_DRIVER_REQUIRED`]): name the
+/// rebuild command, then name the backend switch. Pinned by the
+/// off-feature test in `tests/dispatch.rs`.
+pub const LOCAL_DRIVER_REQUIRED: &str = "this binary was built without the local driver; \
+     rebuild with `cargo build --features local`, or set `backend = \"telegram\"` / \
+     `backend = \"baidu\"` in config.toml";
+
+/// The driver list the binary was compiled with (K32,
+/// docs/plans/2026-09-09-driver-feature-gates.md) — the `(drivers: ...)`
+/// segment of the `--version` banner. A compile-time constant in
+/// substance: every arm is a literal selected by the feature set at
+/// compile time, in the fixed order telegram, baidu, local; a build
+/// with every driver feature off reports `none`. Pinned by
+/// `tests::compiled_drivers_lists_the_feature_set_in_fixed_order`
+/// (cfg-gated arms — one assertion per build).
+pub const fn compiled_drivers() -> &'static str {
+    match (
+        cfg!(feature = "telegram"),
+        cfg!(feature = "baidu"),
+        cfg!(feature = "local"),
+    ) {
+        (true, true, true) => "telegram, baidu, local",
+        (true, true, false) => "telegram, baidu",
+        (true, false, true) => "telegram, local",
+        (false, true, true) => "baidu, local",
+        (true, false, false) => "telegram",
+        (false, true, false) => "baidu",
+        (false, false, true) => "local",
+        (false, false, false) => "none",
+    }
+}
 
 /// Failure modes of [`connect_with_deadline`].
 #[derive(Debug, thiserror::Error)]
@@ -1418,6 +1474,11 @@ impl Stack {
 /// (Phase 2.5 / K21): single-volume callers pass the process cwd (the
 /// frozen behaviour), the multi-volume dispatch passes the volume's
 /// home directory so each volume owns its session file.
+///
+/// Exists only with the `telegram` feature: the config maps onto the
+/// driver's `TransportConfig`, so a binary without the driver has no
+/// use for it (its callers are all gated too).
+#[cfg(feature = "telegram")]
 pub fn transport_config_from(cfg: &CyDriveConfig, cwd: &Path) -> TransportConfig {
     TransportConfig {
         api_id: DEFAULT_API_ID,
@@ -1440,13 +1501,26 @@ pub fn transport_config_from(cfg: &CyDriveConfig, cwd: &Path) -> TransportConfig
 /// (review H1): a silent proxy surfaces "connect did not finish
 /// within ..." plus the [`connect_failure_hint`] diagnosis instead of
 /// hanging the subcommand without output.
+#[cfg(feature = "telegram")]
 pub async fn connect_stack(cfg: &CyDriveConfig) -> Result<Stack> {
     connect_stack_with_deadline(cfg, CONNECT_DEADLINE).await
+}
+
+/// The no-driver twin of [`connect_stack`] (K31): the one-shot data
+/// channel is telegram-only, so a binary built without the driver
+/// refuses at runtime with [`TELEGRAM_DRIVER_REQUIRED`] — the `push` /
+/// `pull` entries stay compilable (and their Vfs-level helpers fully
+/// tested) while the connect reports the actionable rebuild message.
+#[cfg(not(feature = "telegram"))]
+pub async fn connect_stack(cfg: &CyDriveConfig) -> Result<Stack> {
+    let _ = cfg;
+    anyhow::bail!("{TELEGRAM_DRIVER_REQUIRED}")
 }
 
 /// [`connect_stack`] with the connect deadline injected — the tests
 /// shrink the budget to prove the guard wins; everything else about the
 /// assembly is identical.
+#[cfg(feature = "telegram")]
 pub async fn connect_stack_with_deadline(cfg: &CyDriveConfig, deadline: Duration) -> Result<Stack> {
     let cwd = std::env::current_dir().context("resolving the working directory")?;
     let transport_config = transport_config_from(cfg, &cwd);
@@ -1469,6 +1543,15 @@ pub async fn connect_stack_with_deadline(cfg: &CyDriveConfig, deadline: Duration
         vfs_config(cfg),
     ));
     Ok(Stack { db, vfs, transport })
+}
+
+/// The no-driver twin of the deadline-injected assembly: same refusal
+/// contract as [`connect_stack`] (the deadline never comes into play —
+/// there is no connect to bound without the driver).
+#[cfg(not(feature = "telegram"))]
+pub async fn connect_stack_with_deadline(cfg: &CyDriveConfig, deadline: Duration) -> Result<Stack> {
+    let _ = (cfg, deadline);
+    anyhow::bail!("{TELEGRAM_DRIVER_REQUIRED}")
 }
 
 /// The `push` body (contract C11): stream `local` into the drive at
@@ -1802,9 +1885,10 @@ pub async fn run_rebuild_with_driver(
 
 // ------------------------------- backend dispatch (B3b 段二b unit 5) ---
 
-/// The baidu endpoint set the dispatch assembles [`ck_baidu::BaiduParams`]
-/// with. Defaults are the production constants; tests inject a loopback
-/// mock (`build_backend_transport_with`).
+/// The baidu endpoint set the dispatch assembles the driver params
+/// with. Defaults are the production constants (empty inert strings in
+/// a binary without the driver — [`Default::default`]); tests inject a
+/// loopback mock (`build_backend_transport_with`).
 #[derive(Debug, Clone)]
 pub struct BaiduEndpoints {
     /// xpan API base (`pan.baidu.com`).
@@ -1816,10 +1900,25 @@ pub struct BaiduEndpoints {
 }
 
 impl Default for BaiduEndpoints {
+    #[cfg(feature = "baidu")]
     fn default() -> Self {
         BaiduEndpoints {
             api_base: ck_baidu::DEFAULT_API_BASE.to_string(),
             oauth_base: ck_baidu::DEFAULT_OAUTH_BASE.to_string(),
+            pcs_base: None,
+        }
+    }
+
+    /// Inert placeholders (K31 / FT2): the struct stays because the
+    /// dispatch and run signatures name it, but in a binary without the
+    /// driver no baidu surface consumes these values — every consumer
+    /// refuses with [`BAIDU_DRIVER_REQUIRED`] before any endpoint is
+    /// read.
+    #[cfg(not(feature = "baidu"))]
+    fn default() -> Self {
+        BaiduEndpoints {
+            api_base: String::new(),
+            oauth_base: String::new(),
             pcs_base: None,
         }
     }
@@ -1833,6 +1932,10 @@ impl Default for BaiduEndpoints {
 /// single-volume boot passes the cwd (`"."`), the multi-volume dispatch
 /// passes the volume's home directory — public so the per-volume
 /// path-resolution stays pinned by tests.
+///
+/// Exists only with the `baidu` feature (FT2): every caller sits inside
+/// a gated region, and the return type names the driver's params.
+#[cfg(feature = "baidu")]
 pub fn baidu_params(
     cfg: &CyDriveConfig,
     endpoints: &BaiduEndpoints,
@@ -1864,11 +1967,21 @@ pub fn baidu_params(
 /// tests pin that `backend = "baidu"` lands the `Baidu` arm). Telegram
 /// is deliberately NOT an arm: its assembly is the run flow's dedicated
 /// deadline-bounded Grammers connect (zero change — the dispatch only
-/// routes around it).
+/// routes around it). With every driver gated out the enum is
+/// uninhabited — the dispatch always refuses, so no value of this type
+/// can ever exist.
 pub enum BackendTransport {
     /// The baidu transport face over the factory-connected driver.
+    /// Exists only with the `baidu` feature (FT2): a binary without the
+    /// driver cannot assemble this arm (the dispatch refuses with
+    /// [`BAIDU_DRIVER_REQUIRED`] instead).
+    #[cfg(feature = "baidu")]
     Baidu(Arc<ck_baidu::BaiduTransport>),
     /// The local transport face over the factory-initialised driver.
+    /// Exists only with the `local` feature (FT3): a binary without the
+    /// driver cannot assemble this arm (the dispatch refuses with
+    /// [`LOCAL_DRIVER_REQUIRED`] instead).
+    #[cfg(feature = "local")]
     Local(Arc<ck_local::LocalTransport>),
 }
 
@@ -1876,8 +1989,16 @@ impl BackendTransport {
     /// The assembled volume identity (`baidu:<uid>` / `local:<root>`).
     pub fn volume(&self) -> &str {
         match self {
+            #[cfg(feature = "baidu")]
             BackendTransport::Baidu(t) => StorageDriver::volume(t.driver()).as_str(),
+            #[cfg(feature = "local")]
             BackendTransport::Local(t) => StorageDriver::volume(t.driver()).as_str(),
+            // Every driver gated out: the enum is uninhabited — no
+            // value can exist. The empty match over the dereferenced
+            // place is the never-taken arm a reference scrutinee needs
+            // (a reference alone counts as inhabited, E0004).
+            #[cfg(not(any(feature = "baidu", feature = "local")))]
+            _ => match *self {},
         }
     }
 
@@ -1885,8 +2006,12 @@ impl BackendTransport {
     /// plus the K4 `remote_delete` the faces declare).
     pub fn caps(&self) -> Capabilities {
         match self {
+            #[cfg(feature = "baidu")]
             BackendTransport::Baidu(t) => CloudTransport::capabilities(t.as_ref()),
+            #[cfg(feature = "local")]
             BackendTransport::Local(t) => CloudTransport::capabilities(t.as_ref()),
+            #[cfg(not(any(feature = "baidu", feature = "local")))]
+            _ => match *self {},
         }
     }
 
@@ -1897,10 +2022,14 @@ impl BackendTransport {
     /// sync task anyway — [`is_sync_supported`]).
     pub fn sync_namespace_key(&self) -> String {
         match self {
+            #[cfg(feature = "baidu")]
             BackendTransport::Baidu(_) => self.volume().to_string(),
+            #[cfg(feature = "local")]
             BackendTransport::Local(t) => namespace_key_for(&NamespaceIdentity::Local {
                 root: &t.driver().root_path().to_string_lossy(),
             }),
+            #[cfg(not(any(feature = "baidu", feature = "local")))]
+            _ => match *self {},
         }
     }
 
@@ -1909,8 +2038,12 @@ impl BackendTransport {
     /// stays usable).
     pub fn clone_dyn(&self) -> Arc<dyn CloudTransport> {
         match self {
+            #[cfg(feature = "baidu")]
             BackendTransport::Baidu(t) => t.clone() as Arc<dyn CloudTransport>,
+            #[cfg(feature = "local")]
             BackendTransport::Local(t) => t.clone() as Arc<dyn CloudTransport>,
+            #[cfg(not(any(feature = "baidu", feature = "local")))]
+            _ => match *self {},
         }
     }
 
@@ -1923,6 +2056,7 @@ impl BackendTransport {
     /// the boot.
     pub async fn web_quota_snapshot(&self) -> Option<cloudkit_web::QuotaSnapshot> {
         match self {
+            #[cfg(feature = "baidu")]
             BackendTransport::Baidu(t) => match StorageDriver::quota(t.driver()).await {
                 Ok(quota) => Some(cloudkit_web::QuotaSnapshot {
                     used: quota.used,
@@ -1937,7 +2071,10 @@ impl BackendTransport {
                     None
                 }
             },
+            #[cfg(feature = "local")]
             BackendTransport::Local(_) => None,
+            #[cfg(not(any(feature = "baidu", feature = "local")))]
+            _ => match *self {},
         }
     }
 }
@@ -1952,6 +2089,10 @@ impl BackendTransport {
 /// byte (the absent `backend` key IS telegram — pre-Phase-2 configs
 /// never reach this function's error).
 pub async fn build_backend_transport(cfg: &CyDriveConfig) -> Result<BackendTransport> {
+    // With the driver: production endpoints, the K13 config write-back
+    // store and the single-volume cwd state base. Without it: the
+    // reduced twin (no driver-typed parameters exist to pass).
+    #[cfg(feature = "baidu")]
     let dispatched = build_backend_transport_with(
         cfg,
         &BaiduEndpoints::default(),
@@ -1959,10 +2100,30 @@ pub async fn build_backend_transport(cfg: &CyDriveConfig) -> Result<BackendTrans
         Path::new("."),
     )
     .await?;
+    #[cfg(not(feature = "baidu"))]
+    let dispatched = build_backend_transport_with(cfg).await?;
     if let Some(warning) = proxy_ineffective_warning(cfg) {
         tracing::warn!("{warning}");
     }
     Ok(dispatched)
+}
+
+/// The local dispatch arm, shared by the `local`-feature states of
+/// [`build_backend_transport_with`] (FT3): the factory assembly over
+/// the config's root. Exists only with the `local` feature — a binary
+/// without the driver refuses in the dispatch arm (K31) instead.
+#[cfg(feature = "local")]
+async fn build_local_transport(cfg: &CyDriveConfig) -> Result<BackendTransport> {
+    // validate() guarantees Some + absolute when backend=local.
+    let root = cfg.local_root.clone().unwrap_or_default();
+    let driver = ck_local::factory(&ck_local::LocalParams {
+        root: PathBuf::from(root),
+    })
+    .await
+    .map_err(|error| anyhow::anyhow!("initialising the local backend: {error}"))?;
+    Ok(BackendTransport::Local(Arc::new(
+        ck_local::LocalTransport::new(driver),
+    )))
 }
 
 /// [`build_backend_transport`] with the endpoint set, the K13
@@ -1970,7 +2131,9 @@ pub async fn build_backend_transport(cfg: &CyDriveConfig) -> Result<BackendTrans
 /// seam (loopback mock backends; a capturing store). `state_dir` is the
 /// baidu upload-session base: single-volume callers pass the cwd (`"."`,
 /// the frozen behaviour), the multi-volume dispatch passes the volume's
-/// home directory (K21).
+/// home directory (K21). Exists only with the `baidu` feature (FT2 —
+/// the injected types live in the driver).
+#[cfg(feature = "baidu")]
 pub async fn build_backend_transport_with(
     cfg: &CyDriveConfig,
     endpoints: &BaiduEndpoints,
@@ -1978,11 +2141,24 @@ pub async fn build_backend_transport_with(
     state_dir: &Path,
 ) -> Result<BackendTransport> {
     match cfg.backend {
-        Backend::Telegram => anyhow::bail!(
-            "the telegram backend does not assemble through the backend dispatch: the run \
-             flow connects it through its own deadline-bounded GrammersTransport path \
-             (unchanged since pre-Phase-2); a config without the backend key is telegram"
-        ),
+        Backend::Telegram => {
+            // With the driver: the legacy arm's guidance — the run flow
+            // owns the connect (byte-for-byte since pre-Phase-2).
+            // Without the driver: the run flow cannot connect it either,
+            // so the arm carries the actionable rebuild message (K31).
+            #[cfg(feature = "telegram")]
+            {
+                anyhow::bail!(
+                    "the telegram backend does not assemble through the backend dispatch: the run \
+                     flow connects it through its own deadline-bounded GrammersTransport path \
+                     (unchanged since pre-Phase-2); a config without the backend key is telegram"
+                )
+            }
+            #[cfg(not(feature = "telegram"))]
+            {
+                anyhow::bail!("{TELEGRAM_DRIVER_REQUIRED}")
+            }
+        }
         Backend::Baidu => {
             let params = baidu_params(cfg, endpoints, token_store, state_dir);
             let driver = ck_baidu::factory(&params)
@@ -1993,16 +2169,54 @@ pub async fn build_backend_transport_with(
             )))
         }
         Backend::Local => {
-            // validate() guarantees Some + absolute when backend=local.
-            let root = cfg.local_root.clone().unwrap_or_default();
-            let driver = ck_local::factory(&ck_local::LocalParams {
-                root: PathBuf::from(root),
-            })
-            .await
-            .map_err(|error| anyhow::anyhow!("initialising the local backend: {error}"))?;
-            Ok(BackendTransport::Local(Arc::new(
-                ck_local::LocalTransport::new(driver),
-            )))
+            // With the driver: the factory assembly sharing
+            // [`build_local_transport`] (validate() guarantees Some +
+            // absolute when backend=local). Without it: the actionable
+            // rebuild message (K31).
+            #[cfg(feature = "local")]
+            {
+                build_local_transport(cfg).await
+            }
+            #[cfg(not(feature = "local"))]
+            {
+                anyhow::bail!("{LOCAL_DRIVER_REQUIRED}")
+            }
+        }
+    }
+}
+
+/// The no-driver twin (K31 / FT2): the baidu arm carries the actionable
+/// rebuild message — the binary cannot assemble a baidu transport —
+/// while the telegram arm keeps its [`build_backend_transport_with`]
+/// guidance pair and the local arm follows the `local` feature (FT3:
+/// the factory assembly on, the K31 rebuild message off).
+#[cfg(not(feature = "baidu"))]
+pub async fn build_backend_transport_with(cfg: &CyDriveConfig) -> Result<BackendTransport> {
+    match cfg.backend {
+        Backend::Telegram => {
+            #[cfg(feature = "telegram")]
+            {
+                anyhow::bail!(
+                    "the telegram backend does not assemble through the backend dispatch: the run \
+                     flow connects it through its own deadline-bounded GrammersTransport path \
+                     (unchanged since pre-Phase-2); a config without the backend key is telegram"
+                )
+            }
+            #[cfg(not(feature = "telegram"))]
+            {
+                anyhow::bail!("{TELEGRAM_DRIVER_REQUIRED}")
+            }
+        }
+        Backend::Baidu => anyhow::bail!("{BAIDU_DRIVER_REQUIRED}"),
+        Backend::Local => {
+            #[cfg(feature = "local")]
+            {
+                build_local_transport(cfg).await
+            }
+            #[cfg(not(feature = "local"))]
+            {
+                anyhow::bail!("{LOCAL_DRIVER_REQUIRED}")
+            }
         }
     }
 }
@@ -2020,10 +2234,16 @@ pub async fn build_backend_transport_with(
 /// missing/unparsable file means the credentials arrived via env
 /// (`CYDRIVE_BAIDU_*` outrank the file anyway — the operator owns that
 /// rotation), which the warning names.
+///
+/// Exists only with the `baidu` feature (FT2): its behavior IS the
+/// driver's [`ck_baidu::TokenStore`] seam — a binary without the driver
+/// has no token rotation to persist.
+#[cfg(feature = "baidu")]
 pub struct ConfigTokenStore {
     path: PathBuf,
 }
 
+#[cfg(feature = "baidu")]
 impl ConfigTokenStore {
     /// Targets `path` (production: `config.toml` in the cwd —
     /// [`ConfigTokenStore::default`]; tests inject a temp file).
@@ -2032,6 +2252,7 @@ impl ConfigTokenStore {
     }
 }
 
+#[cfg(feature = "baidu")]
 impl Default for ConfigTokenStore {
     fn default() -> Self {
         ConfigTokenStore {
@@ -2040,6 +2261,7 @@ impl Default for ConfigTokenStore {
     }
 }
 
+#[cfg(feature = "baidu")]
 impl ck_baidu::TokenStore for ConfigTokenStore {
     fn save_tokens(&self, access_token: &str, refresh_token: &str) {
         // Light single-file I/O on the refresh path (a few KiB) — the
@@ -2127,12 +2349,18 @@ pub enum BackendProbe {
 /// (no probe artifacts in the user's drive); it is discovered on the
 /// first upload after setup. Bounded by 45s so a dead network cannot
 /// hang an interactive doctor run.
+///
+/// Exists only with the `baidu` feature (FT2 / K31): a binary without
+/// the driver has no token to probe — doctor skips the baidu liveness
+/// leg entirely instead of reporting a fake Unreachable.
+#[cfg(feature = "baidu")]
 pub async fn baidu_backend_probe(cfg: &CyDriveConfig) -> BackendProbe {
     baidu_backend_probe_with(cfg, &BaiduEndpoints::default()).await
 }
 
 /// [`baidu_backend_probe`] with the endpoint set injected (tests point
 /// it at a loopback mock).
+#[cfg(feature = "baidu")]
 pub async fn baidu_backend_probe_with(
     cfg: &CyDriveConfig,
     endpoints: &BaiduEndpoints,
@@ -2191,6 +2419,11 @@ pub async fn baidu_backend_probe_with(
 async fn build_driver(cfg: &CyDriveConfig) -> Result<Arc<dyn StorageDriver>> {
     match cfg.backend {
         Backend::Telegram => anyhow::bail!("{TELEGRAM_REBUILD_REFUSAL}"),
+        // With the driver: the factory assembly sharing [`baidu_params`]
+        // with the transport dispatch. Without it: the actionable
+        // rebuild message (K31) — `rebuild` cannot walk a backend the
+        // binary cannot talk to.
+        #[cfg(feature = "baidu")]
         Backend::Baidu => {
             let params = baidu_params(
                 cfg,
@@ -2203,6 +2436,13 @@ async fn build_driver(cfg: &CyDriveConfig) -> Result<Arc<dyn StorageDriver>> {
                 .map_err(|error| anyhow::anyhow!("connecting the baidu backend: {error}"))?;
             Ok(driver)
         }
+        #[cfg(not(feature = "baidu"))]
+        Backend::Baidu => anyhow::bail!("{BAIDU_DRIVER_REQUIRED}"),
+        // With the driver: the factory assembly (validate() guarantees
+        // Some + absolute when backend=local). Without it: the
+        // actionable rebuild message (K31) — `rebuild` cannot walk a
+        // volume the binary cannot index.
+        #[cfg(feature = "local")]
         Backend::Local => {
             // validate() guarantees Some + absolute when backend=local.
             let root = cfg.local_root.clone().unwrap_or_default();
@@ -2213,6 +2453,8 @@ async fn build_driver(cfg: &CyDriveConfig) -> Result<Arc<dyn StorageDriver>> {
             .map_err(|error| anyhow::anyhow!("initialising the local backend: {error}"))?;
             Ok(driver)
         }
+        #[cfg(not(feature = "local"))]
+        Backend::Local => anyhow::bail!("{LOCAL_DRIVER_REQUIRED}"),
     }
 }
 
@@ -3034,4 +3276,36 @@ pub fn run_migrate(store: &dyn CredentialStore) -> Result<String> {
          for a one-time sign-in"
     );
     Ok(report)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn compiled_drivers_lists_the_feature_set_in_fixed_order() {
+        // K32: the `--version` banner's `(drivers: ...)` segment. Every
+        // arm is a cfg-gated literal — no runtime feature probing — so
+        // exactly one assertion is compiled per build and it pins the
+        // expected list for that feature combination: fixed order
+        // telegram, baidu, local; the all-off build reports `none`.
+        let drivers = compiled_drivers();
+
+        #[cfg(all(feature = "telegram", feature = "baidu", feature = "local"))]
+        assert_eq!(drivers, "telegram, baidu, local");
+        #[cfg(all(feature = "telegram", feature = "baidu", not(feature = "local")))]
+        assert_eq!(drivers, "telegram, baidu");
+        #[cfg(all(feature = "telegram", not(feature = "baidu"), feature = "local"))]
+        assert_eq!(drivers, "telegram, local");
+        #[cfg(all(not(feature = "telegram"), feature = "baidu", feature = "local"))]
+        assert_eq!(drivers, "baidu, local");
+        #[cfg(all(feature = "telegram", not(feature = "baidu"), not(feature = "local")))]
+        assert_eq!(drivers, "telegram");
+        #[cfg(all(not(feature = "telegram"), feature = "baidu", not(feature = "local")))]
+        assert_eq!(drivers, "baidu");
+        #[cfg(all(not(feature = "telegram"), not(feature = "baidu"), feature = "local"))]
+        assert_eq!(drivers, "local");
+        #[cfg(not(any(feature = "telegram", feature = "baidu", feature = "local")))]
+        assert_eq!(drivers, "none");
+    }
 }

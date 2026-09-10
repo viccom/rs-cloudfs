@@ -1,3 +1,9 @@
+#![cfg(feature = "telegram")]
+//! Telegram-gated (FT1): the contract is the telegram connect's deadline
+//! guard; a binary without the driver has no connect to bound (the
+//! `connect_stack_with_deadline` twin refuses immediately, K31), so the
+//! whole file only exists with the driver.
+//!
 //! RED-phase test for the connect deadline on the one-shot data-channel
 //! stack (review H1, plan `docs/plans/2026-09-04-tier1-review-fixes.md`
 //! F1).

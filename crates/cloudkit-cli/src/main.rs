@@ -23,22 +23,44 @@ use std::path::PathBuf;
 use std::sync::Arc;
 
 use anyhow::{Context, Result};
+#[cfg(feature = "telegram")]
 use ck_telegram::transport::GrammersTransport;
 use clap::{Parser, Subcommand};
-use cloudkit_cli::{
-    discover_config, discover_config_with_volumes, BaiduEndpoints, ConfigTokenStore,
-    DiscoveredConfig, VolumeStatus,
-};
+use cloudkit_cli::{discover_config, discover_config_with_volumes, DiscoveredConfig, VolumeStatus};
+// Baidu-only run-flow glue (FT2): the endpoint set and the K13
+// write-back store exist only with the driver.
+#[cfg(feature = "baidu")]
+use cloudkit_cli::{BaiduEndpoints, ConfigTokenStore};
 use cloudkit_core::config::{Backend, CyDriveConfig, VolumeConfig};
 use cloudkit_core::logging::LogConfig;
+#[cfg(feature = "telegram")]
 use cloudkit_core::rel_path::RelPath;
 
 /// CyDrive — Telegram as an unlimited cloud drive, served over WebDAV.
 #[derive(Debug, Parser)]
-#[command(name = "cydrive", version, about)]
+#[command(name = "cydrive", version = version_line(), about)]
 struct Cli {
     #[command(subcommand)]
     command: Command,
+}
+
+/// The `--version` payload (K32): the crate version plus the
+/// compiled-in driver list — e.g. `0.10.0 (drivers: telegram, baidu,
+/// local)`; a build with every driver feature off reports
+/// `(drivers: none)`. Serves both `-V` and `--version` through clap's
+/// `version` attribute. The `&'static str` return keeps clap's
+/// non-`string`-feature `From<&'static str>` path; the once-built line
+/// lives in the static.
+fn version_line() -> &'static str {
+    static LINE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+    LINE.get_or_init(|| {
+        format!(
+            "{} (drivers: {})",
+            env!("CARGO_PKG_VERSION"),
+            cloudkit_cli::compiled_drivers()
+        )
+    })
+    .as_str()
 }
 
 #[derive(Debug, Subcommand)]
@@ -176,7 +198,9 @@ async fn main() -> Result<()> {
 
 /// The run() gates shared by the data channel: without a bot token +
 /// chat id the Telegram connect cannot succeed, so fail with the same
-/// actionable message instead of a transport error.
+/// actionable message instead of a transport error. Telegram-only (the
+/// data channel has no other backend), hence gated with the driver.
+#[cfg(feature = "telegram")]
 fn require_configured(cfg: &CyDriveConfig) -> Result<()> {
     cfg.validate().context("invalid configuration")?;
     if !cfg.is_configured() {
@@ -243,58 +267,85 @@ async fn status_cmd() -> Result<()> {
 /// row's terminal state. A degraded upload keeps its local copy and
 /// retries on the next run.
 async fn push_cmd(path: PathBuf, dest: Option<String>) -> Result<()> {
-    let cfg = discover_config().context("config discovery failed")?;
-    require_configured(&cfg)?;
-    let file_name = path
-        .file_name()
-        .and_then(|name| name.to_str())
-        .with_context(|| format!("the source path {} carries no file name", path.display()))?;
-    let dest = dest.unwrap_or_else(|| format!("/{file_name}"));
-    let dest = RelPath::new(&dest)
-        .with_context(|| format!("invalid drive path {dest:?} (drive paths start with \"/\")"))?;
-
-    let stack = cloudkit_cli::connect_stack(&cfg).await?;
-    let pushed = cloudkit_cli::push_file(&stack.vfs, &path, &dest).await?;
-    println!("pushed {pushed} bytes; draining the upload queue ...");
-    stack.shutdown().await;
-
-    let terminal = stack
-        .db
-        .get_file(dest.as_str())
-        .context("reading the pushed file's terminal state")?
-        .filter(|row| row.is_uploaded);
-    match terminal {
-        Some(row) => println!(
-            "uploaded: {} ({})",
-            dest.as_str(),
-            cloudkit_cli::format_storage_size(row.size)
-        ),
-        None => println!(
-            "queued but not uploaded yet (degraded or still pending); will retry on next run"
-        ),
+    // The data channel is telegram-only: a binary without the driver
+    // refuses up front (K31) instead of surfacing telegram-credential
+    // gates first (FT1).
+    #[cfg(not(feature = "telegram"))]
+    {
+        let _ = (&path, &dest);
+        anyhow::bail!(
+            "`cydrive push` needs the telegram driver: {}",
+            cloudkit_cli::TELEGRAM_DRIVER_REQUIRED
+        )
     }
-    Ok(())
+    #[cfg(feature = "telegram")]
+    {
+        let cfg = discover_config().context("config discovery failed")?;
+        require_configured(&cfg)?;
+        let file_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .with_context(|| format!("the source path {} carries no file name", path.display()))?;
+        let dest = dest.unwrap_or_else(|| format!("/{file_name}"));
+        let dest = RelPath::new(&dest).with_context(|| {
+            format!("invalid drive path {dest:?} (drive paths start with \"/\")")
+        })?;
+
+        let stack = cloudkit_cli::connect_stack(&cfg).await?;
+        let pushed = cloudkit_cli::push_file(&stack.vfs, &path, &dest).await?;
+        println!("pushed {pushed} bytes; draining the upload queue ...");
+        stack.shutdown().await;
+
+        let terminal = stack
+            .db
+            .get_file(dest.as_str())
+            .context("reading the pushed file's terminal state")?
+            .filter(|row| row.is_uploaded);
+        match terminal {
+            Some(row) => println!(
+                "uploaded: {} ({})",
+                dest.as_str(),
+                cloudkit_cli::format_storage_size(row.size)
+            ),
+            None => println!(
+                "queued but not uploaded yet (degraded or still pending); will retry on next run"
+            ),
+        }
+        Ok(())
+    }
 }
 
 /// `cydrive pull`: hydrate a drive file (downloading from Telegram when
 /// the local cache is cold) and copy it out to a local path.
 async fn pull_cmd(path: String, out: PathBuf) -> Result<()> {
-    let cfg = discover_config().context("config discovery failed")?;
-    require_configured(&cfg)?;
-    let rel = RelPath::new(&path).with_context(|| format!("invalid drive path {path:?}"))?;
+    // Telegram-only refusal up front — see `push_cmd` (K31, FT1).
+    #[cfg(not(feature = "telegram"))]
+    {
+        let _ = (&path, &out);
+        anyhow::bail!(
+            "`cydrive pull` needs the telegram driver: {}",
+            cloudkit_cli::TELEGRAM_DRIVER_REQUIRED
+        )
+    }
+    #[cfg(feature = "telegram")]
+    {
+        let cfg = discover_config().context("config discovery failed")?;
+        require_configured(&cfg)?;
+        let rel = RelPath::new(&path).with_context(|| format!("invalid drive path {path:?}"))?;
 
-    let stack = cloudkit_cli::connect_stack(&cfg).await?;
-    let pulled_to = cloudkit_cli::pull_file(&stack.vfs, &rel, &out).await?;
-    let bytes = std::fs::metadata(&pulled_to)
-        .with_context(|| format!("reading the pulled file {}", pulled_to.display()))?
-        .len();
-    println!(
-        "pulled: {} -> {} ({bytes} bytes)",
-        rel.as_str(),
-        pulled_to.display()
-    );
-    stack.shutdown().await;
-    Ok(())
+        let stack = cloudkit_cli::connect_stack(&cfg).await?;
+        let pulled_to = cloudkit_cli::pull_file(&stack.vfs, &rel, &out).await?;
+        let bytes = std::fs::metadata(&pulled_to)
+            .with_context(|| format!("reading the pulled file {}", pulled_to.display()))?
+            .len();
+        println!(
+            "pulled: {} -> {} ({bytes} bytes)",
+            rel.as_str(),
+            pulled_to.display()
+        );
+        stack.shutdown().await;
+        Ok(())
+    }
 }
 
 /// `cydrive cache stats|clear`: local-disk cache inspection and cleanup
@@ -535,6 +586,10 @@ async fn doctor_cmd() -> Result<()> {
         }
         cloudkit_core::config::Backend::Baidu => {
             results.extend(cloudkit_cli::doctor::backend_checks(&cfg));
+            // The live token probe needs the driver (FT2 / K31): a
+            // binary without it skips the liveness leg instead of
+            // reporting a fake Unreachable.
+            #[cfg(feature = "baidu")]
             results.push(cloudkit_cli::doctor::baidu_connectivity_check(
                 &cloudkit_cli::baidu_backend_probe(&cfg).await,
             ));
@@ -762,16 +817,24 @@ async fn run_multi_volume(
                     name = spec.name,
                     backend = backend.as_str()
                 );
-                // K13/K21: token rotations write back into the volume's
-                // own file; upload sessions live in the volume home.
-                let token_store = ConfigTokenStore::new(spec.file_path.clone());
-                let dispatched = cloudkit_cli::build_backend_transport_with(
-                    &settings,
-                    &BaiduEndpoints::default(),
-                    Some(Arc::new(token_store)),
-                    &home,
-                )
-                .await?;
+                // With the driver: K13/K21 — token rotations write back
+                // into the volume's own file; upload sessions live in
+                // the volume home. Without it: the reduced twin (K31 —
+                // a baidu volume refuses with the rebuild message; a
+                // local volume assembles unchanged).
+                #[cfg(feature = "baidu")]
+                let dispatched = {
+                    let token_store = ConfigTokenStore::new(spec.file_path.clone());
+                    cloudkit_cli::build_backend_transport_with(
+                        &settings,
+                        &BaiduEndpoints::default(),
+                        Some(Arc::new(token_store)),
+                        &home,
+                    )
+                    .await?
+                };
+                #[cfg(not(feature = "baidu"))]
+                let dispatched = cloudkit_cli::build_backend_transport_with(&settings).await?;
                 run_options.sync_namespace = Some(dispatched.sync_namespace_key());
                 run_options.web_volume = Some(dispatched.volume().to_string());
                 run_options.web_quota = dispatched.web_quota_snapshot().await;
@@ -849,6 +912,7 @@ async fn run_multi_volume(
 /// directory — the process cwd for a single-volume boot, the volume's
 /// home directory in multi-volume mode (K21). Returns `None` when Ctrl+C
 /// won the race (the caller exits cleanly).
+#[cfg(feature = "telegram")]
 async fn connect_telegram_volume(
     cfg: &CyDriveConfig,
     state_base: &std::path::Path,
@@ -883,4 +947,17 @@ async fn connect_telegram_volume(
         }
     };
     Ok(Some(Arc::new(transport)))
+}
+
+/// The no-driver twin (K31): the signature is identical so both run
+/// flows' telegram arms stay compilable unchanged; a boot that reaches
+/// the telegram connect in a binary built without the driver gets the
+/// actionable rebuild message instead of a connect attempt.
+#[cfg(not(feature = "telegram"))]
+async fn connect_telegram_volume(
+    cfg: &CyDriveConfig,
+    state_base: &std::path::Path,
+) -> Result<Option<Arc<dyn cloudkit_core::transport::CloudTransport>>> {
+    let _ = (cfg, state_base);
+    anyhow::bail!("{}", cloudkit_cli::TELEGRAM_DRIVER_REQUIRED)
 }
