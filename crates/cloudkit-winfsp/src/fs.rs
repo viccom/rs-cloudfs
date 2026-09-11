@@ -508,6 +508,30 @@ impl Handle {
     }
 }
 
+/// The row stat a parked read state was parked under — the freshness
+/// witnesses a reopen's fresh row must match for the reuse to happen
+/// (review H1: the size, plus the mtime since the low-items batch — a
+/// same-size recreate's only tell). Exact equality is the point: both
+/// sides come from the same db column through the same read path, so a
+/// mismatch can only mean "a different file behind this path".
+#[derive(Clone, Copy, PartialEq, Debug)]
+struct RowWitness {
+    /// Row size in bytes.
+    size: u64,
+    /// Row mtime, fractional Unix seconds.
+    mtime: f64,
+}
+
+impl RowWitness {
+    /// The witness for `meta`'s row.
+    fn of(meta: &Meta) -> Self {
+        Self {
+            size: meta.size,
+            mtime: meta.mtime,
+        }
+    }
+}
+
 /// One entry of the K41 grace table: the read state of a closed handle
 /// plus the moment it stops being reusable.
 struct GraceEntry {
@@ -515,11 +539,12 @@ struct GraceEntry {
     read: Arc<AsyncMutex<ReadHandle>>,
     /// `Instant` after which a reopen must build a fresh state.
     expires_at: Instant,
-    /// The row size the state was parked under (the handle's stat
+    /// The row stat the state was parked under (the handle's stat
     /// snapshot). Review H1: a delete + recreate behind the same path
     /// leaves the parked state describing a file that no longer exists —
-    /// the reopen's fresh row size is the witness that discards it.
-    size: u64,
+    /// the reopen's fresh row is the witness that discards it (size
+    /// first; the mtime covers the same-size recreate).
+    witness: RowWitness,
 }
 
 /// The handle grace table (K41), keyed by path.
@@ -550,8 +575,8 @@ impl GraceTable {
 
     /// Parks `read` under `rel`, sweeping expired entries and keeping
     /// the table within `capacity` (the entry closest to expiry — the
-    /// oldest close — goes first). `size` is the row size the state was
-    /// parked under (the handle's stat snapshot).
+    /// oldest close — goes first). `witness` is the row stat the state
+    /// was parked under (the handle's stat snapshot).
     fn park(
         &mut self,
         rel: RelPath,
@@ -559,7 +584,7 @@ impl GraceTable {
         expires_at: Instant,
         now: Instant,
         capacity: usize,
-        size: u64,
+        witness: RowWitness,
     ) {
         self.prune_expired(now);
         self.entries.insert(
@@ -567,7 +592,7 @@ impl GraceTable {
             GraceEntry {
                 read,
                 expires_at,
-                size,
+                witness,
             },
         );
         while self.entries.len() > capacity.max(1) {
@@ -588,19 +613,21 @@ impl GraceTable {
     }
 
     /// Takes the live entry for `rel`, if any. Expired entries are
-    /// dropped, never handed out; so is a parked state whose size
-    /// disagrees with the reopened row's size — it describes a different
+    /// dropped, never handed out; so is a parked state whose size OR
+    /// mtime disagrees with the reopened row — it describes a different
     /// file behind the same path (review H1: delete + recreate inside the
-    /// grace window reused the parked EOF and truncated the new file).
+    /// grace window reused the parked EOF and truncated the new file; the
+    /// low-items batch added the mtime witness for the same-size
+    /// recreate, whose size alone cannot expose it).
     fn take_live(
         &mut self,
         rel: &RelPath,
         now: Instant,
-        row_size: u64,
+        fresh: RowWitness,
     ) -> Option<Arc<AsyncMutex<ReadHandle>>> {
         self.prune_expired(now);
         match self.entries.remove(rel) {
-            Some(entry) if entry.size == row_size => Some(entry.read),
+            Some(entry) if entry.witness == fresh => Some(entry.read),
             Some(_) => None,
             None => None,
         }
@@ -880,7 +907,7 @@ impl CloudFs {
             // serves metadata and enumeration.
             None
         } else {
-            Some(self.acquire_read(&canonical, meta.size)?)
+            Some(self.acquire_read(&canonical, RowWitness::of(&meta))?)
         };
         Ok(Handle::new(canonical, meta, read))
     }
@@ -898,20 +925,20 @@ impl CloudFs {
     /// The read state for one file open: the parked one when the K41
     /// grace table still holds it, otherwise a fresh K33 dispatch.
     ///
-    /// `row_size` is the fresh row's size (review H1): a parked state
-    /// whose size disagrees describes a different file behind the same
-    /// path and is discarded instead of reused.
+    /// `fresh` comes from the freshly read row (review H1): a parked
+    /// state whose witness disagrees describes a different file behind
+    /// the same path and is discarded instead of reused.
     fn acquire_read(
         &self,
         rel: &RelPath,
-        row_size: u64,
+        fresh: RowWitness,
     ) -> std::result::Result<Arc<AsyncMutex<ReadHandle>>, FspError> {
         let now = Instant::now();
         if let Some(parked) = self
             .grace
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take_live(rel, now, row_size)
+            .take_live(rel, now, fresh)
         {
             return Ok(parked);
         }
@@ -1499,11 +1526,28 @@ pub fn rel_from_winfsp(file_name: &U16CStr) -> std::result::Result<RelPath, FspE
 
 /// Unix seconds -> FILETIME (100 ns ticks since 1601), clamped at the
 /// Unix epoch for the db's occasional `0.0` / negative leftovers.
+///
+/// Integer-domain on purpose (review Low "unix_to_filetime precision"):
+/// current-epoch tick counts (~1.7e16) exceed 2^53, so an f64 product
+/// `seconds * 1e7` rounds onto a 2-tick grid and `floor` drifts off the
+/// true quantization. Here the whole seconds and the fractional second
+/// are quantized separately (the fraction's own f64 error is below one
+/// tick's worth of representation granularity at row timestamps), a
+/// fraction rounding up to a full second carries into it, and the tick
+/// math saturates rather than wrapping on absurd inputs.
 pub fn unix_to_filetime(seconds: f64) -> u64 {
     if !seconds.is_finite() || seconds <= 0.0 {
         return WINDOWS_EPOCH_OFFSET;
     }
-    WINDOWS_EPOCH_OFFSET + (seconds * 10_000_000.0).floor() as u64
+    let whole = seconds.trunc();
+    let secs = whole as u64;
+    let frac = ((seconds - whole) * 10_000_000.0).round() as u64;
+    let (secs, frac) = if frac >= 10_000_000 {
+        (secs + 1, frac - 10_000_000)
+    } else {
+        (secs, frac)
+    };
+    WINDOWS_EPOCH_OFFSET.saturating_add(secs.saturating_mul(10_000_000).saturating_add(frac))
 }
 
 /// FILETIME -> Unix seconds, the inverse of [`unix_to_filetime`].
@@ -1677,16 +1721,17 @@ impl FileSystemContext for CloudFs {
         // handles have no read state, and their DirBuffer drops with the
         // handle as always (that drop is the DLL's own delete hook).
         //
-        // The parked entry records the stat size it was parked under, so
-        // a reopen whose fresh row disagrees (delete + recreate behind
-        // the same path — review H1) discards it instead of reusing it.
-        // Directory handles have no read state; `meta()` on one reports
-        // 0 and is never parked.
+        // The parked entry records the row stat (size AND mtime) it was
+        // parked under, so a reopen whose fresh row disagrees (delete +
+        // recreate behind the same path — review H1, including the
+        // same-size recreate whose mtime is the only witness) discards it
+        // instead of reusing it. Directory handles have no read state;
+        // `meta()` on one reports 0 and is never parked.
         //
         // A staged writer that never reached `cleanup` (WinFsp always
         // posts one, so this is the never-reached safety net) drops with
         // the handle and removes its staging sibling.
-        let size = context.meta().size;
+        let witness = RowWitness::of(&context.meta());
         let (rel, read) = context.into_grace_parts();
         let Some(read) = read else { return };
         let now = Instant::now();
@@ -1699,7 +1744,7 @@ impl FileSystemContext for CloudFs {
                 now + self.grace_period,
                 now,
                 self.grace_capacity,
-                size,
+                witness,
             );
     }
 
@@ -1916,10 +1961,10 @@ impl FileSystemContext for CloudFs {
                 // no row to dispatch on). Acquiring it lazily is what
                 // makes a post-cleanup read on the same handle work —
                 // WF0's cache-first probe makes the just-committed copy
-                // the local arm. The fresh row's size rides along as the
+                // the local arm. The fresh row's stat rides along as the
                 // grace-reuse witness (review H1).
-                let row_size = self.meta_for(context.rel())?.size;
-                let state = self.acquire_read(context.rel(), row_size)?;
+                let row = self.meta_for(context.rel())?;
+                let state = self.acquire_read(context.rel(), RowWitness::of(&row))?;
                 context.set_read_state(Some(Arc::clone(&state)));
                 state
             }

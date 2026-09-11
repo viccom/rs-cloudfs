@@ -127,6 +127,18 @@ fn desanitize_segment(name: &str) -> String {
     out.extend(tail.into_iter().rev());
     // 2. The leading markers: `%7E` before a literal-`~` segment, `~`
     //    before a reserved stem.
+    //    Known ambiguity, deliberately kept (review M2 residual,
+    //    low-items batch): a LEGACY (pre-sanitization) disk segment that
+    //    starts with a literal `~` and whose remainder is a reserved stem
+    //    (`~nul.txt`) decodes to the reserved name (`nul.txt`) instead of
+    //    the literal `~nul.txt`. New writes encode a literal `~` as
+    //    `%7E`, so the shape only arises in old copies — which miss by
+    //    name and re-hydrate anyway — and the worst case is an
+    //    eviction/pending-clear matching a name whose file was never
+    //    written under the new scheme (the two spellings never coexist on
+    //    disk). Removing it would need a third escape token and would
+    //    strand every existing disk name, so the ambiguity is documented
+    //    rather than "fixed".
     if let Some(rest) = out.strip_prefix("%7E") {
         out = format!("~{rest}");
     } else if let Some(rest) = out.strip_prefix('~') {

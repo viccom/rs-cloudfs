@@ -29,7 +29,8 @@ use cloudkit_core::transport::CloudTransport;
 use cloudkit_core::upload_queue::RetryPolicy;
 use cloudkit_core::vfs::{Vfs, VfsConfig};
 use cloudkit_winfsp::fs::{
-    fill_dir_info, rel_from_winfsp, unix_to_filetime, CloudFs, DirEntry, Meta, VOLUME_HEADROOM,
+    filetime_to_unix, fill_dir_info, rel_from_winfsp, unix_to_filetime, CloudFs, DirEntry, Meta,
+    VOLUME_HEADROOM,
 };
 use winfsp::filesystem::{DirInfo, FileInfo, FileSystemContext, VolumeInfo};
 use winfsp::U16CStr;
@@ -449,6 +450,54 @@ fn unix_seconds_convert_to_filetime() {
         116_444_736_000_000_000,
         "pre-epoch values clamp to the Unix epoch rather than wrapping u64"
     );
+}
+
+/// FILETIME conversion, integer domain (review Low "unix_to_filetime
+/// precision"): the old `(seconds * 1e7).floor()` ran in the f64 domain
+/// where current-epoch tick counts (~1.7e16) exceed 2^53 — the product
+/// rounds onto a 2-tick grid and `floor` drifts off the true quantization.
+/// The integer-domain conversion quantizes the fractional second on its
+/// own and carries a fraction rounding up to a full second.
+#[test]
+fn unix_seconds_convert_to_filetime_in_the_integer_domain() {
+    // The drift witness: the f64 nearest 1_700_000_000.051 holds a
+    // fraction of ~0.0510001 s (the 2.4e-7 s representation grid at
+    // 1.7e9), which quantizes to 510_001 ticks. The old f64 product
+    // landed two ticks high and `floor` kept 510_002.
+    assert_eq!(
+        unix_to_filetime(1_700_000_000.051),
+        T_1_700_000_000_FILETIME + 510_001,
+        "the fractional second is quantized in its own domain, not through \
+         an f64 product above 2^53"
+    );
+    // Carry: a fraction that rounds up to a full second moves the second
+    // (the old floor kept it a tick below the next second).
+    assert_eq!(
+        unix_to_filetime(0.99999995),
+        116_444_736_000_000_000 + 10_000_000,
+        "a fraction rounding to 1e7 ticks carries into the second"
+    );
+    // Quantization stays tick-true for exact halves and whole seconds.
+    assert_eq!(
+        unix_to_filetime(1_700_000_000.5),
+        T_1_700_000_000_FILETIME + 5_000_000
+    );
+    // Roundtrip through the inverse at fraction-carrying values.
+    for seconds in [1_700_000_000.5, 1_700_000_001.25, 1234.0] {
+        assert_eq!(
+            filetime_to_unix(unix_to_filetime(seconds)),
+            Some(seconds),
+            "filetime roundtrip for {seconds}"
+        );
+    }
+    // Non-finite and non-positive inputs clamp to the epoch offset.
+    for clamped in [0.0, -1.0, f64::NAN, f64::NEG_INFINITY] {
+        assert_eq!(
+            unix_to_filetime(clamped),
+            116_444_736_000_000_000,
+            "{clamped} clamps to the Unix epoch"
+        );
+    }
 }
 
 /// The adapter carries the injected runtime (WF2's async bridge depends

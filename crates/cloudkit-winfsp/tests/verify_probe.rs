@@ -6,8 +6,9 @@
 //! red first against the buggy tree, then turned green by its fix):
 //! - C1: a case-only rename is a legal rename — row and cache copy move
 //!   with it, nothing is destroyed or refused;
-//! - H1: a grace-table entry whose size disagrees with the fresh row is
-//!   stale (delete + recreate behind the same path) and is discarded;
+//! - H1: a grace-table entry whose size OR mtime disagrees with the fresh
+//!   row is stale (delete + recreate behind the same path — different
+//!   size, or same size with a different mtime) and is discarded;
 //! - H2: a db row with a non-vpath rel_path answers an error status, the
 //!   callback never panics;
 //! - H4: a failed cleanup commit keeps the bytes and the pending row, and
@@ -38,7 +39,7 @@ use std::time::Duration;
 use cloudkit_core::database::{FileUpsert, MetaDatabase};
 use cloudkit_core::rel_path::RelPath;
 use cloudkit_core::transport::mock::MockTransport;
-use cloudkit_core::transport::{Capabilities, CloudTransport};
+use cloudkit_core::transport::{Capabilities, CloudTransport, UploadJob};
 use cloudkit_core::upload_queue::RetryPolicy;
 use cloudkit_core::vfs::{Vfs, VfsConfig};
 use cloudkit_winfsp::fs::{CloudFs, DirEntry, Handle};
@@ -79,9 +80,8 @@ fn range_caps() -> Capabilities {
 struct Harness {
     _dir: tempfile::TempDir,
     db: Arc<MetaDatabase>,
-    /// Read by the pending review-fix probes (RB2+); silenced until their
-    /// batches land.
-    #[allow(dead_code)]
+    /// Remote storage for the probes that exercise the streaming arm
+    /// (cache-copy-free rows against the connected mock).
     mock: Arc<MockTransport>,
     vfs: Arc<Vfs>,
     fs: CloudFs,
@@ -178,6 +178,19 @@ impl Harness {
     }
 
     fn seed_row(&self, rel: &str, size: i64, is_uploaded: bool, msg_id: Option<i64>) {
+        self.seed_row_mtime(rel, size, 1_700_000_000.0, is_uploaded, msg_id);
+    }
+
+    /// [`Self::seed_row`] with an explicit mtime — the witness the
+    /// same-size-recreate probe discriminates on.
+    fn seed_row_mtime(
+        &self,
+        rel: &str,
+        size: i64,
+        mtime: f64,
+        is_uploaded: bool,
+        msg_id: Option<i64>,
+    ) {
         let rel_path = RelPath::new(rel).expect("valid rel path");
         self.db
             .upsert_file(&FileUpsert {
@@ -188,7 +201,7 @@ impl Harness {
                     .map(|parent| parent.as_str().to_string())
                     .unwrap_or_else(|| "/".to_string()),
                 size,
-                mtime: 1_700_000_000.0,
+                mtime,
                 sha256: None,
                 is_dir: false,
                 telegram_msg_id: msg_id,
@@ -199,6 +212,29 @@ impl Harness {
                 mime_type: None,
             })
             .expect("seed files row");
+    }
+
+    /// Puts `bytes` on the mock remote under `rel` (a scratch file powers
+    /// the upload) and returns the allocated first msg id — the handle the
+    /// streaming arm needs to read the bytes back. Requires a connected
+    /// mock.
+    fn upload_to_mock(&self, rel: &str, bytes: &[u8]) -> i64 {
+        let dir = tempfile::tempdir().expect("scratch dir");
+        let local = dir.path().join("payload.bin");
+        fs::write(&local, bytes).expect("write scratch payload");
+        let job = UploadJob {
+            rel_path: RelPath::new(rel).expect("valid rel path"),
+            local_path: local,
+            size: bytes.len() as u64,
+            chunk_count: 1,
+            chunk_size: bytes.len().max(1) as u64,
+        };
+        let receipt = self
+            .fs
+            .bridge()
+            .block_on(self.mock.upload(&job))
+            .expect("mock upload");
+        receipt.first_msg_id
     }
 
     /// Seeds a row whose stored rel_path is NOT a valid vpath (the shape only
@@ -523,6 +559,69 @@ fn h1_stale_grace_state_is_discarded_through_the_cleanup_then_close_lifecycle() 
         served, new,
         "H1 FIXED (cleanup+close order): the parked state must not serve the \
          old EOF after a delete + recreate behind the same path"
+    );
+}
+
+/// H1 companion (the RB1 residual narrow slit, low-items batch): delete +
+/// recreate at the SAME size inside the grace window. The size witness
+/// alone matches, so the parked state is reused — and this probe parks a
+/// STREAMING reader whose in-memory window already holds the old bytes, so
+/// the reuse serves stale content. The row's mtime is the second witness
+/// that must discard the parked state (the shape a rename-away + same-size
+/// recreate produces; the streaming arm makes the staleness observable —
+/// a hydrate-arm reader re-reads the rewritten file and cannot show it).
+#[test]
+fn h1_same_size_different_mtime_recreate_serves_the_new_content() {
+    let h = Harness::new();
+    h.fs.bridge()
+        .block_on(h.mock.connect())
+        .expect("connect mock");
+
+    // Old file: 8 bytes on the (mock) remote, no cache copy -> the open
+    // dispatches the streaming arm, and the read fills its in-memory
+    // window with the old bytes.
+    let old = vec![0xAAu8; 8];
+    let new = vec![0xBBu8; 8];
+    let old_id = h.upload_to_mock("/victim3.bin", &old);
+    h.seed_row_mtime(
+        "/victim3.bin",
+        old.len() as i64,
+        1_700_000_000.0,
+        true,
+        Some(old_id),
+    );
+
+    let first = h.open("/victim3.bin").expect("open");
+    assert_eq!(h.read(&first, 0, 8).expect("read old"), old);
+    h.fs.close(first); // parks the streaming reader, window pre-filled
+
+    // Recreate at the same path: SAME size, different mtime, new bytes.
+    let new_id = h.upload_to_mock("/victim3.bin", &new);
+    h.db.delete_file("/victim3.bin").expect("delete row");
+    h.seed_row_mtime(
+        "/victim3.bin",
+        new.len() as i64,
+        1_700_500_000.0,
+        true,
+        Some(new_id),
+    );
+
+    // Immediate reopen: inside the grace window.
+    let second = h.open("/victim3.bin").expect("reopen");
+    let meta = second.meta();
+    let served = h.read(&second, 0, 8).expect("read after recreate");
+    h.fs.close(second);
+
+    assert_eq!(meta.size, 8, "the fresh row carries the same size");
+    assert_eq!(
+        meta.mtime, 1_700_500_000.0,
+        "the fresh row carries the new mtime"
+    );
+    assert_eq!(
+        served, new,
+        "H1 (mtime witness): a same-size recreate inside the grace window \
+         must still serve the recreated file's content — the parked state's \
+         size witness alone cannot tell the files apart"
     );
 }
 

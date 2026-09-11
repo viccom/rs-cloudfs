@@ -88,11 +88,30 @@ pub const MAX_VOLUME_LABEL_CHARS: usize = 32;
 /// The filesystem name Explorer and `fsutil` show for the volume.
 pub const FILESYSTEM_NAME: &str = "cydrive";
 
-/// Volume serial number: `"CYDR"` as a u32 — a stable, recognisable
-/// marker (the spike's fixed value was arbitrary; uniqueness matters only
-/// between simultaneously mounted volumes, and each mount has its own
-/// letter).
-const VOLUME_SERIAL: u32 = 0x4359_4452;
+/// Derives the volume serial number from the volume name (review Low
+/// "VOLUME_SERIAL fixed" — the spike's single hard-coded `"CYDR"` value
+/// gave every volume the same serial). FNV-1a 32-bit, hand-rolled to keep
+/// the dependency graph at zero: deterministic (the same name yields the
+/// same serial on every mount and across restarts) and spread (different
+/// names yield different serials with high probability — the property that
+/// matters between simultaneously mounted volumes). The name is the mount
+/// label: the volume name in the multi-volume flow, `"CyDrive"` in
+/// single-volume mode — so single-volume serials are constant by
+/// construction, which is fine, since one process mounts each letter at
+/// most once. A hash of exactly 0 is remapped to 1 (0 is not a legal
+/// volume serial number).
+fn derive_volume_serial(name: &str) -> u32 {
+    let mut hash: u32 = 0x811c_9dc5;
+    for byte in name.as_bytes() {
+        hash ^= u32::from(*byte);
+        hash = hash.wrapping_mul(0x0100_0193);
+    }
+    if hash == 0 {
+        1
+    } else {
+        hash
+    }
+}
 
 // ------------------------------------------------------------- errors ---
 
@@ -376,17 +395,25 @@ impl WinFspRuntime for SystemWinFsp {
     }
 }
 
-/// The process-level one-shot: the probe runs once and its verdict is
-/// cached (mounting is a process-lifetime decision — an operator who
-/// installs WinFsp mid-process restarts the process). Deliberately the
-/// *only* cached path: the injectable [`winfsp_status_with`] stays
-/// uncached for tests.
+/// The process-cached verdict of the real-machine probe
+/// ([`SystemWinFsp::probe`]): locate (the [`WINFSP_REG_KEYS`] registry
+/// subkeys' `InstallDir` candidates, first one whose runtime DLL exists)
+/// → `LoadLibraryW` preload of that DLL → `winfsp_init`. BOTH outcomes
+/// are cached for the process — failure included, so a WinFsp installed
+/// mid-process stays invisible until the process restarts. What this
+/// cache feeds is the boot-time capability check (the CLI's
+/// `winfsp_capability` → `choose_mount_backend` degradation decision);
+/// the mount path itself re-probes the same steps through
+/// [`winfsp_status_with`] on every [`mount_with`] call, uncached — the
+/// injectable seam deliberately never caches.
 static INIT: OnceLock<Result<WinFspInstall, String>> = OnceLock::new();
 
-/// The K40 gate for the real machine: registry + DLL + preload + init,
-/// probed once per process (see [`INIT`]). Never panics, never exits the
-/// process — a machine without WinFsp gets an actionable
-/// [`WinFspStatus::Unavailable`] and the caller falls back to WebDAV.
+/// The K40 boot-time gate for the real machine: [`SystemWinFsp::probe`]
+/// through the process-level [`INIT`] cache (see there for what is
+/// probed, what is cached and why the mount path re-probes). Never
+/// panics, never exits the process — a machine without WinFsp gets an
+/// actionable [`WinFspStatus::Unavailable`], and the CLI caller degrades
+/// to the WebDAV backend with a visible fallback notice.
 pub fn winfsp_status() -> WinFspStatus {
     match INIT.get_or_init(SystemWinFsp::probe) {
         Ok(install) => WinFspStatus::Ready {
@@ -723,11 +750,14 @@ pub fn mount_with(
         "winfsp runtime ready; mounting the volume"
     );
 
+    // The serial derives from the FULL volume name — capture it before
+    // the label is truncated for the FSD.
+    let volume_name = label;
     let label = volume_label(label);
     // The volume label is the assembly-time snapshot CloudFs answers
     // `get_volume_info` from (K44) — the same string the handle reports.
     let fs = CloudFs::new(vfs, rt, label.clone());
-    let mut host = FileSystemHost::<CloudFs, FineGuard>::new(volume_params(), fs)
+    let mut host = FileSystemHost::<CloudFs, FineGuard>::new(volume_params(volume_name), fs)
         .map_err(|error| MountError::Host(format!("creating the WinFsp host failed: {error}")))?;
     if let Err(error) = host.mount(&mount_point) {
         return Err(MountError::Host(format!(
@@ -773,13 +803,15 @@ pub fn mount_with(
 /// set (K39/K44): case-preserving names, wide-char on-disk names, a fixed
 /// 512-byte sector with one-sector allocation units (NTFS-shaped, which
 /// is what the shell and copy engines expect), 255-char components and a
-/// stable creation timestamp.
+/// stable creation timestamp. The serial derives from `volume_name`
+/// ([`derive_volume_serial`]) so simultaneously mounted volumes no longer
+/// share one hard-coded value.
 ///
 /// `case_sensitive_search` is deliberately left at WinFsp's default
 /// (false): the FSD performs case-insensitive name lookups itself, which
 /// is what Explorer and Windows applications assume — the adapter's own
 /// paths stay case-preserved.
-fn volume_params() -> VolumeParams {
+fn volume_params(volume_name: &str) -> VolumeParams {
     let mut params = VolumeParams::new();
     let now = SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -792,7 +824,7 @@ fn volume_params() -> VolumeParams {
         .sector_size(512)
         .sectors_per_allocation_unit(1)
         .max_component_length(255)
-        .volume_serial_number(VOLUME_SERIAL)
+        .volume_serial_number(derive_volume_serial(volume_name))
         .volume_creation_time(crate::fs::unix_to_filetime(now));
     params
 }
@@ -852,5 +884,36 @@ mod tests {
             picked.is_none(),
             "no DLL anywhere: the runtime gate says not installed"
         );
+    }
+
+    /// The volume serial derives from the volume name (review Low
+    /// "VOLUME_SERIAL fixed"): deterministic across restarts, distinct
+    /// across concurrently mounted volumes, never 0 (an illegal serial).
+    #[test]
+    fn volume_serial_derives_from_the_volume_name() {
+        // A published FNV-1a 32-bit vector pins the algorithm.
+        assert_eq!(derive_volume_serial("foobar"), 0xbf9c_f968);
+        // Deterministic: the same name yields the same serial on every
+        // mount and across restarts.
+        for name in ["CyDrive", "local", "tg", "baidu"] {
+            assert_eq!(
+                derive_volume_serial(name),
+                derive_volume_serial(name),
+                "serial for {name:?} is deterministic"
+            );
+        }
+        // Distinct names (multi-volume labels) get distinct serials with
+        // high probability — pinned on the real volume-name shapes.
+        assert_ne!(derive_volume_serial("local"), derive_volume_serial("tg"));
+        assert_ne!(derive_volume_serial("baidu"), derive_volume_serial("local"));
+        assert_ne!(
+            derive_volume_serial("CyDrive"),
+            derive_volume_serial("cydrive"),
+            "even a case variant yields a distinct serial"
+        );
+        // 0 is not a legal volume serial number.
+        for name in ["CyDrive", "local", "tg", "baidu", ""] {
+            assert_ne!(derive_volume_serial(name), 0, "serial for {name:?}");
+        }
     }
 }
