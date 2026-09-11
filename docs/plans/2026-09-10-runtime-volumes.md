@@ -49,7 +49,7 @@
 ## §3 批次（worktree `feat/runtime-volumes`；串行；每批 TDD 红→绿 + 全门禁）
 
 ### RV0 卷级 enabled 键（小批独立价值）
-- `VOLUME_SCOPED_KEYS` + `CyDriveConfig` 加 `enabled: bool`（serde default true，向后兼容）；`discover_volumes` 解析时跳过 `enabled=false` 的卷（`info!` 声明，不静默）；禁用卷不参与盘符冲突校验/装配/横幅；config.toml（进程级）出现该键仍拒（沿用 K19 分区）。
+- `VOLUME_SCOPED_KEYS` + `CyDriveConfig` 加 `enabled: bool`（serde default true——缺省即启用，语义的自然缺省，非兼容考量）；`discover_volumes` 解析时跳过 `enabled=false` 的卷（`info!` 声明，不静默）；禁用卷不参与盘符冲突校验/装配/横幅；config.toml（进程级）出现该键仍拒（沿用 K19 分区）。
 - 测试：禁用跳过、缺省启用、进程级出现拒收、禁用卷不占盘符。
 - Commit: `feat(config): per-volume enabled key (skip at discovery)`
 
