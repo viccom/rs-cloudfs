@@ -791,6 +791,11 @@ impl VolumeStatus {
 /// for the volumes that assembled, the running pieces. A `Failed` volume
 /// carries its reason instead — the enum shape makes the
 /// status-pieces pairing unrepresentable when inconsistent.
+///
+/// Clone is a cheap snapshot (Arc fields + the spec's strings): registry
+/// lookups clone the entry out so the shared table's lock is never held
+/// across the caller's work.
+#[derive(Clone)]
 pub enum VolumeRuntime {
     /// The volume assembled: spec + injected transport + its own VFS.
     Running {
@@ -856,36 +861,99 @@ impl std::fmt::Debug for VolumeRuntime {
     }
 }
 
-/// The process's volume set (Phase 2.5 / MV1): one [`VolumeRuntime`] per
-/// discovered volume, in discovery (file-name) order. A thin registry by
-/// design — lifecycle lives in [`MultiVolumeHandle`]'s stop task; this
-/// type only answers "what volumes exist and how are they doing".
-#[derive(Debug)]
-pub struct VolumeRegistry {
-    /// The volumes in stable discovery order.
-    pub volumes: Vec<VolumeRuntime>,
+/// The process's volume set (Phase 2.5 / MV1; a live shared handle
+/// since Phase 3.6 / RV1, K51): the `Arc<RwLock<ordered volume table>>`
+/// one [`VolumeRuntime`] per discovered volume, in discovery (file-name)
+/// order. A thin registry by design — lifecycle lives in
+/// [`MultiVolumeHandle`]'s stop task; this type only answers "what
+/// volumes exist and how are they doing", and (RV2) lets the control
+/// channel's ADD/REMOVE mutate that answer while the process runs.
+///
+/// Clone shares the table. Every read clones its result out and
+/// releases the lock before the caller's work (banner printing, mount
+/// passes), so the lock never spans an await; the same release-then-run
+/// contract makes `status_list` a live query — the banner/doctor face
+/// reads the table as it stands when asked, not as boot left it.
+///
+/// This is the master truth: the WebDAV dispatcher and the dashboard
+/// each carry their own face table (crate-own types — a layering
+/// constraint, R1) filled by the composition root from THIS table at
+/// boot, and RV2's serialized ADD/REMOVE keeps all three coherent.
+#[derive(Clone, Debug)]
+pub struct RegistryHandle {
+    volumes: Arc<std::sync::RwLock<Vec<VolumeRuntime>>>,
 }
 
-impl VolumeRegistry {
-    /// One volume's registry entry by name (`None` for an unknown name) —
-    /// the lookup the mount pass resolves each claim's VFS with.
-    pub fn volume(&self, name: &str) -> Option<&VolumeRuntime> {
-        self.volumes.iter().find(|volume| volume.name() == name)
+impl RegistryHandle {
+    /// Builds the handle over the boot-assembled entries (in discovery
+    /// order).
+    pub fn new(volumes: Vec<VolumeRuntime>) -> Self {
+        Self {
+            volumes: Arc::new(std::sync::RwLock::new(volumes)),
+        }
     }
 
-    /// The (name, status) list for banners and (MV3) `/api/volumes`.
+    /// One volume's registry entry by name (`None` for an unknown name)
+    /// — the lookup the mount pass resolves each claim's VFS with. A
+    /// clone: the table lock is released before the caller's work.
+    pub fn volume(&self, name: &str) -> Option<VolumeRuntime> {
+        self.read()
+            .iter()
+            .find(|volume| volume.name() == name)
+            .cloned()
+    }
+
+    /// The (name, status) list for banners and (MV3) `/api/volumes` —
+    /// a live query over the current table (RV1).
     pub fn status_list(&self) -> Vec<(String, VolumeStatus)> {
-        self.volumes
+        self.read()
             .iter()
             .map(|volume| (volume.name().to_string(), volume.status()))
             .collect()
     }
 
+    /// A snapshot of the whole table, in order (mount-claim collection
+    /// and the Debug faces).
+    pub fn volumes(&self) -> Vec<VolumeRuntime> {
+        self.read().clone()
+    }
+
     /// `true` when not a single volume assembled (the boot's Err gate).
     pub fn all_failed(&self) -> bool {
-        self.volumes
+        self.read()
             .iter()
             .all(|volume| matches!(volume, VolumeRuntime::Failed { .. }))
+    }
+
+    /// Removes the volume named `name`; `true` when it was registered
+    /// (the K50 seam RV2's REMOVE acts through — the K51 liveness this
+    /// pins is what makes the removal visible to the WebDAV dispatch,
+    /// the dashboard and the banner).
+    pub fn remove(&self, name: &str) -> bool {
+        let mut volumes = self.write();
+        match volumes.iter().position(|volume| volume.name() == name) {
+            Some(position) => {
+                volumes.remove(position);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The table read lock, poisoned-lock recovery per the code-style
+    /// norm (a panicked holder must not take the process's volume view
+    /// down).
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Vec<VolumeRuntime>> {
+        self.volumes
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The table write lock (same recovery norm).
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Vec<VolumeRuntime>> {
+        self.volumes
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
     }
 }
 
@@ -969,7 +1037,7 @@ struct VolumeStopUnit {
 /// shutdown, same semantics as [`RunHandle::shutdown`]) and the stop
 /// task that owns the aggregated graceful sequence.
 pub struct MultiVolumeHandle {
-    registry: VolumeRegistry,
+    registry: RegistryHandle,
     watch: Arc<ShutdownWatch>,
     stop_task: tokio::task::JoinHandle<()>,
     /// The per-volume periodic sync tasks (`None` entries = volumes
@@ -1001,8 +1069,16 @@ impl std::fmt::Debug for MultiVolumeHandle {
 }
 
 impl MultiVolumeHandle {
-    /// One volume's registry entry (name lookup).
-    pub fn volume(&self, name: &str) -> Option<&VolumeRuntime> {
+    /// The boot's registry handle (a shared clone — RV2's control
+    /// channel mutates the SAME table through it; reads see the table
+    /// as it stands when asked).
+    pub fn registry(&self) -> RegistryHandle {
+        self.registry.clone()
+    }
+
+    /// One volume's registry entry (name lookup). A snapshot clone —
+    /// the shared table's lock is never held across the caller's work.
+    pub fn volume(&self, name: &str) -> Option<VolumeRuntime> {
         self.registry.volume(name)
     }
 
@@ -1184,12 +1260,12 @@ pub async fn run_multi_with_transports(
     if runtimes.is_empty() {
         anyhow::bail!("multi-volume boot received no volumes to assemble");
     }
-    let registry = VolumeRegistry { volumes: runtimes };
+    let registry = RegistryHandle::new(runtimes);
     if registry.all_failed() {
         anyhow::bail!(
             "every volume failed to assemble ({}): {} — fix the reported volume \
              configurations and run again",
-            registry.volumes.len(),
+            registry.status_list().len(),
             registry
                 .status_list()
                 .iter()
@@ -1200,18 +1276,26 @@ pub async fn run_multi_with_transports(
     }
 
     // The ONE WebDAV listener (K20): `/vol/<name>/` routes to every
-    // running volume. A bind failure degrades (K22, the same policy as
-    // the control channel but with the bigger blast radius spelled
-    // out): the volumes' data planes — queues, sync, inbound — keep
-    // running; the WebDAV face is simply absent.
-    let webdav_server = bind_multi_webdav(process_cfg, volume_fses).await;
+    // running volume — through the shared face table (RV1/K51) the
+    // listener re-reads per request, so RV2's runtime ADD/REMOVE is
+    // visible on the same port. A bind failure degrades (K22, the same
+    // policy as the control channel but with the bigger blast radius
+    // spelled out): the volumes' data planes — queues, sync, inbound —
+    // keep running; the WebDAV face is simply absent.
+    let webdav_server = bind_multi_webdav(
+        process_cfg,
+        cloudkit_webdav::RegistryHandle::new(volume_fses),
+    )
+    .await;
     let webdav_addr = webdav_server.as_ref().map(WebDavServer::local_addr);
 
     // The ONE dashboard (K24 / MV3): a single process-level port serving
-    // the volume registry (per-volume tabs, `/api/volumes` aggregate).
-    // Same K22 degrade policy as the WebDAV bind: a failure only logs
-    // an error — the volumes keep running without the UI.
-    let web_ui = bind_multi_web_ui(process_cfg, ui_entries).await;
+    // the volume registry (per-volume tabs, `/api/volumes` aggregate) —
+    // through the dashboard's own shared face table (RV1/K51). Same K22
+    // degrade policy as the WebDAV bind: a failure only logs an error —
+    // the volumes keep running without the UI.
+    let web_ui =
+        bind_multi_web_ui(process_cfg, cloudkit_web::RegistryHandle::new(ui_entries)).await;
     let web_ui_addr = web_ui.as_ref().map(WebUiServer::local_addr);
 
     // Per-volume mounts (K27 + K40): only volumes that EXPLICITLY set a
@@ -1347,7 +1431,7 @@ pub async fn run_multi_with_transports(
 /// running, only the UI face is gone.
 async fn bind_multi_web_ui(
     process_cfg: &CyDriveConfig,
-    volumes: Vec<cloudkit_web::VolumeUiEntry>,
+    volumes: cloudkit_web::RegistryHandle,
 ) -> Option<WebUiServer> {
     if !process_cfg.enable_web_ui {
         tracing::info!("web UI disabled (enable_web_ui = false)");
@@ -1387,7 +1471,7 @@ async fn bind_multi_web_ui(
 /// all-failed gate) also skips the bind.
 async fn bind_multi_webdav(
     process_cfg: &CyDriveConfig,
-    volumes: Vec<(String, CyDriveFs)>,
+    volumes: cloudkit_webdav::RegistryHandle,
 ) -> Option<WebDavServer> {
     if volumes.is_empty() {
         return None;
@@ -1423,9 +1507,9 @@ async fn bind_multi_webdav(
 /// The mount claims (K27): every RUNNING volume whose volume file
 /// explicitly set `drive_letter` (presence semantics — the parsed
 /// default is a placeholder that claims nothing).
-fn collect_mount_claims(registry: &VolumeRegistry) -> Vec<(String, String)> {
+fn collect_mount_claims(registry: &RegistryHandle) -> Vec<(String, String)> {
     registry
-        .volumes
+        .volumes()
         .iter()
         .filter_map(|volume| match volume {
             VolumeRuntime::Running { spec, .. } if spec.explicit_drive_letter => {
@@ -3107,7 +3191,7 @@ struct MountPlan<'a> {
     /// is a cfg'd no-op, so the fields are legitimately unread there — the
     /// `allow` keeps a `-D warnings` build honest about the *other* legs.
     #[cfg_attr(not(all(windows, feature = "winfsp")), allow(dead_code))]
-    registry: &'a VolumeRegistry,
+    registry: &'a RegistryHandle,
     /// The process runtime handle the adapters bridge their async core on.
     #[cfg_attr(not(all(windows, feature = "winfsp")), allow(dead_code))]
     rt: &'a tokio::runtime::Handle,
@@ -3263,8 +3347,7 @@ async fn mount_claims_via_winfsp(plan: &MountPlan<'_>) -> VolumeMounts {
         let Some(vfs) = plan
             .registry
             .volume(name)
-            .and_then(VolumeRuntime::vfs)
-            .cloned()
+            .and_then(|runtime| runtime.vfs().cloned())
         else {
             tracing::error!(
                 volume = %name,

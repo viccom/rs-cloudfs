@@ -33,7 +33,7 @@
 
 pub mod server;
 
-pub use server::{ServerError, WebDavServer};
+pub use server::{RegistryHandle, ServerError, WebDavServer};
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};

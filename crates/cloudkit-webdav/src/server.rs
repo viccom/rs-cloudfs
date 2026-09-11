@@ -16,10 +16,9 @@
 //! - no auth and no principal negotiation — loopback only is the
 //!   contract (production binds 127.0.0.1:8080, compat contract 1).
 
-use std::collections::HashMap;
 use std::convert::Infallible;
 use std::net::SocketAddr;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex, RwLock};
 
 use dav_server::body::Body as DavBody;
 use dav_server::fakels::FakeLs;
@@ -60,6 +59,94 @@ pub struct WebDavServer {
     task: Mutex<Option<tokio::task::JoinHandle<()>>>,
 }
 
+/// The dynamic volume table behind the multi-volume dispatch (Phase 3.6
+/// / RV1, K51): the `Arc<RwLock<ordered volume table>>` shared handle —
+/// one entry per registered volume, in insertion order, so the caller
+/// can insert/remove volumes while the server keeps running; every
+/// request re-reads the table under a read lock, so a removal 404s and
+/// an insertion routes at once, on the same port (no listener restart,
+/// no route rebuild). Entries carry the volume's already-built
+/// [`DavHandler`] (own FakeLs), so a volume's lock state lives exactly
+/// as long as its registration — the same lifetime the pre-dynamic
+/// startup table had.
+///
+/// Clone shares the table; the critical sections are synchronous and
+/// short (find + clone the handler), so the lock never spans an await.
+/// Removal while a request is in flight lets that request drain on its
+/// cloned handler (the shutdown semantics).
+#[derive(Clone)]
+pub struct RegistryHandle {
+    volumes: Arc<RwLock<Vec<(String, DavHandler)>>>,
+}
+
+impl RegistryHandle {
+    /// Builds the table with the given starting volumes (each volume's
+    /// handler is assembled here, one per volume).
+    pub fn new(volumes: Vec<(String, CyDriveFs)>) -> Self {
+        let handle = Self {
+            volumes: Arc::new(RwLock::new(Vec::new())),
+        };
+        for (name, fs) in volumes {
+            handle.insert(name, fs);
+        }
+        handle
+    }
+
+    /// Registers a volume under `name` (appending to the table order)
+    /// and assembles its handler; a duplicate name is the caller's
+    /// contract error (RV2's ADD refuses it before reaching here).
+    pub fn insert(&self, name: impl Into<String>, fs: CyDriveFs) {
+        self.write().push((name.into(), volume_handler(fs)));
+    }
+
+    /// Removes the volume registered under `name`; `true` when it was
+    /// registered. Its handler (and lock state) drops with the entry.
+    /// Order-preserving: the table is the ordered volume table (K51),
+    /// and volume counts are tiny — the O(n) shift is nothing.
+    pub fn remove(&self, name: &str) -> bool {
+        let mut volumes = self.write();
+        match volumes
+            .iter()
+            .position(|(registered, _)| registered == name)
+        {
+            Some(position) => {
+                volumes.remove(position);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// Whether no volume is registered (the caller may skip the bind).
+    pub fn is_empty(&self) -> bool {
+        self.read().is_empty()
+    }
+
+    /// One volume's handler by name (a clone — the table's entry stays
+    /// shared and the read lock is released before the request runs).
+    fn lookup(&self, name: &str) -> Option<DavHandler> {
+        self.read()
+            .iter()
+            .find(|(registered, _)| registered == name)
+            .map(|(_, handler)| handler.clone())
+    }
+
+    /// The table read lock, poisoned-lock recovery per the code-style
+    /// norm (a panicked holder must not take the dispatcher down).
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Vec<(String, DavHandler)>> {
+        self.volumes
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The table write lock (same recovery norm).
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Vec<(String, DavHandler)>> {
+        self.volumes
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 impl WebDavServer {
     /// Binds `addr` and serves `fs`. Loopback no-auth is the contract
     /// (production binds 127.0.0.1:8080); tests bind 127.0.0.1:0.
@@ -85,15 +172,18 @@ impl WebDavServer {
         })
     }
 
-    /// Binds `addr` and serves every volume on that ONE port (Phase 2.5
-    /// / K20): each request dispatches by its `/vol/<name>/` URL prefix
-    /// to that volume's own [`DavHandler`] (own FakeLs). The prefix is a
-    /// process-level concept — the volume's [`CyDriveFs`] only ever sees
-    /// the stripped path (R1). `/vol/<name>` and `/vol/<name>/` both
-    /// address the volume root; anything else (no prefix, `/vol/`, an
-    /// unknown volume) answers 404 without touching any volume.
+    /// Binds `addr` and serves every volume of `registry` on that ONE
+    /// port (Phase 2.5 / K20; dynamic since RV1 / K51): each request
+    /// dispatches by its `/vol/<name>/` URL prefix through a READ of the
+    /// shared table, so volumes the caller registers later are routable
+    /// at once and removed ones 404 at once — no listener restart, no
+    /// route rebuild. The prefix is a process-level concept — the
+    /// volume's [`CyDriveFs`] only ever sees the stripped path (R1).
+    /// `/vol/<name>` and `/vol/<name>/` both address the volume root;
+    /// anything else (no prefix, `/vol/`, an unregistered volume)
+    /// answers 404 without touching any volume.
     pub async fn serve_volumes(
-        volumes: Vec<(String, CyDriveFs)>,
+        volumes: RegistryHandle,
         addr: SocketAddr,
     ) -> Result<Self, ServerError> {
         let listener = TcpListener::bind(addr)
@@ -103,10 +193,9 @@ impl WebDavServer {
             .local_addr()
             .map_err(|source| ServerError::Bind { addr, source })?;
 
-        let router = VolumeRouter::new(volumes);
+        let router = VolumeRouter { volumes };
         let (shutdown, rx) = watch::channel(false);
         let task = tokio::task::spawn(accept_loop(listener, Dispatcher::Volumes(router), rx));
-
         Ok(Self {
             addr,
             shutdown,
@@ -192,36 +281,29 @@ impl Dispatcher {
     }
 }
 
-/// The `/vol/<name>/` prefix table (Phase 2.5 / K20): one [`DavHandler`]
-/// per volume — each with its own FakeLs and the same locked-down
-/// method set as the single-volume mode.
+/// The `/vol/<name>/` dispatch (Phase 2.5 / K20; dynamic since RV1 /
+/// K51): a read of the shared [`RegistryHandle`] per request resolves
+/// the volume's handler — each with its own FakeLs and the same
+/// locked-down method set as the single-volume mode. Cloning the router
+/// clones the handle (one Arc), never the table.
 #[derive(Clone)]
 struct VolumeRouter {
-    handlers: HashMap<String, DavHandler>,
+    volumes: RegistryHandle,
 }
 
 impl VolumeRouter {
-    /// Builds one handler per volume (`FakeLs` instances stay
-    /// per-volume).
-    fn new(volumes: Vec<(String, CyDriveFs)>) -> Self {
-        Self {
-            handlers: volumes
-                .into_iter()
-                .map(|(name, fs)| (name, volume_handler(fs)))
-                .collect(),
-        }
-    }
-
     /// Strips the `/vol/<name>` segment, rebuilds the request URI
     /// (query preserved) and hands the request to that volume's
-    /// handler; an unroutable path answers 404 without touching any
-    /// volume.
+    /// handler; an unroutable path (or an unregistered volume) answers
+    /// 404 without touching any volume.
     async fn dispatch(&self, req: Request<Incoming>) -> http::Response<DavBody> {
         let path = req.uri().path().to_owned();
         let Some((name, tail)) = split_volume_segment(&path) else {
             return not_found();
         };
-        let Some(handler) = self.handlers.get(name) else {
+        // The read lock spans only the lookup; the request runs on the
+        // cloned handler after the lock is released.
+        let Some(handler) = self.volumes.lookup(name) else {
             return not_found();
         };
         let (mut parts, body) = req.into_parts();

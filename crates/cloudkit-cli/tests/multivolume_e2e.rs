@@ -1,4 +1,4 @@
-//! RED-phase tests for Phase 2.5 / MV1: the VolumeRegistry assembly.
+//! RED-phase tests for Phase 2.5 / MV1: the volume registry assembly.
 //!
 //! Contract under test: `docs/plans/2026-09-08-phase2-5-multivolume.md`
 //! §3-MV1 — `run_multi_with_transports` boots several volumes in one
@@ -975,5 +975,67 @@ async fn web_ui_bind_failure_degrades_without_failing_volumes() {
     timeout(Duration::from_secs(30), handle.shutdown())
         .await
         .expect("the degraded boot still stops cleanly")
+        .expect("shutdown joins cleanly");
+}
+
+// ------------------------------------------ 7. RV1: the live registry handle ---
+
+/// RV1 (K51): the boot registry is a live shared handle, not a frozen
+/// Vec snapshot — removing a volume from it is immediately visible to
+/// the status queries the banner and doctor read (`status_list` /
+/// `volume`), while the surviving volume keeps its entry. RV2's ADD/
+/// REMOVE control commands own the mutation surface; this pins the seam
+/// they act through and the liveness the banner inherits.
+#[tokio::test]
+async fn registry_removal_is_immediately_visible_to_status_queries() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    write_file(
+        &dir.path().join("volumes").join("b.toml"),
+        &volume_toml("222:BBB", 222222),
+    );
+    let _guard = chdir(dir.path());
+
+    let specs = load_specs();
+    let mocks = vec![mock_transport().await, mock_transport().await];
+    let handle = boot_multi(specs, mocks).await;
+
+    let registry = handle.registry();
+    assert_eq!(
+        handle.volumes().len(),
+        2,
+        "both volumes are registered at boot"
+    );
+
+    // The removal: the K50 seam the runtime unload acts through.
+    assert!(
+        registry.remove("a"),
+        "removing a registered volume reports it"
+    );
+    assert!(
+        !registry.remove("a"),
+        "removing an already-removed volume reports the miss"
+    );
+
+    assert!(
+        handle.volume("a").is_none(),
+        "the removed volume is gone from name lookups"
+    );
+    assert_eq!(
+        handle.volumes(),
+        vec![("b".to_string(), VolumeStatus::Running)],
+        "the status list reflects the removal immediately (the banner's live query)"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
         .expect("shutdown joins cleanly");
 }

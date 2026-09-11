@@ -36,7 +36,9 @@ use cloudkit_core::transport::mock::MockTransport;
 use cloudkit_core::transport::{CloudTransport, UploadJob, UploadReceipt};
 use cloudkit_core::upload_queue::RetryPolicy;
 use cloudkit_core::vfs::{Vfs, VfsConfig};
-use cloudkit_web::{QuotaSnapshot, VolumeUiEntry, VolumeUiStatus, WebUiConfig, WebUiServer};
+use cloudkit_web::{
+    QuotaSnapshot, RegistryHandle, VolumeUiEntry, VolumeUiStatus, WebUiConfig, WebUiServer,
+};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 
@@ -123,9 +125,22 @@ async fn volume_env(dir: &Path, name: &str, cfg: WebUiConfig) -> VolumeEnv {
     }
 }
 
-/// Serves the multi-volume dashboard on an ephemeral loopback port.
+/// Serves the multi-volume dashboard on an ephemeral loopback port
+/// (RV1 mechanical adaptation: the static vec is wrapped into the
+/// shared [`RegistryHandle`]; all assertions unchanged).
 async fn multi_server(entries: Vec<VolumeUiEntry>) -> WebUiServer {
-    WebUiServer::serve_multi(entries, SocketAddr::from(([127, 0, 0, 1], 0)))
+    WebUiServer::serve_multi(
+        RegistryHandle::new(entries),
+        SocketAddr::from(([127, 0, 0, 1], 0)),
+    )
+    .await
+    .expect("serve the multi-volume dashboard on an ephemeral port")
+}
+
+/// Serves the multi-volume dashboard over a caller-owned registry
+/// handle (the RV1 dynamic tests mutate the table while serving).
+async fn serve_registry(registry: RegistryHandle) -> WebUiServer {
+    WebUiServer::serve_multi(registry, SocketAddr::from(([127, 0, 0, 1], 0)))
         .await
         .expect("serve the multi-volume dashboard on an ephemeral port")
 }
@@ -945,4 +960,120 @@ async fn unclaimed_drive_letter_reports_null_not_the_default() {
     assert_eq!(status_of(&resp), 200, "ok: {resp}");
     let stats: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse");
     assert!(stats["drive_letter"].is_null(), "stats: {stats}");
+}
+
+// ------------------------------------------------- RV1: the dynamic table ---
+
+/// RV1 (K51): the dashboard reads the registry handle per request.
+/// Removing a volume from the table drops its `/api/volumes` row and its
+/// `?volume=` routes immediately, while the surviving volume serves
+/// unchanged — no server restart, no route rebuild.
+#[tokio::test]
+async fn removed_volume_disappears_from_routes_and_listing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let a = volume_env(
+        dir.path(),
+        "a",
+        volume_cfg("local", "V:", "a", 0, false, Some("local:aa11"), true, None),
+    )
+    .await;
+    let b = volume_env(
+        dir.path(),
+        "b",
+        volume_cfg("baidu", "Z:", "b", 0, false, Some("baidu:42"), false, None),
+    )
+    .await;
+    seed_row(&a.db, "/only-a.txt", false, 100, true);
+    seed_row(&b.db, "/only-b.txt", false, 50, false);
+
+    let registry = RegistryHandle::new(vec![a.entry.clone(), b.entry.clone()]);
+    let server = serve_registry(registry.clone()).await;
+    let addr = server.local_addr();
+
+    // Boot sanity: both volumes are addressable and listed.
+    let resp = send(addr, &request("GET", "/api/stats?volume=a", addr, &[], "")).await;
+    assert_eq!(status_of(&resp), 200, "volume a at boot: {resp}");
+
+    // The removal: the K50 seam the runtime unload acts through.
+    assert!(
+        registry.remove("a"),
+        "removing a registered volume reports it"
+    );
+
+    // The listing lost exactly one row — only b remains.
+    let resp = send(addr, &request("GET", "/api/volumes", addr, &[], "")).await;
+    assert_eq!(status_of(&resp), 200, "listing after removal: {resp}");
+    let rows: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse rows");
+    let rows = rows.as_array().expect("array body");
+    assert_eq!(rows.len(), 1, "one row after removing a: {rows:?}");
+    assert_eq!(rows[0]["name"], "b", "the surviving volume's row");
+    assert_eq!(rows[0]["total_files"], 1, "b's own numbers unchanged");
+
+    // The removed volume's routes answer unknown-volume 404 ...
+    let resp = send(addr, &request("GET", "/api/stats?volume=a", addr, &[], "")).await;
+    assert_eq!(status_of(&resp), 404, "removed volume's stats: {resp}");
+    let resp = send(addr, &request("GET", "/api/files?volume=a", addr, &[], "")).await;
+    assert_eq!(status_of(&resp), 404, "removed volume's files: {resp}");
+
+    // ... while the surviving volume keeps serving its own data.
+    let resp = send(addr, &request("GET", "/api/files?volume=b", addr, &[], "")).await;
+    assert_eq!(status_of(&resp), 200, "surviving volume: {resp}");
+    let files: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse files");
+    let names: Vec<&str> = files
+        .as_array()
+        .expect("array body")
+        .iter()
+        .map(|row| row["name"].as_str().expect("name"))
+        .collect();
+    assert_eq!(names, vec!["only-b.txt"], "b's rows, untouched");
+}
+
+/// RV1 (K51): inserting a volume into the table makes it immediately
+/// addressable — `/api/volumes` grows a row and the `?volume=` routes
+/// resolve on the same port, with no server restart.
+#[tokio::test]
+async fn dynamically_inserted_volume_is_immediately_addressable() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let b = volume_env(
+        dir.path(),
+        "b",
+        volume_cfg("baidu", "Z:", "b", 0, false, Some("baidu:42"), false, None),
+    )
+    .await;
+    seed_row(&b.db, "/only-b.txt", false, 50, false);
+
+    let registry = RegistryHandle::new(vec![b.entry.clone()]);
+    let server = serve_registry(registry.clone()).await;
+    let addr = server.local_addr();
+
+    // Before the insert the name is unknown.
+    let resp = send(addr, &request("GET", "/api/stats?volume=c", addr, &[], "")).await;
+    assert_eq!(status_of(&resp), 404, "unregistered volume: {resp}");
+
+    // The insert: the RV2 runtime-load seam.
+    let c = volume_env(
+        dir.path(),
+        "c",
+        volume_cfg("local", "C:", "c", 0, false, Some("local:cc22"), true, None),
+    )
+    .await;
+    seed_row(&c.db, "/c-file.txt", false, 9, true);
+    registry.insert(c.entry.clone());
+
+    // The routes resolve at once, with the inserted volume's own identity.
+    let resp = send(addr, &request("GET", "/api/stats?volume=c", addr, &[], "")).await;
+    assert_eq!(status_of(&resp), 200, "dynamically inserted volume: {resp}");
+    let stats: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse stats");
+    assert_eq!(stats["backend"], "local", "the inserted volume's identity");
+    assert_eq!(stats["drive_letter"], "C:", "the inserted volume's letter");
+    assert_eq!(stats["total_files"], 1, "the inserted volume's own numbers");
+
+    // The listing grew to two rows, in insertion order (b first, c last).
+    let resp = send(addr, &request("GET", "/api/volumes", addr, &[], "")).await;
+    assert_eq!(status_of(&resp), 200, "listing after insert: {resp}");
+    let rows: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse rows");
+    let rows = rows.as_array().expect("array body");
+    assert_eq!(rows.len(), 2, "one row per volume: {rows:?}");
+    assert_eq!(rows[0]["name"], "b", "boot volume keeps its position");
+    assert_eq!(rows[1]["name"], "c", "the inserted volume appends");
 }
