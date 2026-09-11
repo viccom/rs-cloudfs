@@ -1342,6 +1342,51 @@ async fn download_unsatisfiable_range_416_touches_no_remote() {
     );
 }
 
+/// 15c2. SR2 hardening: a body longer than one streaming window is
+///        served through MULTIPLE bounded `open_range` calls (at most
+///        4 MiB each), never one whole-length call — the open-ended
+///        `Range: bytes=0-` shape browsers and players send for video
+///        playback included. Bytes stay exact; the 206/Content-Range/
+///        Content-Length contract is unchanged.
+#[tokio::test]
+async fn download_open_ended_range_over_one_window_streams_bounded_windows() {
+    let env = test_env().await;
+    let addr = env.server.local_addr();
+    // 5 MiB: strictly more than one 4 MiB streaming window.
+    let content = ascii_pattern(5 * 1024 * 1024);
+    seed_remote_file(&env.db, &env.mock, "/big.bin", &content, 1024 * 1024).await;
+
+    let resp = send(
+        addr,
+        &request(
+            "GET",
+            "/api/download/big.bin",
+            addr,
+            &[("Range", "bytes=0-")],
+            "",
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 206, "partial content: {resp}");
+    assert_eq!(
+        header(&resp, "content-range"),
+        Some("bytes 0-5242879/5242880")
+    );
+    assert_eq!(header(&resp, "content-length"), Some("5242880"));
+    assert_eq!(header(&resp, "accept-ranges"), Some("bytes"));
+    assert_eq!(
+        body_of(&resp),
+        String::from_utf8_lossy(&content).into_owned(),
+        "byte-exact full body across the window seams"
+    );
+    assert!(env.mock.open_calls().is_empty(), "no full open");
+    assert_eq!(
+        env.mock.open_range_calls(),
+        vec![(0, 4 * 1024 * 1024), (4 * 1024 * 1024, 1024 * 1024)],
+        "one bounded ≤4 MiB window per open_range call"
+    );
+}
+
 /// 15d. SR2 fallback (R-5): an encrypted row never streams — the
 ///      download serves through the full hydrate path, and the mock's
 ///      observation face shows the contrast with 15a/15b: a full `open`,

@@ -892,9 +892,10 @@ fn streaming_download_response(
                 .into_response(),
         };
     }
-    // Full-body stream: the one window IS the whole object (the
-    // transport slices it into bounded frames on its own, so memory
-    // stays frame-granular, never file-granular).
+    // Full-body stream: [`RangeBody`] walks the object in bounded
+    // `open_range` windows (≤4 MiB each), so memory stays
+    // window-granular, never file-granular — including the decrypting
+    // wrapper, whose per-call span pull must stay bounded (K47).
     (
         [
             (header::CONTENT_TYPE, mime),
@@ -907,33 +908,59 @@ fn streaming_download_response(
         .into_response()
 }
 
-/// Response-body side of one `open_range` window (the SSE `FramePipe`
-/// precedent shape): the [`Stream`] impl awaits the transport call,
-/// then forwards the transport's frames to [`Body::from_stream`]
-/// verbatim. The transport error type satisfies `Into<BoxError>`
-/// directly, so no re-mapping layer is needed.
+/// Response-body side of the streaming download (the SSE `FramePipe`
+/// precedent shape): the [`Stream`] impl walks the requested range in
+/// bounded `open_range` windows (at most [`WEB_STREAM_WINDOW`] bytes
+/// each — the RangeFile/WindowReader model), forwarding each window's
+/// frames to [`Body::from_stream`] verbatim. The transport error type
+/// satisfies `Into<BoxError>` directly, so no re-mapping layer is
+/// needed. Plaintext transports self-bound their fetches anyway; the
+/// window loop additionally bounds the per-call length the decrypting
+/// wrapper (K47) turns into one bounded span pull — a whole-body call
+/// length would stall the first byte behind the full-ciphertext
+/// aggregate (the 2026-09-10 open-ended-playback defect).
+const WEB_STREAM_WINDOW: u64 = 4 * 1024 * 1024;
+
 struct RangeBody {
+    transport: Arc<dyn CloudTransport>,
+    handle: RemoteHandle,
+    /// Current window start (advances window by window).
+    off: u64,
+    /// Bytes still owed to the response body.
+    remaining: u64,
     state: RangeBodyState,
 }
 
-/// Lifecycle of a [`RangeBody`]: the `open_range` call in flight, its
-/// frame stream flowing, or terminal after an error.
+/// Lifecycle of a [`RangeBody`]: between windows, the `open_range` call
+/// in flight, its frame stream flowing, or terminal after an error /
+/// short window / full length served.
 enum RangeBodyState {
-    /// The `open_range` future (owned `handle`/`transport`, so the
-    /// boxed future is `'static`).
+    /// No window in flight: the next poll opens one (or ends at zero
+    /// `remaining`).
+    Idle,
+    /// The `open_range` future (owned `handle`/`transport`, so the boxed
+    /// future is `'static`).
     Opening(Pin<Box<dyn std::future::Future<Output = Result<ByteStream, StorageError>> + Send>>),
-    /// The window's frames.
-    Streaming(ByteStream),
-    /// After an error frame: nothing more, ever.
+    /// The current window's frames, plus how much it was asked for and
+    /// has served.
+    Streaming {
+        stream: ByteStream,
+        window_len: u64,
+        served: u64,
+    },
+    /// After an error frame, a short window (EOF/truncation) or the full
+    /// length: nothing more, ever.
     Done,
 }
 
 impl RangeBody {
     fn new(transport: Arc<dyn CloudTransport>, handle: RemoteHandle, off: u64, len: u64) -> Self {
         Self {
-            state: RangeBodyState::Opening(Box::pin(async move {
-                transport.open_range(&handle, off, len).await
-            })),
+            transport,
+            handle,
+            off,
+            remaining: len,
+            state: RangeBodyState::Idle,
         }
     }
 }
@@ -943,21 +970,78 @@ impl Stream for RangeBody {
 
     fn poll_next(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
         let this = self.get_mut();
-        if let RangeBodyState::Opening(future) = &mut this.state {
-            match future.as_mut().poll(cx) {
-                Poll::Pending => return Poll::Pending,
-                Poll::Ready(Ok(stream)) => this.state = RangeBodyState::Streaming(stream),
-                Poll::Ready(Err(error)) => {
-                    this.state = RangeBodyState::Done;
-                    return Poll::Ready(Some(Err(error)));
+        loop {
+            // Take the state out (the boxed futures/streams move with it)
+            // so the arms can install the successor state free of borrow
+            // conflicts; `Done` is the between-steps placeholder.
+            match std::mem::replace(&mut this.state, RangeBodyState::Done) {
+                RangeBodyState::Done => return Poll::Ready(None),
+                RangeBodyState::Idle => {
+                    if this.remaining == 0 {
+                        return Poll::Ready(None);
+                    }
+                    let len = this.remaining.min(WEB_STREAM_WINDOW);
+                    let transport = Arc::clone(&this.transport);
+                    let handle = this.handle.clone();
+                    let off = this.off;
+                    this.state = RangeBodyState::Opening(Box::pin(async move {
+                        transport.open_range(&handle, off, len).await
+                    }));
                 }
+                RangeBodyState::Opening(mut future) => match future.as_mut().poll(cx) {
+                    Poll::Pending => {
+                        this.state = RangeBodyState::Opening(future);
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(Ok(stream)) => {
+                        this.state = RangeBodyState::Streaming {
+                            stream,
+                            window_len: this.remaining.min(WEB_STREAM_WINDOW),
+                            served: 0,
+                        };
+                    }
+                    Poll::Ready(Err(error)) => {
+                        return Poll::Ready(Some(Err(error)));
+                    }
+                },
+                RangeBodyState::Streaming {
+                    mut stream,
+                    window_len,
+                    served,
+                } => match stream.as_mut().poll_next(cx) {
+                    Poll::Pending => {
+                        this.state = RangeBodyState::Streaming {
+                            stream,
+                            window_len,
+                            served,
+                        };
+                        return Poll::Pending;
+                    }
+                    Poll::Ready(Some(Ok(frame))) => {
+                        this.state = RangeBodyState::Streaming {
+                            stream,
+                            window_len,
+                            served: served + frame.len() as u64,
+                        };
+                        return Poll::Ready(Some(Ok(frame)));
+                    }
+                    Poll::Ready(Some(Err(error))) => {
+                        return Poll::Ready(Some(Err(error)));
+                    }
+                    Poll::Ready(None) => {
+                        if served < window_len {
+                            // Short window = EOF or truncation: the next
+                            // window would ask past what the transport
+                            // just proved it will not serve — stop instead
+                            // of looping.
+                            return Poll::Ready(None);
+                        }
+                        this.off += served;
+                        this.remaining = this.remaining.saturating_sub(served);
+                        this.state = RangeBodyState::Idle;
+                    }
+                },
             }
-        }
-        match &mut this.state {
-            RangeBodyState::Streaming(stream) => stream.as_mut().poll_next(cx),
-            RangeBodyState::Done => Poll::Ready(None),
-            // Transitioned (or returned) in the Opening arm above.
-            RangeBodyState::Opening(_) => unreachable!("the Opening arm always transitions"),
         }
     }
 }
