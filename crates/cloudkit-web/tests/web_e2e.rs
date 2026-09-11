@@ -1666,3 +1666,146 @@ async fn delete_rings_the_sync_wake() {
         .await
         .expect("delete must ring the sync wake");
 }
+
+/// 19 (RB3 / stream-H1): an aead_v2 row over a range-capable transport
+///     streams through the WEB face — the webdav/winfsp faces got this
+///     regression shield in Phase 3.5-a, the web layer (RangeBody ×
+///     DecryptingTransport × WindowStream, the exact stack of the
+///     2026-09-11 open-range regression) had none. A `Range` GET answers
+///     206 with the PLAINTEXT Content-Length / Content-Range and the
+///     byte-exact plaintext slice; the full GET reassembles the whole
+///     plaintext; and BOTH arrive through the decrypting wrapper's ranged
+///     inner reads (the 34-byte header pull, then ciphertext spans in
+///     crypto-chunk coordinates) — never through a whole-file hydrate.
+///     The transport call SHAPE is the stream/hydrate discriminator:
+///     hydrate answers with correct bytes too, but only through `open`.
+#[tokio::test]
+async fn download_aead_v2_row_streams_ranges_through_the_decrypting_transport() {
+    let cfg = VfsConfig {
+        encryption_password: Some("pw".to_string()),
+        ..base_cfg()
+    };
+    let env = env_with(cfg, Arc::new(MockTransport::new())).await;
+    let addr = env.server.local_addr();
+
+    // aead_v2 container geometry (the webdav 6h face test's): one 34-byte
+    // header, one 16-byte tag per 1 MiB crypto chunk, a non-exact tail —
+    // 3 crypto chunks total, so a mid-file range sits inside chunk 0
+    // while the full walk crosses every chunk boundary by construction.
+    const V2_CHUNK: u64 = 1024 * 1024;
+    const V2_TAG: u64 = 16;
+    const V2_HEADER: u64 = 34;
+    let plain_len = 2 * V2_CHUNK + 700_000;
+    let plaintext = ascii_pattern(plain_len as usize);
+    let container = cloudkit_core::crypto::AeadV2::new().encrypt("pw", &plaintext);
+    let container_len = container.len() as u64;
+    assert_eq!(
+        container_len,
+        V2_HEADER + 2 * (V2_CHUNK + V2_TAG) + 700_000 + V2_TAG,
+        "seed sanity: one header, one tag per crypto chunk"
+    );
+    let receipt = seed_remote(&env.mock, "/vault.bin", &container, 1, container_len).await;
+    let rel = RelPath::new("/vault.bin").expect("valid rel path");
+    env.db
+        .upsert_file_scheme(
+            &FileUpsert {
+                rel_path: rel.as_str().to_string(),
+                name: rel.name().to_string(),
+                parent_dir: rel.parent().expect("non-root path").as_str().to_string(),
+                size: plain_len as i64,
+                mtime: 1_700_000_123.0,
+                sha256: None,
+                is_dir: false,
+                telegram_msg_id: Some(receipt.first_msg_id),
+                is_uploaded: true,
+                is_cached: false,
+                is_encrypted: true,
+                chunk_count: 1,
+                mime_type: None,
+            },
+            "aead_v2",
+        )
+        .expect("seed aead_v2 row");
+
+    // ① The ranged GET: 206, plaintext range headers, the byte-exact
+    //    plaintext slice — served from the one ciphertext span covering
+    //    crypto chunk 0 (the header pull first), never a whole-container
+    //    open.
+    let resp = send(
+        addr,
+        &request(
+            "GET",
+            "/api/download/vault.bin",
+            addr,
+            &[("Range", "bytes=100-299")],
+            "",
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 206, "partial content: {resp}");
+    let expected_content_range = format!("bytes 100-299/{plain_len}");
+    assert_eq!(
+        header(&resp, "content-range"),
+        Some(expected_content_range.as_str()),
+        "Content-Range is decided against the PLAINTEXT total (K35), not the container"
+    );
+    assert_eq!(
+        header(&resp, "content-length"),
+        Some("200"),
+        "the promised body length is the plaintext slice, not ciphertext"
+    );
+    assert_eq!(
+        body_of(&resp),
+        std::str::from_utf8(&plaintext[100..300]).expect("ascii pattern"),
+        "the range body is the byte-exact plaintext slice"
+    );
+    let chunk = V2_CHUNK + V2_TAG;
+    assert_eq!(
+        env.mock.open_range_calls(),
+        vec![(0, V2_HEADER), (V2_HEADER, chunk)],
+        "streaming shape: the header pull first, then exactly the one ciphertext \
+         span covering crypto chunk 0 (the Range lands in ciphertext coordinates) — \
+         never a whole-container open"
+    );
+    assert!(
+        env.mock.open_calls().is_empty(),
+        "a ranged GET must not hydrate (no whole-file open)"
+    );
+
+    // ② The whole-file GET: 200 + the plaintext Content-Length + the full
+    //    plaintext, through one more header pull (a fresh request builds
+    //    a fresh decrypting wrapper) and one whole-container span — still
+    //    zero hydrate arms.
+    let resp = send(
+        addr,
+        &request("GET", "/api/download/vault.bin", addr, &[], ""),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 200, "full body: {resp}");
+    let expected_length = plain_len.to_string();
+    assert_eq!(
+        header(&resp, "content-length"),
+        Some(expected_length.as_str()),
+        "Content-Length is the PLAINTEXT total (K35), not the container"
+    );
+    assert_eq!(
+        body_of(&resp),
+        std::str::from_utf8(&plaintext).expect("ascii pattern"),
+        "the full GET reassembles the plaintext byte-exactly"
+    );
+    assert_eq!(
+        env.mock.open_range_calls(),
+        vec![
+            (0, V2_HEADER),
+            (V2_HEADER, chunk),
+            (0, V2_HEADER),
+            (V2_HEADER, 2 * chunk + 700_000 + V2_TAG),
+        ],
+        "the whole-file GET added header + one whole-container span — still zero \
+         hydrate arms"
+    );
+    assert!(
+        env.mock.open_calls().is_empty(),
+        "neither leg ever downloaded through the whole-file face"
+    );
+}
