@@ -865,6 +865,11 @@ async fn run() -> Result<()> {
         env!("CARGO_PKG_VERSION"),
         cwd.display()
     );
+    // Pretty/INFO on stdout; a parseable RUST_LOG overrides the level.
+    // Installed BEFORE config discovery: discovery-time events (the RV0
+    // disabled-volume skip note among them) must reach the log, not die
+    // against a not-yet-installed subscriber.
+    cloudkit_core::logging::init(&LogConfig::default()).context("initializing logging")?;
     match discover_config_with_volumes().context("config discovery failed")? {
         DiscoveredConfig::Single(cfg) => run_single_volume(cfg, cwd).await,
         DiscoveredConfig::Multi { process, volumes } => {
@@ -886,8 +891,7 @@ async fn run_single_volume(cfg: CyDriveConfig, cwd: std::path::PathBuf) -> Resul
     }
 
     // Pretty/INFO on stdout; a parseable RUST_LOG overrides the level.
-    cloudkit_core::logging::init(&LogConfig::default()).context("initializing logging")?;
-
+    // (Installed in `run` before discovery — see the note there.)
     let mut run_options = cloudkit_cli::RunOptions::default();
     let Some(transport) = connect_single_volume_transport(&cfg, &cwd, &mut run_options).await?
     else {
@@ -931,8 +935,7 @@ async fn run_multi_volume(
     volumes: Vec<VolumeConfig>,
     _cwd: std::path::PathBuf,
 ) -> Result<()> {
-    // Pretty/INFO on stdout; a parseable RUST_LOG overrides the level.
-    cloudkit_core::logging::init(&LogConfig::default()).context("initializing logging")?;
+    // (Logging is installed in `run` before discovery — see the note there.)
     println!("Assembling {} volume(s) ...", volumes.len());
 
     let mut injections = Vec::new();
