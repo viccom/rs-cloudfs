@@ -6,10 +6,10 @@
 
 **非目标（挂账）**：文件监视/自动热加载（触发源用显式控制命令，见 K48）；`cydrive volumes enable/disable` 的 toml 编辑 CLI（含凭据文件的程序化改写风险，v1 手编文件）；REMOVE 的持久化（运行态卸载不碰卷文件，重启后按文件回来——持久禁用=手编 `enabled = false`）。
 
-## §0 已核实接缝（2026-09-10 主会话侦察）
+## §0 已核实接缝（2026-09-10 主会话侦察；2026-09-11 经 RB1-RB4/telegram E2E/Low 清尾后复核仍全部成立）
 
 - `cloudkit-cli/src/lib.rs:864` `VolumeRegistry { volumes: Vec<VolumeRuntime> }`——启动期一次构建的平铺 Vec；`volume(name)`/`status_list()` 是仅有的消费面（mount pass、横幅、MV3 `/api/volumes`）。
-- `WebDavServer::serve_volumes(Vec<(String, CyDriveFs)>, addr)`（webdav lib.rs）——启动期把每卷路由一次性挂进 axum Router；无动态分发层。
+- `WebDavServer::serve_volumes(volumes: Vec<(String, CyDriveFs)>, addr)`（**crates/cloudkit-webdav/src/server.rs:95**）——启动期把每卷路由一次性挂进 axum Router；无动态分发层。
 - 控制通道（`control.rs`）：loopback 行协议，**仅 `STOP`** 一命令（122 行 `if line == "STOP"`）；`ControlServer::bind(cfg)` 回调触发 shutdown gate。扩命令的自然位置就在这个行协议。
 - `MultiVolumeHandle { registry, watch, stop_task, sync_tasks: Vec<Option<JoinHandle>>, webdav_addr, web_ui_addr, mounted_letters, mounted_volumes }`（lib.rs:971）——sync 任务与挂载列表也是启动期快照。
 - 每卷装配闭环已独立（K21/K22）：独立 db/CacheManager/transport/Vfs/上传队列；`Vfs::shutdown()` 每卷排空停止（stop 序列在用）；winfsp `MountHandle` 自带 mount/unmount + 就绪/消失双轮询（WF4）。

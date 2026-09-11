@@ -1,7 +1,7 @@
 # Phase 3.6 运行态卷管理 任务跟踪单
 
 > 计划：docs/plans/2026-09-10-runtime-volumes.md ｜ 裁决 K48–K51 ｜ worktree：`feat/runtime-volumes`（收口 merge 回 main）。
-> 基线：main@5508f49（workspace 888/0/9，winfsp 腿 94/0/1）。
+> 基线：main@5927a25（workspace 911/0/12 ignored——含 telegram 真网 E2E 3 个；winfsp 腿 117/0/1）。2026-09-11 复核：§0 六接缝经 RB1-RB4/telegram E2E/Low 清尾后全部成立（serve_volumes 精确化至 webdav server.rs:95）；兼容表述已按 1.0 前不兼容政策清除。
 
 | 任务 | 内容 | 状态 | 完成情况 | 证据 |
 |---|---|---|---|---|
