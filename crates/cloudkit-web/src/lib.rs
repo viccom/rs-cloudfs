@@ -933,7 +933,7 @@ struct RangeBody {
 
 /// Lifecycle of a [`RangeBody`]: between windows, the `open_range` call
 /// in flight, its frame stream flowing, or terminal after an error /
-/// short window / full length served.
+/// full length served.
 enum RangeBodyState {
     /// No window in flight: the next poll opens one (or ends at zero
     /// `remaining`).
@@ -948,8 +948,8 @@ enum RangeBodyState {
         window_len: u64,
         served: u64,
     },
-    /// After an error frame, a short window (EOF/truncation) or the full
-    /// length: nothing more, ever.
+    /// After an error frame (including a short window — stream-M1) or
+    /// the full length: nothing more, ever.
     Done,
 }
 
@@ -1030,11 +1030,19 @@ impl Stream for RangeBody {
                     }
                     Poll::Ready(None) => {
                         if served < window_len {
-                            // Short window = EOF or truncation: the next
-                            // window would ask past what the transport
-                            // just proved it will not serve — stop instead
-                            // of looping.
-                            return Poll::Ready(None);
+                            // stream-M1 (review RB4): a short window is a
+                            // TRUNCATION, not a graceful end — the inner
+                            // transport just proved it cannot serve what
+                            // its own handle promised. Fail the body with
+                            // an error frame (the enc_stream face's
+                            // "short read = error" semantics) instead of
+                            // ending cleanly at the short window, which
+                            // would pass truncation off as the whole
+                            // object.
+                            return Poll::Ready(Some(Err(StorageError::Unavailable(format!(
+                                "range window short: inner transport returned {served} \
+                                     of {window_len} bytes (object truncated?)"
+                            )))));
                         }
                         this.off += served;
                         this.remaining = this.remaining.saturating_sub(served);
@@ -1358,4 +1366,81 @@ async fn api_stats_summary(State(state): State<AppState>) -> Response {
         "quota_total": quota_total,
     }))
     .into_response()
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// stream-M1 (review RB4): a short window is an ERROR, not a clean
+    /// end. An inner transport whose handle promises [`PROMISED`] bytes
+    /// but serves fewer must surface as an error frame — the same
+    /// "short read = error" semantics the encrypted-stream face pins
+    /// (enc_stream's span check) — instead of silently truncating the
+    /// body at the short window. Today's drivers self-clamp, so only a
+    /// misbehaving future driver can trigger this; the test injects
+    /// exactly that (a remote holding 40 bytes behind a 100-byte handle).
+    #[test]
+    fn range_body_short_window_is_an_error_not_a_silent_end() {
+        const PROMISED: u64 = 100;
+        const SERVED: u64 = 40;
+
+        let rt = tokio::runtime::Builder::new_current_thread()
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        rt.block_on(async move {
+            let mock = Arc::new(cloudkit_core::transport::mock::MockTransport::new());
+            mock.connect().await.expect("connect the mock");
+            // 40 real bytes behind a handle that promises 100: every
+            // window the body opens comes back short.
+            let dir = tempfile::tempdir().expect("seed scratch dir");
+            let local_path = dir.path().join("short.bin");
+            std::fs::write(&local_path, vec![b'x'; SERVED as usize]).expect("seed bytes");
+            let receipt = mock
+                .upload(&cloudkit_core::transport::UploadJob {
+                    rel_path: RelPath::new("/short.bin").expect("valid rel path"),
+                    local_path,
+                    size: SERVED,
+                    chunk_count: 1,
+                    chunk_size: SERVED,
+                })
+                .await
+                .expect("seed upload");
+            let handle = RemoteHandle {
+                first_msg_id: receipt.first_msg_id,
+                chunk_msg_ids: receipt.chunk_msg_ids,
+                total_size: PROMISED,
+                path: None,
+            };
+            let transport: Arc<dyn CloudTransport> = mock;
+            let mut body = RangeBody::new(transport, handle, 0, PROMISED);
+
+            async fn next_item(body: &mut RangeBody) -> Option<Result<Bytes, StorageError>> {
+                std::future::poll_fn(|cx| Pin::new(&mut *body).poll_next(cx)).await
+            }
+
+            // ① First poll: the window's single frame — the mock's whole
+            //    40-byte store, short of the promised window.
+            let first = next_item(&mut body).await;
+            let frame = match first {
+                Some(Ok(frame)) => frame,
+                other => panic!("expected the window's first frame, got {other:?}"),
+            };
+            assert_eq!(
+                frame.len() as u64,
+                SERVED,
+                "the mock serves exactly its stored bytes, short of the window"
+            );
+
+            // ② Second poll: the short window must surface as an ERROR
+            //    frame (never a silent `None` — that would truncate the
+            //    response body at the short window with a clean end).
+            let second = next_item(&mut body).await;
+            assert!(
+                matches!(second, Some(Err(StorageError::Unavailable(_)))),
+                "a short window must end the body with an error frame, got {second:?}"
+            );
+        });
+    }
 }

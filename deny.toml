@@ -21,6 +21,19 @@ all-features = true
 # (.github/workflows/ci.yml, the `cargo tree --prefix none --format
 # "{lib}"` step), because a dependency edge of an *enabled* feature is
 # not something cargo-deny can assert.
+#
+# Scope note (review cross-L7, RB4): a `[graph] exclude` entry removes
+# the named crates from EVERY cargo-deny check, not only licenses —
+# advisories and bans too. That is the deliberate K38 trade: both crates
+# are feature-gated (`winfsp`, default off) out of every shipped graph —
+# the default build, the driver-pruned builds (K30) and CI's default
+# target — so nothing they could flag reaches a shipped binary;
+# winfsp-sys is bindgen output plus a vendored DLL import lib with no
+# independent source/advisory feed of its own; and the compensating
+# controls are the CI `cargo tree` assertion above plus the winfsp leg's
+# own test suite, which compile and exercise exactly the excluded
+# subtree. Any future crate added to this list needs the same statement
+# of edge, reachability and compensation.
 exclude = ["winfsp", "winfsp-sys"]
 
 [licenses]

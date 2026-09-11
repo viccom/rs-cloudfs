@@ -181,5 +181,13 @@ jobs:
       - name: cargo test (-p cloudkit-winfsp --features winfsp)
         run: cargo test -p cloudkit-winfsp --features winfsp
 
+      # RB3 (cli-M3): the cli crate's own suite against the winfsp leg —
+      # its feature-gated tests (mount_backend's runtime-gate matrix,
+      # doctor_winfsp) previously ran nowhere in CI, only locally.
+      # Same honesty rule as the winfsp crate's leg: they must pass
+      # WITHOUT WinFsp installed (never a DLL call).
+      - name: cargo test (-p cloudkit-cli --features winfsp)
+        run: cargo test -p cloudkit-cli --features winfsp
+
       - name: cargo build (-p cloudkit-cli --features winfsp)
         run: cargo build -p cloudkit-cli --features winfsp

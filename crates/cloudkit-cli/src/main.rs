@@ -31,7 +31,7 @@ use cloudkit_cli::{discover_config, discover_config_with_volumes, DiscoveredConf
 // write-back store exist only with the driver.
 #[cfg(feature = "baidu")]
 use cloudkit_cli::{BaiduEndpoints, ConfigTokenStore};
-use cloudkit_core::config::{Backend, CyDriveConfig, VolumeConfig};
+use cloudkit_core::config::{Backend, CyDriveConfig, MountBackend, VolumeConfig};
 use cloudkit_core::logging::LogConfig;
 #[cfg(feature = "telegram")]
 use cloudkit_core::rel_path::RelPath;
@@ -449,6 +449,11 @@ async fn mount_cmd_winfsp(
              the configured volume in-process (set mount_backend = \"webdav\" to map a URL)"
         );
     }
+    // The run flow's double-start guard applies here too (RB3 / cli-H2):
+    // this command builds a full stack against the instance's metadata db
+    // — a boot over a LIVE instance would contend for the db lock and
+    // double-write its caches, so it is refused the same actionable way.
+    cloudkit_cli::control::ensure_not_running(&cfg).await?;
     let letter = letter.unwrap_or_else(|| cfg.drive_letter.clone());
     let cwd = std::env::current_dir().context("resolving the working directory")?;
     let mut dispatch_options = cloudkit_cli::RunOptions::default();
@@ -458,7 +463,13 @@ async fn mount_cmd_winfsp(
         return Ok(()); // Ctrl+C during the connect
     };
     let stack = cloudkit_cli::build_stack(&cfg, transport).await?;
-    let label = cfg.drive_letter.clone();
+    // Review L1 (RB4): the volume label is the NAME Explorer shows, not
+    // the mount point — labeling the volume with its own drive letter
+    // ("V:") told the operator nothing. Single-volume mode has no volume
+    // name (that is a multi-volume `volumes_dir` concept, K21), so the
+    // stable product name is the honest label; the letter stays visible
+    // as the mount point in the banner.
+    let label = "CyDrive".to_string();
     let vfs = Arc::clone(&stack.vfs);
     let rt = tokio::runtime::Handle::current();
     let mount_point = letter.clone();
@@ -525,14 +536,38 @@ async fn unmount_cmd(letter: Option<String>, path: Option<PathBuf>) -> Result<()
         if path.is_some() {
             anyhow::bail!("--path applies to Unix mounts only; Windows uses drive letters");
         }
-        // K40 / WF4: an in-process winfsp mount belongs to the process
-        // that created it — WinFsp offers no cross-process unmount. Say so
-        // instead of running `net use /delete` (which would either fail or
-        // delete a mapping that is none of our business) and reporting a
-        // success that never happened.
-        if let Some(note) = cloudkit_cli::winfsp_unmount_note(&cfg) {
-            println!("{note}");
-            return Ok(());
+        // K40 / WF4 + RB3 (cli-H1): probe before answering. A *degraded*
+        // winfsp boot created a real `net use` mapping (K40's visible
+        // fallback) — that mapping is cross-process and ours, so unmount
+        // releases it at the probe-verified letter. Only a winfsp
+        // instance with nothing mapped on its drive URL gets the
+        // in-process note; the WebDAV backend keeps the direct release
+        // below. The probe is the status path's read-only `net use` scan
+        // (`cloudkit_platform::current_mount_for`) — never a mutation.
+        let probed = if cfg.mount_backend == MountBackend::Winfsp {
+            cloudkit_platform::current_mount_for(&cloudkit_cli::default_mount_url(&cfg))
+        } else {
+            None
+        };
+        match cloudkit_cli::winfsp_unmount_step(cfg.mount_backend, probed) {
+            Some(cloudkit_cli::WinfspUnmountStep::ReleaseDegradedMapping { letter }) => {
+                cloudkit_platform::windows::unmount_drive(&letter)
+                    .with_context(|| format!("unmounting {letter}"))?;
+                println!(
+                    "CyDrive unmounted from {letter} — the degraded winfsp boot's WebDAV \
+                     mapping (mount_backend = \"winfsp\" could not be honoured, so the boot \
+                     mapped the drive with `net use`; this release is that mapping's \
+                     `net use /delete`)"
+                );
+                return Ok(());
+            }
+            Some(cloudkit_cli::WinfspUnmountStep::ExplainInProcess) => {
+                let note = cloudkit_cli::winfsp_unmount_note(&cfg)
+                    .expect("the winfsp backend always carries the in-process note");
+                println!("{note}");
+                return Ok(());
+            }
+            None => {} // the WebDAV backend: its cross-process mapping is released below
         }
         let letter = cloudkit_cli::resolve_unmount_letter(&cfg, letter);
         cloudkit_platform::windows::unmount_drive(&letter)

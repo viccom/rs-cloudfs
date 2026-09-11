@@ -235,44 +235,100 @@ const WINFSP_REG_KEYS: [&str; 2] = [r"SOFTWARE\WOW6432Node\WinFsp", r"SOFTWARE\W
 /// other architectures' names are `winfsp-x86.dll` / `winfsp-a64.dll`.
 const WINFSP_DLL: &str = "winfsp-x64.dll";
 
-impl SystemWinFsp {
-    /// Registry `InstallDir` → `<dir>\bin\winfsp-x64.dll`, `None` when the
-    /// key or the DLL is missing (both mean "not installed", which is the
-    /// CI box's normal state).
-    fn locate() -> Option<WinFspInstall> {
-        use windows::core::w;
-        use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
+/// Reads one subkey's `InstallDir` (a pure registry read; `None` when
+/// the key or the value is unreadable).
+///
+/// No fixed-size cap: the value is read through a stack buffer first,
+/// and on `ERROR_MORE_DATA` (the buffer was too small; `size` then
+/// carries the required byte count) the read is retried once into a
+/// right-sized allocation (review cli-M1, RB4 — the old fixed
+/// 260-UTF-16-unit buffer silently turned a long `InstallDir` into a
+/// probe miss the doctor would not reproduce).
+fn read_install_dir(subkey: &str) -> Option<PathBuf> {
+    use windows::core::w;
+    use windows::Win32::System::Registry::{RegGetValueW, HKEY_LOCAL_MACHINE, RRF_RT_REG_SZ};
 
-        for subkey in WINFSP_REG_KEYS {
-            let key: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
-            let mut buf = [0u16; 260];
-            let mut size = (buf.len() * std::mem::size_of::<u16>()) as u32;
-            let status = unsafe {
-                RegGetValueW(
-                    HKEY_LOCAL_MACHINE,
-                    windows::core::PCWSTR(key.as_ptr()),
-                    w!("InstallDir"),
-                    RRF_RT_REG_SZ,
-                    None,
-                    Some(buf.as_mut_ptr().cast()),
-                    Some(&mut size),
-                )
-            };
-            if status.is_err() {
-                continue;
-            }
-            // `size` counts bytes including the NUL terminator.
-            let len = (size as usize / std::mem::size_of::<u16>()).saturating_sub(1);
-            let dir = PathBuf::from(String::from_utf16_lossy(&buf[..len]));
-            let dll = dir.join("bin").join(WINFSP_DLL);
-            if dll.exists() {
-                return Some(WinFspInstall {
-                    install_dir: dir,
-                    dll,
-                });
-            }
+    let key: Vec<u16> = subkey.encode_utf16().chain(std::iter::once(0)).collect();
+    let value = w!("InstallDir");
+
+    let mut buf = [0u16; 260];
+    let mut size = (buf.len() * std::mem::size_of::<u16>()) as u32;
+    let mut status = unsafe {
+        RegGetValueW(
+            HKEY_LOCAL_MACHINE,
+            windows::core::PCWSTR(key.as_ptr()),
+            value,
+            RRF_RT_REG_SZ,
+            None,
+            Some(buf.as_mut_ptr().cast()),
+            Some(&mut size),
+        )
+    };
+    if status == windows::Win32::Foundation::ERROR_MORE_DATA {
+        // `size` is now the required byte count (including the NUL);
+        // retry once, right-sized.
+        let mut wide = vec![0u16; size as usize / std::mem::size_of::<u16>() + 1];
+        let mut retry_size = (wide.len() * std::mem::size_of::<u16>()) as u32;
+        status = unsafe {
+            RegGetValueW(
+                HKEY_LOCAL_MACHINE,
+                windows::core::PCWSTR(key.as_ptr()),
+                value,
+                RRF_RT_REG_SZ,
+                None,
+                Some(wide.as_mut_ptr().cast()),
+                Some(&mut retry_size),
+            )
+        };
+        if status.is_err() {
+            return None;
         }
-        None
+        // `retry_size` counts bytes including the NUL terminator.
+        let len = (retry_size as usize / std::mem::size_of::<u16>()).saturating_sub(1);
+        wide.truncate(len);
+        return Some(PathBuf::from(String::from_utf16_lossy(&wide)));
+    }
+    if status.is_err() {
+        return None;
+    }
+    // `size` counts bytes including the NUL terminator.
+    let len = (size as usize / std::mem::size_of::<u16>()).saturating_sub(1);
+    Some(PathBuf::from(String::from_utf16_lossy(&buf[..len])))
+}
+
+/// The probe's selection seam (pure, the same shape the doctor's
+/// `cloudkit_platform::windows::winfsp_install` follows — the cli-M1
+/// alignment): the first candidate whose runtime DLL exists; a DLL-less
+/// candidate never masks a good later one.
+fn pick_install<I>(candidates: I) -> Option<WinFspInstall>
+where
+    I: IntoIterator<Item = PathBuf>,
+{
+    for install_dir in candidates {
+        let dll = install_dir.join("bin").join(WINFSP_DLL);
+        if dll.exists() {
+            return Some(WinFspInstall { install_dir, dll });
+        }
+    }
+    None
+}
+
+impl SystemWinFsp {
+    /// Registry `InstallDir` candidates → the first one whose runtime
+    /// DLL exists, `None` when no subkey carries a usable install (both
+    /// mean "not installed", which is the CI box's normal state).
+    ///
+    /// Selection semantics (review cli-M1, RB4): a subkey whose DLL is
+    /// missing is SKIPPED, not final — a stale first-subkey install must
+    /// not mask a good second-subkey one, and the doctor's probe
+    /// (`cloudkit_platform::windows::winfsp_install`) follows the exact
+    /// same shape so diagnosis and runtime can never disagree about the
+    /// same machine.
+    fn locate() -> Option<WinFspInstall> {
+        let candidates = WINFSP_REG_KEYS
+            .iter()
+            .filter_map(|subkey| read_install_dir(subkey));
+        pick_install(candidates)
     }
 
     /// One full probe: locate → preload → init.
@@ -739,4 +795,62 @@ fn volume_params() -> VolumeParams {
         .volume_serial_number(VOLUME_SERIAL)
         .volume_creation_time(crate::fs::unix_to_filetime(now));
     params
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fake install tree: `<dir>/bin/winfsp-x64.dll`.
+    fn install_tree(dir: &Path, with_dll: bool) -> PathBuf {
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).expect("create bin/");
+        if with_dll {
+            std::fs::write(bin.join(WINFSP_DLL), b"dll").expect("write dll");
+        }
+        dir.to_path_buf()
+    }
+
+    /// cli-M1 (review RB4): the selection seam — probe order wins when
+    /// the first candidate is complete, a DLL-less candidate never masks
+    /// a good later one, and no DLL anywhere is `None` (the runtime's
+    /// "not installed", the same machine shape the doctor's twin seam
+    /// answers `dll: None` on).
+    #[test]
+    fn pick_install_prefers_the_first_complete_candidate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = install_tree(&dir.path().join("first"), true);
+        let second = install_tree(&dir.path().join("second"), true);
+
+        let picked = pick_install([first.clone(), second]).expect("complete first candidate");
+        assert_eq!(
+            picked.install_dir, first,
+            "probe order wins when the first candidate is complete"
+        );
+    }
+
+    #[test]
+    fn pick_install_skips_a_dll_less_candidate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stale = install_tree(&dir.path().join("stale"), false);
+        let good = install_tree(&dir.path().join("good"), true);
+
+        let picked = pick_install([stale, good.clone()]).expect("the second candidate is good");
+        assert_eq!(
+            picked.install_dir, good,
+            "a stale first install must not mask a good second one (cli-M1)"
+        );
+    }
+
+    #[test]
+    fn pick_install_answers_none_when_no_candidate_carries_the_dll() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stale = install_tree(&dir.path().join("stale"), false);
+
+        let picked = pick_install([stale, dir.path().join("missing")]);
+        assert!(
+            picked.is_none(),
+            "no DLL anywhere: the runtime gate says not installed"
+        );
+    }
 }

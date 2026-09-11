@@ -26,11 +26,18 @@
 //! - **Closing the handle is part of the commit**: Windows refuses some
 //!   renames of open handles, so the staged file's handle is closed (and
 //!   fsynced) before the rename inside `put_staged`.
-//! - **No leaked staging siblings**: a writer that is dropped without a
-//!   commit removes its sibling (a handle can die between write and
-//!   cleanup, e.g. on abort), and a failed commit removes it too —
-//!   cleanup cannot report failure (WinFsp has no way to), so the
-//!   alternative would be a stray file in the cache tree forever.
+//! - **The staging sibling carries a random segment** (review M1): the
+//!   WebDAV spelling `.{name}.tmp` is a legal VIRTUAL path, so a remote
+//!   holding an editor-temp-shaped name would make `/foo`'s staging file
+//!   BE `/.foo.tmp`'s cache copy — staging truncated another pending
+//!   row's only copy of the bytes. The random segment makes the sibling
+//!   uncollidable; every cleanup path (commit, abort, Drop) removes the
+//!   actual randomized name.
+//! - **A failed commit keeps the bytes** (review H4): `put_staged`
+//!   renates the sibling onto the final cache path BEFORE the row/enqueue
+//!   tail, so on any failure that copy (or the pre-rename sibling) is the
+//!   only copy of the bytes — nothing is removed, the landed row stays
+//!   pending, and `Vfs::requeue_pending` revives it at the next boot.
 //!
 //! Pure local-file logic on purpose: nothing here calls into the WinFsp
 //! DLL, so the whole write model is testable on a machine without WinFsp
@@ -49,29 +56,42 @@ use cloudkit_core::vfs::{Vfs, VfsError};
 #[cfg(windows)]
 use std::os::windows::fs::FileExt as WindowsFileExt;
 
-/// The cache-tree staging sibling for a final local path:
-/// `dir/name.ext` -> `dir/.name.ext.tmp`, byte-for-byte the WebDAV
-/// adapter's `staged_sibling` (`cloudkit-webdav` src/lib.rs:914).
+/// A fresh 8-hex-digit tag for a staging sibling: `RandomState`'s
+/// per-instance OS seed runs through a fresh hasher — no extra
+/// dependency, and two calls differ with overwhelming probability (32
+/// bits against a collision that would need the same final path AND
+/// overlapping writers).
+fn random_tag() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    format!("{:08x}", hasher.finish() as u32)
+}
+
+/// The cache-tree staging sibling for a final local path, with a random
+/// segment (review M1): `dir/name.ext` ->
+/// `dir/.name.ext.<rand8>.tmp`. The random segment is what keeps the
+/// sibling from ever being another row's cache path — the fixed
+/// `.{name}.tmp` spelling is a legal virtual path, so a remote could hold
+/// a row whose cache copy sits exactly there (and staging truncated it).
 ///
-/// Note (divergence, deliberate): `cloudkit-core`'s own `tmp_sibling`
-/// (`vfs.rs:144`, used by `put`/`ingest_file`) names the same idea
-/// `name.ext.tmp` — no leading dot. Both are private helpers and both
-/// are transient; this module keeps the WebDAV writer's spelling because
-/// the WinFsp writer is that writer's port (plan §3-WF3: "路径策略照搬
-/// StagedFile").
+/// Divergence from the WebDAV writer (deliberate): that adapter keeps the
+/// plain `.{name}.tmp` spelling (`cloudkit-webdav` src/lib.rs:914), and
+/// `cloudkit-core`'s own `tmp_sibling` (`vfs.rs:145`) uses
+/// `name.ext.tmp` — both remain fixed-name transients.
 pub fn staged_sibling(final_local: &Path) -> PathBuf {
     let name = final_local.file_name().map_or_else(
         || "cydrive".to_string(),
         |n| n.to_string_lossy().into_owned(),
     );
-    final_local.with_file_name(format!(".{name}.tmp"))
+    final_local.with_file_name(format!(".{name}.{}.tmp", random_tag()))
 }
 
 /// The staged bytes of one open file handle.
 pub struct StagedWriter {
     /// The virtual path the commit will publish (`put_staged`).
     rel: RelPath,
-    /// The staging sibling (`.{name}.tmp` next to the final cache path).
+    /// The staging sibling (`.{name}.{rand8}.tmp` next to the final cache
+    /// path — review M1's random segment).
     staged: PathBuf,
     /// The open staging handle. `None` once the commit closed it (or the
     /// writer was aborted).
@@ -214,23 +234,28 @@ impl StagedWriter {
     /// The commit (K41/K43): fsync, close the staging handle, hand the
     /// sibling to `Vfs::put_staged` (atomic rename onto the cache path +
     /// pending row + enqueue). Called exactly once per writer because it
-    /// consumes it; a failure removes the sibling and surfaces the error
-    /// for the caller to log (cleanup cannot report it to Windows).
+    /// consumes it; a failure surfaces the error for the caller to log
+    /// (cleanup cannot report it to Windows) and KEEPS the bytes — review
+    /// H4: `put_staged` renames the sibling onto the final cache path
+    /// before the row/enqueue tail, so on any failure that copy (or, for
+    /// a failure before the rename, the sibling itself) is the only copy
+    /// of the bytes. Removing it would silently destroy the write; the
+    /// landed row stays pending and `Vfs::requeue_pending` revives it at
+    /// the next boot.
     pub async fn commit(mut self, vfs: &Vfs, mtime: f64) -> Result<(), VfsError> {
         if let Some(file) = self.file.take() {
             if let Err(error) = file.sync_all() {
+                // The bytes never left the staging sibling — that sibling
+                // is the only copy, so it stays (review H4). `closed`
+                // stops Drop from removing it.
                 self.closed = true;
-                let _ = std::fs::remove_file(&self.staged);
                 return Err(VfsError::Io(error));
             }
         }
         let result = vfs.put_staged(&self.rel, &self.staged, mtime).await;
-        // Either way the sibling is gone or the commit owns it now: an
-        // aborted commit must not leave a stray `.name.tmp` behind.
+        // Either way nothing is removed here: the sibling is gone (the
+        // rename consumed it) or it holds the only copy of the bytes.
         self.closed = true;
-        if result.is_err() {
-            let _ = std::fs::remove_file(&self.staged);
-        }
         result
     }
 
@@ -283,13 +308,76 @@ mod tests {
         RelPath::new(name).expect("valid rel path")
     }
 
-    /// The staging sibling is the WebDAV writer's spelling.
+    /// The staging sibling hides under a randomized hidden name
+    /// (`.{name}.{rand8}.tmp`): hidden, `.tmp`-suffixed, carrying the
+    /// final name and a fresh random segment per call, in the same
+    /// directory (review M1).
     #[test]
-    fn staged_sibling_matches_the_webdav_spelling() {
+    fn staged_sibling_hides_under_a_randomized_name() {
         let final_local = Path::new("C:\\cache\\docs\\report.bin");
-        let staged = staged_sibling(final_local);
-        assert_eq!(staged.file_name().expect("name"), ".report.bin.tmp");
-        assert_eq!(staged.parent(), final_local.parent());
+        let first = staged_sibling(final_local);
+        let first_name = first
+            .file_name()
+            .expect("name")
+            .to_string_lossy()
+            .into_owned();
+        assert!(
+            first_name.starts_with(".report.bin."),
+            "hidden name: {first_name}"
+        );
+        assert!(first_name.ends_with(".tmp"), "tmp-suffixed: {first_name}");
+        assert_eq!(first.parent(), final_local.parent(), "same directory");
+
+        // The random segment is 8 hex digits between the final name and
+        // the suffix, and it differs call to call.
+        let segment = first_name
+            .strip_prefix(".report.bin.")
+            .expect("prefix")
+            .strip_suffix(".tmp")
+            .expect("suffix");
+        assert_eq!(segment.len(), 8, "rand8 segment: {first_name}");
+        assert!(
+            segment.chars().all(|c| c.is_ascii_hexdigit()),
+            "hex segment: {first_name}"
+        );
+        assert_ne!(
+            first,
+            staged_sibling(final_local),
+            "two staging siblings of the same path must not share a name"
+        );
+    }
+
+    /// M1 at the writer level: staging `/foo` must never touch a file
+    /// spelled `.{name}.tmp` next to it — the old fixed sibling spelling
+    /// is a legal virtual path whose cache copy could sit exactly there.
+    #[test]
+    fn staging_foo_does_not_touch_a_dot_foo_dot_tmp_neighbor() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let final_local = dir.path().join("foo");
+        let neighbor = dir.path().join(".foo.tmp");
+        std::fs::write(&neighbor, b"SECRET").expect("seed the neighbor copy");
+
+        let mut writer =
+            StagedWriter::create_empty(rel("/foo"), &final_local).expect("create staged");
+        assert_ne!(
+            writer.staged_path().file_name(),
+            neighbor.file_name(),
+            "the randomized sibling must differ from the old fixed spelling"
+        );
+        writer.write_at(0, b"new-bytes").expect("write");
+        assert_eq!(writer.len().expect("len"), 9);
+
+        assert_eq!(
+            std::fs::read(&neighbor).expect("the neighbor copy"),
+            b"SECRET",
+            "staging /foo must not truncate or rewrite .foo.tmp"
+        );
+        writer.abort();
+        assert_eq!(
+            std::fs::read(&neighbor).expect("the neighbor copy"),
+            b"SECRET",
+            "aborting /foo's staging must not remove .foo.tmp either"
+        );
     }
 
     /// A positioned write below EOF lands byte-exact and leaves the rest
@@ -428,18 +516,101 @@ mod tests {
     }
 
     /// A writer dropped without a commit does not leak the sibling
-    /// (a handle can die between the last write and cleanup).
+    /// (a handle can die between the last write and cleanup) — and the
+    /// sibling removed is the actual randomized name.
     #[test]
     fn drop_without_commit_removes_the_staging_sibling() {
         let dir = tempfile::tempdir().expect("temp dir");
         let final_local = dir.path().join("dropped.bin");
-        let staged = staged_sibling(&final_local);
         {
             let mut writer = StagedWriter::create_empty(rel("/dropped.bin"), &final_local)
                 .expect("create staged");
             writer.write_at(0, b"never committed").expect("write");
-            assert!(staged.exists());
+            assert!(writer.staged_path().exists());
+            let staged = writer.staged_path().to_path_buf();
+            drop(writer);
+            assert!(!staged.exists(), "drop must remove the staging sibling");
         }
-        assert!(!staged.exists(), "drop must remove the staging sibling");
+        assert_eq!(
+            std::fs::read_dir(dir.path())
+                .expect("read dir")
+                .filter_map(|entry| entry.ok())
+                .map(|entry| entry.file_name().to_string_lossy().into_owned())
+                .collect::<Vec<_>>(),
+            Vec::<String>::new(),
+            "the cache directory holds no leftovers"
+        );
+    }
+
+    /// H4 at the writer level: a commit whose enqueue fails keeps the
+    /// bytes wherever the rename left them. With the queue closed,
+    /// `put_staged` renames the sibling onto the final path and fails the
+    /// enqueue — the bytes stay at the FINAL path and nothing is removed
+    /// (review H4: the old "the write was discarded" semantics were false).
+    #[tokio::test]
+    async fn failed_commit_keeps_the_migrated_bytes() {
+        use std::sync::Arc;
+        use std::time::Duration;
+
+        use cloudkit_core::cache::CacheManager;
+        use cloudkit_core::database::MetaDatabase;
+        use cloudkit_core::transport::mock::MockTransport;
+        use cloudkit_core::transport::{Capabilities, CloudTransport};
+        use cloudkit_core::upload_queue::RetryPolicy;
+        use cloudkit_core::vfs::VfsConfig;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let db = Arc::new(MetaDatabase::open(&dir.path().join("meta.db")).expect("db"));
+        let cache = CacheManager::new(dir.path().join("cache"), 1 << 30);
+        let mock = Arc::new(
+            MockTransport::builder()
+                .capabilities(Capabilities {
+                    range_read: true,
+                    inbound: true,
+                    chat: true,
+                    ..Capabilities::none()
+                })
+                .build(),
+        );
+        let transport: Arc<dyn CloudTransport> = mock.clone();
+        let vfs = Vfs::new(
+            db,
+            cache,
+            transport,
+            VfsConfig {
+                chunk_size_bytes: 64,
+                workers: 1,
+                queue_capacity: 16,
+                retry: RetryPolicy {
+                    initial_backoff: Duration::from_millis(1),
+                    max_backoff: Duration::from_millis(2),
+                    max_attempts: 3,
+                },
+                encryption_password: None,
+                encryption_scheme: cloudkit_core::config::EncryptionScheme::Gcm,
+                hydrate_timeout: Duration::from_secs(180),
+            },
+        );
+        vfs.shutdown().await; // the enqueue will fail
+
+        let final_local = dir.path().join("cache").join("stuck.bin");
+        let mut writer =
+            StagedWriter::create_empty(rel("/stuck.bin"), &final_local).expect("create staged");
+        writer.write_at(0, b"payload-bytes").expect("stage bytes");
+        let staged = writer.staged_path().to_path_buf();
+
+        let result = writer.commit(&vfs, 0.0).await;
+        assert!(result.is_err(), "the closed queue must fail the commit");
+
+        // The bytes survived the rename onto the final path and stayed.
+        assert_eq!(
+            std::fs::read(&final_local).expect("the kept bytes"),
+            b"payload-bytes",
+            "H4 FIXED: the migrated bytes must stay at the final cache path"
+        );
+        assert!(
+            !staged.exists(),
+            "the sibling was consumed by the rename, not by a removal"
+        );
     }
 }

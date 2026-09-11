@@ -584,6 +584,18 @@ impl AeadV2Window {
     /// `plain_len`-byte container, header included — the coordinates a
     /// random-access consumer forwards to storage (`open_range(off,
     /// len)`), and the slice bounds within the whole container bytes.
+    ///
+    /// # Contract (review stream-M3, RB4)
+    ///
+    /// `first <= last && last < n_chunks_for_plain(plain_len)` — the
+    /// span arithmetic is undefined for an out-of-file range. Every
+    /// caller derives `first`/`last` from positions already clamped to
+    /// the plaintext total (`WindowSteps.next_window` clamps its window
+    /// to `end <= total`; the webdav `RangeFile` and winfsp `WindowReader`
+    /// clamp to `total_size`), and the tuple return keeps the function a
+    /// pure layout expression — so the precondition is pinned by a
+    /// debug assertion rather than widened into a `Result` whose error
+    /// arm no honest caller could reach.
     pub fn ciphertext_span(&self, first: u64, last: u64, plain_len: u64) -> (u64, u64) {
         let n = self.n_chunks_for_plain(plain_len);
         debug_assert!(first <= last && last < n, "chunk range outside the file");
@@ -602,14 +614,20 @@ impl AeadV2Window {
     /// Decrypts and authenticates one chunk (`ct` = ciphertext + tag
     /// exactly as addressed by [`AeadV2Window::ciphertext_span`]).
     /// Tampering, a wrong index/finality or a wrong password is
-    /// [`CryptoError::AuthFailed`] — never wrong plaintext.
+    /// [`CryptoError::AuthFailed`] — never wrong plaintext. An `index`
+    /// at/past [`MAX_CHUNKS`] is [`CryptoError::Malformed`]: the nonce
+    /// counter cannot address it, so the input is outside the format's
+    /// representable domain (review stream-M3, RB4 — a runtime refusal,
+    /// not a debug-only assertion).
     pub fn decrypt_chunk(
         &self,
         index: u64,
         is_last: bool,
         ct: &[u8],
     ) -> Result<Vec<u8>, CryptoError> {
-        debug_assert!(index < MAX_CHUNKS, "chunk index beyond nonce capacity");
+        if index >= MAX_CHUNKS {
+            return Err(CryptoError::Malformed);
+        }
         decrypt_chunk(
             &self.cipher,
             &self.header_bytes,

@@ -19,9 +19,11 @@
 //! Case sensitivity (known, deliberate): lookups are byte-exact against
 //! the `/`-separated rows (`RelPath`'s contract). Windows sends the names
 //! it saw in `read_directory`, so Explorer's own navigation matches, but
-//! a program typed-`\DOCS\README.TXT` miss is a `STATUS_OBJECT_NAME_NOT_FOUND`
-//! until a case-folding layer is decided (WF4 open question, not
-//! invented here).
+//! a program typed-`\DOCS\README.TXT` miss with an existing `\DOCS` row
+//! is a `STATUS_OBJECT_NAME_NOT_FOUND` until a case-folding layer is
+//! decided (WF4 open question, not invented here). A miss whose parent
+//! row is gone (or not a directory) is `STATUS_OBJECT_PATH_NOT_FOUND` —
+//! review M6, RB4.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -33,18 +35,23 @@ use std::time::{Duration, Instant};
 // so two reads of one reused handle serialize instead of interleaving
 // fills) — hence the await-aware lock, the same choice ck-baidu's token
 // refresh lock makes. Everything else here is a plain `std` mutex: the
-// enumeration buffer, the grace table, the open-time stat snapshot and
-// the staged write state are only ever held synchronously (the staged
-// writer's commit is taken OUT of its slot before the bridge blocks).
+// enumeration buffer, the grace table and the open-time stat snapshot are
+// only ever held synchronously. The staged write slot is the one bounded
+// exception (review winfsp-M5, RB4): `writer_slot` holds its guard across
+// the materializing `block_on(hydrate)` on purpose — the awaited future
+// never takes the slot itself, so this is same-handle serialization
+// (a second writer, or a reader, waits out the one hydrate), never a
+// deadlock — and `commit` is taken OUT of its slot before the bridge
+// blocks.
 use tokio::sync::Mutex as AsyncMutex;
 
 use cloudkit_core::database::FileRecord;
 use cloudkit_core::rel_path::RelPath;
-use cloudkit_core::vfs::{StreamSource, Vfs, VfsError};
+use cloudkit_core::vfs::{StreamSource, Vfs, VfsError, MAX_SEGMENT_UTF16};
 use windows::Win32::Foundation::{
-    STATUS_ACCESS_DENIED, STATUS_DIRECTORY_NOT_EMPTY, STATUS_INVALID_DEVICE_REQUEST,
-    STATUS_INVALID_PARAMETER, STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_COLLISION,
-    STATUS_OBJECT_NAME_NOT_FOUND, STATUS_OBJECT_PATH_NOT_FOUND,
+    STATUS_DIRECTORY_NOT_EMPTY, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER,
+    STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
+    STATUS_OBJECT_PATH_NOT_FOUND,
 };
 use winfsp::constants::FspCleanupFlags;
 use winfsp::filesystem::{
@@ -508,6 +515,11 @@ struct GraceEntry {
     read: Arc<AsyncMutex<ReadHandle>>,
     /// `Instant` after which a reopen must build a fresh state.
     expires_at: Instant,
+    /// The row size the state was parked under (the handle's stat
+    /// snapshot). Review H1: a delete + recreate behind the same path
+    /// leaves the parked state describing a file that no longer exists —
+    /// the reopen's fresh row size is the witness that discards it.
+    size: u64,
 }
 
 /// The handle grace table (K41), keyed by path.
@@ -538,7 +550,8 @@ impl GraceTable {
 
     /// Parks `read` under `rel`, sweeping expired entries and keeping
     /// the table within `capacity` (the entry closest to expiry — the
-    /// oldest close — goes first).
+    /// oldest close — goes first). `size` is the row size the state was
+    /// parked under (the handle's stat snapshot).
     fn park(
         &mut self,
         rel: RelPath,
@@ -546,9 +559,17 @@ impl GraceTable {
         expires_at: Instant,
         now: Instant,
         capacity: usize,
+        size: u64,
     ) {
         self.prune_expired(now);
-        self.entries.insert(rel, GraceEntry { read, expires_at });
+        self.entries.insert(
+            rel,
+            GraceEntry {
+                read,
+                expires_at,
+                size,
+            },
+        );
         while self.entries.len() > capacity.max(1) {
             let victim = self
                 .entries
@@ -566,11 +587,30 @@ impl GraceTable {
         }
     }
 
-    /// Takes the live entry for `rel`, if any (expired entries are
-    /// dropped, never handed out).
-    fn take_live(&mut self, rel: &RelPath, now: Instant) -> Option<Arc<AsyncMutex<ReadHandle>>> {
+    /// Takes the live entry for `rel`, if any. Expired entries are
+    /// dropped, never handed out; so is a parked state whose size
+    /// disagrees with the reopened row's size — it describes a different
+    /// file behind the same path (review H1: delete + recreate inside the
+    /// grace window reused the parked EOF and truncated the new file).
+    fn take_live(
+        &mut self,
+        rel: &RelPath,
+        now: Instant,
+        row_size: u64,
+    ) -> Option<Arc<AsyncMutex<ReadHandle>>> {
         self.prune_expired(now);
-        self.entries.remove(rel).map(|entry| entry.read)
+        match self.entries.remove(rel) {
+            Some(entry) if entry.size == row_size => Some(entry.read),
+            Some(_) => None,
+            None => None,
+        }
+    }
+
+    /// Drops the entry for `rel`, whatever its expiry (review H1):
+    /// delete, rename and commit are events a parked read state must not
+    /// survive.
+    fn invalidate(&mut self, rel: &RelPath) {
+        self.entries.remove(rel);
     }
 }
 
@@ -606,6 +646,22 @@ pub const DEFAULT_HANDLE_GRACE: Duration = Duration::from_secs(5);
 /// keeps closing at once. Expired entries are swept on every touch
 /// (open/close), so the table drains as soon as any handle moves.
 pub const DEFAULT_GRACE_CAPACITY: usize = 64;
+
+/// Upper bound on the [`CloudFs::with_stream_window`] override (review
+/// winfsp-L6, RB4): the seam exists so tests can make multi-window read
+/// sequences observable with small windows, and production keeps
+/// [`crate::reader::DEFAULT_READ_WINDOW`]. 64 MiB is 16× that default —
+/// far past anything an observability test needs — so an override past
+/// it is misuse the clamp absorbs instead of a per-window memory and
+/// fetch blast radius a caller could accidentally ask for.
+pub const MAX_STREAM_WINDOW: u64 = 64 * 1024 * 1024;
+
+/// The clamp [`CloudFs::with_stream_window`] applies: at least one byte
+/// (a 0-byte window could never make progress), at most
+/// [`MAX_STREAM_WINDOW`].
+pub fn clamp_stream_window(window: u64) -> u64 {
+    window.clamp(1, MAX_STREAM_WINDOW)
+}
 
 impl CloudFs {
     /// Assembles the adapter over an already-built VFS.
@@ -645,8 +701,11 @@ impl CloudFs {
     /// the WebDAV adapter's `with_stream_window`: small windows turn
     /// multi-window read sequences observable without multi-megabyte
     /// fixtures; production keeps [`crate::reader::DEFAULT_READ_WINDOW`]).
+    /// The override is clamped through [`clamp_stream_window`] — a seam
+    /// without a ceiling would store an absurd override verbatim (review
+    /// winfsp-L6, RB4).
     pub fn with_stream_window(mut self, window: u64) -> Self {
-        self.stream_window = window.max(1);
+        self.stream_window = clamp_stream_window(window);
         self
     }
 
@@ -724,7 +783,7 @@ impl CloudFs {
         self.resolve_row(rel)?
             .as_ref()
             .map(Meta::from_record)
-            .ok_or_else(|| STATUS_OBJECT_NAME_NOT_FOUND.into())
+            .ok_or_else(|| self.lookup_miss(rel))
     }
 
     /// The row for `rel` under Windows case semantics: the exact
@@ -801,31 +860,58 @@ impl CloudFs {
         // a caller's case variant.
         let record = self
             .resolve_row(rel)?
-            .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
-        let canonical = RelPath::new(&record.rel_path).expect("db rows carry canonical rel paths");
+            .ok_or_else(|| self.lookup_miss(rel))?;
+        // Review H2: a db row's rel_path is only ever canonical when it
+        // came from an in-tree writer; external/legacy writers (the
+        // Python baseline does no validation) can park a non-vpath
+        // spelling here. The callback must answer an error, never panic.
+        let canonical = RelPath::new(&record.rel_path).map_err(|error| {
+            tracing::error!(
+                rel_path = %record.rel_path,
+                %error,
+                "winfsp: db row carries a non-vpath rel_path; the entry \
+                 cannot be opened"
+            );
+            invalid_name()
+        })?;
         let meta = Meta::from_record(&record);
         let read = if meta.is_dir {
             // Directories have no read state; their handle only ever
             // serves metadata and enumeration.
             None
         } else {
-            Some(self.acquire_read(&canonical)?)
+            Some(self.acquire_read(&canonical, meta.size)?)
         };
         Ok(Handle::new(canonical, meta, read))
     }
 
+    /// Drops any parked read state for `rel` (review H1): delete, rename
+    /// and commit are events a parked read state must not survive — a
+    /// reopen after them must build a fresh state.
+    fn grace_invalidate(&self, rel: &RelPath) {
+        self.grace
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .invalidate(rel);
+    }
+
     /// The read state for one file open: the parked one when the K41
     /// grace table still holds it, otherwise a fresh K33 dispatch.
+    ///
+    /// `row_size` is the fresh row's size (review H1): a parked state
+    /// whose size disagrees describes a different file behind the same
+    /// path and is discarded instead of reused.
     fn acquire_read(
         &self,
         rel: &RelPath,
+        row_size: u64,
     ) -> std::result::Result<Arc<AsyncMutex<ReadHandle>>, FspError> {
         let now = Instant::now();
         if let Some(parked) = self
             .grace
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .take_live(rel, now)
+            .take_live(rel, now, row_size)
         {
             return Ok(parked);
         }
@@ -881,6 +967,25 @@ impl CloudFs {
         }
     }
 
+    /// The lookup-miss verdict for the open face (`open`, and
+    /// `get_security_by_name` through `meta_for`): `NAME_NOT_FOUND` when
+    /// the parent directory row exists (the entry itself is missing),
+    /// `PATH_NOT_FOUND` when the parent is missing or not a directory —
+    /// the same NT shape `require_dir_parent` answers on the create arm
+    /// (review M6, RB4: the two arms used to disagree, open reporting a
+    /// name miss for a path whose directory chain is gone). A root-level
+    /// or parentless miss is a plain name miss.
+    fn lookup_miss(&self, rel: &RelPath) -> FspError {
+        match rel.parent() {
+            Some(parent) if !parent.is_root() => match self.row(&parent) {
+                Ok(Some(row)) if row.is_dir => STATUS_OBJECT_NAME_NOT_FOUND.into(),
+                Ok(_) => STATUS_OBJECT_PATH_NOT_FOUND.into(),
+                Err(error) => error,
+            },
+            _ => STATUS_OBJECT_NAME_NOT_FOUND.into(),
+        }
+    }
+
     // -------------------------------------------------- write staging ---
 
     /// The K43 create half, DLL-free (the callback past it only fills the
@@ -904,6 +1009,17 @@ impl CloudFs {
         create_options: u32,
         file_attributes: u32,
     ) -> std::result::Result<Handle, FspError> {
+        // Review M3: a segment past the mount layer's 255-UTF-16-unit
+        // enumeration cap is refused at the face — publishing it would
+        // give the entry a staged state the directory listing can never
+        // show again (the write surfaces carry the same cap as
+        // `VfsError::NameTooLong`; this is the FSD-facing twin).
+        if rel.as_str()[1..]
+            .split('/')
+            .any(|segment| segment.encode_utf16().count() > MAX_SEGMENT_UTF16)
+        {
+            return Err(invalid_name());
+        }
         let intent = create_intent(create_options, file_attributes)?;
         if self.row(rel)?.is_some() {
             return Err(STATUS_OBJECT_NAME_COLLISION.into());
@@ -1176,9 +1292,20 @@ impl CloudFs {
         // not-found arm is a deliberate silent success, so an unresolved
         // spelling would delete nothing while reporting none of it.
         let rel = match self.resolve_row(&rel) {
-            Ok(Some(record)) => {
-                RelPath::new(&record.rel_path).expect("db rows carry valid rel paths")
-            }
+            // Review H2: a dirty row (non-vpath rel_path) keeps the entry
+            // instead of panicking the callback.
+            Ok(Some(record)) => match RelPath::new(&record.rel_path) {
+                Ok(canonical) => canonical,
+                Err(error) => {
+                    tracing::error!(
+                        rel_path = %record.rel_path,
+                        %error,
+                        "winfsp: cleanup delete hit a db row with a non-vpath \
+                         rel_path; the entry was kept"
+                    );
+                    return;
+                }
+            },
             Ok(None) => rel,
             Err(error) => {
                 tracing::error!(
@@ -1196,12 +1323,20 @@ impl CloudFs {
             );
             return;
         }
-        if let Err(error) = self.bridge.block_on(self.delete_entry(&rel)) {
-            tracing::error!(
+        match self.bridge.block_on(self.delete_entry(&rel)) {
+            Ok(()) => {
+                // Review H1: the row and the cache copy are gone — a
+                // parked state for this path is stale by construction,
+                // and the dying handle's own read state must not be
+                // parked by the close that follows this cleanup.
+                self.grace_invalidate(&rel);
+                context.set_read_state(None);
+            }
+            Err(error) => tracing::error!(
                 rel_path = %rel,
                 %error,
                 "winfsp: cleanup delete failed; the entry was kept"
-            );
+            ),
         }
     }
 
@@ -1209,8 +1344,13 @@ impl CloudFs {
     /// (`cloudkit-webdav` src/lib.rs:388-431) with the WinFsp API's
     /// extras:
     ///
-    /// - `from == to` is refused (the WebDAV adapter's `Forbidden`; the
-    ///   OS never posts a same-name rename);
+    /// - a **case-only rename** — the destination equals the canonical
+    ///   source up to case, the shape every FSD-delivered upcased source
+    ///   produces — is a legal rename: the row and the cache copy move to
+    ///   the new spelling, nothing is refused or replaced (review C1;
+    ///   the WebDAV face needs no equivalent because its row lookups are
+    ///   byte-exact, so a case-variant destination never resolves onto
+    ///   the source row there);
     /// - the destination is replaced only when the FSD says
     ///   `replace_if_exists` (Win32 `ReplaceIfExists`) — without it an
     ///   existing destination is `STATUS_OBJECT_NAME_COLLISION`;
@@ -1234,9 +1374,6 @@ impl CloudFs {
         to: &RelPath,
         replace_if_exists: bool,
     ) -> std::result::Result<(), FspError> {
-        if from == to {
-            return Err(STATUS_ACCESS_DENIED.into());
-        }
         if handle.has_pending_write() {
             return Err(fsp_error(&VfsError::UploadPending(
                 from.as_str().to_string(),
@@ -1247,8 +1384,49 @@ impl CloudFs {
             .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
         // The FSD may deliver the source upcased (case-insensitive
         // resolution): everything downstream keys off the canonical
-        // spelling the row carries.
-        let from = RelPath::new(&row.rel_path).expect("db rows carry valid rel paths");
+        // spelling the row carries. Review H2: a dirty row's rel_path
+        // (external/legacy writer) must answer an error, never panic.
+        let from = RelPath::new(&row.rel_path).map_err(|error| {
+            tracing::error!(
+                rel_path = %row.rel_path,
+                %error,
+                "winfsp: rename source row carries a non-vpath rel_path"
+            );
+            invalid_name()
+        })?;
+        // Case-only rename (review C1): the canonical source and the
+        // destination agree up to case — including the byte-equal shape
+        // an upcased source produces — so there is no distinct
+        // destination. The old raw `from == to` guard refused the most
+        // common case rename outright (ACCESS_DENIED), and a case-variant
+        // destination resolved onto THIS row in the overwrite branch
+        // below and deleted it — the row plus, through NTFS's
+        // case-insensitive remove, the cache copy — while the same-row
+        // `rename_path` updated zero rows and still answered Ok. A case
+        // rename is just a rename: move the row, let the case-insensitive
+        // local rename flip the cache copy's spelling, and invalidate the
+        // grace table (review H1).
+        if from.as_str().to_lowercase() == to.as_str().to_lowercase() {
+            if !row.is_uploaded && self.vfs.local_copy_exists(&from) {
+                return Err(fsp_error(&VfsError::UploadPending(
+                    from.as_str().to_string(),
+                )));
+            }
+            self.vfs
+                .db()
+                .rename_path(from.as_str(), to.as_str())
+                .map_err(|error| fsp_error(&VfsError::Db(error)))?;
+            let from_local = self.vfs.local_path(&from);
+            let to_local = self.vfs.local_path(to);
+            if row.is_dir {
+                move_tree_best_effort(&from_local, &to_local);
+            } else if from_local.exists() {
+                let _ = std::fs::rename(&from_local, &to_local);
+            }
+            self.grace_invalidate(&from);
+            self.grace_invalidate(to);
+            return Ok(());
+        }
         self.require_dir_parent(to)?;
         if !row.is_uploaded && self.vfs.local_copy_exists(&from) {
             return Err(fsp_error(&VfsError::UploadPending(
@@ -1256,19 +1434,25 @@ impl CloudFs {
             )));
         }
         if let Some(dest) = self.row(to)? {
-            if dest.is_dir || row.is_dir {
-                return Err(STATUS_OBJECT_NAME_COLLISION.into());
-            }
-            if !replace_if_exists || (!dest.is_uploaded && self.vfs.local_copy_exists(to)) {
-                return Err(STATUS_OBJECT_NAME_COLLISION.into());
-            }
-            self.vfs
-                .db()
-                .delete_file(to.as_str())
-                .map_err(|error| fsp_error(&VfsError::Db(error)))?;
-            let dest_local = self.vfs.local_path(to);
-            if dest_local.exists() {
-                let _ = std::fs::remove_file(&dest_local);
+            // Review C1 guard: a destination that resolves to the row
+            // being renamed is a case-only rename (answered above), never
+            // an overwrite target — the one thing this branch must not do
+            // is delete the row being renamed.
+            if dest.id != row.id {
+                if dest.is_dir || row.is_dir {
+                    return Err(STATUS_OBJECT_NAME_COLLISION.into());
+                }
+                if !replace_if_exists || (!dest.is_uploaded && self.vfs.local_copy_exists(to)) {
+                    return Err(STATUS_OBJECT_NAME_COLLISION.into());
+                }
+                self.vfs
+                    .db()
+                    .delete_file(to.as_str())
+                    .map_err(|error| fsp_error(&VfsError::Db(error)))?;
+                let dest_local = self.vfs.local_path(to);
+                if dest_local.exists() {
+                    let _ = std::fs::remove_file(&dest_local);
+                }
             }
         }
         self.vfs
@@ -1285,6 +1469,11 @@ impl CloudFs {
             }
             let _ = std::fs::rename(&from_local, &to_local);
         }
+        // Review H1: the source path now names a different (or no) file,
+        // and a replaced destination's parked state describes deleted
+        // bytes — neither may be reused inside the grace window.
+        self.grace_invalidate(&from);
+        self.grace_invalidate(to);
         Ok(())
     }
 }
@@ -1394,14 +1583,34 @@ pub fn fill_file_info(info: &mut FileInfo, meta: &Meta) {
 /// search miss, restart enumeration and spin (spike's most expensive
 /// lesson: 5.2M `read_directory` calls, Explorer hung). `set_name`
 /// (OsStr) appends a NUL and counts it — never use it here.
-pub fn fill_dir_info(entry: &mut DirInfo<255>, child: &DirEntry) -> Result<()> {
+///
+/// Returns `Ok(true)` when the entry was filled and `Ok(false)` when it
+/// was SKIPPED (review M3): winfsp-rs' `DirInfo<255>` buffer holds at most
+/// 255 UTF-16 code units and `set_name_raw` answers
+/// `STATUS_INSUFFICIENT_RESOURCES` for a longer one — a single such row
+/// used to fail the WHOLE directory listing. Such rows can still enter
+/// through channels that bypass the write surfaces' segment cap (legacy
+/// db / sync / telegram captions), so the enumeration skips them
+/// deliberately (warn-logged): one unreadable entry must not hide the
+/// rest of the directory.
+pub fn fill_dir_info(entry: &mut DirInfo<255>, child: &DirEntry) -> Result<bool> {
+    let wide: Vec<u16> = child.name.encode_utf16().collect();
+    if wide.len() > 255 {
+        tracing::warn!(
+            name_len = wide.len(),
+            name_prefix = %child.name.chars().take(32).collect::<String>(),
+            "winfsp: directory entry name exceeds the 255 UTF-16-unit \
+             enumeration cap; the entry is skipped"
+        );
+        return Ok(false);
+    }
     {
         let info = entry.file_info_mut();
         *info = FileInfo::default();
         fill_file_info(info, &child.meta);
     }
-    let wide: Vec<u16> = child.name.encode_utf16().collect();
-    entry.set_name_raw(wide.as_slice())
+    entry.set_name_raw(wide.as_slice())?;
+    Ok(true)
 }
 
 impl FileSystemContext for CloudFs {
@@ -1468,16 +1677,30 @@ impl FileSystemContext for CloudFs {
         // handles have no read state, and their DirBuffer drops with the
         // handle as always (that drop is the DLL's own delete hook).
         //
+        // The parked entry records the stat size it was parked under, so
+        // a reopen whose fresh row disagrees (delete + recreate behind
+        // the same path — review H1) discards it instead of reusing it.
+        // Directory handles have no read state; `meta()` on one reports
+        // 0 and is never parked.
+        //
         // A staged writer that never reached `cleanup` (WinFsp always
         // posts one, so this is the never-reached safety net) drops with
         // the handle and removes its staging sibling.
+        let size = context.meta().size;
         let (rel, read) = context.into_grace_parts();
         let Some(read) = read else { return };
         let now = Instant::now();
         self.grace
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
-            .park(rel, read, now + self.grace_period, now, self.grace_capacity);
+            .park(
+                rel,
+                read,
+                now + self.grace_period,
+                now,
+                self.grace_capacity,
+                size,
+            );
     }
 
     fn cleanup(&self, context: &Self::FileContext, file_name: Option<&U16CStr>, flags: u32) {
@@ -1494,6 +1717,15 @@ impl FileSystemContext for CloudFs {
                 let mtime = staged.mtime().unwrap_or_else(unix_now);
                 match self.bridge.block_on(staged.commit(&self.vfs, mtime)) {
                     Ok(()) => {
+                        // Review H1: the commit replaced the file's
+                        // content — no parked state for this path may be
+                        // reused, and the handle's own open-time read
+                        // state goes with it (otherwise the close that
+                        // follows would park a pre-commit state under
+                        // the refreshed size). The next read lazily
+                        // re-acquires against the committed row.
+                        self.grace_invalidate(context.rel());
+                        context.set_read_state(None);
                         // Refresh the snapshot: the FSD may still query
                         // this handle before Close ("The file system must
                         // be ready to receive additional operations until
@@ -1503,15 +1735,31 @@ impl FileSystemContext for CloudFs {
                         }
                     }
                     // Cleanup cannot report failure (winfsp.h: "There is
-                    // no way to report failure of this operation"), and
-                    // the writer already removed the staging sibling on a
-                    // failed commit — the log is the only trace the write
-                    // happened at all.
-                    Err(error) => tracing::error!(
-                        rel_path = %context.rel(),
-                        %error,
-                        "winfsp: staged commit failed at cleanup; the write was discarded"
-                    ),
+                    // no way to report failure of this operation"). The
+                    // truthful semantics (review H4): the writer kept the
+                    // bytes — `put_staged` renames the staging sibling
+                    // onto the final cache path BEFORE the row/enqueue
+                    // tail, so they sit at the final path (or, for a
+                    // failure before the rename, at the staging sibling);
+                    // a landed row stays pending and
+                    // `Vfs::requeue_pending` revives it at the next boot.
+                    // The log names whichever location holds the bytes so
+                    // recovery never has to guess.
+                    Err(error) => {
+                        let rel = context.rel();
+                        let final_local = self.vfs.local_path(rel);
+                        let location = if final_local.exists() {
+                            "the final cache path"
+                        } else {
+                            "the staging sibling"
+                        };
+                        tracing::error!(
+                            rel_path = %rel,
+                            %error,
+                            "winfsp: staged commit failed at cleanup; the bytes were kept at \
+                             {location}; the row stays pending and is requeued at the next boot"
+                        );
+                    }
                 }
             }
             None => {}
@@ -1668,8 +1916,10 @@ impl FileSystemContext for CloudFs {
                 // no row to dispatch on). Acquiring it lazily is what
                 // makes a post-cleanup read on the same handle work —
                 // WF0's cache-first probe makes the just-committed copy
-                // the local arm.
-                let state = self.acquire_read(context.rel())?;
+                // the local arm. The fresh row's size rides along as the
+                // grace-reuse witness (review H1).
+                let row_size = self.meta_for(context.rel())?.size;
+                let state = self.acquire_read(context.rel(), row_size)?;
                 context.set_read_state(Some(Arc::clone(&state)));
                 state
             }
@@ -1707,7 +1957,11 @@ impl FileSystemContext for CloudFs {
             let lock = dir_buffer.acquire(true, None)?;
             for child in &children {
                 let mut entry = DirInfo::<255>::new();
-                fill_dir_info(&mut entry, child)?;
+                // M3: an overlong name is skipped inside fill_dir_info
+                // (warn-logged there) instead of failing the listing.
+                if !fill_dir_info(&mut entry, child)? {
+                    continue;
+                }
                 lock.write(&mut entry)?;
             }
             // Drop the lock before reading: the buffer must be published

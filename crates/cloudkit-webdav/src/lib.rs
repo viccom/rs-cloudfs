@@ -610,6 +610,14 @@ impl RangeFile {
 
     /// Fetches `[pos, pos + window)` (clamped to EOF) into the buffer,
     /// replacing whatever window was there.
+    ///
+    /// stream-M1 (review RB4): the fetch is validated — a window that
+    /// comes back SHORT of what was asked is an error (warn-logged,
+    /// `FsError::GeneralFailure`), the same "short read = error"
+    /// semantics the encrypted-stream and web `RangeBody` faces pin.
+    /// Over-delivery stays tolerated (the extra bytes are never served —
+    /// `read_bytes` clamps at `total_size`), matching its long-standing
+    /// contract.
     async fn fill_window(&mut self) -> FsResult<()> {
         let len = self.window.min(self.total_size - self.pos);
         let mut stream = self
@@ -622,6 +630,17 @@ impl RangeFile {
         // (K34's deliberate backpressure shape).
         while let Some(frame) = stream.next().await {
             data.extend_from_slice(&frame.map_err(storage_err)?);
+        }
+        if (data.len() as u64) < len {
+            tracing::warn!(
+                handle = %self.handle.first_msg_id,
+                pos = self.pos,
+                asked = len,
+                got = data.len(),
+                "webdav: short window fetch — the backend served fewer bytes \
+                 than its handle promises (object truncated?)"
+            );
+            return Err(FsError::GeneralFailure);
         }
         self.buf = Some(Window {
             start: self.pos,
@@ -970,6 +989,10 @@ fn vfs_err(error: VfsError) -> FsError {
         VfsError::Exists(_) => FsError::Exists,
         VfsError::ParentMissing(_) => FsError::NotFound,
         VfsError::UploadPending(_) => FsError::Forbidden,
+        // The write surfaces refuse overlong segments up front (review
+        // M3): a refusal of the name itself is a policy refusal ->
+        // Forbidden.
+        VfsError::NameTooLong { .. } => FsError::Forbidden,
         VfsError::QueueClosed
         | VfsError::Db(_)
         | VfsError::Transport(_)
@@ -1045,6 +1068,62 @@ mod tests {
         assert_eq!(
             storage_err(StorageError::Unavailable("dlink expired".into())),
             FsError::GeneralFailure
+        );
+    }
+
+    /// stream-M1 (review RB4): a short window fetch is an ERROR, not a
+    /// silent short serve. A transport whose handle promises 100 bytes
+    /// but stores only 40 makes `fill_window` come back short; the read
+    /// must fail (`FsError`) instead of quietly serving the 40 bytes and
+    /// letting dav-server treat the hole as data end. Today's drivers
+    /// self-clamp, so only a misbehaving future driver can trigger this;
+    /// the test injects exactly that.
+    #[tokio::test]
+    async fn fill_window_short_fetch_is_an_error_not_a_silent_short_serve() {
+        const PROMISED: u64 = 100;
+        const SERVED: u64 = 40;
+
+        let mock = Arc::new(cloudkit_core::transport::mock::MockTransport::new());
+        mock.connect().await.expect("connect the mock");
+        // 40 real bytes behind a handle that promises 100: every window
+        // fetch comes back short of what was asked.
+        let dir = tempfile::tempdir().expect("seed scratch dir");
+        let local_path = dir.path().join("short.bin");
+        std::fs::write(&local_path, vec![b'x'; SERVED as usize]).expect("seed bytes");
+        let receipt = mock
+            .upload(&cloudkit_core::transport::UploadJob {
+                rel_path: RelPath::new("/short.bin").expect("valid rel path"),
+                local_path,
+                size: SERVED,
+                chunk_count: 1,
+                chunk_size: SERVED,
+            })
+            .await
+            .expect("seed upload");
+        let handle = RemoteHandle {
+            first_msg_id: receipt.first_msg_id,
+            chunk_msg_ids: receipt.chunk_msg_ids,
+            total_size: PROMISED,
+            path: None,
+        };
+        let transport: Arc<dyn CloudTransport> = mock;
+        let meta = RowMetaData {
+            len: PROMISED,
+            mtime: 0.0,
+            created: None,
+            is_dir: false,
+            sha256: None,
+        };
+        let mut file = RangeFile::new(handle, PROMISED, transport, meta, 64);
+
+        // The first read fills a window: asked for min(64, 100) = 64
+        // bytes, the mock stores 40 — a short fetch, which must fail the
+        // read instead of serving 40 silent bytes.
+        let result = DavFile::read_bytes(&mut file, 50).await;
+        assert!(
+            result.is_err(),
+            "a short window fetch must fail the read, got {} bytes",
+            result.as_ref().map(|bytes| bytes.len()).unwrap_or_default()
         );
     }
 }

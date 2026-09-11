@@ -2933,6 +2933,16 @@ pub fn single_volume_winfsp_note(cfg: &CyDriveConfig) -> Option<&'static str> {
     )
 }
 
+/// The in-process note text itself — [`winfsp_unmount_note`]'s payload
+/// and the [`WinfspUnmountStep::ExplainInProcess`] arm's content, kept in
+/// one place so the two spellings cannot drift.
+pub const WINFSP_UNMOUNT_IN_PROCESS_NOTE: &str =
+    "nothing to unmount: `mount_backend = \"winfsp\"` mounts the volume in-process, and an \
+     in-process mount is released when its process exits — WinFsp has no cross-process \
+     unmount. Stop that process instead (Ctrl+C in its console, or `cydrive stop`). No \
+     `net use` mapping is created by the winfsp backend; if the letter carries one you \
+     mapped yourself, remove it with `net use <letter> /delete`.";
+
 /// `cydrive unmount`'s answer for a winfsp-backed instance (Phase 3 /
 /// WF4): an in-process mount lives exactly as long as the process that
 /// created it, and WinFsp has no cross-process unmount — so there is
@@ -2941,13 +2951,47 @@ pub fn single_volume_winfsp_note(cfg: &CyDriveConfig) -> Option<&'static str> {
 /// is not ours). `None` for the WebDAV backend, whose mapping *is*
 /// cross-process.
 pub fn winfsp_unmount_note(cfg: &CyDriveConfig) -> Option<&'static str> {
-    (cfg.mount_backend == MountBackend::Winfsp).then_some(
-        "nothing to unmount: `mount_backend = \"winfsp\"` mounts the volume in-process, and an \
-         in-process mount is released when its process exits — WinFsp has no cross-process \
-         unmount. Stop that process instead (Ctrl+C in its console, or `cydrive stop`). No \
-         `net use` mapping is created by the winfsp backend; if the letter carries one you \
-         mapped yourself, remove it with `net use <letter> /delete`.",
-    )
+    (cfg.mount_backend == MountBackend::Winfsp).then_some(WINFSP_UNMOUNT_IN_PROCESS_NOTE)
+}
+
+/// What `cydrive unmount` (Windows) does for a winfsp-configured
+/// instance, as a pure function of the backend and the *probed* mapping
+/// (RB3 / cli-H1): a degraded winfsp boot created a real `net use`
+/// mapping (K40's visible fallback) and that mapping is cross-process and
+/// ours — unmount releases it, at the letter the probe actually found,
+/// instead of refusing. Only a winfsp instance with no mapping for its
+/// drive URL gets the in-process note; the WebDAV backend keeps its
+/// resolve-and-release flow (`None`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WinfspUnmountStep {
+    /// The instance's drive URL is mapped at this actual letter — a
+    /// degraded boot's WebDAV fallback. Release it, saying that is what
+    /// happened.
+    ReleaseDegradedMapping {
+        /// The probe-verified letter (`net use`'s own answer, which an
+        /// explicit `--letter` on the original mount may override).
+        letter: String,
+    },
+    /// No mapping for the drive URL: print the in-process note and touch
+    /// nothing ([`WINFSP_UNMOUNT_IN_PROCESS_NOTE`]).
+    ExplainInProcess,
+}
+
+/// The decision behind [`WinfspUnmountStep`]. The probe input is the
+/// status path's [`cloudkit_platform::current_mount_for`] against the
+/// glued drive URL — the same read-only `net use` scan the degraded
+/// boot's mapping answers; never a mutation.
+pub fn winfsp_unmount_step(
+    backend: MountBackend,
+    probed: Option<String>,
+) -> Option<WinfspUnmountStep> {
+    match backend {
+        MountBackend::Webdav => None,
+        MountBackend::Winfsp => Some(match probed {
+            Some(letter) => WinfspUnmountStep::ReleaseDegradedMapping { letter },
+            None => WinfspUnmountStep::ExplainInProcess,
+        }),
+    }
 }
 
 /// One volume's completed mount (K27 + K40): the name, the drive letter
@@ -3092,7 +3136,22 @@ async fn mount_volumes_if_configured(plan: &MountPlan<'_>) -> VolumeMounts {
     #[cfg(not(unix))]
     {
         if plan.claims.is_empty() {
-            tracing::info!("no volume claimed a drive_letter; skipping the drive mappings");
+            // Review L2 (RB4): the claims list is pre-filtered upstream —
+            // with the webdav backend and a degraded listener it is
+            // emptied wholesale (`run_multi_volume`'s claims match), so
+            // "no volume claimed" would be a lie there. Name the actual
+            // reason instead; with the winfsp backend (or a bound
+            // listener) an empty list really is no claims.
+            if plan.process_cfg.mount_backend == MountBackend::Winfsp {
+                tracing::info!("no volume claimed a drive_letter; skipping the drive mounts");
+            } else if plan.webdav_available {
+                tracing::info!("no volume claimed a drive_letter; skipping the drive mappings");
+            } else {
+                tracing::info!(
+                    "the WebDAV listener is not bound (the bind degraded), so the drive \
+                     mappings have no endpoint to mount; skipping"
+                );
+            }
             return VolumeMounts::default();
         }
         if !plan.process_cfg.auto_mount_drive {
@@ -3278,8 +3337,43 @@ async fn mount_claims_via_winfsp(plan: &MountPlan<'_>) -> VolumeMounts {
                 tracing::error!(
                     volume = %name,
                     %error,
-                    "the winfsp mount task failed to complete; skipping this volume"
+                    "the winfsp mount task failed to complete; falling back to the WebDAV \
+                     drive mapping when the letter state allows (K40)"
                 );
+                println!("winfsp mount task FAILED for volume {name} ({error}).");
+                // A join failure means the mount task itself panicked, so
+                // there is no typed verdict about the letter — unlike the
+                // Ok(Err) arm, where `MountError::LetterInUse` is exactly
+                // the one outcome that must NOT fall back (the WebDAV
+                // mapping clears the letter first, taking over whatever
+                // holds it). The same carve-out, decided by a read-only
+                // occupancy probe instead: a letter that currently answers
+                // on anything (foreign mapping, someone else's volume, an
+                // orphan of the panicking mount) is left alone.
+                let letter_taken = cloudkit_platform::windows::used_drive_letters()
+                    .iter()
+                    .any(|used| used.eq_ignore_ascii_case(letter));
+                if letter_taken {
+                    println!(
+                        "No WebDAV fallback for volume {name}: the drive letter {letter} is \
+                         already in use and the failed mount task left no typed verdict \
+                         about it — the letter is left alone. The volume stays reachable \
+                         at {}.",
+                        volume_mount_url(plan.process_cfg, name)
+                    );
+                } else if plan.webdav_available {
+                    println!("Falling back to the WebDAV drive mapping for volume {name}.");
+                    mounted.extend(mount_claims_via_webdav(
+                        plan.process_cfg,
+                        std::slice::from_ref(&(name.clone(), letter.clone())),
+                        plan.webdav_available,
+                        |_| MountedBackend::WebDavFallback {
+                            reason: format!("winfsp mount task failed: {error}"),
+                        },
+                    ));
+                } else {
+                    println!("No fallback for volume {name}: the WebDAV listener is not bound.");
+                }
             }
         }
     }

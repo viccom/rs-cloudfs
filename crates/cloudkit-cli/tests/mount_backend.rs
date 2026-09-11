@@ -16,8 +16,8 @@
 
 use cloudkit_cli::{
     choose_mount_backend, single_volume_winfsp_note, winfsp_capability, winfsp_fallback_notice,
-    winfsp_unmount_note, MountBackendDecision, MountedBackend, WinFspCapability,
-    WINFSP_FEATURE_REQUIRED,
+    winfsp_unmount_note, winfsp_unmount_step, MountBackendDecision, MountedBackend,
+    WinFspCapability, WinfspUnmountStep, WINFSP_FEATURE_REQUIRED,
 };
 use cloudkit_core::config::{CyDriveConfig, MountBackend};
 
@@ -217,4 +217,49 @@ fn single_volume_winfsp_request_is_an_explicit_note() {
         note.contains("webdav") || note.contains("WebDAV"),
         "the note says what is happening instead, got: {note}"
     );
+}
+
+/// RB3 / cli-H1: the unmount decision against probed reality. A
+/// *degraded* winfsp boot created a real `net use` mapping (K40's
+/// visible fallback) — `cydrive unmount` must release it, at the letter
+/// the probe actually found, instead of refusing; only a winfsp instance
+/// with no mapping for its drive URL gets the in-process note, and the
+/// WebDAV backend keeps its cross-process flow (`None`).
+#[test]
+fn unmount_releases_the_probed_mapping_of_a_degraded_winfsp_boot() {
+    let step = winfsp_unmount_step(MountBackend::Winfsp, Some("Q:".to_string()));
+    match step {
+        Some(WinfspUnmountStep::ReleaseDegradedMapping { letter }) => {
+            assert_eq!(
+                letter, "Q:",
+                "the release targets the probe-verified letter, not the configured one"
+            );
+        }
+        other => panic!("a probed mapping must be released, got {other:?}"),
+    }
+}
+
+/// No mapping for the drive URL: the honest in-process note stands and
+/// nothing is touched (an in-process winfsp mount is released when its
+/// process exits — never a fake success here).
+#[test]
+fn unmount_without_a_mapping_explains_the_in_process_mount() {
+    assert_eq!(
+        winfsp_unmount_step(MountBackend::Winfsp, None),
+        Some(WinfspUnmountStep::ExplainInProcess),
+        "no mapping for the drive URL: the note stands, nothing is touched"
+    );
+}
+
+/// The WebDAV backend's mapping IS cross-process: the decision hands the
+/// request back to the original resolve-and-release flow, whatever the
+/// probe saw.
+#[test]
+fn the_webdav_backend_keeps_its_cross_process_unmount() {
+    assert_eq!(
+        winfsp_unmount_step(MountBackend::Webdav, Some("Y:".to_string())),
+        None,
+        "webdav keeps the resolve-and-release flow"
+    );
+    assert_eq!(winfsp_unmount_step(MountBackend::Webdav, None), None);
 }

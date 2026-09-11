@@ -682,6 +682,7 @@ name = "cloudkit-platform"
 version = "0.10.0"
 dependencies = [
  "cloudkit-core",
+ "tempfile",
  "thiserror 2.0.20",
  "winreg",
 ]
@@ -752,6 +753,7 @@ dependencies = [
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
+ "tracing",
 ]
 
 [[package]]
@@ -763,6 +765,7 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+ "tracing-subscriber",
  "windows 0.61.3",
  "winfsp",
 ]

@@ -136,6 +136,52 @@ pub enum VfsError {
     /// be cleaned up.
     #[error("upload still pending: {0}")]
     UploadPending(String),
+    /// A write-surface path carries a segment longer than
+    /// [`MAX_SEGMENT_UTF16`] UTF-16 code units. The row was NOT written:
+    /// the mount layer cannot enumerate such a name at all (winfsp's
+    /// DirInfo buffer caps entries at 255 UTF-16 units — a longer row used
+    /// to fail its WHOLE directory listing), so the error names the
+    /// offending segment and asks for a shorter name (review M3).
+    #[error(
+        "segment {segment:?} of {path} is {length} UTF-16 units long; names over {limit} \
+         UTF-16 units cannot be mounted — use a shorter name"
+    )]
+    NameTooLong {
+        /// The full virtual path that carried the overlong segment.
+        path: String,
+        /// The offending segment.
+        segment: String,
+        /// The segment's UTF-16 code-unit length.
+        length: usize,
+        /// The cap ([`MAX_SEGMENT_UTF16`]).
+        limit: usize,
+    },
+}
+
+/// The per-segment length cap for every path entering through the write
+/// surfaces (review M3): the WinFsp mount's `DirInfo` buffer holds at most
+/// 255 UTF-16 code units per entry name, so a longer segment could never
+/// be enumerated again. The cap matches the mount layer, not NTFS' own
+/// on-disk limit.
+pub const MAX_SEGMENT_UTF16: usize = 255;
+
+/// Rejects a path whose any segment exceeds [`MAX_SEGMENT_UTF16`] UTF-16
+/// code units (review M3). Runs at the top of the put chain — before any
+/// byte is staged, renamed or published — so a refusal can never leave a
+/// staged copy or a row behind.
+fn validate_segment_lengths(rel: &RelPath) -> Result<(), VfsError> {
+    let long = rel.as_str()[1..]
+        .split('/')
+        .find(|segment| segment.encode_utf16().count() > MAX_SEGMENT_UTF16);
+    match long {
+        None => Ok(()),
+        Some(segment) => Err(VfsError::NameTooLong {
+            path: rel.as_str().to_string(),
+            segment: segment.to_string(),
+            length: segment.encode_utf16().count(),
+            limit: MAX_SEGMENT_UTF16,
+        }),
+    }
 }
 
 /// Sibling staging path of `target`: the full file name plus a `.tmp`
@@ -347,6 +393,7 @@ impl Vfs {
     /// `is_uploaded = false, is_cached = true` and enqueues the upload
     /// job. Returning means accepted, not uploaded.
     pub async fn put(&self, rel: &RelPath, bytes: &[u8], mtime: f64) -> Result<(), VfsError> {
+        validate_segment_lengths(rel)?;
         // Stage the bytes before touching metadata: the queue reads the
         // local copy (and only deletes it after a successful upload).
         let local = self.cache.local_path(rel);
@@ -366,6 +413,9 @@ impl Vfs {
         staged_tmp: &Path,
         mtime: f64,
     ) -> Result<(), VfsError> {
+        // Before the rename (review M3): a refusal must leave the
+        // caller's staged file in place for its own cleanup.
+        validate_segment_lengths(rel)?;
         let local = self.cache.local_path(rel);
         if let Some(parent) = local.parent() {
             std::fs::create_dir_all(parent)?;
@@ -889,6 +939,7 @@ impl Vfs {
         if rel.is_root() {
             return Err(VfsError::Exists(rel.as_str().to_string()));
         }
+        validate_segment_lengths(rel)?;
         if self.db.get_file(rel.as_str())?.is_some() {
             return Err(VfsError::Exists(rel.as_str().to_string()));
         }
@@ -1078,6 +1129,9 @@ impl Vfs {
         source: &Path,
         mtime: f64,
     ) -> Result<u64, VfsError> {
+        // Before the copy (review M3): a refusal leaves the source
+        // untouched and stages nothing.
+        validate_segment_lengths(rel)?;
         let size = tokio::fs::metadata(source).await?.len();
         let local = self.cache.local_path(rel);
         let staged = tmp_sibling(&local);

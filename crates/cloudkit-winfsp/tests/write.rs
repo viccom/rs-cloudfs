@@ -3,8 +3,9 @@
 //! Contract under test (plan §3-WF3 + K41/K43/K44/K45):
 //! - `create` follows the K43 disposition→intent matrix: a directory
 //!   request becomes a `files` row (`Vfs::create_dir`), a file request
-//!   stages its bytes in a `.{name}.tmp` sibling of the final cache
-//!   path, and an existing name is a collision;
+//!   stages its bytes in a randomized hidden sibling
+//!   (`.{name}.{rand8}.tmp`, review M1) of the final cache path, and an
+//!   existing name is a collision;
 //! - the staged bytes are committed **exactly once**, by `cleanup` (K41:
 //!   `flush` has zero side effects) — `Vfs::put_staged` then publishes
 //!   the atomic rename, the pending row and the queue entry, so the
@@ -34,7 +35,7 @@
 #![cfg(all(windows, feature = "winfsp"))]
 
 use std::fs;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -317,14 +318,14 @@ impl Harness {
             .local_path(&RelPath::new(rel).expect("valid rel path"))
     }
 
-    /// The staging sibling of `rel`'s final cache path.
-    fn staged_path(&self, rel: &str) -> PathBuf {
-        let local = self.local_path(rel);
-        let name = local
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .expect("file name");
-        local.with_file_name(format!(".{name}.tmp"))
+    /// Every staging sibling currently under the cache root (recursive).
+    /// The siblings carry a random segment (review M1), so tests observe
+    /// them by shape — hidden `.name.<rand>.tmp` files — instead of
+    /// predicting the name.
+    fn stage_siblings(&self) -> Vec<PathBuf> {
+        let mut found = Vec::new();
+        collect_stage_siblings(&self.local_path("/"), &mut found);
+        found
     }
 
     /// Jobs the VFS accepted into the upload queue.
@@ -352,13 +353,31 @@ impl Harness {
 /// FSD path string -> the wide NUL-terminated form the callbacks receive.
 ///
 /// The tests speak the virtual `/`-separated paths and this converts them
-/// to the FSD's own spelling (`\dirile`), which is what
+/// to the FSD's own spelling (`\dir\file`), which is what
 /// `open`/`create`/`rename`/`set_delete` actually hand in.
 fn fsd_path(name: &str) -> Vec<u16> {
     name.replace('/', "\\")
         .encode_utf16()
         .chain(std::iter::once(0))
         .collect()
+}
+
+/// Recursively collects the hidden `.tmp` staging siblings under `dir` —
+/// the shape `StagedWriter`'s randomized siblings always have.
+fn collect_stage_siblings(dir: &Path, out: &mut Vec<PathBuf>) {
+    let Ok(entries) = fs::read_dir(dir) else {
+        return;
+    };
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if path.is_dir() {
+            collect_stage_siblings(&path, out);
+        } else if let Some(name) = path.file_name().and_then(|n| n.to_str()) {
+            if name.starts_with('.') && name.ends_with(".tmp") {
+                out.push(path);
+            }
+        }
+    }
 }
 
 /// The NTSTATUS a failing callback answered with (the tests pin raw
@@ -472,7 +491,11 @@ fn create_write_cleanup_commits_once_and_reopens_byte_exact() {
 
     let handle = h.create_file("/new.bin").expect("create");
     assert!(handle.has_pending_write(), "create stages an empty writer");
-    assert!(h.staged_path("/new.bin").exists(), "staging sibling exists");
+    assert_eq!(
+        h.stage_siblings().len(),
+        1,
+        "the staging sibling exists (under its random name)"
+    );
     assert!(h.row("/new.bin").is_none(), "nothing is published yet");
 
     // ④ Out-of-order writes: the middle, then the head, then the seam.
@@ -505,10 +528,7 @@ fn create_write_cleanup_commits_once_and_reopens_byte_exact() {
     // ③ the local copy is byte-exact, and the staging sibling is gone.
     let cached = fs::read(h.local_path("/new.bin")).expect("cache copy");
     assert_eq!(cached, content, "the committed bytes are byte-exact");
-    assert!(
-        !h.staged_path("/new.bin").exists(),
-        "no staging sibling left"
-    );
+    assert!(h.stage_siblings().is_empty(), "no staging sibling left");
 
     // ④ a reopen reads the committed bytes back.
     let reopened = h.open("/new.bin").expect("reopen");
@@ -606,8 +626,9 @@ fn flush_does_not_commit() {
 
     assert!(h.row("/flushed.bin").is_none(), "flush must not publish");
     assert_eq!(h.enqueued(), 0, "flush must not enqueue");
-    assert!(
-        h.staged_path("/flushed.bin").exists(),
+    assert_eq!(
+        h.stage_siblings().len(),
+        1,
         "the staged bytes survive a flush"
     );
     h.cleanup(&handle);
@@ -729,6 +750,45 @@ fn create_file_under_a_missing_parent_is_refused() {
     assert_eq!(h.enqueued(), 0);
 }
 
+/// A create whose name exceeds the mount layer's 255-UTF-16-unit
+/// enumeration cap is refused at the create face with
+/// STATUS_OBJECT_NAME_INVALID — publishing such a row would give it a
+/// staging state it can never enumerate again (review M3).
+#[test]
+fn create_refuses_a_name_longer_than_the_enumeration_cap() {
+    let h = Harness::new();
+    let long = format!("/{}", "A".repeat(300));
+    let outcome = h.create_file(&long);
+    let reported = match &outcome {
+        Ok(_) => "created".to_string(),
+        Err(FspError::NTSTATUS(status)) => format!("status {status:#010x}"),
+        Err(other) => format!("{other:?}"),
+    };
+    assert_eq!(
+        reported, "status 0xc0000033",
+        "M3 FIXED: a create past the 255-UTF-16-unit enumeration cap must \
+         be refused with STATUS_OBJECT_NAME_INVALID; got {reported}"
+    );
+    assert!(
+        h.row(&long).is_none(),
+        "no row may be published for an overlong name"
+    );
+    assert!(
+        h.stage_siblings().is_empty(),
+        "no staging sibling may survive the refusal"
+    );
+    assert_eq!(h.enqueued(), 0, "nothing was queued");
+
+    // The directory arm is refused through the same face.
+    let long_dir = format!("/{}", "D".repeat(300));
+    assert_eq!(
+        status_of(h.create_dir_entry(&long_dir)),
+        0xC000_0033,
+        "STATUS_OBJECT_NAME_INVALID for the directory arm too"
+    );
+    assert!(h.row(&long_dir).is_none(), "no directory row either");
+}
+
 // ------------------------------------------------------------ overwrite ---
 
 /// CREATE_ALWAYS on an existing file is two FSD transactions: the open
@@ -776,7 +836,7 @@ fn delete_on_close_discards_a_created_file() {
         !h.local_path("/temp.bin").exists(),
         "no cache copy survives"
     );
-    assert!(!h.staged_path("/temp.bin").exists(), "no staging sibling");
+    assert!(h.stage_siblings().is_empty(), "no staging sibling");
     assert_eq!(h.enqueued(), 0, "nothing was queued");
 }
 
