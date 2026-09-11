@@ -16,11 +16,11 @@
 6. `docs/tracking/phase0-1.md` —— 当前任务跟踪单（**开工先读、每批收口更新**）
 
 ## 当前阶段
-**Phase 3 完成（2026-09-10）**：WinFsp 类本地盘挂载（WF0–WF5 六批，K38–K46 入档 decisions）——新 L5 crate `cloudkit-winfsp`（feature `winfsp` 默认关，K38 许可隔离）做 native 薄适配器（winfsp-rs 0.13 sync trait + tokio Handle::block_on 桥，K39），读写语义核心三面共享（open_read 三重门+cache-first / RangeFile 4MiB 窗口 / StagedFile→put_staged，K42/K43），K40 加法集成+可见降级（`mount_backend` 进程级键，未装/未编译回退 webdav 不拒启）+ K41 生命周期三件套；执行期修复 FSD 大小写形态（rename/delete 名字大写送达→resolve_row 父目录扫描回退，6b25ede）。**真机验收矩阵七项全过**（三卷单进程 winfsp 原生挂载 V:local加密+Y:tg+Z:baidu、文件操作矩阵、写链冷读回逐字匹配、stop 全停、回退腿实证；764MB 视频 open 55.4s→7-11ms）。feat/winfsp 收口 merge main 由主会话执行。前置 Phase 2.5（0.10.0）完成；过渡测试包：E:\Rs_Codes\cydrive-0.8.0-testkit（telegram+加密 U:/V:，仓外不入库）。
+**Phase 3.6 完成（2026-09-12）**：存储卷运行态动态加载/卸载 + 卷级 enabled 键（RV0–RV3 四批，K48–K51 入档 decisions）——RV0 卷级 `enabled` 键（缺省 true=语义自然缺省，发现期跳过+`info!` 声明，禁用卷不占盘符不装配）；RV1 注册表动态化（三面 `RegistryHandle`：cli 主表=真源、webdav/web=投影，变更统一经 cli mutator 汇流；dav per-request 读锁查表分发，端口不变无重绑，锁不跨 await）；RV2 控制通道 `ADD/REMOVE/LIST`（K50 安全序=排空上传→盘符释放→faces 先 workers 后提交，任一步超时/失败中止且卷保持注册——绝不半卸；命令串行处理；REMOVE 只动运行态不碰卷文件，K49；`cydrive status` 多卷面带 LIST 转发）；RV3 真机矩阵六项全过（运行态 ADD baidu 卷 Q: 三面即时可见可读写、REMOVE 排空后三面消失数据跨往返完好、enabled=false 重启跳过、坏凭据 ADD 不伤兄弟卷；执行期发现：winfsp 卸载不受用户态句柄阻挡——占用中止路径在 webdav 腿+注入探针单测；执行期修复：logging::init 上移到配置发现前，发现期 info! 不再被吞）。前置 Phase 3（winfsp 挂载，K38–K46+K52）与 Phase 2.5（0.10.0 多卷/仪表盘）完成；过渡测试包：E:\Rs_Codes\cydrive-0.8.0-testkit（telegram+加密 U:/V:，仓外不入库）。
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 911 测试（RB4 对齐加固批 + telegram E2E；ignored 12 = 真机/平台/真网类）
+cargo test --workspace --no-fail-fast            # 934 测试（Phase 3.6 运行态卷管理批；ignored 12 = 真机/平台/真网类）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo build -p cloudkit-cli --no-default-features --features local,baidu   # 驱动裁剪构建（K30 三 feature）；缺驱动构建运行期报可行动错误（K31 rebuild 指引），cydrive --version 显示驱动清单（K32）
@@ -48,12 +48,13 @@ scripts/scan_secrets                             # R3 秘密扫描门禁（CI �
 - **多卷模式 `CYDRIVE_*` env 覆盖被忽略**（K28）：全局 env 覆盖会跨卷串味，卷模式 discover 直接跳过并在 tracing 声明；凭据 env>file>keyring 解析链在驱动 resolve 时不变——排查「env 不生效」先看是否卷模式
 - **winfsp 腿构建需 libclang + MSVC**：winfsp-sys 的 bindgen 依赖 libclang（本机 pip 包装于 `D:/Python312/Lib/site-packages/clang/native`，构建时 `LIBCLANG_PATH` 指它）；winfsp-sys 对 gnu 工具链 panic——只能 MSVC 构建
 - **FSD 大小写形态（K45 执行期实证）**：winfsp 回调里 rename 源名与 cleanup 删除名会以**大写**送达（FSD 大小写不敏感解析的归一形态）——适配层 resolve_row 精确命中 + 父目录扫描回退（歧义保持 miss），6b25ede 修复
+- **共享 CARGO_TARGET_DIR 跨 worktree 产物污染（RV3 实证）**：主仓与 worktree 的包名+版本相同（0.10.0），共享 target 下指纹按 name+version 键合——交叉构建会把 A 树编译的 rmeta 喂给 B 树的源码（症状：对 A 树才有的类型报 E0308）。**纪律：worktree 构建用独立 target 目录；merge 回主仓后重建产物前先 `cargo clean` 共享 target**
 - 实现期陷阱查 `docs/rust-rewrite-design.md`「深度调研补遗」节（axum 2MB body 上限/grammers FloodWait 藏点/dav-server Bytes-Seek 模型/WebClient 4GB-1/挂载 Basic 认证）
 - PCFS 反面教材勿抄：错误类型跨层泄漏、硬编码密钥、纯 CTR 无认证、注释掉的调试日志
 
 ## 待人工清单
 1. ~~基线设计 §9-2/9-3/9-4 三项建议待负责人确认~~ **已裁决（2026-09-11，decisions.md 当日条目）**：§9-2 rs-CyDrive 正式冻结（~~生产切换时机未裁~~ **负责人收回自行安排（2026-09-11）——仓库任务清单销账**；切换所需的 telegram 真机验收前提已由 K54 备齐）；§9-3 确认 v1 不拆 crate；§9-4 R→E 已自然落地销账
-2. **卷级 `enabled` 启用/禁用键——负责人 2026-09-10 已批准、暂缓实施**：volume-scoped 布尔键（缺省 true），discover_volumes 对 `enabled=false` 的卷跳过装配 + `info!` 声明，禁用卷不占盘符不进 `/vol/<名>`；现状变通=改后缀/挪子目录（discover 只认 `*.toml` 平铺文件）。负责人同日问询运行态动态加载/卸载存储卷的可行性（架构评估已答：可行，`enabled` 恰为卸载的持久化形态），若立项两者同批。
+2. ~~卷级 `enabled` 启用/禁用键~~ **已落地（Phase 3.6 / RV0，2026-09-12）**：volume-scoped 布尔键（缺省 true），发现期跳过 + `info!` 声明，禁用卷不占盘符不进 `/vol/<名>`；同批落地运行态动态加载/卸载（控制通道 `ADD/REMOVE/LIST`，K48–K51——负责人 2026-09-10 的运行态装卸可行性问询一并销账）。
 2. **telegram E2E 腿——已定向（2026-09-11 裁决选项 B：独立测试 bot/chat）**：**凭据已就位（2026-09-11）**：测试 bot @cydrive_test_bot，配置落 `E:\GitHub\rs-CyDrive\test\config.toml`（bot_token + chat_id，gitignore 内），Bot HTTP API 连通性自检通过（getMe/getUpdates/sendMessage，经代理）。**已知事实：本机访问 Telegram 必须走代理**（`proxy_url = "socks5://127.0.0.1:7897"`，MTProto 同理）——E2E 批的卷/transport 配置必带。**E2E 批已落地（2026-09-11，feat/tg-e2e → main，decisions K54）**：驱动级 2 + vfs 加密全栈 1，真网三连绿（上传/回读逐字/Range 跨部件/覆盖 append-only 语义钉死/清理核空）；运行经验：稳定 session 勿 fresh-session 重试（RateLimited 1576s 实录）。现状参照：生产配置在 `D:\Tools\rs-CyDrive`；baidu appkey 即负责人本人凭据（PCFS client.go:69-70，decisions 2026-09-09 澄清），meta 31300 若要恢复直查须在百度开放平台为本 key 开 meta 权限
 3. ~~新仓远端 origin 待建~~ **已建**：origin = github.com/viccom/rs-cloudfs（**私有**，2026-09-09 建，main + feat/phase0-1 + feat/phase2 已推）。~~公开化前建议做一次全历史秘密审查~~ **已做（2026-09-11，gitleaks 8.30.1 全历史 388 提交）**：8 命中全部为公开 Cynet Android `api_hash` 常量（与 config.rs 默认值同源），**零真实凭据**——公开化前的历史审查此项销账。
 4. 自 rs-CyDrive 继承的挂账——**2026-09-08 修复批后仅剩验证类**：P3 hydrate 快照回写竞态已修（47c4fc2，目标列写 set_cached_flag）；Low×5 已清（sync_url host 校验 f8040aa/模拟器排序 e93433a/SyncClient trait 文档 09fff2c/--help 实证漂移 bc34d43/64MB 并发闸 08fee1d；凭据门槛核实本已统一于 resolve_sync_secret）；gen_compat_fixtures.py 已修（5a3a319，重生成需同步改 database.rs 钉死的 created_at 断言）；deny advisories 已过（`advisories ok`，经 7897 代理拉库——github.com 直连不通的既有限制自此有绕行方案）。**剩余：#[ignore] 真机测试 ×3、litmus 套件（均验证类，随真机窗口跑）**
