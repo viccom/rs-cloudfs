@@ -52,7 +52,7 @@ scripts/scan_secrets                             # R3 秘密扫描门禁（CI �
 - PCFS 反面教材勿抄：错误类型跨层泄漏、硬编码密钥、纯 CTR 无认证、注释掉的调试日志
 
 ## 待人工清单
-1. ~~基线设计 §9-2/9-3/9-4 三项建议待负责人确认~~ **已裁决（2026-09-11，decisions.md 当日条目）**：§9-2 rs-CyDrive 正式冻结（生产切换时机未裁，独立待排期小批：D:\Tools\rs-CyDrive 旧二进制 → 新仓部署）；§9-3 确认 v1 不拆 crate；§9-4 R→E 已自然落地销账
+1. ~~基线设计 §9-2/9-3/9-4 三项建议待负责人确认~~ **已裁决（2026-09-11，decisions.md 当日条目）**：§9-2 rs-CyDrive 正式冻结（~~生产切换时机未裁~~ **负责人收回自行安排（2026-09-11）——仓库任务清单销账**；切换所需的 telegram 真机验收前提已由 K54 备齐）；§9-3 确认 v1 不拆 crate；§9-4 R→E 已自然落地销账
 2. **卷级 `enabled` 启用/禁用键——负责人 2026-09-10 已批准、暂缓实施**：volume-scoped 布尔键（缺省 true），discover_volumes 对 `enabled=false` 的卷跳过装配 + `info!` 声明，禁用卷不占盘符不进 `/vol/<名>`；现状变通=改后缀/挪子目录（discover 只认 `*.toml` 平铺文件）。负责人同日问询运行态动态加载/卸载存储卷的可行性（架构评估已答：可行，`enabled` 恰为卸载的持久化形态），若立项两者同批。
 2. **telegram E2E 腿——已定向（2026-09-11 裁决选项 B：独立测试 bot/chat）**：**凭据已就位（2026-09-11）**：测试 bot @cydrive_test_bot，配置落 `E:\GitHub\rs-CyDrive\test\config.toml`（bot_token + chat_id，gitignore 内），Bot HTTP API 连通性自检通过（getMe/getUpdates/sendMessage，经代理）。**已知事实：本机访问 Telegram 必须走代理**（`proxy_url = "socks5://127.0.0.1:7897"`，MTProto 同理）——E2E 批的卷/transport 配置必带。**E2E 批已落地（2026-09-11，feat/tg-e2e → main，decisions K54）**：驱动级 2 + vfs 加密全栈 1，真网三连绿（上传/回读逐字/Range 跨部件/覆盖 append-only 语义钉死/清理核空）；运行经验：稳定 session 勿 fresh-session 重试（RateLimited 1576s 实录）。现状参照：生产配置在 `D:\Tools\rs-CyDrive`；baidu appkey 即负责人本人凭据（PCFS client.go:69-70，decisions 2026-09-09 澄清），meta 31300 若要恢复直查须在百度开放平台为本 key 开 meta 权限
 3. ~~新仓远端 origin 待建~~ **已建**：origin = github.com/viccom/rs-cloudfs（**私有**，2026-09-09 建，main + feat/phase0-1 + feat/phase2 已推）。~~公开化前建议做一次全历史秘密审查~~ **已做（2026-09-11，gitleaks 8.30.1 全历史 388 提交）**：8 命中全部为公开 Cynet Android `api_hash` 常量（与 config.rs 默认值同源），**零真实凭据**——公开化前的历史审查此项销账。
