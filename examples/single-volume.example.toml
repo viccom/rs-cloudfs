@@ -1,0 +1,66 @@
+# cydrive 单卷模式全参数示例（一个 config.toml = 一个存储卷 = 一个盘）
+#
+# 用法：复制为本目录的 config.toml（config.toml 被 .gitignore 忽略，不会误提交），
+# 按 backend 替换凭据占位符，然后 `cydrive run`。
+# 未列出的键全部有默认值；本文件列出全部 36 个已知键（KNOWN_TOML_KEYS）。
+# 注意：本格式不支持 TOML 嵌套表（[section] 会被 schema 拒绝为 unknown key），
+# 层次感靠注释分组。要多卷（一进程多盘）见 ../multi-volume/。
+
+# ── 后端选择（"telegram" | "baidu" | "local"，默认 "telegram"）────────────
+backend = "baidu"
+
+# ── baidu 凭据（backend = "baidu" 时必填；也可走环境变量 CYDRIVE_BAIDU_*）──
+baidu_root = "/apps/cloudfs"
+baidu_app_key = "REPLACE_WITH_YOUR_BAIDU_APP_KEY"
+baidu_app_secret = "REPLACE_WITH_YOUR_BAIDU_APP_SECRET"
+baidu_access_token = "REPLACE_WITH_YOUR_BAIDU_ACCESS_TOKEN"
+baidu_refresh_token = "REPLACE_WITH_YOUR_BAIDU_REFRESH_TOKEN"
+
+# ── telegram 凭据（仅 backend = "telegram" 时需要；baidu/local 下无效）────
+# bot_token = "1234567890:REPLACE_WITH_YOUR_BOTFATHER_TOKEN"
+# chat_id = 1234567890
+# api_id = 6                   # 公开 Cynet Android 客户端凭据，通常不必改
+# api_hash = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
+# proxy_url = "socks5://127.0.0.1:7897"   # MTProto SOCKS5 代理；None = 直连
+
+# ── local 凭据（仅 backend = "local" 时需要；必须是绝对路径）──────────────
+# local_root = "D:\\CyDriveRoot"
+
+# ── 挂载（Windows 盘符形态 "X:"；"Y"/"y" 会被规范化）──────────────────────
+drive_letter = "Z:"              # 默认 "Y:"
+auto_mount_drive = true          # 启动即挂载；默认 true
+mount_backend = "winfsp"         # 默认 "webdav"（net use）；"winfsp" 需 --features winfsp
+                                 # 构建且已装 WinFsp 运行时，缺失时可见降级回 webdav 不拒启
+# mount_point = "/home/me/CyDrive"         # 仅 Linux 生效；None = $HOME/CyDrive
+
+# ── 服务端口 ────────────────────────────────────────────────────────────────
+webdav_host = "127.0.0.1"        # 默认同值
+webdav_port = 8485               # 默认 8080
+web_ui_host = "127.0.0.1"        # 默认同值
+web_ui_port = 8486               # 默认 8088
+enable_web_ui = true             # 默认 true
+
+# ── 加密（客户端侧；读路径按每行 scheme 分派，与这里无关）─────────────────
+enable_encryption = true         # 默认 false
+encryption_password = "REPLACE_WITH_A_STRONG_PASSWORD"   # 开加密时必填非空
+encryption_scheme = "aead_v2"    # 新上传容器格式："gcm"（默认，Python 兼容 v1）| "aead_v2"（流式 v2）
+
+# ── 路径（相对当前工作目录；默认值即 Python 基线形态）─────────────────────
+storage_path = "./Telegram_Drive"     # 虚拟盘根（上传/下载树）
+cache_path = "./Telegram_Cache"       # 本地水合缓存根
+db_path = "./cydrive_meta.db"         # SQLite 元数据库
+
+# ── 传输与队列（默认值即可用）───────────────────────────────────────────────
+chunk_size_mb = 1900             # 上传分块 MB（telegram 单消息上限留量；1..=2000）
+cache_limit_gb = 20              # 缓存容量 GB
+upload_workers = 2               # 上传并发（1..=32）
+queue_capacity = 256             # 上传队列容量（>= upload_workers，<= 100000）
+hydrate_timeout_secs = 1800      # 单文件水合超时秒（1..=86400）
+
+# ── sync-lite 元数据同步（可选；不设 = 完全禁用）───────────────────────────
+# sync_url = "https://sync.example.org:8290"   # 需 http(s) 前缀
+# sync_secret = "REPLACE_WITH_YOUR_SYNC_SECRET" # 建议改用环境变量 CYDRIVE_SYNC_SECRET
+# sync_interval_secs = 300                      # 轮询秒（1..=86400）
+
+# ── 多卷模式开关（设置 = 进入多卷，本文件只许保留进程级键）─────────────────
+# volumes_dir = "volumes"       # 见 ../multi-volume/；单卷模式保持不设

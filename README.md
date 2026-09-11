@@ -41,6 +41,7 @@ cargo build --release
 
 baidu 实例最小配置（config.toml）：`backend = "baidu"` + `baidu_app_key/baidu_app_secret/baidu_refresh_token`（或 env `CYDRIVE_BAIDU_*`，access_token 缺省由 refresh 换取）；`baidu_root` 默认 `/apps/cloudfs`。
 local 实例：`backend = "local"` + `local_root = "<绝对路径>"`。
+**全参数示例配置**（凭据已脱敏占位，可用 `cydrive status` 验证解析）：单卷 [`examples/single-volume.example.toml`](examples/single-volume.example.toml)（36 键全览，注释分组）；多卷 [`examples/multi-volume/`](examples/multi-volume/)（进程级 `config.example.toml` + `volumes/` 下 baidu 全参数卷 + local 最小卷——多卷模式的层次在文件布局：进程级键与卷级键分文件，见下节）。
 权威后端（baidu/local）冷启动可 `cydrive rebuild` 从后端重建索引（明文集；加密实例走 sync）。
 新后端接入指南：[docs/standards/driver-onboarding.md](docs/standards/driver-onboarding.md)（conformance 套件 + 装配点 + E2E 拓扑）。
 

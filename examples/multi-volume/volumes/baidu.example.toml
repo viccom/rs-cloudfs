@@ -1,0 +1,49 @@
+# 多卷示例卷：baidu 全参数（28 个卷级键全覆盖）
+#
+# 卷名 = 本文件名去掉 .toml（此处即 "baidu"）。卷内的相对路径锚定在
+# <volumes_dir>/<卷名>/ 目录下（K21），不是进程 cwd。
+# 凭据占位符必须替换；也可改走该卷自己的环境变量（CYDRIVE_BAIDU_*）。
+
+# ── 后端与凭据 ──────────────────────────────────────────────────────────────
+backend = "baidu"
+baidu_root = "/apps/cloudfs"
+baidu_app_key = "REPLACE_WITH_YOUR_BAIDU_APP_KEY"
+baidu_app_secret = "REPLACE_WITH_YOUR_BAIDU_APP_SECRET"
+baidu_access_token = "REPLACE_WITH_YOUR_BAIDU_ACCESS_TOKEN"
+baidu_refresh_token = "REPLACE_WITH_YOUR_BAIDU_REFRESH_TOKEN"
+
+# ── 挂载（本卷的盘符；与其他卷不得冲突，冲突在装配期报错）─────────────────
+drive_letter = "Z:"              # 注释掉 = 本卷不占盘符（仅经 /vol/<name> 访问）
+# mount_point = "/mnt/baidu"     # 仅 Linux 生效
+
+# ── 加密（本卷独立）────────────────────────────────────────────────────────
+enable_encryption = true
+encryption_password = "REPLACE_WITH_A_STRONG_PASSWORD"
+encryption_scheme = "aead_v2"    # "gcm"（默认）| "aead_v2"
+
+# ── 路径（相对锚定 <volumes_dir>/baidu/）──────────────────────────────────
+storage_path = "./Telegram_Drive"
+cache_path = "./Telegram_Cache"
+db_path = "./cydrive_meta.db"
+
+# ── 传输与队列（本卷独立的上传流水线）───────────────────────────────────────
+chunk_size_mb = 1900
+cache_limit_gb = 20
+upload_workers = 2
+queue_capacity = 256
+hydrate_timeout_secs = 1800
+
+# ── telegram 凭据组（仅 backend = "telegram" 的卷需要；baidu 卷下无效）────
+# bot_token = "1234567890:REPLACE_WITH_YOUR_BOTFATHER_TOKEN"
+# chat_id = 1234567890
+# api_id = 6
+# api_hash = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
+# proxy_url = "socks5://127.0.0.1:7897"
+
+# ── local 组（仅 backend = "local" 的卷需要）───────────────────────────────
+# local_root = "root"            # 相对 = 卷目录下的 root/
+
+# ── sync-lite 同步（本卷独立；不设 = 禁用）────────────────────────────────
+# sync_url = "https://sync.example.org:8290"
+# sync_secret = "REPLACE_WITH_YOUR_SYNC_SECRET"
+# sync_interval_secs = 300
