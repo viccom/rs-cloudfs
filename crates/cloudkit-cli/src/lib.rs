@@ -32,10 +32,11 @@
 //! `MockTransport` through the same seam, [`run_with_transport`].
 
 use std::fmt::Write as _;
+use std::future::Future;
 use std::net::{IpAddr, SocketAddr};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
 #[cfg(feature = "telegram")]
@@ -893,6 +894,15 @@ impl RegistryHandle {
         }
     }
 
+    /// Registers one volume (appending to the table order) — RV2's ADD
+    /// lands here at runtime, the boot loop hands its assembled Vec to
+    /// [`RegistryHandle::new`]. A duplicate name is the caller's
+    /// contract error (the control channel's ADD refuses duplicates
+    /// before reaching here).
+    pub fn insert(&self, runtime: VolumeRuntime) {
+        self.write().push(runtime);
+    }
+
     /// One volume's registry entry by name (`None` for an unknown name)
     /// — the lookup the mount pass resolves each claim's VFS with. A
     /// clone: the table lock is released before the caller's work.
@@ -1026,23 +1036,243 @@ struct VolumeStopUnit {
     inbound: cloudkit_core::inbound::InboundWorkerHandle,
 }
 
+impl VolumeStopUnit {
+    /// The per-volume stop segment the aggregated stop task, REMOVE's
+    /// commit and ADD's rollback all share (RV2's 单卷停段): the VFS
+    /// drain (queue workers join, every enqueued job reaches a terminal
+    /// state) then the inbound worker join — the order the stop sequence
+    /// has always used.
+    async fn release(self) {
+        self.vfs.shutdown().await;
+        self.inbound.shutdown().await;
+    }
+}
+
+// ------------------------------------------------- RV2: live volume plumbing ---
+
+/// The boxed reply future of one [`DriveRelease::release`] call.
+pub type ReleaseFuture<'a> =
+    std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send + 'a>>;
+
+/// The K50 mount-release step, abstracted over the mount backend so the
+/// removal sequence (and its abort path) is the same code for every
+/// backend — and testable in the default (winfsp-off) build. The
+/// default implementations are the WF4 pieces: [`WinFspRelease`] runs
+/// the real `MountHandle::unmount` (its own disappearance poll, the 10s
+/// K50 window) on the blocking pool; [`WebDavRelease`] deletes the
+/// `net use` mapping. Tests inject any [`DriveRelease`] through
+/// [`MultiVolumeHandle::live_table`] to pin the abort path.
+pub trait DriveRelease: Send {
+    /// Release the volume's drive mount and confirm the letter is gone.
+    /// `Err` carries the actionable reason the removal must abort (K50:
+    /// a failed unmount leaves the volume registered — never a
+    /// half-removal). Idempotence is the implementation's business (the
+    /// winfsp handle is take-once; a spent release is a no-op Ok).
+    fn release(&mut self) -> ReleaseFuture<'_>;
+}
+
+/// The winfsp arm of [`DriveRelease`] (K40/K50): the native adapter's
+/// own unmount — the dispatcher stop plus the disappearance poll — on
+/// the blocking pool (synchronous WinFsp calls; see
+/// `cloudkit_winfsp::mount`'s threading notes). The handle sits in an
+/// `Option` because `unmount` is take-once: a second release is a
+/// no-op `Ok` (the idempotence the K50 abort + retry flow relies on).
+#[cfg(all(windows, feature = "winfsp"))]
+struct WinFspRelease {
+    handle: Option<cloudkit_winfsp::mount::MountHandle>,
+}
+
+#[cfg(all(windows, feature = "winfsp"))]
+impl DriveRelease for WinFspRelease {
+    fn release(&mut self) -> ReleaseFuture<'_> {
+        let handle = self.handle.take();
+        Box::pin(async move {
+            let Some(mut handle) = handle else {
+                return Ok(());
+            };
+            match tokio::task::spawn_blocking(move || handle.unmount()).await {
+                Ok(Ok(())) => Ok(()),
+                Ok(Err(error)) => Err(error.to_string()),
+                Err(error) => Err(format!("the unmount task failed to complete: {error}")),
+            }
+        })
+    }
+}
+
+/// The WebDAV arm of [`DriveRelease`]: the `net use /delete` that
+/// releases the cross-process mapping (the stop sequence's own release,
+/// now per volume). A failure is the K50 abort reason verbatim.
+struct WebDavRelease {
+    letter: String,
+}
+
+impl DriveRelease for WebDavRelease {
+    fn release(&mut self) -> ReleaseFuture<'_> {
+        let letter = self.letter.clone();
+        Box::pin(async move {
+            cloudkit_platform::windows::unmount_drive(&letter)
+                .map(|_| ())
+                .map_err(|error| format!("`net use {letter} /delete` failed: {error}"))
+        })
+    }
+}
+
+/// One live volume's runtime plumbing (RV2): the stop segment's pieces,
+/// the volume's own periodic sync task, and — when the volume claimed a
+/// drive letter — the mount record plus the backend release step. ADD
+/// creates entries, REMOVE consumes them, the stop task drains whatever
+/// remains; all three go through [`VolumeLiveTable`].
+struct LiveVolume {
+    stop_unit: VolumeStopUnit,
+    sync_task: Option<tokio::task::JoinHandle<()>>,
+    mount: Option<MountedVolume>,
+    release: Option<Box<dyn DriveRelease>>,
+}
+
+/// The live volumes' shared table (RV2): what the boot assembled and
+/// ADD grew and REMOVE shrank — the single structure the stop sequence,
+/// the control commands and the mount accessors read, replacing the
+/// boot-time `Vec` snapshots. A short-critical-section std mutex (no
+/// await runs under the lock); clones of the payload come out, never
+/// references.
+#[derive(Default)]
+pub struct VolumeLiveTable {
+    entries: std::sync::Mutex<Vec<(String, LiveVolume)>>,
+}
+
+impl VolumeLiveTable {
+    fn lock(&self) -> std::sync::MutexGuard<'_, Vec<(String, LiveVolume)>> {
+        self.entries
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// Registers one live volume (append order = registration order).
+    fn insert(&self, name: &str, entry: LiveVolume) {
+        self.lock().push((name.to_owned(), entry));
+    }
+
+    /// Takes the volume's entry out (REMOVE's first move); the caller
+    /// either commits the removal or puts the entry back with
+    /// [`VolumeLiveTable::insert`] when a K50 step aborts.
+    fn take(&self, name: &str) -> Option<LiveVolume> {
+        let position = self
+            .lock()
+            .iter()
+            .position(|(registered, _)| registered == name)?;
+        Some(self.lock().remove(position).1)
+    }
+
+    /// Re-attaches the mount record + release step of a volume that
+    /// mounted (`None` release = the backend needs none here).
+    fn attach_mount(
+        &self,
+        name: &str,
+        mount: MountedVolume,
+        release: Option<Box<dyn DriveRelease>>,
+    ) {
+        if let Some((_, entry)) = self
+            .lock()
+            .iter_mut()
+            .find(|(registered, _)| registered == name)
+        {
+            entry.mount = Some(mount);
+            entry.release = release;
+        }
+    }
+
+    /// Replaces the volume's release step — the injected-probe seam the
+    /// K50 abort-path tests use (the winfsp unmount is the production
+    /// implementation behind the same [`DriveRelease`] trait). `false`
+    /// when no live volume carries that name.
+    pub fn set_release(&self, name: &str, release: Box<dyn DriveRelease>) -> bool {
+        match self
+            .lock()
+            .iter_mut()
+            .find(|(registered, _)| registered == name)
+        {
+            Some((_, entry)) => {
+                entry.release = Some(release);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The mounts, in registration order (the banner and
+    /// `mounted_volumes` face).
+    fn mounted_volumes(&self) -> Vec<MountedVolume> {
+        self.lock()
+            .iter()
+            .filter_map(|(_, entry)| entry.mount.clone())
+            .collect()
+    }
+
+    /// The drive letters actually mounted (the `mounted_letters` face).
+    fn mounted_letters(&self) -> Vec<String> {
+        self.mounted_volumes()
+            .into_iter()
+            .map(|mount| mount.letter)
+            .collect()
+    }
+
+    /// One volume's mount record (LIST's letter/backend columns).
+    fn mount_of(&self, name: &str) -> Option<MountedVolume> {
+        self.lock()
+            .iter()
+            .find(|(registered, _)| registered == name)
+            .and_then(|(_, entry)| entry.mount.clone())
+    }
+
+    /// Snapshots the periodic sync tasks still live, emptying the
+    /// entries' slots (JoinHandle is not Clone): shutdown's abort pass
+    /// takes them exactly once; REMOVE-committed volumes no longer carry
+    /// theirs. The same semantics the boot-time Vec had.
+    fn take_sync_tasks(&self) -> Vec<tokio::task::JoinHandle<()>> {
+        let mut guard = self.lock();
+        let tasks = guard
+            .iter_mut()
+            .filter_map(|(_, entry)| entry.sync_task.take())
+            .collect();
+        drop(guard);
+        tasks
+    }
+
+    /// Drains the whole table (the stop task's teardown pass): every
+    /// remaining entry comes out for its release + stop segment.
+    fn take_all(&self) -> Vec<(String, LiveVolume)> {
+        std::mem::take(&mut self.lock())
+    }
+}
+
+impl std::fmt::Debug for VolumeLiveTable {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The entries are not Debug (task handles, trait objects); the
+        // mount list is the diagnostic surface.
+        f.debug_struct("VolumeLiveTable")
+            .field("mounted", &self.mounted_volumes())
+            .finish()
+    }
+}
+
 /// The assembled product of [`run_multi_with_transports`]: the volume
 /// registry (statuses for the banner and tests), the ONE stop gate every
 /// volume and the process-level control channel funnel into, the single
 /// multi-volume WebDAV listener (K20 — `None` when its bind degraded,
 /// see [`MultiVolumeHandle::webdav_addr`]), the single multi-volume
 /// dashboard (K24 / MV3 — `None` when off or degraded, see
-/// [`MultiVolumeHandle::web_ui_addr`]), the drive letters actually
-/// mounted (K27), the per-volume periodic sync tasks (aborted at
-/// shutdown, same semantics as [`RunHandle::shutdown`]) and the stop
-/// task that owns the aggregated graceful sequence.
+/// [`MultiVolumeHandle::web_ui_addr`]), the per-volume live table (RV2 —
+/// drive letters, mounts and sync tasks live there and follow runtime
+/// ADD/REMOVE; K27) and the stop task that owns the aggregated graceful
+/// sequence.
 pub struct MultiVolumeHandle {
     registry: RegistryHandle,
     watch: Arc<ShutdownWatch>,
     stop_task: tokio::task::JoinHandle<()>,
-    /// The per-volume periodic sync tasks (`None` entries = volumes
-    /// without sync configured / failed volumes).
-    sync_tasks: Vec<Option<tokio::task::JoinHandle<()>>>,
+    /// The live volumes (RV2): per-volume stop segments, sync tasks and
+    /// mounts — grown and shrunk by the control channel's ADD/REMOVE,
+    /// drained by the stop task. Replaces the boot-time Vec snapshots.
+    live: Arc<VolumeLiveTable>,
     /// The single WebDAV listener's bound address (`None` = the bind
     /// degraded; the volumes' data planes keep running, K22).
     webdav_addr: Option<SocketAddr>,
@@ -1050,12 +1280,6 @@ pub struct MultiVolumeHandle {
     /// `enable_web_ui` off, or the bind degraded per the same K22
     /// policy).
     web_ui_addr: Option<SocketAddr>,
-    /// The drive letters the per-volume mounts actually claimed
-    /// (possibly fewer than configured — a failed mount only warns).
-    mounted_letters: Vec<String>,
-    /// The same mounts with the backend that carried each one (K40's
-    /// per-volume banner annotation).
-    mounted_volumes: Vec<MountedVolume>,
 }
 
 impl std::fmt::Debug for MultiVolumeHandle {
@@ -1105,16 +1329,28 @@ impl MultiVolumeHandle {
     /// The drive letters the per-volume mounts actually claimed (K27;
     /// empty when none did — volumes without an explicit
     /// `drive_letter`, `auto_mount_drive` off, non-Windows, or failed
-    /// mounts that only warned).
-    pub fn mounted_letters(&self) -> &[String] {
-        &self.mounted_letters
+    /// mounts that only warned). A live query over the RV2 table: a
+    /// runtime ADD/REMOVE is visible here immediately.
+    pub fn mounted_letters(&self) -> Vec<String> {
+        self.live.mounted_letters()
     }
 
     /// The mounts with the backend that carried each one (Phase 3 / WF4):
     /// the banner annotates every letter with it, so a degraded winfsp
-    /// request is visible at a glance (`webdav (fallback: …)`).
-    pub fn mounted_volumes(&self) -> &[MountedVolume] {
-        &self.mounted_volumes
+    /// request is visible at a glance (`webdav (fallback: …)`). A live
+    /// query over the RV2 table, in registration order.
+    pub fn mounted_volumes(&self) -> Vec<MountedVolume> {
+        self.live.mounted_volumes()
+    }
+
+    /// The live volumes' shared table (RV2): what the control channel's
+    /// ADD/REMOVE mutate and the stop sequence drains. Published as the
+    /// injection seam for the K50 abort-path tests (a stuck
+    /// [`DriveRelease`] goes in through
+    /// [`VolumeLiveTable::set_release`]); no CLI face reads it directly
+    /// — the user-visible face is the control channel's `LIST`.
+    pub fn live_table(&self) -> &Arc<VolumeLiveTable> {
+        &self.live
     }
 
     /// One arm of the run flow's shutdown wait, the multi-volume analog
@@ -1125,23 +1361,24 @@ impl MultiVolumeHandle {
     }
 
     /// Graceful stop for every volume: fires the ONE gate (a no-op when
-    /// a source already did), aborts each volume's periodic sync task
-    /// (same abort-not-drain choice and rationale as
+    /// a source already did), aborts each live volume's periodic sync
+    /// task (same abort-not-drain choice and rationale as
     /// [`RunHandle::shutdown`]; a non-cancelled join error there is a
     /// warn, not a stop-sequence failure), then joins the stop task,
-    /// which drains every running volume's upload queue, joins its
-    /// inbound worker and finally removes the process-level control
-    /// file. The stop task's own join error propagates — a panicked
-    /// stop sequence is a failed shutdown, not a clean one.
+    /// which drains every remaining live volume's upload queue, joins
+    /// its inbound worker, releases its drive mount and finally removes
+    /// the process-level control file. The stop task's own join error
+    /// propagates — a panicked stop sequence is a failed shutdown, not a
+    /// clean one.
     pub async fn shutdown(self) -> Result<()> {
         let Self {
             watch,
             stop_task,
-            sync_tasks,
+            live,
             ..
         } = self;
         watch.trigger();
-        for task in sync_tasks.into_iter().flatten() {
+        for task in live.take_sync_tasks() {
             task.abort();
             if let Err(error) = task.await {
                 if !error.is_cancelled() {
@@ -1158,16 +1395,170 @@ impl MultiVolumeHandle {
     }
 }
 
+/// The runtime transport dispatch for ADD (RV2 / K48): given a parsed
+/// volume spec, connect its transport and produce the per-boot options —
+/// the same two arms the production run dispatch runs, injected so the
+/// library stays driver-facing only. `Ok(None)` = the connect was
+/// interrupted; the ADD answers without registering anything.
+pub type DispatchFuture<'a> = std::pin::Pin<
+    Box<
+        dyn Future<Output = anyhow::Result<Option<(RunOptions, Arc<dyn CloudTransport>)>>>
+            + Send
+            + 'a,
+    >,
+>;
+pub type VolumeTransportDispatch =
+    Arc<dyn for<'a> Fn(&'a VolumeConfig) -> DispatchFuture<'a> + Send + Sync + 'static>;
+
+/// K50's abort-timeout knobs (the removal sequence's two waits). The
+/// defaults are the production budgets; [`RemoveTuning::fast`] shrinks
+/// them to millisecond scale for the tests.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RemoveTuning {
+    /// How long the drain step waits for the upload queue's in-flight
+    /// jobs to reach a terminal state before the removal aborts (K50:
+    /// 任一步超时 → 卷保持注册不动).
+    pub drain_timeout: Duration,
+    /// Cadence of the queue-idle poll inside the drain window.
+    pub poll_interval: Duration,
+}
+
+impl Default for RemoveTuning {
+    fn default() -> Self {
+        Self {
+            // Uploads are legitimately slow; a drain abort must be rare
+            // (the LIST pending count is the visible aid meanwhile).
+            drain_timeout: Duration::from_secs(60),
+            poll_interval: Duration::from_millis(100),
+        }
+    }
+}
+
+impl RemoveTuning {
+    /// Millisecond-scale windows for the tests (never production).
+    pub fn fast() -> Self {
+        Self {
+            drain_timeout: Duration::from_millis(800),
+            poll_interval: Duration::from_millis(20),
+        }
+    }
+}
+
+/// The RV2 boot extras: what the runtime-volume command surface needs
+/// beyond the plain boot. [`Default`] (no dispatch, production tuning)
+/// is exactly what [`run_multi_with_transports`] passes — LIST/REMOVE
+/// work everywhere, only ADD needs a dispatch.
+#[derive(Clone, Default)]
+pub struct RuntimeVolumeCommands {
+    /// The transport dispatch runtime ADD assembles volumes through
+    /// (`None` = ADD refuses with the actionable rebuild-style message;
+    /// the production `run` passes its real dispatch).
+    pub dispatch: Option<VolumeTransportDispatch>,
+    /// The K50 removal waits (tests shrink them).
+    pub remove_tuning: RemoveTuning,
+}
+
+/// The single-volume assembly result (RV2's 单卷装配): everything ONE
+/// volume needs once its transport exists, regardless of who called —
+/// the boot loop or a runtime ADD. The three face-table entries derive
+/// from these pieces (the caller decides whether a failure registers a
+/// `Failed` entry — boot — or refuses the ADD — the control channel).
+struct AssembledVolume {
+    /// The running registry entry (spec + transport + VFS).
+    runtime: VolumeRuntime,
+    /// The stop segment (VFS drain + inbound join).
+    stop_unit: VolumeStopUnit,
+    /// The volume's periodic sync task (K26), `None` when unconfigured.
+    sync_task: Option<tokio::task::JoinHandle<()>>,
+    /// The volume's FS adapter (the WebDAV face's per-volume handler).
+    fs: CyDriveFs,
+    /// The dashboard identity (K24) the web face registers.
+    ui_config: cloudkit_web::WebUiConfig,
+    /// The running VFS (the dashboard entry and LIST's pending count).
+    vfs: Arc<Vfs>,
+}
+
+/// Assembles ONE volume (RV2's 单卷装配, the extraction of the boot
+/// loop's per-volume body): resolves the settings against the volume
+/// home (K21), builds the dashboard identity from the dispatched truth
+/// (K24), declares the transport's capability line (R-5), builds the
+/// volume core and spawns its periodic sync task when configured (K26),
+/// and returns the pieces every face table consumes. On failure the
+/// already-built dashboard identity comes back alongside the error —
+/// the boot registers it as `Failed` (K22), a runtime ADD refuses.
+async fn assemble_volume(
+    process_cfg: &CyDriveConfig,
+    spec: &VolumeConfig,
+    options: &RunOptions,
+    transport: Arc<dyn CloudTransport>,
+    watch: &Arc<ShutdownWatch>,
+) -> std::result::Result<AssembledVolume, (cloudkit_web::WebUiConfig, anyhow::Error)> {
+    let name = spec.name.clone();
+    // The dashboard identity pieces (K24), captured before the
+    // transport moves into the core: the running arm reports the
+    // dispatched truth (RunOptions' volume/quota payload plus the
+    // transport's own capability bits — R4, never hardcoded).
+    let capabilities = transport.capabilities();
+    let ui_config = cloudkit_web::WebUiConfig {
+        // Only an explicit drive_letter claim reaches the dashboard;
+        // an unclaimed volume mounts nothing and must not report the
+        // config-default letter as a phantom claim (the parsed
+        // default "Y:" is a placeholder, not a mount).
+        drive_letter: spec
+            .explicit_drive_letter
+            .then(|| spec.settings.drive_letter.clone()),
+        webdav_url: volume_mount_url(process_cfg, &name),
+        chat_id: spec.settings.chat_id,
+        is_configured: spec.settings.is_configured(),
+        backend: spec.settings.backend.as_str().to_string(),
+        volume: options.web_volume.clone(),
+        remote_delete: capabilities.remote_delete,
+        quota: options.web_quota.clone(),
+    };
+    let (runtime, stop_unit, sync_task, fs) = build_volume_runtime(spec, options, transport, watch)
+        .await
+        .map_err(|error| (ui_config.clone(), error))?;
+    let vfs = Arc::clone(runtime.vfs().expect("a running volume carries its vfs"));
+    Ok(AssembledVolume {
+        runtime,
+        stop_unit,
+        sync_task,
+        fs,
+        ui_config,
+        vfs,
+    })
+}
+
 /// Boots the multi-volume stack with the transports injected (Phase 2.5
 /// / MV1's test seam; the production `run` dispatch builds the same
-/// tuples per volume). One volume core per spec (db + cache + VFS +
-/// requeue + inbound worker, K21-resolved paths), one periodic sync task
-/// per configured volume (K26), ONE process-level stop gate plus control
-/// channel (K25), and the single multi-volume WebDAV listener routing
-/// `/vol/<name>/` to every RUNNING volume (K20 / MV2 — failed volumes
-/// stay out of the route table; their status is the registry's to
-/// report). Volumes with an explicit `drive_letter` mount through the
-/// process WebDAV port (K27).
+/// tuples per volume) — the plain face of
+/// [`run_multi_with_transports_and_commands`], without a runtime ADD
+/// dispatch (LIST/REMOVE still answer; ADD refuses actionably).
+pub async fn run_multi_with_transports(
+    process_cfg: &CyDriveConfig,
+    volumes: Vec<(VolumeConfig, RunOptions, Arc<dyn CloudTransport>)>,
+) -> Result<MultiVolumeHandle> {
+    run_multi_with_transports_and_commands(process_cfg, volumes, RuntimeVolumeCommands::default())
+        .await
+}
+
+/// [`run_multi_with_transports`] with the runtime-volume command surface
+/// (Phase 3.6 / RV2, K48): the process-level control channel gains
+/// `ADD <name>` / `REMOVE <name>` / `LIST` — ADD assembles a volume at
+/// runtime through `commands.dispatch` and registers it into all three
+/// faces at once (master registry, WebDAV dispatch, dashboard — the cli
+/// master table is the truth, the faces are projections), REMOVE runs
+/// the K50 safe sequence, LIST reports the live set. Commands are
+/// serialized on the control loop, so they never interleave.
+///
+/// Boot itself is unchanged: one volume core per spec (db + cache + VFS
+/// with requeue and inbound worker, K21-resolved paths), one periodic sync
+/// task per configured volume (K26), ONE process-level stop gate plus
+/// control channel (K25), and the single multi-volume WebDAV listener
+/// routing `/vol/<name>/` to every RUNNING volume (K20 / MV2 — failed
+/// volumes stay out of the route table; their status is the registry's
+/// to report). Volumes with an explicit `drive_letter` mount through
+/// the process WebDAV port (K27).
 ///
 /// K22 failure policy: a volume that fails to assemble becomes
 /// `Failed{reason}` in the registry (with a `tracing::error`) and the
@@ -1180,61 +1571,44 @@ impl MultiVolumeHandle {
 /// MV3: with `enable_web_ui` the boot also binds the ONE process-level
 /// dashboard (K24) serving the volume registry — per-volume tabs, the
 /// `/api/volumes` listing and the K23 `?volume=` routing.
-pub async fn run_multi_with_transports(
+pub async fn run_multi_with_transports_and_commands(
     process_cfg: &CyDriveConfig,
     volumes: Vec<(VolumeConfig, RunOptions, Arc<dyn CloudTransport>)>,
+    commands: RuntimeVolumeCommands,
 ) -> Result<MultiVolumeHandle> {
     // The double-start guard (see the single-volume call site): refuse a
     // second boot over a live instance before touching any volume.
     control::ensure_not_running(process_cfg).await?;
     let watch = Arc::new(ShutdownWatch::new());
+    let live: Arc<VolumeLiveTable> = Arc::new(VolumeLiveTable::default());
     let mut runtimes: Vec<VolumeRuntime> = Vec::new();
-    let mut stop_units: Vec<VolumeStopUnit> = Vec::new();
-    let mut sync_tasks: Vec<Option<tokio::task::JoinHandle<()>>> = Vec::new();
     let mut volume_fses: Vec<(String, CyDriveFs)> = Vec::new();
     let mut ui_entries: Vec<cloudkit_web::VolumeUiEntry> = Vec::new();
 
     for (spec, options, transport) in volumes {
         let name = spec.name.clone();
-        // The dashboard identity pieces (K24), captured before the
-        // transport moves into the assembly: the running arm reports
-        // the dispatched truth (RunOptions' volume/quota payload plus
-        // the transport's own capability bits — R4, never hardcoded);
-        // the failed arm degrades to what the volume file declares.
-        let capabilities = transport.capabilities();
-        let ui_config = cloudkit_web::WebUiConfig {
-            // Only an explicit drive_letter claim reaches the dashboard;
-            // an unclaimed volume mounts nothing and must not report the
-            // config-default letter as a phantom claim (the parsed
-            // default "Y:" is a placeholder, not a mount).
-            drive_letter: spec
-                .explicit_drive_letter
-                .then(|| spec.settings.drive_letter.clone()),
-            webdav_url: volume_mount_url(process_cfg, &name),
-            chat_id: spec.settings.chat_id,
-            is_configured: spec.settings.is_configured(),
-            backend: spec.settings.backend.as_str().to_string(),
-            volume: options.web_volume.clone(),
-            remote_delete: capabilities.remote_delete,
-            quota: options.web_quota.clone(),
-        };
-        match build_volume_runtime(&spec, &options, transport, &watch).await {
-            Ok((runtime, stop_unit, sync_task, fs)) => {
+        match assemble_volume(process_cfg, &spec, &options, transport, &watch).await {
+            Ok(assembled) => {
                 tracing::info!(volume = %name, "volume is running");
-                volume_fses.push((name.clone(), fs));
+                volume_fses.push((name.clone(), assembled.fs));
                 ui_entries.push(cloudkit_web::VolumeUiEntry {
                     name: name.clone(),
                     status: cloudkit_web::VolumeUiStatus::Running,
-                    config: ui_config,
-                    vfs: Some(Arc::clone(
-                        runtime.vfs().expect("a running volume carries its vfs"),
-                    )),
+                    config: assembled.ui_config,
+                    vfs: Some(Arc::clone(&assembled.vfs)),
                 });
-                runtimes.push(runtime);
-                stop_units.push(stop_unit);
-                sync_tasks.push(sync_task);
+                runtimes.push(assembled.runtime);
+                live.insert(
+                    &name,
+                    LiveVolume {
+                        stop_unit: assembled.stop_unit,
+                        sync_task: assembled.sync_task,
+                        mount: None,
+                        release: None,
+                    },
+                );
             }
-            Err(error) => {
+            Err((ui_config, error)) => {
                 tracing::error!(
                     volume = %name,
                     %error,
@@ -1252,7 +1626,6 @@ pub async fn run_multi_with_transports(
                     spec,
                     reason: error.to_string(),
                 });
-                sync_tasks.push(None);
             }
         }
     }
@@ -1281,21 +1654,20 @@ pub async fn run_multi_with_transports(
     // visible on the same port. A bind failure degrades (K22, the same
     // policy as the control channel but with the bigger blast radius
     // spelled out): the volumes' data planes — queues, sync, inbound —
-    // keep running; the WebDAV face is simply absent.
-    let webdav_server = bind_multi_webdav(
-        process_cfg,
-        cloudkit_webdav::RegistryHandle::new(volume_fses),
-    )
-    .await;
+    // keep running; the WebDAV face is simply absent. The boot keeps a
+    // clone of the face handle: RV2's ADD/REMOVE mutate the same table.
+    let webdav_face = cloudkit_webdav::RegistryHandle::new(volume_fses);
+    let webdav_server = bind_multi_webdav(process_cfg, webdav_face.clone()).await;
     let webdav_addr = webdav_server.as_ref().map(WebDavServer::local_addr);
 
     // The ONE dashboard (K24 / MV3): a single process-level port serving
     // the volume registry (per-volume tabs, `/api/volumes` aggregate) —
     // through the dashboard's own shared face table (RV1/K51). Same K22
     // degrade policy as the WebDAV bind: a failure only logs an error —
-    // the volumes keep running without the UI.
-    let web_ui =
-        bind_multi_web_ui(process_cfg, cloudkit_web::RegistryHandle::new(ui_entries)).await;
+    // the volumes keep running without the UI. The boot keeps a clone
+    // for the same reason.
+    let web_face = cloudkit_web::RegistryHandle::new(ui_entries);
+    let web_ui = bind_multi_web_ui(process_cfg, web_face.clone()).await;
     let web_ui_addr = web_ui.as_ref().map(WebUiServer::local_addr);
 
     // Per-volume mounts (K27 + K40): only volumes that EXPLICITLY set a
@@ -1312,7 +1684,7 @@ pub async fn run_multi_with_transports(
         (false, false) => Vec::new(),
     };
     let runtime_handle = tokio::runtime::Handle::current();
-    let mounts = mount_volumes_if_configured(&MountPlan {
+    let mut mounts = mount_volumes_if_configured(&MountPlan {
         process_cfg,
         claims: &mount_claims,
         registry: &registry,
@@ -1321,34 +1693,46 @@ pub async fn run_multi_with_transports(
         winfsp: winfsp_capability(),
     })
     .await;
-    let mounted_letters: Vec<String> = mounts
-        .mounted
-        .iter()
-        .map(|mount| mount.letter.clone())
-        .collect();
-    let mounted_volumes = mounts.mounted;
-    let winfsp_mounts = mounts.winfsp;
-    // The stop loop's `net use /delete` releases mappings, and only the
-    // WebDAV arm creates mappings — a winfsp-mounted letter carries none,
-    // so deleting it would only log a failure (the letter is already
-    // gone by then; see `winfsp_mounts.release()` below).
-    let webdav_letters: Vec<String> = mounted_volumes
-        .iter()
-        .filter(|mount| mount.backend.as_str() == "webdav")
-        .map(|mount| mount.letter.clone())
-        .collect();
+    // Each completed mount lands in its volume's live entry: the record
+    // (letter + backend, the banner's payload) and the K50 release step
+    // (the winfsp handle, or the net-use delete for the mapped ones).
+    let mut winfsp_handles = mounts.winfsp.drain();
+    for mount in mounts.mounted {
+        let release = mount_release(&mount, &mut winfsp_handles);
+        let name = mount.volume.clone();
+        live.attach_mount(&name, mount, release);
+    }
 
     // The process-level control channel (K25): same file name and
     // cwd-anchored location as the single-volume mode (the process
     // config's default db_path anchors the file in the working
-    // directory), same optional-component degrade.
+    // directory), same optional-component degrade. RV2: the channel
+    // serves the volume commands through the shared runtime state.
     let control_file = match control::ControlServer::bind(process_cfg).await {
         Ok(server) => {
             let path = control::control_file_path(process_cfg);
             tracing::info!(addr = %server.local_addr(), "control channel listening");
             let gate = Arc::clone(&watch);
+            let command_surface = Arc::new(RuntimeVolumeControl {
+                process_cfg: process_cfg.clone(),
+                registry: registry.clone(),
+                webdav: webdav_face.clone(),
+                web: web_face.clone(),
+                live: Arc::clone(&live),
+                watch: Arc::clone(&watch),
+                webdav_available: webdav_addr.is_some(),
+                dispatch: commands.dispatch,
+                tuning: commands.remove_tuning,
+            });
+            let handler: control::VolumeCommandHandler = Arc::new(move |line: &str| {
+                let surface = Arc::clone(&command_surface);
+                Box::pin(async move { surface.handle(line).await })
+            });
             tokio::spawn(async move {
-                if let Err(error) = server.run(move || gate.trigger()).await {
+                if let Err(error) = server
+                    .run_with_commands(move || gate.trigger(), Some(handler))
+                    .await
+                {
                     tracing::warn!(%error, "the control channel accept loop ended");
                 }
             });
@@ -1367,11 +1751,15 @@ pub async fn run_multi_with_transports(
     // The one runner of the aggregated graceful stop sequence: the
     // WebDAV listener stops first (in-flight requests drain), then the
     // dashboard drains the same way (the single-volume order), then per
-    // volume (queue drain then inbound join), then the process-level
-    // control file, then the mounted letters release — exactly once for
-    // any number of gate fires.
+    // volume — drive mount release (winfsp unmount / net use delete)
+    // BEFORE its VFS workers (the callbacks call into the Vfs, so the
+    // host must be gone first; a failure only warns: a stuck letter
+    // must never block the exit — rclone's "unmount has no force"
+    // reality) — then the process-level control file. Exactly once for
+    // any number of gate fires; the per-volume pass drains whatever the
+    // runtime-ADD/REMOVE cycle left in the live table.
     let gate = Arc::clone(&watch);
-    let unmount_letters = webdav_letters;
+    let stop_live = Arc::clone(&live);
     let stop_task = tokio::spawn(async move {
         watch.wait().await;
         if let Some(server) = &webdav_server {
@@ -1380,17 +1768,18 @@ pub async fn run_multi_with_transports(
         if let Some(web_ui) = &web_ui {
             web_ui.shutdown().await;
         }
-        // The in-process winfsp mounts come down BEFORE the volumes' VFS
-        // workers: their callbacks call into the Vfs, so the host must be
-        // gone first — the same ordering rule the WebDAV listener above
-        // follows. Each unmount is a blocking WinFsp call (plus the
-        // drive-letter disappearance poll) on the blocking pool, and a
-        // failure only warns: a stuck letter must never block the exit
-        // (rclone's "unmount has no force" reality).
-        winfsp_mounts.release().await;
-        for unit in stop_units {
-            unit.vfs.shutdown().await;
-            unit.inbound.shutdown().await;
+        for (name, entry) in stop_live.take_all() {
+            if let Some(mut release) = entry.release {
+                match release.release().await {
+                    Ok(()) => tracing::info!(volume = %name, "released the volume's drive mount"),
+                    Err(error) => tracing::warn!(
+                        volume = %name,
+                        %error,
+                        "releasing the volume's drive failed; continuing the shutdown"
+                    ),
+                }
+            }
+            entry.stop_unit.release().await;
         }
         if let Some(path) = &control_file {
             if let Err(error) = std::fs::remove_file(path) {
@@ -1403,25 +1792,14 @@ pub async fn run_multi_with_transports(
                 }
             }
         }
-        for letter in &unmount_letters {
-            if let Err(e) = cloudkit_platform::windows::unmount_drive(letter) {
-                tracing::warn!(
-                    letter = %letter,
-                    error = %e,
-                    "unmounting the volume's drive failed; continuing the shutdown"
-                );
-            }
-        }
     });
     Ok(MultiVolumeHandle {
         registry,
         watch: gate,
         stop_task,
-        sync_tasks,
+        live,
         webdav_addr,
         web_ui_addr,
-        mounted_letters,
-        mounted_volumes,
     })
 }
 
@@ -1577,6 +1955,407 @@ async fn build_volume_runtime(
         sync_task,
         fs,
     ))
+}
+
+// --------------------------------------- RV2: the volume command surface ---
+
+/// The state the control channel's `ADD`/`REMOVE`/`LIST` commands act
+/// through (RV2 / K48): the cli master registry (the truth), the two
+/// face tables (the WebDAV dispatch and dashboard projections), the live
+/// volumes and the pieces runtime ADD needs to assemble one. Commands
+/// run serialized on the control loop (runtime-volumes §4), so a
+/// plain-`&self` pass over these interior-mutable tables cannot
+/// interleave.
+struct RuntimeVolumeControl {
+    process_cfg: CyDriveConfig,
+    registry: RegistryHandle,
+    webdav: cloudkit_webdav::RegistryHandle,
+    web: cloudkit_web::RegistryHandle,
+    live: Arc<VolumeLiveTable>,
+    watch: Arc<ShutdownWatch>,
+    /// Whether the single WebDAV listener bound at boot (the webdav
+    /// arm's mount target — the same `webdav_available` the boot's own
+    /// mount pass got).
+    webdav_available: bool,
+    dispatch: Option<VolumeTransportDispatch>,
+    tuning: RemoveTuning,
+}
+
+impl RuntimeVolumeControl {
+    /// One control line in, the verbatim reply out (K48's transport
+    /// contract: every command answers, errors are actionable text, the
+    /// connection never carries state across commands).
+    async fn handle(&self, line: &str) -> String {
+        let mut tokens = line.split_whitespace();
+        match (tokens.next(), tokens.next(), tokens.next()) {
+            (Some("LIST"), None, None) => self.list(),
+            (Some("ADD"), Some(name), None) => self.add_volume(name).await,
+            (Some("REMOVE"), Some(name), None) => self.remove_volume(name).await,
+            (Some(cmd @ ("ADD" | "REMOVE")), _, _) => format!(
+                "ERR: usage: {cmd} <name> — exactly one volume name (volume names match \
+                 ^[a-z][a-z0-9_-]{{0,31}}$)\n"
+            ),
+            _ => "ERR: usage: ADD <name> | REMOVE <name> | LIST\n".to_string(),
+        }
+    }
+
+    /// `LIST`: one line per registered volume —
+    /// `name status letter backend pending=N` (K49's runtime read; the
+    /// pending count is the §4 drain aid: the queue jobs REMOVE's drain
+    /// step would wait for). The letter/backend columns name the actual
+    /// mount; an unmounted volume carries `-` and its configured
+    /// backend. A failed entry has no queue — `pending=-`.
+    fn list(&self) -> String {
+        let volumes = self.registry.volumes();
+        let mut reply = format!("OK: {} volume(s)\n", volumes.len());
+        for runtime in volumes {
+            let name = runtime.name().to_owned();
+            let status = runtime.status();
+            let mount = self.live.mount_of(&name);
+            let letter = mount
+                .as_ref()
+                .map(|mount| mount.letter.clone())
+                .unwrap_or_else(|| "-".to_string());
+            let backend = match &mount {
+                Some(mount) => mount.backend.as_str().to_string(),
+                None => runtime.spec().settings.backend.as_str().to_string(),
+            };
+            let pending = match runtime.vfs() {
+                Some(vfs) => {
+                    let stats = vfs.queue_stats();
+                    format!(
+                        "pending={}",
+                        stats
+                            .enqueued
+                            .saturating_sub(stats.succeeded + stats.degraded)
+                    )
+                }
+                None => "pending=-".to_string(),
+            };
+            reply.push_str(&format!(
+                "{name} {} {letter} {backend} {pending}\n",
+                status.as_str()
+            ));
+        }
+        reply
+    }
+
+    /// `ADD <name>` (K48's runtime assembly): read `volumes/<name>.toml`
+    /// (K49: `enabled = false` refuses — the file is the persistent
+    /// source of truth), connect the transport through the injected
+    /// dispatch, assemble through the SAME single-volume assembly the
+    /// boot loop runs, register into all three faces at once, then mount
+    /// the volume's explicit drive-letter claim through the same K27/K40
+    /// pass boot uses. Every failure answers with its reason and leaves
+    /// the running set untouched (K22's runtime twin); a claim that
+    /// cannot be honored rolls the addition all the way back.
+    async fn add_volume(&self, name: &str) -> String {
+        // Path-safety precheck before the name becomes a file name: the
+        // full name rules live in `load_volume_config`.
+        if name.is_empty()
+            || name
+                .chars()
+                .any(|c| matches!(c, '/' | '\\' | '.' | ':') || c.is_whitespace())
+        {
+            return format!(
+                "ERR: `{name}` is not a volume name — ADD takes the file stem of a \
+                 volumes_dir entry (names match ^[a-z][a-z0-9_-]{{0,31}}$)\n"
+            );
+        }
+        if let Some(registered) = self.registry.volume(name) {
+            return format!(
+                "ERR: volume `{name}` is already registered (status: {}) — remove it \
+                 first (`REMOVE {name}`) if you want to re-assemble it\n",
+                registered.status().as_str()
+            );
+        }
+        let Some(dir) = self.process_cfg.volumes_dir.as_deref() else {
+            return "ERR: this instance runs single-volume mode (no volumes_dir) — \
+                    runtime ADD serves multi-volume instances\n"
+                .to_string();
+        };
+        let path = Path::new(dir).join(format!("{name}.toml"));
+        let spec = match cloudkit_core::config::load_volume_config(&path) {
+            Ok(spec) => spec,
+            Err(error) => {
+                return format!(
+                    "ERR: reading the volume file {} failed: {error} — fix the file \
+                     and retry\n",
+                    path.display()
+                );
+            }
+        };
+        if !spec.settings.enabled {
+            return format!(
+                "ERR: volume `{name}` is disabled (enabled = false in {}) — the volume \
+                 file is the persistent source of truth (K49); flip the key to true \
+                 and retry\n",
+                spec.file_path.display()
+            );
+        }
+        let Some(dispatch) = &self.dispatch else {
+            return "ERR: this instance booted without a runtime transport dispatch — \
+                    ADD cannot assemble new volumes here\n"
+                .to_string();
+        };
+        let (options, transport) = match dispatch(&spec).await {
+            Ok(Some(pair)) => pair,
+            Ok(None) => {
+                return format!(
+                    "ERR: connecting volume `{name}` was interrupted; nothing changed\n"
+                );
+            }
+            Err(error) => {
+                return format!(
+                    "ERR: connecting volume `{name}` failed: {error:#} — nothing was \
+                     changed; fix the volume file and retry\n"
+                );
+            }
+        };
+        let assembled =
+            match assemble_volume(&self.process_cfg, &spec, &options, transport, &self.watch).await
+            {
+                Ok(assembled) => assembled,
+                Err((_, error)) => {
+                    return format!(
+                        "ERR: assembling volume `{name}` failed: {error:#} — nothing was \
+                         changed; fix the volume file and retry\n"
+                    );
+                }
+            };
+
+        // The registration point: all three faces move together (the
+        // master table is the truth, these are its projections).
+        self.registry.insert(assembled.runtime);
+        self.webdav.insert(name, assembled.fs);
+        self.web.insert(cloudkit_web::VolumeUiEntry {
+            name: name.to_string(),
+            status: cloudkit_web::VolumeUiStatus::Running,
+            config: assembled.ui_config,
+            vfs: Some(Arc::clone(&assembled.vfs)),
+        });
+        self.live.insert(
+            name,
+            LiveVolume {
+                stop_unit: assembled.stop_unit,
+                sync_task: assembled.sync_task,
+                mount: None,
+                release: None,
+            },
+        );
+        println!("Volume {name} added at runtime (control ADD).");
+        tracing::info!(volume = name, "volume added at runtime (control ADD)");
+
+        // The mount pass (K27 + K40), the same gates and dispatch boot
+        // runs: only an explicit drive_letter claim mounts, and the
+        // backend decision (winfsp / webdav / visible fallback) is the
+        // process one.
+        if !spec.explicit_drive_letter {
+            return format!("OK: added volume `{name}` (running; no drive letter claimed)\n");
+        }
+        if !self.process_cfg.auto_mount_drive {
+            tracing::info!(
+                volume = name,
+                "drive_letter claimed but auto_mount_drive is off; the volume runs \
+                 without its drive (the same gate the boot mount pass applies)"
+            );
+            return format!("OK: added volume `{name}` (running; no drive letter claimed)\n");
+        }
+        let claims = vec![(name.to_string(), spec.settings.drive_letter.clone())];
+        let mut mounts = mount_volumes_if_configured(&MountPlan {
+            process_cfg: &self.process_cfg,
+            claims: &claims,
+            registry: &self.registry,
+            rt: &tokio::runtime::Handle::current(),
+            webdav_available: self.webdav_available,
+            winfsp: winfsp_capability(),
+        })
+        .await;
+        let mut handles = mounts.winfsp.drain();
+        match mounts.mounted.into_iter().next() {
+            Some(mount) => {
+                let release = mount_release(&mount, &mut handles);
+                let backend = mount.backend.label();
+                let short = mount.backend.as_str();
+                let letter = mount.letter.clone();
+                self.live.attach_mount(name, mount, release);
+                println!("Volume {name} mounted at {letter} ({backend}).");
+                tracing::info!(volume = name, letter = %letter, backend = %backend, "runtime ADD mounted the volume's drive");
+                format!("OK: added volume `{name}` (running; mounted {letter} via {short})\n")
+            }
+            None => {
+                // A claimed letter that cannot be honored fails the ADD
+                // (the ruling lists 盘符冲突 as an ADD failure): roll the
+                // addition all the way back — the volume is not
+                // registered half-claimed.
+                self.rollback_add(name).await;
+                format!(
+                    "ERR: volume `{name}` assembled but its drive mount failed — the \
+                     addition was rolled back; free the drive letter (see the hints \
+                     above) and retry\n"
+                )
+            }
+        }
+    }
+
+    /// Undoes a runtime ADD whose mount step failed: out of all three
+    /// faces, the sync task aborted, the stop segment released. The
+    /// volume never served a client request through the faces (same
+    /// task, serialized), so this is quiet teardown, not a drain.
+    async fn rollback_add(&self, name: &str) {
+        self.webdav.remove(name);
+        self.web.remove(name);
+        self.registry.remove(name);
+        if let Some(entry) = self.live.take(name) {
+            if let Some(task) = entry.sync_task {
+                task.abort();
+            }
+            entry.stop_unit.release().await;
+        }
+        println!("Volume {name} rolled back: the drive mount failed (see the hints above).");
+        tracing::warn!(
+            volume = name,
+            "runtime ADD rolled back: the drive mount failed"
+        );
+    }
+
+    /// `REMOVE <name>` — the K50 safe sequence: drain the upload queue
+    /// (bounded), release the drive mount (bounded by the backend's own
+    /// disappearance poll), then commit (faces first, then the volume's
+    /// workers). Any failed step aborts the removal with the volume
+    /// fully registered — never a half-removal (K50). Runtime-only
+    /// (K49): the volume file stays; a later boot brings the volume
+    /// back.
+    async fn remove_volume(&self, name: &str) -> String {
+        let Some(runtime) = self.registry.volume(name) else {
+            return format!(
+                "ERR: no volume registered under `{name}` — `LIST` shows the current set\n"
+            );
+        };
+        // A failed boot entry is runtime garbage: no queue, no mount —
+        // the faces just drop it.
+        let Some(vfs) = runtime.vfs().cloned() else {
+            self.web.remove(name);
+            self.registry.remove(name);
+            println!("Volume {name} removed at runtime (failed entry).");
+            tracing::info!(
+                volume = name,
+                "failed volume entry removed (control REMOVE)"
+            );
+            return format!("OK: removed volume `{name}`\n");
+        };
+        let Some(mut entry) = self.live.take(name) else {
+            // Structural impossibility (Running entries always carry
+            // live plumbing — both are written together); refuse rather
+            // than half-remove.
+            return format!("ERR: volume `{name}` has no live runtime state — nothing to remove\n");
+        };
+
+        // K50 step 1: drain — wait for the queue's in-flight jobs to
+        // reach a terminal state (cumulative counters: enqueued minus
+        // its terminal states), bounded by the drain budget.
+        let deadline = Instant::now() + self.tuning.drain_timeout;
+        loop {
+            let stats = vfs.queue_stats();
+            let outstanding = stats
+                .enqueued
+                .saturating_sub(stats.succeeded + stats.degraded);
+            if outstanding == 0 {
+                break;
+            }
+            if Instant::now() >= deadline {
+                // Abort: put the entry back — the volume keeps running
+                // exactly as it was (the queue workers were never
+                // touched).
+                self.live.insert(name, entry);
+                return format!(
+                    "ERR: volume `{name}` still has {outstanding} upload(s) in flight \
+                     (pending={outstanding}) — the removal was aborted and the volume \
+                     stays registered; retry once the queue drains (`LIST` shows the \
+                     count)\n"
+                );
+            }
+            tokio::time::sleep(self.tuning.poll_interval).await;
+        }
+
+        // K50 step 2: release the drive mount (the winfsp unmount's own
+        // disappearance poll / the net-use delete). A failure aborts;
+        // the release object goes back with the entry — a spent winfsp
+        // handle is a no-op on retry, a failed net-use can be retried.
+        if let Some(step) = entry.release.as_mut() {
+            if let Err(error) = step.release().await {
+                self.live.insert(name, entry);
+                return format!(
+                    "ERR: unmounting volume `{name}` failed: {error} — the removal was \
+                     aborted and the volume stays registered and mounted; close whatever \
+                     holds the drive and retry\n"
+                );
+            }
+        }
+
+        // K50 step 3: commit — the faces first (no new request routes to
+        // the volume; an in-flight request drains on its cloned
+        // handler), then the volume's own workers (the same per-volume
+        // stop segment the shutdown runs).
+        self.webdav.remove(name);
+        self.web.remove(name);
+        self.registry.remove(name);
+        if let Some(task) = entry.sync_task {
+            task.abort();
+        }
+        entry.stop_unit.release().await;
+        println!("Volume {name} removed at runtime (control REMOVE).");
+        tracing::info!(volume = name, "volume removed at runtime (control REMOVE)");
+        format!("OK: removed volume `{name}`\n")
+    }
+}
+
+/// Pairs a completed mount with its backend release step (shared by the
+/// boot pass and runtime ADD): a winfsp mount carries its handle, every
+/// net-use-carried letter (webdav or a winfsp fallback) carries the
+/// mapping delete. The handle type exists only with the feature; the
+/// twin build's pairs are empty placeholders.
+#[cfg(all(windows, feature = "winfsp"))]
+fn mount_release(
+    mount: &MountedVolume,
+    handles: &mut Vec<(String, cloudkit_winfsp::mount::MountHandle)>,
+) -> Option<Box<dyn DriveRelease>> {
+    if let Some(position) = handles.iter().position(|(name, _)| name == &mount.volume) {
+        let (_, handle) = handles.remove(position);
+        return Some(Box::new(WinFspRelease {
+            handle: Some(handle),
+        }));
+    }
+    match mount.backend {
+        MountedBackend::WinFsp => {
+            // Structural: a winfsp-carried mount without a parked handle
+            // cannot occur (both are produced by the same pass). Refuse
+            // loudly rather than leaving it unreleasable.
+            tracing::error!(
+                volume = mount.volume,
+                "a winfsp mount has no parked handle; it cannot be released"
+            );
+            None
+        }
+        MountedBackend::WebDav | MountedBackend::WebDavFallback { .. } => {
+            Some(Box::new(WebDavRelease {
+                letter: mount.letter.clone(),
+            }))
+        }
+    }
+}
+
+/// [`mount_release`] for every build that cannot mount through WinFsp:
+/// no winfsp handle can exist, so every mount is a mapping delete.
+#[cfg(not(all(windows, feature = "winfsp")))]
+fn mount_release(
+    mount: &MountedVolume,
+    handles: &mut Vec<(String, ())>,
+) -> Option<Box<dyn DriveRelease>> {
+    let _ = handles;
+    Some(Box::new(WebDavRelease {
+        letter: mount.letter.clone(),
+    }))
 }
 
 /// A one-shot CLI stack (the `push` / `pull` data channel, contract
@@ -3091,17 +3870,20 @@ pub struct MountedVolume {
     pub backend: MountedBackend,
 }
 
-/// The live in-process WinFsp mounts a boot must release, as this build
-/// can hold them.
+/// The live in-process WinFsp mounts a mount pass produced, as this
+/// build can hold them: `(volume name, handle)` pairs so each handle
+/// lands in its own volume's live entry (RV2 — the stop sequence
+/// releases through the per-volume [`DriveRelease`]s, runtime REMOVE
+/// through the same).
 ///
 /// With the feature it wraps
 /// [`cloudkit_winfsp::mount::MountHandle`]s; without it the set is
 /// necessarily empty (the arm degrades to WebDAV before a handle could
 /// exist) — the type itself stays the same so the boot and stop code paths
-/// are written once, and [`WinFspHandles::release`] carries the cfg.
+/// are written once.
 #[cfg(all(windows, feature = "winfsp"))]
 #[derive(Default)]
-pub struct WinFspHandles(Vec<cloudkit_winfsp::mount::MountHandle>);
+pub struct WinFspHandles(Vec<(String, cloudkit_winfsp::mount::MountHandle)>);
 
 /// The no-feature twin: nothing to hold, ever (see the feature'd type).
 #[cfg(not(all(windows, feature = "winfsp")))]
@@ -3110,9 +3892,10 @@ pub struct WinFspHandles;
 
 #[cfg(all(windows, feature = "winfsp"))]
 impl WinFspHandles {
-    /// Parks one live mount for the stop sequence.
-    fn push(&mut self, handle: cloudkit_winfsp::mount::MountHandle) {
-        self.0.push(handle);
+    /// Parks one live mount (with its volume's name) for the per-volume
+    /// live entries.
+    fn push(&mut self, volume: String, handle: cloudkit_winfsp::mount::MountHandle) {
+        self.0.push((volume, handle));
     }
 
     /// `true` when no mount was parked.
@@ -3120,34 +3903,11 @@ impl WinFspHandles {
         self.0.is_empty()
     }
 
-    /// Releases every in-process mount: unmount + dispatcher stop + the
-    /// drive letter's disappearance poll, each on the blocking pool (these
-    /// are synchronous WinFsp calls — see `cloudkit_winfsp::mount`'s
-    /// threading notes). Failures warn; the shutdown always continues.
-    pub async fn release(self) {
-        for handle in self.0 {
-            let letter = handle.mount_point().to_string();
-            let outcome = tokio::task::spawn_blocking(move || {
-                let mut handle = handle;
-                handle.unmount().map_err(|error| error.to_string())
-            })
-            .await;
-            match outcome {
-                Ok(Ok(())) => {
-                    tracing::info!(letter = %letter, "released the in-process winfsp mount")
-                }
-                Ok(Err(error)) => tracing::warn!(
-                    letter = %letter,
-                    %error,
-                    "releasing the winfsp mount reported a problem; continuing the shutdown"
-                ),
-                Err(error) => tracing::warn!(
-                    letter = %letter,
-                    %error,
-                    "joining the winfsp unmount task failed; continuing the shutdown"
-                ),
-            }
-        }
+    /// Hands every parked mount out (name + handle), emptying the set —
+    /// the mount pass's caller parks each handle into its volume's live
+    /// entry (RV2's per-volume release plumbing).
+    pub fn drain(&mut self) -> Vec<(String, cloudkit_winfsp::mount::MountHandle)> {
+        std::mem::take(&mut self.0)
     }
 }
 
@@ -3158,10 +3918,10 @@ impl WinFspHandles {
         true
     }
 
-    /// Nothing to release: this build cannot mount through WinFsp (the
+    /// Nothing to hand out: this build cannot mount through WinFsp (the
     /// arm degrades to WebDAV), so the set is empty by construction.
-    pub async fn release(self) {
-        let Self = self;
+    pub fn drain(&mut self) -> Vec<(String, ())> {
+        Vec::new()
     }
 }
 
@@ -3380,7 +4140,7 @@ async fn mount_claims_via_winfsp(plan: &MountPlan<'_>) -> VolumeMounts {
                     );
                 }
                 println!("Volume {name} mounted in-process at {letter} (winfsp).");
-                handles.push(landed.handle);
+                handles.push(name.clone(), landed.handle);
                 mounted.push(MountedVolume {
                     volume: name.clone(),
                     letter,

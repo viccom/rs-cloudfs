@@ -261,6 +261,31 @@ async fn status_cmd() -> Result<()> {
             println!();
             let rows = cloudkit_cli::volumes::collect_volume_stats(&volumes)?;
             println!("{}", cloudkit_cli::volumes::render_volume_stats(&rows));
+            // RV2 (K48): the live instance's runtime volume table,
+            // forwarded as a LIST over the control channel. An instance
+            // that is not running keeps the config-only face above — the
+            // existing fallback behavior is untouched (no control file =
+            // nothing live to ask).
+            if report.instance.is_some() {
+                if let Ok(addr) = cloudkit_cli::control::read_control_addr(&process) {
+                    match cloudkit_cli::control::send_command(addr, "LIST").await {
+                        Ok(reply) => {
+                            if let Some(section) =
+                                cloudkit_cli::volumes::format_runtime_volumes_section(&reply)
+                            {
+                                println!();
+                                print!("{section}");
+                            }
+                        }
+                        Err(error) => {
+                            println!();
+                            println!(
+                                "runtime volumes: the control channel did not answer ({error})"
+                            );
+                        }
+                    }
+                }
+            }
         }
     }
     Ok(())
@@ -942,34 +967,32 @@ async fn run_multi_volume(
                     name = spec.name,
                     backend = backend.as_str()
                 );
-                // With the driver: K13/K21 — token rotations write back
-                // into the volume's own file; upload sessions live in
-                // the volume home. Without it: the reduced twin (K31 —
-                // a baidu volume refuses with the rebuild message; a
-                // local volume assembles unchanged).
-                #[cfg(feature = "baidu")]
-                let dispatched = {
-                    let token_store = ConfigTokenStore::new(spec.file_path.clone());
-                    cloudkit_cli::build_backend_transport_with(
-                        &settings,
-                        &BaiduEndpoints::default(),
-                        Some(Arc::new(token_store)),
-                        &home,
-                    )
-                    .await?
-                };
-                #[cfg(not(feature = "baidu"))]
-                let dispatched = cloudkit_cli::build_backend_transport_with(&settings).await?;
-                run_options.sync_namespace = Some(dispatched.sync_namespace_key());
-                run_options.web_volume = Some(dispatched.volume().to_string());
-                run_options.web_quota = dispatched.web_quota_snapshot().await;
-                dispatched.clone_dyn()
+                // RV2 extraction: the arm below is shared verbatim with
+                // the runtime ADD's dispatch (`dispatch_runtime_volume`)
+                // so the two dispatch sites cannot drift.
+                dispatch_unified_backend_volume(&spec, &settings, &home, &mut run_options).await?
             }
         };
         injections.push((spec, run_options, transport));
     }
 
-    let handle = cloudkit_cli::run_multi_with_transports(&process, injections).await?;
+    // RV2 (K48): the runtime-volume command surface — the runtime ADD
+    // assembles volumes through the same prelude and unified-backend arm
+    // this boot just ran; its telegram arm is the runtime twin of
+    // `connect_telegram_volume` (an answerable Err instead of the boot's
+    // process exit — a control command must never kill the instance).
+    let dispatch: cloudkit_cli::VolumeTransportDispatch = Arc::new(|spec: &VolumeConfig| {
+        Box::pin(async move { dispatch_runtime_volume(spec).await })
+    });
+    let handle = cloudkit_cli::run_multi_with_transports_and_commands(
+        &process,
+        injections,
+        cloudkit_cli::RuntimeVolumeCommands {
+            dispatch: Some(dispatch),
+            ..cloudkit_cli::RuntimeVolumeCommands::default()
+        },
+    )
+    .await?;
     // K29 process-level banner: the volume list with per-volume status;
     // each volume's capability line rides in the boot log (same R-5
     // declaration as the single-volume banner). MV2 adds the single
@@ -1138,5 +1161,122 @@ async fn connect_telegram_volume(
     state_base: &std::path::Path,
 ) -> Result<Option<Arc<dyn cloudkit_core::transport::CloudTransport>>> {
     let _ = (cfg, state_base);
+    anyhow::bail!("{}", cloudkit_cli::TELEGRAM_DRIVER_REQUIRED)
+}
+
+// ------------------------------------------------ RV2: runtime ADD dispatch ---
+
+/// The runtime ADD's transport dispatch (RV2 / K48): the same prelude
+/// (K21 resolution + validate) and the same unified-backend arm the boot
+/// loop runs; the telegram arm is the runtime twin of
+/// [`connect_telegram_volume`] — the same deadline-bounded connect with
+/// the failure hint, but an ANSWERABLE Err instead of the boot's
+/// `process::exit(1)`, and no Ctrl+C race (a control command must never
+/// kill the instance; the run flow's own Ctrl+C handling still owns
+/// shutdown). `Ok(None)` cannot occur on this path (nothing interrupts
+/// the connect but its own deadline).
+async fn dispatch_runtime_volume(
+    spec: &VolumeConfig,
+) -> Result<
+    Option<(
+        cloudkit_cli::RunOptions,
+        Arc<dyn cloudkit_core::transport::CloudTransport>,
+    )>,
+> {
+    let home = cloudkit_cli::volume_home(spec)?;
+    let settings = cloudkit_cli::resolve_volume_settings(spec)?;
+    settings
+        .validate()
+        .with_context(|| format!("invalid configuration for volume `{}`", spec.name))?;
+    let mut run_options = cloudkit_cli::RunOptions::default();
+    let transport: Arc<dyn cloudkit_core::transport::CloudTransport> = match settings.backend {
+        Backend::Telegram => {
+            if !settings.is_configured() {
+                anyhow::bail!(
+                    "volume `{}` is not configured: set bot_token (a \"<id>:<secret>\" \
+                     BotFather token) and chat_id in the volume file {}",
+                    spec.name,
+                    spec.file_path.display()
+                );
+            }
+            println!("Connecting volume {} to Telegram ...", spec.name);
+            connect_telegram_volume_for_add(&settings, &home).await?
+        }
+        _ => {
+            println!(
+                "Connecting volume {name} to the {backend} backend ...",
+                name = spec.name,
+                backend = settings.backend.as_str()
+            );
+            dispatch_unified_backend_volume(spec, &settings, &home, &mut run_options).await?
+        }
+    };
+    Ok(Some((run_options, transport)))
+}
+
+/// The unified baidu/local transport dispatch (RV2 extraction of the
+/// multi-volume boot loop's catch-all arm, shared verbatim by the boot
+/// loop and [`dispatch_runtime_volume`]): K13/K21 — token rotations
+/// write back into the volume's own file, upload sessions live in the
+/// volume home. Without the baidu driver: the reduced twin (K31 — a
+/// baidu volume refuses with the rebuild message; a local volume
+/// assembles unchanged). The dispatched RunOptions fields (sync
+/// namespace, dashboard identity, quota snapshot) land in `run_options`.
+async fn dispatch_unified_backend_volume(
+    spec: &VolumeConfig,
+    settings: &CyDriveConfig,
+    home: &std::path::Path,
+    run_options: &mut cloudkit_cli::RunOptions,
+) -> Result<Arc<dyn cloudkit_core::transport::CloudTransport>> {
+    // With the driver: K13/K21 — token rotations write back into the
+    // volume's own file; upload sessions live in the volume home.
+    // Without it: the reduced twin (K31 — a baidu volume refuses with
+    // the rebuild message; a local volume assembles unchanged).
+    #[cfg(feature = "baidu")]
+    let dispatched = {
+        let token_store = ConfigTokenStore::new(spec.file_path.clone());
+        cloudkit_cli::build_backend_transport_with(
+            settings,
+            &BaiduEndpoints::default(),
+            Some(Arc::new(token_store)),
+            home,
+        )
+        .await?
+    };
+    #[cfg(not(feature = "baidu"))]
+    let dispatched = cloudkit_cli::build_backend_transport_with(settings).await?;
+    run_options.sync_namespace = Some(dispatched.sync_namespace_key());
+    run_options.web_volume = Some(dispatched.volume().to_string());
+    run_options.web_quota = dispatched.web_quota_snapshot().await;
+    Ok(dispatched.clone_dyn())
+}
+
+/// The runtime twin of [`connect_telegram_volume`]'s connect core (RV2):
+/// deadline-bounded connect, the failure hint on error — but the error
+/// RETURNS (the control command answers `ERR`) instead of exiting the
+/// process, and no Ctrl+C arm (the run flow owns shutdown signals).
+#[cfg(feature = "telegram")]
+async fn connect_telegram_volume_for_add(
+    settings: &CyDriveConfig,
+    home: &std::path::Path,
+) -> Result<Arc<dyn cloudkit_core::transport::CloudTransport>> {
+    let transport_config = cloudkit_cli::transport_config_from(settings, home);
+    let transport = cloudkit_cli::connect_with_deadline(
+        GrammersTransport::connect(transport_config),
+        cloudkit_cli::CONNECT_DEADLINE,
+    )
+    .await
+    .context("connecting the Telegram transport")
+    .context(cloudkit_cli::connect_failure_hint())?;
+    Ok(Arc::new(transport))
+}
+
+/// The no-driver twin (K31 shape): identical signature, the actionable
+/// rebuild message.
+#[cfg(not(feature = "telegram"))]
+async fn connect_telegram_volume_for_add(
+    _settings: &CyDriveConfig,
+    _home: &std::path::Path,
+) -> Result<Arc<dyn cloudkit_core::transport::CloudTransport>> {
     anyhow::bail!("{}", cloudkit_cli::TELEGRAM_DRIVER_REQUIRED)
 }

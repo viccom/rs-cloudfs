@@ -1,23 +1,44 @@
 //! The loopback control channel behind `cydrive stop` and `cydrive
-//! status` (service-lifecycle plan contracts C1/C2; status plan C1).
+//! status` (service-lifecycle plan contracts C1/C2; status plan C1;
+//! runtime-volumes plan K48).
 //!
 //! Every running instance binds a loopback-only listener on an ephemeral
 //! port and drops a one-line port file (`127.0.0.1:<port>`) next to its
-//! metadata db; the line protocol has exactly two commands — `STOP`
-//! answers `OK: shutting down` and fires the shutdown callback, `PING`
-//! answers `OK: cydrive <version>` and disturbs nothing (the payload
-//! `cydrive status` shows on its instance row), anything else answers
-//! `ERR: unknown command`.
+//! metadata db. The line protocol, one command per connection, the reply
+//! read to EOF:
+//!
+//! - `STOP` answers `OK: shutting down`, closes, and fires the shutdown
+//!   callback (the reply lands before the close, so the stopper's
+//!   read-to-EOF sees it the moment the shutdown starts);
+//! - `PING` answers `OK: cydrive <version>` and disturbs nothing (the
+//!   payload `cydrive status` shows on its instance row);
+//! - `ADD <name>` / `REMOVE <name>` / `LIST` (runtime-volumes K48) are
+//!   forwarded to the installed [`VolumeCommandHandler`]; its reply is
+//!   passed through verbatim — `OK: ...` or a multi-line `OK:`/`ERR:`
+//!   block whose text is the handler's actionable message. The replies
+//!   are documented where the handler lives ([`crate`]'s multi-volume
+//!   boot); the transport layer adds nothing to them;
+//! - anything else answers `ERR: unknown command`. An instance without a
+//!   handler answers the volume commands with the actionable
+//!   "not available" ERR instead of routing them.
 //!
 //! Security model (plan C1): the listener binds 127.0.0.1 only and
 //! carries no authentication — an attacker who can already talk to the
 //! machine's loopback can equally `taskkill` the process, so the channel
 //! opens no new attack surface. The port file is a runtime artifact;
 //! the run shutdown removes it (Task 2 wiring).
+//!
+//! Concurrency (runtime-volumes §4): volume commands are serialized —
+//! the accept loop awaits the handler for at most one command at a time,
+//! so ADD and REMOVE can never interleave (a later command, STOP
+//! included, queues behind the one in flight).
 
+use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::pin::Pin;
+use std::sync::Arc;
 use std::time::Duration;
 
 use anyhow::{bail, Context as _, Result};
@@ -46,8 +67,39 @@ pub fn control_file_path(cfg: &CyDriveConfig) -> PathBuf {
     parent.join(CONTROL_FILE_NAME)
 }
 
+/// The volume-command handler the multi-volume boot installs (K48): the
+/// raw command line (trimmed, e.g. `ADD b` / `REMOVE b` / `LIST`) in,
+/// the verbatim reply text out — `OK: ...` or `ERR: ...`, multi-line
+/// allowed, `\n`-terminated lines. At most one invocation runs at a time
+/// (the accept loop serializes), so the handler needs no internal
+/// locking of its own for command-vs-command races.
+pub type VolumeCommandHandler = Arc<
+    dyn for<'a> Fn(&'a str) -> Pin<Box<dyn Future<Output = String> + Send + 'a>>
+        + Send
+        + Sync
+        + 'static,
+>;
+
+/// The reply an instance without a handler gives its volume commands:
+/// actionable about who does serve them (a multi-volume `run`).
+const VOLUME_COMMANDS_UNAVAILABLE: &str =
+    "ERR: volume commands are not available on this instance\n";
+
+/// The first token of a control line (uppercased for the keyword match).
+fn first_token(line: &str) -> &str {
+    line.split_whitespace().next().unwrap_or("")
+}
+
+/// `true` for the lines the volume-command surface owns (K48): the
+/// three keywords, with or without their argument — the handler answers
+/// malformed shapes with its own usage ERR.
+fn is_volume_command(line: &str) -> bool {
+    matches!(first_token(line), "ADD" | "REMOVE" | "LIST")
+}
+
 /// A running instance's loopback control listener (contract C1): the
-/// one-command line protocol whose `STOP` fires the shutdown callback.
+/// line protocol whose `STOP` fires the shutdown callback and whose
+/// volume commands reach the installed [`VolumeCommandHandler`].
 pub struct ControlServer {
     listener: TcpListener,
     addr: SocketAddr,
@@ -83,8 +135,10 @@ impl ControlServer {
     /// The accept loop (one spawned task per connection): a line reading
     /// `STOP` (trimmed) is answered `OK: shutting down`, the connection
     /// is closed, and `shutdown` fires; a line reading `PING` is answered
-    /// with [`ping_reply`]'s version line and fires nothing; any other
-    /// line answers `ERR: unknown command`. The loop keeps serving after
+    /// with [`ping_reply`]'s version line and fires nothing; a volume
+    /// command (`ADD`/`REMOVE`/`LIST`, K48) is forwarded to the
+    /// installed handler and its reply written verbatim; any other line
+    /// answers `ERR: unknown command`. The loop keeps serving after
     /// a STOP, so later `STOP`s fire the callback again — **the callback
     /// must be idempotent** (the run wiring passes the unified shutdown
     /// trigger, which is). Per-connection I/O errors only end that
@@ -93,17 +147,39 @@ impl ControlServer {
     ///
     /// The callback itself runs on this loop's task — the connection
     /// tasks only request it over an internal channel — so a plain
-    /// `Send` closure with no `Sync` is enough.
+    /// `Send` closure with no `Sync` is enough. The volume commands run
+    /// on the same task, one at a time: the serialization that keeps
+    /// ADD and REMOVE from interleaving (runtime-volumes §4).
     pub async fn run(self, shutdown: impl Fn() + Send + 'static) -> io::Result<()> {
+        self.run_with_commands(shutdown, None).await
+    }
+
+    /// [`ControlServer::run`] with the volume-command surface installed
+    /// (K48): `ADD`/`REMOVE`/`LIST` lines route to `handler`, whose
+    /// reply is written to the connection verbatim; without a handler
+    /// those lines get the actionable "not available" ERR. The STOP and
+    /// PING branches are untouched by the handler's presence.
+    pub async fn run_with_commands(
+        self,
+        shutdown: impl Fn() + Send + 'static,
+        commands: Option<VolumeCommandHandler>,
+    ) -> io::Result<()> {
         let listener = self.listener;
         // One buffered request per STOP: every STOP line fires the
         // callback exactly once, serialized on this task.
         let (stop_tx, mut stop_rx) = tokio::sync::mpsc::unbounded_channel::<()>();
+        // Volume commands queue here and run one at a time on the loop
+        // task; the reply travels back to the connection task on a
+        // one-shot.
+        let (command_tx, mut command_rx) =
+            tokio::sync::mpsc::unbounded_channel::<(String, tokio::sync::oneshot::Sender<String>)>(
+            );
         loop {
             tokio::select! {
                 accepted = listener.accept() => {
                     let (mut stream, peer) = accepted?;
                     let stop_tx = stop_tx.clone();
+                    let command_tx = command_tx.clone();
                     tokio::spawn(async move {
                         // read_until also returns the partial bytes at
                         // EOF, so a client that closes without a newline
@@ -141,6 +217,31 @@ impl ControlServer {
                             if let Err(error) = stream.write_all(ping_reply().as_bytes()).await {
                                 tracing::warn!(%peer, %error, "control connection: write failed");
                             }
+                        } else if is_volume_command(&line) {
+                            // K48: the handler lives on the accept loop
+                            // (one command at a time); the connection
+                            // task waits for the reply one-shot and
+                            // writes it verbatim. A dropped one-shot
+                            // means the accept loop died mid-command —
+                            // there is nobody left to answer.
+                            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel();
+                            if command_tx.send((line, reply_tx)).is_err() {
+                                tracing::warn!(%peer, "control connection: the command loop is gone");
+                                return;
+                            }
+                            match reply_rx.await {
+                                Ok(reply) => {
+                                    if let Err(error) = stream.write_all(reply.as_bytes()).await {
+                                        tracing::warn!(%peer, %error, "control connection: write failed");
+                                    }
+                                }
+                                Err(_) => {
+                                    tracing::warn!(
+                                        %peer,
+                                        "control connection: the command handler dropped the reply"
+                                    );
+                                }
+                            }
                         } else if let Err(error) = stream.write_all(b"ERR: unknown command\n").await {
                             tracing::warn!(%peer, %error, "control connection: write failed");
                         }
@@ -149,6 +250,18 @@ impl ControlServer {
                 stop = stop_rx.recv() => {
                     if stop.is_some() {
                         shutdown();
+                    }
+                }
+                command = command_rx.recv() => {
+                    if let Some((line, reply_tx)) = command {
+                        // The serialized command execution: at most one
+                        // handler invocation is awaited here at a time
+                        // (runtime-volumes §4's concurrency ruling).
+                        let reply = match &commands {
+                            Some(handler) => handler(&line).await,
+                            None => VOLUME_COMMANDS_UNAVAILABLE.to_string(),
+                        };
+                        let _ = reply_tx.send(reply);
                     }
                 }
             }
@@ -197,6 +310,18 @@ pub async fn send_stop(addr: SocketAddr) -> io::Result<String> {
 /// the caller's "stale control file" signal.
 pub async fn send_ping(addr: SocketAddr) -> io::Result<String> {
     exchange_line(addr, b"PING\n").await
+}
+
+/// The volume-command client half (runtime-volumes K48): send one
+/// command line (`LIST`, `ADD <name>`, `REMOVE <name>`) and return the
+/// running instance's verbatim reply — `OK: ...` or an actionable
+/// `ERR: ...`, multi-line. Same skeleton and error semantics as
+/// [`send_stop`] — a refused/timeout address is the caller's "stale
+/// control file" signal. `cydrive status`'s runtime volume section
+/// forwards `LIST` through this.
+pub async fn send_command(addr: SocketAddr, command: &str) -> io::Result<String> {
+    let line = format!("{command}\n");
+    exchange_line(addr, line.as_bytes()).await
 }
 
 /// The double-start guard (Phase 2.5, run-flow front door): a boot over

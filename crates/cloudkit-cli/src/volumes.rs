@@ -134,6 +134,24 @@ pub fn volumes_report(discovered: &DiscoveredConfig) -> Result<String> {
 
 // ---------------------------------------------------- status volume stats ---
 
+/// Renders the RV2 runtime-volume section `cydrive status` shows when a
+/// live instance answers its `LIST` (K48): the control channel's reply
+/// (`OK: N volume(s)` + one row per volume) becomes a small section.
+/// `None` for an `ERR` reply — the caller words that case itself.
+pub fn format_runtime_volumes_section(reply: &str) -> Option<String> {
+    let mut lines = reply.lines();
+    let header = lines.next()?;
+    if !header.starts_with("OK:") {
+        return None;
+    }
+    let mut section = String::from("runtime volumes (live, via the control channel):\n");
+    for line in lines {
+        section.push_str(line.trim_end());
+        section.push('\n');
+    }
+    Some(section)
+}
+
 /// One volume's db read outcome for the multi-volume `status` report.
 #[derive(Debug, Clone)]
 pub enum VolumeDbOutcome {

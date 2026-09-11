@@ -1,0 +1,838 @@
+//! RED-phase tests for Phase 3.6 / RV2: runtime volume ADD/REMOVE/LIST
+//! over the control channel (plan `docs/plans/2026-09-10-runtime-volumes.md`
+//! §3-RV2; rulings K48/K49/K50).
+//!
+//! Contract under test: a running multi-volume instance answers
+//! `ADD <name>` / `REMOVE <name>` / `LIST` on the loopback control
+//! channel; ADD assembles one volume at runtime through the SAME
+//! per-volume assembly the boot loop uses and registers it into all
+//! three faces (master registry, WebDAV dispatch, dashboard); REMOVE
+//! runs the K50 safe sequence (drain → unmount → unregister) and any
+//! failed step aborts the removal with the volume fully intact; LIST
+//! reports name × status × letter × backend × pending per volume.
+
+use std::fs;
+use std::future::Future;
+use std::net::SocketAddr;
+use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::{Arc, Mutex, MutexGuard};
+use std::time::Duration;
+
+use cloudkit_cli::control::read_control_addr;
+use cloudkit_cli::{
+    run_multi_with_transports, run_multi_with_transports_and_commands, DriveRelease,
+    MultiVolumeHandle, RemoveTuning, RunOptions, RuntimeVolumeCommands, VolumeStatus,
+    VolumeTransportDispatch,
+};
+use cloudkit_core::config::{CyDriveConfig, VolumeConfig};
+use cloudkit_core::database::MetaDatabase;
+use cloudkit_core::rel_path::RelPath;
+use cloudkit_core::transport::mock::{MockTransport, UploadAction};
+use cloudkit_core::transport::CloudTransport;
+use cloudkit_storage::StorageError;
+use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
+use tokio::net::TcpStream;
+use tokio::time::timeout;
+
+// ------------------------------------------------------------- helpers ---
+
+/// Serialises every test that changes the process-wide working directory
+/// (the `multivolume_e2e.rs` convention — tests in one binary share one
+/// process; `set_current_dir` races).
+static CWD_MUTEX: Mutex<()> = Mutex::new(());
+
+/// Holds [`CWD_MUTEX`] and restores the previous working directory on
+/// drop — including on panic.
+struct CwdGuard {
+    _lock: MutexGuard<'static, ()>,
+    prev: PathBuf,
+}
+
+impl Drop for CwdGuard {
+    fn drop(&mut self) {
+        std::env::set_current_dir(&self.prev).expect("restore previous cwd");
+    }
+}
+
+/// Locks [`CWD_MUTEX`] and moves the process cwd into `dir` for the
+/// duration of the guard. Declare the guard *after* the owning `TempDir`
+/// so the cwd is restored before the directory is deleted.
+fn chdir(dir: &Path) -> CwdGuard {
+    let lock = CWD_MUTEX
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner());
+    let prev = std::env::current_dir().expect("current dir");
+    std::env::set_current_dir(dir).expect("chdir into temp dir");
+    CwdGuard { _lock: lock, prev }
+}
+
+/// Writes `text` to `path`, creating missing parent directories.
+fn write_file(path: &Path, text: &str) {
+    if let Some(parent) = path.parent() {
+        fs::create_dir_all(parent).expect("create parent dir");
+    }
+    fs::write(path, text).expect("write file");
+}
+
+/// The process-level config for multi-volume mode (the `multivolume_e2e`
+/// shape): `volumes_dir` set, ephemeral ports, no auto-mount (the offline
+/// gate never maps a real network drive), dashboard off.
+fn process_config() -> CyDriveConfig {
+    CyDriveConfig {
+        volumes_dir: Some("volumes".to_string()),
+        webdav_port: 0,
+        enable_web_ui: false,
+        web_ui_port: 0,
+        auto_mount_drive: false,
+        ..CyDriveConfig::default()
+    }
+}
+
+/// A minimal legal telegram-flavoured volume file body (the injected
+/// mock replaces the real connect; the keys keep the file a legal
+/// volume shape).
+fn volume_toml(token: &str, chat_id: i64) -> String {
+    format!("backend = \"telegram\"\nbot_token = \"{token}\"\nchat_id = {chat_id}\n")
+}
+
+/// A pre-connected mock transport (the seam the production dispatch
+/// substitutes real transports for).
+async fn mock_transport() -> Arc<MockTransport> {
+    let mock = Arc::new(MockTransport::new());
+    mock.connect().await.expect("pre-connect mock transport");
+    mock
+}
+
+/// The RV2 dispatch seam under test: the runtime ADD reads the volume
+/// file, then builds the transport through this closure (the production
+/// `run` passes its real dispatch; tests inject mocks).
+fn mock_dispatch() -> VolumeTransportDispatch {
+    Arc::new(move |_spec: &VolumeConfig| Box::pin(async { mock_dispatch_result().await }))
+}
+
+/// One dispatched mock (the closure body, spelled out so failure-closing
+/// dispatches can reuse the shape).
+async fn mock_dispatch_result() -> anyhow::Result<Option<(RunOptions, Arc<dyn CloudTransport>)>> {
+    let mock = Arc::new(MockTransport::new());
+    mock.connect().await.expect("pre-connect mock transport");
+    Ok(Some((
+        RunOptions::default(),
+        mock as Arc<dyn CloudTransport>,
+    )))
+}
+
+/// The full-cycle boot: the RV2-extended entry with the mock dispatch.
+async fn boot_with_commands(
+    cfg: CyDriveConfig,
+    specs: Vec<VolumeConfig>,
+    mocks: Vec<Arc<MockTransport>>,
+    commands: RuntimeVolumeCommands,
+) -> MultiVolumeHandle {
+    assert_eq!(specs.len(), mocks.len(), "one transport per volume");
+    let injections = specs
+        .into_iter()
+        .zip(mocks)
+        .map(|(spec, mock)| (spec, RunOptions::default(), mock as Arc<dyn CloudTransport>))
+        .collect();
+    run_multi_with_transports_and_commands(&cfg, injections, commands)
+        .await
+        .expect("multi-volume boot with runtime commands")
+}
+
+/// Sends one control-channel line and returns the reply (read to EOF).
+async fn send_cmd(addr: SocketAddr, line: &str) -> String {
+    let mut stream = TcpStream::connect(addr).await.expect("connect to control");
+    stream
+        .write_all(format!("{line}\n").as_bytes())
+        .await
+        .expect("send control line");
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .await
+        .expect("read control reply");
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
+/// The running instance's control address (the port file in the cwd —
+/// the process config's default db_path anchors it there).
+fn control_addr() -> SocketAddr {
+    read_control_addr(&process_config()).expect("the control file parses into an address")
+}
+
+/// The LIST reply's data rows (everything after the `OK: N volume(s)`
+/// header), one per volume.
+fn list_rows(reply: &str) -> Vec<String> {
+    reply
+        .lines()
+        .skip(1)
+        .map(|line| line.trim().to_owned())
+        .collect()
+}
+
+/// One raw HTTP/1.1 request (`Connection: close`), response read to EOF.
+async fn send_http(addr: SocketAddr, request: &str) -> String {
+    let mut stream = TcpStream::connect(addr).await.expect("connect to server");
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("send request");
+    let mut raw = Vec::new();
+    stream
+        .read_to_end(&mut raw)
+        .await
+        .expect("read response to EOF");
+    String::from_utf8_lossy(&raw).into_owned()
+}
+
+/// Builds an HTTP/1.1 request with Host and `Connection: close`.
+fn http_request(method: &str, target: &str, addr: SocketAddr) -> String {
+    format!(
+        "{method} {target} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\
+         Content-Length: 0\r\n\r\n",
+        addr.port()
+    )
+}
+
+/// Parses the numeric status code off the status line.
+fn status_of(resp: &str) -> u16 {
+    let line = resp.lines().next().expect("status line");
+    line.split_whitespace()
+        .nth(1)
+        .expect("status code token")
+        .parse()
+        .expect("numeric status code")
+}
+
+// ------------------------------------------------- 1. ADD / REMOVE / LIST full cycle ---
+
+/// The whole runtime cycle over the control channel (mock transports):
+/// ADD assembles `b` through the runtime dispatch and registers it into
+/// the master registry AND the WebDAV face (`/vol/b` answers) at once;
+/// REMOVE unregisters it from both, its upload queue drains to the
+/// terminal state, and re-ADD after a REMOVE works (clean teardown).
+#[tokio::test]
+async fn add_remove_list_full_cycle_over_the_control_channel() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    write_file(
+        &dir.path().join("volumes").join("b.toml"),
+        &volume_toml("222:BBB", 222222),
+    );
+    let _guard = chdir(dir.path());
+
+    let specs = {
+        let mut v =
+            cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load volume specs");
+        // Boot volume `a` only; `b` arrives at runtime through ADD.
+        v.retain(|spec| spec.name == "a");
+        v
+    };
+    let handle = boot_with_commands(
+        process_config(),
+        specs,
+        vec![mock_transport().await],
+        RuntimeVolumeCommands {
+            dispatch: Some(mock_dispatch()),
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await;
+    let addr = control_addr();
+    let webdav = handle.webdav_addr().expect("webdav bound");
+
+    // LIST at boot: one volume, no letter, no mount backend — the
+    // volume file's backend fills the column.
+    let reply = send_cmd(addr, "LIST").await;
+    assert!(reply.starts_with("OK: 1 volume(s)"), "LIST header: {reply}");
+    assert_eq!(
+        list_rows(&reply),
+        vec!["a running - telegram pending=0".to_string()],
+        "LIST row format: name status letter backend pending=N: {reply}"
+    );
+
+    // ADD b: assembled at runtime, registered everywhere at once.
+    let reply = send_cmd(addr, "ADD b").await;
+    assert!(
+        reply.starts_with("OK:") && reply.contains("added volume `b`"),
+        "ADD reply: {reply}"
+    );
+    assert_eq!(
+        handle.volume("b").expect("volume b registered").status(),
+        VolumeStatus::Running,
+        "the runtime-added volume is running"
+    );
+    let reply = send_cmd(addr, "LIST").await;
+    assert!(
+        reply.starts_with("OK: 2 volume(s)"),
+        "both volumes listed: {reply}"
+    );
+    assert!(
+        list_rows(&reply)
+            .iter()
+            .any(|row| row.starts_with("b running ")),
+        "volume b has its row: {reply}"
+    );
+
+    // The data plane follows: /vol/b routes on the SAME port, no
+    // listener restart (K51 liveness through the RV1 dispatch).
+    let resp = send_http(webdav, &http_request("PROPFIND", "/vol/b/", webdav)).await;
+    assert_eq!(
+        status_of(&resp),
+        207,
+        "runtime-added volume reachable: {resp}"
+    );
+
+    // REMOVE b: unregistered, unroutable, queue drained to the terminal
+    // state before the reply comes back.
+    let source = dir.path().join("b-source.txt");
+    fs::write(&source, b"remove-drains-me").expect("write source");
+    let rel = RelPath::new("/b.txt").expect("valid rel path");
+    handle
+        .volume("b")
+        .expect("volume b")
+        .vfs()
+        .expect("vfs b")
+        .ingest_file(&rel, &source, 1.0)
+        .await
+        .expect("ingest into volume b");
+
+    let reply = send_cmd(addr, "REMOVE b").await;
+    assert!(
+        reply.starts_with("OK:") && reply.contains("removed volume `b`"),
+        "REMOVE reply: {reply}"
+    );
+    assert!(
+        handle.volume("b").is_none(),
+        "the removed volume is gone from the master registry"
+    );
+    let reply = send_cmd(addr, "LIST").await;
+    assert_eq!(
+        list_rows(&reply),
+        vec!["a running - telegram pending=0".to_string()],
+        "only the surviving volume remains: {reply}"
+    );
+    let resp = send_http(webdav, &http_request("PROPFIND", "/vol/b/", webdav)).await;
+    assert_eq!(status_of(&resp), 404, "removed volume unroutable: {resp}");
+
+    // The queue drained: the row reached the uploaded terminal state.
+    let db_b = MetaDatabase::open(&dir.path().join("volumes").join("b").join("cydrive_meta.db"))
+        .expect("reopen volume b's db");
+    let row = db_b
+        .get_file("/b.txt")
+        .expect("db read b")
+        .expect("row exists");
+    assert!(row.is_uploaded, "REMOVE drained volume b's queue");
+
+    // Rejections: REMOVE of a missing volume, and re-ADD after a REMOVE
+    // (the teardown left nothing behind that blocks a fresh cycle).
+    let reply = send_cmd(addr, "REMOVE b").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("no volume registered"),
+        "REMOVE of a missing volume is refused actionably: {reply}"
+    );
+    let reply = send_cmd(addr, "ADD b").await;
+    assert!(
+        reply.starts_with("OK:"),
+        "re-ADD after REMOVE works (clean teardown): {reply}"
+    );
+    let reply = send_cmd(addr, "REMOVE b").await;
+    assert!(reply.starts_with("OK:"), "cleanup REMOVE: {reply}");
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+/// Refusals that must not touch the running set: ADD of an already
+/// registered name (pointed at REMOVE), ADD of a file that does not
+/// exist, ADD of a disabled volume (K49: `enabled = false` is the
+/// persistent-disable form), and REMOVE of a *failed* boot entry (the
+/// runtime garbage a broken assembly left — removable, nothing to drain).
+#[tokio::test]
+async fn add_and_remove_rejections_answer_actionably() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    write_file(
+        &dir.path().join("volumes").join("bad.toml"),
+        // The poisoned volume (the K22 shape from multivolume_e2e): its
+        // db_path points at the volume toml itself, so the assembly fails.
+        "backend = \"telegram\"\nbot_token = \"222:BBB\"\nchat_id = 222222\ndb_path = \"../bad.toml\"\n",
+    );
+    let _guard = chdir(dir.path());
+
+    let specs = cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load specs");
+    let mocks = vec![mock_transport().await, mock_transport().await];
+    let handle = boot_with_commands(
+        process_config(),
+        specs,
+        mocks,
+        RuntimeVolumeCommands {
+            dispatch: Some(mock_dispatch()),
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await;
+    let addr = control_addr();
+
+    // ADD of a registered name.
+    let reply = send_cmd(addr, "ADD a").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("already registered"),
+        "duplicate ADD refused: {reply}"
+    );
+    assert!(
+        reply.contains("REMOVE"),
+        "the refusal names the way out: {reply}"
+    );
+
+    // ADD of a file that does not exist.
+    let reply = send_cmd(addr, "ADD nosuch").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("nosuch"),
+        "missing-file ADD names the volume: {reply}"
+    );
+
+    // ADD of a disabled volume: the persistent-disable form (K49) must
+    // not be overrideable at runtime.
+    write_file(
+        &dir.path().join("volumes").join("dis.toml"),
+        &format!("{}enabled = false\n", volume_toml("333:CCC", 333333)),
+    );
+    let reply = send_cmd(addr, "ADD dis").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("enabled = false"),
+        "disabled ADD refused with the key named: {reply}"
+    );
+
+    // None of the refusals changed the running set.
+    let reply = send_cmd(addr, "LIST").await;
+    let rows = list_rows(&reply);
+    assert_eq!(rows.len(), 2, "a (running) + bad (failed) listed: {reply}");
+    assert!(
+        rows.iter().any(|row| row.starts_with("a running ")),
+        "volume a unaffected: {reply}"
+    );
+    assert!(
+        rows.iter().any(|row| row.starts_with("bad failed ")),
+        "the failed boot entry is listed failed: {reply}"
+    );
+
+    // A failed entry is runtime garbage REMOVE can clear: no queue, no
+    // mount — the registry (and the dashboard face) just drop it.
+    let reply = send_cmd(addr, "REMOVE bad").await;
+    assert!(
+        reply.starts_with("OK:") && reply.contains("removed volume `bad`"),
+        "REMOVE of a failed entry succeeds: {reply}"
+    );
+    let reply = send_cmd(addr, "LIST").await;
+    assert_eq!(
+        list_rows(&reply),
+        vec!["a running - telegram pending=0".to_string()],
+        "only a remains: {reply}"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+/// ADD failure isolation (K22's runtime twin): a volume whose transport
+/// dispatch fails is refused with the reason, and the sibling keeps
+/// serving — nothing partially registered.
+#[tokio::test]
+async fn add_failure_leaves_siblings_untouched() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    write_file(
+        &dir.path().join("volumes").join("bad.toml"),
+        &volume_toml("222:BBB", 222222),
+    );
+    let _guard = chdir(dir.path());
+
+    let specs = {
+        let mut v =
+            cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load volume specs");
+        v.retain(|spec| spec.name == "a");
+        v
+    };
+    let failing_dispatch: VolumeTransportDispatch = Arc::new(move |spec: &VolumeConfig| {
+        Box::pin(async move {
+            if spec.name == "bad" {
+                anyhow::bail!("credentials rejected by the backend");
+            }
+            mock_dispatch_result().await
+        })
+    });
+    let handle = boot_with_commands(
+        process_config(),
+        specs,
+        vec![mock_transport().await],
+        RuntimeVolumeCommands {
+            dispatch: Some(failing_dispatch),
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await;
+    let addr = control_addr();
+    let webdav = handle.webdav_addr().expect("webdav bound");
+
+    let reply = send_cmd(addr, "ADD bad").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("credentials rejected"),
+        "the dispatch failure surfaces in the refusal: {reply}"
+    );
+
+    // The sibling is untouched and `bad` is not half-registered anywhere.
+    assert_eq!(
+        handle.volumes(),
+        vec![("a".to_string(), VolumeStatus::Running)],
+        "the failed ADD left the registry unchanged"
+    );
+    let resp = send_http(webdav, &http_request("PROPFIND", "/vol/a/", webdav)).await;
+    assert_eq!(status_of(&resp), 207, "sibling still serving: {resp}");
+    let reply = send_cmd(addr, "REMOVE bad").await;
+    assert!(
+        reply.starts_with("ERR:"),
+        "nothing to remove after the failed ADD: {reply}"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+// --------------------------------------------------- 2. K50 safe removal ---
+
+/// The K50 drain step: a volume with an upload held in flight (the mock
+/// transport answers `RateLimited{3600s}`, which the queue honors exactly
+/// and never degrades) refuses REMOVE with a pending count, and the
+/// abort leaves the volume fully intact — registered, routable, nothing
+/// torn down.
+#[tokio::test]
+async fn remove_with_undrained_queue_aborts_and_keeps_the_volume() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    write_file(
+        &dir.path().join("volumes").join("stuck.toml"),
+        &volume_toml("222:BBB", 222222),
+    );
+    let _guard = chdir(dir.path());
+
+    let specs = {
+        let mut v =
+            cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load volume specs");
+        v.retain(|spec| spec.name != "stuck");
+        v
+    };
+    // The ADD dispatch hands out a transport whose uploads fail with an
+    // authoritative RateLimited{3600s}: the worker honors the wait
+    // exactly (never clamped, never degraded), so the job stays
+    // in-flight for the whole test.
+    let hold_dispatch: VolumeTransportDispatch = Arc::new(move |_spec: &VolumeConfig| {
+        Box::pin(async {
+            let mock = Arc::new(
+                MockTransport::builder()
+                    .upload_action(UploadAction::Fail {
+                        error: StorageError::RateLimited {
+                            retry_after: Some(Duration::from_secs(3600)),
+                        },
+                    })
+                    .build(),
+            );
+            mock.connect().await.expect("connect hold mock");
+            Ok(Some((
+                RunOptions::default(),
+                mock as Arc<dyn CloudTransport>,
+            )))
+        })
+    });
+    let handle = boot_with_commands(
+        process_config(),
+        specs,
+        vec![mock_transport().await],
+        RuntimeVolumeCommands {
+            dispatch: Some(hold_dispatch),
+            remove_tuning: RemoveTuning::fast(),
+        },
+    )
+    .await;
+    let addr = control_addr();
+    let webdav = handle.webdav_addr().expect("webdav bound");
+
+    let reply = send_cmd(addr, "ADD stuck").await;
+    assert!(reply.starts_with("OK:"), "stuck adds cleanly: {reply}");
+
+    let source = dir.path().join("hold.txt");
+    fs::write(&source, b"hold me in flight").expect("write source");
+    let rel = RelPath::new("/hold.txt").expect("valid rel path");
+    handle
+        .volume("stuck")
+        .expect("volume stuck")
+        .vfs()
+        .expect("vfs stuck")
+        .ingest_file(&rel, &source, 1.0)
+        .await
+        .expect("ingest into stuck");
+
+    // LIST shows the pending count (the §4 risk-table aid): the healthy
+    // volume reads 0, the held one reads 1.
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let reply = send_cmd(addr, "LIST").await;
+    let rows = list_rows(&reply);
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("a running ") && row.ends_with("pending=0")),
+        "healthy volume shows pending=0: {reply}"
+    );
+    assert!(
+        rows.iter()
+            .any(|row| row.starts_with("stuck running ") && row.ends_with("pending=1")),
+        "held upload shows pending=1: {reply}"
+    );
+
+    // REMOVE aborts on the drain timeout, actionably.
+    let reply = send_cmd(addr, "REMOVE stuck").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("pending"),
+        "the drain timeout names the pending count: {reply}"
+    );
+    assert!(
+        handle.volume("stuck").expect("still registered").status() == VolumeStatus::Running,
+        "the aborted removal left the volume registered"
+    );
+    let resp = send_http(webdav, &http_request("PROPFIND", "/vol/stuck/", webdav)).await;
+    assert_eq!(
+        status_of(&resp),
+        207,
+        "the aborted removal kept the data plane: {resp}"
+    );
+
+    // Deliberate leak: this handle is dropped WITHOUT shutdown — the
+    // held worker sleeps 3600s (the RateLimited wait) and a drain-join
+    // would hang the test. The runtime drop cancels the task.
+    drop(handle);
+}
+
+/// The K50 unmount abort (the injected-probe path): a volume whose drive
+/// release reports failure stops the removal — the volume stays
+/// registered and its mount entry untouched; only a release that
+/// succeeds lets the removal complete. The probe is injected through the
+/// live-volume table seam, so this runs in the default (winfsp-off)
+/// build against the same code the winfsp unmount plugs into.
+#[tokio::test]
+async fn unmount_failure_aborts_the_removal_with_the_volume_intact() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    let _guard = chdir(dir.path());
+
+    let specs = cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load specs");
+    let handle = run_multi_with_transports(&process_config(), {
+        vec![(
+            specs.into_iter().next().expect("volume a"),
+            RunOptions::default(),
+            mock_transport().await as Arc<dyn CloudTransport>,
+        )]
+    })
+    .await
+    .expect("boot");
+    let addr = control_addr();
+
+    // Inject the never-succeeding release (the "letter never disappears"
+    // probe — the winfsp unmount is the real counterpart behind the same
+    // trait).
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let released = Arc::new(AtomicBool::new(false));
+    assert!(
+        handle.live_table().set_release(
+            "a",
+            Box::new(FakeRelease {
+                attempts: Arc::clone(&attempts),
+                released: Arc::clone(&released),
+                succeed: false,
+            }),
+        ),
+        "the release injects into the live volume"
+    );
+
+    let reply = send_cmd(addr, "REMOVE a").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("unmount"),
+        "the unmount failure aborts the removal actionably: {reply}"
+    );
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "exactly one release attempt (no retry storm behind the abort)"
+    );
+    assert!(
+        !released.load(Ordering::SeqCst),
+        "the (fake) drive letter was never released — nothing was half-unmounted"
+    );
+    assert_eq!(
+        handle.volumes(),
+        vec![("a".to_string(), VolumeStatus::Running)],
+        "the volume stays registered through the abort"
+    );
+
+    // A succeeding release lets the same removal complete.
+    assert!(
+        handle.live_table().set_release(
+            "a",
+            Box::new(FakeRelease {
+                attempts: Arc::new(AtomicUsize::new(0)),
+                released: Arc::clone(&released),
+                succeed: true,
+            }),
+        ),
+        "the replacement release injects"
+    );
+    let reply = send_cmd(addr, "REMOVE a").await;
+    assert!(
+        reply.starts_with("OK:") && reply.contains("removed volume `a`"),
+        "the removal completes once the drive releases: {reply}"
+    );
+    assert!(
+        released.load(Ordering::SeqCst),
+        "the succeeding release ran"
+    );
+    assert!(
+        handle.volume("a").is_none(),
+        "the volume is gone after the completed removal"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+/// The injectable K50 release probe: succeeds or fails on demand, with
+/// attempt/release observation for the abort assertions.
+struct FakeRelease {
+    attempts: Arc<AtomicUsize>,
+    released: Arc<AtomicBool>,
+    succeed: bool,
+}
+
+impl DriveRelease for FakeRelease {
+    fn release(
+        &mut self,
+    ) -> std::pin::Pin<Box<dyn Future<Output = Result<(), String>> + Send + '_>> {
+        let attempts = Arc::clone(&self.attempts);
+        let released = Arc::clone(&self.released);
+        let succeed = self.succeed;
+        Box::pin(async move {
+            attempts.fetch_add(1, Ordering::SeqCst);
+            // The disappearance poll's stand-in: the winfsp unmount waits
+            // for the letter to vanish and reports when it does not.
+            tokio::time::sleep(Duration::from_millis(20)).await;
+            if succeed {
+                released.store(true, Ordering::SeqCst);
+                Ok(())
+            } else {
+                Err(
+                    "the drive letter did not disappear within the unmount window \
+                     (a program is holding it open)"
+                        .to_string(),
+                )
+            }
+        })
+    }
+}
+
+// ------------------------------------------------------- 3. LIST data face ---
+
+/// LIST answers on every multi-volume instance (commands are process
+/// surfaces, not options): a plain boot without a runtime dispatch still
+/// lists, and its ADD refusal names the missing dispatch instead of
+/// failing silently.
+#[tokio::test]
+async fn list_works_and_add_without_dispatch_refuses() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    let _guard = chdir(dir.path());
+
+    let specs = cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load specs");
+    let handle = run_multi_with_transports(&process_config(), {
+        vec![(
+            specs.into_iter().next().expect("volume a"),
+            RunOptions::default(),
+            mock_transport().await as Arc<dyn CloudTransport>,
+        )]
+    })
+    .await
+    .expect("boot");
+    let addr = control_addr();
+
+    let reply = send_cmd(addr, "LIST").await;
+    assert_eq!(
+        list_rows(&reply),
+        vec!["a running - telegram pending=0".to_string()],
+        "LIST works without a runtime dispatch: {reply}"
+    );
+
+    // A valid, unregistered volume file with no dispatch behind ADD:
+    // the refusal names the missing dispatch (the file checks pass —
+    // they precede it — so this is the dispatch gate's own wording).
+    write_file(
+        &dir.path().join("volumes").join("b.toml"),
+        &volume_toml("222:BBB", 222222),
+    );
+    let reply = send_cmd(addr, "ADD b").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("dispatch"),
+        "ADD without a runtime dispatch is refused actionably: {reply}"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
