@@ -6,7 +6,7 @@
 
 | 批次 | 任务 | 覆盖发现 | 状态 | 完成情况 | 证据 |
 |---|---|---|---|---|---|
-| RB1 | case-rename 修复 + 宽限表失效 | winfsp-C1、winfsp-H1 | ⬜ | — | — |
+| RB1 | case-rename 修复 + 宽限表失效 | winfsp-C1、winfsp-H1 | ✅ | 2026-09-11 完成 | 红：verify_probe C1×4/H1×2 改断正确行为后 6 失败（ACCESS_DENIED 0xC0000022 / COLLISION 0xC0000035 / 行缓存被删 / 陈旧 EOF 8B≠64B）；绿：winfsp 腿 107/0/1（含翻绿 6 测试）、workspace 892/0/9（=基线 891+webdav case-rename 回归 1）、clippy×2/fmt/check_layers/scan_secrets 全过。C1：case-only 判定移到规范化后（含 from==to 原始相等形态）走合法改名路径 + dest.id 守卫；H1：take_live 行 size 校验不符即弃 + delete_after_cleanup/rename_entry（源与目标）/cleanup 提交成功后 grace.invalidate，提交/删除成功同时清本 handle 读状态防 close 重泊陈旧态；verify_probe.rs 转正式回归（头注更新，门控不变，RB2+ 探针 7 个保持断言未修 BUG）。webdav 面：row 查找字节精确，case-variant 目标不可能命中源行——无需修，补回归测试 rename_case_only_lands_row_and_cache_at_the_new_spelling 钉死。 |
 | RB2 | 命名卫生与失败语义 | winfsp-H4、M1、M2、M3、H2 | ⬜ | — | — |
 | RB3 | 集成面与测试防线 | cli-H1、cli-H2、cli-M2、cli-M3、stream-H1 | ⬜ | — | — |
 | RB4 | 对齐与加固 | cli-M1、stream-M1、stream-M3、M5、M6、Low 顺手项 | ⬜ | — | — |

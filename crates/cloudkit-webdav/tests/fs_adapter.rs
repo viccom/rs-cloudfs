@@ -1487,6 +1487,65 @@ async fn rename_file_moves_row_cache_and_chunks() {
     );
 }
 
+/// 12b. case-only rename (review C1's WebDAV-face evaluation): dav row
+///     lookups are byte-exact, so a case-variant destination never
+///     resolves onto the source row and the destructive overwrite branch
+///     cannot fire — the rename flows through the normal move path and
+///     lands the row (id preserved) and the cache copy at the new
+///     spelling intact. Pinned because the winfsp face needed a fix for
+///     exactly this shape; this face is correct by construction (a
+///     case-variant SOURCE stays NotFound — the documented byte-exact
+///     lookup contract).
+#[tokio::test]
+async fn rename_case_only_lands_row_and_cache_at_the_new_spelling() {
+    let (_dir, db, cache_root, mock, _vfs, fs) = test_env(u64::MAX).await;
+    seed_remote_file(&db, &mock, "/mixed.txt", b"abcdefg", 3).await;
+    let local = seed_local(&cache_root, "/mixed.txt", b"abcdefg");
+    let old_row = db
+        .get_file("/mixed.txt")
+        .expect("db read")
+        .expect("row exists");
+
+    fs.rename(
+        &DavPath::new("/mixed.txt").expect("path"),
+        &DavPath::new("/Mixed.TXT").expect("path"),
+    )
+    .await
+    .expect("case-only rename");
+
+    let moved = db
+        .get_file("/Mixed.TXT")
+        .expect("db read")
+        .expect("row moved to the new spelling");
+    assert_eq!(moved.id, old_row.id, "the row moves in place (id kept)");
+    assert!(
+        db.get_file("/mixed.txt").expect("db read").is_none(),
+        "the old spelling is gone"
+    );
+    // On a case-insensitive cache volume the old spelling's path probes
+    // the very same file — assert there is exactly ONE physical copy
+    // instead of probing the old path for absence.
+    let cache_dir = local.parent().expect("cache parent dir");
+    let copies = fs::read_dir(cache_dir)
+        .expect("list cache dir")
+        .filter_map(|entry| entry.ok())
+        .filter(|entry| {
+            entry
+                .file_name()
+                .to_string_lossy()
+                .eq_ignore_ascii_case("mixed.txt")
+        })
+        .count();
+    assert_eq!(copies, 1, "exactly one physical cache copy — no duplicate");
+    let rel = RelPath::new("/Mixed.TXT").expect("valid rel path");
+    assert_eq!(
+        fs::read(CacheManager::new(cache_root.clone(), u64::MAX).local_path(&rel))
+            .expect("read moved cache copy"),
+        b"abcdefg",
+        "the cache copy follows the rename with its bytes intact"
+    );
+}
+
 /// 13. rename (dir): the subtree rows move (listing at the new path
 ///     shows the child), old paths disappear.
 #[tokio::test]
