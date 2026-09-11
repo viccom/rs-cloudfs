@@ -119,7 +119,8 @@ drive_letter = "Z"
 
 - **挂载**：单 WebDAV 端口，每卷一个子路径 `http://127.0.0.1:8080/vol/<name>`（声明了 `drive_letter` 的卷按 `cydrive run` 自动挂载为各自盘符）。
 - **仪表盘**：单端口 `:8088`，卷切换 tabs + 跨卷汇总；API 带 `?volume=<name>`（多卷下无参卷作用 API 返回 400 + 卷清单）。
-- 运维：`cydrive volumes` 列卷清单、`cydrive doctor` 逐卷体检、`cydrive status` 逐卷 db 统计、`cydrive setup --multi` 生成骨架；`cydrive stop` 一次停全部卷。
+- 运维：`cydrive volumes` 列卷清单、`cydrive doctor` 逐卷体检、`cydrive status` 逐卷 db 统计 + 在线实例的运行态卷表、`cydrive setup --multi` 生成骨架；`cydrive stop` 一次停全部卷。
+- **运行态装卸**（不停进程）：回环控制通道支持 `ADD <name>`（按 `volumes/<name>.toml` 装配并挂载，`enabled = false` 或凭据/盘符有问题则拒绝且不影响兄弟卷）、`REMOVE <name>`（排空上传 → 卸盘符 → 摘除，超时/占用即中止、卷保持完好；不碰卷文件，重启后按文件回来——持久禁用 = 手编 `enabled = false`）、`LIST`（卷名/状态/盘符/backend/pending 一行一卷）。命令串行处理，回复 `OK:`/`ERR:` 可行动文本；`cydrive status` 的多卷输出已带 LIST 转发。
 - 注意：多卷模式下 `CYDRIVE_*` 配置覆盖 env 被忽略（K28，防跨卷串味）；单卷模式行为与旧版字节兼容。
 
 多机同步（可选）：部署 `cydrive-sync-server`（[部署文档](docs/sync-server-deployment.md)）→ 各机 config.toml 写 `sync_url`/`sync_secret`，上传成功后秒级同步到其他机器。

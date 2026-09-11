@@ -305,3 +305,119 @@ async fn ensure_not_running_refuses_live_removes_stale_and_passes_clean() {
         "the guard removes the stale control file"
     );
 }
+
+// ------------------------------------------------- RV2: volume commands ---
+
+/// RV2 (runtime-volumes plan K48): `LIST` on an instance that serves no
+/// volume commands (the plain `run` wiring, e.g. single-volume mode) is
+/// still answered — an actionable ERR naming the unavailability, never
+/// silence and never the generic unknown-command line.
+#[tokio::test]
+async fn volume_commands_without_a_handler_answer_a_not_available_err() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cfg = temp_config(dir.path());
+
+    let server = ControlServer::bind(&cfg)
+        .await
+        .expect("bind control server");
+    let addr = server.local_addr();
+    spawn_run(server, || {});
+
+    let resp = cloudkit_cli::control::send_command(addr, "LIST")
+        .await
+        .expect("send LIST to the live server");
+    assert!(
+        resp.contains("ERR:") && resp.contains("not available"),
+        "LIST without a command surface answers the actionable not-available ERR: {resp}"
+    );
+}
+
+/// RV2: the volume-command surface (`ADD`/`REMOVE`/`LIST` lines) routes
+/// through the installed handler, its ERR replies keep the channel
+/// serving (one connection per command, the listener never drops), and
+/// the STOP branch behaves byte-identically alongside the handler.
+#[tokio::test]
+async fn volume_commands_route_to_the_handler_and_stop_stays_untouched() {
+    use std::sync::Mutex;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cfg = temp_config(dir.path());
+
+    let server = ControlServer::bind(&cfg)
+        .await
+        .expect("bind control server");
+    let addr = server.local_addr();
+    let triggered = Arc::new(AtomicBool::new(false));
+    let seen: Arc<Mutex<Vec<String>>> = Arc::new(Mutex::new(Vec::new()));
+    let flag = Arc::clone(&triggered);
+    let seen_for_handler = Arc::clone(&seen);
+    let handler: cloudkit_cli::control::VolumeCommandHandler = Arc::new(move |line: &str| {
+        seen_for_handler
+            .lock()
+            .unwrap_or_else(|p| p.into_inner())
+            .push(line.to_owned());
+        Box::pin(async move {
+            if line.starts_with("ADD") || line.starts_with("REMOVE") {
+                "ERR: test handler refusal\n".to_string()
+            } else {
+                "OK: test handler list\n".to_string()
+            }
+        })
+    });
+    tokio::spawn(async move {
+        let _ = server
+            .run_with_commands(move || flag.store(true, Ordering::SeqCst), Some(handler))
+            .await;
+    });
+
+    // A LIST reaches the handler and its reply comes back verbatim.
+    let resp = cloudkit_cli::control::send_command(addr, "LIST")
+        .await
+        .expect("send LIST");
+    assert_eq!(
+        resp, "OK: test handler list",
+        "the handler's reply passes through verbatim: {resp}"
+    );
+
+    // An ERR reply from the handler must not degrade the channel: the
+    // next command still routes.
+    let resp = cloudkit_cli::control::send_command(addr, "ADD nope")
+        .await
+        .expect("send ADD");
+    assert_eq!(
+        resp, "ERR: test handler refusal",
+        "the handler's ERR passes through: {resp}"
+    );
+    let resp = cloudkit_cli::control::send_command(addr, "REMOVE nope")
+        .await
+        .expect("send REMOVE");
+    assert_eq!(
+        resp, "ERR: test handler refusal",
+        "REMOVE routes too: {resp}"
+    );
+
+    // STOP alongside the handler: byte-identical reply, callback fires.
+    let resp = send_stop(addr).await.expect("send STOP");
+    assert!(
+        resp.contains("OK: shutting down"),
+        "STOP stays byte-identical with a handler installed: {resp}"
+    );
+    let deadline = Instant::now() + Duration::from_secs(1);
+    while !triggered.load(Ordering::SeqCst) {
+        assert!(
+            Instant::now() < deadline,
+            "STOP must fire the shutdown callback within 1s"
+        );
+        tokio::task::yield_now().await;
+    }
+    let lines = seen.lock().unwrap_or_else(|p| p.into_inner()).clone();
+    assert_eq!(
+        lines,
+        vec![
+            "LIST".to_string(),
+            "ADD nope".to_string(),
+            "REMOVE nope".to_string()
+        ],
+        "exactly the volume-command lines reached the handler (STOP did not)"
+    );
+}

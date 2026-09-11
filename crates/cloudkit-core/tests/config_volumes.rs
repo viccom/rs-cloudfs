@@ -422,3 +422,249 @@ fn process_keys_process_only_set_passes() {
     ])
     .expect("a pure process-level key set is legal");
 }
+
+// -------------------------------------------- volume enabled key (RV0) ---
+// Phase 3.6 / RV0 + K49: a per-volume `enabled` boolean (default true) is
+// the persistent form of "this volume is disabled". Discovery-side policy:
+// `load_volumes` skips disabled volumes with an info note — they join no
+// drive-letter conflict check, no assembly, no banner, no `/vol/<name>`.
+// The process-level `config.toml` keeps rejecting the key (K19 partition:
+// volume-scoped).
+
+#[test]
+fn enabled_key_is_a_volume_scoped_known_key() {
+    assert!(
+        KNOWN_TOML_KEYS.contains(&"enabled"),
+        "the strict toml surface must accept the key"
+    );
+    assert!(
+        VOLUME_SCOPED_KEYS.contains(&"enabled"),
+        "the enable switch is per-volume state (K19 partition)"
+    );
+    assert!(
+        !PROCESS_SCOPED_KEYS.contains(&"enabled"),
+        "a volume-level switch must not sit on the process side"
+    );
+}
+
+#[test]
+fn load_volumes_skips_disabled_volumes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("a.toml"),
+        "backend = \"local\"\nlocal_root = \"a\"\nenabled = false\n",
+    );
+    write_file(&dir.path().join("b.toml"), LOCAL_VOLUME_TOML);
+
+    let volumes = load_volumes(dir.path()).expect("the enabled volume loads");
+    let names: Vec<&str> = volumes.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["b"],
+        "the disabled volume must be skipped at discovery (RV0)"
+    );
+}
+
+#[test]
+fn load_volumes_announces_the_disabled_skip_in_the_log() {
+    // RV0: "info! 声明，不静默" — a skip is a visible, one-line
+    // declaration naming the volume, never a silent drop. Captured
+    // through a thread-local dispatcher (the tests/logging.rs pattern;
+    // each integration test is its own process, so the interest-cache
+    // rebuild cannot race another test's subscriber here).
+    use std::io::Write;
+    use std::sync::{Arc, Mutex};
+
+    struct Sink(Arc<Mutex<Vec<u8>>>);
+    impl Write for Sink {
+        fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+            self.0
+                .lock()
+                .unwrap_or_else(|poisoned| poisoned.into_inner())
+                .extend_from_slice(buf);
+            Ok(buf.len())
+        }
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
+
+    let buf: Arc<Mutex<Vec<u8>>> = Arc::default();
+    let subscriber = tracing_subscriber::fmt()
+        .with_max_level(tracing::Level::INFO)
+        .with_writer({
+            let buf = Arc::clone(&buf);
+            move || Sink(Arc::clone(&buf))
+        })
+        .finish();
+    let dispatch = tracing::Dispatch::new(subscriber);
+    let _guard = tracing::dispatcher::set_default(&dispatch);
+    tracing::callsite::rebuild_interest_cache();
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("a.toml"),
+        "backend = \"local\"\nlocal_root = \"a\"\nenabled = false\n",
+    );
+    assert!(
+        load_volumes(dir.path())
+            .expect("discovery still succeeds")
+            .is_empty(),
+        "the disabled volume is still skipped"
+    );
+
+    let captured = String::from_utf8(
+        buf.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .clone(),
+    )
+    .expect("the log is valid UTF-8");
+    assert!(
+        captured.contains("INFO") && captured.contains("volume is disabled"),
+        "the skip must be announced at info level: {captured:?}"
+    );
+    assert!(
+        captured.contains("a.toml") || captured.contains("\"a\""),
+        "the announcement must name the skipped volume: {captured:?}"
+    );
+}
+
+#[test]
+fn load_volumes_disabled_volume_does_not_claim_drive_letter() {
+    // Both volumes claim "V"; the disabled one must never reach the
+    // conflict check, so the enabled one loads and mounts "V" alone.
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("a.toml"),
+        "backend = \"local\"\nlocal_root = \"a\"\ndrive_letter = \"V\"\nenabled = false\n",
+    );
+    write_file(
+        &dir.path().join("b.toml"),
+        "backend = \"local\"\nlocal_root = \"b\"\ndrive_letter = \"V\"\n",
+    );
+
+    let volumes =
+        load_volumes(dir.path()).expect("no conflict: the disabled volume is skipped first");
+    let names: Vec<&str> = volumes.iter().map(|v| v.name.as_str()).collect();
+    assert_eq!(names, vec!["b"]);
+    assert_eq!(volumes[0].settings.drive_letter, "V");
+}
+
+#[test]
+fn process_config_with_enabled_key_is_rejected_by_mixing_guard() {
+    // K19 partition: the process config.toml must reject `enabled` with
+    // the actionable move-it-into-a-volume-file guidance.
+    let err = ensure_no_volume_keys_in_process(&["volumes_dir".to_string(), "enabled".to_string()])
+        .expect_err("an explicit `enabled` in the process config must be rejected");
+    let message = err.to_string();
+    assert!(
+        message.contains("enabled"),
+        "error must name the offending key: {message}"
+    );
+    assert!(
+        message.contains("volume"),
+        "error must tell the user to move it into a volume file: {message}"
+    );
+}
+
+#[test]
+fn process_config_file_with_enabled_key_still_rejected_end_to_end() {
+    // Characterization + contract: before RV0 the strict schema rejected
+    // `enabled` as an unknown key at load time; after RV0 the file parses
+    // and the K19 mixing guard rejects it. Either way a process
+    // config.toml carrying the key is refused — this pins the observable
+    // outcome across both shapes.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    write_file(&path, "volumes_dir = \"volumes\"\nenabled = true\n");
+
+    let rejected = match CyDriveConfig::load_toml_with_keys(&path) {
+        Ok((_, keys)) => ensure_no_volume_keys_in_process(&keys)
+            .expect_err("the mixing guard must reject `enabled`"),
+        Err(err) => err, // pre-RV0 shape: unknown-key rejection at load
+    };
+    assert!(
+        rejected.to_string().contains("enabled"),
+        "rejection must name the key: {rejected}"
+    );
+}
+
+#[test]
+fn legacy_json_rejects_the_enabled_key() {
+    // Legacy Python config.json is frozen history; a key it cannot honour
+    // must fail loudly (the volumes_dir/mount_backend precedent, K19),
+    // not sit silently ignored while the user believes a disable took
+    // effect.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.json");
+    fs::write(&path, r#"{ "enabled": false }"#).expect("write config.json");
+
+    let err = CyDriveConfig::load_legacy_json(&path)
+        .expect_err("legacy json must reject the enabled key");
+    assert!(
+        matches!(err, ConfigError::Parse { .. }),
+        "expected Parse error, got: {err:?}"
+    );
+    assert!(
+        err.to_string().contains("enabled"),
+        "error must name the rejected key: {err}"
+    );
+}
+
+#[test]
+fn volume_file_without_enabled_defaults_to_enabled() {
+    // The natural default (RV0): absent key = enabled — a volume file
+    // written before RV0, or without the key, behaves exactly as before.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("local.toml");
+    write_file(&path, LOCAL_VOLUME_TOML);
+
+    let volume = load_volume_config(&path).expect("legal volume file loads");
+    assert!(
+        volume.settings.enabled,
+        "an absent `enabled` key must default to true"
+    );
+    assert!(
+        CyDriveConfig::default().enabled,
+        "the struct default is enabled"
+    );
+
+    // An explicit `enabled = true` parses identically.
+    let path = dir.path().join("on.toml");
+    write_file(
+        &path,
+        "backend = \"local\"\nlocal_root = \"on\"\nenabled = true\n",
+    );
+    let volume = load_volume_config(&path).expect("explicit true parses");
+    assert!(volume.settings.enabled);
+}
+
+#[test]
+fn enabled_false_roundtrips_and_default_saves_stay_clean() {
+    // save_toml of an enabled (default) config must NOT emit the key —
+    // a process config.toml written by setup stays free of volume-scoped
+    // keys (K19). The key appears only when explicitly false, so a
+    // volume file's disable survives a programmatic round-trip.
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let path = dir.path().join("process.toml");
+    CyDriveConfig::default()
+        .save_toml(&path)
+        .expect("save_toml");
+    let text = fs::read_to_string(&path).expect("read saved toml");
+    let table: toml::Table = toml::from_str(&text).expect("saved toml parses");
+    assert!(
+        !table.contains_key("enabled"),
+        "a default save must not emit the volume-scoped `enabled` key:\n{text}"
+    );
+
+    let disabled = CyDriveConfig {
+        enabled: false,
+        ..CyDriveConfig::default()
+    };
+    let path = dir.path().join("volume.toml");
+    disabled.save_toml(&path).expect("save_toml");
+    let reloaded = CyDriveConfig::load_toml(&path).expect("reload");
+    assert!(!reloaded.enabled, "the disable must survive the round-trip");
+    assert_eq!(reloaded, disabled, "the whole config round-trips");
+}

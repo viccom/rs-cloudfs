@@ -688,3 +688,37 @@ async fn rebuild_multi_populates_each_volume_home_db_and_skips_telegram() {
     assert!(db.get_file("/readme.txt").expect("read").is_some());
     assert!(db.get_file("/docs/n.txt").expect("read").is_some());
 }
+
+// ------------------------------------------------- RV2: runtime section ---
+
+/// RV2 (runtime-volumes plan K48): the `cydrive status` runtime section
+/// renderer — an `OK: ...` LIST reply becomes the section (header line +
+/// the rows verbatim), an `ERR` reply renders `None` (the caller words
+/// that case), and an empty reply has no section either.
+#[test]
+fn runtime_volumes_section_renders_ok_replies_only() {
+    let reply = "OK: 2 volume(s)\na running Q: winfsp pending=0\nb running - baidu pending=3\n";
+    let section =
+        cloudkit_cli::volumes::format_runtime_volumes_section(reply).expect("an OK reply renders");
+    assert!(
+        section.starts_with("runtime volumes (live, via the control channel):\n"),
+        "the section names its source: {section}"
+    );
+    assert!(
+        section.contains("a running Q: winfsp pending=0")
+            && section.contains("b running - baidu pending=3"),
+        "the rows pass through verbatim: {section}"
+    );
+
+    assert!(
+        cloudkit_cli::volumes::format_runtime_volumes_section(
+            "ERR: volume commands are not available on this instance\n"
+        )
+        .is_none(),
+        "an ERR reply renders no section"
+    );
+    assert!(
+        cloudkit_cli::volumes::format_runtime_volumes_section("").is_none(),
+        "an empty reply renders no section"
+    );
+}

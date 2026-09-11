@@ -219,6 +219,86 @@ pub enum WebUiError {
     },
 }
 
+/// The dynamic volume table behind the multi-volume dashboard (Phase 3.6
+/// / RV1, K51): the `Arc<RwLock<ordered volume table>>` shared handle —
+/// one [`VolumeUiEntry`] per volume, in insertion order, so the caller
+/// can insert/remove volumes while the dashboard keeps serving; every
+/// request re-reads the table, so a removal drops the volume's tab,
+/// `/api/volumes` row and `?volume=` routes at once and an insertion
+/// makes them addressable at once (no listener restart, no route
+/// rebuild). The cli composition root fills the table at boot and (RV2)
+/// mutates it through the same handle.
+///
+/// Clone shares the table; every read clones entries out and releases
+/// the lock before the (sync) handler bodies run, so the lock never
+/// spans an await. Poison recovery follows the code-style norm — a
+/// panicked holder must not take the dashboard down.
+#[derive(Clone)]
+pub struct RegistryHandle {
+    volumes: Arc<std::sync::RwLock<Vec<VolumeUiEntry>>>,
+}
+
+impl RegistryHandle {
+    /// Builds the table with the given starting volumes (boot order).
+    pub fn new(volumes: Vec<VolumeUiEntry>) -> Self {
+        Self {
+            volumes: Arc::new(std::sync::RwLock::new(volumes)),
+        }
+    }
+
+    /// Registers a volume (appending to the table order); a duplicate
+    /// name is the caller's contract error (RV2's ADD refuses it before
+    /// reaching here).
+    pub fn insert(&self, entry: VolumeUiEntry) {
+        self.write().push(entry);
+    }
+
+    /// Removes the volume named `name`; `true` when it was registered.
+    pub fn remove(&self, name: &str) -> bool {
+        let mut volumes = self.write();
+        match volumes.iter().position(|entry| entry.name == name) {
+            Some(position) => {
+                volumes.remove(position);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// The registered names, in table order (the K23 error payloads'
+    /// addressable-volume list).
+    pub fn names(&self) -> Vec<String> {
+        self.read().iter().map(|entry| entry.name.clone()).collect()
+    }
+
+    /// One volume's entry by name (a clone — the lock is released
+    /// before the handler body runs).
+    pub fn find(&self, name: &str) -> Option<VolumeUiEntry> {
+        self.read().iter().find(|entry| entry.name == name).cloned()
+    }
+
+    /// The whole table, in order (a snapshot — same release-then-run
+    /// contract as [`RegistryHandle::find`]).
+    pub fn snapshot(&self) -> Vec<VolumeUiEntry> {
+        self.read().clone()
+    }
+
+    /// The table read lock, poisoned-lock recovery per the code-style
+    /// norm (a panicked holder must not take the dashboard down).
+    fn read(&self) -> std::sync::RwLockReadGuard<'_, Vec<VolumeUiEntry>> {
+        self.volumes
+            .read()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+
+    /// The table write lock (same recovery norm).
+    fn write(&self) -> std::sync::RwLockWriteGuard<'_, Vec<VolumeUiEntry>> {
+        self.volumes
+            .write()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+    }
+}
+
 /// The embedded `static/` tree (copied verbatim from the Python
 /// dashboard; the multi-backend adapter edits only its copy — the
 /// served bytes are whatever this folder holds at compile time).
@@ -265,11 +345,13 @@ impl WebUiServer {
     }
 
     /// Binds `addr` and serves the multi-volume dashboard (Phase 2.5 /
-    /// MV3) over the volume registry: the same nine routes (now taking
-    /// the K23 `?volume=<name>` parameter) plus the two registry routes
-    /// `/api/volumes` and `/api/stats/summary`.
+    /// MV3; dynamic since RV1 / K51) over the shared volume table: the
+    /// same nine routes (now taking the K23 `?volume=<name>` parameter)
+    /// plus the two registry routes `/api/volumes` and
+    /// `/api/stats/summary` — every request re-reads the table, so
+    /// later insertions/removals are visible at once.
     pub async fn serve_multi(
-        volumes: Vec<VolumeUiEntry>,
+        volumes: RegistryHandle,
         addr: SocketAddr,
     ) -> Result<Self, WebUiError> {
         let app = multi_router(volumes);
@@ -355,10 +437,8 @@ fn router(vfs: Arc<Vfs>, cfg: WebUiConfig) -> axum::Router {
 
 /// Assembles the multi-volume route table: the nine contract routes
 /// (K23 volume-parameter flavour) plus the two registry routes.
-fn multi_router(volumes: Vec<VolumeUiEntry>) -> axum::Router {
-    let state = AppState::Multi {
-        volumes: Arc::new(volumes),
-    };
+fn multi_router(volumes: RegistryHandle) -> axum::Router {
+    let state = AppState::Multi { volumes };
     contract_routes(axum::Router::new())
         .route("/api/volumes", get(api_volumes))
         .route("/api/stats/summary", get(api_stats_summary))
@@ -366,7 +446,7 @@ fn multi_router(volumes: Vec<VolumeUiEntry>) -> axum::Router {
 }
 
 /// Shared handler state: exactly one volume (the frozen single-volume
-/// face) or the volume registry (MV3).
+/// face) or the volume registry (MV3; a live shared handle since RV1).
 #[derive(Clone)]
 enum AppState {
     /// The single-volume boot: one VFS, one config — handlers resolve
@@ -376,16 +456,18 @@ enum AppState {
         vfs: Arc<Vfs>,
         cfg: Arc<WebUiConfig>,
     },
-    /// The multi-volume boot (K23/K24): one entry per volume; handlers
-    /// resolve the `?volume=<name>` parameter against it.
-    Multi { volumes: Arc<Vec<VolumeUiEntry>> },
+    /// The multi-volume boot (K23/K24): the shared table the handlers
+    /// re-read per request (RV1) to resolve the `?volume=<name>`
+    /// parameter.
+    Multi { volumes: RegistryHandle },
 }
 
 /// One request's volume resolution: the `(vfs, config)` pair the frozen
-/// handler bodies run against.
-struct ResolvedVolume<'a> {
-    vfs: &'a Arc<Vfs>,
-    cfg: &'a WebUiConfig,
+/// handler bodies run against. Owned values — cloned out of the table
+/// lock before the handler body runs.
+struct ResolvedVolume {
+    vfs: Arc<Vfs>,
+    cfg: WebUiConfig,
 }
 
 /// The K23 routing refusals' uniform JSON body: the error message plus
@@ -412,11 +494,14 @@ impl AppState {
     // straight back as the handler's return value); boxing it would
     // trade a per-request indirection for a lint's byte count.
     #[allow(clippy::result_large_err)]
-    fn resolve(&self, query: Option<&str>) -> Result<ResolvedVolume<'_>, Response> {
+    fn resolve(&self, query: Option<&str>) -> Result<ResolvedVolume, Response> {
         match self {
-            AppState::Single { vfs, cfg } => Ok(ResolvedVolume { vfs, cfg }),
+            AppState::Single { vfs, cfg } => Ok(ResolvedVolume {
+                vfs: Arc::clone(vfs),
+                cfg: (**cfg).clone(),
+            }),
             AppState::Multi { volumes } => {
-                let names: Vec<String> = volumes.iter().map(|v| v.name.clone()).collect();
+                let names = volumes.names();
                 let requested = query
                     .and_then(|q| query_param(q, "volume"))
                     .filter(|name| !name.is_empty());
@@ -428,7 +513,7 @@ impl AppState {
                         &names,
                     ));
                 };
-                let Some(entry) = volumes.iter().find(|v| v.name == name) else {
+                let Some(entry) = volumes.find(&name) else {
                     return Err(volume_routing_error(
                         StatusCode::NOT_FOUND,
                         format!("unknown volume '{name}'"),
@@ -442,8 +527,8 @@ impl AppState {
                         &names,
                     )),
                     (_, Some(vfs)) => Ok(ResolvedVolume {
-                        vfs,
-                        cfg: &entry.config,
+                        vfs: Arc::clone(vfs),
+                        cfg: entry.config.clone(),
                     }),
                     // A running entry without a VFS is an inconsistent
                     // assembly (unrepresentable through the cli boot);
@@ -1132,7 +1217,7 @@ async fn api_download(
         // The fallback signal and every error keep the pre-SR2 path:
         // hydrate (with its own NotFound/IsDirectory mapping) or the
         // frozen 404/500 answers.
-        Ok(StreamSource::Hydrate) => hydrate_download(volume.vfs, &rel, &filename, range).await,
+        Ok(StreamSource::Hydrate) => hydrate_download(&volume.vfs, &rel, &filename, range).await,
         Err(VfsError::NotFound(_)) | Err(VfsError::IsDirectory(_)) => download_not_found(),
         Err(error) => error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     }
@@ -1274,14 +1359,17 @@ async fn api_queue(State(state): State<AppState>, uri: Uri) -> Response {
 /// than failing the whole listing (the K22 spirit: one broken volume
 /// must not hide its siblings).
 async fn api_volumes(State(state): State<AppState>) -> Response {
-    let AppState::Multi { volumes } = &state else {
-        // Unreachable through the multi router; the single-volume table
-        // never registers this route (its unknown-route 404 IS the
-        // frozen behavior).
-        return error_json(
-            StatusCode::NOT_FOUND,
-            "no volume registry: this dashboard serves a single volume",
-        );
+    let volumes = match &state {
+        AppState::Multi { volumes } => volumes.snapshot(),
+        AppState::Single { .. } => {
+            // Unreachable through the multi router; the single-volume
+            // table never registers this route (its unknown-route 404
+            // IS the frozen behavior).
+            return error_json(
+                StatusCode::NOT_FOUND,
+                "no volume registry: this dashboard serves a single volume",
+            );
+        }
     };
     Json(serde_json::Value::Array(
         volumes.iter().map(volume_summary_json).collect(),
@@ -1325,11 +1413,14 @@ fn volume_summary_json(entry: &VolumeUiEntry) -> serde_json::Value {
 /// db read failure on one volume skips its contribution rather than
 /// failing the aggregate.
 async fn api_stats_summary(State(state): State<AppState>) -> Response {
-    let AppState::Multi { volumes } = &state else {
-        return error_json(
-            StatusCode::NOT_FOUND,
-            "no volume registry: this dashboard serves a single volume",
-        );
+    let volumes = match &state {
+        AppState::Multi { volumes } => volumes.snapshot(),
+        AppState::Single { .. } => {
+            return error_json(
+                StatusCode::NOT_FOUND,
+                "no volume registry: this dashboard serves a single volume",
+            )
+        }
     };
     let mut running = 0u64;
     let (mut total_files, mut total_bytes, mut total_dirs) = (0i64, 0i64, 0i64);

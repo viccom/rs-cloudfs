@@ -239,6 +239,8 @@ fn toml_roundtrip_preserves_full_config() {
         baidu_refresh_token: None,
         local_root: None,
         volumes_dir: None,
+        // Phase 3.6 / RV0: the volume enable switch round-trips too.
+        enabled: true,
     };
 
     cfg.save_toml(&path).expect("save_toml");

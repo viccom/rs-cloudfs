@@ -100,6 +100,7 @@ pub const KNOWN_TOML_KEYS: &[&str] = &[
     "baidu_refresh_token",
     "local_root",
     "volumes_dir",
+    "enabled",
 ];
 
 /// Numeric fields for which legacy JSON additionally accepts a numeric
@@ -137,6 +138,7 @@ const LEGACY_REJECTED_KEYS: &[&str] = &[
     "baidu_refresh_token",
     "local_root",
     "volumes_dir",
+    "enabled",
 ];
 
 /// Client-side encryption container scheme (Batch E / E-4, foundation D7).
@@ -279,7 +281,8 @@ pub const PROCESS_SCOPED_KEYS: &[&str] = &[
 /// Volume-scoped keys (Phase 2.5 / K19): everything a single storage
 /// volume owns — the backend selector, all driver parameters and
 /// credentials, the encryption group, db/cache/queue tuning, the drive
-/// letter/mount keys and the sync group. Legal in a volume file; a
+/// letter/mount keys, the sync group and the `enabled` switch (Phase 3.6
+/// / RV0 — the persistent disable form). Legal in a volume file; a
 /// multi-volume process-level `config.toml` carrying any of them is a
 /// mixing error (see [`ensure_no_volume_keys_in_process`]).
 pub const VOLUME_SCOPED_KEYS: &[&str] = &[
@@ -311,6 +314,7 @@ pub const VOLUME_SCOPED_KEYS: &[&str] = &[
     "baidu_access_token",
     "baidu_refresh_token",
     "local_root",
+    "enabled",
 ];
 
 /// One discovered volume: a `<name>.toml` file under the volumes
@@ -486,8 +490,12 @@ fn normalize_drive_letter(letter: &str) -> String {
 /// the same `drive_letter` (K27 — spelling differences like `"V"` vs
 /// `"v:"` normalise to the same letter and still collide). A volume that
 /// left `drive_letter` unset participates in no conflict: the parsed
-/// default `"Y:"` is a placeholder, not a mount claim. The returned order
-/// is the stable file-name order of [`discover_volumes`].
+/// default `"Y:"` is a placeholder, not a mount claim. A volume carrying
+/// `enabled = false` (Phase 3.6 / RV0) is skipped with an info note — it
+/// joins neither the conflict check nor the returned set, which is the
+/// persistent disable form (K49; re-enabling is hand-editing the file).
+/// The returned order is the stable file-name order of
+/// [`discover_volumes`].
 ///
 /// Duplicate volume names cannot occur with the single `.toml`
 /// extension: two files in one directory cannot share a stem. Should a
@@ -498,6 +506,15 @@ pub fn load_volumes(dir: &Path) -> Result<Vec<VolumeConfig>, ConfigError> {
     let mut mounted: std::collections::BTreeMap<String, String> = std::collections::BTreeMap::new();
     for path in discover_volumes(dir)? {
         let volume = load_volume_config(&path)?;
+        if !volume.settings.enabled {
+            tracing::info!(
+                volume = %volume.name,
+                file = %volume.file_path.display(),
+                "volume is disabled (enabled = false in its volume file); skipping it — \
+                 no drive-letter claim, no assembly, no /vol route"
+            );
+            continue;
+        }
         if volume.explicit_drive_letter {
             let letter = normalize_drive_letter(&volume.settings.drive_letter);
             if let Some(other) = mounted.get(&letter) {
@@ -566,6 +583,22 @@ fn default_hydrate_timeout_secs() -> u64 {
 /// Default `sync_interval_secs` (sync-lite plan, client side).
 fn default_sync_interval_secs() -> u64 {
     300
+}
+
+/// Default `enabled` (Phase 3.6 / RV0): absent key = the volume takes
+/// part in assembly — the semantic natural, not a compatibility
+/// consideration.
+fn default_enabled() -> bool {
+    true
+}
+
+/// `skip_serializing_if` predicate for `enabled`: the default (`true`)
+/// is omitted from serialized files — a process config written by
+/// `setup` must never carry the volume-scoped key (the K19 mixing guard
+/// would reject its own output in multi-volume mode) — while an
+/// explicit `false` (the disable) survives the round-trip.
+fn is_enabled(value: &bool) -> bool {
+    *value
 }
 
 /// Default `baidu_root` (Phase 2 / K17): the Baidu app-dir root
@@ -754,6 +787,22 @@ pub struct CyDriveConfig {
     /// error) and the directory must exist and hold at least one
     /// volume file.
     pub volumes_dir: Option<String>,
+    /// Whether this storage volume takes part in assembly (Phase 3.6 /
+    /// RV0, K49). A **volume-scoped** key (K19 partition): legal in a
+    /// volume file, rejected in the process `config.toml` by the mixing
+    /// guard. The default — `true` — is the semantic natural (absent
+    /// key = enabled), so volume files written before RV0 behave exactly
+    /// as before. `false` is the persistent form of "disabled":
+    /// [`load_volumes`] skips the volume at discovery with an info note —
+    /// it joins no drive-letter conflict check, no assembly, no banner,
+    /// no `/vol/<name>` route; re-enabling is hand-editing the key back
+    /// (runtime add/remove is the RV2 control channel's orthogonal
+    /// mechanism and never touches the file). `validate` adds no rule —
+    /// a bool has no invalid value. Serialization emits the key only
+    /// when `false`, so a process config saved by `setup` never carries
+    /// it (the K19 mixing guard would reject its own output otherwise).
+    #[serde(default = "default_enabled", skip_serializing_if = "is_enabled")]
+    pub enabled: bool,
 }
 
 impl Default for CyDriveConfig {
@@ -798,6 +847,7 @@ impl Default for CyDriveConfig {
             baidu_refresh_token: None,
             local_root: None,
             volumes_dir: None,
+            enabled: default_enabled(),
         }
     }
 }

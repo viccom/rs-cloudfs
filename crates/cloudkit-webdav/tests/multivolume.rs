@@ -30,7 +30,7 @@ use cloudkit_core::transport::mock::MockTransport;
 use cloudkit_core::transport::{CloudTransport, UploadJob};
 use cloudkit_core::upload_queue::RetryPolicy;
 use cloudkit_core::vfs::{Vfs, VfsConfig};
-use cloudkit_webdav::{CyDriveFs, WebDavServer};
+use cloudkit_webdav::{CyDriveFs, RegistryHandle, WebDavServer};
 
 // ------------------------------------------------------------- helpers ---
 
@@ -94,10 +94,11 @@ impl VolumeEnv {
 }
 
 /// Boots `serve_volumes` with two volumes named `a` and `b` on an
-/// ephemeral loopback port.
+/// ephemeral loopback port (RV1 mechanical adaptation: the static vec
+/// became the shared [`RegistryHandle`]; assertions unchanged).
 async fn serve_two(a: CyDriveFs, b: CyDriveFs) -> WebDavServer {
     WebDavServer::serve_volumes(
-        vec![("a".to_string(), a), ("b".to_string(), b)],
+        RegistryHandle::new(vec![("a".to_string(), a), ("b".to_string(), b)]),
         SocketAddr::from(([127, 0, 0, 1], 0)),
     )
     .await
@@ -525,6 +526,113 @@ async fn volume_get_range_streams_bounded_window() {
     server.shutdown().await;
     vol_a.shutdown().await;
     vol_b.shutdown().await;
+}
+
+// ------------------------------------------------- 7. the dynamic table (RV1) ---
+
+/// RV1 (K51): the route table is a live shared handle — removing a
+/// volume from the registry makes its `/vol/<name>` routes answer 404
+/// immediately (per-request table lookup, no route rebuild, no listener
+/// restart) while the surviving volume keeps serving untouched.
+#[tokio::test]
+async fn removed_volume_answers_404_while_survivors_keep_serving() {
+    let vol_a = volume_env().await;
+    let vol_b = volume_env().await;
+    let registry = RegistryHandle::new(vec![
+        ("a".to_string(), vol_a.fs.clone()),
+        ("b".to_string(), vol_b.fs.clone()),
+    ]);
+    let server =
+        WebDavServer::serve_volumes(registry.clone(), SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("serve_volumes binds the ephemeral port");
+    let addr = server.local_addr();
+
+    // Boot sanity: both volumes are reachable before the removal.
+    let resp = send(addr, &request("PUT", "/vol/a/pre.txt", addr, &[], "a")).await;
+    assert_eq!(status_of(&resp), 201, "volume a at boot: {resp}");
+    let resp = send(addr, &request("PUT", "/vol/b/pre.txt", addr, &[], "b")).await;
+    assert_eq!(status_of(&resp), 201, "volume b at boot: {resp}");
+
+    // The removal: the K50 seam the runtime unload acts through.
+    assert!(
+        registry.remove("a"),
+        "removing a registered volume reports it"
+    );
+
+    // The removed volume's routes are gone — the same URL that answered
+    // 201 above now answers the plain 404, without touching any volume.
+    let resp = send(addr, &request("PUT", "/vol/a/late.txt", addr, &[], "late")).await;
+    assert_eq!(status_of(&resp), 404, "removed volume: {resp}");
+    assert!(
+        vol_a.db.get_file("/late.txt").expect("db read a").is_none(),
+        "the removed volume's db must not see requests"
+    );
+
+    // The surviving volume is unaffected: it still routes, writes and
+    // lists, and the removal never touched its rows.
+    let resp = send(
+        addr,
+        &request("PUT", "/vol/b/late.txt", addr, &[], "b-late"),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 201, "surviving volume: {resp}");
+    let resp = propfind(addr, "/vol/b/").await;
+    assert_eq!(status_of(&resp), 207, "surviving volume listing: {resp}");
+    assert!(
+        resp.contains("late.txt") && resp.contains("pre.txt"),
+        "the surviving volume lists its boot and post-removal rows: {resp}"
+    );
+    assert!(
+        vol_b.db.get_file("/late.txt").expect("db read b").is_some(),
+        "the surviving volume took the write"
+    );
+
+    server.shutdown().await;
+    vol_a.shutdown().await;
+    vol_b.shutdown().await;
+}
+
+/// RV1 (K51): inserting a volume into the registry after boot makes it
+/// immediately routable on the SAME port — no server restart, no route
+/// rebuild; and it never existed for requests before the insert.
+#[tokio::test]
+async fn dynamically_inserted_volume_is_immediately_routable() {
+    let vol_a = volume_env().await;
+    let vol_c = volume_env().await;
+    let registry = RegistryHandle::new(vec![("a".to_string(), vol_a.fs.clone())]);
+    let server =
+        WebDavServer::serve_volumes(registry.clone(), SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("serve_volumes binds the ephemeral port");
+    let addr = server.local_addr();
+
+    // Before the insert the name is an unknown volume: 404.
+    let resp = send(addr, &request("PUT", "/vol/c/first.txt", addr, &[], "x")).await;
+    assert_eq!(status_of(&resp), 404, "unregistered volume: {resp}");
+
+    // The insert: the K50/RV2 seam the runtime load acts through.
+    registry.insert("c", vol_c.fs.clone());
+
+    // The route is live at once — prefix stripped (R1), row in c's db.
+    let resp = send(
+        addr,
+        &request("PUT", "/vol/c/first.txt", addr, &[], "c-payload"),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 201, "dynamically inserted volume: {resp}");
+    assert!(
+        vol_c
+            .db
+            .get_file("/first.txt")
+            .expect("db read c")
+            .is_some(),
+        "the inserted volume sees the prefix-stripped row"
+    );
+
+    server.shutdown().await;
+    vol_a.shutdown().await;
+    vol_c.shutdown().await;
 }
 
 // ------------------------------------------------------- 6. graceful stop ---
