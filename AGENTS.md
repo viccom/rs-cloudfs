@@ -24,7 +24,7 @@ cargo test --workspace --no-fail-fast            # 911 测试（RB4 对齐加固
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo build -p cloudkit-cli --no-default-features --features local,baidu   # 驱动裁剪构建（K30 三 feature）；缺驱动构建运行期报可行动错误（K31 rebuild 指引），cydrive --version 显示驱动清单（K32）
-LIBCLANG_PATH=D:/Python312/Lib/site-packages/clang/native cargo test -p cloudkit-winfsp --features winfsp   # winfsp 腿（114 测试，ignored 1 = 真机挂载；需 libclang+MSVC，见已知陷阱）
+LIBCLANG_PATH=D:/Python312/Lib/site-packages/clang/native cargo test -p cloudkit-winfsp --features winfsp   # winfsp 腿（117 测试，ignored 1 = 真机挂载；需 libclang+MSVC，见已知陷阱）
 scripts/check_layers                             # R1 层依赖门禁（CI 同款；动 Cargo.toml 依赖后必跑）
 scripts/scan_secrets                             # R3 秘密扫描门禁（CI 同款；本地模式=全树扫描）
 ```
@@ -55,5 +55,6 @@ scripts/scan_secrets                             # R3 秘密扫描门禁（CI �
 1. 基线设计 §9-2/9-3/9-4 三项建议待负责人确认（旧仓冻结时点 / bot 分 crate 时点 / R-E 批序）
 2. **卷级 `enabled` 启用/禁用键——负责人 2026-09-10 已批准、暂缓实施**：volume-scoped 布尔键（缺省 true），discover_volumes 对 `enabled=false` 的卷跳过装配 + `info!` 声明，禁用卷不占盘符不进 `/vol/<名>`；现状变通=改后缀/挪子目录（discover 只认 `*.toml` 平铺文件）。负责人同日问询运行态动态加载/卸载存储卷的可行性（架构评估已答：可行，`enabled` 恰为卸载的持久化形态），若立项两者同批。
 2. **telegram E2E 腿二选一**：telegram 实测配置在 `D:\Tools\rs-CyDrive`（生产实例，bot/chat 即生产命名空间；E:\GitHub\rs-CyDrive\test\ 不存在）——负责人明示接受生产 chat 污染跑 E2E，或提供独立测试 bot/chat（§7a 隔离裁决）；baidu appkey 即负责人本人凭据（PCFS client.go:69-70，decisions 2026-09-09 澄清），meta 31300 若要恢复直查须在百度开放平台为本 key 开 meta 权限
-3. ~~新仓远端 origin 待建~~ **已建**：origin = github.com/viccom/rs-cloudfs（**私有**，2026-09-09 建，main + feat/phase0-1 + feat/phase2 已推；历史含 rs-CyDrive 时代旧提交，公开化前建议做一次全历史秘密审查）
+3. ~~新仓远端 origin 待建~~ **已建**：origin = github.com/viccom/rs-cloudfs（**私有**，2026-09-09 建，main + feat/phase0-1 + feat/phase2 已推）。~~公开化前建议做一次全历史秘密审查~~ **已做（2026-09-11，gitleaks 8.30.1 全历史 388 提交）**：8 命中全部为公开 Cynet Android `api_hash` 常量（与 config.rs 默认值同源），**零真实凭据**——公开化前的历史审查此项销账。
 4. 自 rs-CyDrive 继承的挂账——**2026-09-08 修复批后仅剩验证类**：P3 hydrate 快照回写竞态已修（47c4fc2，目标列写 set_cached_flag）；Low×5 已清（sync_url host 校验 f8040aa/模拟器排序 e93433a/SyncClient trait 文档 09fff2c/--help 实证漂移 bc34d43/64MB 并发闸 08fee1d；凭据门槛核实本已统一于 resolve_sync_secret）；gen_compat_fixtures.py 已修（5a3a319，重生成需同步改 database.rs 钉死的 created_at 断言）；deny advisories 已过（`advisories ok`，经 7897 代理拉库——github.com 直连不通的既有限制自此有绕行方案）。**剩余：#[ignore] 真机测试 ×3、litmus 套件（均验证类，随真机窗口跑）**
+5. **工程债清单（权威记录 = docs/tracking/review-fixes.md 挂账节 + docs/decisions.md K53）**：原审查 H3（rename 进 staged 路径 chimera，探针留证）、header RTT+PBKDF2 LRU、fs.rs 拆分、窗口数学 AeadV2Window 下沉、delete_pending 半死代码维持现状（生产写/测试读，激活需语义设计）。2026-09-11 已清一批（K53）：VOLUME_SERIAL 按卷名派生、宽限表 size+mtime 双见证（RB1 窄缝闭环）、unix_to_filetime 整数域、M2 反解歧义注释留证、LetterInUse 文案达标。

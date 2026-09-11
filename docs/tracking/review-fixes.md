@@ -20,8 +20,9 @@
 
 - 每请求 header RTT + PBKDF2 的 LRU 收敛；fs.rs 拆分；窗口数学五处下沉；Phase 3.6 运行态卷管理（K48-K51 另有计划）。
 - **原审查 H3（探针留证、终版报告未列入修复清单）**：rename 进另一 handle 已 staged 的路径 → 该行成 chimera（A 的 size + B 的远端 msg_id，源字节经挂载不可达）。窄竞态（需同路径他 handle staged 且 rename 穿过守卫窗），verify_probe 的 h3 探针保持断言该未修行为——若立项修复，照 RB 批红→绿翻正。
-- M2 消毒的遗留窄边（RB2 审查记录）：旧缓存副本中字面 `~` 开头且余干恰为保留名的段名，rel_from_disk 反解会向保留名漂移（新写入经 `%7E` 编码不受影响）——旧副本本就 miss 重水合，影响面仅限按名驱逐的匹配精度。
-- RB1 残余窄缝（commit 77504da 正文）：rename 后原 handle 读状态在 close 时仍泊旧路径键下，「rename 走 + 同路径同尺寸 5s 内重建」形状可能复用；take_live size 校验已覆盖探针实证的全部形态（异尺寸重建/删除重建）。
+- ~~M2 消毒的遗留窄边~~ **2026-09-11 注释留证销账**（固有歧义不可修：旧副本字面 `~`+保留干反解漂移；cache.rs desanitize_segment 分支注释如实记录，新写入经 `%7E` 编码免疫，旧副本 miss 重水合自愈）。
+- ~~RB1 残余窄缝~~ **2026-09-11 闭环**（f37a198：GraceEntry 见证升格 RowWitness{size, mtime}，take_live 双见证任一不符即弃；verify_probe 新增 H1 第三探针——同尺寸不同 mtime 重建，红→绿留证）。
+- **delete_pending 半死代码**（2026-09-11 核验维持现状）：生产路径仅写不读（mark_delete ×2 于 set_delete 流），测试读 ×4 钉契约——激活需先设计 set_delete × cleanup-delete 竞争语义，非清尾批可动；审查原文允许「顺手处理或不处理」，取不处理+记录。
 
 ## 批次日志
 
@@ -31,3 +32,4 @@
 - 2026-09-11：RB3 完成（cli-H1+cli-H2+cli-M2+cli-M3+stream-H1）。cli-M2 取舍说明：join 失败档补了降级，但**不是无条件对齐**——Ok(Err) 档的 fallback 安全性由 `MountError::LetterInUse` 类型裁决保证（占符即不降级），join 失败（任务 panic）拿不到类型裁决，盘符状态未知；故加 `used_drive_letters()` 只读占用探测做门控（空闲→fallback、被占→声明性 println 说明理由），把 Ok(Err) 档的 carve-out 不变量在该档重新变为可判定。若取「无条件 fallback」，panic 恰发生在占用检查之前时会对占符者执行 `net use /delete`（夺符），风险不可接受。
 - 2026-09-11：RB4 完成（cli-M1+stream-M1+stream-M3+winfsp-M5+winfsp-M6+Low 顺手项）。取舍与解读：stream-M3 二选一取「decrypt_chunk 升运行时（已返回 Result，升级便宜）+ ciphertext_span 文档契约（tuple 返回非 Result，升级动三面公共 API 而调用方恒界内，最坏路径=debug panic）」；M5 取最小达标（注释修正），物化标志快速失败不加（同句柄串行是正确语义，快速失败反而改变行为）；L1/L2 为文案级最小修正，报告原始记录不在仓内，按批文提示 rg 定位后以代码事实为准（解读已记录在 RB4 行与 commit 正文）。范围红线核验：推翻项 winfsp-L4/L5、cross-L5 与 H3 探针零触碰（H3 探针保持断言未修 BUG 行为）。
 - 2026-09-11：收口完成。全门禁复跑全绿（911/0/9、114/0/1、clippy×3、fmt、check_layers、scan_secrets、裁剪构建）；真机冒烟三 case 过（case 改名=混合形态实走修复路径+全大写形态 FSD 层安全短路、删除重建即开=宽限窗内新内容、网页播放=双面 206 明文 Range 三面逐字节一致）；K52 入档；merge main + push + 双产物重建。审查期一处过程记录：冒烟中段 Range 首测返回整尾曾疑回归，裸 socket 复测+代码比对判定为探针自身手误（终点 4000001023 > EOF，服务器按 RFC 9110 正确钳制）——非产品缺陷，留证以免后患。
+- 2026-09-11：Low 项清尾批（cleanup/low-items，f37a198，K53）：VOLUME_SERIAL 卷名派生 / RowWitness{size,mtime} 双见证闭环 RB1 窄缝 / unix_to_filetime 整数域 / INIT 注释 / M2 歧义注释留证 / LetterInUse 达标判定；delete_pending 半死核验维持现状（子代理证伪「全死」前提并按断言零漂移纪律停手——主会话任务书前提有误，子代理拦截正确）。winfsp 腿 117/0/1。同日 gitleaks 全历史扫描：8 命中全为公开 Cynet 常量，零真实凭据（待人工 #3 尾注销账）。
