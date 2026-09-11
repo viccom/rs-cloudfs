@@ -567,3 +567,9 @@
 - **§9-3 bot-telegram 层级 → 裁定：按建议确认**（L5 应用形态、v1 不拆 crate，维持 ck-telegram 驱动层现状；新仓无 bot 应用层代码，将来若立项 bot 功能再议拆分）。
 - **§9-4 Phase 1 内 R/E 顺序 → 裁定：R→E 已自然落地，项销账**（K42 窗口读模型先行、K47 aead_v2 装饰器随后，与建议顺序一致且已真机验证——无需再做选择）。
 - **telegram E2E 腿 → 裁定：选项 B 独立测试 bot/chat**（§7a 默认「不接受生产污染」维持有效；负责人将登录 Telegram 经 @BotFather 创建测试 bot，测试配置落 `E:\GitHub\rs-CyDrive\test\`（§7a 原定凭据路径，目录需新建）；bot 就位前 telegram E2E 批不开工。所有 E2E 写操作仍限定 `/_e2e/` 前缀 + 收尾清理）。
+
+## 2026-09-11 telegram E2E 批落地：K54 入档（feat/tg-e2e，1c7c425）
+
+- **K54 telegram 真网 E2E = 驱动级 2 + vfs 级 1，三测试全绿（真 bot @cydrive_test_bot / 真 chat / 真 SOCKS5 代理）**：tg1 登录→4.5MB 多部件上传→stat 全对→下载逐字一致→清理核空（24.1s）；tg2 range_read=true 实证（跨部件/骑边界窗口逐字节精确、尾窗 EOF 钳制）+ 覆盖写实测为 transport 层 append-only（同 rel_path 新消息集旧集按 id 仍可取——与 K4/remote_delete=false 的 VFS 覆盖语义分层一致，测试按观测行为钉死）+ 删除核空（15.3s）；tg_vfs 全栈 vfs+AEAD_V2+telegram 加密往返 + 跨加密块边界窗口解密逐字（10.1s）。捕获力验证：上传侧 1 字节变异 → 红于第 4660 字节精确命中 → 还原绿。
+- **运行时裁决/经验**：① **稳定 session 是卫生**——fresh-session 反复重试会累积服务端 auth 限流（RateLimited{retry_after:1576s} 实录），session 落 temp 目录复用快路径；② 代理装配经 ConnectionParams::proxy_url（SOCKS5 7897），无代理本机不可达，实证必要；③ 无凭据环境 SKIP 非 fail（CI 友好）；④ workspace ignored 9→12（+真网 3），#[ignore] 真机清单重分类完毕——**telegram 腿无遗留**，baidu 真机×3/winssf Q:/platform×3/keyring/perf/sync https 各随其窗口。
+- **验收矩阵状态**：telegram 驱动自此具备可重复的自动化真网验收（上传/回读/Range/覆盖/删除/加密全栈），与 baidu（负责人真机）、local（负责人真机）并列。生产切换小批（旧仓→新仓）的 telegram 真机验收前提就此备齐。
