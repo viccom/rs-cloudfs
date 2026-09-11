@@ -11,10 +11,10 @@ backend = "baidu"
 
 # ── baidu 凭据（backend = "baidu" 时必填；也可走环境变量 CYDRIVE_BAIDU_*）──
 baidu_root = "/apps/cloudfs"
-baidu_app_key = "REPLACE_WITH_YOUR_BAIDU_APP_KEY"
-baidu_app_secret = "REPLACE_WITH_YOUR_BAIDU_APP_SECRET"
-baidu_access_token = "REPLACE_WITH_YOUR_BAIDU_ACCESS_TOKEN"
-baidu_refresh_token = "REPLACE_WITH_YOUR_BAIDU_REFRESH_TOKEN"
+baidu_app_key = "REPLACE WITH YOUR BAIDU APP KEY"
+baidu_app_secret = "REPLACE WITH YOUR BAIDU APP SECRET"
+baidu_access_token = "REPLACE WITH YOUR BAIDU ACCESS TOKEN"
+baidu_refresh_token = "REPLACE WITH YOUR BAIDU REFRESH TOKEN"
 
 # ── telegram 凭据（仅 backend = "telegram" 时需要；baidu/local 下无效）────
 # bot_token = "1234567890:REPLACE_WITH_YOUR_BOTFATHER_TOKEN"
@@ -42,7 +42,7 @@ enable_web_ui = true             # 默认 true
 
 # ── 加密（客户端侧；读路径按每行 scheme 分派，与这里无关）─────────────────
 enable_encryption = true         # 默认 false
-encryption_password = "REPLACE_WITH_A_STRONG_PASSWORD"   # 开加密时必填非空
+encryption_password = "REPLACE WITH A STRONG PASSWORD"   # 开加密时必填非空
 encryption_scheme = "aead_v2"    # 新上传容器格式："gcm"（默认，Python 兼容 v1）| "aead_v2"（流式 v2）
 
 # ── 路径（相对当前工作目录；默认值即 Python 基线形态）─────────────────────
@@ -59,7 +59,7 @@ hydrate_timeout_secs = 1800      # 单文件水合超时秒（1..=86400）
 
 # ── sync-lite 元数据同步（可选；不设 = 完全禁用）───────────────────────────
 # sync_url = "https://sync.example.org:8290"   # 需 http(s) 前缀
-# sync_secret = "REPLACE_WITH_YOUR_SYNC_SECRET" # 建议改用环境变量 CYDRIVE_SYNC_SECRET
+# sync_secret = "REPLACE WITH YOUR SYNC SECRET" # 建议改用环境变量 CYDRIVE_SYNC_SECRET
 # sync_interval_secs = 300                      # 轮询秒（1..=86400）
 
 # ── 多卷模式开关（设置 = 进入多卷，本文件只许保留进程级键）─────────────────

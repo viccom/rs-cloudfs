@@ -1,0 +1,27 @@
+# 多卷示例卷：local-enc（本地存储 · 文件加密）
+#
+# local 后端无网络凭据；local_root 相对路径锚定在 volumes/local-enc/ 下
+# （K21），写绝对路径（如 "D:\\Data\\EncDrive"）则按字面使用。
+# 加密卷：写入该目录的文件是 aead_v2/gcm 容器，无密码不可读。
+
+# ── 后端与根目录 ────────────────────────────────────────────────────────────
+backend = "local"
+local_root = "root"              # 相对 = 卷目录 volumes/local-enc/root/
+
+# ── 挂载 ────────────────────────────────────────────────────────────────────
+drive_letter = "V:"
+
+# ── 加密（文件加密卷 = 开）─────────────────────────────────────────────────
+enable_encryption = true
+encryption_password = "REPLACE WITH A STRONG PASSWORD"
+encryption_scheme = "aead_v2"
+
+# ── 路径与队列（默认值即可用，可整组省略）───────────────────────────────────
+# storage_path = "./Telegram_Drive"
+# cache_path = "./Telegram_Cache"
+# db_path = "./cydrive_meta.db"
+# chunk_size_mb = 1900
+# cache_limit_gb = 20
+# upload_workers = 2
+# queue_capacity = 256
+# hydrate_timeout_secs = 1800

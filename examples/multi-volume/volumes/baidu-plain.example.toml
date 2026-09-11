@@ -1,0 +1,32 @@
+# 多卷示例卷：baidu-plain（百度网盘 · 文件不加密）
+#
+# 与 baidu-enc 卷同账号不同远端子树（/apps/cloudfs/plain）——加密与明文
+# 文件在远端物理隔离；加密组整组不设即为明文卷（enable_encryption 默认 false）。
+
+# ── 后端与凭据（同账号即可与 enc 卷共用同一套占位符替换值）─────────────────
+backend = "baidu"
+baidu_root = "/apps/cloudfs/plain"
+baidu_app_key = "REPLACE WITH YOUR BAIDU APP KEY"
+baidu_app_secret = "REPLACE WITH YOUR BAIDU APP SECRET"
+baidu_access_token = "REPLACE WITH YOUR BAIDU ACCESS TOKEN"
+baidu_refresh_token = "REPLACE WITH YOUR BAIDU REFRESH TOKEN"
+
+# ── 挂载 ────────────────────────────────────────────────────────────────────
+drive_letter = "Y:"
+
+# ── 加密（明文卷 = 不设；默认 enable_encryption = false）──────────────────
+# enable_encryption = false
+# encryption_password = "..."
+# encryption_scheme = "gcm"      # 明文卷无需关心；若日后开启，默认 "gcm"
+
+# ── 路径（相对锚定 <volumes_dir>/baidu-plain/；默认值即如下，可省略）──────
+storage_path = "./Telegram_Drive"
+cache_path = "./Telegram_Cache"
+db_path = "./cydrive_meta.db"
+
+# ── 传输与队列（默认值即可用，可整组省略）───────────────────────────────────
+chunk_size_mb = 1900
+cache_limit_gb = 20
+upload_workers = 2
+queue_capacity = 256
+hydrate_timeout_secs = 1800

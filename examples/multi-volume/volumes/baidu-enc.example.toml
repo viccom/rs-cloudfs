@@ -1,0 +1,54 @@
+# 多卷示例卷：baidu-enc（百度网盘 · 文件加密）——28 个卷级键全覆盖
+#
+# 卷名 = 本文件名去掉 .toml（须匹配 ^[a-z][a-z0-9_-]{0,31}$）。
+# 卷内相对路径锚定在 <volumes_dir>/baidu-enc/ 目录下（K21），各卷天然隔离。
+#
+# 同一百度账号跑两个卷（enc + plain）时，两卷的 baidu_root 必须指向
+# 不同的远端子树（本例 /apps/cloudfs/enc 与 /apps/cloudfs/plain）——
+# 否则两卷索引同一棵远端树，互相可见且重复上传。也可两卷各用一套账号凭据。
+# 加密卷与明文卷的字节容器互不兼容：enc 卷写入的是 aead_v2 容器，
+# 只有用同一密码才能读回。
+
+# ── 后端与凭据 ──────────────────────────────────────────────────────────────
+backend = "baidu"
+baidu_root = "/apps/cloudfs/enc"
+baidu_app_key = "REPLACE WITH YOUR BAIDU APP KEY"
+baidu_app_secret = "REPLACE WITH YOUR BAIDU APP SECRET"
+baidu_access_token = "REPLACE WITH YOUR BAIDU ACCESS TOKEN"
+baidu_refresh_token = "REPLACE WITH YOUR BAIDU REFRESH TOKEN"
+
+# ── 挂载（本卷的盘符；与其他卷不得冲突，冲突在装配期报错）─────────────────
+drive_letter = "Z:"
+# mount_point = "/mnt/baidu-enc"   # 仅 Linux 生效
+
+# ── 加密（本卷独立：文件加密卷 = 开）───────────────────────────────────────
+enable_encryption = true
+encryption_password = "REPLACE WITH A STRONG PASSWORD"
+encryption_scheme = "aead_v2"    # "gcm"（默认，Python 兼容 v1）| "aead_v2"（流式 v2）
+
+# ── 路径（相对锚定 <volumes_dir>/baidu-enc/）──────────────────────────────
+storage_path = "./Telegram_Drive"
+cache_path = "./Telegram_Cache"
+db_path = "./cydrive_meta.db"
+
+# ── 传输与队列（本卷独立的上传流水线）───────────────────────────────────────
+chunk_size_mb = 1900
+cache_limit_gb = 20
+upload_workers = 2
+queue_capacity = 256
+hydrate_timeout_secs = 1800
+
+# ── telegram 凭据组（仅 backend = "telegram" 的卷需要；baidu 卷下无效）────
+# bot_token = "1234567890:REPLACE_WITH_YOUR_BOTFATHER_TOKEN"
+# chat_id = 1234567890
+# api_id = 6
+# api_hash = "eb06d4abfb49dc3eeb1aeb98ae0f581e"
+# proxy_url = "socks5://127.0.0.1:7897"
+
+# ── local 组（仅 backend = "local" 的卷需要）───────────────────────────────
+# local_root = "root"            # 相对 = 卷目录下的 root/
+
+# ── sync-lite 同步（本卷独立；不设 = 禁用）────────────────────────────────
+# sync_url = "https://sync.example.org:8290"
+# sync_secret = "REPLACE WITH YOUR SYNC SECRET"
+# sync_interval_secs = 300

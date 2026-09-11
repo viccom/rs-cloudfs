@@ -1,8 +1,0 @@
-# 多卷示例卷：local 最小形态（本仓 `cydrive setup --multi` 生成的同款）
-#
-# 演示同一进程挂第二个盘：local 后端无凭据，两行即可运行。
-# 相对路径 local_root 锚定在 volumes/local/ 目录下（K21）。
-
-backend = "local"
-local_root = "root"
-drive_letter = "L:"              # 与 baidu 卷的 Z: 不同盘符；注释掉 = 不占盘符

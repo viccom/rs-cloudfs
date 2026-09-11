@@ -1,0 +1,16 @@
+# 多卷示例卷：local-plain（本地存储 · 文件不加密）
+#
+# 最小形态：两行即可运行（本仓 `cydrive setup --multi` 生成的同款）。
+# 明文卷：加密组不设（默认 enable_encryption = false），文件原样落盘。
+
+# ── 后端与根目录 ────────────────────────────────────────────────────────────
+backend = "local"
+local_root = "root"              # 相对 = 卷目录 volumes/local-plain/root/
+
+# ── 挂载 ────────────────────────────────────────────────────────────────────
+drive_letter = "U:"
+
+# ── 加密（明文卷 = 不设）───────────────────────────────────────────────────
+# enable_encryption = false
+# encryption_password = "..."
+# encryption_scheme = "gcm"
