@@ -37,6 +37,9 @@ pub fn ntstatus_for(error: &VfsError) -> NTSTATUS {
         // upload lands, so a delete/open is a sharing problem, not a
         // missing file — and it is the code Explorer retries on.
         VfsError::UploadPending(_) => STATUS_SHARING_VIOLATION,
+        // The write surfaces refuse overlong segments up front (review
+        // M3): the name itself is the problem.
+        VfsError::NameTooLong { .. } => STATUS_OBJECT_NAME_INVALID,
         // A newer build wrote the payload; this build cannot dispatch.
         // Not an I/O fault — the operator has to upgrade.
         VfsError::UnsupportedEncryptionScheme { .. } => STATUS_NOT_SUPPORTED,

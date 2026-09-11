@@ -614,6 +614,135 @@ async fn put_staged_zero_byte_skips_transport() {
     );
 }
 
+// ------------------------------------------------- segment length cap ---
+// Review M3: a segment longer than 255 UTF-16 code units can never be
+// enumerated by the mount layer (winfsp's DirInfo buffer caps names at
+// 255 units — a longer row used to fail its WHOLE directory listing), and
+// such names still enter through the db/sync/caption channels. The write
+// surfaces must refuse them up front with an actionable error instead of
+// publishing an unreadable row.
+
+/// `put` refuses an overlong segment before any byte is staged and before
+/// any row is written, with an error naming the limit and the path.
+#[tokio::test]
+async fn put_refuses_segments_longer_than_the_enumeration_cap() {
+    let (_dir, db, cache, cache_root, mock) = test_env(1 << 20).await;
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let vfs = Vfs::new(db.clone(), cache, transport, test_cfg(64, None));
+    let long = "A".repeat(300);
+    let rel = RelPath::new(&format!("/{long}")).expect("valid rel path");
+
+    let outcome = vfs.put(&rel, b"payload", 1_700_000_000.0).await;
+    assert!(
+        outcome.is_err(),
+        "M3 FIXED: put must refuse a segment past the 255-UTF-16-unit \
+         enumeration cap"
+    );
+    let message = outcome
+        .err()
+        .map(|error| error.to_string())
+        .unwrap_or_default();
+    assert!(
+        message.contains("255") && message.contains(&long),
+        "the error must be actionable — it names the limit and the \
+         offending path; got {message:?}"
+    );
+
+    assert!(
+        db.get_file(rel.as_str()).expect("db read").is_none(),
+        "no row may be published for an overlong segment"
+    );
+    let mut leftovers = Vec::new();
+    collect_files(
+        CacheManager::new(cache_root.clone(), u64::MAX)
+            .local_path(&RelPath::root())
+            .as_path(),
+        &mut leftovers,
+    );
+    assert!(
+        leftovers.is_empty(),
+        "no staged byte may survive the refusal: {leftovers:?}"
+    );
+}
+
+/// `put_staged` refuses before the rename: the caller's staged file is
+/// still there to clean up, and nothing was published.
+#[tokio::test]
+async fn put_staged_refuses_segments_longer_than_the_enumeration_cap() {
+    let (_dir, db, cache, cache_root, mock) = test_env(1 << 20).await;
+    let paths = CacheManager::new(cache_root.clone(), u64::MAX);
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let vfs = Vfs::new(db.clone(), cache, transport, test_cfg(64, None));
+    let long = "B".repeat(300);
+    let rel = RelPath::new(&format!("/{long}")).expect("valid rel path");
+
+    let staged = paths
+        .local_path(&RelPath::root())
+        .join(".caller-staged.tmp");
+    fs::write(&staged, b"staged bytes").expect("write staged file");
+
+    let outcome = vfs.put_staged(&rel, &staged, 1_700_000_000.0).await;
+    assert!(
+        outcome.is_err(),
+        "M3 FIXED: put_staged must refuse a segment past the \
+         255-UTF-16-unit enumeration cap"
+    );
+    assert!(
+        staged.exists(),
+        "the refusal must happen BEFORE the rename — the caller's staged \
+         file survives for its own cleanup"
+    );
+    assert!(
+        db.get_file(rel.as_str()).expect("db read").is_none(),
+        "no row may be published for an overlong segment"
+    );
+}
+
+/// `ingest_file` refuses up front (before the copy) and publishes nothing.
+#[tokio::test]
+async fn ingest_file_refuses_segments_longer_than_the_enumeration_cap() {
+    let (_dir, db, cache, _cache_root, mock) = test_env(1 << 20).await;
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let vfs = Vfs::new(db.clone(), cache, transport, test_cfg(64, None));
+    let source_dir = tempfile::tempdir().expect("source dir");
+    let source = source_dir.path().join("src.bin");
+    fs::write(&source, b"payload").expect("source bytes");
+    let long = "C".repeat(300);
+    let rel = RelPath::new(&format!("/{long}")).expect("valid rel path");
+
+    let outcome = vfs.ingest_file(&rel, &source, 1_700_000_000.0).await;
+    assert!(
+        outcome.is_err(),
+        "M3 FIXED: ingest_file must refuse a segment past the \
+         255-UTF-16-unit enumeration cap"
+    );
+    assert!(
+        db.get_file(rel.as_str()).expect("db read").is_none(),
+        "no row may be published for an overlong segment"
+    );
+}
+
+/// `create_dir` refuses an overlong directory segment too.
+#[tokio::test]
+async fn create_dir_refuses_segments_longer_than_the_enumeration_cap() {
+    let (_dir, db, cache, _cache_root, mock) = test_env(1 << 20).await;
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let vfs = Vfs::new(db.clone(), cache, transport, test_cfg(64, None));
+    let long = "D".repeat(300);
+    let rel = RelPath::new(&format!("/{long}")).expect("valid rel path");
+
+    let outcome = vfs.create_dir(&rel);
+    assert!(
+        outcome.is_err(),
+        "M3 FIXED: create_dir must refuse a segment past the \
+         255-UTF-16-unit enumeration cap"
+    );
+    assert!(
+        db.get_file(rel.as_str()).expect("db read").is_none(),
+        "no row may be published for an overlong segment"
+    );
+}
+
 /// 14. Stalled remote: an `open_delay` of 500ms against a 50ms
 ///     `hydrate_timeout` surfaces `Timeout(50ms)` (Python parity: the
 ///     WebDAV thread's `future.result(timeout=180)` download cap) and

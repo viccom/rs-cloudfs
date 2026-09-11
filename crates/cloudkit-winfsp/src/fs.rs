@@ -40,7 +40,7 @@ use tokio::sync::Mutex as AsyncMutex;
 
 use cloudkit_core::database::FileRecord;
 use cloudkit_core::rel_path::RelPath;
-use cloudkit_core::vfs::{StreamSource, Vfs, VfsError};
+use cloudkit_core::vfs::{StreamSource, Vfs, VfsError, MAX_SEGMENT_UTF16};
 use windows::Win32::Foundation::{
     STATUS_DIRECTORY_NOT_EMPTY, STATUS_INVALID_DEVICE_REQUEST, STATUS_INVALID_PARAMETER,
     STATUS_NOT_A_DIRECTORY, STATUS_OBJECT_NAME_COLLISION, STATUS_OBJECT_NAME_NOT_FOUND,
@@ -835,7 +835,19 @@ impl CloudFs {
         let record = self
             .resolve_row(rel)?
             .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
-        let canonical = RelPath::new(&record.rel_path).expect("db rows carry canonical rel paths");
+        // Review H2: a db row's rel_path is only ever canonical when it
+        // came from an in-tree writer; external/legacy writers (the
+        // Python baseline does no validation) can park a non-vpath
+        // spelling here. The callback must answer an error, never panic.
+        let canonical = RelPath::new(&record.rel_path).map_err(|error| {
+            tracing::error!(
+                rel_path = %record.rel_path,
+                %error,
+                "winfsp: db row carries a non-vpath rel_path; the entry \
+                 cannot be opened"
+            );
+            invalid_name()
+        })?;
         let meta = Meta::from_record(&record);
         let read = if meta.is_dir {
             // Directories have no read state; their handle only ever
@@ -952,6 +964,17 @@ impl CloudFs {
         create_options: u32,
         file_attributes: u32,
     ) -> std::result::Result<Handle, FspError> {
+        // Review M3: a segment past the mount layer's 255-UTF-16-unit
+        // enumeration cap is refused at the face — publishing it would
+        // give the entry a staged state the directory listing can never
+        // show again (the write surfaces carry the same cap as
+        // `VfsError::NameTooLong`; this is the FSD-facing twin).
+        if rel.as_str()[1..]
+            .split('/')
+            .any(|segment| segment.encode_utf16().count() > MAX_SEGMENT_UTF16)
+        {
+            return Err(invalid_name());
+        }
         let intent = create_intent(create_options, file_attributes)?;
         if self.row(rel)?.is_some() {
             return Err(STATUS_OBJECT_NAME_COLLISION.into());
@@ -1224,9 +1247,20 @@ impl CloudFs {
         // not-found arm is a deliberate silent success, so an unresolved
         // spelling would delete nothing while reporting none of it.
         let rel = match self.resolve_row(&rel) {
-            Ok(Some(record)) => {
-                RelPath::new(&record.rel_path).expect("db rows carry valid rel paths")
-            }
+            // Review H2: a dirty row (non-vpath rel_path) keeps the entry
+            // instead of panicking the callback.
+            Ok(Some(record)) => match RelPath::new(&record.rel_path) {
+                Ok(canonical) => canonical,
+                Err(error) => {
+                    tracing::error!(
+                        rel_path = %record.rel_path,
+                        %error,
+                        "winfsp: cleanup delete hit a db row with a non-vpath \
+                         rel_path; the entry was kept"
+                    );
+                    return;
+                }
+            },
             Ok(None) => rel,
             Err(error) => {
                 tracing::error!(
@@ -1305,8 +1339,16 @@ impl CloudFs {
             .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
         // The FSD may deliver the source upcased (case-insensitive
         // resolution): everything downstream keys off the canonical
-        // spelling the row carries.
-        let from = RelPath::new(&row.rel_path).expect("db rows carry valid rel paths");
+        // spelling the row carries. Review H2: a dirty row's rel_path
+        // (external/legacy writer) must answer an error, never panic.
+        let from = RelPath::new(&row.rel_path).map_err(|error| {
+            tracing::error!(
+                rel_path = %row.rel_path,
+                %error,
+                "winfsp: rename source row carries a non-vpath rel_path"
+            );
+            invalid_name()
+        })?;
         // Case-only rename (review C1): the canonical source and the
         // destination agree up to case — including the byte-equal shape
         // an upcased source produces — so there is no distinct
@@ -1496,14 +1538,34 @@ pub fn fill_file_info(info: &mut FileInfo, meta: &Meta) {
 /// search miss, restart enumeration and spin (spike's most expensive
 /// lesson: 5.2M `read_directory` calls, Explorer hung). `set_name`
 /// (OsStr) appends a NUL and counts it — never use it here.
-pub fn fill_dir_info(entry: &mut DirInfo<255>, child: &DirEntry) -> Result<()> {
+///
+/// Returns `Ok(true)` when the entry was filled and `Ok(false)` when it
+/// was SKIPPED (review M3): winfsp-rs' `DirInfo<255>` buffer holds at most
+/// 255 UTF-16 code units and `set_name_raw` answers
+/// `STATUS_INSUFFICIENT_RESOURCES` for a longer one — a single such row
+/// used to fail the WHOLE directory listing. Such rows can still enter
+/// through channels that bypass the write surfaces' segment cap (legacy
+/// db / sync / telegram captions), so the enumeration skips them
+/// deliberately (warn-logged): one unreadable entry must not hide the
+/// rest of the directory.
+pub fn fill_dir_info(entry: &mut DirInfo<255>, child: &DirEntry) -> Result<bool> {
+    let wide: Vec<u16> = child.name.encode_utf16().collect();
+    if wide.len() > 255 {
+        tracing::warn!(
+            name_len = wide.len(),
+            name_prefix = %child.name.chars().take(32).collect::<String>(),
+            "winfsp: directory entry name exceeds the 255 UTF-16-unit \
+             enumeration cap; the entry is skipped"
+        );
+        return Ok(false);
+    }
     {
         let info = entry.file_info_mut();
         *info = FileInfo::default();
         fill_file_info(info, &child.meta);
     }
-    let wide: Vec<u16> = child.name.encode_utf16().collect();
-    entry.set_name_raw(wide.as_slice())
+    entry.set_name_raw(wide.as_slice())?;
+    Ok(true)
 }
 
 impl FileSystemContext for CloudFs {
@@ -1628,15 +1690,31 @@ impl FileSystemContext for CloudFs {
                         }
                     }
                     // Cleanup cannot report failure (winfsp.h: "There is
-                    // no way to report failure of this operation"), and
-                    // the writer already removed the staging sibling on a
-                    // failed commit — the log is the only trace the write
-                    // happened at all.
-                    Err(error) => tracing::error!(
-                        rel_path = %context.rel(),
-                        %error,
-                        "winfsp: staged commit failed at cleanup; the write was discarded"
-                    ),
+                    // no way to report failure of this operation"). The
+                    // truthful semantics (review H4): the writer kept the
+                    // bytes — `put_staged` renames the staging sibling
+                    // onto the final cache path BEFORE the row/enqueue
+                    // tail, so they sit at the final path (or, for a
+                    // failure before the rename, at the staging sibling);
+                    // a landed row stays pending and
+                    // `Vfs::requeue_pending` revives it at the next boot.
+                    // The log names whichever location holds the bytes so
+                    // recovery never has to guess.
+                    Err(error) => {
+                        let rel = context.rel();
+                        let final_local = self.vfs.local_path(rel);
+                        let location = if final_local.exists() {
+                            "the final cache path"
+                        } else {
+                            "the staging sibling"
+                        };
+                        tracing::error!(
+                            rel_path = %rel,
+                            %error,
+                            "winfsp: staged commit failed at cleanup; the bytes were kept at \
+                             {location}; the row stays pending and is requeued at the next boot"
+                        );
+                    }
                 }
             }
             None => {}
@@ -1834,7 +1912,11 @@ impl FileSystemContext for CloudFs {
             let lock = dir_buffer.acquire(true, None)?;
             for child in &children {
                 let mut entry = DirInfo::<255>::new();
-                fill_dir_info(&mut entry, child)?;
+                // M3: an overlong name is skipped inside fill_dir_info
+                // (warn-logged there) instead of failing the listing.
+                if !fill_dir_info(&mut entry, child)? {
+                    continue;
+                }
                 lock.write(&mut entry)?;
             }
             // Drop the lock before reading: the buffer must be published

@@ -47,6 +47,11 @@ windows = { version = "0.61", optional = true, features = [
 
 [dev-dependencies]
 tempfile = "3"
+# The H4 probe captures the adapter's own tracing events (log-semantics
+# assertions) through a thread-local fmt subscriber with a buffer writer.
+tracing-subscriber = { version = "0.3", default-features = false, features = [
+    "fmt",
+] }
 # The integration tests assemble a real Vfs (whose upload queue spawns
 # tasks) and drive the async bridge, so they need the multi-thread
 # runtime + time.

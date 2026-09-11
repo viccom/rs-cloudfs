@@ -2,17 +2,26 @@
 //! (docs/reports/2026-09-11-phase3-winfsp-enc-review.md), part of the
 //! suite since the review-fixes batches (docs/plans/2026-09-11-review-fixes.md).
 //!
-//! The RB1 findings below assert the FIXED behavior (they were written
-//! red first against the buggy tree, then turned green by the fix):
+//! The RB1/RB2 findings below assert the FIXED behavior (each was written
+//! red first against the buggy tree, then turned green by its fix):
 //! - C1: a case-only rename is a legal rename — row and cache copy move
 //!   with it, nothing is destroyed or refused;
 //! - H1: a grace-table entry whose size disagrees with the fresh row is
-//!   stale (delete + recreate behind the same path) and is discarded.
+//!   stale (delete + recreate behind the same path) and is discarded;
+//! - H2: a db row with a non-vpath rel_path answers an error status, the
+//!   callback never panics;
+//! - H4: a failed cleanup commit keeps the bytes and the pending row, and
+//!   the failure log says exactly that (never "the write was discarded");
+//! - M1: /foo's staging sibling can never be another row's cache path
+//!   (random sibling segment);
+//! - M2: reserved device names and trailing dot/space map onto real,
+//!   distinct cache files;
+//! - M3: an overlong (>255 UTF-16 units) name is skipped by the
+//!   enumeration instead of failing the whole directory.
 //!
-//! The remaining probes (H2/H3/H4/M1/M2/M3/M6) still assert the UNFIXED
-//! bug behavior — they pass against the current tree on purpose and are
-//! flipped to the fixed behavior by their own batches (RB2/RB3), the
-//! same red-first way.
+//! The remaining probes (H3/M6) still assert the UNFIXED bug behavior —
+//! they pass against the current tree on purpose and are flipped by their
+//! own batches (H3 has no batch yet, M6 is RB4), the same red-first way.
 //!
 //! Run:
 //!   CARGO_TARGET_DIR='E:/Rs_Codes/rs-cloudfs/target' \
@@ -236,17 +245,51 @@ impl Harness {
             .local_path(&RelPath::new(rel).expect("valid rel path"))
     }
 
-    fn staged_path(&self, rel: &str) -> PathBuf {
-        let local = self.local_path(rel);
-        let name = local
-            .file_name()
-            .map(|n| n.to_string_lossy().into_owned())
-            .expect("file name");
-        local.with_file_name(format!(".{name}.tmp"))
-    }
-
     fn enqueued(&self) -> u64 {
         self.vfs.queue_stats().enqueued
+    }
+}
+
+/// Captures THIS thread's tracing events into a shared buffer (review H4's
+/// log-semantics assertions). `set_default` is thread-local, so the guard
+/// only affects the calling test; events emitted inside the bridge's
+/// runtime workers are not captured — every log asserted here fires on the
+/// caller's thread.
+fn capture_logs() -> (
+    tracing::subscriber::DefaultGuard,
+    Arc<std::sync::Mutex<Vec<u8>>>,
+) {
+    let buffer: Arc<std::sync::Mutex<Vec<u8>>> = Arc::default();
+    let subscriber = tracing_subscriber::fmt()
+        .without_time()
+        .with_writer(CaptureWriter(Arc::clone(&buffer)))
+        .finish();
+    (tracing::subscriber::set_default(subscriber), buffer)
+}
+
+/// A `MakeWriter` fanning formatted tracing events into the probe's buffer.
+#[derive(Clone)]
+struct CaptureWriter(Arc<std::sync::Mutex<Vec<u8>>>);
+
+impl std::io::Write for CaptureWriter {
+    fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
+        self.0
+            .lock()
+            .expect("log buffer mutex")
+            .extend_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for CaptureWriter {
+    type Writer = CaptureWriter;
+
+    fn make_writer(&'a self) -> Self::Writer {
+        self.clone()
     }
 }
 
@@ -487,11 +530,12 @@ fn h1_stale_grace_state_is_discarded_through_the_cleanup_then_close_lifecycle() 
 // H2 — `.expect` panics on a db row with a non-vpath rel_path
 // =====================================================================
 
-/// A row whose stored rel_path is not a valid vpath (reachable only from an
-/// external/legacy writer — Python baseline does no validation) makes the
-/// open path PANIC at fs.rs:805 once resolve_row's parent-scan arm finds it.
+/// H2 FIXED: a row whose stored rel_path is not a valid vpath (reachable
+/// only from an external/legacy writer — Python baseline does no
+/// validation) must make the open callback answer
+/// STATUS_OBJECT_NAME_INVALID, never panic.
 #[test]
-fn h2_open_panics_on_a_row_with_a_non_vpath_rel_path() {
+fn h2_open_answers_an_error_for_a_row_with_a_non_vpath_rel_path() {
     let h = Harness::new();
     // rel_path with a backslash can never come out of RelPath::new, and the
     // db layer does not validate; name/parent_dir make the parent-scan arm
@@ -503,23 +547,31 @@ fn h2_open_panics_on_a_row_with_a_non_vpath_rel_path() {
     let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| {
         // The case-variant spelling forces resolve_row into the parent-scan
         // arm (exact get_file("/PATH") misses), which returns the bad row.
-        match h.open("/PATH") {
-            Ok(_) => None,
-            Err(error) => Some(format!("returned Err instead: {error:?}")),
-        }
+        h.open("/PATH")
     }));
     std::panic::set_hook(prev_hook);
-    let payload = outcome.expect_err("the open callback must panic");
 
-    let msg = payload
-        .downcast_ref::<&str>()
-        .map(|s| s.to_string())
-        .or_else(|| payload.downcast_ref::<String>().cloned())
-        .unwrap_or_else(|| "<non-string panic payload>".to_string());
-    println!("[H2] open() panicked with: {msg:?}");
-    assert!(
-        msg.starts_with("db rows carry canonical rel paths"),
-        "H2 CONFIRMED: fs.rs:805 panic reached from the open callback (got {msg:?})"
+    let reported = match outcome {
+        Ok(Ok(_)) => "answered Ok".to_string(),
+        Ok(Err(FspError::NTSTATUS(status))) => {
+            format!("answered NTSTATUS {:#010x}", status as u32)
+        }
+        Ok(Err(other)) => format!("answered {other:?}"),
+        Err(payload) => {
+            let msg = payload
+                .downcast_ref::<&str>()
+                .map(|s| s.to_string())
+                .or_else(|| payload.downcast_ref::<String>().cloned())
+                .unwrap_or_else(|| "<non-string panic payload>".to_string());
+            format!("PANICKED with {msg:?}")
+        }
+    };
+    println!("[H2] open(/PATH) with a dirty row -> {reported}");
+    assert_eq!(
+        reported, "answered NTSTATUS 0xc0000033",
+        "H2 FIXED: the open callback must answer STATUS_OBJECT_NAME_INVALID \
+         (0xC0000033) for a db row whose rel_path is not a valid vpath — \
+         instead it {reported}"
     );
 }
 
@@ -579,16 +631,16 @@ fn h3_rename_into_a_staged_path_overwrites_the_migrated_row_at_cleanup() {
 }
 
 // =====================================================================
-// H4 — cleanup commit failure is silent AND the "discarded" comment lies
+// H4 — cleanup commit failure semantics
 // =====================================================================
 
-/// Close the upload queue first (enqueue will fail with QueueClosed). The
-/// staged commit then: renames the sibling onto the FINAL cache path (bytes
-/// survive there), upserts the pending row, fails the enqueue, removes the
-/// (already renamed away) sibling as a no-op, and logs "the write was
-/// discarded" — while the bytes and the row are both on disk.
+/// H4 FIXED: with the queue closed (enqueue fails), the failed commit
+/// keeps the bytes at the final cache path (the rename already happened),
+/// leaves the row pending for the boot-time requeue, leaves no staging
+/// sibling behind, and the failure log states exactly that — it never
+/// claims "the write was discarded".
 #[test]
-fn h4_failed_commit_keeps_the_bytes_at_the_final_path_and_the_row_pending() {
+fn h4_failed_commit_keeps_the_bytes_reports_truthfully_and_leaves_the_row_pending() {
     let h = Harness::new();
 
     let a = h.create_file("/stuck.bin").expect("create");
@@ -597,140 +649,176 @@ fn h4_failed_commit_keeps_the_bytes_at_the_final_path_and_the_row_pending() {
     // Drain + close the queue so commit_put's enqueue fails.
     h.fs.bridge().block_on(h.vfs.shutdown());
 
+    let (log_guard, logs) = capture_logs();
     h.cleanup(&a);
+    drop(log_guard);
     h.fs.close(a);
+    let log = String::from_utf8_lossy(&logs.lock().expect("log buffer mutex")).into_owned();
+    println!("[H4] failure log: {log:?}");
 
+    // The bytes are kept at the final cache path.
     let local = h.local_path("/stuck.bin");
-    let row = h.row("/stuck.bin");
-    println!(
-        "[H4] local copy exists at FINAL path = {}, content = {:?}",
-        local.exists(),
-        fs::read(&local)
-            .ok()
-            .map(|b| String::from_utf8_lossy(&b).into_owned())
-    );
-    println!(
-        "[H4] row = {:?}",
-        row.as_ref().map(|r| (r.size, r.is_uploaded, r.is_cached))
-    );
-    println!(
-        "[H4] staging sibling exists = {}",
-        h.staged_path("/stuck.bin").exists()
-    );
-    println!("[H4] enqueued jobs = {}", h.enqueued());
-
+    let content = fs::read(&local);
     assert!(
-        local.exists(),
-        "H4 CONFIRMED (comment drift): the write was NOT discarded — the bytes \
-         sit at the final cache path"
+        matches!(&content, Ok(bytes) if bytes == b"payload-bytes"),
+        "H4 FIXED: a failed commit keeps the bytes at the final cache path; \
+         read back {content:?} at {local:?}"
     );
-    let row = row.expect("the pending row exists");
-    assert_eq!(row.size, 13);
+    // The row stays pending — the boot-time requeue heals it.
+    let row = h.row("/stuck.bin").expect("the pending row exists");
     assert!(
         !row.is_uploaded,
-        "the row is pending forever (no job enqueued)"
+        "the row stays pending (no job was ever accepted)"
     );
+    assert!(row.is_cached, "the cache copy backs the pending row");
     assert_eq!(h.enqueued(), 0, "no upload job was ever accepted");
+
+    // No staging sibling survives under any spelling.
+    let leftovers: Vec<String> = fs::read_dir(h.local_path("/"))
+        .expect("read cache root")
+        .map(|entry| {
+            entry
+                .expect("entry")
+                .file_name()
+                .to_string_lossy()
+                .into_owned()
+        })
+        .filter(|name| name.ends_with(".tmp"))
+        .collect();
+    assert!(
+        leftovers.is_empty(),
+        "no staging sibling may survive a consumed commit; found {leftovers:?}"
+    );
+
+    // The failure log must state the truthful semantics.
+    assert!(
+        log.contains("kept at the final cache path"),
+        "H4 FIXED: the failure log must say the bytes were kept at the \
+         final cache path; log: {log:?}"
+    );
+    assert!(
+        log.contains("requeued at the next boot"),
+        "the log must say the pending row is requeued at the next boot; \
+         log: {log:?}"
+    );
+    assert!(
+        !log.contains("discarded"),
+        "H4 FIXED: the log must not claim the write was discarded — the \
+         bytes and the row are both on disk; log: {log:?}"
+    );
 }
 
 // =====================================================================
-// M1 — the staging sibling of /foo is /.foo.tmp, someone else's cache path
+// M1 — /foo's staging sibling must never be another row's cache path
 // =====================================================================
 
-/// A PENDING row named /.foo.tmp has its only copy of the bytes in the cache
-/// tree; creating /foo stages at the same path and truncates it.
+/// M1 FIXED: the staging sibling carries a random segment, so creating
+/// /foo stages in its own private file — the cache copy of a pending row
+/// named /.foo.tmp (the old deterministic sibling spelling) is untouched
+/// through staging AND commit.
 #[test]
-fn m1_creating_foo_truncates_the_cache_copy_of_the_hidden_row_dot_foo_dot_tmp() {
+fn m1_creating_foo_leaves_the_hidden_dot_foo_dot_tmp_row_copy_untouched() {
     let h = Harness::new();
     // Pending row (uploaded=false): the cache copy is the ONLY copy.
     h.seed_row("/.foo.tmp", 6, false, None);
     let victim = h.seed_cache_copy("/.foo.tmp", b"SECRET");
-    println!(
-        "[M1] /.foo.tmp cache copy before = {:?} ({} bytes)",
-        fs::read(&victim)
-            .ok()
-            .map(|b| String::from_utf8_lossy(&b).into_owned()),
-        fs::metadata(&victim).map(|m| m.len()).unwrap_or(0)
-    );
 
-    let _foo = h.create_file("/foo").expect("create /foo stages .foo.tmp");
-    let after = fs::read(&victim).ok().map(|b| b.len());
-    println!(
-        "[M1] /.foo.tmp cache copy after create(/foo) = {after:?} bytes (staged sibling of /foo = {:?})",
-        h.staged_path("/foo")
-    );
-    h.fs.close(_foo);
+    let foo = h.create_file("/foo").expect("create /foo");
+    // The staged sibling of /foo must be a private file: writes land and
+    // read back without ever touching /.foo.tmp's bytes.
+    h.write(&foo, 0, b"new-bytes").expect("stage bytes");
+    let staged_read = h.read(&foo, 0, 9).expect("read your own writes");
+    let victim_after_stage = fs::read(&victim);
+    h.cleanup(&foo);
+    h.fs.close(foo);
+    let victim_after_commit = fs::read(&victim);
+
     assert_eq!(
-        after,
-        Some(0),
-        "M1 CONFIRMED: create(/foo) truncated /.foo.tmp's cache copy — the only \
-         copy of a pending row's bytes"
+        staged_read, b"new-bytes",
+        "staging works on its own sibling"
+    );
+    assert!(
+        matches!(&victim_after_stage, Ok(bytes) if bytes == b"SECRET"),
+        "M1 FIXED: create(/foo) must stage in a sibling that cannot be \
+         another row's cache path — /.foo.tmp's only copy read back as \
+         {victim_after_stage:?} after staging"
+    );
+    assert!(
+        matches!(&victim_after_commit, Ok(bytes) if bytes == b"SECRET"),
+        "M1 FIXED: the commit must not disturb /.foo.tmp's copy either; \
+         read back {victim_after_commit:?}"
+    );
+    assert!(
+        h.row("/.foo.tmp").is_some(),
+        "the hidden row is untouched by /foo's lifecycle"
     );
 }
 
 // =====================================================================
-// M2 — reserved device names / trailing dot & space survive vpath + cache
+// M2 — reserved device names / trailing dot & space map to safe,
+//      distinct cache files
 // =====================================================================
 
+/// M2 FIXED: `CacheManager::local_path` sanitizes the disk mapping only —
+/// a reserved-stem name (`/nul.txt`) writes a REAL cache file whose bytes
+/// read back, and the three distinct trailing dot/space vpaths map onto
+/// three distinct disk files (the vpath and the db keep the original
+/// spelling).
 #[test]
-fn m2_reserved_and_degenerate_names_in_vpath_and_on_disk() {
+fn m2_reserved_and_degenerate_names_map_to_real_distinct_cache_files() {
     let h = Harness::new();
-    let cache_root = h.local_path("/");
 
-    for name in [
-        "/CON", "/nul", "/nul.txt", "/aux.txt", "/foo.", "/foo ", "/foo. ",
-    ] {
-        let rel = RelPath::new(name);
-        println!(
-            "[M2] RelPath::new({name:?}) -> {} (path {:?})",
-            rel.is_ok(),
-            rel.as_ref().ok().map(|r| r.as_str().to_string())
-        );
+    // Reserved device stem with an extension: the unmapped form
+    // `nul.txt` writes into the NUL device — the write "succeeds" and the
+    // file never exists, so every read re-downloads forever.
+    let nul = RelPath::new("/nul.txt").expect("vpath accepts it");
+    assert_eq!(nul.as_str(), "/nul.txt", "the vpath itself is untouched");
+    let nul_local = h.vfs.local_path(&nul);
+    fs::write(&nul_local, b"data1234").expect("write the cache copy");
+    let nul_read = fs::read(&nul_local);
+    assert!(
+        matches!(&nul_read, Ok(bytes) if bytes == b"data1234"),
+        "M2 FIXED: bytes written under /nul.txt must land in a real cache \
+         file and read back; got {nul_read:?} at {nul_local:?}"
+    );
+
+    // Trailing dot / space variants are DISTINCT vpaths; each one's cache
+    // copy must be its own disk file holding its own bytes (the unmapped
+    // forms all normalize onto the same `foo` file — cross-row cache
+    // pollution).
+    let written: Vec<(&str, &[u8])> = vec![
+        ("/foo", b"plain".as_slice()),
+        ("/foo.", b"one".as_slice()),
+        ("/foo ", b"two".as_slice()),
+        ("/foo. ", b"three".as_slice()),
+    ];
+    for (name, bytes) in &written {
+        let rel = RelPath::new(name).expect("vpath accepts it");
+        fs::write(h.vfs.local_path(&rel), bytes).expect("write the cache copy");
     }
-
-    // What std::fs actually does with the mapped paths under the cache root.
-    for name in ["/nul", "/nul.txt", "/foo.", "/foo ", "/foo. "] {
+    for (name, bytes) in &written {
         let rel = RelPath::new(name).expect("vpath accepts it");
         let local = h.vfs.local_path(&rel);
-        let write = fs::write(&local, b"data1234");
-        let exists = local.exists();
-        let meta = fs::metadata(&local).map(|m| m.len()).ok();
-        println!(
-            "[M2] name={name:?} local={:?} write={write:?} exists={exists} metadata_len={meta:?}",
-            local
+        let read = fs::read(&local);
+        assert!(
+            matches!(&read, Ok(got) if got == *bytes),
+            "M2 FIXED: the cache copy of {name:?} must live on its own disk \
+             file; read back {read:?} (expected {bytes:?}) at {local:?}"
         );
     }
-
-    // What actually landed in the cache root directory.
-    let mut names: Vec<String> = fs::read_dir(&cache_root)
-        .expect("read cache root")
-        .map(|e| e.expect("entry").file_name().to_string_lossy().into_owned())
-        .collect();
-    names.sort();
-    println!("[M2] cache root now holds: {names:?}");
-
-    // Cross-name contamination: a probe of the virtual "/foo." (an `is_cached`
-    // probe maps it to <root>/foo. which Windows normalizes to <root>/foo).
-    if names.iter().any(|n| n == "foo") {
-        let probe = fs::metadata(h.local_path("/foo.")).map(|m| m.len()).ok();
-        println!(
-            "[M2] metadata(local_path(\"/foo.\")) -> {probe:?} (normalized onto the `foo` file)"
-        );
-        assert_eq!(
-            probe,
-            Some(8),
-            "M2 CONFIRMED (trailing-dot aliasing): /foo. and /foo are the same disk file"
-        );
-    }
-    let _ = names; // silence unused warnings on non-NTFS hosts
 }
 
 // =====================================================================
-// M3 — a >255 wide-char name breaks DirInfo and the whole enumeration
+// M3 — a >255 wide-char name is skipped, never fails the enumeration
 // =====================================================================
 
+/// M3 FIXED: the enumeration of a directory holding a 300-wide-char name
+/// SUCCEEDS — the overlong entry is skipped (`fill_dir_info` answers
+/// `Ok(false)` for it, warn-logged) while the legal entries fill
+/// (`Ok(true)`). The fill outcome is Debug-formatted, so the assertions
+/// read identically before and after the fix.
 #[test]
-fn m3_overlong_name_fills_dir_info_with_an_error() {
+fn m3_overlong_name_is_skipped_without_failing_the_enumeration() {
     let h = Harness::new();
     let long_name = "A".repeat(300);
     h.seed_row(&format!("/{long_name}"), 4, true, Some(1));
@@ -743,45 +831,38 @@ fn m3_overlong_name_fills_dir_info_with_an_error() {
         h.fs.prepare_enumeration(&root, true)
             .expect("prepare_enumeration is fine")
             .expect("Some(entries)");
-    println!(
-        "[M3] prepare_enumeration listed {} entries: {:?}",
-        entries.len(),
-        entries
+    // The listing itself still carries every row (the db is untouched —
+    // only the enumeration fill decides enumerability).
+    assert!(
+        entries.iter().any(|e: &DirEntry| e.name.len() == 300),
+        "the listing carries the overlong row"
+    );
+
+    let mut results: Vec<(usize, String)> = Vec::new();
+    for child in &entries {
+        let mut entry = DirInfo::<255>::new();
+        let reported = match cloudkit_winfsp::fs::fill_dir_info(&mut entry, child) {
+            Ok(written) => format!("ok({written:?})"),
+            Err(error) => format!("err({error:?})"),
+        };
+        results.push((child.name.len(), reported));
+    }
+    println!("[M3] fill results: {results:?}");
+
+    assert!(
+        results.contains(&(300, "ok(false)".to_string())),
+        "M3 FIXED: the 300-wide-char entry must be skipped (Ok(false)) \
+         without an error; got {results:?}"
+    );
+    assert!(
+        results.contains(&(6, "ok(true)".to_string())),
+        "the legal entry still fills (Ok(true)); got {results:?}"
+    );
+    assert!(
+        results
             .iter()
-            .map(|e: &DirEntry| e.name.len())
-            .collect::<Vec<_>>()
-    );
-
-    for child in &entries {
-        let mut entry = DirInfo::<255>::new();
-        let filled = cloudkit_winfsp::fs::fill_dir_info(&mut entry, child);
-        match filled {
-            Ok(()) => println!("[M3] name len {} -> Ok", child.name.len()),
-            Err(error) => println!(
-                "[M3] name len {} -> Err {:?} (ntstatus {:#010x})",
-                child.name.len(),
-                error,
-                error.to_ntstatus() as u32
-            ),
-        }
-    }
-
-    // The long entry must be the one that fails; the normal one must pass.
-    let mut results = Vec::new();
-    for child in &entries {
-        let mut entry = DirInfo::<255>::new();
-        results.push((
-            child.name.len(),
-            cloudkit_winfsp::fs::fill_dir_info(&mut entry, child).is_ok(),
-        ));
-    }
-    assert!(
-        results.contains(&(300, false)),
-        "M3 CONFIRMED: the 300-char entry fails fill_dir_info (winfsp-rs caps the buffer at 255)"
-    );
-    assert!(
-        results.contains(&(6, true)),
-        "the normal entry still fills fine"
+            .all(|(_, reported)| reported.starts_with("ok(")),
+        "no entry may fail the directory enumeration; got {results:?}"
     );
     h.fs.close(root);
 }

@@ -970,6 +970,10 @@ fn vfs_err(error: VfsError) -> FsError {
         VfsError::Exists(_) => FsError::Exists,
         VfsError::ParentMissing(_) => FsError::NotFound,
         VfsError::UploadPending(_) => FsError::Forbidden,
+        // The write surfaces refuse overlong segments up front (review
+        // M3): a refusal of the name itself is a policy refusal ->
+        // Forbidden.
+        VfsError::NameTooLong { .. } => FsError::Forbidden,
         VfsError::QueueClosed
         | VfsError::Db(_)
         | VfsError::Transport(_)
