@@ -1246,3 +1246,45 @@ async fn stale_empty_put_artifact_neither_phantom_uploads_nor_deletes_cache() {
     assert_eq!(chunks.len(), 1, "the real job's chunk row exists");
     assert_eq!(chunks[0].telegram_msg_id, Some(2));
 }
+
+/// H2（幽灵 outstanding）：过期空 PUT 工件的 skip 路径也必须落到某个
+/// 终态计数器——工件任务入队时已计入 enqueued，若 skip 时既不计
+/// succeeded 也不计 degraded，则 enqueued − (succeeded + degraded)
+/// 恒 ≥ 1，REMOVE 的排空判据永远等不到归零（LIST 的 pending 同理）。
+/// 裁决：计入 degraded（本队列「未上传即终态」的既有语义，与无行/
+/// 元数据读失败路径一致）；db 行归补全的 full PUT 任务所有。
+#[tokio::test]
+async fn stale_empty_put_artifact_reaches_terminal_queue_state() {
+    let (_dir, db, cache, mock) = test_env().await;
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let handle = spawn_queue(db.clone(), transport, test_cfg(64));
+
+    // MiniRedir 空 PUT 工件（行 size=0 + 空缓存副本），随后补全的
+    // full PUT 已把行抢先更新为 size=3（真实链序：empty PUT → LOCK →
+    // full PUT）；缓存副本重写为完整内容——skip 路径无权删它。
+    let local = seed_pending(&db, &cache, "/f.bin", b"", 1);
+    fs::write(&local, b"abc").expect("rewrite cache copy");
+    seed_row(&db, "/f.bin", 3, 1, false, None);
+
+    handle
+        .enqueue(job_for(&cache, "/f.bin", 0, 1, 64))
+        .await
+        .expect("enqueue artifact");
+    handle.shutdown().await;
+
+    let stats = handle.stats();
+    assert_eq!(stats.enqueued, 1);
+    assert_eq!(stats.degraded, 1, "skipped artifact counts as degraded");
+    assert_eq!(
+        stats.succeeded + stats.degraded,
+        stats.enqueued,
+        "every enqueued job must reach a terminal state (the drain predicate)"
+    );
+    assert!(mock.upload_calls().is_empty(), "transport never called");
+    let row = db.get_file("/f.bin").expect("db read").expect("row exists");
+    assert!(
+        !row.is_uploaded,
+        "the superseding full PUT owns the outcome"
+    );
+    assert!(local.exists(), "cache copy kept for the superseding job");
+}

@@ -2021,15 +2021,7 @@ impl RuntimeVolumeControl {
                 None => runtime.spec().settings.backend.as_str().to_string(),
             };
             let pending = match runtime.vfs() {
-                Some(vfs) => {
-                    let stats = vfs.queue_stats();
-                    format!(
-                        "pending={}",
-                        stats
-                            .enqueued
-                            .saturating_sub(stats.succeeded + stats.degraded)
-                    )
-                }
+                Some(vfs) => format!("pending={}", vfs.queue_stats().outstanding()),
                 None => "pending=-".to_string(),
             };
             reply.push_str(&format!(
@@ -2256,10 +2248,7 @@ impl RuntimeVolumeControl {
         // its terminal states), bounded by the drain budget.
         let deadline = Instant::now() + self.tuning.drain_timeout;
         loop {
-            let stats = vfs.queue_stats();
-            let outstanding = stats
-                .enqueued
-                .saturating_sub(stats.succeeded + stats.degraded);
+            let outstanding = vfs.queue_stats().outstanding();
             if outstanding == 0 {
                 break;
             }

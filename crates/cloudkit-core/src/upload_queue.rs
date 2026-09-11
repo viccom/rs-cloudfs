@@ -188,6 +188,17 @@ pub struct QueueStats {
     pub retries: u64,
 }
 
+impl QueueStats {
+    /// Jobs that have not reached a terminal state yet — the queue's
+    /// drain predicate (REMOVE's budgeted wait, LIST's `pending=`).
+    /// Every skip path must land in exactly one terminal counter, or
+    /// this never settles (H2: a stale empty-PUT artifact skipped
+    /// without accounting kept one ghost outstanding forever).
+    pub fn outstanding(&self) -> u64 {
+        self.enqueued.saturating_sub(self.succeeded + self.degraded)
+    }
+}
+
 /// The four atomic counters shared by the handle and every worker task.
 #[derive(Default)]
 struct StatsCounters {
@@ -601,6 +612,16 @@ async fn process_job(
                 row_size = row.size,
                 "stale empty-PUT artifact skipped: the row was superseded by a full PUT"
             );
+            // Terminal accounting: the job was already counted in
+            // `enqueued`, so the skip must land in exactly one terminal
+            // counter or the drain predicate (enqueued − terminal) never
+            // settles and REMOVE/LIST wait forever (H2's ghost
+            // outstanding). Counted as `degraded` — this queue's
+            // established "not uploaded" terminal state (same as the
+            // unknown-row and metadata-failure paths): no requeue side
+            // effects, and the db row belongs to the superseding full
+            // PUT's job.
+            bump(&stats.degraded);
             return;
         }
         match persist_zero_byte(db, &row, sha256) {
