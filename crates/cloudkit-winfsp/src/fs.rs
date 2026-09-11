@@ -19,9 +19,11 @@
 //! Case sensitivity (known, deliberate): lookups are byte-exact against
 //! the `/`-separated rows (`RelPath`'s contract). Windows sends the names
 //! it saw in `read_directory`, so Explorer's own navigation matches, but
-//! a program typed-`\DOCS\README.TXT` miss is a `STATUS_OBJECT_NAME_NOT_FOUND`
-//! until a case-folding layer is decided (WF4 open question, not
-//! invented here).
+//! a program typed-`\DOCS\README.TXT` miss with an existing `\DOCS` row
+//! is a `STATUS_OBJECT_NAME_NOT_FOUND` until a case-folding layer is
+//! decided (WF4 open question, not invented here). A miss whose parent
+//! row is gone (or not a directory) is `STATUS_OBJECT_PATH_NOT_FOUND` —
+//! review M6, RB4.
 
 use std::collections::HashMap;
 use std::ffi::c_void;
@@ -33,9 +35,14 @@ use std::time::{Duration, Instant};
 // so two reads of one reused handle serialize instead of interleaving
 // fills) — hence the await-aware lock, the same choice ck-baidu's token
 // refresh lock makes. Everything else here is a plain `std` mutex: the
-// enumeration buffer, the grace table, the open-time stat snapshot and
-// the staged write state are only ever held synchronously (the staged
-// writer's commit is taken OUT of its slot before the bridge blocks).
+// enumeration buffer, the grace table and the open-time stat snapshot are
+// only ever held synchronously. The staged write slot is the one bounded
+// exception (review winfsp-M5, RB4): `writer_slot` holds its guard across
+// the materializing `block_on(hydrate)` on purpose — the awaited future
+// never takes the slot itself, so this is same-handle serialization
+// (a second writer, or a reader, waits out the one hydrate), never a
+// deadlock — and `commit` is taken OUT of its slot before the bridge
+// blocks.
 use tokio::sync::Mutex as AsyncMutex;
 
 use cloudkit_core::database::FileRecord;
@@ -640,6 +647,22 @@ pub const DEFAULT_HANDLE_GRACE: Duration = Duration::from_secs(5);
 /// (open/close), so the table drains as soon as any handle moves.
 pub const DEFAULT_GRACE_CAPACITY: usize = 64;
 
+/// Upper bound on the [`CloudFs::with_stream_window`] override (review
+/// winfsp-L6, RB4): the seam exists so tests can make multi-window read
+/// sequences observable with small windows, and production keeps
+/// [`crate::reader::DEFAULT_READ_WINDOW`]. 64 MiB is 16× that default —
+/// far past anything an observability test needs — so an override past
+/// it is misuse the clamp absorbs instead of a per-window memory and
+/// fetch blast radius a caller could accidentally ask for.
+pub const MAX_STREAM_WINDOW: u64 = 64 * 1024 * 1024;
+
+/// The clamp [`CloudFs::with_stream_window`] applies: at least one byte
+/// (a 0-byte window could never make progress), at most
+/// [`MAX_STREAM_WINDOW`].
+pub fn clamp_stream_window(window: u64) -> u64 {
+    window.clamp(1, MAX_STREAM_WINDOW)
+}
+
 impl CloudFs {
     /// Assembles the adapter over an already-built VFS.
     ///
@@ -678,8 +701,11 @@ impl CloudFs {
     /// the WebDAV adapter's `with_stream_window`: small windows turn
     /// multi-window read sequences observable without multi-megabyte
     /// fixtures; production keeps [`crate::reader::DEFAULT_READ_WINDOW`]).
+    /// The override is clamped through [`clamp_stream_window`] — a seam
+    /// without a ceiling would store an absurd override verbatim (review
+    /// winfsp-L6, RB4).
     pub fn with_stream_window(mut self, window: u64) -> Self {
-        self.stream_window = window.max(1);
+        self.stream_window = clamp_stream_window(window);
         self
     }
 
@@ -757,7 +783,7 @@ impl CloudFs {
         self.resolve_row(rel)?
             .as_ref()
             .map(Meta::from_record)
-            .ok_or_else(|| STATUS_OBJECT_NAME_NOT_FOUND.into())
+            .ok_or_else(|| self.lookup_miss(rel))
     }
 
     /// The row for `rel` under Windows case semantics: the exact
@@ -834,7 +860,7 @@ impl CloudFs {
         // a caller's case variant.
         let record = self
             .resolve_row(rel)?
-            .ok_or_else(|| FspError::from(STATUS_OBJECT_NAME_NOT_FOUND))?;
+            .ok_or_else(|| self.lookup_miss(rel))?;
         // Review H2: a db row's rel_path is only ever canonical when it
         // came from an in-tree writer; external/legacy writers (the
         // Python baseline does no validation) can park a non-vpath
@@ -938,6 +964,25 @@ impl CloudFs {
                 _ => Err(STATUS_OBJECT_PATH_NOT_FOUND.into()),
             },
             _ => Ok(()),
+        }
+    }
+
+    /// The lookup-miss verdict for the open face (`open`, and
+    /// `get_security_by_name` through `meta_for`): `NAME_NOT_FOUND` when
+    /// the parent directory row exists (the entry itself is missing),
+    /// `PATH_NOT_FOUND` when the parent is missing or not a directory —
+    /// the same NT shape `require_dir_parent` answers on the create arm
+    /// (review M6, RB4: the two arms used to disagree, open reporting a
+    /// name miss for a path whose directory chain is gone). A root-level
+    /// or parentless miss is a plain name miss.
+    fn lookup_miss(&self, rel: &RelPath) -> FspError {
+        match rel.parent() {
+            Some(parent) if !parent.is_root() => match self.row(&parent) {
+                Ok(Some(row)) if row.is_dir => STATUS_OBJECT_NAME_NOT_FOUND.into(),
+                Ok(_) => STATUS_OBJECT_PATH_NOT_FOUND.into(),
+                Err(error) => error,
+            },
+            _ => STATUS_OBJECT_NAME_NOT_FOUND.into(),
         }
     }
 

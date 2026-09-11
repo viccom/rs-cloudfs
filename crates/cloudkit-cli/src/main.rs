@@ -463,7 +463,13 @@ async fn mount_cmd_winfsp(
         return Ok(()); // Ctrl+C during the connect
     };
     let stack = cloudkit_cli::build_stack(&cfg, transport).await?;
-    let label = cfg.drive_letter.clone();
+    // Review L1 (RB4): the volume label is the NAME Explorer shows, not
+    // the mount point — labeling the volume with its own drive letter
+    // ("V:") told the operator nothing. Single-volume mode has no volume
+    // name (that is a multi-volume `volumes_dir` concept, K21), so the
+    // stable product name is the honest label; the letter stays visible
+    // as the mount point in the banner.
+    let label = "CyDrive".to_string();
     let vfs = Arc::clone(&stack.vfs);
     let rt = tokio::runtime::Handle::current();
     let mount_point = letter.clone();

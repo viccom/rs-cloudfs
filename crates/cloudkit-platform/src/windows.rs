@@ -90,30 +90,62 @@ pub fn read_webclient_params() -> Option<(u32, u32)> {
 /// `InstallDir` under either [`WINFSP_REG_KEYS`] subkey, plus the runtime
 /// DLL when it is there.
 ///
-/// Read-only by design (`doctor`'s leg): no load, no `winfsp_init`, no
-/// feature flag — a machine without WinFsp simply gets `None`, which is
-/// the `[WARN]` the doctor renders. `None` also covers "the registry key
-/// is unreadable", which is indistinguishable from "not installed" for
-/// diagnosis purposes.
+/// Selection semantics (review cli-M1, RB4 — the exact shape the runtime
+/// gate in `cloudkit-winfsp`'s mount probe follows, so the doctor can
+/// never diagnose a half install while a mount would happily run): each
+/// subkey's `InstallDir` is a *candidate*; a candidate whose runtime DLL
+/// is missing is skipped and the next subkey probed, and only when no
+/// candidate carries the DLL does the probe report the first readable
+/// `InstallDir` with `dll: None` (the true half-install the doctor
+/// warns about). Read-only by design (`doctor`'s leg): no load, no
+/// `winfsp_init`, no feature flag — a machine without WinFsp simply gets
+/// `None`, which is the `[WARN]` the doctor renders. `None` also covers
+/// "the registry key is unreadable", which is indistinguishable from
+/// "not installed" for diagnosis purposes.
 pub fn winfsp_install() -> Option<WinFspInstall> {
+    let candidates = crate::WINFSP_REG_KEYS
+        .iter()
+        .filter_map(|subkey| read_install_dir(subkey));
+    pick_winfsp_install(candidates)
+}
+
+/// Reads one subkey's `InstallDir` (a pure registry read; `None` when
+/// the key or the value is unreadable).
+fn read_install_dir(subkey: &str) -> Option<std::path::PathBuf> {
     use winreg::enums::{HKEY_LOCAL_MACHINE, KEY_READ};
 
     let hklm = winreg::RegKey::predef(HKEY_LOCAL_MACHINE);
-    for subkey in crate::WINFSP_REG_KEYS {
-        let Ok(key) = hklm.open_subkey_with_flags(subkey, KEY_READ) else {
-            continue;
-        };
-        let Ok(dir) = key.get_value::<String, _>("InstallDir") else {
-            continue;
-        };
-        let install_dir = std::path::PathBuf::from(dir);
+    let key = hklm.open_subkey_with_flags(subkey, KEY_READ).ok()?;
+    key.get_value::<String, _>("InstallDir")
+        .ok()
+        .map(std::path::PathBuf::from)
+}
+
+/// The probe's selection seam (pure, so both sides of the cli-M1
+/// alignment are testable without a real registry): the first candidate
+/// whose runtime DLL exists — a DLL-less candidate never masks a good
+/// later one.
+fn pick_winfsp_install<I>(candidates: I) -> Option<WinFspInstall>
+where
+    I: IntoIterator<Item = std::path::PathBuf>,
+{
+    let mut first_readable = None;
+    for install_dir in candidates {
         let dll = install_dir.join("bin").join(crate::WINFSP_X64_DLL);
-        return Some(WinFspInstall {
-            dll: dll.exists().then_some(dll),
-            install_dir,
-        });
+        if dll.exists() {
+            return Some(WinFspInstall {
+                dll: Some(dll),
+                install_dir,
+            });
+        }
+        if first_readable.is_none() {
+            first_readable = Some(install_dir);
+        }
     }
-    None
+    first_readable.map(|install_dir| WinFspInstall {
+        dll: None,
+        install_dir,
+    })
 }
 
 /// Maps the WebDAV endpoint at `url` to a drive letter and returns the
@@ -188,5 +220,88 @@ fn registry_error(context: &str, err: &std::io::Error) -> PlatformError {
         ))
     } else {
         PlatformError::Registry(format!("{context}: {err}"))
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A fake install tree: `<dir>/bin/winfsp-x64.dll`.
+    fn install_tree(dir: &Path, with_dll: bool) -> std::path::PathBuf {
+        let bin = dir.join("bin");
+        std::fs::create_dir_all(&bin).expect("create bin/");
+        if with_dll {
+            std::fs::write(bin.join(crate::WINFSP_X64_DLL), b"dll").expect("write dll");
+        }
+        dir.to_path_buf()
+    }
+
+    /// cli-M1 (review RB4): the selection seam — probe order wins when
+    /// the first candidate is complete, a DLL-less candidate never masks
+    /// a good later one, and a no-DLL-everywhere probe reports the first
+    /// readable `InstallDir` as the half install (the doctor's Warn).
+    #[test]
+    fn pick_winfsp_install_prefers_the_first_complete_candidate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let first = install_tree(&dir.path().join("first"), true);
+        let second = install_tree(&dir.path().join("second"), true);
+
+        let picked = pick_winfsp_install([first.clone(), second.clone()]);
+        assert_eq!(
+            picked.expect("complete first candidate").install_dir,
+            first,
+            "probe order wins when the first candidate is complete"
+        );
+    }
+
+    #[test]
+    fn pick_winfsp_install_skips_a_dll_less_candidate() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stale = install_tree(&dir.path().join("stale"), false);
+        let good = install_tree(&dir.path().join("good"), true);
+
+        let picked = pick_winfsp_install([stale.clone(), good.clone()])
+            .expect("the second candidate is complete");
+        assert_eq!(
+            picked.install_dir, good,
+            "a stale first install must not mask a good second one (cli-M1)"
+        );
+        assert!(picked.dll.is_some(), "the picked candidate carries its DLL");
+        assert_eq!(
+            picked
+                .dll
+                .as_ref()
+                .expect("dll")
+                .parent()
+                .and_then(Path::parent),
+            Some(good.as_path()),
+            "the DLL path is <install_dir>/bin/winfsp-x64.dll"
+        );
+    }
+
+    #[test]
+    fn pick_winfsp_install_reports_the_half_install_when_no_dll_exists() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let stale = install_tree(&dir.path().join("stale"), false);
+
+        let picked = pick_winfsp_install([stale.clone(), dir.path().join("missing")])
+            .expect("a readable InstallDir without a DLL is still reported");
+        assert_eq!(
+            picked.install_dir, stale,
+            "the first readable dir is reported"
+        );
+        assert!(
+            picked.dll.is_none(),
+            "no candidate carries the DLL: the half install the doctor warns about"
+        );
+    }
+
+    #[test]
+    fn pick_winfsp_install_answers_none_for_no_candidates() {
+        assert!(
+            pick_winfsp_install([]).is_none(),
+            "no readable InstallDir at all: not installed"
+        );
     }
 }

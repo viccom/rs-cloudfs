@@ -19,9 +19,9 @@
 //! - M3: an overlong (>255 UTF-16 units) name is skipped by the
 //!   enumeration instead of failing the whole directory.
 //!
-//! The remaining probes (H3/M6) still assert the UNFIXED bug behavior —
-//! they pass against the current tree on purpose and are flipped by their
-//! own batches (H3 has no batch yet, M6 is RB4), the same red-first way.
+//! The remaining probe (H3) still asserts the UNFIXED bug behavior — it
+//! passes against the current tree on purpose and is flipped by its own
+//! batch when one exists (M6 was flipped the same red-first way by RB4).
 //!
 //! Run:
 //!   CARGO_TARGET_DIR='E:/Rs_Codes/rs-cloudfs/target' \
@@ -868,18 +868,20 @@ fn m3_overlong_name_is_skipped_without_failing_the_enumeration() {
 }
 
 // =====================================================================
-// M6 — open of /missing/file reports NAME_NOT_FOUND, not PATH_NOT_FOUND
+// M6 — open under a MISSING parent reports PATH_NOT_FOUND (RB4-fixed:
+// written against the buggy tree asserting NAME_NOT_FOUND first, flipped
+// here the same red-first way)
 // =====================================================================
 
 #[test]
-fn m6_open_under_a_missing_parent_reports_name_not_found() {
+fn m6_open_under_a_missing_parent_reports_path_not_found() {
     let h = Harness::new();
     h.seed_uploaded_file("/real.txt", b"x");
 
     let status = status_of(h.open("/missing/file.txt"));
     println!(
         "[M6] open(/missing/file.txt) status = {status:#010x} \
-         (0xC0000034=NAME_NOT_FOUND, Windows expects 0xC000003A=PATH_NOT_FOUND)"
+         (0xC000003A=PATH_NOT_FOUND, the parent directory is gone)"
     );
-    assert_eq!(status, 0xC000_0034, "STATUS_OBJECT_NAME_NOT_FOUND");
+    assert_eq!(status, 0xC000_003A, "STATUS_OBJECT_PATH_NOT_FOUND");
 }

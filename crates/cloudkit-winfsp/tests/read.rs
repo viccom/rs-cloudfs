@@ -839,3 +839,40 @@ fn aead_v2_grace_reopen_reuses_the_parked_state_header_pulled_once() {
         "the reopened handle still never hydrates"
     );
 }
+
+// =====================================================================
+// winfsp-L6 — the stream-window override has an upper bound (RB4)
+// =====================================================================
+
+/// review winfsp-L6 (RB4): `with_stream_window` is a testing seam, and a
+/// seam without a ceiling is a misuse hazard — an absurd override used to
+/// be stored verbatim. The clamp: at least one byte (a 0-byte window
+/// could never make progress, the pre-existing rule), at most
+/// `MAX_STREAM_WINDOW` (16× the production default — far past anything a
+/// multi-window-observability test needs).
+#[test]
+fn stream_window_override_is_clamped() {
+    use cloudkit_winfsp::fs::{clamp_stream_window, MAX_STREAM_WINDOW};
+
+    assert_eq!(
+        clamp_stream_window(0),
+        1,
+        "a 0-byte window could never make progress"
+    );
+    assert_eq!(
+        clamp_stream_window(16),
+        16,
+        "a legal small test window passes through unchanged"
+    );
+    assert_eq!(
+        clamp_stream_window(u64::MAX),
+        MAX_STREAM_WINDOW,
+        "an absurd override is clamped to the ceiling, not stored"
+    );
+}
+
+/// Compile-time pin: the ceiling never constrains the production default.
+const _: () = assert!(
+    cloudkit_winfsp::fs::MAX_STREAM_WINDOW > cloudkit_winfsp::reader::DEFAULT_READ_WINDOW,
+    "the ceiling must not constrain the production default"
+);

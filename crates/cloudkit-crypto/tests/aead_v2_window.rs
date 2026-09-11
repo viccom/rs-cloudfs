@@ -312,3 +312,25 @@ fn window_decrypt_fails_closed() {
         Err(CryptoError::AuthFailed)
     ));
 }
+
+// --------------------------------------------------- index bounds (RB4) ---
+
+/// stream-M3 (review RB4): a chunk index at/past the nonce capacity
+/// (`MAX_CHUNKS` = 2^56, a private v2 constant) is a RUNTIME
+/// `CryptoError::Malformed` — the format cannot address such a chunk, so
+/// the input is rejected up front instead of relying on a debug-only
+/// assertion (which panicked under the test profile) or, worse, silently
+/// deriving an unauthenticated-trust nonce in release.
+#[test]
+fn decrypt_chunk_rejects_an_index_beyond_nonce_capacity_at_runtime() {
+    let ct = scheme_small().encrypt(PW, &pattern(S + 3));
+    let w = window_for(&ct);
+    let (off, len) = w.ciphertext_span(0, 0, (S + 3) as u64);
+    let chunk = &ct[off as usize..(off + len) as usize];
+
+    let beyond_capacity: u64 = 1 << 56;
+    assert!(matches!(
+        w.decrypt_chunk(beyond_capacity, false, chunk),
+        Err(CryptoError::Malformed)
+    ));
+}

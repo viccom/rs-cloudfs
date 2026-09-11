@@ -3136,7 +3136,22 @@ async fn mount_volumes_if_configured(plan: &MountPlan<'_>) -> VolumeMounts {
     #[cfg(not(unix))]
     {
         if plan.claims.is_empty() {
-            tracing::info!("no volume claimed a drive_letter; skipping the drive mappings");
+            // Review L2 (RB4): the claims list is pre-filtered upstream —
+            // with the webdav backend and a degraded listener it is
+            // emptied wholesale (`run_multi_volume`'s claims match), so
+            // "no volume claimed" would be a lie there. Name the actual
+            // reason instead; with the winfsp backend (or a bound
+            // listener) an empty list really is no claims.
+            if plan.process_cfg.mount_backend == MountBackend::Winfsp {
+                tracing::info!("no volume claimed a drive_letter; skipping the drive mounts");
+            } else if plan.webdav_available {
+                tracing::info!("no volume claimed a drive_letter; skipping the drive mappings");
+            } else {
+                tracing::info!(
+                    "the WebDAV listener is not bound (the bind degraded), so the drive \
+                     mappings have no endpoint to mount; skipping"
+                );
+            }
             return VolumeMounts::default();
         }
         if !plan.process_cfg.auto_mount_drive {

@@ -17,6 +17,8 @@ http = "1"
 hyper = { version = "1", default-features = false, features = ["http1", "server"] }
 hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
 thiserror = "2"
+# stream-M1 (review RB4): the short-window warn in `fill_window`.
+tracing = "0.1"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt", "sync"] }
 
 [dev-dependencies]
