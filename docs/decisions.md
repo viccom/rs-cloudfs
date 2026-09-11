@@ -560,3 +560,10 @@
 - **delete_pending 半死代码维持现状**：子代理核验证伪「全死」前提——mark_delete 生产调用 ×2（set_delete 流）+ 测试读 ×4 钉契约，属「生产写不读、测试读」形态；激活需先设计 set_delete × cleanup-delete 竞争语义（行为变更，超出清尾批授权）。挂账记录，审查原文允许「或不处理」。
 - **全历史秘密审查销账（待人工清单 #3 尾注）**：gitleaks 8.30.1 全历史 388 提交/4.47MB，8 命中逐一比对**全部为公开 Cynet Android api_hash 常量**（与 config.rs 默认值同源，含示例文件注释、spike example、旧 cydrive-core 默认值与测试断言、AGENTS 历史行）——**零真实凭据**，公开化前的历史审查项有据销账。
 - **门禁与计数**：winfsp 腿 117/0/1（+3：derive_volume_serial 单测、H1 第三探针、metadata 换算测试）；workspace 911/0/9 不变（新测试全在 feature 腿）；clippy×2/fmt/check_layers/scan_secrets 全绿。
+
+## 2026-09-11 负责人裁决四项（基线设计收口 + telegram E2E 定向）
+
+- **§9-2 旧仓策略 → 裁定：rs-CyDrive 正式冻结**（仅 hotfix；新仓 rs-cloudfs 为唯一主线；upstream-cydrive 维持只读参照）。事实状态本已如此（旧仓末次提交 2026-09-07 即融合设计文档本身），本次升格为正式裁决。**生产部署位切换时机未裁**，作为独立待排期小批挂账（D:\Tools\rs-CyDrive 旧二进制 → 新仓 0.10.0+ 部署：migrate 迁移配置 + telegram 真机验收 + 切换；切换前生产持续缺 2026-09-10/11 的流式与挂载修复）。
+- **§9-3 bot-telegram 层级 → 裁定：按建议确认**（L5 应用形态、v1 不拆 crate，维持 ck-telegram 驱动层现状；新仓无 bot 应用层代码，将来若立项 bot 功能再议拆分）。
+- **§9-4 Phase 1 内 R/E 顺序 → 裁定：R→E 已自然落地，项销账**（K42 窗口读模型先行、K47 aead_v2 装饰器随后，与建议顺序一致且已真机验证——无需再做选择）。
+- **telegram E2E 腿 → 裁定：选项 B 独立测试 bot/chat**（§7a 默认「不接受生产污染」维持有效；负责人将登录 Telegram 经 @BotFather 创建测试 bot，测试配置落 `E:\GitHub\rs-CyDrive\test\`（§7a 原定凭据路径，目录需新建）；bot 就位前 telegram E2E 批不开工。所有 E2E 写操作仍限定 `/_e2e/` 前缀 + 收尾清理）。
