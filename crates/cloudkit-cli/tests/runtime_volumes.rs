@@ -836,3 +836,219 @@ async fn list_works_and_add_without_dispatch_refuses() {
         .expect("shutdown completes")
         .expect("shutdown joins cleanly");
 }
+
+// ------------------------------- 4. shutdown gate vs in-flight commands (H1) ---
+
+/// H1 (review fix): a REMOVE caught mid-drain by the shutdown gate —
+/// Ctrl+C / `cydrive stop` firing while the K50 drain step waits on a
+/// held upload — must observe the gate within one poll tick, put the
+/// entry BACK into the live table (so the stop task's idle barrier plus
+/// `take_all` sees it and the volume drains through the shutdown
+/// sequence), and answer a shutdown-specific ERR well before the drain
+/// budget expires. The `FakeRelease` probe, planted while the entry
+/// still sits in the live table (REMOVE's first move takes it out),
+/// travels with the entry and proves the hand-back end to end: after
+/// the shutdown joins, its one and only attempt ran — the stop task's
+/// teardown pass released the handed-back entry.
+#[tokio::test]
+async fn remove_drain_observes_the_shutdown_gate_and_hands_the_entry_back() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    write_file(
+        &dir.path().join("volumes").join("stuck.toml"),
+        &volume_toml("222:BBB", 222222),
+    );
+    let _guard = chdir(dir.path());
+
+    let specs = cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load specs");
+    assert_eq!(
+        specs
+            .iter()
+            .map(|spec| spec.name.clone())
+            .collect::<Vec<_>>(),
+        vec!["a".to_string(), "stuck".to_string()],
+        "the mocks pair up with the specs by position"
+    );
+    // stuck's boot transport: one authoritative RateLimited{12s} — the
+    // worker honors the wait exactly (the job stays in flight, REMOVE
+    // parks in its drain loop), and the exhausted script then serves
+    // the retry as Ok, so the shutdown's own queue drain finishes
+    // shortly after the sleep instead of hanging the test.
+    let stuck_mock = Arc::new(
+        MockTransport::builder()
+            .upload_action(UploadAction::Fail {
+                error: StorageError::RateLimited {
+                    retry_after: Some(Duration::from_secs(12)),
+                },
+            })
+            .build(),
+    );
+    stuck_mock.connect().await.expect("pre-connect stuck mock");
+    let handle = boot_with_commands(
+        process_config(),
+        specs,
+        vec![mock_transport().await, stuck_mock],
+        RuntimeVolumeCommands {
+            dispatch: Some(mock_dispatch()),
+            // A 10s drain budget: the red behaviour would wait it out
+            // fully; the gate observation must win far earlier.
+            remove_tuning: RemoveTuning {
+                drain_timeout: Duration::from_secs(10),
+                poll_interval: Duration::from_millis(50),
+            },
+        },
+    )
+    .await;
+    let addr = control_addr();
+
+    // Hold one real upload in flight (the RateLimited sleep).
+    let source = dir.path().join("hold.txt");
+    fs::write(&source, b"hold me in flight").expect("write source");
+    let rel = RelPath::new("/hold.txt").expect("valid rel path");
+    handle
+        .volume("stuck")
+        .expect("volume stuck")
+        .vfs()
+        .expect("vfs stuck")
+        .ingest_file(&rel, &source, 1.0)
+        .await
+        .expect("ingest into stuck");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The release probe goes in BEFORE the REMOVE takes the entry out:
+    // it then travels with the entry (take → hand-back → take_all), and
+    // only the stop task's teardown pass calls it.
+    let attempts = Arc::new(AtomicUsize::new(0));
+    let released = Arc::new(AtomicBool::new(false));
+    assert!(
+        handle.live_table().set_release(
+            "stuck",
+            Box::new(FakeRelease {
+                attempts: Arc::clone(&attempts),
+                released: Arc::clone(&released),
+                succeed: true,
+            }),
+        ),
+        "the probe injects into the live volume"
+    );
+
+    // REMOVE parks in its drain loop, THEN the gate fires — the Ctrl+C
+    // topology (a control-channel STOP would queue behind the in-flight
+    // REMOVE on the accept loop; the signal arm fires the gate directly
+    // through `request_stop`, which is what races the command). The
+    // reply wording pins that the drain observation point answered, not
+    // the entry refusal.
+    let started = std::time::Instant::now();
+    let remove_task = tokio::spawn(async move { send_cmd(addr, "REMOVE stuck").await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    handle.request_stop();
+    let reply = timeout(Duration::from_secs(8), remove_task)
+        .await
+        .expect("REMOVE settles after the gate fire")
+        .expect("the REMOVE task joins");
+    let elapsed = started.elapsed();
+    assert!(
+        reply.starts_with("ERR:")
+            && reply.contains("shutting down")
+            && reply.contains("removal aborted"),
+        "REMOVE answers the shutdown-specific drain abort (took {elapsed:?}): {reply}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "the gate observation wins well inside the 10s drain budget: {elapsed:?}"
+    );
+
+    // The real stop task now owns the handed-back entry: its idle
+    // barrier waits out the in-flight REMOVE, `take_all` sees the entry
+    // (the hand-back is what the release probe proves), and the queue
+    // drain joins once the held worker's 12s sleep expires.
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+    assert_eq!(
+        attempts.load(Ordering::SeqCst),
+        1,
+        "exactly one release ran — the shutdown's teardown pass picked up the handed-back entry"
+    );
+    assert!(
+        released.load(Ordering::SeqCst),
+        "the handed-back entry's release step actually ran"
+    );
+}
+
+/// H1 (review fix): once the stop gate has fired, the command surface
+/// refuses new ADD/REMOVE (an answer must still come back — the
+/// connection task parks on the reply one-shot) while the read-only
+/// LIST keeps answering; nothing mutates the tables the shutdown
+/// sequence is about to drain. Red: the ADD runs to completion (an OK)
+/// and the REMOVE runs into the already-drained live state.
+#[tokio::test]
+async fn volume_commands_are_refused_after_the_stop_gate_fires() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    write_file(
+        &dir.path().join("volumes").join("b.toml"),
+        &volume_toml("333:CCC", 333333),
+    );
+    let _guard = chdir(dir.path());
+
+    let specs = {
+        let mut v =
+            cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load volume specs");
+        v.retain(|spec| spec.name == "a");
+        v
+    };
+    let handle = boot_with_commands(
+        process_config(),
+        specs,
+        vec![mock_transport().await],
+        RuntimeVolumeCommands {
+            dispatch: Some(mock_dispatch()),
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await;
+    let addr = control_addr();
+
+    // Fire the gate the production way (a real `cydrive stop` walks
+    // this exact path); the accept loop keeps serving connections, so a
+    // late command still reaches the handler.
+    let reply = send_cmd(addr, "STOP").await;
+    assert!(reply.starts_with("OK:"), "STOP acknowledges: {reply}");
+
+    let reply = send_cmd(addr, "ADD b").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("shutting down"),
+        "ADD after the gate is refused with the shutdown reason: {reply}"
+    );
+    let reply = send_cmd(addr, "REMOVE a").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("shutting down"),
+        "REMOVE after the gate is refused with the shutdown reason: {reply}"
+    );
+    let reply = send_cmd(addr, "LIST").await;
+    assert!(
+        reply.starts_with("OK:") && reply.contains("a running"),
+        "the read-only LIST still answers on a shutting-down instance: {reply}"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}

@@ -283,6 +283,14 @@ impl ShutdownWatch {
             }
         }
     }
+
+    /// Whether the gate has already fired — the synchronous probe the
+    /// volume-command surface checks at its entry and mid-sequence
+    /// observation points (review H1); [`ShutdownWatch::wait`] is the
+    /// async face. Latched like the gate itself.
+    pub fn fired(&self) -> bool {
+        *self.rx.borrow()
+    }
 }
 
 /// A running CyDrive stack: the WebDAV server, the web dashboard, the
@@ -1154,13 +1162,17 @@ impl VolumeLiveTable {
 
     /// Takes the volume's entry out (REMOVE's first move); the caller
     /// either commits the removal or puts the entry back with
-    /// [`VolumeLiveTable::insert`] when a K50 step aborts.
+    /// [`VolumeLiveTable::insert`] when a K50 step aborts. The
+    /// find-and-remove is atomic under ONE lock hold (review H1): the
+    /// previous two-lock form let a concurrent [`VolumeLiveTable::
+    /// take_all`] empty the vec between the position lookup and the
+    /// remove, panicking out of bounds and killing the control loop.
     fn take(&self, name: &str) -> Option<LiveVolume> {
-        let position = self
-            .lock()
+        let mut guard = self.lock();
+        let position = guard
             .iter()
             .position(|(registered, _)| registered == name)?;
-        Some(self.lock().remove(position).1)
+        Some(guard.remove(position).1)
     }
 
     /// Re-attaches the mount record + release step of a volume that
@@ -1358,6 +1370,19 @@ impl MultiVolumeHandle {
     /// stop gate fires (control STOP, `shutdown`, Ctrl+C in `run`).
     pub async fn wait_for_stop_request(&self) {
         self.watch.wait().await;
+    }
+
+    /// Fires the stop gate WITHOUT joining the stop task — the
+    /// signal-arm semantic (`run`'s Ctrl+C/SIGTERM select cannot await;
+    /// a real `shutdown` is trigger-then-join, this is the trigger
+    /// alone). The aggregated stop sequence starts on its own task; a
+    /// later [`MultiVolumeHandle::shutdown`] joins it (the trigger is
+    /// idempotent). In-process callers — and the tests that need a
+    /// gate fire mid-command, exactly where a signal would land — use
+    /// this instead of racing the control channel's STOP (which queues
+    /// behind an in-flight volume command).
+    pub fn request_stop(&self) {
+        self.watch.trigger();
     }
 
     /// Graceful stop for every volume: fires the ONE gate (a no-op when
@@ -1708,6 +1733,10 @@ pub async fn run_multi_with_transports_and_commands(
     // config's default db_path anchors the file in the working
     // directory), same optional-component degrade. RV2: the channel
     // serves the volume commands through the shared runtime state.
+    // Created before the bind (a degraded bind keeps the stop task's
+    // idle barrier working — with no handler installed it is trivially
+    // idle).
+    let in_flight = Arc::new(InFlightCommands::default());
     let control_file = match control::ControlServer::bind(process_cfg).await {
         Ok(server) => {
             let path = control::control_file_path(process_cfg);
@@ -1724,10 +1753,23 @@ pub async fn run_multi_with_transports_and_commands(
                 dispatch: commands.dispatch,
                 tuning: commands.remove_tuning,
             });
-            let handler: control::VolumeCommandHandler = Arc::new(move |line: &str| {
+            // Every handler invocation enters under the in-flight
+            // counter (review H1): the stop task's idle barrier waits
+            // these out before draining the live table, so a command
+            // caught mid-sequence by a gate fire hands its entry back
+            // instead of orphaning it.
+            let handler: control::VolumeCommandHandler = {
                 let surface = Arc::clone(&command_surface);
-                Box::pin(async move { surface.handle(line).await })
-            });
+                let in_flight = Arc::clone(&in_flight);
+                Arc::new(move |line: &str| {
+                    let surface = Arc::clone(&surface);
+                    let guard = in_flight.enter();
+                    Box::pin(async move {
+                        let _in_flight = guard;
+                        surface.handle(line).await
+                    })
+                })
+            };
             tokio::spawn(async move {
                 if let Err(error) = server
                     .run_with_commands(move || gate.trigger(), Some(handler))
@@ -1760,6 +1802,7 @@ pub async fn run_multi_with_transports_and_commands(
     // runtime-ADD/REMOVE cycle left in the live table.
     let gate = Arc::clone(&watch);
     let stop_live = Arc::clone(&live);
+    let stop_in_flight = Arc::clone(&in_flight);
     let stop_task = tokio::spawn(async move {
         watch.wait().await;
         if let Some(server) = &webdav_server {
@@ -1768,6 +1811,15 @@ pub async fn run_multi_with_transports_and_commands(
         if let Some(web_ui) = &web_ui {
             web_ui.shutdown().await;
         }
+        // The idle barrier (review H1): a volume command in flight when
+        // the gate fired (Ctrl+C / SIGTERM race the control loop's
+        // serialized handler) may be holding an entry out of the live
+        // table mid-K50 — draining NOW would orphan it. The in-flight
+        // command observes the gate at its checkpoints and hands the
+        // entry back; only then does this pass take everything (see
+        // [`InFlightCommands`] for the invariant and the bounded-wait
+        // argument).
+        stop_in_flight.wait_idle().await;
         for (name, entry) in stop_live.take_all() {
             if let Some(mut release) = entry.release {
                 match release.release().await {
@@ -1959,6 +2011,76 @@ async fn build_volume_runtime(
 
 // --------------------------------------- RV2: the volume command surface ---
 
+/// The in-flight volume-command counter behind the stop task's idle
+/// barrier (review H1): every handler invocation runs under an
+/// [`InFlightGuard`] (+1 on entry, −1 with a notify on drop — a
+/// cancelled future releases its slot too), and the stop task — after
+/// the gate fires but BEFORE `VolumeLiveTable::take_all` — waits for
+/// the count to reach zero.
+///
+/// Core invariant: once the gate has fired, no volume command mutates
+/// the live table except to put an entry BACK (the entry refusal is
+/// immediate; REMOVE's drain loop and commit point observe the gate
+/// each tick and hand the entry back; ADD's checkpoint tears down a
+/// volume that never served a request), so once the count is zero,
+/// `take_all` is guaranteed to see every live entry — the orphaned-
+/// entry race (REMOVE holding an entry out of the table while the stop
+/// task drains it) cannot occur. The wait is bounded: every in-flight
+/// command's tail after a gate fire is bounded (the K50 steps carry
+/// their own deadlines, and a never-served volume's release joins idle
+/// workers), so this barrier cannot deadlock the shutdown.
+#[derive(Default)]
+struct InFlightCommands {
+    count: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+impl InFlightCommands {
+    fn enter(self: &Arc<Self>) -> InFlightGuard {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        InFlightGuard {
+            tracker: Arc::clone(self),
+        }
+    }
+
+    /// Resolves once no command is in flight. The double-check
+    /// registers the notification BEFORE re-reading the counter, so a
+    /// decrement landing between the check and the await cannot be
+    /// missed.
+    async fn wait_idle(&self) {
+        loop {
+            if self.count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                return;
+            }
+            let notified = self.idle.notified();
+            if self.count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// The +1/−1 guard around one volume-command invocation (see
+/// [`InFlightCommands`]). Drop is the ONLY exit path — completion,
+/// early return and cancellation all release the slot.
+struct InFlightGuard {
+    tracker: Arc<InFlightCommands>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if self
+            .tracker
+            .count
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            self.tracker.idle.notify_waiters();
+        }
+    }
+}
+
 /// The state the control channel's `ADD`/`REMOVE`/`LIST` commands act
 /// through (RV2 / K48): the cli master registry (the truth), the two
 /// face tables (the WebDAV dispatch and dashboard projections), the live
@@ -1989,8 +2111,26 @@ impl RuntimeVolumeControl {
         let mut tokens = line.split_whitespace();
         match (tokens.next(), tokens.next(), tokens.next()) {
             (Some("LIST"), None, None) => self.list(),
-            (Some("ADD"), Some(name), None) => self.add_volume(name).await,
-            (Some("REMOVE"), Some(name), None) => self.remove_volume(name).await,
+            (Some(cmd @ ("ADD" | "REMOVE")), Some(name), None) => {
+                // The gate's entry observation point (review H1): once
+                // the shutdown gate has fired, the mutating commands are
+                // refused — the stop task's idle barrier is waiting for
+                // in-flight commands to settle, and a fresh mutation
+                // would race its `take_all`. LIST is read-only and the
+                // registry stays valid through the shutdown, so it keeps
+                // answering. The refusal still goes back over the reply
+                // channel (the connection task parks on the one-shot).
+                if self.watch.fired() {
+                    return format!(
+                        "ERR: {cmd} refused — the instance is shutting down; volume changes \
+                         are no longer accepted (`LIST` still answers)\n"
+                    );
+                }
+                match cmd {
+                    "ADD" => self.add_volume(name).await,
+                    _ => self.remove_volume(name).await,
+                }
+            }
             (Some(cmd @ ("ADD" | "REMOVE")), _, _) => format!(
                 "ERR: usage: {cmd} <name> — exactly one volume name (volume names match \
                  ^[a-z][a-z0-9_-]{{0,31}}$)\n"
@@ -2115,6 +2255,26 @@ impl RuntimeVolumeControl {
                     );
                 }
             };
+
+        // The gate's mid-ADD observation point (review H1): the
+        // dispatch/assembly awaits above can straddle a gate fire. The
+        // check sits BEFORE the first mutation of the shared state (the
+        // three faces and the live table below) — keep that semantic
+        // placement if the registration order moves (H3). The teardown
+        // mirrors `rollback_add` minus the face removals (nothing was
+        // registered yet); the never-served volume's release joins idle
+        // workers, so it is bounded and cannot wedge the stop task's
+        // idle barrier.
+        if self.watch.fired() {
+            if let Some(task) = assembled.sync_task {
+                task.abort();
+            }
+            assembled.stop_unit.release().await;
+            return format!(
+                "ERR: volume `{name}` not added — the instance is shutting down; the \
+                 assembled volume was torn down and nothing was registered\n"
+            );
+        }
 
         // The registration point: all three faces move together (the
         // master table is the truth, these are its projections).
@@ -2248,6 +2408,15 @@ impl RuntimeVolumeControl {
         // its terminal states), bounded by the drain budget.
         let deadline = Instant::now() + self.tuning.drain_timeout;
         loop {
+            // The gate's drain observation point (review H1): a
+            // shutdown that fires mid-drain takes over the cleanup —
+            // hand the entry back (the stop task's idle barrier is
+            // waiting on this command) and answer within one poll tick
+            // instead of parking the whole drain budget.
+            if self.watch.fired() {
+                self.live.insert(name, entry);
+                return removal_aborted_by_shutdown(name);
+            }
             let outstanding = vfs.queue_stats().outstanding();
             if outstanding == 0 {
                 break;
@@ -2282,6 +2451,16 @@ impl RuntimeVolumeControl {
             }
         }
 
+        // The gate's commit observation point (review H1): a shutdown
+        // that fired during the (bounded) release step also takes over
+        // the cleanup — hand the entry back instead of committing the
+        // face removals under the stop task's feet (a spent release is
+        // a no-op when the shutdown's teardown pass runs it again).
+        if self.watch.fired() {
+            self.live.insert(name, entry);
+            return removal_aborted_by_shutdown(name);
+        }
+
         // K50 step 3: commit — the faces first (no new request routes to
         // the volume; an in-flight request drains on its cloned
         // handler), then the volume's own workers (the same per-volume
@@ -2297,6 +2476,19 @@ impl RuntimeVolumeControl {
         tracing::info!(volume = name, "volume removed at runtime (control REMOVE)");
         format!("OK: removed volume `{name}`\n")
     }
+}
+
+/// REMOVE's shutdown-gate reply — the drain-loop and commit-point
+/// observation points (review H1) share it. The entry is back in the
+/// live table by the time this is returned, so the stop task's idle
+/// barrier plus `take_all` sees it and the volume's drain/release runs
+/// in the shutdown sequence: this REMOVE neither half-removes the
+/// volume nor orphans its entry.
+fn removal_aborted_by_shutdown(name: &str) -> String {
+    format!(
+        "ERR: volume `{name}` removal aborted — the instance is shutting down; the \
+         volume stays registered and its drain/release runs in the shutdown sequence\n"
+    )
 }
 
 /// Pairs a completed mount with its backend release step (shared by the
@@ -4794,5 +4986,117 @@ mod tests {
         assert_eq!(drivers, "local");
         #[cfg(not(any(feature = "telegram", feature = "baidu", feature = "local")))]
         assert_eq!(drivers, "none");
+    }
+
+    /// H1 (review fix): `take` used to find the position under one lock
+    /// and remove it under a second — a concurrent `take_all` landing in
+    /// that seam emptied the vec and the `remove(position)` panicked out
+    /// of bounds (killing the control loop task). This pins the table's
+    /// concurrency invariant instead of racing for the narrow seam:
+    /// hammered from three threads, the table never panics and every
+    /// inserted entry is accounted for — each is either taken by name
+    /// or drained by `take_all`; none is lost to the seam.
+    #[tokio::test]
+    async fn live_table_concurrent_take_take_all_insert_is_lossless() {
+        // One shared VFS backs every hammer entry's stop unit (the table
+        // structure is under test, not the stop semantics); each entry
+        // carries its identity in the mount record's letter.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(MetaDatabase::open(&dir.path().join("meta.db")).expect("open db"));
+        let cache = CacheManager::new(dir.path().join("cache"), u64::MAX);
+        let transport: Arc<dyn CloudTransport> =
+            Arc::new(cloudkit_core::transport::mock::MockTransport::new());
+        let vfs = Arc::new(Vfs::new(
+            db,
+            cache,
+            Arc::clone(&transport),
+            Default::default(),
+        ));
+
+        let table = Arc::new(VolumeLiveTable::default());
+        let inserted: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let taken: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let drained: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        const ROUNDS: usize = 2_000;
+
+        // Pre-build the hammer entries in the async context (each stop
+        // unit's inbound handle needs a reactor to spawn); the threads
+        // below only move them through the table.
+        let mut to_insert: Vec<(String, LiveVolume)> = (0..ROUNDS)
+            .map(|k| {
+                let letter = format!("i{k}");
+                let entry = LiveVolume {
+                    stop_unit: VolumeStopUnit {
+                        vfs: Arc::clone(&vfs),
+                        inbound: spawn_inbound_worker(
+                            Arc::clone(&vfs),
+                            Arc::clone(&transport),
+                            "X:".to_string(),
+                        ),
+                    },
+                    sync_task: None,
+                    mount: Some(MountedVolume {
+                        volume: "v".to_string(),
+                        letter: letter.clone(),
+                        backend: MountedBackend::WebDav,
+                    }),
+                    release: None,
+                };
+                (letter, entry)
+            })
+            .collect();
+
+        // The methods are synchronous (a std mutex inside), so plain
+        // threads hammer them concurrently.
+        std::thread::scope(|scope| {
+            let inserter_table = Arc::clone(&table);
+            let inserted = Arc::clone(&inserted);
+            scope.spawn(move || {
+                while let Some((letter, entry)) = to_insert.pop() {
+                    inserter_table.insert("v", entry);
+                    inserted.lock().expect("inserted log").push(letter);
+                }
+            });
+            let taker_table = Arc::clone(&table);
+            let taken = Arc::clone(&taken);
+            scope.spawn(move || {
+                for _ in 0..ROUNDS {
+                    if let Some(entry) = taker_table.take("v") {
+                        let letter = entry.mount.expect("every entry carries its id").letter;
+                        taken.lock().expect("taken log").push(letter);
+                    }
+                }
+            });
+            let drainer_table = Arc::clone(&table);
+            let drained = Arc::clone(&drained);
+            scope.spawn(move || {
+                for _ in 0..ROUNDS {
+                    for (_, entry) in drainer_table.take_all() {
+                        let letter = entry.mount.expect("every entry carries its id").letter;
+                        drained.lock().expect("drained log").push(letter);
+                    }
+                }
+            });
+        });
+
+        let mut expected = inserted.lock().expect("inserted log").clone();
+        expected.sort();
+        let mut accounted: Vec<String> = taken
+            .lock()
+            .expect("taken log")
+            .drain(..)
+            .chain(drained.lock().expect("drained log").drain(..))
+            .collect();
+        accounted.sort();
+        // Entries move out of the table exactly once, so the multiset
+        // equality is losslessness: every inserted id was handed to
+        // exactly one consumer (a take or the take_all drain).
+        assert_eq!(
+            accounted, expected,
+            "every inserted entry is either taken by name or drained by take_all — none lost"
+        );
     }
 }
