@@ -585,3 +585,12 @@
 - **RV3 真机执行期修复：logging::init 上移至 `run()` 发现配置之前**——发现期（load_volumes）的 info!（RV0 跳过声明等）此前撞上未装 subscriber 被静默吞掉，违反「不静默」要求；真机红（重启日志无声明行）→绿（声明行可见）。
 - **RV3 真机矩阵六项全过**（examples/config 用户实例 4 卷 U/V/Y/Z + 临时卷 rv3tmp@Q:，baidu 明文卷独立远端子树 /apps/cloudfs-rv3tmp，测试文件经产品链路自清）：①运行态 ADD baidu 卷→`OK ... mounted Q: via winfsp`、盘符跨进程可见可读写、/vol 207、仪表盘行即时出现；②REMOVE 三面消失+排空断言（pending=0）+数据跨装卸往返逐字完好；③占用句柄（发现如上）；④enabled=false 重启跳过（Assembling 4、Q: 不占、声明行可见）；⑤坏凭据 ADD→ERR（errno=20017）兄弟卷零影响；⑥status 静态配置面/运行态 LIST 面分离清晰、doctor 20 ok/0 fail。
 - **环境新陷阱：共享 CARGO_TARGET_DIR 跨 worktree 同名包产物污染**——主仓与 worktree 包名版本相同（0.10.0），共享 target 下指纹按 name+version 键合，交叉构建会把 A 树 rmeta 喂给 B 树编译（实例：主仓 cli 源码对 worktree 版 web/webdav 的 RegistryHandle 报 E0308）。纪律：worktree 构建用独立 target；共享 target 的主仓重建前先 `cargo clean`。
+
+## 2026-09-12 Phase 3.6 合入后深度审查 + 修复批落地：K55 入档（fix/phase36-review）
+
+- **K55 审查裁决**：四分域深度审查（cli 状态机/协议层/动态分发/config+测试质量）+ 主会话逐条核验。3 High 同根因——「命令串行化」的推理被外推到它不覆盖的并发世界（Ctrl+C 停机任务、axum 请求任务、被 take 出表的 entry）。两条子代理结论经亲验证伪：大小写 ADD「不可移除卷」不成立（config.rs stem 校验先于读文件，注册面名字恒一致）；「cydrive stop 客户端挂起」不成立（STOP 在连接任务内即时回执；实际挂起的是 status 的 LIST 转发——它走命令队列）。
+- **H2（7a2050e）**：stale empty-PUT skip 补 `bump(&stats.degraded)` + `QueueStats::outstanding()` 单点收口——前置潜伏计数器缺口（2026-09-09 实录场景）被 RV2 排空判据首次激活为「卷永远卸不掉」；degraded 而非新计数器：语义同族（未上传即终态）、无 requeue 副作用、零既有断言破坏。
+- **H1（c8489a6）**：停机交错三件套——① `take()` 单锁化（双锁竞态压力测试 7/7 复现红）；② 命令观测停机 gate（入口拒新：ADD/REMOVE 拒、LIST 照答；REMOVE 排水循环+提交点观测：放回 entry+shutdown ERR；ADD 注册前观测：拆装配件）核心不变量=「gate 后命令除放回外不再变更 live 表」；③ stop task `InFlightCommands` idle 屏障（RAII + Notify double-check）——`take_all` 必然看到全部 entry。执行期发现：控制通道 STOP 无法复现该竞态（accept loop 命令臂阻塞 stop_rx 分支）——测试经新 `request_stop()` 面（Ctrl+C 真实拓扑）触发。
+- **H3（86e49a5）**：ADD 改「先装配后公示」——三面 insert 后移到挂载成功后（红证：挂载阻塞期 PROPFIND 207→绿 404）；挂载失败走 `tear_down_unpublished`（rollback_add 删除吸收）；winfsp 挂载 pass 喂单条目 shadow registry（registry 在 pass 内唯一用途=按 claim 解析 VFS，主会话核证）；新增可注入挂载缝 `RuntimeVolumeCommands.mount`（一并补上审查 M5 最重的 rollback 零覆盖缺口）。
+- **M1（68175a8）**：控制通道鲁棒性三件——handler panic 包 `AssertUnwindSafe(...).catch_unwind()`（futures-util 单依赖边）回 internal-error ERR 通道存活；客户端交换 120s 预算（`EXCHANGE_BUDGET`，REMOVE 60s 排空+10s unmount+余量）+ `exchange_line_bounded` 测试缝；`WebDavRelease` net use 改 spawn_blocking + 30s 预算（超时分支离线不可测，commit 内如实声明，错误路径双测试 pin）。
+- **挂账（未批准修复）**：M2 排空期入站写入不断流（ERR 文案不可达）、M3 解析错误 ERR 凭据值片段风险、M4 全禁用 boot 文案、M5 余下测试缺口（并发语义/keep-alive 跨摘卷/空表）与 Low 全集——权威清单见 docs/tracking/phase36-review-fixes.md。
