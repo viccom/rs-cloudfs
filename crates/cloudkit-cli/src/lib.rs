@@ -1107,20 +1107,57 @@ impl DriveRelease for WinFspRelease {
     }
 }
 
+/// The `net use /delete` budget (review M1-3): a hung network provider
+/// must not wedge the K50 removal sequence (or an executor thread — the
+/// command runs on the blocking pool). 30s comfortably exceeds a healthy
+/// mapping delete (sub-second) while staying well inside the client
+/// exchange budget. The timeout branch is untestable offline (a real
+/// `net use` cannot be made to hang on demand) — its cover is this
+/// comment plus code review; the error path IS pinned
+/// (`webdav_release_propagates_the_net_use_failure` and the K50 abort
+/// integration pin).
+const NET_USE_RELEASE_BUDGET: Duration = Duration::from_secs(30);
+
 /// The WebDAV arm of [`DriveRelease`]: the `net use /delete` that
 /// releases the cross-process mapping (the stop sequence's own release,
 /// now per volume). A failure is the K50 abort reason verbatim.
-struct WebDavRelease {
-    letter: String,
+/// Constructible (pub) so the tests inject the production release
+/// object through the [`VolumeLiveTable::set_release`] seam.
+pub struct WebDavRelease {
+    /// The drive letter the mapping delete targets (`"Q:"`).
+    pub letter: String,
 }
 
 impl DriveRelease for WebDavRelease {
     fn release(&mut self) -> ReleaseFuture<'_> {
         let letter = self.letter.clone();
         Box::pin(async move {
-            cloudkit_platform::windows::unmount_drive(&letter)
-                .map(|_| ())
-                .map_err(|error| format!("`net use {letter} /delete` failed: {error}"))
+            // The mapping delete is a synchronous `std::process::Command`
+            // — on the blocking pool (never the executor thread) and
+            // inside the budget above: a hung provider aborts the
+            // removal per K50 (卷保持注册不动) instead of wedging the
+            // control loop.
+            let deleted = tokio::time::timeout(
+                NET_USE_RELEASE_BUDGET,
+                tokio::task::spawn_blocking({
+                    let letter = letter.clone();
+                    move || cloudkit_platform::windows::unmount_drive(&letter)
+                }),
+            )
+            .await;
+            match deleted {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(error))) => Err(format!("`net use {letter} /delete` failed: {error}")),
+                Ok(Err(join_error)) => Err(format!(
+                    "the `net use {letter} /delete` task failed to complete: {join_error}"
+                )),
+                Err(_elapsed) => Err(format!(
+                    "`net use {letter} /delete` did not finish within {}s — the network \
+                     provider appears hung; the removal was aborted and the volume stays \
+                     registered (K50)",
+                    NET_USE_RELEASE_BUDGET.as_secs()
+                )),
+            }
         })
     }
 }
@@ -5185,6 +5222,38 @@ mod tests {
         assert_eq!(
             accounted, expected,
             "every inserted entry is either taken by name or drained by take_all — none lost"
+        );
+    }
+
+    /// M1-3 (review fix): the net-use release's error path through the
+    /// spawn_blocking + budget wrapper — deleting a mapping that does
+    /// not exist must come back Err (the verbatim net-use failure, with
+    /// the command named), the exact input the K50 abort consumes; the
+    /// wrapper must neither swallow nor alter it. The budget branch (a
+    /// hung provider) is untestable offline — see
+    /// NET_USE_RELEASE_BUDGET's comment.
+    #[tokio::test]
+    async fn webdav_release_propagates_the_net_use_failure() {
+        let used = cloudkit_platform::windows::used_drive_letters();
+        let letter = (b'A'..=b'Z')
+            .map(|byte| format!("{}:", char::from(byte)))
+            .find(|letter| {
+                used.iter()
+                    .all(|mounted| !mounted.eq_ignore_ascii_case(letter))
+            })
+            .expect("at least one unmapped drive letter exists");
+        let mut release = WebDavRelease { letter };
+        let error = release
+            .release()
+            .await
+            .expect_err("deleting a mapping that does not exist must fail");
+        assert!(
+            error.contains("net use"),
+            "the failure names the command it ran: {error}"
+        );
+        assert!(
+            error.contains("failed"),
+            "the failure reads as a failure: {error}"
         );
     }
 }

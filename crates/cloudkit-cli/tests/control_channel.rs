@@ -421,3 +421,110 @@ async fn volume_commands_route_to_the_handler_and_stop_stays_untouched() {
         "exactly the volume-command lines reached the handler (STOP did not)"
     );
 }
+
+// ------------------------------------------ M1: control-channel robustness ---
+
+/// M1-1 (review fix): a handler that panics must not take the control
+/// channel down. Volume commands execute on the accept loop's task, so
+/// an unguarded panic used to kill that task — the listener dropped,
+/// every later stop/status/ADD/REMOVE connection was refused, and the
+/// panicking command's own client read a bare EOF. The contract: the
+/// panicking command still gets its reply (the actionable internal-error
+/// ERR), and the very next command on the same channel answers
+/// normally. Red: the reply arrives empty (the one-shot died with the
+/// loop task) and the follow-up cannot even connect.
+#[tokio::test]
+async fn a_panicking_handler_is_isolated_and_the_channel_survives() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let cfg = temp_config(dir.path());
+
+    let server = ControlServer::bind(&cfg)
+        .await
+        .expect("bind control server");
+    let addr = server.local_addr();
+    let handler: cloudkit_cli::control::VolumeCommandHandler = Arc::new(|line: &str| {
+        Box::pin(async move {
+            if line.starts_with("ADD") {
+                panic!("handler exploded (the deliberate test panic)");
+            }
+            "OK: still alive\n".to_string()
+        })
+    });
+    tokio::spawn(async move {
+        let _ = server.run_with_commands(|| {}, Some(handler)).await;
+    });
+
+    let resp = cloudkit_cli::control::send_command(addr, "ADD boom")
+        .await
+        .expect("the panicking command still gets a reply");
+    assert!(
+        resp.contains("ERR:") && resp.contains("internal error"),
+        "a panicking handler answers the internal-error ERR: {resp}"
+    );
+    assert!(
+        resp.contains("the control channel stays up"),
+        "the ERR says the channel survived: {resp}"
+    );
+
+    // The channel survived: the next command routes to the handler and
+    // STOP stays byte-identical alongside the isolation.
+    let resp = cloudkit_cli::control::send_command(addr, "LIST")
+        .await
+        .expect("the channel still accepts connections after a panic");
+    assert_eq!(
+        resp.trim(),
+        "OK: still alive",
+        "the command after the panic answers normally: {resp}"
+    );
+    let resp = send_stop(addr)
+        .await
+        .expect("STOP still works after a panic");
+    assert!(
+        resp.contains("OK: shutting down"),
+        "STOP is byte-identical after a panic: {resp}"
+    );
+}
+
+/// M1-2 (review fix): the client half's exchange must give up within
+/// its budget. `cydrive status`'s LIST forward queues behind an
+/// in-flight REMOVE (commands serialize on the accept loop), so an
+/// unbounded read-to-EOF used to park the caller for the whole command
+/// (70s+) with zero feedback. The silent server — accepts, consumes
+/// the command, never replies, never closes — stands in for the busy
+/// instance; the bounded exchange must come back a TimedOut io error
+/// naming the busy instance. The 5s outer timeout is the safety net
+/// that keeps a still-unbounded exchange a failing test instead of a
+/// hung one (that failure is the red form).
+#[tokio::test]
+async fn client_exchange_gives_up_once_its_budget_elapses() {
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind the silent server");
+    let addr = listener.local_addr().expect("the silent server's addr");
+    tokio::spawn(async move {
+        while let Ok((mut stream, _)) = listener.accept().await {
+            tokio::spawn(async move {
+                let mut sink = [0u8; 64];
+                let _ = stream.read(&mut sink).await;
+                std::future::pending::<()>().await;
+            });
+        }
+    });
+
+    let exchange = tokio::time::timeout(
+        Duration::from_secs(5),
+        cloudkit_cli::control::exchange_line_bounded(addr, b"LIST\n", Duration::from_millis(300)),
+    )
+    .await
+    .expect("the exchange settles within its budget instead of hanging forever");
+    let error = exchange.expect_err("a silent server must yield a timeout error");
+    assert_eq!(
+        error.kind(),
+        std::io::ErrorKind::TimedOut,
+        "the give-up is an io timeout: {error}"
+    );
+    assert!(
+        error.to_string().contains("busy"),
+        "the error names the busy instance: {error}"
+    );
+}

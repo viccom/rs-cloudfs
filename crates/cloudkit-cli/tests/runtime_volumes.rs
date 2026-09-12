@@ -1295,3 +1295,96 @@ async fn add_whose_mount_fails_leaves_no_residue_anywhere() {
         .expect("shutdown completes")
         .expect("shutdown joins cleanly");
 }
+
+// ----------------------------- 6. the production net-use release (M1-3) ---
+
+/// M1-3 (review fix): the production net-use release object (now on the
+/// blocking pool with a 30s budget) rides the same K50 abort path the
+/// FakeRelease pins — injected over a live volume with an unmapped
+/// letter, its Err must abort the REMOVE with the volume intact and the
+/// net-use failure surfacing verbatim. The budget branch (a hung
+/// provider) is untestable offline; its cover is the constant's comment
+/// plus review.
+#[tokio::test]
+async fn the_real_net_use_release_aborts_the_removal_when_it_fails() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    let _guard = chdir(dir.path());
+
+    let specs = cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load specs");
+    let handle = run_multi_with_transports(&process_config(), {
+        vec![(
+            specs.into_iter().next().expect("volume a"),
+            RunOptions::default(),
+            mock_transport().await as Arc<dyn CloudTransport>,
+        )]
+    })
+    .await
+    .expect("boot");
+    let addr = control_addr();
+    let webdav = handle.webdav_addr().expect("webdav bound");
+
+    // A letter nothing maps: the production release's real net use must
+    // fail on it (deterministic — picked off this machine's mount set).
+    let used = cloudkit_platform::windows::used_drive_letters();
+    let letter = (b'A'..=b'Z')
+        .map(|byte| format!("{}:", char::from(byte)))
+        .find(|letter| {
+            used.iter()
+                .all(|mounted| !mounted.eq_ignore_ascii_case(letter))
+        })
+        .expect("at least one unmapped drive letter exists");
+    assert!(
+        handle
+            .live_table()
+            .set_release("a", Box::new(cloudkit_cli::WebDavRelease { letter })),
+        "the production release injects into the live volume"
+    );
+
+    let reply = send_cmd(addr, "REMOVE a").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("unmounting volume `a` failed"),
+        "the release failure aborts the removal actionably: {reply}"
+    );
+    assert!(
+        reply.contains("net use"),
+        "the net-use failure surfaces verbatim in the abort reason: {reply}"
+    );
+    assert_eq!(
+        handle.volumes(),
+        vec![("a".to_string(), VolumeStatus::Running)],
+        "the volume stays registered through the abort (K50)"
+    );
+    let resp = send_http(webdav, &http_request("PROPFIND", "/vol/a/", webdav)).await;
+    assert_eq!(status_of(&resp), 207, "the data plane survives: {resp}");
+
+    // A healthy release then completes the same removal.
+    assert!(
+        handle.live_table().set_release(
+            "a",
+            Box::new(FakeRelease {
+                attempts: Arc::new(AtomicUsize::new(0)),
+                released: Arc::new(AtomicBool::new(false)),
+                succeed: true,
+            }),
+        ),
+        "the replacement release injects"
+    );
+    let reply = send_cmd(addr, "REMOVE a").await;
+    assert!(
+        reply.starts_with("OK:") && reply.contains("removed volume `a`"),
+        "the removal completes once the drive releases: {reply}"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
