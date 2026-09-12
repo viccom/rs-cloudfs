@@ -156,8 +156,39 @@ fn keepalive_put(target: &str, addr: SocketAddr, body: &str) -> String {
     )
 }
 
+/// A keep-alive `Depth: 1` PROPFIND (no `Connection: close`) for the
+/// same-connection removal test — the multistatus reply comes back
+/// chunk-framed, so [`read_response`] peels exactly one reply off the
+/// connection.
+fn keepalive_propfind(target: &str, addr: SocketAddr) -> String {
+    format!(
+        "PROPFIND {target} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nDepth: 1\r\n\
+         Content-Length: 0\r\n\r\n",
+        addr.port()
+    )
+}
+
+/// Reads one CRLF/LF-terminated line off `stream` (terminator included)
+/// — the chunked-framing helper of [`read_response`].
+async fn read_line(stream: &mut TcpStream) -> Vec<u8> {
+    let mut buf = Vec::new();
+    let mut byte = [0u8; 1];
+    loop {
+        stream.read_exact(&mut byte).await.expect("read line byte");
+        buf.push(byte[0]);
+        if buf.ends_with(b"\n") {
+            break;
+        }
+    }
+    buf
+}
+
 /// Reads exactly one HTTP response off `stream`: headers to the blank
-/// line, then `Content-Length` bytes of body (keep-alive framing).
+/// line, then the body framed either by `Content-Length` (the empty
+/// 201/404 replies) or — the dav-server multistatus shape, whose
+/// streamed body carries no length — by `Transfer-Encoding: chunked`
+/// (decoded and concatenated). Either way the connection is left at
+/// the exact start of the next response.
 async fn read_response(stream: &mut TcpStream) -> String {
     let mut buf = Vec::new();
     let mut byte = [0u8; 1];
@@ -172,16 +203,45 @@ async fn read_response(stream: &mut TcpStream) -> String {
         }
     }
     let head = String::from_utf8_lossy(&buf).into_owned();
-    let len: usize = head
-        .lines()
-        .find_map(|line| {
-            let (name, value) = line.split_once(':')?;
-            name.eq_ignore_ascii_case("content-length")
-                .then(|| value.trim().parse().expect("numeric content-length"))
+    let header = |name: &str| {
+        head.lines().find_map(|line| {
+            let (key, value) = line.split_once(':')?;
+            key.trim()
+                .eq_ignore_ascii_case(name)
+                .then(|| value.trim().to_string())
         })
-        .unwrap_or(0);
-    let mut body = vec![0u8; len];
-    stream.read_exact(&mut body).await.expect("read body");
+    };
+    let mut body = Vec::new();
+    if let Some(len) = header("content-length") {
+        let len: usize = len.parse().expect("numeric content-length");
+        body = vec![0u8; len];
+        stream.read_exact(&mut body).await.expect("read body");
+    } else if header("transfer-encoding").is_some_and(|value| value.eq_ignore_ascii_case("chunked"))
+    {
+        loop {
+            let size_line = read_line(stream).await;
+            let size = usize::from_str_radix(
+                String::from_utf8_lossy(&size_line)
+                    .trim()
+                    .split(';')
+                    .next()
+                    .expect("chunk size token"),
+                16,
+            )
+            .expect("hex chunk size");
+            if size == 0 {
+                // The terminating CRLF (an empty trailer section) ends
+                // the response body.
+                read_line(stream).await;
+                break;
+            }
+            let mut chunk = vec![0u8; size];
+            stream.read_exact(&mut chunk).await.expect("read chunk");
+            body.extend_from_slice(&chunk);
+            // The CRLF after each chunk's data.
+            read_line(stream).await;
+        }
+    }
     format!("{head}{}", String::from_utf8_lossy(&body))
 }
 
@@ -633,6 +693,87 @@ async fn dynamically_inserted_volume_is_immediately_routable() {
     server.shutdown().await;
     vol_a.shutdown().await;
     vol_c.shutdown().await;
+}
+
+/// RV1 (K51) keep-alive companion, M5 test gap 3 (characterization,
+/// expected green): the per-request dispatch is not cached per
+/// connection. ONE keep-alive connection PROPFINDs volume a to a 207,
+/// then `registry.remove("a")` runs, and the VERY SAME connection
+/// asks the same URL again — it must now get the 404 (the request
+/// re-reads the live table; a connection-level route would keep
+/// serving the removed volume), while the surviving volume b keeps
+/// answering both on that same connection and on a fresh one.
+#[tokio::test]
+async fn keep_alive_connection_sees_a_volume_removal_mid_connection() {
+    let vol_a = volume_env().await;
+    let vol_b = volume_env().await;
+    let registry = RegistryHandle::new(vec![
+        ("a".to_string(), vol_a.fs.clone()),
+        ("b".to_string(), vol_b.fs.clone()),
+    ]);
+    let server =
+        WebDavServer::serve_volumes(registry.clone(), SocketAddr::from(([127, 0, 0, 1], 0)))
+            .await
+            .expect("serve_volumes binds the ephemeral port");
+    let addr = server.local_addr();
+
+    // Before the removal: the keep-alive connection routes to a.
+    let mut stream = TcpStream::connect(addr).await.expect("connect");
+    stream
+        .write_all(keepalive_propfind("/vol/a/", addr).as_bytes())
+        .await
+        .expect("send first PROPFIND");
+    let resp = read_response(&mut stream).await;
+    assert_eq!(
+        status_of(&resp),
+        207,
+        "volume a answers before the removal: {resp}"
+    );
+
+    // The removal through the shared registry handle (the K50 seam).
+    assert!(
+        registry.remove("a"),
+        "removing a registered volume reports it"
+    );
+
+    // The SAME connection, the SAME URL: the plain 404 now — the
+    // request re-reads the dispatch table instead of reusing whatever
+    // route answered the first request on this connection.
+    stream
+        .write_all(keepalive_propfind("/vol/a/", addr).as_bytes())
+        .await
+        .expect("send second PROPFIND on the SAME connection");
+    let resp = read_response(&mut stream).await;
+    assert_eq!(
+        status_of(&resp),
+        404,
+        "the same connection sees the removal: {resp}"
+    );
+
+    // The connection stays usable and the survivor is reachable on it.
+    stream
+        .write_all(keepalive_propfind("/vol/b/", addr).as_bytes())
+        .await
+        .expect("send the survivor PROPFIND on the same connection");
+    let resp = read_response(&mut stream).await;
+    assert_eq!(
+        status_of(&resp),
+        207,
+        "the survivor answers the old connection: {resp}"
+    );
+    drop(stream);
+
+    // And on a fresh connection: volume b is unaffected by a's removal.
+    let resp = propfind(addr, "/vol/b/").await;
+    assert_eq!(
+        status_of(&resp),
+        207,
+        "the survivor on a fresh connection: {resp}"
+    );
+
+    server.shutdown().await;
+    vol_a.shutdown().await;
+    vol_b.shutdown().await;
 }
 
 // ------------------------------------------------------- 6. graceful stop ---
