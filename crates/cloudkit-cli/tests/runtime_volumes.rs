@@ -22,8 +22,8 @@ use std::time::Duration;
 use cloudkit_cli::control::read_control_addr;
 use cloudkit_cli::{
     run_multi_with_transports, run_multi_with_transports_and_commands, DriveRelease,
-    MultiVolumeHandle, RemoveTuning, RunOptions, RuntimeVolumeCommands, VolumeStatus,
-    VolumeTransportDispatch,
+    MountedBackend, MountedVolume, MultiVolumeHandle, RemoveTuning, RunOptions, RuntimeMount,
+    RuntimeVolumeCommands, VolumeMounts, VolumeStatus, VolumeTransportDispatch,
 };
 use cloudkit_core::config::{CyDriveConfig, VolumeConfig};
 use cloudkit_core::database::MetaDatabase;
@@ -86,6 +86,16 @@ fn process_config() -> CyDriveConfig {
         web_ui_port: 0,
         auto_mount_drive: false,
         ..CyDriveConfig::default()
+    }
+}
+
+/// [`process_config`] with the auto-mount switch ON — the ADD mount arm's
+/// precondition (the H3 tests; the mount itself is stubbed, so no real
+/// drive is ever touched).
+fn mount_process_config() -> CyDriveConfig {
+    CyDriveConfig {
+        auto_mount_drive: true,
+        ..process_config()
     }
 }
 
@@ -586,6 +596,7 @@ async fn remove_with_undrained_queue_aborts_and_keeps_the_volume() {
         RuntimeVolumeCommands {
             dispatch: Some(hold_dispatch),
             remove_tuning: RemoveTuning::fast(),
+            ..RuntimeVolumeCommands::default()
         },
     )
     .await;
@@ -903,6 +914,7 @@ async fn remove_drain_observes_the_shutdown_gate_and_hands_the_entry_back() {
                 drain_timeout: Duration::from_secs(10),
                 poll_interval: Duration::from_millis(50),
             },
+            ..RuntimeVolumeCommands::default()
         },
     )
     .await;
@@ -1047,6 +1059,237 @@ async fn volume_commands_are_refused_after_the_stop_gate_fires() {
         "the read-only LIST still answers on a shutting-down instance: {reply}"
     );
 
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+// ------------------------- 5. publish-after-mount ordering (H3) ---
+
+/// A mount stub that parks until released: reports "started" over the
+/// channel the moment the ADD enters its mount step, then holds the ADD
+/// inside the mount window until the watch flips — the deterministic
+/// stand-in for the seconds-long real mount (review H3's seam).
+fn blocked_mount_stub(
+    started: tokio::sync::mpsc::Sender<()>,
+    go: tokio::sync::watch::Receiver<bool>,
+) -> RuntimeMount {
+    Arc::new(move |name: &str, letter: &str| {
+        let volume = name.to_string();
+        // Canonical display form (the real mounter's own): "Q" -> "Q:".
+        let letter = format!("{}:", letter.trim_end_matches(':').to_ascii_uppercase());
+        let started = started.clone();
+        let mut go = go.clone();
+        Box::pin(async move {
+            let _ = started.send(()).await;
+            while !*go.borrow_and_update() {
+                if go.changed().await.is_err() {
+                    break;
+                }
+            }
+            VolumeMounts {
+                mounted: vec![MountedVolume {
+                    volume,
+                    letter,
+                    backend: MountedBackend::WebDav,
+                }],
+                winfsp: Default::default(),
+            }
+        })
+    })
+}
+
+/// H3 (review fix): an ADD's faces publish only after its mount settles.
+/// The old order registered the volume into all three faces BEFORE the
+/// (seconds-long) mount pass — `/vol/<name>` routed and the dashboard
+/// tab appeared while the drive did not exist yet, and a mount failure
+/// rolled the faces back under in-flight requests (axum request tasks
+/// run concurrently with the control loop; "same task, serialized" only
+/// holds between commands). With the stub blocking mid-mount, a PROPFIND
+/// during the window must NOT route; after the stub succeeds and the ADD
+/// answers, the volume (and its mount) is visible everywhere.
+#[tokio::test]
+async fn add_publishes_its_faces_only_after_the_mount_settles() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    write_file(
+        &dir.path().join("volumes").join("m.toml"),
+        &format!("{}drive_letter = \"Q\"\n", volume_toml("222:BBB", 222222)),
+    );
+    let _guard = chdir(dir.path());
+
+    let specs = {
+        let mut v =
+            cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load volume specs");
+        v.retain(|spec| spec.name == "a");
+        v
+    };
+    let (started_tx, mut started_rx) = tokio::sync::mpsc::channel::<()>(1);
+    let (go_tx, go_rx) = tokio::sync::watch::channel(false);
+    let handle = boot_with_commands(
+        mount_process_config(),
+        specs,
+        vec![mock_transport().await],
+        RuntimeVolumeCommands {
+            dispatch: Some(mock_dispatch()),
+            mount: Some(blocked_mount_stub(started_tx, go_rx)),
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await;
+    let addr = control_addr();
+    let webdav = handle.webdav_addr().expect("webdav bound");
+
+    // The ADD parks inside the (stubbed) mount step.
+    let add_task = tokio::spawn(async move { send_cmd(addr, "ADD m").await });
+    timeout(Duration::from_secs(5), started_rx.recv())
+        .await
+        .expect("the ADD reaches its mount step within the safety window")
+        .expect("the started signal arrives");
+
+    // During the mount window the volume is invisible on every face —
+    // this PROPFIND is exactly the in-flight request the old order
+    // served off a not-yet-mounted (and, on failure, rolled-back)
+    // volume.
+    let resp = send_http(webdav, &http_request("PROPFIND", "/vol/m/", webdav)).await;
+    assert_eq!(
+        status_of(&resp),
+        404,
+        "not routable while the mount is in flight: {resp}"
+    );
+    assert!(
+        handle.volume("m").is_none(),
+        "the registry face is still empty during the mount window"
+    );
+
+    // Release the stub: the ADD completes and publishes everywhere.
+    go_tx.send(true).expect("release the mount stub");
+    let reply = timeout(Duration::from_secs(5), add_task)
+        .await
+        .expect("the ADD settles once the stub releases")
+        .expect("the ADD task joins");
+    assert!(
+        reply.starts_with("OK:") && reply.contains("mounted Q:"),
+        "the ADD reports the mounted letter: {reply}"
+    );
+    let resp = send_http(webdav, &http_request("PROPFIND", "/vol/m/", webdav)).await;
+    assert_eq!(
+        status_of(&resp),
+        207,
+        "routable after the mount settled: {resp}"
+    );
+    let reply = send_cmd(addr, "LIST").await;
+    assert!(
+        list_rows(&reply)
+            .iter()
+            .any(|row| row.starts_with("m running Q: webdav")),
+        "LIST shows the volume with its mount: {reply}"
+    );
+
+    // Cleanup: swap the (would-be net-use) release for the probe so the
+    // REMOVE never touches a real drive, then remove and stop.
+    let released = Arc::new(AtomicBool::new(false));
+    let released_for_cleanup = Arc::clone(&released);
+    assert!(
+        handle.live_table().set_release(
+            "m",
+            Box::new(FakeRelease {
+                attempts: Arc::new(AtomicUsize::new(0)),
+                released: released_for_cleanup,
+                succeed: true,
+            }),
+        ),
+        "the probe injects into the mounted volume"
+    );
+    let reply = send_cmd(addr, "REMOVE m").await;
+    assert!(reply.starts_with("OK:"), "cleanup REMOVE: {reply}");
+    assert!(released.load(Ordering::SeqCst), "the probe release ran");
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+/// H3 (review fix): a runtime ADD whose drive mount fails answers ERR
+/// and leaves NOTHING behind — no registry entry, no `/vol/<name>`
+/// route, no live entry — so a later REMOVE of the name answers the
+/// plain "no volume registered" refusal, and the sibling kept serving
+/// throughout. (The pre-fix rollback produced the same post-state; this
+/// pins the new never-registered teardown path.)
+#[tokio::test]
+async fn add_whose_mount_fails_leaves_no_residue_anywhere() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    write_file(
+        &dir.path().join("volumes").join("m.toml"),
+        &format!("{}drive_letter = \"Q\"\n", volume_toml("222:BBB", 222222)),
+    );
+    let _guard = chdir(dir.path());
+
+    let specs = {
+        let mut v =
+            cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load volume specs");
+        v.retain(|spec| spec.name == "a");
+        v
+    };
+    let failing_mount: RuntimeMount =
+        Arc::new(|_name: &str, _letter: &str| Box::pin(async { VolumeMounts::default() }));
+    let handle = boot_with_commands(
+        mount_process_config(),
+        specs,
+        vec![mock_transport().await],
+        RuntimeVolumeCommands {
+            dispatch: Some(mock_dispatch()),
+            mount: Some(failing_mount),
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await;
+    let addr = control_addr();
+    let webdav = handle.webdav_addr().expect("webdav bound");
+
+    let reply = send_cmd(addr, "ADD m").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("rolled back"),
+        "the failed mount fails the ADD actionably: {reply}"
+    );
+    assert!(
+        handle.volume("m").is_none(),
+        "no registry entry survives the failed ADD"
+    );
+    let resp = send_http(webdav, &http_request("PROPFIND", "/vol/m/", webdav)).await;
+    assert_eq!(status_of(&resp), 404, "no route survives: {resp}");
+    let reply = send_cmd(addr, "LIST").await;
+    assert_eq!(
+        list_rows(&reply),
+        vec!["a running - telegram pending=0".to_string()],
+        "only the sibling is listed: {reply}"
+    );
+    let reply = send_cmd(addr, "REMOVE m").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("no volume registered"),
+        "nothing to remove after the rolled-back ADD: {reply}"
+    );
+    let resp = send_http(webdav, &http_request("PROPFIND", "/vol/a/", webdav)).await;
+    assert_eq!(status_of(&resp), 207, "the sibling kept serving: {resp}");
+
+    // The unpublished teardown is bounded: the stop task joins cleanly.
     timeout(Duration::from_secs(30), handle.shutdown())
         .await
         .expect("shutdown completes")

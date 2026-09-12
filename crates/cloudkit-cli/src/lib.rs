@@ -1435,6 +1435,19 @@ pub type DispatchFuture<'a> = std::pin::Pin<
 pub type VolumeTransportDispatch =
     Arc<dyn for<'a> Fn(&'a VolumeConfig) -> DispatchFuture<'a> + Send + Sync + 'static>;
 
+/// The boxed mount outcome of one [`RuntimeMount`] call (review H3's
+/// seam — the same shape [`mount_volumes_if_configured`] returns).
+pub type RuntimeMountFuture<'a> = std::pin::Pin<Box<dyn Future<Output = VolumeMounts> + Send + 'a>>;
+
+/// The runtime ADD's mount step behind a seam (review H3): receives the
+/// ADD's one claim (the volume's name and its configured letter) and
+/// answers what the mount pass produced. Production (`None`) runs the
+/// SAME [`mount_volumes_if_configured`] pass boot runs; the tests inject
+/// stubs that block or fail the mount deterministically, so the
+/// publish-after-mount ordering is pinnable without a real drive.
+pub type RuntimeMount =
+    Arc<dyn for<'a> Fn(&'a str, &'a str) -> RuntimeMountFuture<'a> + Send + Sync + 'static>;
+
 /// K50's abort-timeout knobs (the removal sequence's two waits). The
 /// defaults are the production budgets; [`RemoveTuning::fast`] shrinks
 /// them to millisecond scale for the tests.
@@ -1481,6 +1494,10 @@ pub struct RuntimeVolumeCommands {
     pub dispatch: Option<VolumeTransportDispatch>,
     /// The K50 removal waits (tests shrink them).
     pub remove_tuning: RemoveTuning,
+    /// The ADD mount step (review H3's seam): `None` (production) runs
+    /// the real K27/K40 mount pass; the tests inject a stub that blocks
+    /// or fails the mount to pin the publish-after-mount ordering.
+    pub mount: Option<RuntimeMount>,
 }
 
 /// The single-volume assembly result (RV2's 单卷装配): everything ONE
@@ -1751,6 +1768,7 @@ pub async fn run_multi_with_transports_and_commands(
                 watch: Arc::clone(&watch),
                 webdav_available: webdav_addr.is_some(),
                 dispatch: commands.dispatch,
+                mount: commands.mount,
                 tuning: commands.remove_tuning,
             });
             // Every handler invocation enters under the in-flight
@@ -2100,6 +2118,9 @@ struct RuntimeVolumeControl {
     /// mount pass got).
     webdav_available: bool,
     dispatch: Option<VolumeTransportDispatch>,
+    /// The ADD mount step (review H3's seam) — production runs the real
+    /// pass (`None`), tests inject blockers/failures.
+    mount: Option<RuntimeMount>,
     tuning: RemoveTuning,
 }
 
@@ -2176,11 +2197,16 @@ impl RuntimeVolumeControl {
     /// (K49: `enabled = false` refuses — the file is the persistent
     /// source of truth), connect the transport through the injected
     /// dispatch, assemble through the SAME single-volume assembly the
-    /// boot loop runs, register into all three faces at once, then mount
-    /// the volume's explicit drive-letter claim through the same K27/K40
-    /// pass boot uses. Every failure answers with its reason and leaves
-    /// the running set untouched (K22's runtime twin); a claim that
-    /// cannot be honored rolls the addition all the way back.
+    /// boot loop runs, mount the volume's explicit drive-letter claim
+    /// through the same K27/K40 pass boot uses, and only THEN register
+    /// into all three faces at once (review H3: a volume publishes only
+    /// after its mount settles, so `/vol/<name>` never routes to a
+    /// volume whose drive is not up — and a failed mount tears down a
+    /// volume no client ever saw). Every failure answers with its
+    /// reason and leaves the running set untouched (K22's runtime twin);
+    /// a claim that cannot be honored fails the ADD with nothing
+    /// registered (the assembled volume is quietly torn down — its
+    /// workers never served a request).
     async fn add_volume(&self, name: &str) -> String {
         // Path-safety precheck before the name becomes a file name: the
         // full name rules live in `load_volume_config`.
@@ -2259,25 +2285,147 @@ impl RuntimeVolumeControl {
         // The gate's mid-ADD observation point (review H1): the
         // dispatch/assembly awaits above can straddle a gate fire. The
         // check sits BEFORE the first mutation of the shared state (the
-        // three faces and the live table below) — keep that semantic
-        // placement if the registration order moves (H3). The teardown
-        // mirrors `rollback_add` minus the face removals (nothing was
-        // registered yet); the never-served volume's release joins idle
-        // workers, so it is bounded and cannot wedge the stop task's
-        // idle barrier.
+        // three faces and the live table — every registration below)
+        // and before the mount pass, whose own awaits get a second
+        // observation point after they settle. The teardown releases
+        // the never-served volume's idle workers, so it is bounded and
+        // cannot wedge the stop task's idle barrier.
         if self.watch.fired() {
-            if let Some(task) = assembled.sync_task {
-                task.abort();
-            }
-            assembled.stop_unit.release().await;
+            tear_down_unpublished(assembled).await;
             return format!(
                 "ERR: volume `{name}` not added — the instance is shutting down; the \
                  assembled volume was torn down and nothing was registered\n"
             );
         }
 
+        // Volumes that mount nothing (no explicit drive_letter claim, or
+        // the auto-mount switch off) keep the assemble-and-publish
+        // semantics — there is no mount window to hide behind (H3).
+        if !spec.explicit_drive_letter {
+            self.publish_added_volume(name, assembled, None, None);
+            return format!("OK: added volume `{name}` (running; no drive letter claimed)\n");
+        }
+        if !self.process_cfg.auto_mount_drive {
+            tracing::info!(
+                volume = name,
+                "drive_letter claimed but auto_mount_drive is off; the volume runs \
+                 without its drive (the same gate the boot mount pass applies)"
+            );
+            self.publish_added_volume(name, assembled, None, None);
+            return format!("OK: added volume `{name}` (running; no drive letter claimed)\n");
+        }
+
+        // The mount-first window (review H3): the ADD's drive mount runs
+        // BEFORE any face publishes the volume. The old order inserted
+        // into the three faces first, so `/vol/<name>` routed and the
+        // dashboard tab appeared while the mount was still seconds away
+        // — and a mount failure rolled the faces back under in-flight
+        // requests (axum request tasks run concurrently with the control
+        // loop; "same task, serialized" only holds between commands).
+        // Publishing after the mount settles makes the window
+        // unobservable: a volume is either not registered at all or
+        // registered AND mounted. Accepted edge: the LIST/banner face
+        // briefly lacks a volume whose mount is in flight (one ADD's
+        // worth of seconds — and no client can observe the half-state
+        // either way).
+        let mut mounts = match &self.mount {
+            Some(mount_step) => mount_step(name, &spec.settings.drive_letter).await,
+            None => {
+                // The pass's winfsp arm resolves each claim's VFS through
+                // the registry it is handed, and the volume is
+                // deliberately NOT in the shared one yet — so this
+                // single-entry registry is the whole pass's view (the
+                // claims list carries exactly this volume).
+                let shadow_registry = RegistryHandle::new(vec![assembled.runtime.clone()]);
+                mount_volumes_if_configured(&MountPlan {
+                    process_cfg: &self.process_cfg,
+                    claims: std::slice::from_ref(&(
+                        name.to_string(),
+                        spec.settings.drive_letter.clone(),
+                    )),
+                    registry: &shadow_registry,
+                    rt: &tokio::runtime::Handle::current(),
+                    webdav_available: self.webdav_available,
+                    winfsp: winfsp_capability(),
+                })
+                .await
+            }
+        };
+        let mut handles = mounts.winfsp.drain();
+        let Some(mount) = mounts.mounted.into_iter().next() else {
+            // A claimed letter that cannot be honored fails the ADD (the
+            // ruling lists 盘符冲突 as an ADD failure): tear the
+            // assembled volume down — nothing was ever registered, so
+            // there are no faces to roll back and no in-flight client
+            // request ever saw the volume (H3: the old rollback ran with
+            // the faces already published).
+            tear_down_unpublished(assembled).await;
+            println!("Volume {name} rolled back: the drive mount failed (see the hints above).");
+            tracing::warn!(
+                volume = name,
+                "runtime ADD rolled back: the drive mount failed"
+            );
+            return format!(
+                "ERR: volume `{name}` assembled but its drive mount failed — the \
+                 addition was rolled back; free the drive letter (see the hints \
+                 above) and retry\n"
+            );
+        };
+        let release = mount_release(&mount, &mut handles);
+        let backend = mount.backend.label();
+        let short = mount.backend.as_str();
+        let letter = mount.letter.clone();
+
+        // The gate's post-mount observation point (the H1 placement
+        // semantic at the new registration point): the mount pass's
+        // awaits can straddle a gate fire too. A shutdown landing here
+        // takes over the cleanup — release the just-mounted drive FIRST
+        // (its callbacks call into the Vfs, so the host must be gone
+        // before the workers; a release failure only warns, the
+        // stop-sequence policy), then tear the never-published volume
+        // down. Nothing is registered on this path.
+        if self.watch.fired() {
+            if let Some(mut release) = release {
+                if let Err(error) = release.release().await {
+                    tracing::warn!(
+                        volume = name,
+                        %error,
+                        "releasing the freshly mounted drive failed while aborting the \
+                         ADD for shutdown; continuing the teardown"
+                    );
+                }
+            }
+            tear_down_unpublished(assembled).await;
+            return format!(
+                "ERR: volume `{name}` not added — the instance is shutting down; the \
+                 freshly mounted drive was released, the assembled volume torn down, \
+                 and nothing was registered\n"
+            );
+        }
+
         // The registration point: all three faces move together (the
-        // master table is the truth, these are its projections).
+        // master table is the truth, these are its projections), with
+        // the settled mount and its release step attached — publication
+        // IS the "registered AND mounted" state (H3).
+        self.publish_added_volume(name, assembled, Some(mount), release);
+        println!("Volume {name} mounted at {letter} ({backend}).");
+        tracing::info!(volume = name, letter = %letter, backend = %backend, "runtime ADD mounted the volume's drive");
+        format!("OK: added volume `{name}` (running; mounted {letter} via {short})\n")
+    }
+
+    /// The ADD publication point (review H3): all three faces and the
+    /// live table move together — the master registry is the truth, the
+    /// WebDAV dispatch and the dashboard are its projections. Callers
+    /// hold the publish until the volume's state is final (its mount
+    /// settled, or it mounts nothing at all), so a published volume is
+    /// never observable half-assembled.
+    fn publish_added_volume(
+        &self,
+        name: &str,
+        assembled: AssembledVolume,
+        mount: Option<MountedVolume>,
+        release: Option<Box<dyn DriveRelease>>,
+    ) {
         self.registry.insert(assembled.runtime);
         self.webdav.insert(name, assembled.fs);
         self.web.insert(cloudkit_web::VolumeUiEntry {
@@ -2291,84 +2439,12 @@ impl RuntimeVolumeControl {
             LiveVolume {
                 stop_unit: assembled.stop_unit,
                 sync_task: assembled.sync_task,
-                mount: None,
-                release: None,
+                mount,
+                release,
             },
         );
         println!("Volume {name} added at runtime (control ADD).");
         tracing::info!(volume = name, "volume added at runtime (control ADD)");
-
-        // The mount pass (K27 + K40), the same gates and dispatch boot
-        // runs: only an explicit drive_letter claim mounts, and the
-        // backend decision (winfsp / webdav / visible fallback) is the
-        // process one.
-        if !spec.explicit_drive_letter {
-            return format!("OK: added volume `{name}` (running; no drive letter claimed)\n");
-        }
-        if !self.process_cfg.auto_mount_drive {
-            tracing::info!(
-                volume = name,
-                "drive_letter claimed but auto_mount_drive is off; the volume runs \
-                 without its drive (the same gate the boot mount pass applies)"
-            );
-            return format!("OK: added volume `{name}` (running; no drive letter claimed)\n");
-        }
-        let claims = vec![(name.to_string(), spec.settings.drive_letter.clone())];
-        let mut mounts = mount_volumes_if_configured(&MountPlan {
-            process_cfg: &self.process_cfg,
-            claims: &claims,
-            registry: &self.registry,
-            rt: &tokio::runtime::Handle::current(),
-            webdav_available: self.webdav_available,
-            winfsp: winfsp_capability(),
-        })
-        .await;
-        let mut handles = mounts.winfsp.drain();
-        match mounts.mounted.into_iter().next() {
-            Some(mount) => {
-                let release = mount_release(&mount, &mut handles);
-                let backend = mount.backend.label();
-                let short = mount.backend.as_str();
-                let letter = mount.letter.clone();
-                self.live.attach_mount(name, mount, release);
-                println!("Volume {name} mounted at {letter} ({backend}).");
-                tracing::info!(volume = name, letter = %letter, backend = %backend, "runtime ADD mounted the volume's drive");
-                format!("OK: added volume `{name}` (running; mounted {letter} via {short})\n")
-            }
-            None => {
-                // A claimed letter that cannot be honored fails the ADD
-                // (the ruling lists 盘符冲突 as an ADD failure): roll the
-                // addition all the way back — the volume is not
-                // registered half-claimed.
-                self.rollback_add(name).await;
-                format!(
-                    "ERR: volume `{name}` assembled but its drive mount failed — the \
-                     addition was rolled back; free the drive letter (see the hints \
-                     above) and retry\n"
-                )
-            }
-        }
-    }
-
-    /// Undoes a runtime ADD whose mount step failed: out of all three
-    /// faces, the sync task aborted, the stop segment released. The
-    /// volume never served a client request through the faces (same
-    /// task, serialized), so this is quiet teardown, not a drain.
-    async fn rollback_add(&self, name: &str) {
-        self.webdav.remove(name);
-        self.web.remove(name);
-        self.registry.remove(name);
-        if let Some(entry) = self.live.take(name) {
-            if let Some(task) = entry.sync_task {
-                task.abort();
-            }
-            entry.stop_unit.release().await;
-        }
-        println!("Volume {name} rolled back: the drive mount failed (see the hints above).");
-        tracing::warn!(
-            volume = name,
-            "runtime ADD rolled back: the drive mount failed"
-        );
     }
 
     /// `REMOVE <name>` — the K50 safe sequence: drain the upload queue
@@ -2489,6 +2565,18 @@ fn removal_aborted_by_shutdown(name: &str) -> String {
         "ERR: volume `{name}` removal aborted — the instance is shutting down; the \
          volume stays registered and its drain/release runs in the shutdown sequence\n"
     )
+}
+
+/// The teardown of an assembled-but-never-published volume (review H3):
+/// abort its periodic sync task and release its stop segment (the VFS
+/// drain + inbound join). Bounded by construction — the volume never
+/// served a client request through the faces, so its workers are idle —
+/// and nothing else needs undoing: no face was ever told about it.
+async fn tear_down_unpublished(assembled: AssembledVolume) {
+    if let Some(task) = assembled.sync_task {
+        task.abort();
+    }
+    assembled.stop_unit.release().await;
 }
 
 /// Pairs a completed mount with its backend release step (shared by the
