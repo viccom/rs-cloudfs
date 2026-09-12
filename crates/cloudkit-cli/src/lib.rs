@@ -1710,7 +1710,12 @@ pub async fn run_multi_with_transports_and_commands(
     }
 
     if runtimes.is_empty() {
-        anyhow::bail!("multi-volume boot received no volumes to assemble");
+        // Review M4: reachable since RV0 — every volume file disabled.
+        // The assembly entry main.rs boots through IS the actionable
+        // face (the skip itself is only an info line in the log), so
+        // the bail rescan counts the volume files and names the two
+        // ways out instead of the bare structural text.
+        anyhow::bail!("{}", no_enabled_volumes_message(process_cfg));
     }
     let registry = RegistryHandle::new(runtimes);
     if registry.all_failed() {
@@ -1949,11 +1954,41 @@ async fn bind_multi_web_ui(
     }
 }
 
+/// The empty-assembly bail's message (review M4): a read-only rescan of
+/// the volumes directory (cheap — a directory listing) separates the
+/// RV0-reachable case (volume files exist, every one skipped as
+/// `enabled = false`) from the structural one, and names the two ways
+/// out. In the production flow an empty set reaching here IS the
+/// all-disabled case: parse failures error out during discovery and
+/// failed assemblies register `Failed` entries (kept alive by the
+/// all-failed gate below).
+fn no_enabled_volumes_message(process_cfg: &CyDriveConfig) -> String {
+    let Some(dir) = process_cfg.volumes_dir.as_deref() else {
+        return "multi-volume boot received no volumes to assemble".to_string();
+    };
+    match cloudkit_core::config::discover_volumes(Path::new(dir)) {
+        Ok(files) if !files.is_empty() => format!(
+            "every volume is disabled: all {} volume file(s) under `{}` set enabled = \
+             false — flip the key back to true in the volume file(s) you want served, or \
+             remove `volumes_dir` from config.toml to run single-volume",
+            files.len(),
+            dir
+        ),
+        _ => format!(
+            "multi-volume boot received no enabled volumes to assemble — add one \
+             `<name>.toml` per volume (enabled = true) under `{dir}`, or remove \
+             `volumes_dir` from config.toml to run single-volume"
+        ),
+    }
+}
+
 /// Binds the single multi-volume WebDAV listener (K20) or degrades
 /// visibly (K22): an address-parse or bind failure logs an error and
 /// returns `None` — the volumes keep running, only the WebDAV face is
-/// gone. An empty volume set (theoretically unreachable behind the
-/// all-failed gate) also skips the bind.
+/// gone. An empty volume set cannot reach the bind (the
+/// no-enabled-volumes and all-failed guards bail first); the empty
+/// skip stays as a structural backstop — an empty router would bind a
+/// listener that can serve nothing.
 async fn bind_multi_webdav(
     process_cfg: &CyDriveConfig,
     volumes: cloudkit_webdav::RegistryHandle,
