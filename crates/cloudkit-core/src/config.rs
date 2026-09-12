@@ -414,9 +414,10 @@ fn credential_assignment_value_offset(line: &str) -> Option<usize> {
 }
 
 /// Redacts credential values from a parse-error message (review M3 —
-/// the single funnel every `load_volume_config` parse error passes
-/// through, so boot, the ADD reply and the log share one scrubbed
-/// text). Two surfaces carry values:
+/// the single funnel EVERY config parse error passes through: both
+/// `load_volume_config` construction points AND the process-level
+/// `CyDriveConfig::load_toml_with_keys` pair, so boot, the ADD reply
+/// and the log share one scrubbed text). Two surfaces carry values:
 ///
 /// - toml embeds the offending source line (`bot_token = "xxx` — a
 ///   broken quote runs the raw value to the line end): every line with
@@ -1023,7 +1024,11 @@ impl CyDriveConfig {
         // deserialization with per-field `#[serde(default)]` fallback.
         let table: toml::Table = toml::from_str(&text).map_err(|err| ConfigError::Parse {
             path: path_str.clone(),
-            message: err.to_string(),
+            // Review M3 follow-up: the same redaction the volume-file
+            // loader applies — the toml error embeds the offending
+            // source line, and a broken-quote credential line would
+            // leak its value into the boot error otherwise.
+            message: redact_credential_values(&err.to_string()),
         })?;
         for key in table.keys() {
             if !KNOWN_TOML_KEYS.contains(&key.as_str()) {
@@ -1036,7 +1041,10 @@ impl CyDriveConfig {
         let keys: Vec<String> = table.keys().cloned().collect();
         let config: CyDriveConfig = table.try_into().map_err(|err| ConfigError::Parse {
             path: path_str,
-            message: err.to_string(),
+            // Review M3 follow-up: the serde error quotes the offending
+            // value in backticks — a wrong-typed credential value must
+            // not ride the message into the boot error.
+            message: redact_credential_values(&err.to_string()),
         })?;
         Ok((config, keys))
     }
