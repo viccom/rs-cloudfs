@@ -594,3 +594,13 @@
 - **H3（86e49a5）**：ADD 改「先装配后公示」——三面 insert 后移到挂载成功后（红证：挂载阻塞期 PROPFIND 207→绿 404）；挂载失败走 `tear_down_unpublished`（rollback_add 删除吸收）；winfsp 挂载 pass 喂单条目 shadow registry（registry 在 pass 内唯一用途=按 claim 解析 VFS，主会话核证）；新增可注入挂载缝 `RuntimeVolumeCommands.mount`（一并补上审查 M5 最重的 rollback 零覆盖缺口）。
 - **M1（68175a8）**：控制通道鲁棒性三件——handler panic 包 `AssertUnwindSafe(...).catch_unwind()`（futures-util 单依赖边）回 internal-error ERR 通道存活；客户端交换 120s 预算（`EXCHANGE_BUDGET`，REMOVE 60s 排空+10s unmount+余量）+ `exchange_line_bounded` 测试缝；`WebDavRelease` net use 改 spawn_blocking + 30s 预算（超时分支离线不可测，commit 内如实声明，错误路径双测试 pin）。
 - **挂账（未批准修复）**：M2 排空期入站写入不断流（ERR 文案不可达）、M3 解析错误 ERR 凭据值片段风险、M4 全禁用 boot 文案、M5 余下测试缺口（并发语义/keep-alive 跨摘卷/空表）与 Low 全集——权威清单见 docs/tracking/phase36-review-fixes.md。
+
+## 2026-09-12 审查修复批二（Medium 清偿）：K56 入档（fix/phase36-med，M2/M3/M4/M5 + M3 补全）
+
+- **K56 范围裁决**：负责人确认 Medium 亦为真 bug，批准清偿剩余 M2–M5（M1 已随 K55 批修掉）；Low 项继续挂账。
+- **M2（9eb8233）**：REMOVE 排水循环新增「写入仍在到达」检测（相邻 poll 间 enqueued 增长即中止，gate 检查优先于增长检测）——活跃写入的卷及早回专属可行动文案（关闭占用程序后重试）而非等满 60s 预算给不可达成的建议；纯超时分支文案补 close-writers-first 子句。红→绿：排水期二次 ingest，等满 5.36s 通用超时 → 1 poll 内专属 ERR。
+- **M3（093cd4d + 补全 b78ece1）**：解析错误凭据脱敏收口在 config.rs 构造点（非回复面）——`redact_credential_values`：消息含凭据类键名才脱敏（赋值行值段/未闭合多行串/serde 反引号值段，保前后 2 字符），普通语法错误原文保留；`load_volume_config`（卷文件）与 `load_toml_with_keys`（单卷 config.toml，同根因补全）全部 Parse 构造点覆盖。红→绿 ×3 + 对照 ×2。
+- **M4（5d68c1b）**：全禁用 boot 专门文案——装配入口对空卷表重扫 `discover_volumes` 计数，报「N 个卷文件全部 disabled + 目录 + 改回 true/走单卷模式两条出路」；`bind_multi_webdav` 过时注释修正。红→绿 e2e。
+- **M5（685e554）**：三个特征测试钉住已声明行为（均直接绿，如实标注 pin）——①慢 REMOVE 在途时控制通道整体让位（PING/LIST 回复都在 REMOVE 完成后），②摘到空表实例继续服务（LIST 0 卷/端口在/PING 活），③**keep-alive 同连接跨摘卷**（207→remove→同连接 404，裸 TCP keep-alive helper，RV1 per-request 分发声明的直接钉子）；webdav 测试 helper 增强 chunked 解码（multistatus 无 Content-Length，纯测试侧）。
+- **审查结论修正（K55 条目的证伪②撤回）**：K55 批曾裁定「cydrive stop 客户端挂起不成立——STOP 在连接任务内即时回执」。M5 特征测试实证：**连接任务的 accept 本身在 handler await 期间不被 poll**——PING/STOP 的回执同样要等在途命令完成（TCP 握手仅在内核 backlog 成功）。K55 M1 的 120s 客户端预算恰好兜住该挂起面；若未来要求 PING/STOP 真即时（探活不被长命令阻塞），需把 PING/STOP 挪出 accept loop，属行为变更留裁决（tracking 挂账）。
+- **批次执行事故如实记录**：M3/M4 首 push 前因 fmt 门禁差两行 soft reset 重 commit（dba923f/83223a0 → 093cd4d/5d68c1b，内容不变）；M5 测试期发现并如实区分一处探针问题（read_response 不认 chunked）与产品行为。
