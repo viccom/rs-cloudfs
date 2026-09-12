@@ -657,6 +657,151 @@ async fn remove_with_undrained_queue_aborts_and_keeps_the_volume() {
     drop(handle);
 }
 
+/// Review M2: a drain that keeps being fed is not a drain. While REMOVE
+/// parks in its drain window (one upload held by RateLimited{3600s}), a
+/// SECOND upload arrives — the enqueued count grows between polls, so a
+/// client is still writing the volume and the 60s budget can never be
+/// enough (the queue is being re-fed). The drain must detect the growth
+/// and abort EARLY with the writes-still-arriving wording (close the
+/// programs using the volume), not wait the budget out and answer the
+/// generic retry-once-drained advice that this scenario can never
+/// satisfy. The volume stays registered either way (K50).
+#[tokio::test]
+async fn remove_drain_aborts_early_when_new_uploads_keep_arriving() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    write_file(
+        &dir.path().join("volumes").join("stuck.toml"),
+        &volume_toml("222:BBB", 222222),
+    );
+    let _guard = chdir(dir.path());
+
+    let specs = {
+        let mut v =
+            cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load volume specs");
+        v.retain(|spec| spec.name != "stuck");
+        v
+    };
+    // Same hold transport as the undrained-queue test, with the Fail
+    // action scripted TWICE (upload scripts are consumed one entry per
+    // call; an exhausted script serves Ok): both the first and the
+    // second upload fail with an authoritative RateLimited{3600s} and
+    // stay in flight for the whole test.
+    let hold_dispatch: VolumeTransportDispatch = Arc::new(move |_spec: &VolumeConfig| {
+        Box::pin(async {
+            let mock = Arc::new(
+                MockTransport::builder()
+                    .upload_action(UploadAction::Fail {
+                        error: StorageError::RateLimited {
+                            retry_after: Some(Duration::from_secs(3600)),
+                        },
+                    })
+                    .upload_action(UploadAction::Fail {
+                        error: StorageError::RateLimited {
+                            retry_after: Some(Duration::from_secs(3600)),
+                        },
+                    })
+                    .build(),
+            );
+            mock.connect().await.expect("connect hold mock");
+            Ok(Some((
+                RunOptions::default(),
+                mock as Arc<dyn CloudTransport>,
+            )))
+        })
+    });
+    // A 5s drain budget: the red behaviour would wait it out fully
+    // (proving the mis-diagnosis); the growth detection must answer
+    // within a couple of poll ticks of the second upload.
+    let handle = boot_with_commands(
+        process_config(),
+        specs,
+        vec![mock_transport().await],
+        RuntimeVolumeCommands {
+            dispatch: Some(hold_dispatch),
+            remove_tuning: RemoveTuning {
+                drain_timeout: Duration::from_secs(5),
+                poll_interval: Duration::from_millis(50),
+            },
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await;
+    let addr = control_addr();
+    let webdav = handle.webdav_addr().expect("webdav bound");
+
+    let reply = send_cmd(addr, "ADD stuck").await;
+    assert!(reply.starts_with("OK:"), "stuck adds cleanly: {reply}");
+
+    // The first upload parks the queue at outstanding=1 (the drain's
+    // enqueued baseline).
+    let source = dir.path().join("hold.txt");
+    fs::write(&source, b"hold me in flight").expect("write source");
+    let rel = RelPath::new("/hold.txt").expect("valid rel path");
+    handle
+        .volume("stuck")
+        .expect("volume stuck")
+        .vfs()
+        .expect("vfs stuck")
+        .ingest_file(&rel, &source, 1.0)
+        .await
+        .expect("ingest into stuck");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // REMOVE parks in its drain loop; 300ms later a second upload
+    // arrives — the enqueued count grows mid-drain (a client still
+    // writes the volume).
+    let started = std::time::Instant::now();
+    let remove_task = tokio::spawn(async move { send_cmd(addr, "REMOVE stuck").await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let source2 = dir.path().join("hold2.txt");
+    fs::write(&source2, b"another write while draining").expect("write source 2");
+    let rel2 = RelPath::new("/hold2.txt").expect("valid rel path 2");
+    handle
+        .volume("stuck")
+        .expect("volume stuck")
+        .vfs()
+        .expect("vfs stuck")
+        .ingest_file(&rel2, &source2, 1.0)
+        .await
+        .expect("second ingest into stuck");
+
+    let reply = timeout(Duration::from_secs(10), remove_task)
+        .await
+        .expect("REMOVE settles")
+        .expect("the REMOVE task joins");
+    let elapsed = started.elapsed();
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("still arriving"),
+        "the fed drain answers the writes-still-arriving abort: {reply}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the growth detection aborts well inside the 5s budget: {elapsed:?}"
+    );
+    assert!(
+        handle.volume("stuck").expect("still registered").status() == VolumeStatus::Running,
+        "the aborted removal left the volume registered"
+    );
+    let resp = send_http(webdav, &http_request("PROPFIND", "/vol/stuck/", webdav)).await;
+    assert_eq!(
+        status_of(&resp),
+        207,
+        "the aborted removal kept the data plane: {resp}"
+    );
+
+    // Deliberate leak (same reason as the undrained-queue test): the
+    // held workers sleep 3600s; the runtime drop cancels the task.
+    drop(handle);
+}
+
 /// The K50 unmount abort (the injected-probe path): a volume whose drive
 /// release reports failure stops the removal — the volume stays
 /// registered and its mount entry untouched; only a release that
@@ -1381,6 +1526,266 @@ async fn the_real_net_use_release_aborts_the_removal_when_it_fails() {
     assert!(
         reply.starts_with("OK:") && reply.contains("removed volume `a`"),
         "the removal completes once the drive releases: {reply}"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+// --------------------- 7. M5 characterization: serialization / empty table ---
+
+/// M5 test gap 1 (characterization, expected green — pins control.rs's
+/// documented concurrency contract: "volume commands queue behind the
+/// one in flight"). The accept loop awaits the serialized handler on
+/// its own task, so while a REMOVE parks in its K50 drain window the
+/// whole channel is held:
+///
+/// - a second connection's `LIST` is not answered until the REMOVE
+///   settles — its command queues behind the in-flight one — and then
+///   answers with the correct post-removal list;
+/// - a `PING` connection is likewise not answered while the REMOVE
+///   holds the loop. PING never enters the command queue (the
+///   connection task answers it inline; the handler-record tests in
+///   `control_channel.rs` pin that STOP and PING never reach the
+///   handler), but the serialized accept loop cannot even ACCEPT the
+///   connection until the handler returns — so the reply lands right
+///   after the REMOVE settles, not before. This is the documented
+///   queueing ("a later command, STOP included, queues behind the one
+///   in flight"), not a PING regression.
+///
+/// The STOP arm is deliberately not constructed here: it shares the
+/// same accept-loop serialization (its reply would equally wait out
+/// the in-flight REMOVE), and firing the shutdown callback mid-test
+/// would race the shutdown sequence for no extra pin.
+#[tokio::test]
+async fn a_slow_remove_holds_the_control_channel_until_it_settles() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    write_file(
+        &dir.path().join("volumes").join("stuck.toml"),
+        &volume_toml("222:BBB", 222222),
+    );
+    let _guard = chdir(dir.path());
+
+    let specs = {
+        let mut v =
+            cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load volume specs");
+        v.retain(|spec| spec.name == "a");
+        v
+    };
+    // The ADD dispatch hands out a transport whose ONE upload fails
+    // with an authoritative RateLimited{5s}: the worker honors the wait
+    // exactly (the job stays in flight for five seconds), then the
+    // exhausted script serves the retry as Ok — so the REMOVE parks in
+    // its drain loop for a bounded, observable window and then
+    // COMPLETES (the drain sees outstanding reach zero well inside the
+    // 15s budget).
+    let hold_dispatch: VolumeTransportDispatch = Arc::new(move |_spec: &VolumeConfig| {
+        Box::pin(async {
+            let mock = Arc::new(
+                MockTransport::builder()
+                    .upload_action(UploadAction::Fail {
+                        error: StorageError::RateLimited {
+                            retry_after: Some(Duration::from_secs(5)),
+                        },
+                    })
+                    .build(),
+            );
+            mock.connect().await.expect("connect hold mock");
+            Ok(Some((
+                RunOptions::default(),
+                mock as Arc<dyn CloudTransport>,
+            )))
+        })
+    });
+    let handle = boot_with_commands(
+        process_config(),
+        specs,
+        vec![mock_transport().await],
+        RuntimeVolumeCommands {
+            dispatch: Some(hold_dispatch),
+            remove_tuning: RemoveTuning {
+                drain_timeout: Duration::from_secs(15),
+                poll_interval: Duration::from_millis(50),
+            },
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await;
+    let addr = control_addr();
+
+    let reply = send_cmd(addr, "ADD stuck").await;
+    assert!(reply.starts_with("OK:"), "stuck adds cleanly: {reply}");
+
+    // Park one real upload in flight (the RateLimited sleep) — the
+    // REMOVE will wait on exactly this in its drain loop.
+    let source = dir.path().join("hold.txt");
+    fs::write(&source, b"hold me five seconds").expect("write source");
+    let rel = RelPath::new("/hold.txt").expect("valid rel path");
+    handle
+        .volume("stuck")
+        .expect("volume stuck")
+        .vfs()
+        .expect("vfs stuck")
+        .ingest_file(&rel, &source, 1.0)
+        .await
+        .expect("ingest into stuck");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The REMOVE parks in its drain loop; PING and LIST arrive on
+    // their own connections while it is in flight.
+    let remove_task = tokio::spawn(async move { send_cmd(addr, "REMOVE stuck").await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let mut ping_task = tokio::spawn(async move { send_cmd(addr, "PING").await });
+    tokio::time::sleep(Duration::from_millis(200)).await;
+    let mut list_task = tokio::spawn(async move { send_cmd(addr, "LIST").await });
+
+    // While the REMOVE is in flight, neither connection is answered —
+    // the LIST queues behind the in-flight command, and the PING
+    // connection cannot even be accepted by the serialized loop.
+    assert!(
+        timeout(Duration::from_millis(400), &mut ping_task)
+            .await
+            .is_err(),
+        "PING is not answered while the in-flight REMOVE holds the accept loop"
+    );
+    assert!(
+        timeout(Duration::from_millis(400), &mut list_task)
+            .await
+            .is_err(),
+        "LIST is not answered while the in-flight REMOVE holds the accept loop"
+    );
+
+    // The REMOVE settles (the held upload retries to Ok, the drain sees
+    // zero) — and only then do the parked connections get served.
+    let reply = timeout(Duration::from_secs(30), remove_task)
+        .await
+        .expect("REMOVE settles within the budget")
+        .expect("the REMOVE task joins");
+    assert!(
+        reply.starts_with("OK:") && reply.contains("removed volume `stuck`"),
+        "the held upload drains and the REMOVE completes: {reply}"
+    );
+    let reply = timeout(Duration::from_secs(5), ping_task)
+        .await
+        .expect("PING is served once the REMOVE settles")
+        .expect("the PING task joins");
+    assert!(
+        reply.starts_with("OK: cydrive"),
+        "the parked PING answers the version line once the loop is free: {reply}"
+    );
+    let reply = timeout(Duration::from_secs(5), list_task)
+        .await
+        .expect("LIST is served once the REMOVE settles")
+        .expect("the LIST task joins");
+    assert_eq!(
+        list_rows(&reply),
+        vec!["a running - telegram pending=0".to_string()],
+        "the queued LIST answers with the correct post-removal list: {reply}"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+/// M5 test gap 2 (characterization, expected green): removing every
+/// volume down to the empty registry leaves the instance serving —
+/// `LIST` answers `OK: 0 volume(s)` with no volume rows, the WebDAV
+/// listener still accepts NEW connections (a PROPFIND on a removed
+/// volume's prefix is the routed 404, not a refused connection), and
+/// PING still answers (K51's empty-table liveness + K50's
+/// remove-to-empty never taking the process down).
+#[tokio::test]
+async fn removing_every_volume_leaves_the_empty_instance_serving() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    write_file(
+        &dir.path().join("volumes").join("b.toml"),
+        &volume_toml("222:BBB", 222222),
+    );
+    let _guard = chdir(dir.path());
+
+    let specs = cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load specs");
+    let handle = boot_with_commands(
+        process_config(),
+        specs,
+        vec![mock_transport().await, mock_transport().await],
+        RuntimeVolumeCommands::default(),
+    )
+    .await;
+    let addr = control_addr();
+    let webdav = handle.webdav_addr().expect("webdav bound");
+
+    // Both volumes answer at boot.
+    let resp = send_http(webdav, &http_request("PROPFIND", "/vol/a/", webdav)).await;
+    assert_eq!(status_of(&resp), 207, "volume a at boot: {resp}");
+    let resp = send_http(webdav, &http_request("PROPFIND", "/vol/b/", webdav)).await;
+    assert_eq!(status_of(&resp), 207, "volume b at boot: {resp}");
+
+    // Remove down to the empty table.
+    let reply = send_cmd(addr, "REMOVE a").await;
+    assert!(
+        reply.starts_with("OK:") && reply.contains("removed volume `a`"),
+        "REMOVE a: {reply}"
+    );
+    let reply = send_cmd(addr, "REMOVE b").await;
+    assert!(
+        reply.starts_with("OK:") && reply.contains("removed volume `b`"),
+        "REMOVE b: {reply}"
+    );
+    assert_eq!(handle.volumes(), Vec::<(String, VolumeStatus)>::new());
+
+    // The empty registry: LIST answers the zero-volume header with no
+    // volume rows behind it.
+    let reply = send_cmd(addr, "LIST").await;
+    assert!(
+        reply.starts_with("OK: 0 volume(s)"),
+        "the empty table's LIST header: {reply}"
+    );
+    assert!(
+        list_rows(&reply).is_empty(),
+        "no volume rows behind the zero-volume header: {reply}"
+    );
+
+    // The WebDAV listener keeps accepting new connections: the removed
+    // volumes' prefixes are the routed 404 (the dispatch table read per
+    // request), not a refused/dropped connection.
+    let resp = send_http(webdav, &http_request("PROPFIND", "/vol/a/", webdav)).await;
+    assert_eq!(
+        status_of(&resp),
+        404,
+        "a fresh connection gets the routed 404 for removed volume a: {resp}"
+    );
+    let resp = send_http(webdav, &http_request("PROPFIND", "/vol/b/", webdav)).await;
+    assert_eq!(
+        status_of(&resp),
+        404,
+        "a fresh connection gets the routed 404 for removed volume b: {resp}"
+    );
+
+    // The instance is still up and answering on the control channel.
+    let reply = send_cmd(addr, "PING").await;
+    assert!(
+        reply.starts_with("OK: cydrive"),
+        "PING still answers on the emptied instance: {reply}"
     );
 
     timeout(Duration::from_secs(30), handle.shutdown())

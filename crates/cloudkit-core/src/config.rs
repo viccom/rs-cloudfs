@@ -366,6 +366,143 @@ fn is_valid_volume_name(name: &str) -> bool {
             .all(|&b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'_' || b == b'-')
 }
 
+/// Keys whose VALUES are credentials — the review-M3 redaction targets.
+/// A toml/serde parse-error message that mentions one of them carries
+/// value text on its face (the embedded offending source line, or the
+/// serde `invalid type: ... \`value\`` quote), and the message travels
+/// into the boot error, the control-channel ADD reply and the tracing
+/// log — so the values are masked at the `ConfigError::Parse`
+/// construction points (the credential-values-never-enter-logs red
+/// line). Key names and positions always stay; only values go.
+const SECRET_VALUED_KEYS: &[&str] = &[
+    "bot_token",
+    "encryption_password",
+    "sync_secret",
+    "baidu_app_secret",
+    "baidu_access_token",
+    "baidu_refresh_token",
+];
+
+/// Masks a credential value span: length-preserving, first and last two
+/// characters visible when the span is long enough to hide anything
+/// (shorter spans are all stars — a two-character head/tail of a tiny
+/// value would leak most of it).
+fn mask_secret_value(value: &str) -> String {
+    let chars: Vec<char> = value.chars().collect();
+    match chars.len() {
+        0 => String::new(),
+        n if n >= 8 => {
+            let head: String = chars[..2].iter().collect();
+            let tail: String = chars[n - 2..].iter().collect();
+            format!("{head}{}{tail}", "*".repeat(n - 4))
+        }
+        n => "*".repeat(n),
+    }
+}
+
+/// Byte offset of the value in a line that assigns a credential key
+/// (just past the `=` that follows the key) — `None` on lines that do
+/// not carry a `credential-key ... =` shape.
+fn credential_assignment_value_offset(line: &str) -> Option<usize> {
+    let key = SECRET_VALUED_KEYS
+        .iter()
+        .copied()
+        .find(|key| line.contains(key))?;
+    let key_end = line.find(key)? + key.len();
+    let equals = line[key_end..].find('=')? + key_end;
+    Some(equals + 1)
+}
+
+/// Redacts credential values from a parse-error message (review M3 —
+/// the single funnel EVERY config parse error passes through: both
+/// `load_volume_config` construction points AND the process-level
+/// `CyDriveConfig::load_toml_with_keys` pair, so boot, the ADD reply
+/// and the log share one scrubbed text). Two surfaces carry values:
+///
+/// - toml embeds the offending source line (`bot_token = "xxx` — a
+///   broken quote runs the raw value to the line end): every line with
+///   a `credential-key ... =` shape has its value span masked; an
+///   unterminated multi-line string opener (`"""` / `'''`) masks
+///   through the end of the message, because the credential's
+///   continuation lines are indistinguishable from the tail;
+/// - serde quotes the offending value in backticks on a line that need
+///   not repeat the key (`invalid type: integer \`123…\``): every
+///   backtick span that is long enough to be a value and is not itself
+///   a known key name (``in `bot_token` `` keeps the key) is masked.
+///
+/// A message naming no credential key is returned verbatim — ordinary
+/// syntax errors keep their full diagnostic text.
+fn redact_credential_values(message: &str) -> String {
+    if !SECRET_VALUED_KEYS.iter().any(|key| message.contains(key)) {
+        return message.to_string();
+    }
+    let masked_assignments = mask_credential_assignment_lines(message);
+    let mut masked = mask_backtick_value_spans(&masked_assignments);
+    if message.ends_with('\n') && !masked.ends_with('\n') {
+        masked.push('\n');
+    }
+    masked
+}
+
+/// Pass 1 of [`redact_credential_values`]: mask the value span on every
+/// line assigning a credential key (see the funnel's doc comment for
+/// the multi-line-opener rule).
+fn mask_credential_assignment_lines(message: &str) -> String {
+    let mut lines: Vec<String> = Vec::new();
+    let mut masked_to_end = false;
+    for line in message.lines() {
+        if masked_to_end {
+            lines.push(mask_secret_value(line));
+            continue;
+        }
+        match credential_assignment_value_offset(line) {
+            Some(offset) => {
+                let (prefix, value) = line.split_at(offset);
+                let trimmed = value.trim_start();
+                if trimmed.starts_with("\"\"\"") || trimmed.starts_with("'''") {
+                    masked_to_end = true;
+                }
+                lines.push(format!("{prefix}{}", mask_secret_value(value)));
+            }
+            None => lines.push(line.to_string()),
+        }
+    }
+    lines.join("\n")
+}
+
+/// Pass 2 of [`redact_credential_values`]: mask backtick spans that
+/// carry values (at least 3 characters — punctuation hints like
+/// `` `"` `` survive — and not a [`KNOWN_TOML_KEYS`] spelling, so
+/// ``in `bot_token` `` keeps naming the key).
+fn mask_backtick_value_spans(message: &str) -> String {
+    let mut out = String::with_capacity(message.len());
+    let mut rest = message;
+    while let Some(open) = rest.find('`') {
+        out.push_str(&rest[..open]);
+        let after_open = &rest[open + '`'.len_utf8()..];
+        match after_open.find('`') {
+            Some(close) => {
+                let content = &after_open[..close];
+                out.push('`');
+                if content.chars().count() >= 3 && !KNOWN_TOML_KEYS.contains(&content) {
+                    out.push_str(&mask_secret_value(content));
+                } else {
+                    out.push_str(content);
+                }
+                out.push('`');
+                rest = &after_open[close + '`'.len_utf8()..];
+            }
+            None => {
+                // An unpaired backtick (prose fragment): keep the tail.
+                out.push_str(rest);
+                return out;
+            }
+        }
+    }
+    out.push_str(rest);
+    out
+}
+
 /// Loads a single volume file (Phase 2.5 / K19). The volume name is the
 /// file stem; the body accepts exactly the [`VOLUME_SCOPED_KEYS`] subset
 /// of the strict `config.toml` surface (unknown keys rejected with the
@@ -402,7 +539,10 @@ pub fn load_volume_config(path: &Path) -> Result<VolumeConfig, ConfigError> {
     })?;
     let table: toml::Table = toml::from_str(&text).map_err(|err| ConfigError::Parse {
         path: path_str.clone(),
-        message: err.to_string(),
+        // Review M3: the toml error embeds the offending source line —
+        // a broken-quote credential line would leak its value into the
+        // ADD reply and the log otherwise.
+        message: redact_credential_values(&err.to_string()),
     })?;
     for key in table.keys() {
         if PROCESS_SCOPED_KEYS.contains(&key.as_str()) {
@@ -424,7 +564,10 @@ pub fn load_volume_config(path: &Path) -> Result<VolumeConfig, ConfigError> {
     let explicit_drive_letter = table.contains_key("drive_letter");
     let settings: CyDriveConfig = table.try_into().map_err(|err| ConfigError::Parse {
         path: path_str,
-        message: err.to_string(),
+        // Review M3: the serde error quotes the offending value in
+        // backticks — a wrong-typed credential value must not ride the
+        // message into the ADD reply or the log.
+        message: redact_credential_values(&err.to_string()),
     })?;
     let base_dir = match path.parent() {
         Some(parent) if !parent.as_os_str().is_empty() => parent.to_path_buf(),
@@ -881,7 +1024,11 @@ impl CyDriveConfig {
         // deserialization with per-field `#[serde(default)]` fallback.
         let table: toml::Table = toml::from_str(&text).map_err(|err| ConfigError::Parse {
             path: path_str.clone(),
-            message: err.to_string(),
+            // Review M3 follow-up: the same redaction the volume-file
+            // loader applies — the toml error embeds the offending
+            // source line, and a broken-quote credential line would
+            // leak its value into the boot error otherwise.
+            message: redact_credential_values(&err.to_string()),
         })?;
         for key in table.keys() {
             if !KNOWN_TOML_KEYS.contains(&key.as_str()) {
@@ -894,7 +1041,10 @@ impl CyDriveConfig {
         let keys: Vec<String> = table.keys().cloned().collect();
         let config: CyDriveConfig = table.try_into().map_err(|err| ConfigError::Parse {
             path: path_str,
-            message: err.to_string(),
+            // Review M3 follow-up: the serde error quotes the offending
+            // value in backticks — a wrong-typed credential value must
+            // not ride the message into the boot error.
+            message: redact_credential_values(&err.to_string()),
         })?;
         Ok((config, keys))
     }

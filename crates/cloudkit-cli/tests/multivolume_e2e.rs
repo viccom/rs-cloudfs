@@ -449,6 +449,58 @@ async fn every_volume_failing_is_an_error() {
     );
 }
 
+/// Review M4: RV0 made the empty-boot path reachable — every volume
+/// file carrying `enabled = false` leaves [`load_volumes`] with an
+/// empty set (each skip is only an info line in the log), and the boot
+/// must refuse with the disabled-specific message: the volume-file
+/// count, the directory, and the two ways out (flip a key back to
+/// true, or drop `volumes_dir`). The pre-fix generic "no volumes to
+/// assemble" bail named none of that.
+#[tokio::test]
+async fn every_volume_disabled_is_an_actionable_boot_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        "backend = \"local\"\nlocal_root = \"root-a\"\nenabled = false\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("b.toml"),
+        "backend = \"local\"\nlocal_root = \"root-b\"\nenabled = false\n",
+    );
+    let _guard = chdir(dir.path());
+
+    let specs = load_specs();
+    assert!(
+        specs.is_empty(),
+        "both disabled volumes are skipped at discovery (the RV0 skip)"
+    );
+
+    let error = run_multi_with_transports(&process_config(), Vec::new())
+        .await
+        .expect_err("a boot with every volume disabled must fail");
+    let message = format!("{error:#}");
+    assert!(
+        message.contains("disabled"),
+        "the error names the disabled cause: {message}"
+    );
+    assert!(
+        message.contains("2 volume file"),
+        "the error counts the skipped volume files: {message}"
+    );
+    assert!(
+        message.contains("volumes"),
+        "the error names the volumes directory: {message}"
+    );
+    assert!(
+        message.contains("single-volume"),
+        "the error offers the single-volume way out: {message}"
+    );
+}
+
 // --------------------------------------------------- 3. K25 aggregated stop ---
 
 /// One control-channel STOP stops every volume (K25): the multi-volume

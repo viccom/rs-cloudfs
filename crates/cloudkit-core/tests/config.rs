@@ -294,6 +294,84 @@ fn toml_unknown_key_is_parse_error() {
     );
 }
 
+/// Review M3 follow-up (fix(core) extension): the single-volume
+/// `config.toml` loader shares the volume-file redaction contract — its
+/// parse errors ride the same `ConfigError::Parse` message into the
+/// boot error path (the log and the console), so a TOML syntax error on
+/// a credential-carrying line must not leak the value either. The key
+/// name and the line/column position stay for diagnosis.
+#[test]
+fn load_toml_parse_error_redacts_credential_values() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    fs::write(&path, "bot_token = \"SECRET-MARKER-456\nchat_id = 1\n").expect("write config.toml");
+
+    let err =
+        CyDriveConfig::load_toml(&path).expect_err("the broken-quote line must fail to parse");
+    assert!(
+        matches!(err, ConfigError::Parse { .. }),
+        "expected Parse error, got: {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        !message.contains("SECRET-MARKER-456"),
+        "the credential value must be redacted from the parse error: {message}"
+    );
+    assert!(
+        message.contains("bot_token"),
+        "the key name stays for diagnosis: {message}"
+    );
+    assert!(
+        message.contains("line"),
+        "the position stays for diagnosis: {message}"
+    );
+}
+
+/// Review M3 follow-up, serde construction point: a wrong-typed
+/// credential value in `config.toml` fails in `try_into`, and the serde
+/// error quotes the value (the embedded source line and the `invalid
+/// type: integer \`...\`` reason) — both occurrences must be masked.
+#[test]
+fn load_toml_type_error_redacts_credential_values() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    fs::write(&path, "encryption_password = 9999999999012345\n").expect("write config.toml");
+
+    let err = CyDriveConfig::load_toml(&path).expect_err("an integer password must fail to parse");
+    assert!(
+        matches!(err, ConfigError::Parse { .. }),
+        "expected Parse error, got: {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        !message.contains("9999999999012345"),
+        "the credential value must be redacted from the type error: {message}"
+    );
+    assert!(
+        message.contains("encryption_password"),
+        "the key name stays for diagnosis: {message}"
+    );
+}
+
+/// Review M3 follow-up, over-redaction guard: a `config.toml` syntax
+/// error on a line with NO credential key keeps its message verbatim —
+/// the diagnostic value of the embedded source line survives the
+/// redaction pass untouched (pin, green on both sides of the fix).
+#[test]
+fn load_toml_parse_error_without_credentials_stays_verbatim() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    fs::write(&path, "local_root = \"plain-offending-value\n").expect("write config.toml");
+
+    let err =
+        CyDriveConfig::load_toml(&path).expect_err("the broken-quote line must fail to parse");
+    let message = err.to_string();
+    assert!(
+        message.contains("local_root = \"plain-offending-value"),
+        "a message without credential keys is not redacted: {message}"
+    );
+}
+
 // ---------------------------------------------------- env overrides ---
 
 #[test]

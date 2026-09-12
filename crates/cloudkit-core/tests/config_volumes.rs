@@ -270,6 +270,92 @@ fn load_volume_config_rejects_invalid_volume_names() {
     assert_eq!(volume.name.len(), 32);
 }
 
+/// Review M3: a TOML syntax error on a line that carries a credential
+/// value (the broken-quote `bot_token` line) must not leak the value —
+/// the parse error's Display embeds the offending source line, and the
+/// message flows into the control-channel ADD reply and the tracing
+/// log (the credential-values-never-enter-logs red line). The message
+/// keeps the key name and the line/column position (still diagnosable)
+/// but the value is masked.
+#[test]
+fn load_volume_config_parse_error_redacts_credential_values() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("leak.toml");
+    write_file(
+        &path,
+        "backend = \"telegram\"\nbot_token = \"SECRET-MARKER-123\nchat_id = 111111\n",
+    );
+
+    let err = load_volume_config(&path).expect_err("the broken-quote line must fail to parse");
+    assert!(
+        matches!(err, ConfigError::Parse { .. }),
+        "expected Parse error, got: {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        !message.contains("SECRET-MARKER-123"),
+        "the credential value must be redacted from the parse error: {message}"
+    );
+    assert!(
+        message.contains("bot_token"),
+        "the key name stays for diagnosis: {message}"
+    );
+    assert!(
+        message.contains("line"),
+        "the position stays for diagnosis: {message}"
+    );
+}
+
+/// Review M3, serde construction point: a credential key with a
+/// wrong-typed value fails in `try_into`, and the serde error quotes
+/// the value twice (the embedded source line and the `invalid type:
+/// integer \`...\`` reason) — both occurrences must be masked.
+#[test]
+fn load_volume_config_type_error_redacts_credential_values() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("leak.toml");
+    write_file(
+        &path,
+        "backend = \"local\"\nlocal_root = \"root\"\nencryption_password = 9999999999012345\n",
+    );
+
+    let err = load_volume_config(&path).expect_err("an integer password must fail to parse");
+    assert!(
+        matches!(err, ConfigError::Parse { .. }),
+        "expected Parse error, got: {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        !message.contains("9999999999012345"),
+        "the credential value must be redacted from the type error: {message}"
+    );
+    assert!(
+        message.contains("encryption_password"),
+        "the key name stays for diagnosis: {message}"
+    );
+}
+
+/// Review M3, over-redaction guard: a syntax error on a line with NO
+/// credential key keeps its message verbatim — the diagnostic value of
+/// the embedded source line (the raw offending text) survives the
+/// redaction pass untouched.
+#[test]
+fn load_volume_config_parse_error_without_credentials_stays_verbatim() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("plain.toml");
+    write_file(
+        &path,
+        "backend = \"local\"\nlocal_root = \"plain-offending-value\n",
+    );
+
+    let err = load_volume_config(&path).expect_err("the broken-quote line must fail to parse");
+    let message = err.to_string();
+    assert!(
+        message.contains("local_root = \"plain-offending-value"),
+        "a message without credential keys is not redacted: {message}"
+    );
+}
+
 // ------------------------------------------------------- discovery -------
 
 #[test]

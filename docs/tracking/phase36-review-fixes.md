@@ -2,6 +2,8 @@
 
 > 审查：2026-09-12 对 `fece74c..6fbd90a`（Phase 3.6 全部改动）四分域深度审查 + 主会话逐条核验。
 > 修复范围（负责人 2026-09-12 批准）：H2、H1、H3+M1；M2–M5 与 Low 项未批准（挂账）。
+> **追加批准（2026-09-12，worktree `fix/phase36-med`，基线 main@18dde15）：M2/M3/M4 三项**（M5 与 Low 仍挂账）。
+> **再追加（2026-09-12，同 worktree）：M5 三缺口 + M3 补全（`load_toml` 单卷面）**——Low 仍挂账。
 > worktree：`fix/phase36-review`（收口 merge 回 main）。基线 main@6fbd90a：workspace 934/0/12、winfsp 腿 117/0/1。
 
 ## 审查发现与修复状态
@@ -12,15 +14,19 @@
 | H1 | Ctrl+C 与在途 REMOVE/ADD 交错：entry 孤儿化（无 Drop 兜底/net use 死映射）+ `take()` 双锁 panic 窗口 | ✅ `c8489a6` | take 双锁竞态压力测试 **7/7 复现红**（`removal index should be < len`）→ 单锁绿；REMOVE 排水中触发 gate：红=等满 10s 预算 → 绿=350ms 回 shutdown ERR + entry 放回 + FakeRelease 探针端到端证明停机序清理；gate 后拒新（ADD 回 ERR、LIST 照答）；`InFlightCommands` idle 屏障（RAII + Notify double-check 防 lost-wakeup）+ `ShutdownWatch::fired()` + `MultiVolumeHandle::request_stop()` |
 | H3 | 三面 insert 先于挂载（假不变量「从未服务过请求」——axum 并发可路由） | ✅ `86e49a5` | 红：挂载阻塞期间 PROPFIND `/vol/<名>` 207（已可路由）→ 绿：404（先装配后公示）；挂载失败零残留测试 pin 新拆除路径；`rollback_add` 删除吸收为 `tear_down_unpublished`；winfsp 挂载 pass 喂单条目 shadow registry（registry 唯一用途=按 claim 解析 VFS，主会话核证无跨卷冲突检查依赖）；可注入挂载缝 `RuntimeVolumeCommands.mount` |
 | M1 | ① handler panic 炸整条通道 ② `exchange_line` 读侧无超时 ③ net use 同步 Command 无界卡 executor | ✅ `68175a8` | ① panic 测试红（第二命令无回复）→ catch_unwind（futures-util 单依赖边）+ `ERR: internal error ... stays up` + 通道存活绿；② 有界交换测试红（挂起→Elapsed）→ 120s `EXCHANGE_BUDGET` + busy 文案 + `exchange_line_bounded` 测试缝；③ `WebDavRelease` spawn_blocking + 30s 预算——**超时分支离线不可测**（真 net use 无法按需挂起），错误路径双测试 pin（lib 单测 + 生产 release 注入 REMOVE 中止），commit 内如实声明 |
+| M2 | 排空期间入站写入不断流：活跃写入的卷 outstanding 永不归零，60s 预算耗尽后回「retry once the queue drains」——该场景不可达，误导运维 | ✅ `9eb8233`（fix/phase36-med） | 红：`remove_drain_aborts_early_when_new_uploads_keep_arriving` 等满 5s 预算回通用超时文案（`still has 2 upload(s) ... retry once the queue drains`）→ 绿：排水循环检测相邻 poll 间 enqueued 增长，及早回「uploads are still arriving ... close the programs using the volume」专属 ERR（耗时 << 预算，卷保持注册 K50）；纯超时分支文案补「若仍有程序在写该卷请先关闭」——既有 `remove_with_undrained_queue_aborts_and_keeps_the_volume` 断言（ERR + pending）零改动仍绿；gate 检查（H1）优先级高于增长检测 |
+| M3 | 解析错误文本携带凭据值：`load_volume_config` 把 toml/serde 错误 Display 原文装进 `ConfigError::Parse.message`（toml 错误含坏行源文本、serde 含反引号值引用）→ 值随 ADD 回复与 tracing 日志流出（R3 关联红线） | ✅ `093cd4d`（fix/phase36-med） | 红：语法错误测试消息含 `SECRET-MARKER-123`、类型错误测试含 `9999999999012345`（真实错误原文留证）→ 绿：两处 Parse 构造点收口 `redact_credential_values`（凭据键名单出现才脱敏：赋值行值段打码保长度/前后 2 字符、未闭合多行串开号掩到消息尾、serde 反引号值段打码但键名保留；无凭据键消息原文返回）；对照测试 pin 普通语法错误零脱敏 |
+| M4 | 全部卷 enabled=false 时 boot 撞裸 bail「no volumes to assemble」（RV0 后首次可达），不提 disabled 不指路 | ✅ `5d68c1b`（fix/phase36-med） | 红：`every_volume_disabled_is_an_actionable_boot_error` 收到裸 bail 文案 → 绿：装配入口（main 经 `run_multi_volume` 走到的同一入口）重扫 `discover_volumes` 计数，回「every volume is disabled: all 2 volume file(s) under `volumes` ... flip the key back to true / remove volumes_dir 走单卷」；lib 侧无文件/无 volumes_dir 形态保留结构后盾文案；`bind_multi_webdav` 过时「theoretically unreachable」注释修正 |
+| M5 | 三个测试缺口：控制通道并发/串行化语义、摘空后的空表行为、keep-alive 连接跨摘卷——均为已声明行为但无直接用例 | ✅ `685e554`（fix/phase36-med 追加批） | 三个 characterization 测试**直接绿**（无产品改动）：①`a_slow_remove_holds_the_control_channel_until_it_settles`——REMOVE 在 K50 排水窗挂起（RateLimited{5s} 挂上传+15s 预算）期间 LIST 不回（排队）、**PING 也不回**（PING 不进命令队列但串行化 accept loop 无法 accept 新连接——头注释「a later command, STOP included, queues behind the one in flight」的既定语义，非回归），REMOVE 完成后两者立即正确应答；STOP 腿按批指令省略（同构串行化+会与停机序竞争）；②`removing_every_volume_leaves_the_empty_instance_serving`——LIST 回 `OK: 0 volume(s)` 无卷行、WebDAV 新连接得已摘卷 404（非拒连）、PING 仍答（K51 空表存活+K50 摘空不炸进程）；③`keep_alive_connection_sees_a_volume_removal_mid_connection`——单条 keep-alive 连接摘卷前 207/摘卷后同连接同 URL 404（RV1 per-request 分发核心安全声明的直接用例）、幸存卷同连接+新连接均 207；`read_response` 增强 chunked 帧解码（dav-server multistatus 响应无长度，实测 `transfer-encoding: chunked`） |
+| M3 补 | M3 脱敏仅收口 `load_volume_config` 两构造点；`CyDriveConfig::load_toml`（单卷 config.toml）的 toml/serde 两处 Parse 构造点同样把坏行凭据值带进 boot 错误（同红线暴露面） | ✅ `b78ece1`（fix/phase36-med 追加批） | 红：`load_toml_parse_error_redacts_credential_values` 泄漏 `bot_token = "SECRET-MARKER-456` 原文、`load_toml_type_error_redacts_credential_values` 泄漏 ``invalid type: integer `9999999999012345` `` → 绿：`load_toml_with_keys` 两处 Parse 构造点接入同一 `redact_credential_values`（键名/行列保留）；对照 `load_toml_parse_error_without_credentials_stays_verbatim`（无凭据键原文返回）修复前后均绿；M3 原批「已知未覆盖：load_toml 单卷面挂账」销账 |
 
-## 未修复挂账（未批准，M2–M5 + Low 全集见 decisions 当日条目）
+## 未修复挂账（未批准：Low 全集见 decisions 当日条目）
 
-- M2 排空期间入站写入不断流（活跃写入的卷实际不可 REMOVE，ERR 文案不可达成）
-- M3 ADD 解析失败 ERR 可能携带凭据值片段（toml 错误 Display 含源行）
-- M4 全部卷 enabled=false 时 boot bail 文案不可行动
-- M5 测试缺口：控制通道并发语义 / keep-alive 跨摘卷 / 空表行为（rollback_add 缺口已随 H3 的挂载缝补上）
+- ~~M5 测试缺口~~ **已清（2026-09-12 追加批 `685e554`）**：控制通道并发语义 / keep-alive 跨摘卷 / 空表行为三个 characterization 用例落地（rollback_add 缺口已随 H3 的挂载缝补上）。**执行期偏差如实记录**：批指令预期「PING 在慢 REMOVE 在途期间即时应答」，实测与代码分析一致为**不回**——PING 虽不进命令队列（连接任务内联应答），但串行化 accept loop 在 await handler 期间无法 accept 新连接（control.rs 头注释与 H1 测试注释均佐证「STOP included, queues behind the one in flight」）。已按真实现钉住并在测试注释注明「documented queueing, not a PING regression」；若负责人要求 PING 真即时（如 status 探活不被长 REMOVE 阻塞），需把 PING/STOP 挪出 accept loop 或 handler 移独立任务——行为变更，留待裁决。
 
 ## 批次日志
 
 - 2026-09-12：立项。四分域审查（cli 状态机/协议层/动态分发/config+测试质量）+ 主会话核验：3 High（同一根因族——命令串行化推理被外推到 Ctrl+C 停机任务/axum 请求任务/出表 entry 三个并发世界）+ 5 Medium + Low 若干；两条子代理结论经亲验证伪（大小写 ADD「不可移除卷」不成立——stem 校验先行；`cydrive stop` 客户端挂起不成立——STOP 在连接任务内即时回执，实际挂起的是 status 的 LIST 转发）。
 - 2026-09-12：H2→H1→H3+M1 串行落地（三个实现子代理，逐个 diff 审查通过）。执行期事故两起如实记录：①断电致 H1 首派中断（半成品丢弃重置重派，无证据污染）；②主会话建 worktree 时 cwd 残留 examples/config 致 worktree 误落 examples/ 下（git worktree move 复位，主仓状态零污染）——「相对路径命令前先 cd」纪律的又一实例，与已入档的 cargo cwd 教训同源。
+- 2026-09-12（fix/phase36-med）：M2→M3→M4 串行落地（TDD 红→绿各留证，commit 9eb8233/093cd4d/5d68c1b）。执行期事项如实记录：①M2 首版红测试漏了 mock `upload_action` 脚本一次性语义（耗尽即 Ok）——第二个上传意外成功致 pending=1，加第二条脚本后红证据干净（pending=2）；②M3/M4 commit 因 fmt 门禁差两行重写（soft reset 重commit，哈希 093cd4d/5d68c1b 替代原 dba923f/83223a0，未推送零影响）。门禁（独立 target）：core 393/0/1、cli 181/0/3、clippy -D warnings 过、fmt 过；workspace 949/0/12（944+5 新测试）。M2 已知未覆盖点：脱敏收口仅在 `load_volume_config` 两构造点（任务范围），`CyDriveConfig::load_toml`（单卷 config.toml，同文件同型暴露面）未动——挂账待负责人裁决。
+- 2026-09-12（fix/phase36-med 追加批）：M5 三缺口 characterization + M3 补全落地（commit 685e554/b78ece1）。M5 三测试直接绿（零产品改动）——执行期确认的语义偏差（PING 在慢 REMOVE 在途不回，见挂账节）按真实现钉住并留裁决；缺口 3 首跑红：`read_response` 只认 Content-Length 帧而 dav-server multistatus 响应 chunked（探针实测 `transfer-encoding: chunked`）——增强测试 helper 解码 chunked（对既有 PUT 用法零影响）后绿。M3 补全红→绿留证（两个泄漏原文入 commit 正文）。门禁（独立 target）：cli 183/0/3（+2）、core 396/0/1（+3）、webdav multivolume 11/11（+1）、clippy -D warnings 过、fmt 过；workspace 955/0/12（949+6 新测试）。
