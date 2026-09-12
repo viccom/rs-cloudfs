@@ -2520,20 +2520,47 @@ impl RuntimeVolumeControl {
         // reach a terminal state (cumulative counters: enqueued minus
         // its terminal states), bounded by the drain budget.
         let deadline = Instant::now() + self.tuning.drain_timeout;
+        // Review M2: the enqueued baseline for the still-arriving
+        // check. The volume keeps serving during the drain (K50's
+        // deliberate order), so an active writer keeps re-feeding the
+        // queue — a drain budget can never cover that. The growth of
+        // `enqueued` between polls is the observable.
+        let mut last_enqueued: Option<u64> = None;
         loop {
             // The gate's drain observation point (review H1): a
             // shutdown that fires mid-drain takes over the cleanup —
             // hand the entry back (the stop task's idle barrier is
             // waiting on this command) and answer within one poll tick
-            // instead of parking the whole drain budget.
+            // instead of parking the whole drain budget. The gate
+            // outranks the growth check below (a shutting-down
+            // instance must not diagnose its writers).
             if self.watch.fired() {
                 self.live.insert(name, entry);
                 return removal_aborted_by_shutdown(name);
             }
-            let outstanding = vfs.queue_stats().outstanding();
+            let stats = vfs.queue_stats();
+            let outstanding = stats.outstanding();
             if outstanding == 0 {
                 break;
             }
+            if let Some(previous) = last_enqueued {
+                if stats.enqueued > previous {
+                    // New uploads arrived DURING the drain — a client
+                    // is still writing the volume. Abort now (the
+                    // budget would just run out and mis-advise) and
+                    // put the entry back: the volume keeps running
+                    // exactly as it was (K50's abort semantics).
+                    self.live.insert(name, entry);
+                    return format!(
+                        "ERR: uploads are still arriving on volume `{name}` \
+                         (pending={outstanding}, more enqueued during the removal) — a \
+                         client is still writing the volume; the removal was aborted \
+                         and the volume stays registered; close the programs using the \
+                         volume (Explorer windows, copy tasks) and retry\n"
+                    );
+                }
+            }
+            last_enqueued = Some(stats.enqueued);
             if Instant::now() >= deadline {
                 // Abort: put the entry back — the volume keeps running
                 // exactly as it was (the queue workers were never
@@ -2542,7 +2569,8 @@ impl RuntimeVolumeControl {
                 return format!(
                     "ERR: volume `{name}` still has {outstanding} upload(s) in flight \
                      (pending={outstanding}) — the removal was aborted and the volume \
-                     stays registered; retry once the queue drains (`LIST` shows the \
+                     stays registered; if a program is still writing the volume, close \
+                     it first, then retry once the queue drains (`LIST` shows the \
                      count)\n"
                 );
             }

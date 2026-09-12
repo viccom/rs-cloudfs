@@ -657,6 +657,151 @@ async fn remove_with_undrained_queue_aborts_and_keeps_the_volume() {
     drop(handle);
 }
 
+/// Review M2: a drain that keeps being fed is not a drain. While REMOVE
+/// parks in its drain window (one upload held by RateLimited{3600s}), a
+/// SECOND upload arrives — the enqueued count grows between polls, so a
+/// client is still writing the volume and the 60s budget can never be
+/// enough (the queue is being re-fed). The drain must detect the growth
+/// and abort EARLY with the writes-still-arriving wording (close the
+/// programs using the volume), not wait the budget out and answer the
+/// generic retry-once-drained advice that this scenario can never
+/// satisfy. The volume stays registered either way (K50).
+#[tokio::test]
+async fn remove_drain_aborts_early_when_new_uploads_keep_arriving() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    write_file(
+        &dir.path().join("volumes").join("stuck.toml"),
+        &volume_toml("222:BBB", 222222),
+    );
+    let _guard = chdir(dir.path());
+
+    let specs = {
+        let mut v =
+            cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load volume specs");
+        v.retain(|spec| spec.name != "stuck");
+        v
+    };
+    // Same hold transport as the undrained-queue test, with the Fail
+    // action scripted TWICE (upload scripts are consumed one entry per
+    // call; an exhausted script serves Ok): both the first and the
+    // second upload fail with an authoritative RateLimited{3600s} and
+    // stay in flight for the whole test.
+    let hold_dispatch: VolumeTransportDispatch = Arc::new(move |_spec: &VolumeConfig| {
+        Box::pin(async {
+            let mock = Arc::new(
+                MockTransport::builder()
+                    .upload_action(UploadAction::Fail {
+                        error: StorageError::RateLimited {
+                            retry_after: Some(Duration::from_secs(3600)),
+                        },
+                    })
+                    .upload_action(UploadAction::Fail {
+                        error: StorageError::RateLimited {
+                            retry_after: Some(Duration::from_secs(3600)),
+                        },
+                    })
+                    .build(),
+            );
+            mock.connect().await.expect("connect hold mock");
+            Ok(Some((
+                RunOptions::default(),
+                mock as Arc<dyn CloudTransport>,
+            )))
+        })
+    });
+    // A 5s drain budget: the red behaviour would wait it out fully
+    // (proving the mis-diagnosis); the growth detection must answer
+    // within a couple of poll ticks of the second upload.
+    let handle = boot_with_commands(
+        process_config(),
+        specs,
+        vec![mock_transport().await],
+        RuntimeVolumeCommands {
+            dispatch: Some(hold_dispatch),
+            remove_tuning: RemoveTuning {
+                drain_timeout: Duration::from_secs(5),
+                poll_interval: Duration::from_millis(50),
+            },
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await;
+    let addr = control_addr();
+    let webdav = handle.webdav_addr().expect("webdav bound");
+
+    let reply = send_cmd(addr, "ADD stuck").await;
+    assert!(reply.starts_with("OK:"), "stuck adds cleanly: {reply}");
+
+    // The first upload parks the queue at outstanding=1 (the drain's
+    // enqueued baseline).
+    let source = dir.path().join("hold.txt");
+    fs::write(&source, b"hold me in flight").expect("write source");
+    let rel = RelPath::new("/hold.txt").expect("valid rel path");
+    handle
+        .volume("stuck")
+        .expect("volume stuck")
+        .vfs()
+        .expect("vfs stuck")
+        .ingest_file(&rel, &source, 1.0)
+        .await
+        .expect("ingest into stuck");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // REMOVE parks in its drain loop; 300ms later a second upload
+    // arrives — the enqueued count grows mid-drain (a client still
+    // writes the volume).
+    let started = std::time::Instant::now();
+    let remove_task = tokio::spawn(async move { send_cmd(addr, "REMOVE stuck").await });
+    tokio::time::sleep(Duration::from_millis(300)).await;
+    let source2 = dir.path().join("hold2.txt");
+    fs::write(&source2, b"another write while draining").expect("write source 2");
+    let rel2 = RelPath::new("/hold2.txt").expect("valid rel path 2");
+    handle
+        .volume("stuck")
+        .expect("volume stuck")
+        .vfs()
+        .expect("vfs stuck")
+        .ingest_file(&rel2, &source2, 1.0)
+        .await
+        .expect("second ingest into stuck");
+
+    let reply = timeout(Duration::from_secs(10), remove_task)
+        .await
+        .expect("REMOVE settles")
+        .expect("the REMOVE task joins");
+    let elapsed = started.elapsed();
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("still arriving"),
+        "the fed drain answers the writes-still-arriving abort: {reply}"
+    );
+    assert!(
+        elapsed < Duration::from_secs(2),
+        "the growth detection aborts well inside the 5s budget: {elapsed:?}"
+    );
+    assert!(
+        handle.volume("stuck").expect("still registered").status() == VolumeStatus::Running,
+        "the aborted removal left the volume registered"
+    );
+    let resp = send_http(webdav, &http_request("PROPFIND", "/vol/stuck/", webdav)).await;
+    assert_eq!(
+        status_of(&resp),
+        207,
+        "the aborted removal kept the data plane: {resp}"
+    );
+
+    // Deliberate leak (same reason as the undrained-queue test): the
+    // held workers sleep 3600s; the runtime drop cancels the task.
+    drop(handle);
+}
+
 /// The K50 unmount abort (the injected-probe path): a volume whose drive
 /// release reports failure stops the removal — the volume stays
 /// registered and its mount entry untouched; only a release that
