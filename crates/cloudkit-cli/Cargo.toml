@@ -122,6 +122,11 @@ tokio = { version = "1", features = [
     "time",
     "sync",
 ] }
+# FutureExt::catch_unwind only: the control loop's panic isolation around
+# an installed volume-command handler (control.rs, review M1-1) — the
+# same 0.3 line cloudkit-webdav/web already carry (already in the lock
+# tree, zero new packages).
+futures-util = "0.3"
 tracing = "0.1"
 
 # Platform credential stores: Windows Credential Manager, macOS Keychain,

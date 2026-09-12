@@ -36,6 +36,7 @@
 use std::future::Future;
 use std::io;
 use std::net::SocketAddr;
+use std::panic::AssertUnwindSafe;
 use std::path::{Path, PathBuf};
 use std::pin::Pin;
 use std::sync::Arc;
@@ -43,6 +44,7 @@ use std::time::Duration;
 
 use anyhow::{bail, Context as _, Result};
 use cloudkit_core::config::CyDriveConfig;
+use futures_util::FutureExt as _;
 use tokio::io::{AsyncBufReadExt as _, AsyncReadExt as _, AsyncWriteExt as _, BufReader};
 use tokio::net::{TcpListener, TcpStream};
 
@@ -84,6 +86,12 @@ pub type VolumeCommandHandler = Arc<
 /// actionable about who does serve them (a multi-volume `run`).
 const VOLUME_COMMANDS_UNAVAILABLE: &str =
     "ERR: volume commands are not available on this instance\n";
+
+/// The reply a command whose handler panicked gets (review M1-1): the
+/// panic is contained, the channel keeps serving — the instance log
+/// carries the panic payload for diagnosis.
+const HANDLER_PANIC_REPLY: &str =
+    "ERR: internal error while executing the command — the control channel stays up; see the instance log\n";
 
 /// The first token of a control line (uppercased for the keyword match).
 fn first_token(line: &str) -> &str {
@@ -158,7 +166,10 @@ impl ControlServer {
     /// (K48): `ADD`/`REMOVE`/`LIST` lines route to `handler`, whose
     /// reply is written to the connection verbatim; without a handler
     /// those lines get the actionable "not available" ERR. The STOP and
-    /// PING branches are untouched by the handler's presence.
+    /// PING branches are untouched by the handler's presence. A
+    /// panicking handler is contained (review M1-1): its command answers
+    /// [`HANDLER_PANIC_REPLY`] and the loop keeps serving — the panic
+    /// never reaches the accept loop's task.
     pub async fn run_with_commands(
         self,
         shutdown: impl Fn() + Send + 'static,
@@ -256,9 +267,44 @@ impl ControlServer {
                     if let Some((line, reply_tx)) = command {
                         // The serialized command execution: at most one
                         // handler invocation is awaited here at a time
-                        // (runtime-volumes §4's concurrency ruling).
+                        // (runtime-volumes §4's concurrency ruling). The
+                        // unwind guard (review M1-1) keeps a panicking
+                        // handler from taking this loop task down — the
+                        // listener lives on it, so an unguarded panic
+                        // would also kill STOP/PING and leave the
+                        // panicking command's client on a bare EOF;
+                        // instead the client gets the actionable
+                        // internal-error ERR and the next command runs
+                        // normally. The payload is our own command text
+                        // and panic message — nothing credential-shaped
+                        // reaches the log.
                         let reply = match &commands {
-                            Some(handler) => handler(&line).await,
+                            Some(handler) => {
+                                match AssertUnwindSafe(handler(&line))
+                                    .catch_unwind()
+                                    .await
+                                {
+                                    Ok(reply) => reply,
+                                    Err(panic) => {
+                                        let reason = panic
+                                            .downcast_ref::<&str>()
+                                            .map(|str| (*str).to_string())
+                                            .or_else(|| {
+                                                panic.downcast_ref::<String>().cloned()
+                                            })
+                                            .unwrap_or_else(|| {
+                                                "<non-string panic payload>".to_string()
+                                            });
+                                        tracing::error!(
+                                            command = %line,
+                                            %reason,
+                                            "a volume command handler panicked; the \
+                                             control channel stays up"
+                                        );
+                                        HANDLER_PANIC_REPLY.to_string()
+                                    }
+                                }
+                            }
                             None => VOLUME_COMMANDS_UNAVAILABLE.to_string(),
                         };
                         let _ = reply_tx.send(reply);
@@ -282,6 +328,29 @@ fn ping_reply() -> String {
 /// and return it trimmed. The connect error propagates as-is so callers
 /// can tell a refused/timeout (stale port file) from a protocol failure.
 async fn exchange_line(addr: SocketAddr, request: &[u8]) -> io::Result<String> {
+    exchange_line_bounded(addr, request, EXCHANGE_BUDGET).await
+}
+
+/// The whole client-side exchange budget (review M1-2): volume commands
+/// serialize on the instance's accept loop, and a REMOVE legitimately
+/// waits out its 60s drain + 10s unmount windows — 120s covers that
+/// plus margin, so a busy instance's eventual reply still lands; past
+/// it the client gives up with the actionable busy-instance error
+/// instead of parking forever (`cydrive status`'s LIST forward is the
+/// caller that used to hang blind).
+const EXCHANGE_BUDGET: Duration = Duration::from_secs(120);
+
+/// [`exchange_line`] with the budget injectable — published as the test
+/// seam (review M1-2) so the give-up is deterministic against a server
+/// that never replies (the tests pass milliseconds). Both the write and
+/// the read-to-EOF run inside the budget: an instance wedged mid-reply
+/// (or a socket that stalls) surfaces as an actionable TimedOut instead
+/// of parking the caller forever.
+pub async fn exchange_line_bounded(
+    addr: SocketAddr,
+    request: &[u8],
+    budget: Duration,
+) -> io::Result<String> {
     let mut stream = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
         Ok(connected) => connected?,
         Err(_elapsed) => {
@@ -291,9 +360,35 @@ async fn exchange_line(addr: SocketAddr, request: &[u8]) -> io::Result<String> {
             ));
         }
     };
-    stream.write_all(request).await?;
+    let written = match tokio::time::timeout(budget, stream.write_all(request)).await {
+        Ok(written) => written,
+        Err(_elapsed) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "writing the control command to {addr} timed out after {budget:?} — the \
+                     instance is likely busy with a long volume command (e.g. a REMOVE \
+                     draining a large upload); retry once it settles"
+                ),
+            ));
+        }
+    };
+    written?;
     let mut response = Vec::new();
-    stream.read_to_end(&mut response).await?;
+    let read = match tokio::time::timeout(budget, stream.read_to_end(&mut response)).await {
+        Ok(read) => read,
+        Err(_elapsed) => {
+            return Err(io::Error::new(
+                io::ErrorKind::TimedOut,
+                format!(
+                    "reading the control reply from {addr} timed out after {budget:?} — the \
+                     instance is likely busy with a long volume command (e.g. a REMOVE \
+                     draining a large upload); retry once it settles"
+                ),
+            ));
+        }
+    };
+    read?;
     Ok(String::from_utf8_lossy(&response).trim().to_owned())
 }
 

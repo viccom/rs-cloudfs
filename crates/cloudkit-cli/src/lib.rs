@@ -283,6 +283,14 @@ impl ShutdownWatch {
             }
         }
     }
+
+    /// Whether the gate has already fired — the synchronous probe the
+    /// volume-command surface checks at its entry and mid-sequence
+    /// observation points (review H1); [`ShutdownWatch::wait`] is the
+    /// async face. Latched like the gate itself.
+    pub fn fired(&self) -> bool {
+        *self.rx.borrow()
+    }
 }
 
 /// A running CyDrive stack: the WebDAV server, the web dashboard, the
@@ -1099,20 +1107,57 @@ impl DriveRelease for WinFspRelease {
     }
 }
 
+/// The `net use /delete` budget (review M1-3): a hung network provider
+/// must not wedge the K50 removal sequence (or an executor thread — the
+/// command runs on the blocking pool). 30s comfortably exceeds a healthy
+/// mapping delete (sub-second) while staying well inside the client
+/// exchange budget. The timeout branch is untestable offline (a real
+/// `net use` cannot be made to hang on demand) — its cover is this
+/// comment plus code review; the error path IS pinned
+/// (`webdav_release_propagates_the_net_use_failure` and the K50 abort
+/// integration pin).
+const NET_USE_RELEASE_BUDGET: Duration = Duration::from_secs(30);
+
 /// The WebDAV arm of [`DriveRelease`]: the `net use /delete` that
 /// releases the cross-process mapping (the stop sequence's own release,
 /// now per volume). A failure is the K50 abort reason verbatim.
-struct WebDavRelease {
-    letter: String,
+/// Constructible (pub) so the tests inject the production release
+/// object through the [`VolumeLiveTable::set_release`] seam.
+pub struct WebDavRelease {
+    /// The drive letter the mapping delete targets (`"Q:"`).
+    pub letter: String,
 }
 
 impl DriveRelease for WebDavRelease {
     fn release(&mut self) -> ReleaseFuture<'_> {
         let letter = self.letter.clone();
         Box::pin(async move {
-            cloudkit_platform::windows::unmount_drive(&letter)
-                .map(|_| ())
-                .map_err(|error| format!("`net use {letter} /delete` failed: {error}"))
+            // The mapping delete is a synchronous `std::process::Command`
+            // — on the blocking pool (never the executor thread) and
+            // inside the budget above: a hung provider aborts the
+            // removal per K50 (卷保持注册不动) instead of wedging the
+            // control loop.
+            let deleted = tokio::time::timeout(
+                NET_USE_RELEASE_BUDGET,
+                tokio::task::spawn_blocking({
+                    let letter = letter.clone();
+                    move || cloudkit_platform::windows::unmount_drive(&letter)
+                }),
+            )
+            .await;
+            match deleted {
+                Ok(Ok(Ok(()))) => Ok(()),
+                Ok(Ok(Err(error))) => Err(format!("`net use {letter} /delete` failed: {error}")),
+                Ok(Err(join_error)) => Err(format!(
+                    "the `net use {letter} /delete` task failed to complete: {join_error}"
+                )),
+                Err(_elapsed) => Err(format!(
+                    "`net use {letter} /delete` did not finish within {}s — the network \
+                     provider appears hung; the removal was aborted and the volume stays \
+                     registered (K50)",
+                    NET_USE_RELEASE_BUDGET.as_secs()
+                )),
+            }
         })
     }
 }
@@ -1154,13 +1199,17 @@ impl VolumeLiveTable {
 
     /// Takes the volume's entry out (REMOVE's first move); the caller
     /// either commits the removal or puts the entry back with
-    /// [`VolumeLiveTable::insert`] when a K50 step aborts.
+    /// [`VolumeLiveTable::insert`] when a K50 step aborts. The
+    /// find-and-remove is atomic under ONE lock hold (review H1): the
+    /// previous two-lock form let a concurrent [`VolumeLiveTable::
+    /// take_all`] empty the vec between the position lookup and the
+    /// remove, panicking out of bounds and killing the control loop.
     fn take(&self, name: &str) -> Option<LiveVolume> {
-        let position = self
-            .lock()
+        let mut guard = self.lock();
+        let position = guard
             .iter()
             .position(|(registered, _)| registered == name)?;
-        Some(self.lock().remove(position).1)
+        Some(guard.remove(position).1)
     }
 
     /// Re-attaches the mount record + release step of a volume that
@@ -1360,6 +1409,19 @@ impl MultiVolumeHandle {
         self.watch.wait().await;
     }
 
+    /// Fires the stop gate WITHOUT joining the stop task — the
+    /// signal-arm semantic (`run`'s Ctrl+C/SIGTERM select cannot await;
+    /// a real `shutdown` is trigger-then-join, this is the trigger
+    /// alone). The aggregated stop sequence starts on its own task; a
+    /// later [`MultiVolumeHandle::shutdown`] joins it (the trigger is
+    /// idempotent). In-process callers — and the tests that need a
+    /// gate fire mid-command, exactly where a signal would land — use
+    /// this instead of racing the control channel's STOP (which queues
+    /// behind an in-flight volume command).
+    pub fn request_stop(&self) {
+        self.watch.trigger();
+    }
+
     /// Graceful stop for every volume: fires the ONE gate (a no-op when
     /// a source already did), aborts each live volume's periodic sync
     /// task (same abort-not-drain choice and rationale as
@@ -1410,6 +1472,19 @@ pub type DispatchFuture<'a> = std::pin::Pin<
 pub type VolumeTransportDispatch =
     Arc<dyn for<'a> Fn(&'a VolumeConfig) -> DispatchFuture<'a> + Send + Sync + 'static>;
 
+/// The boxed mount outcome of one [`RuntimeMount`] call (review H3's
+/// seam — the same shape [`mount_volumes_if_configured`] returns).
+pub type RuntimeMountFuture<'a> = std::pin::Pin<Box<dyn Future<Output = VolumeMounts> + Send + 'a>>;
+
+/// The runtime ADD's mount step behind a seam (review H3): receives the
+/// ADD's one claim (the volume's name and its configured letter) and
+/// answers what the mount pass produced. Production (`None`) runs the
+/// SAME [`mount_volumes_if_configured`] pass boot runs; the tests inject
+/// stubs that block or fail the mount deterministically, so the
+/// publish-after-mount ordering is pinnable without a real drive.
+pub type RuntimeMount =
+    Arc<dyn for<'a> Fn(&'a str, &'a str) -> RuntimeMountFuture<'a> + Send + Sync + 'static>;
+
 /// K50's abort-timeout knobs (the removal sequence's two waits). The
 /// defaults are the production budgets; [`RemoveTuning::fast`] shrinks
 /// them to millisecond scale for the tests.
@@ -1456,6 +1531,10 @@ pub struct RuntimeVolumeCommands {
     pub dispatch: Option<VolumeTransportDispatch>,
     /// The K50 removal waits (tests shrink them).
     pub remove_tuning: RemoveTuning,
+    /// The ADD mount step (review H3's seam): `None` (production) runs
+    /// the real K27/K40 mount pass; the tests inject a stub that blocks
+    /// or fails the mount to pin the publish-after-mount ordering.
+    pub mount: Option<RuntimeMount>,
 }
 
 /// The single-volume assembly result (RV2's 单卷装配): everything ONE
@@ -1708,6 +1787,10 @@ pub async fn run_multi_with_transports_and_commands(
     // config's default db_path anchors the file in the working
     // directory), same optional-component degrade. RV2: the channel
     // serves the volume commands through the shared runtime state.
+    // Created before the bind (a degraded bind keeps the stop task's
+    // idle barrier working — with no handler installed it is trivially
+    // idle).
+    let in_flight = Arc::new(InFlightCommands::default());
     let control_file = match control::ControlServer::bind(process_cfg).await {
         Ok(server) => {
             let path = control::control_file_path(process_cfg);
@@ -1722,12 +1805,26 @@ pub async fn run_multi_with_transports_and_commands(
                 watch: Arc::clone(&watch),
                 webdav_available: webdav_addr.is_some(),
                 dispatch: commands.dispatch,
+                mount: commands.mount,
                 tuning: commands.remove_tuning,
             });
-            let handler: control::VolumeCommandHandler = Arc::new(move |line: &str| {
+            // Every handler invocation enters under the in-flight
+            // counter (review H1): the stop task's idle barrier waits
+            // these out before draining the live table, so a command
+            // caught mid-sequence by a gate fire hands its entry back
+            // instead of orphaning it.
+            let handler: control::VolumeCommandHandler = {
                 let surface = Arc::clone(&command_surface);
-                Box::pin(async move { surface.handle(line).await })
-            });
+                let in_flight = Arc::clone(&in_flight);
+                Arc::new(move |line: &str| {
+                    let surface = Arc::clone(&surface);
+                    let guard = in_flight.enter();
+                    Box::pin(async move {
+                        let _in_flight = guard;
+                        surface.handle(line).await
+                    })
+                })
+            };
             tokio::spawn(async move {
                 if let Err(error) = server
                     .run_with_commands(move || gate.trigger(), Some(handler))
@@ -1760,6 +1857,7 @@ pub async fn run_multi_with_transports_and_commands(
     // runtime-ADD/REMOVE cycle left in the live table.
     let gate = Arc::clone(&watch);
     let stop_live = Arc::clone(&live);
+    let stop_in_flight = Arc::clone(&in_flight);
     let stop_task = tokio::spawn(async move {
         watch.wait().await;
         if let Some(server) = &webdav_server {
@@ -1768,6 +1866,15 @@ pub async fn run_multi_with_transports_and_commands(
         if let Some(web_ui) = &web_ui {
             web_ui.shutdown().await;
         }
+        // The idle barrier (review H1): a volume command in flight when
+        // the gate fired (Ctrl+C / SIGTERM race the control loop's
+        // serialized handler) may be holding an entry out of the live
+        // table mid-K50 — draining NOW would orphan it. The in-flight
+        // command observes the gate at its checkpoints and hands the
+        // entry back; only then does this pass take everything (see
+        // [`InFlightCommands`] for the invariant and the bounded-wait
+        // argument).
+        stop_in_flight.wait_idle().await;
         for (name, entry) in stop_live.take_all() {
             if let Some(mut release) = entry.release {
                 match release.release().await {
@@ -1959,6 +2066,76 @@ async fn build_volume_runtime(
 
 // --------------------------------------- RV2: the volume command surface ---
 
+/// The in-flight volume-command counter behind the stop task's idle
+/// barrier (review H1): every handler invocation runs under an
+/// [`InFlightGuard`] (+1 on entry, −1 with a notify on drop — a
+/// cancelled future releases its slot too), and the stop task — after
+/// the gate fires but BEFORE `VolumeLiveTable::take_all` — waits for
+/// the count to reach zero.
+///
+/// Core invariant: once the gate has fired, no volume command mutates
+/// the live table except to put an entry BACK (the entry refusal is
+/// immediate; REMOVE's drain loop and commit point observe the gate
+/// each tick and hand the entry back; ADD's checkpoint tears down a
+/// volume that never served a request), so once the count is zero,
+/// `take_all` is guaranteed to see every live entry — the orphaned-
+/// entry race (REMOVE holding an entry out of the table while the stop
+/// task drains it) cannot occur. The wait is bounded: every in-flight
+/// command's tail after a gate fire is bounded (the K50 steps carry
+/// their own deadlines, and a never-served volume's release joins idle
+/// workers), so this barrier cannot deadlock the shutdown.
+#[derive(Default)]
+struct InFlightCommands {
+    count: std::sync::atomic::AtomicUsize,
+    idle: tokio::sync::Notify,
+}
+
+impl InFlightCommands {
+    fn enter(self: &Arc<Self>) -> InFlightGuard {
+        self.count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        InFlightGuard {
+            tracker: Arc::clone(self),
+        }
+    }
+
+    /// Resolves once no command is in flight. The double-check
+    /// registers the notification BEFORE re-reading the counter, so a
+    /// decrement landing between the check and the await cannot be
+    /// missed.
+    async fn wait_idle(&self) {
+        loop {
+            if self.count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                return;
+            }
+            let notified = self.idle.notified();
+            if self.count.load(std::sync::atomic::Ordering::SeqCst) == 0 {
+                return;
+            }
+            notified.await;
+        }
+    }
+}
+
+/// The +1/−1 guard around one volume-command invocation (see
+/// [`InFlightCommands`]). Drop is the ONLY exit path — completion,
+/// early return and cancellation all release the slot.
+struct InFlightGuard {
+    tracker: Arc<InFlightCommands>,
+}
+
+impl Drop for InFlightGuard {
+    fn drop(&mut self) {
+        if self
+            .tracker
+            .count
+            .fetch_sub(1, std::sync::atomic::Ordering::SeqCst)
+            == 1
+        {
+            self.tracker.idle.notify_waiters();
+        }
+    }
+}
+
 /// The state the control channel's `ADD`/`REMOVE`/`LIST` commands act
 /// through (RV2 / K48): the cli master registry (the truth), the two
 /// face tables (the WebDAV dispatch and dashboard projections), the live
@@ -1978,6 +2155,9 @@ struct RuntimeVolumeControl {
     /// mount pass got).
     webdav_available: bool,
     dispatch: Option<VolumeTransportDispatch>,
+    /// The ADD mount step (review H3's seam) — production runs the real
+    /// pass (`None`), tests inject blockers/failures.
+    mount: Option<RuntimeMount>,
     tuning: RemoveTuning,
 }
 
@@ -1989,8 +2169,26 @@ impl RuntimeVolumeControl {
         let mut tokens = line.split_whitespace();
         match (tokens.next(), tokens.next(), tokens.next()) {
             (Some("LIST"), None, None) => self.list(),
-            (Some("ADD"), Some(name), None) => self.add_volume(name).await,
-            (Some("REMOVE"), Some(name), None) => self.remove_volume(name).await,
+            (Some(cmd @ ("ADD" | "REMOVE")), Some(name), None) => {
+                // The gate's entry observation point (review H1): once
+                // the shutdown gate has fired, the mutating commands are
+                // refused — the stop task's idle barrier is waiting for
+                // in-flight commands to settle, and a fresh mutation
+                // would race its `take_all`. LIST is read-only and the
+                // registry stays valid through the shutdown, so it keeps
+                // answering. The refusal still goes back over the reply
+                // channel (the connection task parks on the one-shot).
+                if self.watch.fired() {
+                    return format!(
+                        "ERR: {cmd} refused — the instance is shutting down; volume changes \
+                         are no longer accepted (`LIST` still answers)\n"
+                    );
+                }
+                match cmd {
+                    "ADD" => self.add_volume(name).await,
+                    _ => self.remove_volume(name).await,
+                }
+            }
             (Some(cmd @ ("ADD" | "REMOVE")), _, _) => format!(
                 "ERR: usage: {cmd} <name> — exactly one volume name (volume names match \
                  ^[a-z][a-z0-9_-]{{0,31}}$)\n"
@@ -2021,15 +2219,7 @@ impl RuntimeVolumeControl {
                 None => runtime.spec().settings.backend.as_str().to_string(),
             };
             let pending = match runtime.vfs() {
-                Some(vfs) => {
-                    let stats = vfs.queue_stats();
-                    format!(
-                        "pending={}",
-                        stats
-                            .enqueued
-                            .saturating_sub(stats.succeeded + stats.degraded)
-                    )
-                }
+                Some(vfs) => format!("pending={}", vfs.queue_stats().outstanding()),
                 None => "pending=-".to_string(),
             };
             reply.push_str(&format!(
@@ -2044,11 +2234,16 @@ impl RuntimeVolumeControl {
     /// (K49: `enabled = false` refuses — the file is the persistent
     /// source of truth), connect the transport through the injected
     /// dispatch, assemble through the SAME single-volume assembly the
-    /// boot loop runs, register into all three faces at once, then mount
-    /// the volume's explicit drive-letter claim through the same K27/K40
-    /// pass boot uses. Every failure answers with its reason and leaves
-    /// the running set untouched (K22's runtime twin); a claim that
-    /// cannot be honored rolls the addition all the way back.
+    /// boot loop runs, mount the volume's explicit drive-letter claim
+    /// through the same K27/K40 pass boot uses, and only THEN register
+    /// into all three faces at once (review H3: a volume publishes only
+    /// after its mount settles, so `/vol/<name>` never routes to a
+    /// volume whose drive is not up — and a failed mount tears down a
+    /// volume no client ever saw). Every failure answers with its
+    /// reason and leaves the running set untouched (K22's runtime twin);
+    /// a claim that cannot be honored fails the ADD with nothing
+    /// registered (the assembled volume is quietly torn down — its
+    /// workers never served a request).
     async fn add_volume(&self, name: &str) -> String {
         // Path-safety precheck before the name becomes a file name: the
         // full name rules live in `load_volume_config`.
@@ -2124,8 +2319,150 @@ impl RuntimeVolumeControl {
                 }
             };
 
+        // The gate's mid-ADD observation point (review H1): the
+        // dispatch/assembly awaits above can straddle a gate fire. The
+        // check sits BEFORE the first mutation of the shared state (the
+        // three faces and the live table — every registration below)
+        // and before the mount pass, whose own awaits get a second
+        // observation point after they settle. The teardown releases
+        // the never-served volume's idle workers, so it is bounded and
+        // cannot wedge the stop task's idle barrier.
+        if self.watch.fired() {
+            tear_down_unpublished(assembled).await;
+            return format!(
+                "ERR: volume `{name}` not added — the instance is shutting down; the \
+                 assembled volume was torn down and nothing was registered\n"
+            );
+        }
+
+        // Volumes that mount nothing (no explicit drive_letter claim, or
+        // the auto-mount switch off) keep the assemble-and-publish
+        // semantics — there is no mount window to hide behind (H3).
+        if !spec.explicit_drive_letter {
+            self.publish_added_volume(name, assembled, None, None);
+            return format!("OK: added volume `{name}` (running; no drive letter claimed)\n");
+        }
+        if !self.process_cfg.auto_mount_drive {
+            tracing::info!(
+                volume = name,
+                "drive_letter claimed but auto_mount_drive is off; the volume runs \
+                 without its drive (the same gate the boot mount pass applies)"
+            );
+            self.publish_added_volume(name, assembled, None, None);
+            return format!("OK: added volume `{name}` (running; no drive letter claimed)\n");
+        }
+
+        // The mount-first window (review H3): the ADD's drive mount runs
+        // BEFORE any face publishes the volume. The old order inserted
+        // into the three faces first, so `/vol/<name>` routed and the
+        // dashboard tab appeared while the mount was still seconds away
+        // — and a mount failure rolled the faces back under in-flight
+        // requests (axum request tasks run concurrently with the control
+        // loop; "same task, serialized" only holds between commands).
+        // Publishing after the mount settles makes the window
+        // unobservable: a volume is either not registered at all or
+        // registered AND mounted. Accepted edge: the LIST/banner face
+        // briefly lacks a volume whose mount is in flight (one ADD's
+        // worth of seconds — and no client can observe the half-state
+        // either way).
+        let mut mounts = match &self.mount {
+            Some(mount_step) => mount_step(name, &spec.settings.drive_letter).await,
+            None => {
+                // The pass's winfsp arm resolves each claim's VFS through
+                // the registry it is handed, and the volume is
+                // deliberately NOT in the shared one yet — so this
+                // single-entry registry is the whole pass's view (the
+                // claims list carries exactly this volume).
+                let shadow_registry = RegistryHandle::new(vec![assembled.runtime.clone()]);
+                mount_volumes_if_configured(&MountPlan {
+                    process_cfg: &self.process_cfg,
+                    claims: std::slice::from_ref(&(
+                        name.to_string(),
+                        spec.settings.drive_letter.clone(),
+                    )),
+                    registry: &shadow_registry,
+                    rt: &tokio::runtime::Handle::current(),
+                    webdav_available: self.webdav_available,
+                    winfsp: winfsp_capability(),
+                })
+                .await
+            }
+        };
+        let mut handles = mounts.winfsp.drain();
+        let Some(mount) = mounts.mounted.into_iter().next() else {
+            // A claimed letter that cannot be honored fails the ADD (the
+            // ruling lists 盘符冲突 as an ADD failure): tear the
+            // assembled volume down — nothing was ever registered, so
+            // there are no faces to roll back and no in-flight client
+            // request ever saw the volume (H3: the old rollback ran with
+            // the faces already published).
+            tear_down_unpublished(assembled).await;
+            println!("Volume {name} rolled back: the drive mount failed (see the hints above).");
+            tracing::warn!(
+                volume = name,
+                "runtime ADD rolled back: the drive mount failed"
+            );
+            return format!(
+                "ERR: volume `{name}` assembled but its drive mount failed — the \
+                 addition was rolled back; free the drive letter (see the hints \
+                 above) and retry\n"
+            );
+        };
+        let release = mount_release(&mount, &mut handles);
+        let backend = mount.backend.label();
+        let short = mount.backend.as_str();
+        let letter = mount.letter.clone();
+
+        // The gate's post-mount observation point (the H1 placement
+        // semantic at the new registration point): the mount pass's
+        // awaits can straddle a gate fire too. A shutdown landing here
+        // takes over the cleanup — release the just-mounted drive FIRST
+        // (its callbacks call into the Vfs, so the host must be gone
+        // before the workers; a release failure only warns, the
+        // stop-sequence policy), then tear the never-published volume
+        // down. Nothing is registered on this path.
+        if self.watch.fired() {
+            if let Some(mut release) = release {
+                if let Err(error) = release.release().await {
+                    tracing::warn!(
+                        volume = name,
+                        %error,
+                        "releasing the freshly mounted drive failed while aborting the \
+                         ADD for shutdown; continuing the teardown"
+                    );
+                }
+            }
+            tear_down_unpublished(assembled).await;
+            return format!(
+                "ERR: volume `{name}` not added — the instance is shutting down; the \
+                 freshly mounted drive was released, the assembled volume torn down, \
+                 and nothing was registered\n"
+            );
+        }
+
         // The registration point: all three faces move together (the
-        // master table is the truth, these are its projections).
+        // master table is the truth, these are its projections), with
+        // the settled mount and its release step attached — publication
+        // IS the "registered AND mounted" state (H3).
+        self.publish_added_volume(name, assembled, Some(mount), release);
+        println!("Volume {name} mounted at {letter} ({backend}).");
+        tracing::info!(volume = name, letter = %letter, backend = %backend, "runtime ADD mounted the volume's drive");
+        format!("OK: added volume `{name}` (running; mounted {letter} via {short})\n")
+    }
+
+    /// The ADD publication point (review H3): all three faces and the
+    /// live table move together — the master registry is the truth, the
+    /// WebDAV dispatch and the dashboard are its projections. Callers
+    /// hold the publish until the volume's state is final (its mount
+    /// settled, or it mounts nothing at all), so a published volume is
+    /// never observable half-assembled.
+    fn publish_added_volume(
+        &self,
+        name: &str,
+        assembled: AssembledVolume,
+        mount: Option<MountedVolume>,
+        release: Option<Box<dyn DriveRelease>>,
+    ) {
         self.registry.insert(assembled.runtime);
         self.webdav.insert(name, assembled.fs);
         self.web.insert(cloudkit_web::VolumeUiEntry {
@@ -2139,84 +2476,12 @@ impl RuntimeVolumeControl {
             LiveVolume {
                 stop_unit: assembled.stop_unit,
                 sync_task: assembled.sync_task,
-                mount: None,
-                release: None,
+                mount,
+                release,
             },
         );
         println!("Volume {name} added at runtime (control ADD).");
         tracing::info!(volume = name, "volume added at runtime (control ADD)");
-
-        // The mount pass (K27 + K40), the same gates and dispatch boot
-        // runs: only an explicit drive_letter claim mounts, and the
-        // backend decision (winfsp / webdav / visible fallback) is the
-        // process one.
-        if !spec.explicit_drive_letter {
-            return format!("OK: added volume `{name}` (running; no drive letter claimed)\n");
-        }
-        if !self.process_cfg.auto_mount_drive {
-            tracing::info!(
-                volume = name,
-                "drive_letter claimed but auto_mount_drive is off; the volume runs \
-                 without its drive (the same gate the boot mount pass applies)"
-            );
-            return format!("OK: added volume `{name}` (running; no drive letter claimed)\n");
-        }
-        let claims = vec![(name.to_string(), spec.settings.drive_letter.clone())];
-        let mut mounts = mount_volumes_if_configured(&MountPlan {
-            process_cfg: &self.process_cfg,
-            claims: &claims,
-            registry: &self.registry,
-            rt: &tokio::runtime::Handle::current(),
-            webdav_available: self.webdav_available,
-            winfsp: winfsp_capability(),
-        })
-        .await;
-        let mut handles = mounts.winfsp.drain();
-        match mounts.mounted.into_iter().next() {
-            Some(mount) => {
-                let release = mount_release(&mount, &mut handles);
-                let backend = mount.backend.label();
-                let short = mount.backend.as_str();
-                let letter = mount.letter.clone();
-                self.live.attach_mount(name, mount, release);
-                println!("Volume {name} mounted at {letter} ({backend}).");
-                tracing::info!(volume = name, letter = %letter, backend = %backend, "runtime ADD mounted the volume's drive");
-                format!("OK: added volume `{name}` (running; mounted {letter} via {short})\n")
-            }
-            None => {
-                // A claimed letter that cannot be honored fails the ADD
-                // (the ruling lists 盘符冲突 as an ADD failure): roll the
-                // addition all the way back — the volume is not
-                // registered half-claimed.
-                self.rollback_add(name).await;
-                format!(
-                    "ERR: volume `{name}` assembled but its drive mount failed — the \
-                     addition was rolled back; free the drive letter (see the hints \
-                     above) and retry\n"
-                )
-            }
-        }
-    }
-
-    /// Undoes a runtime ADD whose mount step failed: out of all three
-    /// faces, the sync task aborted, the stop segment released. The
-    /// volume never served a client request through the faces (same
-    /// task, serialized), so this is quiet teardown, not a drain.
-    async fn rollback_add(&self, name: &str) {
-        self.webdav.remove(name);
-        self.web.remove(name);
-        self.registry.remove(name);
-        if let Some(entry) = self.live.take(name) {
-            if let Some(task) = entry.sync_task {
-                task.abort();
-            }
-            entry.stop_unit.release().await;
-        }
-        println!("Volume {name} rolled back: the drive mount failed (see the hints above).");
-        tracing::warn!(
-            volume = name,
-            "runtime ADD rolled back: the drive mount failed"
-        );
     }
 
     /// `REMOVE <name>` — the K50 safe sequence: drain the upload queue
@@ -2256,10 +2521,16 @@ impl RuntimeVolumeControl {
         // its terminal states), bounded by the drain budget.
         let deadline = Instant::now() + self.tuning.drain_timeout;
         loop {
-            let stats = vfs.queue_stats();
-            let outstanding = stats
-                .enqueued
-                .saturating_sub(stats.succeeded + stats.degraded);
+            // The gate's drain observation point (review H1): a
+            // shutdown that fires mid-drain takes over the cleanup —
+            // hand the entry back (the stop task's idle barrier is
+            // waiting on this command) and answer within one poll tick
+            // instead of parking the whole drain budget.
+            if self.watch.fired() {
+                self.live.insert(name, entry);
+                return removal_aborted_by_shutdown(name);
+            }
+            let outstanding = vfs.queue_stats().outstanding();
             if outstanding == 0 {
                 break;
             }
@@ -2293,6 +2564,16 @@ impl RuntimeVolumeControl {
             }
         }
 
+        // The gate's commit observation point (review H1): a shutdown
+        // that fired during the (bounded) release step also takes over
+        // the cleanup — hand the entry back instead of committing the
+        // face removals under the stop task's feet (a spent release is
+        // a no-op when the shutdown's teardown pass runs it again).
+        if self.watch.fired() {
+            self.live.insert(name, entry);
+            return removal_aborted_by_shutdown(name);
+        }
+
         // K50 step 3: commit — the faces first (no new request routes to
         // the volume; an in-flight request drains on its cloned
         // handler), then the volume's own workers (the same per-volume
@@ -2308,6 +2589,31 @@ impl RuntimeVolumeControl {
         tracing::info!(volume = name, "volume removed at runtime (control REMOVE)");
         format!("OK: removed volume `{name}`\n")
     }
+}
+
+/// REMOVE's shutdown-gate reply — the drain-loop and commit-point
+/// observation points (review H1) share it. The entry is back in the
+/// live table by the time this is returned, so the stop task's idle
+/// barrier plus `take_all` sees it and the volume's drain/release runs
+/// in the shutdown sequence: this REMOVE neither half-removes the
+/// volume nor orphans its entry.
+fn removal_aborted_by_shutdown(name: &str) -> String {
+    format!(
+        "ERR: volume `{name}` removal aborted — the instance is shutting down; the \
+         volume stays registered and its drain/release runs in the shutdown sequence\n"
+    )
+}
+
+/// The teardown of an assembled-but-never-published volume (review H3):
+/// abort its periodic sync task and release its stop segment (the VFS
+/// drain + inbound join). Bounded by construction — the volume never
+/// served a client request through the faces, so its workers are idle —
+/// and nothing else needs undoing: no face was ever told about it.
+async fn tear_down_unpublished(assembled: AssembledVolume) {
+    if let Some(task) = assembled.sync_task {
+        task.abort();
+    }
+    assembled.stop_unit.release().await;
 }
 
 /// Pairs a completed mount with its backend release step (shared by the
@@ -4805,5 +5111,149 @@ mod tests {
         assert_eq!(drivers, "local");
         #[cfg(not(any(feature = "telegram", feature = "baidu", feature = "local")))]
         assert_eq!(drivers, "none");
+    }
+
+    /// H1 (review fix): `take` used to find the position under one lock
+    /// and remove it under a second — a concurrent `take_all` landing in
+    /// that seam emptied the vec and the `remove(position)` panicked out
+    /// of bounds (killing the control loop task). This pins the table's
+    /// concurrency invariant instead of racing for the narrow seam:
+    /// hammered from three threads, the table never panics and every
+    /// inserted entry is accounted for — each is either taken by name
+    /// or drained by `take_all`; none is lost to the seam.
+    #[tokio::test]
+    async fn live_table_concurrent_take_take_all_insert_is_lossless() {
+        // One shared VFS backs every hammer entry's stop unit (the table
+        // structure is under test, not the stop semantics); each entry
+        // carries its identity in the mount record's letter.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let db = Arc::new(MetaDatabase::open(&dir.path().join("meta.db")).expect("open db"));
+        let cache = CacheManager::new(dir.path().join("cache"), u64::MAX);
+        let transport: Arc<dyn CloudTransport> =
+            Arc::new(cloudkit_core::transport::mock::MockTransport::new());
+        let vfs = Arc::new(Vfs::new(
+            db,
+            cache,
+            Arc::clone(&transport),
+            Default::default(),
+        ));
+
+        let table = Arc::new(VolumeLiveTable::default());
+        let inserted: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+        let taken: Arc<std::sync::Mutex<Vec<String>>> = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let drained: Arc<std::sync::Mutex<Vec<String>>> =
+            Arc::new(std::sync::Mutex::new(Vec::new()));
+
+        const ROUNDS: usize = 2_000;
+
+        // Pre-build the hammer entries in the async context (each stop
+        // unit's inbound handle needs a reactor to spawn); the threads
+        // below only move them through the table.
+        let mut to_insert: Vec<(String, LiveVolume)> = (0..ROUNDS)
+            .map(|k| {
+                let letter = format!("i{k}");
+                let entry = LiveVolume {
+                    stop_unit: VolumeStopUnit {
+                        vfs: Arc::clone(&vfs),
+                        inbound: spawn_inbound_worker(
+                            Arc::clone(&vfs),
+                            Arc::clone(&transport),
+                            "X:".to_string(),
+                        ),
+                    },
+                    sync_task: None,
+                    mount: Some(MountedVolume {
+                        volume: "v".to_string(),
+                        letter: letter.clone(),
+                        backend: MountedBackend::WebDav,
+                    }),
+                    release: None,
+                };
+                (letter, entry)
+            })
+            .collect();
+
+        // The methods are synchronous (a std mutex inside), so plain
+        // threads hammer them concurrently.
+        std::thread::scope(|scope| {
+            let inserter_table = Arc::clone(&table);
+            let inserted = Arc::clone(&inserted);
+            scope.spawn(move || {
+                while let Some((letter, entry)) = to_insert.pop() {
+                    inserter_table.insert("v", entry);
+                    inserted.lock().expect("inserted log").push(letter);
+                }
+            });
+            let taker_table = Arc::clone(&table);
+            let taken = Arc::clone(&taken);
+            scope.spawn(move || {
+                for _ in 0..ROUNDS {
+                    if let Some(entry) = taker_table.take("v") {
+                        let letter = entry.mount.expect("every entry carries its id").letter;
+                        taken.lock().expect("taken log").push(letter);
+                    }
+                }
+            });
+            let drainer_table = Arc::clone(&table);
+            let drained = Arc::clone(&drained);
+            scope.spawn(move || {
+                for _ in 0..ROUNDS {
+                    for (_, entry) in drainer_table.take_all() {
+                        let letter = entry.mount.expect("every entry carries its id").letter;
+                        drained.lock().expect("drained log").push(letter);
+                    }
+                }
+            });
+        });
+
+        let mut expected = inserted.lock().expect("inserted log").clone();
+        expected.sort();
+        let mut accounted: Vec<String> = taken
+            .lock()
+            .expect("taken log")
+            .drain(..)
+            .chain(drained.lock().expect("drained log").drain(..))
+            .collect();
+        accounted.sort();
+        // Entries move out of the table exactly once, so the multiset
+        // equality is losslessness: every inserted id was handed to
+        // exactly one consumer (a take or the take_all drain).
+        assert_eq!(
+            accounted, expected,
+            "every inserted entry is either taken by name or drained by take_all — none lost"
+        );
+    }
+
+    /// M1-3 (review fix): the net-use release's error path through the
+    /// spawn_blocking + budget wrapper — deleting a mapping that does
+    /// not exist must come back Err (the verbatim net-use failure, with
+    /// the command named), the exact input the K50 abort consumes; the
+    /// wrapper must neither swallow nor alter it. The budget branch (a
+    /// hung provider) is untestable offline — see
+    /// NET_USE_RELEASE_BUDGET's comment.
+    #[tokio::test]
+    async fn webdav_release_propagates_the_net_use_failure() {
+        let used = cloudkit_platform::windows::used_drive_letters();
+        let letter = (b'A'..=b'Z')
+            .map(|byte| format!("{}:", char::from(byte)))
+            .find(|letter| {
+                used.iter()
+                    .all(|mounted| !mounted.eq_ignore_ascii_case(letter))
+            })
+            .expect("at least one unmapped drive letter exists");
+        let mut release = WebDavRelease { letter };
+        let error = release
+            .release()
+            .await
+            .expect_err("deleting a mapping that does not exist must fail");
+        assert!(
+            error.contains("net use"),
+            "the failure names the command it ran: {error}"
+        );
+        assert!(
+            error.contains("failed"),
+            "the failure reads as a failure: {error}"
+        );
     }
 }

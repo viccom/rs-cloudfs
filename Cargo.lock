@@ -627,6 +627,7 @@ dependencies = [
  "cloudkit-winfsp",
  "comfy-table",
  "dialoguer",
+ "futures-util",
  "http",
  "http-body-util",
  "hyper-rustls",
