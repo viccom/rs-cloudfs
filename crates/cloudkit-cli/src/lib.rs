@@ -1519,6 +1519,56 @@ impl RemoveTuning {
     }
 }
 
+/// R4's bounded-rebuild knobs (P2, `RebuildTuning`'s own row in
+/// [`RuntimeVolumeCommands`]): the whole background rebuild runs under
+/// `timeout` — an interrupted pass keeps its upserted rows (the rel_path
+/// conflict key makes the merge idempotent, a rerun continues where it
+/// stopped) — and the R5 checkpoint (registry presence + shutdown gate)
+/// is audited every `checkpoint_interval`. Deliberately NOT config
+/// keys (可配性挂账): a struct injection keeps the surface at zero while
+/// the tests reach millisecond scale through [`RebuildTuning::fast`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RebuildTuning {
+    /// The whole background rebuild's budget (default 15 minutes).
+    pub timeout: Duration,
+    /// The R5 checkpoint cadence.
+    pub checkpoint_interval: Duration,
+}
+
+impl Default for RebuildTuning {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(15 * 60),
+            checkpoint_interval: Duration::from_secs(1),
+        }
+    }
+}
+
+impl RebuildTuning {
+    /// Millisecond-scale windows for the tests (never production).
+    pub fn fast() -> Self {
+        Self {
+            timeout: Duration::from_millis(300),
+            checkpoint_interval: Duration::from_millis(50),
+        }
+    }
+}
+
+/// The boxed outcome future of one [`RuntimeRebuild`] call (P2).
+pub type RuntimeRebuildFuture =
+    std::pin::Pin<Box<dyn Future<Output = Result<rebuild::RebuildOutcome>> + Send + 'static>>;
+
+/// The background rebuild executor behind a seam (P2, the mount seam's
+/// twin): receives the volume's name and its RESOLVED settings, answers
+/// the rebuild outcome. Production (`None` in
+/// [`RuntimeVolumeCommands`]) runs the SAME `run_rebuild_command` the
+/// offline `cydrive rebuild` uses (K11 gate + db open + the recursive
+/// walk); the tests inject fakes that park on channels, fail, or count
+/// calls — the R4/R5 supervision (timeout + checkpoint abort) lives
+/// AROUND the executor, so a fake exercises it without a real backend.
+pub type RuntimeRebuild =
+    Arc<dyn Fn(&str, &CyDriveConfig) -> RuntimeRebuildFuture + Send + Sync + 'static>;
+
 /// The RV2 boot extras: what the runtime-volume command surface needs
 /// beyond the plain boot. [`Default`] (no dispatch, production tuning)
 /// is exactly what [`run_multi_with_transports`] passes — LIST/REMOVE
@@ -1535,6 +1585,12 @@ pub struct RuntimeVolumeCommands {
     /// the real K27/K40 mount pass; the tests inject a stub that blocks
     /// or fails the mount to pin the publish-after-mount ordering.
     pub mount: Option<RuntimeMount>,
+    /// The P2 background-rebuild waits (tests shrink them).
+    pub rebuild_tuning: RebuildTuning,
+    /// The background rebuild executor (P2): `None` (production) runs
+    /// the real `run_rebuild_command`; the tests inject parking or
+    /// failing fakes through the seam.
+    pub rebuild: Option<RuntimeRebuild>,
 }
 
 /// The single-volume assembly result (RV2's 单卷装配): everything ONE
@@ -1764,6 +1820,15 @@ pub async fn run_multi_with_transports_and_commands(
     // can inject its `Arc` clone (the web alias is structurally the
     // same type; cloning shares, it does not re-wrap).
     let in_flight = Arc::new(InFlightCommands::default());
+    // The P2 rebuild executor resolution: the injected seam or the
+    // production `run_rebuild_command` closure (the same body the
+    // offline `cydrive rebuild` runs — K11 gate + db open + walk).
+    let rebuild_executor: RuntimeRebuild = commands.rebuild.clone().unwrap_or_else(|| {
+        Arc::new(|_name: &str, settings: &CyDriveConfig| {
+            let settings = settings.clone();
+            Box::pin(async move { run_rebuild_command(&settings).await })
+        })
+    });
     let command_surface = Arc::new(RuntimeVolumeControl {
         process_cfg: process_cfg.clone(),
         registry: registry.clone(),
@@ -1775,6 +1840,9 @@ pub async fn run_multi_with_transports_and_commands(
         dispatch: commands.dispatch,
         mount: commands.mount,
         tuning: commands.remove_tuning,
+        rebuilds: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        rebuild_tuning: commands.rebuild_tuning,
+        rebuild: rebuild_executor,
     });
     let volume_command_handler: control::VolumeCommandHandler = {
         let surface = Arc::clone(&command_surface);
@@ -2221,6 +2289,17 @@ struct RuntimeVolumeControl {
     /// pass (`None`), tests inject blockers/failures.
     mount: Option<RuntimeMount>,
     tuning: RemoveTuning,
+    /// P2/R1: the per-volume rebuild state — a name present here has a
+    /// background rebuild in flight; the value is its wall-clock start
+    /// (the already-running refusal renders it `HH:MM:SS`). Guarded by
+    /// a std Mutex touched from the serialized handler AND the
+    /// background task's exit path; no await ever holds it.
+    rebuilds: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::SystemTime>>>,
+    /// The P2 rebuild waits (tests shrink them).
+    rebuild_tuning: RebuildTuning,
+    /// The resolved P2 executor (the injected seam or the production
+    /// `run_rebuild_command` closure).
+    rebuild: RuntimeRebuild,
 }
 
 impl RuntimeVolumeControl {
@@ -2237,16 +2316,22 @@ impl RuntimeVolumeControl {
             // through it.
             (Some("SHOW"), Some(name), None) => self.show_volume(name),
             (Some("CONFIGS"), None, None) => self.configs(),
-            (Some(cmd @ ("ADD" | "REMOVE" | "ENABLE" | "DISABLE")), Some(name), None) => {
+            (
+                Some(cmd @ ("ADD" | "REMOVE" | "ENABLE" | "DISABLE" | "REBUILD")),
+                Some(name),
+                None,
+            ) => {
                 // The gate's entry observation point (review H1): once
                 // the shutdown gate has fired, the mutating commands are
                 // refused — the stop task's idle barrier is waiting for
                 // in-flight commands to settle, and a fresh mutation
                 // would race its `take_all`. LIST (and the other reads)
                 // is read-only and the registry stays valid through the
-                // shutdown, so it keeps answering. The refusal still
-                // goes back over the reply channel (the connection task
-                // parks on the one-shot).
+                // shutdown, so it keeps answering. REBUILD joins the
+                // mutating family (P2): a shutting-down instance accepts
+                // no new background work. The refusal still goes back
+                // over the reply channel (the connection task parks on
+                // the one-shot).
                 if self.watch.fired() {
                     return format!(
                         "ERR: {cmd} refused — the instance is shutting down; volume changes \
@@ -2257,16 +2342,19 @@ impl RuntimeVolumeControl {
                     "ADD" => self.add_volume(name).await,
                     "REMOVE" => self.remove_volume(name).await,
                     "DISABLE" => self.disable_volume(name).await,
+                    "REBUILD" => self.rebuild_volume(name).await,
                     _ => self.enable_volume(name).await,
                 }
             }
-            (Some(cmd @ ("ADD" | "REMOVE" | "SHOW" | "ENABLE" | "DISABLE")), _, _) => format!(
-                "ERR: usage: {cmd} <name> — exactly one volume name (volume names match \
+            (Some(cmd @ ("ADD" | "REMOVE" | "SHOW" | "ENABLE" | "DISABLE" | "REBUILD")), _, _) => {
+                format!(
+                    "ERR: usage: {cmd} <name> — exactly one volume name (volume names match \
                  ^[a-z][a-z0-9_-]{{0,31}}$)\n"
-            ),
+                )
+            }
             (Some("CONFIGS"), _, _) => "ERR: usage: CONFIGS — takes no argument\n".to_string(),
             _ => "ERR: usage: ADD <name> | REMOVE <name> | ENABLE <name> | DISABLE <name> | \
-                  SHOW <name> | LIST | CONFIGS\n"
+                  SHOW <name> | REBUILD <name> | LIST | CONFIGS\n"
                 .to_string(),
         }
     }
@@ -2274,9 +2362,11 @@ impl RuntimeVolumeControl {
     /// `LIST`: one line per registered volume —
     /// `name status letter backend pending=N` (K49's runtime read; the
     /// pending count is the §4 drain aid: the queue jobs REMOVE's drain
-    /// step would wait for). The letter/backend columns name the actual
-    /// mount; an unmounted volume carries `-` and its configured
-    /// backend. A failed entry has no queue — `pending=-`.
+    /// step would wait for), with a trailing `rebuilding` marker while
+    /// the volume has a background REBUILD in flight (P2/R1's progress
+    /// face). The letter/backend columns name the actual mount; an
+    /// unmounted volume carries `-` and its configured backend. A
+    /// failed entry has no queue — `pending=-`.
     fn list(&self) -> String {
         let volumes = self.registry.volumes();
         let mut reply = format!("OK: {} volume(s)\n", volumes.len());
@@ -2296,9 +2386,15 @@ impl RuntimeVolumeControl {
                 Some(vfs) => format!("pending={}", vfs.queue_stats().outstanding()),
                 None => "pending=-".to_string(),
             };
+            let rebuilding = self
+                .rebuilds
+                .lock()
+                .map(|map| map.contains_key(&name))
+                .unwrap_or(false);
             reply.push_str(&format!(
-                "{name} {} {letter} {backend} {pending}\n",
-                status.as_str()
+                "{name} {} {letter} {backend} {pending}{}\n",
+                status.as_str(),
+                if rebuilding { " rebuilding" } else { "" }
             ));
         }
         reply
@@ -2360,7 +2456,11 @@ impl RuntimeVolumeControl {
     /// parses them back):
     ///
     /// - loadable file: `<name> <backend> enabled=<bool> running|absent`
-    ///   (running = the registry has the name);
+    ///   (running = the registry has the name) with two trailing
+    ///   sparse markers — `encrypted` while the file carries
+    ///   `enable_encryption` (the web Refresh button's gating data,
+    ///   P6) and `rebuilding` while a background REBUILD is in flight
+    ///   (P2/R1's progress face);
     /// - schema-broken file: `<name> invalid (<reason>)` — one broken
     ///   file must not take the whole listing down (the K22 spirit).
     fn configs(&self) -> String {
@@ -2386,8 +2486,22 @@ impl RuntimeVolumeControl {
                     } else {
                         "absent"
                     };
+                    // The sparse markers: emitted only when true, so a
+                    // quiet row keeps its P1 shape byte-for-byte.
+                    let mut markers = String::new();
+                    if spec.settings.enable_encryption {
+                        markers.push_str(" encrypted");
+                    }
+                    if self
+                        .rebuilds
+                        .lock()
+                        .map(|map| map.contains_key(&spec.name))
+                        .unwrap_or(false)
+                    {
+                        markers.push_str(" rebuilding");
+                    }
                     reply.push_str(&format!(
-                        "{} {} enabled={} {running}\n",
+                        "{} {} enabled={} {running}{markers}\n",
                         spec.name,
                         spec.settings.backend.as_str(),
                         spec.settings.enabled
@@ -2897,6 +3011,278 @@ impl RuntimeVolumeControl {
         println!("Volume {name} removed at runtime (control REMOVE).");
         tracing::info!(volume = name, "volume removed at runtime (control REMOVE)");
         format!("OK: removed volume `{name}`\n")
+    }
+
+    /// `REBUILD <name>` (web volume management P2, plan §1.3 R1–R6):
+    /// the gates run SYNCHRONOUSLY — a volume must be registered and
+    /// running (its live VFS answers the queue read), no rebuild may
+    /// already be in flight (R1), an encrypted volume is refused with
+    /// the K11 sync guidance and a telegram volume with the
+    /// shadow-index refusal (R6 — both actionable, neither background
+    /// work), and the upload queue must be drained (R2 — the same
+    /// `outstanding()` the REMOVE drain judges by). Everything past
+    /// the gates is ACCEPTED, not executed: the marker goes up, the
+    /// background task spawns (R3), and the reply is immediate — the
+    /// command queue is never parked behind a walk. The background
+    /// task owns the R4 budget and the R5 checkpoints; its result
+    /// arrives as a log line, never on this reply.
+    async fn rebuild_volume(&self, name: &str) -> String {
+        if !Self::name_is_path_safe(name) {
+            return format!(
+                "ERR: `{name}` is not a volume name — REBUILD takes the file stem of a \
+                 volumes_dir entry (names match ^[a-z][a-z0-9_-]{{0,31}}$)\n"
+            );
+        }
+        let Some(runtime) = self.registry.volume(name) else {
+            return format!(
+                "ERR: no volume registered under `{name}` — `LIST` shows the current set\n"
+            );
+        };
+        let Some(vfs) = runtime.vfs().cloned() else {
+            return format!(
+                "ERR: volume `{name}` is not running (its assembly failed) — fix the \
+                 volume file, re-add it, and retry\n"
+            );
+        };
+        // R1: the single-flight marker (the reply renders the start).
+        if let Some(started) = self
+            .rebuilds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(name)
+            .copied()
+        {
+            return format!(
+                "ERR: rebuild already running on `{name}` (started {}) — `LIST` shows its \
+                 progress\n",
+                format_start_clock(started)
+            );
+        }
+        // R6's synchronous gates, in the offline rebuild's own order
+        // (telegram first, then the K11 plaintext gate) — with the
+        // same texts, so the two surfaces cannot drift.
+        let settings = &runtime.spec().settings;
+        if settings.backend == Backend::Telegram {
+            return format!("ERR: {TELEGRAM_REBUILD_REFUSAL}\n");
+        }
+        if let Err(error) = rebuild::ensure_plaintext_instance(settings) {
+            return format!("ERR: {error}\n");
+        }
+        // R2: the drained-queue threshold (H2's `outstanding()`, the
+        // same observable the REMOVE drain waits on).
+        let outstanding = vfs.queue_stats().outstanding();
+        if outstanding > 0 {
+            return format!(
+                "ERR: volume `{name}` has {outstanding} upload(s) in flight — rebuild \
+                 needs a drained queue; wait or see `LIST` pending\n"
+            );
+        }
+        // The volume's RESOLVED settings (K21 paths; the gates above
+        // read the raw spec because they never touch a path).
+        let resolved = match resolve_volume_settings(runtime.spec()) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                return format!(
+                    "ERR: resolving volume `{name}`'s paths failed: {error:#} — nothing was \
+                     changed; fix the volume file and retry\n"
+                );
+            }
+        };
+        // R1 + R3: the marker goes up and the task detaches. The
+        // command loop is serialized, so a second REBUILD cannot race
+        // this insert; the background task's exit path is the only
+        // other writer, and it removes only its own name.
+        self.rebuilds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(name.to_string(), std::time::SystemTime::now());
+        tokio::spawn(
+            RebuildTask {
+                name: name.to_string(),
+                settings: resolved,
+                registry: self.registry.clone(),
+                watch: Arc::clone(&self.watch),
+                rebuilds: Arc::clone(&self.rebuilds),
+                tuning: self.rebuild_tuning,
+                run: Arc::clone(&self.rebuild),
+            }
+            .run(),
+        );
+        format!(
+            "OK: rebuild of `{name}` started in background — `LIST` shows progress; the \
+             result logs when done\n"
+        )
+    }
+}
+
+/// The wall-clock start of an in-flight rebuild as `HH:MM:SS` (local
+/// time — the operator-facing reading of R1's already-running reply).
+fn format_start_clock(started: std::time::SystemTime) -> String {
+    let local: chrono::DateTime<chrono::Local> = started.into();
+    local.format("%H:%M:%S").to_string()
+}
+
+/// How one background rebuild ended (P2/R3–R5) — each exit has its own
+/// one-line report; every one of them resets the R1 marker.
+enum RebuildExit {
+    /// The executor answered (either arm of its Result).
+    Done(Result<rebuild::RebuildOutcome>),
+    /// The R4 budget ran out (the idempotent-merge world: rows stay).
+    TimedOut(Duration),
+    /// The R5 checkpoint found the volume REMOVEd.
+    VolumeGone,
+    /// The R5 checkpoint found the shutdown gate fired.
+    ShuttingDown,
+    /// The executor's task panicked (contained, like a command panic).
+    Panicked(String),
+}
+
+/// One detached background rebuild (P2/R3): owns the volume's resolved
+/// settings and the executor, supervises it with the R4 budget and the
+/// R5 checkpoints, and reports the outcome as one println + tracing
+/// line (the acceptance reply already went out; this task's logs ARE
+/// the result surface). On EVERY exit the R1 marker comes off, making
+/// the volume re-acceptable — including the abort exits, because the
+/// rebuild's upserts are idempotent (the rel_path conflict key: a
+/// rerun re-merges exactly what the interrupted pass had written).
+struct RebuildTask {
+    name: String,
+    settings: CyDriveConfig,
+    registry: RegistryHandle,
+    watch: Arc<ShutdownWatch>,
+    rebuilds: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::SystemTime>>>,
+    tuning: RebuildTuning,
+    run: RuntimeRebuild,
+}
+
+impl RebuildTask {
+    /// The supervision loop: the executor runs on its own spawned task
+    /// (so an abort can DROP it mid-await — the R5 semantics), with
+    /// the checkpoint ticking between the registry presence and the
+    /// shutdown gate, and the R4 deadline over the whole pass. The
+    /// checkpoint cadence is the plan's "periodic checkpoint" stand-in
+    /// for the per-page hook: `rebuild_from_backend` has no
+    /// page-granularity seam, and a sub-second cadence bounds the
+    /// abort latency as tightly without touching core's walk (the
+    /// trade-off: a page walking slower than the cadence aborts on the
+    /// NEXT tick, not mid-list — accepted, one tick's worth).
+    async fn run(self) {
+        let deadline = tokio::time::Instant::now() + self.tuning.timeout;
+        let mut work = tokio::spawn((self.run)(&self.name, &self.settings));
+        let mut checkpoints = tokio::time::interval(self.tuning.checkpoint_interval);
+        checkpoints.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let exit = loop {
+            tokio::select! {
+                joined = &mut work => {
+                    break match joined {
+                        Ok(outcome) => RebuildExit::Done(outcome),
+                        Err(panic) => RebuildExit::Panicked(
+                            panic
+                                .try_into_panic()
+                                .map(|payload| {
+                                    payload
+                                        .downcast_ref::<&str>()
+                                        .map(|str| (*str).to_string())
+                                        .or_else(|| {
+                                            payload.downcast_ref::<String>().cloned()
+                                        })
+                                        .unwrap_or_else(|| {
+                                            "<non-string panic payload>".to_string()
+                                        })
+                                })
+                                .unwrap_or_else(|cancelled| format!("aborted: {cancelled}")),
+                        ),
+                    };
+                }
+                _ = checkpoints.tick() => {
+                    // R5's two observables, the H1 gate's own reading
+                    // points: the shutdown gate and the registry entry.
+                    if self.watch.fired() {
+                        work.abort();
+                        let _ = work.await;
+                        break RebuildExit::ShuttingDown;
+                    }
+                    if self.registry.volume(&self.name).is_none() {
+                        work.abort();
+                        let _ = work.await;
+                        break RebuildExit::VolumeGone;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    work.abort();
+                    let _ = work.await;
+                    break RebuildExit::TimedOut(self.tuning.timeout);
+                }
+            }
+        };
+        // R1's reset on every exit path — the marker's whole lifetime
+        // is this task's run (the handler only inserts what this
+        // removes; the serialized command loop cannot interleave).
+        self.rebuilds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.name);
+        let name = &self.name;
+        match exit {
+            RebuildExit::Done(Ok(outcome)) => {
+                println!(
+                    "Volume {name} rebuild finished: {} file row(s), {} directory row(s).",
+                    outcome.files, outcome.dirs
+                );
+                tracing::info!(
+                    volume = name,
+                    files = outcome.files,
+                    dirs = outcome.dirs,
+                    "background rebuild finished"
+                );
+            }
+            RebuildExit::Done(Err(error)) => {
+                println!("Volume {name} rebuild failed: {error:#}.");
+                tracing::warn!(volume = name, %error, "background rebuild failed");
+            }
+            RebuildExit::TimedOut(budget) => {
+                println!(
+                    "Volume {name} rebuild interrupted; rerun REBUILD to continue (the \
+                     {budget:?} budget ran out — the rows already rebuilt are kept, the \
+                     merge is idempotent)."
+                );
+                tracing::warn!(
+                    volume = name,
+                    ?budget,
+                    "background rebuild interrupted by its budget; the pass is resumable"
+                );
+            }
+            RebuildExit::VolumeGone => {
+                println!(
+                    "Volume {name} rebuild aborted — the volume was removed at runtime \
+                     (nothing to resume; re-add the volume and REBUILD again)."
+                );
+                tracing::info!(
+                    volume = name,
+                    "background rebuild aborted: the volume was removed at runtime"
+                );
+            }
+            RebuildExit::ShuttingDown => {
+                println!(
+                    "Volume {name} rebuild interrupted; rerun REBUILD to continue (the \
+                     instance is shutting down — the rows already rebuilt are kept)."
+                );
+                tracing::info!(
+                    volume = name,
+                    "background rebuild interrupted by the shutdown gate; the pass is \
+                     resumable"
+                );
+            }
+            RebuildExit::Panicked(reason) => {
+                println!("Volume {name} rebuild task panicked: {reason}.");
+                tracing::error!(
+                    volume = name,
+                    %reason,
+                    "background rebuild task panicked; the marker was reset — a rerun is \
+                     safe"
+                );
+            }
+        }
     }
 }
 
@@ -3425,6 +3811,62 @@ pub async fn run_rebuild_with_driver(
     rebuild::rebuild_from_backend(driver, &db, &cloudkit_storage::RelPath::root())
         .await
         .context("rebuilding the index from the backend")
+}
+
+/// The P2 CLI forward: when a multi-volume instance is LIVE in this
+/// working directory (control file present + PING answers — the status
+/// forward's discovery pair), `cydrive rebuild` does not rebuild
+/// offline against files the instance is actively serving — it
+/// forwards one `REBUILD <name>` per non-telegram volume over the
+/// control channel and reports the per-volume replies (the instance's
+/// background task does the work; its reply is the acceptance). A
+/// telegram volume keeps the shadow-index refusal line, the same
+/// wording the offline pass prints.
+///
+/// `Ok(None)` = no live instance (no control file, or the address is
+/// dead): the caller keeps the existing offline pass untouched —
+/// zero drift for the not-running case. A live instance whose reply
+/// fails to arrive mid-forward reports the transport error on that
+/// volume's row without failing the others (the K22 spirit).
+pub async fn rebuild_forward_live(
+    process_cfg: &CyDriveConfig,
+    volumes: &[VolumeConfig],
+) -> Result<Option<Vec<(String, String)>>> {
+    let addr = match control::read_control_addr(process_cfg) {
+        Ok(addr) => addr,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "reading the control file {}",
+                    control::control_file_path(process_cfg).display()
+                )
+            });
+        }
+    };
+    if control::send_ping(addr).await.is_err() {
+        // A stale port file: nothing is listening — the offline pass
+        // (whose own boot guard removes the file) is the right answer.
+        return Ok(None);
+    }
+    let mut rows = Vec::new();
+    for spec in volumes {
+        if spec.settings.backend == Backend::Telegram {
+            rows.push((
+                spec.name.clone(),
+                format!("NOT rebuilt — {TELEGRAM_REBUILD_REFUSAL}"),
+            ));
+            continue;
+        }
+        match control::send_command(addr, &format!("REBUILD {}", spec.name)).await {
+            Ok(reply) => rows.push((spec.name.clone(), reply.trim().to_owned())),
+            Err(error) => rows.push((
+                spec.name.clone(),
+                format!("NOT rebuilt — forwarding the rebuild failed: {error}"),
+            )),
+        }
+    }
+    Ok(Some(rows))
 }
 
 // ------------------------------- backend dispatch (B3b 段二b unit 5) ---
