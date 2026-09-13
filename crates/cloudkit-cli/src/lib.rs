@@ -2380,29 +2380,38 @@ impl RuntimeVolumeControl {
     /// contract: every command answers, errors are actionable text, the
     /// connection never carries state across commands).
     async fn handle(&self, line: &str) -> String {
-        // CREATE carries a JSON payload as its third span — the payload
-        // is split off POSITIONALLY so its own whitespace (significant
-        // inside JSON strings) survives verbatim; the whitespace-token
-        // match below would mangle it.
-        if first_keyword_is(line, "CREATE") {
-            let rest = line.split_once(char::is_whitespace).map_or("", |(_, r)| r);
-            return match split_name_payload(rest) {
-                Some((name, payload)) if !payload.is_empty() => {
-                    // The H1 gate entry point — the mutating family's
-                    // shared refusal (see the match arm below for the
-                    // rationale).
-                    if self.watch.fired() {
-                        return "ERR: CREATE refused — the instance is shutting down; volume \
-                                changes are no longer accepted (`LIST` still answers)\n"
-                            .to_string();
+        // CREATE/UPDATE carry a JSON payload as their third span — the
+        // payload is split off POSITIONALLY so its own whitespace
+        // (significant inside JSON strings) survives verbatim; the
+        // whitespace-token match below would mangle it.
+        for keyword in ["CREATE", "UPDATE"] {
+            if first_keyword_is(line, keyword) {
+                let rest = line.split_once(char::is_whitespace).map_or("", |(_, r)| r);
+                return match split_name_payload(rest) {
+                    Some((name, payload)) if !payload.is_empty() => {
+                        // The H1 gate entry point — the mutating family's
+                        // shared refusal (see the match arm below for the
+                        // rationale).
+                        if self.watch.fired() {
+                            return format!(
+                                "ERR: {keyword} refused — the instance is shutting down; \
+                                 volume changes are no longer accepted (`LIST` still \
+                                 answers)\n"
+                            );
+                        }
+                        match keyword {
+                            "CREATE" => self.create_volume(name, payload).await,
+                            _ => self.update_volume(name, payload).await,
+                        }
                     }
-                    self.create_volume(name, payload).await
-                }
-                _ => "ERR: usage: CREATE <name> <json> — a volume name and one compact JSON \
-                      object of volume keys (e.g. {\"backend\": \"local\", \"local_root\": \
-                      \"C:/data\"}); volume names match ^[a-z][a-z0-9_-]{0,31}$\n"
-                    .to_string(),
-            };
+                    _ => format!(
+                        "ERR: usage: {keyword} <name> <json> — a volume name and one compact \
+                         JSON object of volume keys (e.g. {{\"backend\": \"local\", \
+                         \"local_root\": \"C:/data\"}}); volume names match \
+                         ^[a-z][a-z0-9_-]{{0,31}}$\n"
+                    ),
+                };
+            }
         }
         let mut tokens = line.split_whitespace();
         match (tokens.next(), tokens.next(), tokens.next()) {
@@ -2451,7 +2460,8 @@ impl RuntimeVolumeControl {
             }
             (Some("CONFIGS"), _, _) => "ERR: usage: CONFIGS — takes no argument\n".to_string(),
             _ => "ERR: usage: ADD <name> | REMOVE <name> | ENABLE <name> | DISABLE <name> | \
-                  SHOW <name> | REBUILD <name> | CREATE <name> <json> | LIST | CONFIGS\n"
+                  SHOW <name> | REBUILD <name> | CREATE <name> <json> | UPDATE <name> <json> | \
+                  LIST | CONFIGS\n"
                 .to_string(),
         }
     }
@@ -2836,6 +2846,179 @@ impl RuntimeVolumeControl {
                 "ERR: the volume file was saved at {}, but assembling the volume failed: \
                  {} — fix the file (or send `UPDATE {name} <json>` with corrected fields) \
                  and retry with `ENABLE {name}` (or `ADD {name}`)\n",
+                path.display(),
+                addition.trim().trim_start_matches("ERR: ")
+            ),
+        }
+    }
+
+    /// `UPDATE <name> <json>` (web volume management P4, plan §1.2): the
+    /// payload names the fields to CHANGE; a credential key that is
+    /// present and non-empty overwrites while a missing or empty one
+    /// keeps the stored value (the write-only rule — the overlay works
+    /// on the toml::Table level, so the stored credential values never
+    /// pass through anything that logs). The order is
+    /// file-first-K50-philosophy: validate the OLD file through the
+    /// full funnel (a half-validated file is never "repaired" by a
+    /// rewrite), overlay + render + validate the MERGED text before the
+    /// write, `fs::write`, then the re-assembly — REMOVE (the same K50
+    /// sequence) + ADD — for a volume that is registered and stays
+    /// enabled; every mixed state the re-assembly can leave (file new /
+    /// runtime old, file new / volume down) answers with its own
+    /// actionable text and the comments-loss note (裁决①: the rewrite
+    /// drops hand-written comments — surfaced, not preserved).
+    async fn update_volume(&self, name: &str, payload: &str) -> String {
+        if !Self::name_is_path_safe(name) {
+            return format!(
+                "ERR: `{name}` is not a volume name — UPDATE takes the file stem of a \
+                 volumes_dir entry (names match ^[a-z][a-z0-9_-]{{0,31}}$)\n"
+            );
+        }
+        let Some(dir) = self.process_cfg.volumes_dir.as_deref() else {
+            return "ERR: this instance runs single-volume mode (no volumes_dir) — UPDATE \
+                    serves multi-volume instances\n"
+                .to_string();
+        };
+        let path = Path::new(dir).join(format!("{name}.toml"));
+        if !path.is_file() {
+            return format!(
+                "ERR: no volume file for `{name}` at {} — UPDATE edits an existing volume \
+                 (`CREATE {name} <json>` writes a new one)\n",
+                path.display()
+            );
+        }
+        // The full funnel on the OLD file first: a half-validated file is
+        // never rewritten (the write_volume_enabled precedent).
+        if let Err(error) = cloudkit_core::config::load_volume_config(&path) {
+            return format!(
+                "ERR: reading the volume file {} failed: {error} — UPDATE never rewrites \
+                 a file the loader would refuse; fix it by hand and retry\n",
+                path.display()
+            );
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                return format!(
+                    "ERR: reading the volume file {} failed: {error}\n",
+                    path.display()
+                );
+            }
+        };
+        let explicit: toml::Table = match toml::from_str(&text) {
+            Ok(table) => table,
+            Err(error) => {
+                return format!(
+                    "ERR: re-reading the volume file {} failed: {error}\n",
+                    path.display()
+                );
+            }
+        };
+        let overlay = match volume_payload_table(payload) {
+            Ok(table) => table,
+            Err(refusal) => return refusal,
+        };
+        if overlay.is_empty() {
+            return "ERR: the payload sets no fields to change — send at least one volume \
+                    key (a credential left empty means keep, not clear)\n"
+                .to_string();
+        }
+        let merged = cloudkit_core::config::render_volume_toml(&explicit, &overlay);
+        let spec = match cloudkit_core::config::parse_volume_toml(&path, name, &merged) {
+            Ok(spec) => spec,
+            Err(error) => {
+                return format!(
+                    "ERR: the merged volume file is invalid: {error} — nothing was \
+                     written; fix the payload and retry\n"
+                );
+            }
+        };
+        if let Err(error) = spec.settings.validate() {
+            return format!(
+                "ERR: invalid volume settings: {error} — nothing was written; fix the \
+                 payload and retry\n"
+            );
+        }
+        // The field-name list only — the overlay's (or the file's)
+        // credential values never reach a log line (M3).
+        let fields: Vec<&str> = overlay.keys().map(String::as_str).collect();
+        tracing::info!(
+            volume = name,
+            fields = ?fields,
+            "UPDATE: rewriting the volume file (field names only, by policy)"
+        );
+        if let Err(error) = std::fs::write(&path, &merged) {
+            return format!(
+                "ERR: writing the volume file {} failed: {error} — the runtime was not \
+                 touched (the volume keeps its current configuration)\n",
+                path.display()
+            );
+        }
+        println!(
+            "Volume {name} updated at {} (control UPDATE).",
+            path.display()
+        );
+        let comments = "note: the volume file was rewritten — hand-written comments are lost";
+        // A file that ended up disabled: the DISABLE semantics (no
+        // re-add), through the same remove_volume.
+        if !spec.settings.enabled {
+            if self.registry.volume(name).is_none() {
+                return format!(
+                    "OK: updated volume `{name}` (file at {}; the volume is not running \
+                     and its file keeps enabled = false — `ENABLE {name}` starts it on \
+                     the new settings); {comments}\n",
+                    path.display()
+                );
+            }
+            let removal = self.remove_volume(name).await;
+            if removal.starts_with("OK:") {
+                return format!(
+                    "OK: updated volume `{name}` (enabled = false at {}; the volume was \
+                     unmounted); {comments}\n",
+                    path.display()
+                );
+            }
+            let reason = removal.trim().trim_start_matches("ERR: ");
+            return format!(
+                "ERR: the file was updated (enabled = false at {}) but the unmount \
+                 failed: {reason} — retry `DISABLE {name}` (the file write is \
+                 idempotent); {comments}\n",
+                path.display()
+            );
+        }
+        // A volume that is not registered: the file write is the whole
+        // action — assembling what ENABLE owns is not UPDATE's business.
+        if self.registry.volume(name).is_none() {
+            return format!(
+                "OK: updated volume `{name}` (file at {}; the volume is not running — \
+                 `ENABLE {name}` starts it on the new settings); {comments}\n",
+                path.display()
+            );
+        }
+        // The re-assembly: REMOVE (the same K50 sequence) then ADD. Each
+        // mixed state the two legs can leave answers with its own text.
+        let removal = self.remove_volume(name).await;
+        if !removal.starts_with("OK:") {
+            let reason = removal.trim().trim_start_matches("ERR: ");
+            return format!(
+                "ERR: the volume file was updated ({}) but the volume still runs its \
+                 OLD configuration: {reason} — drain the pending uploads (`LIST` shows \
+                 the count) and retry `REMOVE {name}` + `ENABLE {name}`; {comments}\n",
+                path.display()
+            );
+        }
+        let addition = self.add_volume(name).await;
+        let state = addition
+            .trim()
+            .strip_prefix(&format!("OK: added volume `{name}` "));
+        match state {
+            Some(state) => format!(
+                "OK: updated volume `{name}` (re-assembled: {}); {comments}\n",
+                state.trim()
+            ),
+            None => format!(
+                "ERR: the volume file was updated ({}) and the volume is now UNMOUNTED: \
+                 {} — fix the file and `ENABLE {name}`; {comments}\n",
                 path.display(),
                 addition.trim().trim_start_matches("ERR: ")
             ),

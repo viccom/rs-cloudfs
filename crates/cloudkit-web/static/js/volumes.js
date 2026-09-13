@@ -18,7 +18,12 @@
 // keys (the backend's defaults rule), the form's checks are UX-level
 // only (slug shape + the starred requireds) — the CREATE command is the
 // authority and its ERR text renders in the form's red box with the
-// values kept.
+// values kept. P4 adds the Edit face on the same card: [Edit] pulls
+// the volume's SHOW config (plain fields verbatim; the write-only
+// credential keys show set/unset placeholders — an empty input keeps
+// the stored value), the name locks, the notice spells the REMOVE+ADD
+// re-assembly + comments-loss semantics, and a pending-upload count
+// (the poll's live data) confirms before the save.
 
 const VOLUME_LABELS = {
     telegram: 'Telegram MTProto',
@@ -161,6 +166,9 @@ function renderVolumesTable(configs, runtime) {
     const tbody = document.getElementById("volumes-tbody");
     const countLabel = document.getElementById("volume-count-label");
     const rows = volumeRows(configs, runtime);
+    // The last poll's merged rows — the edit flow's pending-upload
+    // confirm reads its live data from here.
+    vfLastRows = rows;
     if (countLabel) countLabel.innerText = `${rows.length} volume${rows.length === 1 ? "" : "s"}`;
     if (!tbody) return;
 
@@ -219,18 +227,27 @@ function renderVolumesTable(configs, runtime) {
     }).join("");
 }
 
-// The Actions cell (P1+P6): a running volume offers [Refresh] (rebuild
-// its index from the remote backend — or the muted note where the
-// backend cannot be rebuilt), [Unmount] (runtime removal — the file
-// stays) and [Disable] (file + unmount); a stopped or disabled volume
-// offers [Enable]. An invalid file offers nothing — it needs a hand
-// edit first. Edit/Delete land in later batches.
+// The Actions cell (P1+P6, Edit since P4): a running volume offers
+// [Refresh] (rebuild its index from the remote backend — or the muted
+// note where the backend cannot be rebuilt), [Edit] (the edit form,
+// prefilled from SHOW), [Unmount] (runtime removal — the file stays)
+// and [Disable] (file + unmount); a stopped or disabled volume offers
+// [Edit] + [Enable]. An invalid file offers nothing but the Delete
+// placeholder — it needs a hand edit first (SHOW cannot prefill from a
+// file the loader refuses). Delete is the P5 placeholder (two-step
+// confirmation lands there).
 function volumeActionButtons(v) {
-    if (v.invalid) return '';
+    if (v.invalid) {
+        return deletePlaceholder(v.name);
+    }
     const name = escapeHtml(v.name);
     if (v.running) {
         return `
             ${refreshControl(v, name)}
+            <button class="btn-mini" data-action="edit" data-name="${name}"
+                    title="Edit this volume's configuration (prefilled from its file; saving re-assembles it)">
+                <i class="fa-solid fa-pen"></i> Edit
+            </button>
             <button class="btn-mini" data-action="unmount" data-name="${name}"
                     title="Unmount and unregister now (the volume file stays on disk)">
                 <i class="fa-solid fa-eject"></i> Unmount
@@ -239,12 +256,29 @@ function volumeActionButtons(v) {
                     title="Write enabled = false to the volume file and unmount it (survives restarts)">
                 <i class="fa-solid fa-power-off"></i> Disable
             </button>
+            ${deletePlaceholder(v.name)}
         `;
     }
     return `
+        <button class="btn-mini" data-action="edit" data-name="${name}"
+                title="Edit this volume's configuration (prefilled from its file)">
+            <i class="fa-solid fa-pen"></i> Edit
+        </button>
         <button class="btn-mini" data-action="enable" data-name="${name}"
                 title="Write enabled = true and assemble the volume now">
             <i class="fa-solid fa-play"></i> Enable
+        </button>
+        ${deletePlaceholder(v.name)}
+    `;
+}
+
+// The P5 Delete placeholder (kept visible, disabled — the two-step
+// confirmation modal lands in that batch).
+function deletePlaceholder(name) {
+    return `
+        <button class="btn-mini btn-mini-danger" data-action="delete" data-name="${escapeHtml(name)}"
+                disabled title="coming in P5">
+            <i class="fa-solid fa-trash"></i> Delete
         </button>
     `;
 }
@@ -278,6 +312,11 @@ function refreshControl(v, name) {
 function onVolumeActionClick(event) {
     const button = event.target.closest('button[data-action]');
     if (!button) return;
+    // Edit is a UI action (the edit form), not a command POST.
+    if (button.dataset.action === 'edit') {
+        openEditVolumeForm(button.dataset.name);
+        return;
+    }
     runVolumeAction(button.dataset.action, button.dataset.name, button);
 }
 
@@ -407,9 +446,12 @@ const VF_NUMBERS = {
     'vf-sync-interval': 'sync_interval_secs',
 };
 
-// The form card's current mode: null (closed) or 'create' (the edit
-// mode lands in the P4 batch on this same card).
+// The form card's current mode: null (closed), 'create' or 'edit'.
 let vfMode = null;
+
+// The last poll's merged rows (the Edit flow's pending-upload confirm
+// reads its live data from here — assigned in renderVolumesTable).
+let vfLastRows = [];
 
 function vfEl(id) {
     return document.getElementById(id);
@@ -453,8 +495,10 @@ function initVolumeForm() {
     if (vfMode === null && location.hash === '#add') openVolumeForm('create');
 }
 
-// Opens the card in the given mode ('create' resets everything).
-function openVolumeForm(mode) {
+// Opens the card in the given mode: 'create' resets everything; 'edit'
+// resets then prefills from the SHOW config (the name locks — it is the
+// volume's identity).
+function openVolumeForm(mode, preset) {
     vfMode = mode;
     const card = vfEl('volume-form-card');
     if (!card) return;
@@ -462,11 +506,24 @@ function openVolumeForm(mode) {
     vfHideError();
     const title = vfEl('volume-form-title');
     const submitLabel = vfEl('vf-submit-label');
+    const notice = vfEl('volume-form-notice');
     const nameInput = vfEl('vf-name');
     if (mode === 'create') {
         if (title) title.innerHTML = '<i class="fa-solid fa-plus"></i> Add Volume';
         if (submitLabel) submitLabel.innerText = 'Create volume';
+        if (notice) notice.hidden = true;
         resetVolumeForm();
+    } else if (mode === 'edit') {
+        if (title) title.innerHTML = '<i class="fa-solid fa-pen"></i> Edit Volume';
+        if (submitLabel) submitLabel.innerText = 'Save changes';
+        if (notice) {
+            notice.innerText = 'Saving re-assembles the volume (REMOVE + ADD): the drive \
+briefly disappears and pending uploads must drain first. The volume file is rewritten — \
+hand-written comments are lost. Credential fields left empty keep their stored values.';
+            notice.hidden = false;
+        }
+        resetVolumeForm();
+        vfPrefillEdit(preset);
     }
     if (nameInput) nameInput.focus();
     card.scrollIntoView({ behavior: 'smooth', block: 'start' });
@@ -488,9 +545,99 @@ function resetVolumeForm() {
     const scheme = vfEl('vf-enc-scheme');
     if (scheme) scheme.value = 'gcm';
     const name = vfEl('vf-name');
-    if (name) vfCheckName();
+    if (name) {
+        name.readOnly = false;
+        vfCheckName();
+    }
+    // Restore the create-mode placeholders the edit prefill replaced
+    // with set/unset markers.
+    document.querySelectorAll('.vf-cred-group input, #vf-advanced input').forEach(input => {
+        if (input.dataset.createPlaceholder !== undefined) {
+            input.placeholder = input.dataset.createPlaceholder;
+            delete input.dataset.createPlaceholder;
+        }
+    });
     vfSwapCredentialGroups();
     vfHideError();
+}
+
+// The SHOW prefill for the edit mode (P4): plain values verbatim, the
+// write-only credential keys showing their set/unset placeholders (the
+// value never left the backend — an empty input keeps the stored one).
+function vfPrefillEdit(config) {
+    if (!config) return;
+    const name = vfEl('vf-name');
+    if (name) {
+        name.value = config.name || '';
+        name.readOnly = true;
+    }
+    const plain = {
+        'vf-drive': config.drive_letter,
+        'vf-chat-id': config.chat_id,
+        'vf-baidu-root': config.baidu_root,
+        'vf-local-root': config.local_root,
+        'vf-sync-url': config.sync_url,
+    };
+    for (const [id, value] of Object.entries(plain)) {
+        const el = vfEl(id);
+        if (el && value !== undefined && value !== null) el.value = value;
+    }
+    // The write-only credential keys: SHOW answered {"set": bool}, never
+    // a value — the placeholder states whether one is stored.
+    const writeOnly = {
+        'vf-bot-token': config.bot_token,
+        'vf-baidu-app-key': config.baidu_app_key,
+        'vf-baidu-app-secret': config.baidu_app_secret,
+        'vf-baidu-access-token': config.baidu_access_token,
+        'vf-baidu-refresh-token': config.baidu_refresh_token,
+        'vf-enc-pass': config.encryption_password,
+        'vf-sync-secret': config.sync_secret,
+    };
+    for (const [id, marker] of Object.entries(writeOnly)) {
+        const el = vfEl(id);
+        if (!el) continue;
+        el.dataset.createPlaceholder = el.placeholder;
+        el.value = '';
+        el.placeholder = marker && marker.set
+            ? '已设置（留空 = 不修改）'
+            : '未设置';
+    }
+    // The radio + checkbox faces (an absent enabled key reads enabled —
+    // the natural default).
+    const backend = config.backend || 'telegram';
+    const radio = document.querySelector(`input[name="vf-backend"][value="${backend}"]`);
+    if (radio) radio.checked = true;
+    const enc = vfEl('vf-enc');
+    if (enc) enc.checked = config.enable_encryption === true;
+    const scheme = vfEl('vf-enc-scheme');
+    if (scheme) scheme.value = config.encryption_scheme === 'aead_v2' ? 'aead_v2' : 'gcm';
+    const chunk = vfEl('vf-chunk');
+    if (chunk && typeof config.chunk_size_mb === 'number') chunk.value = config.chunk_size_mb;
+    const interval = vfEl('vf-sync-interval');
+    if (interval && typeof config.sync_interval_secs === 'number') {
+        interval.value = config.sync_interval_secs;
+    }
+    const enabled = vfEl('vf-enabled');
+    if (enabled) enabled.checked = config.enabled !== false;
+    vfSwapCredentialGroups();
+}
+
+// The [Edit] entry point: pull the volume's SHOW config and open the
+// card in edit mode (a broken SHOW toasts its actionable error and
+// leaves the table alone).
+async function openEditVolumeForm(name) {
+    try {
+        const res = await fetch(`/api/volumes/${encodeURIComponent(name)}/config`);
+        if (!res.ok) {
+            const body = await res.json().catch(() => ({}));
+            showToast('err', body.error || `HTTP ${res.status}`);
+            return;
+        }
+        const config = await res.json();
+        openVolumeForm('edit', config);
+    } catch (err) {
+        showToast('err', `request failed: ${err}`);
+    }
 }
 
 // Live slug check (UX-level; the CREATE command re-validates with the
@@ -534,19 +681,23 @@ function vfHideError() {
     if (box) box.hidden = true;
 }
 
-// UX-level validation: the slug shape and the starred requireds of the
-// CHOSEN backend (the authority is the CREATE command — everything else
-// rides its ERR text into the red box).
+// UX-level validation: the slug shape and (in CREATE mode) the starred
+// requireds of the chosen backend — in EDIT mode an empty credential
+// field means "keep the stored value", so the stars gate creation only
+// (the CREATE/UPDATE command is the authority either way; everything
+// else rides its ERR text into the red box).
 function vfValidate() {
     const name = vfValue('vf-name');
     if (!VF_NAME_RULE.test(name)) {
         return 'Pick a volume name first: a lowercase letter, then a-z/0-9/_/- , up to 32 characters.';
     }
-    for (const id of VF_REQUIRED[vfBackend()] || []) {
-        if (!vfValue(id)) {
-            const el = vfEl(id);
-            const label = el ? (el.closest('.volume-field')?.querySelector('span')?.innerText || id) : id;
-            return `The ${label.trim().replace('*', '')} field is required for this backend.`;
+    if (vfMode === 'create') {
+        for (const id of VF_REQUIRED[vfBackend()] || []) {
+            if (!vfValue(id)) {
+                const el = vfEl(id);
+                const label = el ? (el.closest('.volume-field')?.querySelector('span')?.innerText || id) : id;
+                return `The ${label.trim().replace('*', '')} field is required for this backend.`;
+            }
         }
     }
     for (const id of Object.keys(VF_NUMBERS)) {
@@ -590,19 +741,48 @@ async function onVolumeFormSubmit(event) {
         vfShowError(problem);
         return;
     }
+    // The edit-mode re-assembly takes the volume down (REMOVE + ADD) —
+    // pending uploads would be drained (waited on) or abort the update;
+    // the poll's live pending count is the confirm's data.
+    if (vfMode === 'edit') {
+        const name = vfValue('vf-name');
+        const row = vfLastRows.find(r => r.name === name);
+        const pending = row && row.runtime && typeof row.runtime.pending === "number"
+            ? row.runtime.pending : 0;
+        if (pending > 0) {
+            const proceed = confirm(
+                `Volume "${name}" has ${pending} pending upload(s).\n` +
+                'Saving re-assembles the volume (REMOVE + ADD): the update waits for the ' +
+                'queue to drain (or is refused while uploads keep arriving).\n\nProceed?'
+            );
+            if (!proceed) return;
+        }
+    }
     const submit = vfEl('vf-submit');
     const label = vfEl('vf-submit-label');
+    const idleLabel = vfMode === 'create' ? 'Create volume' : 'Save changes';
     if (submit) submit.disabled = true;
-    if (label) label.innerText = 'Creating…';
+    if (label) label.innerText = vfMode === 'create' ? 'Creating…' : 'Saving…';
     try {
-        const payload = vfCollectPayload();
-        payload.name = vfValue('vf-name');
-        const response = await fetch('/api/volumes', {
-            method: 'POST',
-            headers: { 'Content-Type': 'application/json' },
-            body: JSON.stringify(payload),
-        });
-        const body = await response.json().catch(() => ({}));
+        let response, body;
+        if (vfMode === 'create') {
+            const payload = vfCollectPayload();
+            payload.name = vfValue('vf-name');
+            response = await fetch('/api/volumes', {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(payload),
+            });
+        } else {
+            // The edit transport (P4): the name rides the path.
+            const name = vfValue('vf-name');
+            response = await fetch(`/api/volumes/${encodeURIComponent(name)}`, {
+                method: 'POST',
+                headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify(vfCollectPayload()),
+            });
+        }
+        body = await response.json().catch(() => ({}));
         if (response.ok && body.ok) {
             showToast('ok', body.reply || 'Done.');
             closeVolumeForm();
@@ -615,7 +795,7 @@ async function onVolumeFormSubmit(event) {
         vfShowError(`request failed: ${err}`);
     } finally {
         if (submit) submit.disabled = false;
-        if (label) label.innerText = 'Create volume';
+        if (label) label.innerText = idleLabel;
         await loadVolumesPage();
     }
 }

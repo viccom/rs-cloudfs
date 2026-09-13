@@ -111,6 +111,12 @@
 //!   the body's shape (a non-JSON body or a missing `name` answers 400).
 //!   The 180s assembly budget covers the ADD leg's connect + mount
 //!   windows behind the serialized queue.
+//! - `POST /api/volumes/{name}` (P4) — the edit form's member: the name
+//!   rides the path, the body's object rides verbatim as the payload of
+//!   one `UPDATE <name> <json>` (the command owns the write-only
+//!   credential overlay and the REMOVE+ADD re-assembly with its
+//!   mixed-state replies); the same 180s assembly budget and family
+//!   gates.
 //!
 //! The volume-management family (`/api/volumes`, the two config
 //! routes, and the write routes) runs behind a same-origin guard (§1.5
@@ -604,6 +610,10 @@ fn multi_router(
             "/api/volumes/{name}/rebuild",
             post(api_volume_rebuild).layer(axum::middleware::from_fn(same_origin_guard)),
         )
+        .route(
+            "/api/volumes/{name}",
+            post(api_volume_update).layer(axum::middleware::from_fn(same_origin_guard)),
+        )
         .route("/api/stats/summary", get(api_stats_summary))
         .with_state(state)
 }
@@ -1080,6 +1090,90 @@ async fn api_volume_create(State(state): State<AppState>, body: axum::body::Byte
                      or the new volume's backend is slow to connect; the volume file may \
                      still have been written — check the volume list and retry once it \
                      settles"
+                ),
+            );
+        }
+    };
+    map_volume_command_reply(&reply)
+}
+
+/// `POST /api/volumes/{name}` (P4, the edit form's transport): the name
+/// rides the PATH, the body is the fields object verbatim — one compact
+/// `UPDATE <name> <json>` through the seam. The command is the
+/// authority on the payload's semantics (the write-only credential
+/// overlay — an empty string keeps the stored value; the file-first
+/// rewrite; the REMOVE+ADD re-assembly and its mixed-state replies);
+/// the route is the authority on the HTTP body's shape (a non-JSON or
+/// non-object body answers 400). Budget [`VOLUME_ASSEMBLY_TIMEOUT`]
+/// (REMOVE's drain + the ADD leg); the family gates answer before the
+/// command is built.
+async fn api_volume_update(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let AppState::Multi {
+        commands,
+        writes_allowed,
+        ..
+    } = state
+    else {
+        return error_json(
+            StatusCode::NOT_FOUND,
+            "no volume registry: this dashboard serves a single volume",
+        );
+    };
+    if !writes_allowed {
+        return error_json(
+            StatusCode::FORBIDDEN,
+            "remote administration is disabled: the web UI is bound to a non-loopback \
+             address, so the volume-management write routes refuse requests — set \
+             `allow_remote_admin = true` in config.toml to manage volumes remotely",
+        );
+    }
+    let Some(client) = commands else {
+        return error_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "volume commands are not available: this dashboard runs without the \
+             volume-command seam (the multi-volume cli assembly installs it)",
+        );
+    };
+    let fields: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                format!("the request body is not valid JSON: {error} — send the form object"),
+            );
+        }
+    };
+    if !fields.is_object() {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "the update body must be a JSON object of the volume keys to change",
+        );
+    }
+    // Compact serialization: the control channel's line protocol carries
+    // the payload as ONE line.
+    let json = match serde_json::to_string(&fields) {
+        Ok(json) => json,
+        Err(error) => {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                format!("serializing the form payload failed: {error}"),
+            );
+        }
+    };
+    let command = format!("UPDATE {name} {json}");
+    let reply = match tokio::time::timeout(VOLUME_ASSEMBLY_TIMEOUT, client(&command)).await {
+        Ok(reply) => reply,
+        Err(_elapsed) => {
+            return error_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "the UPDATE command for '{name}' timed out — the instance is likely busy \
+                     with a long volume command; the volume file may still have been \
+                     rewritten — check the volume list and retry once it settles"
                 ),
             );
         }

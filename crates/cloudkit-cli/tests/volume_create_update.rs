@@ -21,11 +21,13 @@ use std::time::Duration;
 use cloudkit_cli::control::read_control_addr;
 use cloudkit_cli::{
     run_multi_with_transports_and_commands, MountedBackend, MountedVolume, MultiVolumeHandle,
-    RunOptions, RuntimeMount, RuntimeVolumeCommands, VolumeMounts, VolumeTransportDispatch,
+    RemoveTuning, RunOptions, RuntimeMount, RuntimeVolumeCommands, VolumeMounts,
+    VolumeTransportDispatch,
 };
 use cloudkit_core::config::{CyDriveConfig, VolumeConfig};
-use cloudkit_core::transport::mock::MockTransport;
+use cloudkit_core::transport::mock::{MockTransport, UploadAction};
 use cloudkit_core::transport::CloudTransport;
+use cloudkit_storage::StorageError;
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
 use tokio::net::TcpStream;
 use tokio::time::timeout;
@@ -641,6 +643,439 @@ async fn create_never_leaks_credential_values_into_replies_or_logs() {
     assert!(
         !logs.contains("FAKE-CREATE-MARKER"),
         "no log line carries the credential value: {logs}"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+// --------------------------------------------------- P4: UPDATE (§1.2) ---
+
+/// The happy UPDATE: a running volume's non-credential fields are
+/// rewritten through the controlled overlay (the old credential SURVIVES
+/// a payload that does not name it — the write-only rule's flip side),
+/// the volume re-assembles through REMOVE+ADD, and the reply carries
+/// the re-assembly state plus the comments-loss note (裁决①: accepted
+/// and surfaced).
+#[tokio::test]
+async fn update_rewrites_fields_reassembles_and_keeps_unnamed_credentials() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:FAKE-KEEP-ME", 111111),
+    );
+    let _guard = chdir(dir.path());
+
+    let (handle, addr) = boot(
+        process_config(),
+        RuntimeVolumeCommands {
+            dispatch: Some(mock_dispatch()),
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await;
+
+    let reply = send_cmd(addr, "UPDATE a {\"chat_id\":999999,\"drive_letter\":\"Q\"}").await;
+    assert!(
+        reply.starts_with("OK:") && reply.contains("updated volume `a`"),
+        "the UPDATE acknowledges and names the volume: {reply}"
+    );
+    assert!(
+        reply.contains("re-assembled"),
+        "the reply carries the re-assembly state: {reply}"
+    );
+    assert!(
+        reply.to_lowercase().contains("comment"),
+        "the reply surfaces the comments loss (裁决①): {reply}"
+    );
+
+    // The file: the overlaid fields changed, the unnamed credential
+    // survived, the new key appended.
+    let file = fs::read_to_string(dir.path().join("volumes").join("a.toml"))
+        .expect("read the rewritten file");
+    assert!(
+        file.contains("chat_id = 999999"),
+        "the overlay landed: {file}"
+    );
+    assert!(
+        file.contains("drive_letter = \"Q\""),
+        "the new key appended: {file}"
+    );
+    assert!(
+        file.contains("bot_token = \"111:FAKE-KEEP-ME\""),
+        "a credential the payload did not name survives verbatim: {file}"
+    );
+
+    // The runtime: re-assembled and running.
+    let reply = send_cmd(addr, "LIST").await;
+    assert!(
+        list_rows(&reply)
+            .iter()
+            .any(|row| row.starts_with("a running ")),
+        "the volume runs on the updated settings: {reply}"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+/// The write-only credential rule (K49 分档), read back off the FILE
+/// (never off a log): a present non-empty credential overwrites; an
+/// EMPTY string overlays nothing (the form's leave-alone affordance) —
+/// and a payload that sets nothing at all answers the actionable
+/// no-op refusal without touching the file.
+#[tokio::test]
+async fn update_credentials_are_write_only() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:OLD", 111111),
+    );
+    let _guard = chdir(dir.path());
+
+    let (handle, addr) = boot(
+        process_config(),
+        RuntimeVolumeCommands {
+            dispatch: Some(mock_dispatch()),
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await;
+    let file = dir.path().join("volumes").join("a.toml");
+
+    // Present and non-empty: overwrite.
+    let reply = send_cmd(addr, "UPDATE a {\"bot_token\":\"222:NEW\"}").await;
+    assert!(
+        reply.starts_with("OK:"),
+        "the overwrite update lands: {reply}"
+    );
+    let text = fs::read_to_string(&file).expect("read the file");
+    assert!(
+        text.contains("bot_token = \"222:NEW\"") && !text.contains("111:OLD"),
+        "the present non-empty credential overwrote: {text}"
+    );
+
+    // Empty string: keep (no key written, the old value intact).
+    let reply = send_cmd(addr, "UPDATE a {\"bot_token\":\"\",\"chat_id\":777777}").await;
+    assert!(
+        reply.starts_with("OK:"),
+        "the leave-alone update lands: {reply}"
+    );
+    let text = fs::read_to_string(&file).expect("read the file");
+    assert!(
+        text.contains("bot_token = \"222:NEW\""),
+        "the empty credential kept the stored value: {text}"
+    );
+    assert!(
+        text.contains("chat_id = 777777"),
+        "the sibling overlay still landed: {text}"
+    );
+
+    // A payload that sets NOTHING (every key empty/absent) answers the
+    // no-op refusal and never rewrites the file.
+    let reply = send_cmd(addr, "UPDATE a {\"bot_token\":\"\"}").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("no fields"),
+        "the empty overlay is refused actionably: {reply}"
+    );
+    let text = fs::read_to_string(&file).expect("read the file");
+    assert!(
+        text.contains("chat_id = 777777"),
+        "the no-op refusal did not rewrite the file: {text}"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+/// The `enabled` key rides UPDATE (coexisting with ENABLE/DISABLE): a
+/// running volume updated to `enabled = false` unmounts through the
+/// same K50 sequence (the DISABLE semantics), and a volume that is not
+/// running answers the file-only OK with its ENABLE pointer — UPDATE
+/// never auto-assembles what ENABLE owns.
+#[tokio::test]
+async fn update_flips_enabled_and_answers_the_stopped_volume() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    let _guard = chdir(dir.path());
+
+    let (handle, addr) = boot(
+        process_config(),
+        RuntimeVolumeCommands {
+            dispatch: Some(mock_dispatch()),
+            remove_tuning: RemoveTuning::fast(),
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await;
+
+    // enabled = false on the RUNNING volume: file flips, volume comes
+    // down (no re-add — the DISABLE twin).
+    let reply = send_cmd(addr, "UPDATE a {\"enabled\":false,\"chat_id\":888888}").await;
+    assert!(
+        reply.starts_with("OK:") && reply.contains("updated volume `a`"),
+        "the disabling update acknowledges: {reply}"
+    );
+    let text =
+        fs::read_to_string(dir.path().join("volumes").join("a.toml")).expect("read the file");
+    assert!(
+        text.contains("enabled = false") && text.contains("chat_id = 888888"),
+        "the overlay + disable landed: {text}"
+    );
+    let reply = send_cmd(addr, "LIST").await;
+    assert!(
+        reply.starts_with("OK: 0 volume(s)"),
+        "the disabled volume came down: {reply}"
+    );
+
+    // The stopped volume: a further UPDATE is file-only, with the
+    // ENABLE pointer.
+    let reply = send_cmd(addr, "UPDATE a {\"chat_id\":123456}").await;
+    assert!(
+        reply.starts_with("OK:") && reply.contains("not running"),
+        "the stopped volume answers the file-only OK: {reply}"
+    );
+    assert!(
+        reply.contains("ENABLE a"),
+        "the OK names the way up: {reply}"
+    );
+    let text =
+        fs::read_to_string(dir.path().join("volumes").join("a.toml")).expect("read the file");
+    assert!(
+        text.contains("chat_id = 123456") && text.contains("enabled = false"),
+        "the stopped update landed without touching the runtime: {text}"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+/// The mixed state a drain refusal leaves (REMOVE step 1 of the
+/// re-assembly): the FILE already carries the new settings while the
+/// RUNNING volume still serves the old ones — the reply must say
+/// exactly that, with the drain guidance, and never pretend the update
+/// failed (the file IS the persistent truth; the runtime is stale and
+/// the named retry resolves it).
+#[tokio::test]
+async fn update_drain_refusal_reports_the_mixed_state() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    write_file(
+        &dir.path().join("volumes").join("stuck.toml"),
+        &volume_toml("222:BBB", 222222),
+    );
+    let _guard = chdir(dir.path());
+
+    // The boot's own `a` is healthy; `stuck` joins through the hold
+    // dispatch (its uploads park on RateLimited{3600s}).
+    let specs = {
+        let mut v =
+            cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load volume specs");
+        v.retain(|spec| spec.name == "a");
+        v
+    };
+    let hold_dispatch: VolumeTransportDispatch = Arc::new(move |spec: &VolumeConfig| {
+        let stuck = spec.name == "stuck";
+        Box::pin(async move {
+            let mock = Arc::new(
+                MockTransport::builder()
+                    .upload_action(if stuck {
+                        UploadAction::Fail {
+                            error: StorageError::RateLimited {
+                                retry_after: Some(Duration::from_secs(3600)),
+                            },
+                        }
+                    } else {
+                        UploadAction::Ok
+                    })
+                    .build(),
+            );
+            mock.connect().await.expect("connect mock");
+            Ok(Some((
+                RunOptions::default(),
+                mock as Arc<dyn CloudTransport>,
+            )))
+        })
+    });
+    let injections = vec![(
+        specs[0].clone(),
+        RunOptions::default(),
+        mock_transport().await as Arc<dyn CloudTransport>,
+    )];
+    let handle = run_multi_with_transports_and_commands(
+        &process_config(),
+        injections,
+        RuntimeVolumeCommands {
+            dispatch: Some(hold_dispatch),
+            remove_tuning: RemoveTuning::fast(),
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await
+    .expect("boot");
+    let addr = read_control_addr(&process_config()).expect("control address");
+
+    let reply = send_cmd(addr, "ADD stuck").await;
+    assert!(reply.starts_with("OK:"), "stuck adds cleanly: {reply}");
+    let source = dir.path().join("hold.txt");
+    fs::write(&source, b"hold me in flight").expect("write source");
+    let rel = cloudkit_core::rel_path::RelPath::new("/hold.txt").expect("valid rel path");
+    handle
+        .volume("stuck")
+        .expect("volume stuck")
+        .vfs()
+        .expect("vfs stuck")
+        .ingest_file(&rel, &source, 1.0)
+        .await
+        .expect("ingest into stuck");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    let reply = send_cmd(addr, "UPDATE stuck {\"chat_id\":333333}").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("OLD configuration"),
+        "the drain refusal reports the mixed state: {reply}"
+    );
+    assert!(
+        reply.contains("REMOVE stuck") && reply.contains("ENABLE stuck"),
+        "the refusal names the two-step retry: {reply}"
+    );
+    let text =
+        fs::read_to_string(dir.path().join("volumes").join("stuck.toml")).expect("read the file");
+    assert!(
+        text.contains("chat_id = 333333"),
+        "the FILE carries the new settings: {text}"
+    );
+    let reply = send_cmd(addr, "LIST").await;
+    assert!(
+        reply.contains("stuck running"),
+        "the RUNTIME still serves the volume (old settings, kept alive): {reply}"
+    );
+
+    // Deliberate leak (the remove_with_undrained_queue precedent): the
+    // held worker sleeps 3600s; a drain-join would hang the test.
+    drop(handle);
+}
+
+/// The unmounted mixed state (REMOVE ok, ADD fails — the re-add hit the
+/// same broken dispatch a wrong credential would): the file is updated,
+/// the volume is DOWN, and the refusal says so with its ENABLE retry
+/// and the comments note.
+#[tokio::test]
+async fn update_whose_readd_fails_reports_the_unmounted_state() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    let _guard = chdir(dir.path());
+
+    let (handle, addr) = boot(
+        process_config(),
+        RuntimeVolumeCommands {
+            dispatch: Some(failing_dispatch("mock connect refused")),
+            remove_tuning: RemoveTuning::fast(),
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await;
+
+    let reply = send_cmd(addr, "UPDATE a {\"chat_id\":777777}").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("UNMOUNTED"),
+        "the failed re-add reports the unmounted state: {reply}"
+    );
+    assert!(
+        reply.contains("ENABLE a"),
+        "the refusal names the retry: {reply}"
+    );
+    let text =
+        fs::read_to_string(dir.path().join("volumes").join("a.toml")).expect("read the file");
+    assert!(
+        text.contains("chat_id = 777777"),
+        "the file carries the update: {text}"
+    );
+    let reply = send_cmd(addr, "LIST").await;
+    assert!(
+        reply.starts_with("OK: 0 volume(s)"),
+        "the volume is down (removed, not re-added): {reply}"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+/// UPDATE joins the mutating family on the shutdown gate (H1): after a
+/// real STOP the command is refused — the file included.
+#[tokio::test]
+async fn update_is_refused_after_the_stop_gate_fires() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    let _guard = chdir(dir.path());
+
+    let (handle, addr) = boot(
+        process_config(),
+        RuntimeVolumeCommands {
+            dispatch: Some(mock_dispatch()),
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await;
+
+    let reply = send_cmd(addr, "STOP").await;
+    assert!(reply.starts_with("OK:"), "STOP acknowledges: {reply}");
+    let reply = send_cmd(addr, "UPDATE a {\"chat_id\":1}").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("shutting down"),
+        "UPDATE after the gate is refused with the shutdown reason: {reply}"
+    );
+    let text =
+        fs::read_to_string(dir.path().join("volumes").join("a.toml")).expect("read the file");
+    assert!(
+        text.contains("chat_id = 111111"),
+        "the refused UPDATE rewrote nothing: {text}"
     );
 
     timeout(Duration::from_secs(30), handle.shutdown())

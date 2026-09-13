@@ -1309,3 +1309,171 @@ async fn create_route_inherits_origin_remote_and_seam_gates() {
         "actionable error: {body}"
     );
 }
+
+// --------------------------- the P4 update route (web volume §1.2/§1.5) ---
+
+/// `POST /api/volumes/{name}` (P4, the edit form's transport): the body
+/// is the fields object verbatim — the name rides the PATH — and the
+/// route forwards one compact `UPDATE <name> <json>` through the seam
+/// with the 180s assembly budget (REMOVE's drain + the ADD leg); the
+/// reply mapping is the write family's (OK pinned shape, ERR 409 with
+/// the actionable text — the mixed-state refusals included).
+#[tokio::test]
+async fn update_route_forwards_the_fields_through_the_seam() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let (seam, seen) = recording_seam(
+        "OK: updated volume `a` (re-assembled: running; no drive letter claimed); note: the \
+         volume file was rewritten — hand-written comments are lost\n"
+            .to_string(),
+    );
+    let server = multi_server_with_commands(vec![entry], seam).await;
+    let addr = server.local_addr();
+
+    let resp = send(
+        addr,
+        &request_with_body(
+            "POST",
+            "/api/volumes/a",
+            addr,
+            &[],
+            r#"{"chat_id": 999999, "bot_token": "", "drive_letter": "Q"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 200, "update ok: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse body");
+    assert_eq!(body["ok"], serde_json::json!(true), "the ok flag: {body}");
+    assert!(
+        body["reply"]
+            .as_str()
+            .is_some_and(|r| r.contains("updated volume `a`")),
+        "the reply rides verbatim (comments note included): {body}"
+    );
+    assert_eq!(
+        *seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+        vec!["UPDATE a {\"bot_token\":\"\",\"chat_id\":999999,\"drive_letter\":\"Q\"}".to_string()],
+        "the path's name keys the command; the body rides as one compact JSON payload \
+         (serde_json's map order — alphabetical — is the deterministic wire form)"
+    );
+    server.shutdown().await;
+}
+
+/// The update route maps the seam's mixed-state `ERR:` replies to the
+/// family's 409 verbatim — the edit form renders the drain guidance
+/// inline (the file IS updated; the runtime is stale).
+#[tokio::test]
+async fn update_route_maps_mixed_state_err_to_409() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let server = multi_server_with_commands(
+        vec![entry],
+        canned_seam(
+            "ERR: the volume file was updated (volumes/a.toml) but the volume still runs its \
+             OLD configuration — drain the pending uploads and retry\n"
+                .to_string(),
+        ),
+    )
+    .await;
+    let addr = server.local_addr();
+
+    let resp = send(
+        addr,
+        &request_with_body("POST", "/api/volumes/a", addr, &[], r#"{"chat_id": 1}"#),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 409, "mixed-state ERR maps to 409: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("error json");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("OLD configuration")),
+        "the mixed-state text rides verbatim: {body}"
+    );
+    server.shutdown().await;
+}
+
+/// The update route's body gate: a non-JSON body and a non-object body
+/// answer actionable 400s without reaching the seam; the family's gates
+/// (Origin, remote degrade, seam) answer before the command.
+#[tokio::test]
+async fn update_route_body_and_family_gates() {
+    // The body gate: nothing broken reaches the seam.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let (seam, seen) = recording_seam("OK: unreachable\n".to_string());
+    let server = multi_server_with_commands(vec![entry], seam).await;
+    let addr = server.local_addr();
+    for (label, body) in [("not JSON", "just words"), ("a bare array", "[1]")] {
+        let resp = send(
+            addr,
+            &request_with_body("POST", "/api/volumes/a", addr, &[], body),
+        )
+        .await;
+        assert_eq!(status_of(&resp), 400, "{label} refused: {resp}");
+    }
+    // Origin: refused before the seam.
+    let resp = send(
+        addr,
+        &request_with_body(
+            "POST",
+            "/api/volumes/a",
+            addr,
+            &[("Origin", "http://evil.example")],
+            r#"{"chat_id": 1}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 403, "cross-origin update refused: {resp}");
+    assert!(
+        seen.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty(),
+        "no broken or foreign request reaches the seam"
+    );
+    server.shutdown().await;
+
+    // Remote degrade + the seam-less 503.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let (seam, _seen) = recording_seam("OK: updated\n".to_string());
+    let server = WebUiServer::serve_multi_with_remote_admin(
+        RegistryHandle::new(vec![entry]),
+        "0.0.0.0:0".parse().expect("parse the bind address"),
+        Some(seam),
+        false,
+    )
+    .await
+    .expect("serve on a non-loopback binding");
+    let addr = SocketAddr::from(([127, 0, 0, 1], server.local_addr().port()));
+    let resp = send(
+        addr,
+        &request_with_body("POST", "/api/volumes/a", addr, &[], r#"{"chat_id": 1}"#),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 403, "remote update withheld: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("error json");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("allow_remote_admin")),
+        "the refusal names the opt-in key: {body}"
+    );
+    server.shutdown().await;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let server = multi_server(vec![entry]).await;
+    let addr = server.local_addr();
+    let resp = send(
+        addr,
+        &request_with_body("POST", "/api/volumes/a", addr, &[], r#"{"chat_id": 1}"#),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 503, "no seam: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("error json");
+    assert!(
+        body["error"].as_str().is_some_and(|msg| !msg.is_empty()),
+        "actionable error: {body}"
+    );
+}
