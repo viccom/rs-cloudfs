@@ -20,21 +20,19 @@
                  exactly that instead of an empty management table. -->
             <section class="files-container" id="volumes-single-note">
                 <div class="section-title">
-                    <h3><i class="fa-solid fa-database"></i> Volume Management</h3>
+                    <h3><i class="fa-solid fa-database"></i> <span data-i18n="volumes.title">Volume Management</span></h3>
                 </div>
                 <p style="color: var(--text-muted); line-height: 1.7;">
                     <i class="fa-solid fa-circle-info" style="color: var(--accent-cyan);"></i>
-                    Single-volume mode: this instance serves <strong>one volume defined by
-                    <code>config.toml</code></strong> — there is no volume registry to manage here.
+                    <span data-i18n="vsingle.p1_1">Single-volume mode: this instance serves </span><strong><span data-i18n="vsingle.p1_2">one volume defined by </span><code>config.toml</code></strong><span data-i18n="vsingle.p1_3"> — there is no volume registry to manage here.</span>
                 </p>
                 <p style="color: var(--text-muted); line-height: 1.7;">
-                    To manage volumes from the dashboard, run the instance in multi-volume mode:
-                    point <code>volumes_dir</code> at a directory of <code>&lt;name&gt;.toml</code>
-                    volume files and restart. The usage-state dashboard for the current volume is
-                    <a href="/" style="color: var(--accent-cyan);">on the home page</a>.
+                    <span data-i18n="vsingle.p2_1">To manage volumes from the dashboard, run the instance in multi-volume mode: point </span><code>volumes_dir</code><span data-i18n="vsingle.p2_2"> at a directory of </span><code>&lt;name&gt;.toml</code><span data-i18n="vsingle.p2_3"> volume files and restart. The usage-state dashboard for the current volume is </span><a href="/" style="color: var(--accent-cyan);"><span data-i18n="vsingle.p2_4">on the home page</span></a>.
                 </p>
             </section>
         </main>
     </div>
+
+    <script src="/static/js/i18n.js"></script>
 </body>
 </html>

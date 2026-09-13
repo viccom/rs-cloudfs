@@ -33,14 +33,17 @@
 // {confirm: true, purge_local} to /api/volumes/<name>/destroy; cancel
 // at either step closes the modal with zero requests.
 
+// Backend display names through the i18n dictionary (i18n.js loads
+// first).
 const VOLUME_LABELS = {
-    telegram: 'Telegram MTProto',
-    baidu: 'Baidu Netdisk',
-    local: 'Local Disk',
+    telegram: 'backend.telegram',
+    baidu: 'backend.baidu',
+    local: 'backend.local',
 };
 
 function backendDisplayName(backend) {
-    return VOLUME_LABELS[backend] || backend || 'unknown';
+    const key = VOLUME_LABELS[backend];
+    return key ? t(key) : (backend || t('common.unknown'));
 }
 
 document.addEventListener("DOMContentLoaded", () => {
@@ -94,7 +97,7 @@ function renderVolumesError(status) {
         <tr>
             <td colspan="7" style="text-align: center; color: var(--text-muted); padding: 3rem;">
                 <i class="fa-solid fa-triangle-exclamation" style="font-size: 2rem; display: block; color: #ff6688; margin-bottom: 0.8rem;"></i>
-                The volume listing failed (HTTP ${status}) — this page needs a multi-volume instance.
+                ${t('volumes.loading_error', { status })}
             </td>
         </tr>
     `;
@@ -116,9 +119,13 @@ function renderVolumeCards(configs, runtime) {
     setText("stat-volume-pending", pending);
 }
 
-// Instance-level storage (裁决⑤): Σ of every running volume's indexed
-// bytes, with the quota ratio when the volumes report quota ceilings
-// (the index storage card's visual language, fed by the runtime rows).
+// Instance-level storage (裁决⑤), now the stats grid's FIFTH card (the
+// sidebar card retired with the sidebar rework): the Σ of every running
+// volume's indexed bytes is the headline, the quota ratio — when the
+// volumes report ceilings — the detail line ("All volumes · used /
+// total"; "All volumes · ∞" without one). The former "N volume(s) on
+// this instance" line is gone for good: the Volumes stat card already
+// counts the configured files.
 function renderStorageCard(runtime) {
     let bytes = 0, quotaUsed = 0, quotaTotal = 0, hasQuota = false;
     for (const v of runtime) {
@@ -129,23 +136,14 @@ function renderStorageCard(runtime) {
             hasQuota = true;
         }
     }
-    const detailEl = document.getElementById("storage-detail");
-    const barEl = document.getElementById("storage-bar");
-    const percentEl = document.getElementById("storage-percent");
-    const indexed = formatBytes(bytes);
-    if (detailEl && barEl && percentEl) {
-        if (hasQuota && quotaTotal > 0) {
-            const pct = Math.min(100, Math.round((quotaUsed / quotaTotal) * 100));
-            detailEl.innerText = `${formatBytes(quotaUsed)} / ${formatBytes(quotaTotal)}`;
-            percentEl.innerText = `${pct}%`;
-            barEl.style.width = `${pct}%`;
-        } else {
-            detailEl.innerText = `${indexed} / Unlimited`;
-            percentEl.innerText = '∞';
-            barEl.style.width = '0%';
-        }
+    const headline = document.getElementById("stat-total-storage");
+    if (headline) headline.innerText = formatBytes(bytes);
+    const detailEl = document.getElementById("stat-storage-detail");
+    if (detailEl) {
+        detailEl.innerText = hasQuota && quotaTotal > 0
+            ? `${t('common.all_volumes')} · ${formatBytes(quotaUsed)} / ${formatBytes(quotaTotal)}`
+            : `${t('common.all_volumes')} · ∞`;
     }
-    setText("volume-count", runtime.length);
 }
 
 // One table row model: the configs row (name/backend/enabled/running or
@@ -178,7 +176,7 @@ function renderVolumesTable(configs, runtime) {
     // The last poll's merged rows — the edit flow's pending-upload
     // confirm reads its live data from here.
     vfLastRows = rows;
-    if (countLabel) countLabel.innerText = `${rows.length} volume${rows.length === 1 ? "" : "s"}`;
+    if (countLabel) countLabel.innerText = `${rows.length} ${rows.length === 1 ? t('volumes.volume_one') : t('volumes.volume_many')}`;
     if (!tbody) return;
 
     if (!rows.length) {
@@ -186,7 +184,7 @@ function renderVolumesTable(configs, runtime) {
             <tr>
                 <td colspan="7" style="text-align: center; color: var(--text-muted); padding: 3rem;">
                     <i class="fa-solid fa-database" style="font-size: 2.2rem; margin-bottom: 0.8rem; display: block; color: var(--accent-cyan); opacity: 0.6;"></i>
-                    No volume files are configured on this instance.
+                    ${t('volumes.empty')}
                 </td>
             </tr>
         `;
@@ -196,21 +194,21 @@ function renderVolumesTable(configs, runtime) {
     tbody.innerHTML = rows.map(v => {
         let statusBadge, rowClass = '', title = '';
         if (v.invalid) {
-            statusBadge = `<span class="badge-status badge-failed" title="${escapeHtml(v.invalidReason)}"><i class="fa-solid fa-file-circle-xmark"></i> Invalid</span>`;
+            statusBadge = `<span class="badge-status badge-failed" title="${escapeHtml(v.invalidReason)}"><i class="fa-solid fa-file-circle-xmark"></i> ${t('volumes.status.invalid')}</span>`;
             title = escapeHtml(v.invalidReason);
         } else if (v.enabled && v.running) {
             const failed = v.runtime && v.runtime.status === 'failed';
             if (failed) {
                 const reason = v.runtime.status_reason || 'assembly failed';
-                statusBadge = `<span class="badge-status badge-failed" title="${escapeHtml(reason)}"><i class="fa-solid fa-circle-exclamation"></i> Failed</span>`;
+                statusBadge = `<span class="badge-status badge-failed" title="${escapeHtml(reason)}"><i class="fa-solid fa-circle-exclamation"></i> ${t('volumes.status.failed')}</span>`;
                 title = escapeHtml(reason);
             } else {
-                statusBadge = '<span class="badge-status badge-synced"><i class="fa-solid fa-circle-check"></i> Running</span>';
+                statusBadge = `<span class="badge-status badge-synced"><i class="fa-solid fa-circle-check"></i> ${t('volumes.status.running')}</span>`;
             }
         } else if (v.enabled) {
-            statusBadge = '<span class="badge-status badge-stopped"><i class="fa-solid fa-circle-pause"></i> Stopped</span>';
+            statusBadge = `<span class="badge-status badge-stopped"><i class="fa-solid fa-circle-pause"></i> ${t('volumes.status.stopped')}</span>`;
         } else {
-            statusBadge = '<span class="badge-status badge-disabled"><i class="fa-solid fa-ban"></i> Disabled</span>';
+            statusBadge = `<span class="badge-status badge-disabled"><i class="fa-solid fa-ban"></i> ${t('volumes.status.disabled')}</span>`;
             rowClass = ' class="volume-disabled"';
         }
         const rt = v.runtime || {};
@@ -253,28 +251,28 @@ function volumeActionButtons(v) {
         return `
             ${refreshControl(v, name)}
             <button class="btn-mini" data-action="edit" data-name="${name}"
-                    title="Edit this volume's configuration (prefilled from its file; saving re-assembles it)">
-                <i class="fa-solid fa-pen"></i> Edit
+                    title="${t('volumes.tip.edit_running')}">
+                <i class="fa-solid fa-pen"></i> ${t('volumes.actions.edit')}
             </button>
             <button class="btn-mini" data-action="unmount" data-name="${name}"
-                    title="Unmount and unregister now (the volume file stays on disk)">
-                <i class="fa-solid fa-eject"></i> Unmount
+                    title="${t('volumes.tip.unmount')}">
+                <i class="fa-solid fa-eject"></i> ${t('volumes.actions.unmount')}
             </button>
             <button class="btn-mini btn-mini-danger" data-action="disable" data-name="${name}"
-                    title="Write enabled = false to the volume file and unmount it (survives restarts)">
-                <i class="fa-solid fa-power-off"></i> Disable
+                    title="${t('volumes.tip.disable')}">
+                <i class="fa-solid fa-power-off"></i> ${t('volumes.actions.disable')}
             </button>
             ${deleteControl(v)}
         `;
     }
     return `
         <button class="btn-mini" data-action="edit" data-name="${name}"
-                title="Edit this volume's configuration (prefilled from its file)">
-            <i class="fa-solid fa-pen"></i> Edit
+                title="${t('volumes.tip.edit')}">
+            <i class="fa-solid fa-pen"></i> ${t('volumes.actions.edit')}
         </button>
         <button class="btn-mini" data-action="enable" data-name="${name}"
-                title="Write enabled = true and assemble the volume now">
-            <i class="fa-solid fa-play"></i> Enable
+                title="${t('volumes.tip.enable')}">
+            <i class="fa-solid fa-play"></i> ${t('volumes.actions.enable')}
         </button>
         ${deleteControl(v)}
     `;
@@ -290,15 +288,15 @@ function deleteControl(v) {
     if (v.invalid) {
         return `
             <button class="btn-mini btn-mini-danger" data-action="delete" data-name="${name}"
-                    disabled title="the volume file cannot be parsed — fix it by hand (or delete volumes/${name}.toml manually)">
-                <i class="fa-solid fa-trash"></i> Delete
+                    disabled title="${t('volumes.tip.delete_invalid', { name })}">
+                <i class="fa-solid fa-trash"></i> ${t('volumes.actions.delete')}
             </button>
         `;
     }
     return `
         <button class="btn-mini btn-mini-danger" data-action="delete" data-name="${name}"
-                title="Delete this volume for good (two-step confirmation; its local data directory stays unless you tick purge)">
-            <i class="fa-solid fa-trash"></i> Delete
+                title="${t('volumes.tip.delete')}">
+            <i class="fa-solid fa-trash"></i> ${t('volumes.actions.delete')}
         </button>
     `;
 }
@@ -314,16 +312,16 @@ function deleteControl(v) {
 // settles.
 function refreshControl(v, name) {
     if (v.backend === 'telegram') {
-        return `<span class="volume-note" data-note="refresh-unsupported" title="Refresh is not supported for the telegram backend — its db IS the index (the shadow index); use \`cydrive sync\` to replicate it to another instance instead"><i class="fa-solid fa-rotate"></i></span>`;
+        return `<span class="volume-note" data-note="refresh-unsupported" title="${t('volumes.note.refresh_telegram')}"><i class="fa-solid fa-rotate"></i></span>`;
     }
     if (v.encrypted) {
-        return `<span class="volume-note" data-note="refresh-unsupported" title="Refresh refuses encrypted instances — the backend only sees ciphertext containers; use \`cydrive sync\` instead (the sync payload carries the encrypted row semantics)"><i class="fa-solid fa-rotate"></i></span>`;
+        return `<span class="volume-note" data-note="refresh-unsupported" title="${t('volumes.note.refresh_encrypted')}"><i class="fa-solid fa-rotate"></i></span>`;
     }
     const busy = v.rebuilding === true;
     return `
         <button class="btn-mini" data-action="refresh" data-name="${name}"${busy ? ' disabled' : ''}
-                title="Rebuild this volume's index from its remote backend (idempotent, runs in the background)">
-            <i class="fa-solid ${busy ? 'fa-circle-notch fa-spin' : 'fa-rotate'}"></i> Refresh
+                title="${t('volumes.tip.refresh')}">
+            <i class="fa-solid ${busy ? 'fa-circle-notch fa-spin' : 'fa-rotate'}"></i> ${t('volumes.actions.refresh')}
         </button>
     `;
 }
@@ -351,8 +349,8 @@ async function runVolumeAction(action, name, button) {
     if (!spec) return;
     if (spec.confirm) {
         const message = action === 'unmount'
-            ? `Unmount volume "${name}"?\nIts drive disappears immediately; the volume file stays on disk (re-enable anytime).`
-            : `Disable volume "${name}"?\nThis writes enabled = false to its file (it stays disabled across restarts) and unmounts it.`;
+            ? t('volumes.confirm.unmount', { name })
+            : t('volumes.confirm.disable', { name });
         if (!confirm(message)) return;
     }
     setButtonLoading(button, true);
@@ -362,14 +360,14 @@ async function runVolumeAction(action, name, button) {
         });
         const body = await res.json().catch(() => ({}));
         if (res.ok && body.ok) {
-            showToast('ok', body.reply || 'Done.');
+            showToast('ok', body.reply || t('common.done'));
         } else {
             // The backend's ERR text is already actionable — show it
             // verbatim rather than replacing it with a generic message.
             showToast('err', body.error || `HTTP ${res.status}`);
         }
     } catch (err) {
-        showToast('err', `request failed: ${err}`);
+        showToast('err', t('common.request_failed', { error: err }));
     } finally {
         // The refresh rebuilds the table (and the button with it); the
         // loading state only needs to span the request itself.
@@ -535,17 +533,15 @@ function openVolumeForm(mode, preset) {
     const notice = vfEl('volume-form-notice');
     const nameInput = vfEl('vf-name');
     if (mode === 'create') {
-        if (title) title.innerHTML = '<i class="fa-solid fa-plus"></i> Add Volume';
-        if (submitLabel) submitLabel.innerText = 'Create volume';
+        if (title) title.innerHTML = `<i class="fa-solid fa-plus"></i> ${t('volumes.add_volume')}`;
+        if (submitLabel) submitLabel.innerText = t('volumes.create_volume');
         if (notice) notice.hidden = true;
         resetVolumeForm();
     } else if (mode === 'edit') {
-        if (title) title.innerHTML = '<i class="fa-solid fa-pen"></i> Edit Volume';
-        if (submitLabel) submitLabel.innerText = 'Save changes';
+        if (title) title.innerHTML = `<i class="fa-solid fa-pen"></i> ${t('volumes.edit_volume')}`;
+        if (submitLabel) submitLabel.innerText = t('volumes.save_changes');
         if (notice) {
-            notice.innerText = 'Saving re-assembles the volume (REMOVE + ADD): the drive \
-briefly disappears and pending uploads must drain first. The volume file is rewritten — \
-hand-written comments are lost. Credential fields left empty keep their stored values.';
+            notice.innerText = t('volumes.form.notice_edit');
             notice.hidden = false;
         }
         resetVolumeForm();
@@ -625,8 +621,8 @@ function vfPrefillEdit(config) {
         el.dataset.createPlaceholder = el.placeholder;
         el.value = '';
         el.placeholder = marker && marker.set
-            ? '已设置（留空 = 不修改）'
-            : '未设置';
+            ? t('volumes.form.cred_set')
+            : t('volumes.form.cred_unset');
     }
     // The radio + checkbox faces (an absent enabled key reads enabled —
     // the natural default).
@@ -662,7 +658,7 @@ async function openEditVolumeForm(name) {
         const config = await res.json();
         openVolumeForm('edit', config);
     } catch (err) {
-        showToast('err', `request failed: ${err}`);
+        showToast('err', t('common.request_failed', { error: err }));
     }
 }
 
@@ -678,8 +674,8 @@ function vfCheckName() {
     const bad = value !== '' && !VF_NAME_RULE.test(value);
     input.classList.toggle('vf-invalid', bad);
     hint.classList.toggle('vf-hint-bad', bad);
-    if (bad) hint.innerText = 'names start with a lowercase letter; only a-z, 0-9, _ and -; up to 32 chars';
-    else hint.innerText = 'a–z, 0–9, _ and - ; starts with a letter, up to 32 chars';
+    if (bad) hint.innerText = t('volumes.form.hint_name_bad');
+    else hint.innerText = t('volumes.form.hint_name');
 }
 
 function vfSwapCredentialGroups() {
@@ -715,21 +711,21 @@ function vfHideError() {
 function vfValidate() {
     const name = vfValue('vf-name');
     if (!VF_NAME_RULE.test(name)) {
-        return 'Pick a volume name first: a lowercase letter, then a-z/0-9/_/- , up to 32 characters.';
+        return t('volumes.form.name_required');
     }
     if (vfMode === 'create') {
         for (const id of VF_REQUIRED[vfBackend()] || []) {
             if (!vfValue(id)) {
                 const el = vfEl(id);
                 const label = el ? (el.closest('.volume-field')?.querySelector('span')?.innerText || id) : id;
-                return `The ${label.trim().replace('*', '')} field is required for this backend.`;
+                return t('volumes.form.required', { field: label.trim().replace('*', '') });
             }
         }
     }
-    for (const id of Object.keys(VF_NUMBERS)) {
+    for (const [id, key] of Object.entries(VF_NUMBERS)) {
         const raw = vfValue(id);
         if (raw !== '' && !/^-?\d+$/.test(raw)) {
-            return `"${raw}" is not a whole number — the ${VF_NUMBERS[id]} field takes digits only.`;
+            return t('volumes.form.not_whole', { value: raw, key });
         }
     }
     return '';
@@ -776,19 +772,15 @@ async function onVolumeFormSubmit(event) {
         const pending = row && row.runtime && typeof row.runtime.pending === "number"
             ? row.runtime.pending : 0;
         if (pending > 0) {
-            const proceed = confirm(
-                `Volume "${name}" has ${pending} pending upload(s).\n` +
-                'Saving re-assembles the volume (REMOVE + ADD): the update waits for the ' +
-                'queue to drain (or is refused while uploads keep arriving).\n\nProceed?'
-            );
+            const proceed = confirm(t('volumes.form.confirm_pending', { name, count: pending }));
             if (!proceed) return;
         }
     }
     const submit = vfEl('vf-submit');
     const label = vfEl('vf-submit-label');
-    const idleLabel = vfMode === 'create' ? 'Create volume' : 'Save changes';
+    const idleLabel = vfMode === 'create' ? t('volumes.create_volume') : t('volumes.save_changes');
     if (submit) submit.disabled = true;
-    if (label) label.innerText = vfMode === 'create' ? 'Creating…' : 'Saving…';
+    if (label) label.innerText = vfMode === 'create' ? t('volumes.creating') : t('volumes.saving');
     try {
         let response, body;
         if (vfMode === 'create') {
@@ -810,7 +802,7 @@ async function onVolumeFormSubmit(event) {
         }
         body = await response.json().catch(() => ({}));
         if (response.ok && body.ok) {
-            showToast('ok', body.reply || 'Done.');
+            showToast('ok', body.reply || t('common.done'));
             closeVolumeForm();
         } else {
             // The backend's ERR text is already actionable — keep the
@@ -818,7 +810,7 @@ async function onVolumeFormSubmit(event) {
             vfShowError(body.error || `HTTP ${response.status}`);
         }
     } catch (err) {
-        vfShowError(`request failed: ${err}`);
+        vfShowError(t('common.request_failed', { error: err }));
     } finally {
         if (submit) submit.disabled = false;
         if (label) label.innerText = idleLabel;
@@ -924,7 +916,7 @@ async function onDeleteConfirm() {
     const confirm = vfEl('delm-confirm');
     const label = vfEl('delm-confirm-label');
     if (confirm) confirm.disabled = true;
-    if (label) label.innerText = 'Removing…';
+    if (label) label.innerText = t('volumes.delm.removing');
     try {
         const res = await fetch(`/api/volumes/${encodeURIComponent(name)}/destroy`, {
             method: "POST",
@@ -933,16 +925,16 @@ async function onDeleteConfirm() {
         });
         const body = await res.json().catch(() => ({}));
         if (res.ok && body.ok) {
-            showToast('ok', body.reply || 'Deleted.');
+            showToast('ok', body.reply || t('common.deleted'));
         } else {
             // The backend's ERR text is already actionable (a drain
             // refusal, a purge leftover) — toast it verbatim.
             showToast('err', body.error || `HTTP ${res.status}`);
         }
     } catch (err) {
-        showToast('err', `request failed: ${err}`);
+        showToast('err', t('common.request_failed', { error: err }));
     } finally {
-        if (label) label.innerText = 'Delete volume';
+        if (label) label.innerText = t('volumes.delm.confirm');
         closeDeleteModal();
         await loadVolumesPage();
     }

@@ -9,8 +9,11 @@
     --accent-green: #00ff88;
     --text-main: #f0f4fc;
     --text-muted: #8b9bb4;
-    --font-main: 'Outfit', sans-serif;
-    --font-mono: 'JetBrains Mono', monospace;
+    /* CJK fallbacks: the zh overlay (i18n.js) renders outside Outfit's
+       latin coverage — PingFang (macOS) / YaHei (Windows) keep the
+       weights coherent. */
+    --font-main: 'Outfit', 'PingFang SC', 'Microsoft YaHei', sans-serif;
+    --font-mono: 'JetBrains Mono', 'PingFang SC', 'Microsoft YaHei', monospace;
 }
 
 * {
@@ -134,44 +137,31 @@ body {
     border-left: 3px solid var(--accent-cyan);
 }
 
-.storage-card {
-    background: rgba(255, 255, 255, 0.03);
-    border: 1px solid var(--border-color);
-    padding: 1.2rem;
-    border-radius: 14px;
-}
-
-.storage-header {
-    display: flex;
-    justify-content: space-between;
-    font-size: 0.85rem;
+/* Small section labels inside the sidebar (the views filter on the
+   dashboard, the bottom page switcher's title). */
+.nav-section-title {
+    font-size: 0.65rem;
     font-weight: 600;
-    margin-bottom: 0.6rem;
+    letter-spacing: 1.5px;
+    text-transform: uppercase;
+    color: var(--text-muted);
+    padding: 0 1.1rem;
+    margin-bottom: 0.2rem;
+    opacity: 0.8;
 }
 
-.progress-bar {
-    height: 6px;
-    background: rgba(255, 255, 255, 0.1);
-    border-radius: 10px;
-    overflow: hidden;
-    margin-bottom: 0.6rem;
+/* The page switcher, anchored at the sidebar's bottom: margin-top auto
+   eats the spare column height (the dashboard's mid nav also grows),
+   so both pages share the same anchor semantics. */
+.sidebar-pages {
+    margin-top: auto;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    padding-top: 1.5rem;
+    border-top: 1px solid var(--border-color);
 }
 
-.progress-fill {
-    height: 100%;
-    background: linear-gradient(90deg, var(--accent-cyan), var(--accent-purple));
-    border-radius: 10px;
-    transition: width 0.4s ease;
-}
-
-/* Idle storage bar (local disk: no quota concept to meter). */
-.progress-fill.muted {
-    background: var(--text-muted);
-    opacity: 0.35;
-}
-
-/* Backend identity pill in the brand block (the active backend's
-   config spelling, server-reported via /api/stats). */
 .backend-badge {
     display: inline-block;
     margin-top: 0.3rem;
@@ -295,12 +285,6 @@ body {
     display: none;
 }
 
-.storage-card p {
-    font-size: 0.75rem;
-    color: var(--text-muted);
-    margin-bottom: 0.8rem;
-}
-
 .drive-badge {
     background: rgba(0, 243, 255, 0.1);
     border: 1px solid rgba(0, 243, 255, 0.2);
@@ -309,6 +293,14 @@ body {
     font-size: 0.8rem;
     color: var(--accent-cyan);
     text-align: center;
+}
+
+/* The drive badge's new home inside the storage stat card (the sidebar
+   chassis it grew up in is gone): a compact inline pill under the
+   used/total detail line. */
+.stat-info .drive-badge {
+    display: inline-block;
+    margin-top: 0.45rem;
 }
 
 /* Main Content */
@@ -386,6 +378,39 @@ body {
 
 .btn-icon:hover {
     background: var(--bg-card-hover);
+    color: var(--accent-cyan);
+}
+
+/* The bilingual switch ([中|EN]): a two-segment pill in the topbar's
+   action row; the active language's segment highlights, a click on the
+   other stores the choice and reloads (i18n.js setLang). */
+.lang-pill {
+    display: inline-flex;
+    align-items: stretch;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    overflow: hidden;
+    background: var(--bg-card);
+}
+
+.lang-seg {
+    padding: 0.65rem 0.9rem;
+    background: transparent;
+    border: none;
+    color: var(--text-muted);
+    font-family: var(--font-main);
+    font-size: 0.85rem;
+    font-weight: 600;
+    cursor: pointer;
+    transition: all 0.2s ease;
+}
+
+.lang-seg:hover {
+    color: var(--text-main);
+}
+
+.lang-seg.active {
+    background: rgba(0, 243, 255, 0.12);
     color: var(--accent-cyan);
 }
 

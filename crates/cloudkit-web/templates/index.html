@@ -26,30 +26,23 @@
                 </div>
             </div>
 
+            <!-- The view filters (the only mid-sidebar nav this page
+                 keeps; Cloud Drive merged into the bottom page
+                 switcher) -->
             <nav class="nav-menu">
-                <a href="#" class="nav-item active" onclick="filterType('all')"><i class="fa-solid fa-hard-drive"></i> Cloud Drive</a>
-                <a href="#" class="nav-item" onclick="filterType('media')"><i class="fa-solid fa-photo-film"></i> Media Gallery</a>
-                <a href="#" class="nav-item" onclick="filterType('documents')"><i class="fa-solid fa-file-lines"></i> Documents</a>
-                <!-- The configuration-state twin (web volume management
-                     §1.4): the volume registry's management page -->
-                <a href="/volumes" class="nav-item"><i class="fa-solid fa-database"></i> Volumes</a>
-                <a href="https://github.com/thecynetx/CyDrive" target="_blank" class="nav-item"><i class="fa-brands fa-github"></i> GitHub</a>
-                <a href="https://cynetx.ir" target="_blank" class="nav-item"><i class="fa-solid fa-shield-halved"></i> Cynet Security</a>
+                <div class="nav-section-title" data-i18n="sidebar.views">Views</div>
+                <a href="#" class="nav-item" onclick="filterType('media')"><i class="fa-solid fa-photo-film"></i> <span data-i18n="index.media_gallery">Media Gallery</span></a>
+                <a href="#" class="nav-item" onclick="filterType('documents')"><i class="fa-solid fa-file-lines"></i> <span data-i18n="index.documents">Documents</span></a>
             </nav>
 
-            <div class="storage-card">
-                <div class="storage-header">
-                    <span>Cloud Storage</span>
-                    <span id="storage-percent">0%</span>
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-fill" id="storage-bar" style="width: 15%;"></div>
-                </div>
-                <p id="storage-detail">0 MB / Unlimited</p>
-                <div class="drive-badge">
-                    <i class="fa-brands fa-windows"></i> Mounted on <strong id="drive-letter">Y:</strong>
-                </div>
-            </div>
+            <!-- The page switcher, anchored at the sidebar's bottom
+                 (flex): the cross-page twin of the /volumes page's own
+                 switcher -->
+            <nav class="sidebar-pages" aria-label="Pages">
+                <div class="nav-section-title" data-i18n="sidebar.pages">Pages</div>
+                <a href="/" class="nav-item active"><i class="fa-solid fa-hard-drive"></i> <span data-i18n="page.files">Files</span></a>
+                <a href="/volumes" class="nav-item"><i class="fa-solid fa-database"></i> <span data-i18n="page.volumes">Volumes</span></a>
+            </nav>
         </aside>
 
         <!-- Main Content Area -->
@@ -62,15 +55,23 @@
             <header class="topbar">
                 <div class="search-box">
                     <i class="fa-solid fa-magnifying-glass"></i>
-                    <input type="text" id="search-input" placeholder="Search files, documents, videos in CyDrive...">
+                    <input type="text" id="search-input" placeholder="Search files, documents, videos in CyDrive..."
+                           data-i18n-placeholder="index.search_placeholder">
                 </div>
 
                 <div class="topbar-actions">
+                    <!-- The bilingual switch: the active language's
+                         segment highlights (i18n.js); a click stores the
+                         choice and reloads -->
+                    <div class="lang-pill" role="group" aria-label="Language">
+                        <button type="button" class="lang-seg" data-lang="zh" onclick="setLang('zh')">中</button>
+                        <button type="button" class="lang-seg active" data-lang="en" onclick="setLang('en')">EN</button>
+                    </div>
                     <button class="btn btn-primary" onclick="document.getElementById('file-upload').click()">
-                        <i class="fa-solid fa-cloud-arrow-up"></i> Upload File
+                        <i class="fa-solid fa-cloud-arrow-up"></i> <span data-i18n="index.upload_file">Upload File</span>
                     </button>
                     <input type="file" id="file-upload" style="display: none;" onchange="handleFileUpload(this)">
-                    <button class="btn btn-icon" title="Refresh Drive" onclick="loadDriveData()"><i class="fa-solid fa-rotate"></i></button>
+                    <button class="btn btn-icon" title="Refresh Drive" data-i18n-title="index.refresh_drive" onclick="loadDriveData()"><i class="fa-solid fa-rotate"></i></button>
                 </div>
             </header>
 
@@ -80,21 +81,21 @@
                     <div class="stat-icon icon-blue"><i class="fa-solid fa-cloud"></i></div>
                     <div class="stat-info">
                         <h3 id="stat-total-files">0</h3>
-                        <p>Total Files Stored</p>
+                        <p data-i18n="index.total_files">Total Files Stored</p>
                     </div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-icon icon-purple"><i class="fa-solid fa-database"></i></div>
                     <div class="stat-info">
                         <h3 id="stat-total-size">0 MB</h3>
-                        <p>Total Cloud Volume</p>
+                        <p data-i18n="index.total_size">Total Cloud Volume</p>
                     </div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-icon icon-green"><i class="fa-solid fa-bolt"></i></div>
                     <div class="stat-info">
-                        <h3>Active</h3>
-                        <p id="backend-label">MTProto Telethon Sync</p>
+                        <h3 data-i18n="index.active">Active</h3>
+                        <p id="backend-label" data-i18n="backend.telegram">MTProto Telethon Sync</p>
                         <span id="backend-detail" class="backend-detail" hidden></span>
                     </div>
                 </div>
@@ -102,7 +103,21 @@
                     <div class="stat-icon icon-cyan"><i class="fa-solid fa-network-wired"></i></div>
                     <div class="stat-info">
                         <h3 id="webdav-endpoint">127.0.0.1:8080</h3>
-                        <p>WebDAV Service</p>
+                        <p data-i18n="index.webdav_service">WebDAV Service</p>
+                    </div>
+                </div>
+                <!-- The storage card (moved out of the sidebar): the
+                     quota percent is the headline, used/total the
+                     detail, the drive badge the mount line. In
+                     multi-volume mode the volume-scoped /api/stats
+                     makes it show the SELECTED volume, coexisting with
+                     the cross-volume summary card below. -->
+                <div class="stat-card" id="storage-card">
+                    <div class="stat-icon icon-cyan"><i class="fa-solid fa-hard-drive"></i></div>
+                    <div class="stat-info">
+                        <h3 id="storage-percent">0%</h3>
+                        <p id="storage-detail">0 MB / Unlimited</p>
+                        <span class="drive-badge"><i class="fa-brands fa-windows"></i> <span data-i18n="index.mounted_on">Mounted on</span> <strong id="drive-letter">Y:</strong></span>
                     </div>
                 </div>
                 <!-- Cross-volume aggregate card (multi-volume mode only;
@@ -112,7 +127,7 @@
                     <div class="stat-icon icon-green"><i class="fa-solid fa-layer-group"></i></div>
                     <div class="stat-info">
                         <h3 id="summary-size">0 B</h3>
-                        <p id="summary-detail">All volumes</p>
+                        <p id="summary-detail" data-i18n="common.all_volumes">All volumes</p>
                     </div>
                 </div>
             </section>
@@ -120,14 +135,14 @@
             <!-- Drag & Drop Upload Zone -->
             <section class="drop-zone" id="drop-zone">
                 <i class="fa-solid fa-cloud-arrow-up drop-icon"></i>
-                <h3>Drag & Drop Files Here</h3>
-                <p id="drop-zone-sub">Instantly syncs to your Windows Drive & Telegram Cloud</p>
+                <h3 data-i18n="index.drop_here">Drag & Drop Files Here</h3>
+                <p id="drop-zone-sub" data-i18n="index.drop_sub">Instantly syncs to your Windows Drive & Telegram Cloud</p>
             </section>
 
             <!-- Files Section -->
             <section class="files-container">
                 <div class="section-title">
-                    <h3><i class="fa-solid fa-folder-open"></i> Cloud Files & Directories</h3>
+                    <h3><i class="fa-solid fa-folder-open"></i> <span data-i18n="index.cloud_files">Cloud Files & Directories</span></h3>
                     <span id="file-count-label">0 items</span>
                 </div>
 
@@ -135,17 +150,17 @@
                     <table class="files-table">
                         <thead>
                             <tr>
-                                <th>Name</th>
-                                <th>Size</th>
-                                <th>Status</th>
-                                <th>Last Modified</th>
-                                <th>Actions</th>
+                                <th data-i18n="table.name">Name</th>
+                                <th data-i18n="table.size">Size</th>
+                                <th data-i18n="table.status">Status</th>
+                                <th data-i18n="table.last_modified">Last Modified</th>
+                                <th data-i18n="table.actions">Actions</th>
                             </tr>
                         </thead>
                         <tbody id="files-tbody">
                             <tr>
                                 <td colspan="5" class="loading-state">
-                                    <i class="fa-solid fa-circle-notch fa-spin"></i> Loading CyDrive files...
+                                    <i class="fa-solid fa-circle-notch fa-spin"></i> <span data-i18n="index.loading_files">Loading CyDrive files...</span>
                                 </td>
                             </tr>
                         </tbody>
@@ -159,11 +174,12 @@
     <div id="media-modal" class="modal">
         <div class="modal-content">
             <button class="modal-close" onclick="closeModal()">&times;</button>
-            <h3 id="modal-title">File Preview</h3>
+            <h3 id="modal-title" data-i18n="index.file_preview">File Preview</h3>
             <div id="modal-body"></div>
         </div>
     </div>
 
+    <script src="/static/js/i18n.js"></script>
     <script src="/static/js/app.js"></script>
 </body>
 </html>

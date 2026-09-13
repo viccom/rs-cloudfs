@@ -20,15 +20,17 @@ let volumeState = {
     current: null, // selected volume name
 };
 
-// Display names per backend spelling (the /api/stats `backend` values).
+// Display names per backend spelling (the /api/stats `backend` values),
+// through the i18n dictionary (i18n.js loads first).
 const BACKEND_LABELS = {
-    telegram: 'Telegram MTProto',
-    baidu: 'Baidu Netdisk',
-    local: 'Local Disk',
+    telegram: 'backend.telegram',
+    baidu: 'backend.baidu',
+    local: 'backend.local',
 };
 
 function backendDisplayName(backend) {
-    return BACKEND_LABELS[backend] || 'your cloud drive';
+    const key = BACKEND_LABELS[backend];
+    return key ? t(key) : t('backend.fallback');
 }
 
 document.addEventListener("DOMContentLoaded", async () => {
@@ -157,7 +159,7 @@ function renderVolumeTabs() {
             ? `<button class="volume-tab failed" disabled${reason}>${label}</button>`
             : `<button class="volume-tab${active}" onclick="switchVolume('${escapeHtml(v.name)}')"${reason}>${label}</button>`;
     }).join("");
-    bar.innerHTML = `${chips}<a href="/volumes" class="volume-tab volume-add" title="Manage volumes">＋</a>`;
+    bar.innerHTML = `${chips}<a href="/volumes" class="volume-tab volume-add" title="${t('index.manage_volumes')}">＋</a>`;
     ensureCurrentVolume();
 }
 
@@ -224,7 +226,7 @@ function updateSummaryCard() {
     if (sizeEl) sizeEl.innerText = formatBytes(bytes);
     const detailEl = document.getElementById("summary-detail");
     if (detailEl) {
-        let detail = `All volumes: ${files} file${files === 1 ? "" : "s"}`;
+        let detail = `${t('common.all_volumes')}: ${files} ${files === 1 ? t('index.file_one') : t('index.file_many')}`;
         if (hasTotal) detail += ` • ${formatBytes(quotaUsed)} / ${formatBytes(quotaTotal)}`;
         detailEl.innerText = detail;
     }
@@ -256,40 +258,37 @@ function updateStatsUI(stats) {
     }
 }
 
+// The storage card (a stats-grid stat-card since the sidebar rework):
+// the quota percent is the headline, used/total the detail line, and
+// the static drive badge carries the mount letter. No progress bar
+// anymore — the percent headline took over its job.
+//
+// Local disk: no quota concept — the number is what the drive indexes.
+// A real backend ceiling: the ratio is the true used/total share (boot
+// snapshot from /api/stats — informational, not live). Unlimited
+// (telegram) or the quota snapshot unavailable: there is no honest
+// ratio, so the headline rests at ∞.
 function updateStorageCard(stats, indexedStr) {
     const detailEl = document.getElementById("storage-detail");
-    const barEl = document.getElementById("storage-bar");
     const percentEl = document.getElementById("storage-percent");
-    if (!detailEl || !barEl || !percentEl) return;
+    if (!detailEl || !percentEl) return;
 
-    barEl.classList.remove("muted");
-
-    // Local disk: no quota concept — the number is what the drive
-    // indexes, the bar rests as a dim idle strip.
     if (backendState.backend === 'local') {
-        detailEl.innerText = `${indexedStr} on local disk`;
+        detailEl.innerText = t('index.on_local_disk', { size: indexedStr });
         percentEl.innerText = '—';
-        barEl.style.width = '100%';
-        barEl.classList.add('muted');
         return;
     }
 
-    // A real backend ceiling: the ratio is the true used/total share
-    // (boot snapshot from /api/stats — informational, not live).
     if (Number.isFinite(stats.quota_total) && stats.quota_total > 0) {
         const used = stats.quota_used || 0;
         const pct = Math.min(100, Math.round((used / stats.quota_total) * 100));
         detailEl.innerText = `${formatBytes(used)} / ${formatBytes(stats.quota_total)}`;
         percentEl.innerText = `${pct}%`;
-        barEl.style.width = `${pct}%`;
         return;
     }
 
-    // Unlimited (telegram) or the quota snapshot is unavailable: there
-    // is no honest ratio to show, so the bar rests empty.
-    detailEl.innerText = `${indexedStr} / Unlimited`;
+    detailEl.innerText = t('index.size_unlimited', { size: indexedStr });
     percentEl.innerText = '∞';
-    barEl.style.width = '0%';
 }
 
 function updateBackendUI(stats) {
@@ -327,7 +326,7 @@ function updateBackendUI(stats) {
     // Drop zone copy: name the real destination.
     const dropSub = document.getElementById("drop-zone-sub");
     if (dropSub && backendState.backend) {
-        dropSub.innerText = `Instantly syncs to your Windows Drive & ${label}`;
+        dropSub.innerText = t('index.drop_sub_backend', { backend: label });
     }
 }
 
@@ -368,17 +367,17 @@ function applyCurrentFilter() {
 function renderFilesTable(files) {
     const tbody = document.getElementById("files-tbody");
     const countLabel = document.getElementById("file-count-label");
-    if (countLabel) countLabel.innerText = `${files.length} items`;
+    if (countLabel) countLabel.innerText = `${files.length} ${t('index.items')}`;
 
     if (!files || files.length === 0) {
         const target = backendState.backend
             ? backendDisplayName(backendState.backend)
-            : 'your cloud drive';
+            : t('backend.fallback');
         tbody.innerHTML = `
             <tr>
                 <td colspan="5" style="text-align: center; color: var(--text-muted); padding: 3rem;">
                     <i class="fa-solid fa-folder-open" style="font-size: 2.2rem; margin-bottom: 0.8rem; display: block; color: var(--accent-cyan); opacity: 0.6;"></i>
-                    No files found in this view. Drag and drop files above to sync to ${escapeHtml(target)}!
+                    ${t('index.empty_files', { target: escapeHtml(target) })}
                 </td>
             </tr>
         `;
@@ -389,9 +388,9 @@ function renderFilesTable(files) {
         const icon = getFileIcon(file.name, file.is_dir);
         const sizeStr = file.is_dir ? "-" : formatBytes(file.size);
         const dateStr = file.mtime ? new Date(file.mtime * 1000).toLocaleDateString() : "-";
-        const statusBadge = file.is_uploaded 
-            ? '<span class="badge-status badge-synced"><i class="fa-solid fa-circle-check"></i> Synced</span>'
-            : '<span class="badge-status badge-uploading"><i class="fa-solid fa-rotate fa-spin"></i> Syncing</span>';
+        const statusBadge = file.is_uploaded
+            ? `<span class="badge-status badge-synced"><i class="fa-solid fa-circle-check"></i> ${t('status.synced')}</span>`
+            : `<span class="badge-status badge-uploading"><i class="fa-solid fa-rotate fa-spin"></i> ${t('status.syncing')}</span>`;
 
         const isDir = Boolean(file.is_dir);
         const encName = encodeURIComponent(file.name);
@@ -399,8 +398,8 @@ function renderFilesTable(files) {
         // backend really removes the cloud object, telegram only drops
         // the local row.
         const deleteTitle = backendState.remoteDelete
-            ? 'Delete from Cloud'
-            : 'Remove from local index';
+            ? t('index.delete_remote')
+            : t('index.delete_local');
 
         return `
             <tr>
@@ -414,8 +413,8 @@ function renderFilesTable(files) {
                 <td>${statusBadge}</td>
                 <td>${dateStr}</td>
                 <td>
-                    ${!isDir ? `<a href="${apiUrl(`/api/download/${encName}`)}" class="action-btn" title="Download"><i class="fa-solid fa-download"></i></a>` : ''}
-                    ${!isDir && isMedia(file.name) ? `<button class="action-btn" title="Stream Online" onclick="previewMedia('${encName}')"><i class="fa-solid fa-play"></i></button>` : ''}
+                    ${!isDir ? `<a href="${apiUrl(`/api/download/${encName}`)}" class="action-btn" title="${t('index.download')}"><i class="fa-solid fa-download"></i></a>` : ''}
+                    ${!isDir && isMedia(file.name) ? `<button class="action-btn" title="${t('index.stream')}" onclick="previewMedia('${encName}')"><i class="fa-solid fa-play"></i></button>` : ''}
                     <button class="action-btn btn-delete" title="${deleteTitle}" onclick="deleteFile('${encName}')"><i class="fa-solid fa-trash-can"></i></button>
                 </td>
             </tr>
@@ -487,10 +486,10 @@ async function deleteFile(encodedName) {
     // cloud object, telegram keeps the remote copy (Python parity).
     // In multi-volume mode the volume name scopes the action (K23).
     const volumeNote = volumeState.multi && volumeState.current
-        ? ` in volume "${volumeState.current}"` : "";
+        ? t('index.volume_note', { name: volumeState.current }) : "";
     const message = backendState.remoteDelete
-        ? `Are you sure you want to delete "${fileName}"${volumeNote}? This will also delete the file from the cloud backend.`
-        : `Are you sure you want to remove "${fileName}"${volumeNote} from the local index? The cloud copy is kept.`;
+        ? t('index.delete_confirm_remote', { name: fileName, volume: volumeNote })
+        : t('index.delete_confirm_local', { name: fileName, volume: volumeNote });
     if (!confirm(message)) {
         return;
     }
@@ -505,7 +504,7 @@ async function deleteFile(encodedName) {
         if (res.ok) {
             loadDriveData();
         } else {
-            alert("Could not delete file from cloud.");
+            alert(t('index.delete_failed_alert'));
         }
     } catch (err) {
         console.error("Delete error:", err);
