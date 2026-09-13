@@ -3,12 +3,28 @@ let currentFilter = 'all';
 
 // Client-side pagination of the files table: allFiles is fully in
 // memory, so a page is just a slice of the current filter result. The
-// page resets on user-driven filter changes (search box, view filters)
-// and only clamps on poll refreshes — so a delete that empties the
-// current page steps back instead of staring at a blank table.
-const PAGE_SIZE = 50;
+// page resets on user-driven filter changes (search box, view filters,
+// the page-size select) and only clamps on poll refreshes — so a delete
+// that empties the current page steps back instead of staring at a
+// blank table. The page size is the user's own choice (the bar's
+// select; persisted to localStorage, an unusable stored value falls
+// back to the default).
+const PAGE_SIZES = [10, 20, 50];
+const DEFAULT_PAGE_SIZE = 10;
 let currentPage = 1;
 let filteredFiles = [];
+
+// The stored page size, or the default when nothing (or something
+// unusable — off-list, non-numeric) is stored. Storage may be disabled
+// in hostile embedders; a failed read must never break the UI.
+function readPageSize() {
+    try {
+        const stored = Number(localStorage.getItem('cydrive.pageSize'));
+        if (PAGE_SIZES.includes(stored)) return stored;
+    } catch (err) { /* storage off */ }
+    return DEFAULT_PAGE_SIZE;
+}
+let pageSize = readPageSize();
 
 // The active backend's identity, refreshed from every /api/stats poll
 // (server-reported — the UI never guesses which backend is running).
@@ -52,11 +68,14 @@ document.addEventListener("DOMContentLoaded", async () => {
     setInterval(loadDriveData, 4000);
 });
 
-// One delegated listener on the static pagination host serves every
-// bar the renderer mints.
+// One delegated listener pair on the static pagination host serves
+// every bar the renderer mints (clicks move pages, the select changes
+// the page size — both survive the bar's re-renders).
 function setupPagination() {
     const host = document.getElementById("pagination");
-    if (host) host.addEventListener("click", onPaginationClick);
+    if (!host) return;
+    host.addEventListener("click", onPaginationClick);
+    host.addEventListener("change", onPageSizeChange);
 }
 
 // Boot probe: a parameterless /api/stats answers 200 on a single-volume
@@ -358,17 +377,19 @@ function filterFiles() {
 function applyCurrentFilter(resetPage) {
     if (resetPage) currentPage = 1;
     filteredFiles = filterFiles();
-    const pages = Math.max(1, Math.ceil(filteredFiles.length / PAGE_SIZE));
+    const pages = Math.max(1, Math.ceil(filteredFiles.length / pageSize));
     if (currentPage > pages) currentPage = pages;
 
-    const start = (currentPage - 1) * PAGE_SIZE;
-    renderFilesTable(filteredFiles.slice(start, start + PAGE_SIZE));
+    const start = (currentPage - 1) * pageSize;
+    renderFilesTable(filteredFiles.slice(start, start + pageSize));
     renderPagination();
 }
 
 // The pagination bar under the table: prev/next (disabled at the
-// bounds), the x / y indicator and the total. Hidden while there is
-// nothing to page through (the empty-state row carries the table).
+// bounds), the x / y indicator, the total — and the per-page size
+// select (10/20/50, i18n-labelled "n / page"), whose choice persists
+// and re-slices from page 1. Hidden while there is nothing to page
+// through (the empty-state row carries the table).
 function renderPagination() {
     const host = document.getElementById("pagination");
     if (!host) return;
@@ -379,7 +400,10 @@ function renderPagination() {
         return;
     }
     host.hidden = false;
-    const pages = Math.ceil(total / PAGE_SIZE);
+    const pages = Math.ceil(total / pageSize);
+    const options = PAGE_SIZES.map(n =>
+        `<option value="${n}"${n === pageSize ? " selected" : ""}>${t('pagination.per_page', { n })}</option>`
+    ).join("");
     host.innerHTML = `
         <button class="page-btn" data-page="${currentPage - 1}"${currentPage <= 1 ? " disabled" : ""}>
             <i class="fa-solid fa-chevron-left"></i> ${t('pagination.prev')}
@@ -389,7 +413,24 @@ function renderPagination() {
             ${t('pagination.next')} <i class="fa-solid fa-chevron-right"></i>
         </button>
         <span class="page-total">${t('pagination.total', { n: total })}</span>
+        <label class="page-size">
+            <select class="page-size-select" aria-label="${t('pagination.per_page', { n: pageSize })}">${options}</select>
+        </label>
     `;
+}
+
+// The size select's delegated change handler: an unusable value is
+// ignored (the select only offers the PAGE_SIZES list), a real change
+// persists to localStorage and re-slices from page 1 — a size change is
+// a user-driven view change, so it resets the page like the filters do.
+function onPageSizeChange(event) {
+    const select = event.target.closest("select.page-size-select");
+    if (!select) return;
+    const size = Number(select.value);
+    if (!PAGE_SIZES.includes(size) || size === pageSize) return;
+    pageSize = size;
+    try { localStorage.setItem('cydrive.pageSize', String(size)); } catch (err) { /* storage off */ }
+    applyCurrentFilter(true);
 }
 
 // The bar's click handler: one delegated listener moves by the data-page
@@ -397,12 +438,12 @@ function renderPagination() {
 function onPaginationClick(event) {
     const button = event.target.closest("button[data-page]");
     if (!button || button.disabled) return;
-    const pages = Math.max(1, Math.ceil(filteredFiles.length / PAGE_SIZE));
+    const pages = Math.max(1, Math.ceil(filteredFiles.length / pageSize));
     const page = Math.min(pages, Math.max(1, Number(button.dataset.page)));
     if (page === currentPage) return;
     currentPage = page;
-    const start = (currentPage - 1) * PAGE_SIZE;
-    renderFilesTable(filteredFiles.slice(start, start + PAGE_SIZE));
+    const start = (currentPage - 1) * pageSize;
+    renderFilesTable(filteredFiles.slice(start, start + pageSize));
     renderPagination();
     const table = document.querySelector(".files-table");
     if (table) table.scrollIntoView({ behavior: "smooth", block: "start" });

@@ -315,6 +315,43 @@ async fn volumes_page_serves_the_management_skeleton() {
     }
 }
 
+/// UI polish round 2: the config section's submenu rides above the page
+/// pill on the config-side pages — both entries present, the exact-path
+/// active entry is `/volumes` here, and the system entry carries the
+/// read-only badge.
+#[tokio::test]
+async fn volumes_page_carries_the_config_submenu() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let server = multi_server(vec![entry]).await;
+    let addr = server.local_addr();
+
+    let resp = send(addr, &request("GET", "/volumes", addr, &[])).await;
+    assert_eq!(status_of(&resp), 200, "ok: {resp}");
+    let body = body_of(&resp);
+    let submenu = body
+        .split("config-submenu")
+        .nth(1)
+        .and_then(|rest| rest.split("</nav>").next())
+        .expect("the config submenu block");
+    assert!(
+        submenu.contains("href=\"/volumes\"") && submenu.contains("href=\"/volumes/system\""),
+        "both config pages are listed: {submenu}"
+    );
+    assert!(
+        submenu.contains("href=\"/volumes\" class=\"config-sub active\""),
+        "the volume-management entry is the active one on /volumes: {submenu}"
+    );
+    assert!(
+        !submenu.contains("href=\"/volumes/system\" class=\"config-sub active\""),
+        "exact-path matching: the system entry stays inactive here: {submenu}"
+    );
+    assert!(
+        submenu.contains("ro-badge"),
+        "the system entry carries the read-only badge: {submenu}"
+    );
+}
+
 /// 裁决④: a single-volume instance's `/volumes` is the explanation
 /// page (single-volume volumes live in config.toml), not the management
 /// table.
@@ -352,6 +389,133 @@ async fn volumes_page_in_single_volume_mode_is_the_explanation_page() {
     assert!(
         !body.contains("id=\"volumes-tbody\""),
         "no management table in single-volume mode: {body}"
+    );
+}
+
+/// UI polish round 2, item 4: `GET /volumes/system` (multi-volume mode)
+/// serves the read-only system-parameters skeleton — the system title +
+/// its read-only subtitle, the instance section's four faces, the
+/// collapsible volume-parameter cards host, the config submenu (system
+/// entry active, read-only badge), NO primary action button, and its
+/// own script behind i18n.js.
+#[tokio::test]
+async fn system_page_serves_the_readonly_skeleton() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let server = multi_server(vec![entry]).await;
+    let addr = server.local_addr();
+
+    let resp = send(addr, &request("GET", "/volumes/system", addr, &[])).await;
+    assert_eq!(status_of(&resp), 200, "the page answers: {resp}");
+    assert!(resp.contains("text/html"), "html: {resp}");
+    let body = body_of(&resp);
+    for marker in [
+        // The page skeleton: the i18n-keyed title and its read-only
+        // subtitle.
+        "data-i18n=\"system.title\"",
+        "data-i18n=\"system.subtitle\"",
+        // The instance section's four faces (JS-filled).
+        "id=\"sys-dashboard-url\"",
+        "id=\"sys-webdav-endpoints\"",
+        "id=\"sys-volume-files\"",
+        "id=\"sys-running\"",
+        // The per-volume collapsible cards host.
+        "id=\"sys-volume-cards\"",
+        // The config submenu: this page's entry active, both listed.
+        "config-submenu",
+        "href=\"/volumes/system\" class=\"config-sub active\"",
+        "href=\"/volumes\" class=\"config-sub\"",
+        "ro-badge",
+        // The page pill's configuration segment is the active one.
+        "data-i18n=\"pages.config\"",
+    ] {
+        assert!(body.contains(marker), "skeleton needs `{marker}`: {body}");
+    }
+    // Read-only by construction: no primary action button in the topbar
+    // (the language pill and the round refresh are the only controls).
+    let topbar = body
+        .split("<header class=\"topbar\">")
+        .nth(1)
+        .and_then(|rest| rest.split("</header>").next())
+        .expect("the topbar block")
+        .to_string();
+    assert!(
+        !topbar.contains("btn-primary"),
+        "a read-only page carries no primary action: {topbar}"
+    );
+    assert!(
+        topbar.contains("lang-pill") && topbar.contains("btn-icon"),
+        "the shared topbar shape (lang pill + refresh): {topbar}"
+    );
+    // i18n.js loads before the page script (the overlay contract).
+    assert!(
+        body.find("<script src=\"/static/js/i18n.js\"").unwrap()
+            < body.find("<script src=\"/static/js/system.js\"").unwrap(),
+        "i18n.js loads before system.js: {body}"
+    );
+}
+
+/// UI polish round 2, item 4: a single-volume instance's
+/// `/volumes/system` is the explanation page (its parameters ARE its
+/// config.toml — the cards host has nothing to iterate), not the
+/// multi-volume skeleton.
+#[tokio::test]
+async fn system_page_in_single_volume_mode_is_the_explanation_page() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = Arc::new(MetaDatabase::open(&dir.path().join("single.db")).expect("open db"));
+    let mock = idle_mock().await;
+    let vfs = Arc::new(Vfs::new(
+        db,
+        CacheManager::new(dir.path().join("cache"), u64::MAX),
+        mock,
+        base_cfg(),
+    ));
+    let server = WebUiServer::serve(
+        vfs,
+        volume_cfg("telegram", "Y:"),
+        SocketAddr::from(([127, 0, 0, 1], 0)),
+    )
+    .await
+    .expect("serve single-volume dashboard");
+    let addr = server.local_addr();
+
+    let resp = send(addr, &request("GET", "/volumes/system", addr, &[])).await;
+    assert_eq!(
+        status_of(&resp),
+        200,
+        "the explanation page answers: {resp}"
+    );
+    let body = body_of(&resp);
+    assert!(
+        body.contains("id=\"system-single-note\""),
+        "the single-volume note marker: {body}"
+    );
+    assert!(
+        body.contains("config.toml"),
+        "the note names the defining file: {body}"
+    );
+    assert!(
+        !body.contains("id=\"sys-volume-cards\""),
+        "no parameters host in single-volume mode: {body}"
+    );
+}
+
+/// The embedded static tree picked up the system page's script
+/// (rust-embed embeds at compile time — a miss would leave the page's
+/// script tag pointing at a 404).
+#[tokio::test]
+async fn static_tree_serves_the_system_script() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let server = multi_server(vec![entry]).await;
+    let addr = server.local_addr();
+
+    let resp = send(addr, &request("GET", "/static/js/system.js", addr, &[])).await;
+    assert_eq!(status_of(&resp), 200, "the script serves: {resp}");
+    assert!(resp.contains("javascript"), "a JS content type: {resp}");
+    assert!(
+        body_of(&resp).contains("loadSystemPage"),
+        "the real script body, not a stub: {resp}"
     );
 }
 
@@ -552,6 +716,27 @@ async fn index_page_is_bilingual_ready_and_storage_card_moved() {
     assert!(
         pages.contains("page-seg active") && pages.contains("href=\"/\""),
         "Files is the active page segment: {pages}"
+    );
+    // UI polish round 2 (item 3): the usage-state page carries NO config
+    // submenu — it is the config section's affordance alone.
+    assert!(
+        !body.contains("config-submenu"),
+        "the config submenu stays off the index page: {body}"
+    );
+    // UI polish round 2 (item 1): the topbar is the main-content's FIRST
+    // child — the volume tabs row follows it (one visual order across
+    // the pages: title row on top, the page's secondary elements after).
+    let main_at = body
+        .find("<main class=\"main-content\">")
+        .expect("the main block");
+    let topbar_at = body
+        .find("<header class=\"topbar\">")
+        .expect("the topbar somewhere");
+    let tabs_at = body.find("id=\"volume-tabs\"").expect("the tabs row");
+    assert!(
+        main_at < topbar_at && topbar_at < tabs_at,
+        "the topbar leads the main content, the tabs follow it: \
+         main {main_at} < topbar {topbar_at} < tabs {tabs_at}"
     );
     // The search box moved out of the topbar into the files section's
     // title row (title left, search right) — the topbar block itself

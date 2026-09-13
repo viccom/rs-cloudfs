@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CyDrive • System Parameters</title>
+    <link rel="icon" type="image/jpeg" href="/static/img/logo.jpg">
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div class="background-glow"></div>
+
+    <div class="app-container">
+        <main class="main-content">
+            <!-- The single-volume instance's /volumes/system face (the
+                 volumes-single pattern): there is no volume registry to
+                 enumerate — the one volume's parameters ARE the
+                 config.toml the process booted on — so the page says
+                 exactly that instead of an empty parameters list. -->
+            <section class="files-container" id="system-single-note">
+                <div class="section-title">
+                    <h3><i class="fa-solid fa-sliders"></i> <span data-i18n="system.title">System Parameters</span></h3>
+                </div>
+                <p style="color: var(--text-muted); line-height: 1.7;">
+                    <i class="fa-solid fa-circle-info" style="color: var(--accent-cyan);"></i>
+                    <span data-i18n="syssingle.p1_1">Single-volume mode: this instance serves </span><strong><span data-i18n="syssingle.p1_2">one volume defined by </span><code>config.toml</code></strong><span data-i18n="syssingle.p1_3"> — its parameters are that file's content, and this read-only page serves multi-volume instances.</span>
+                </p>
+            </section>
+        </main>
+    </div>
+
+    <script src="/static/js/i18n.js"></script>
+</body>
+</html>

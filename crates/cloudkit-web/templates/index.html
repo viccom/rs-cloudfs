@@ -42,22 +42,20 @@
             <nav class="sidebar-pages" aria-label="Pages">
                 <div class="page-switch" role="group" aria-label="Page switch">
                     <a href="/" class="page-seg active"><i class="fa-solid fa-folder"></i> <span data-i18n="page.files">Files</span></a>
-                    <a href="/volumes" class="page-seg"><i class="fa-solid fa-database"></i> <span data-i18n="page.volumes">Volumes</span></a>
+                    <a href="/volumes" class="page-seg"><i class="fa-solid fa-database"></i> <span data-i18n="pages.config">Configuration</span></a>
                 </div>
             </nav>
         </aside>
 
         <!-- Main Content Area -->
         <main class="main-content">
-            <!-- Volume tabs (multi-volume mode only; revealed by app.js
-                 after the boot probe detects a volume registry) -->
-            <div class="volume-tabs" id="volume-tabs" hidden></div>
-
             <!-- Top Bar (the same shape as the /volumes page's: the
                  page title + subtitle on the left, the language pill +
                  the page's primary action + the round refresh button on
                  the right; the file search lives in the files table's
-                 section-title row below) -->
+                 section-title row below). FIRST child — the title row
+                 leads the page, the tabs row follows (one visual order
+                 across the pages). -->
             <header class="topbar">
                 <div class="topbar-title">
                     <h2><i class="fa-solid fa-folder"></i> <span data-i18n="page.files">Files</span></h2>
@@ -79,6 +77,10 @@
                     <button class="btn btn-icon" title="Refresh Drive" data-i18n-title="index.refresh_drive" onclick="loadDriveData()"><i class="fa-solid fa-rotate"></i></button>
                 </div>
             </header>
+
+            <!-- Volume tabs (multi-volume mode only; revealed by app.js
+                 after the boot probe detects a volume registry) -->
+            <div class="volume-tabs" id="volume-tabs" hidden></div>
 
             <!-- Stats Grid -->
             <section class="stats-grid">
@@ -175,8 +177,10 @@
                 </div>
 
                 <!-- Client-side pagination (app.js slices the in-memory
-                     filtered list, 50 rows a page and fills this host;
-                     hidden until there is something to page through) -->
+                     filtered list — 10 rows a page by default, the
+                     size select in the bar persists to localStorage —
+                     and fills this host; hidden until there is
+                     something to page through) -->
                 <nav class="pagination" id="pagination" hidden aria-label="Files pagination"></nav>
             </section>
         </main>

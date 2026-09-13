@@ -1236,3 +1236,168 @@ tr.volume-disabled td {
     gap: 0.8rem;
 }
 
+/* ------------------- UI polish round 2 (负责人 four-item feedback) -------
+   The config section submenu (item 3), the pagination size select
+   (item 2) and the read-only system-parameters page's faces (item 4) —
+   additive glue over the existing tokens only. */
+
+/* The config section submenu: rides above the page pill on the
+   config-side pages (/volumes, /volumes/system) — the section's two
+   page entries, the exact-path-active one highlighted, the system
+   entry carrying the read-only badge. The index page carries none. */
+.config-submenu {
+    display: flex;
+    flex-direction: column;
+    gap: 0.25rem;
+    margin-bottom: 0.75rem;
+}
+
+.config-sub {
+    display: flex;
+    align-items: center;
+    gap: 0.5rem;
+    padding: 0.45rem 0.75rem;
+    border-radius: 8px;
+    color: var(--text-muted);
+    text-decoration: none;
+    font-size: 0.82rem;
+    font-weight: 600;
+    white-space: nowrap;
+    transition: all 0.2s ease;
+}
+
+.config-sub:hover {
+    color: var(--text-main);
+    background: rgba(0, 243, 255, 0.06);
+}
+
+.config-sub.active {
+    background: rgba(0, 243, 255, 0.1);
+    color: var(--accent-cyan);
+}
+
+/* The read-only badge on the system entry: a small muted outline pill
+   pushed to the row's far end. */
+.ro-badge {
+    margin-left: auto;
+    padding: 0.05rem 0.45rem;
+    border-radius: 999px;
+    border: 1px solid rgba(139, 155, 180, 0.4);
+    color: var(--text-muted);
+    font-size: 0.6rem;
+    font-weight: 600;
+    letter-spacing: 0.05em;
+    text-transform: uppercase;
+}
+
+/* The pagination bar's per-page size select (10/20/50; the choice
+   persists to localStorage) — quiet, bar-styled, right of the total. */
+.page-size {
+    display: inline-flex;
+    align-items: center;
+}
+
+.page-size-select {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    color: var(--text-main);
+    font-family: var(--font-main);
+    font-size: 0.78rem;
+    font-weight: 600;
+    padding: 0.3rem 0.45rem;
+    cursor: pointer;
+    outline: none;
+}
+
+.page-size-select:hover {
+    border-color: rgba(0, 243, 255, 0.35);
+}
+
+/* The system-parameters page (read-only): the instance faces reuse the
+   files-table chassis with label-column rows; each volume is one
+   collapsible details card. */
+.sys-table th,
+.sys-kv th {
+    width: 220px;
+    max-width: 40%;
+    font-weight: 600;
+    color: var(--text-muted);
+}
+
+.sys-card {
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    background: var(--bg-card);
+    margin-bottom: 0.7rem;
+    overflow: hidden;
+}
+
+.sys-card summary {
+    display: flex;
+    align-items: center;
+    gap: 0.9rem;
+    padding: 0.8rem 1rem;
+    cursor: pointer;
+    user-select: none;
+    list-style: none;
+}
+
+.sys-card summary::-webkit-details-marker {
+    display: none;
+}
+
+.sys-card summary:hover {
+    background: rgba(0, 243, 255, 0.05);
+}
+
+.sys-card[open] summary {
+    border-bottom: 1px solid var(--border-color);
+}
+
+.sys-card-name {
+    font-weight: 600;
+    color: var(--text-main);
+}
+
+.sys-card-name i {
+    color: var(--accent-cyan);
+    margin-right: 0.2rem;
+}
+
+.sys-card-backend {
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    text-transform: uppercase;
+    letter-spacing: 0.05em;
+    padding: 0.1rem 0.45rem;
+    border-radius: 999px;
+    border: 1px solid rgba(0, 243, 255, 0.25);
+    background: rgba(0, 243, 255, 0.08);
+    color: var(--accent-cyan);
+}
+
+/* An enabled=false volume's whole card recedes (the volumes-table
+   disabled-row semantics). */
+.sys-card.sys-disabled {
+    opacity: 0.5;
+}
+
+.sys-card-body {
+    padding: 0.4rem 1rem 0.9rem;
+}
+
+/* The muted one-line states (config unavailable, empty set). */
+.sys-note {
+    color: var(--text-muted);
+    font-size: 0.82rem;
+    line-height: 1.6;
+    padding: 0.4rem 0.2rem;
+}
+
+.sys-note i {
+    color: var(--accent-cyan);
+    opacity: 0.6;
+    margin-right: 0.35rem;
+}
+

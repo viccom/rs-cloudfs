@@ -1,0 +1,117 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CyDrive • System Parameters</title>
+    <link rel="icon" type="image/jpeg" href="/static/img/logo.jpg">
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div class="background-glow"></div>
+
+    <div class="app-container">
+        <!-- Sidebar (the /volumes skeleton): the config section's
+             submenu rides above the page pill, the SYSTEM entry active
+             here (exact-path matching) with its read-only badge. -->
+        <aside class="sidebar">
+            <div class="brand">
+                <div class="logo-box">
+                    <img src="/static/img/logo.jpg" alt="CyDrive Logo" class="brand-logo-img">
+                </div>
+                <div class="brand-text">
+                    <h2>CyDrive</h2>
+                    <span>v2.0 • CYNET ENGINE</span>
+                    <span id="backend-badge" class="backend-badge" hidden></span>
+                </div>
+            </div>
+
+            <nav class="sidebar-pages" aria-label="Pages">
+                <div class="config-submenu" role="group" aria-label="Configuration">
+                    <a href="/volumes" class="config-sub"><span data-i18n="config.volumes">Volume Management</span></a>
+                    <a href="/volumes/system" class="config-sub active"><span data-i18n="config.system">System Parameters</span> <span class="ro-badge" data-i18n="config.readonly">Read-only</span></a>
+                </div>
+                <div class="page-switch" role="group" aria-label="Page switch">
+                    <a href="/" class="page-seg"><i class="fa-solid fa-folder"></i> <span data-i18n="page.files">Files</span></a>
+                    <a href="/volumes" class="page-seg active"><i class="fa-solid fa-database"></i> <span data-i18n="pages.config">Configuration</span></a>
+                </div>
+            </nav>
+        </aside>
+
+        <!-- Main Content Area (read-only: the language pill and the
+             round refresh are the topbar's only controls — no primary
+             action button, no write controls anywhere on the page) -->
+        <main class="main-content">
+            <header class="topbar">
+                <div class="topbar-title">
+                    <h2><i class="fa-solid fa-sliders"></i> <span data-i18n="system.title">System Parameters</span></h2>
+                    <p data-i18n="system.subtitle">Read-only · from the instance's current configuration</p>
+                </div>
+
+                <div class="topbar-actions">
+                    <!-- The bilingual switch: the active language's
+                         segment highlights (i18n.js); a click stores the
+                         choice and reloads -->
+                    <div class="lang-pill" role="group" aria-label="Language">
+                        <button type="button" class="lang-seg" data-lang="zh" onclick="setLang('zh')">中</button>
+                        <button type="button" class="lang-seg active" data-lang="en" onclick="setLang('en')">EN</button>
+                    </div>
+                    <button class="btn btn-icon" title="Refresh" data-i18n-title="common.refresh" onclick="loadSystemPage()"><i class="fa-solid fa-rotate"></i></button>
+                </div>
+            </header>
+
+            <!-- Section 1 · Instance: the dashboard address, the WebDAV
+                 endpoints (deduped host:port list off /api/volumes), the
+                 volume file count and the running count. -->
+            <section class="files-container">
+                <div class="section-title">
+                    <h3><i class="fa-solid fa-server"></i> <span data-i18n="sys.instance">Instance</span></h3>
+                </div>
+                <div class="table-responsive">
+                    <table class="files-table sys-table">
+                        <tbody>
+                            <tr>
+                                <th scope="row" data-i18n="sys.dashboard_url">Dashboard address</th>
+                                <td id="sys-dashboard-url">—</td>
+                            </tr>
+                            <tr>
+                                <th scope="row" data-i18n="sys.webdav_endpoints">WebDAV endpoints</th>
+                                <td id="sys-webdav-endpoints">—</td>
+                            </tr>
+                            <tr>
+                                <th scope="row" data-i18n="sys.volume_files">Volume files</th>
+                                <td id="sys-volume-files">—</td>
+                            </tr>
+                            <tr>
+                                <th scope="row" data-i18n="sys.running_volumes">Running volumes</th>
+                                <td id="sys-running">—</td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+
+            <!-- Section 2 · Storage volume parameters: one collapsible
+                 card per volume file (system.js), the expanded body a
+                 read-only key/value table. Credential rows show only the
+                 set/unset badge — the values never leave the backend
+                 (the SHOW write-only contract). -->
+            <section class="files-container">
+                <div class="section-title">
+                    <h3><i class="fa-solid fa-database"></i> <span data-i18n="sys.volume_params">Storage Volume Parameters</span></h3>
+                </div>
+                <div id="sys-volume-cards">
+                    <p class="loading-state">
+                        <i class="fa-solid fa-circle-notch fa-spin"></i> <span data-i18n="sys.loading">Loading configuration...</span>
+                    </p>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="/static/js/i18n.js"></script>
+    <script src="/static/js/system.js"></script>
+</body>
+</html>

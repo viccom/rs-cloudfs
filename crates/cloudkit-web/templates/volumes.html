@@ -32,11 +32,18 @@
 
             <!-- The page switcher (bottom-anchored): the aggregate
                  storage line that used to close this sidebar moved up
-                 into the stats grid's Total Storage card -->
+                 into the stats grid's Total Storage card. On the
+                 config-side pages the section's own submenu rides above
+                 the pill — the exact-path-active page entry, the system
+                 page's entry carrying the read-only badge. -->
             <nav class="sidebar-pages" aria-label="Pages">
+                <div class="config-submenu" role="group" aria-label="Configuration">
+                    <a href="/volumes" class="config-sub active"><span data-i18n="config.volumes">Volume Management</span></a>
+                    <a href="/volumes/system" class="config-sub"><span data-i18n="config.system">System Parameters</span> <span class="ro-badge" data-i18n="config.readonly">Read-only</span></a>
+                </div>
                 <div class="page-switch" role="group" aria-label="Page switch">
                     <a href="/" class="page-seg"><i class="fa-solid fa-folder"></i> <span data-i18n="page.files">Files</span></a>
-                    <a href="/volumes" class="page-seg active"><i class="fa-solid fa-database"></i> <span data-i18n="page.volumes">Volumes</span></a>
+                    <a href="/volumes" class="page-seg active"><i class="fa-solid fa-database"></i> <span data-i18n="pages.config">Configuration</span></a>
                 </div>
             </nav>
         </aside>
