@@ -117,6 +117,15 @@
 //!   credential overlay and the REMOVE+ADD re-assembly with its
 //!   mixed-state replies); the same 180s assembly budget and family
 //!   gates.
+//! - `POST /api/volumes/{name}/destroy` (P5) — the delete modal's
+//!   member: the two-leg protocol's HTTP face. A body without
+//!   `confirm: true` forwards the bare `DESTROY <name>` (the preview —
+//!   the command executes nothing) and answers
+//!   `{"ok": true, "reply": ..., "confirm_required": true}`; a
+//!   confirmed body forwards `DESTROY <name> confirm` with the optional
+//!   literal `purge_local` third word and answers the family's plain
+//!   success shape. Budget 120s (REMOVE's ≈70s windows + the file
+//!   deletion's instant); the family gates answer before the command.
 //!
 //! The volume-management family (`/api/volumes`, the two config
 //! routes, and the write routes) runs behind a same-origin guard (§1.5
@@ -611,6 +620,10 @@ fn multi_router(
             post(api_volume_rebuild).layer(axum::middleware::from_fn(same_origin_guard)),
         )
         .route(
+            "/api/volumes/{name}/destroy",
+            post(api_volume_destroy).layer(axum::middleware::from_fn(same_origin_guard)),
+        )
+        .route(
             "/api/volumes/{name}",
             post(api_volume_update).layer(axum::middleware::from_fn(same_origin_guard)),
         )
@@ -919,6 +932,45 @@ async fn api_volume_config(State(state): State<AppState>, Path(name): Path<Strin
 /// command rather than giving up on it.
 const VOLUME_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 
+/// The write family's shared gate ladder (P1 §1.5, extracted for the
+/// P5 destroy route): the single-volume 404, the non-loopback write
+/// verdict 403 (naming the opt-in key) and the missing-seam 503 —
+/// answered in that order, BEFORE any command is built. `Ok` hands
+/// back the seam client.
+// axum's Response IS the handler currency here (the `resolve`
+// precedent: every refusal goes straight back as the handler's return
+// value); boxing it would trade a per-request indirection for a lint's
+// byte count.
+#[allow(clippy::result_large_err)]
+fn write_family_gates(state: &AppState) -> Result<&VolumeCommandClient, Response> {
+    let AppState::Multi {
+        commands,
+        writes_allowed,
+        ..
+    } = state
+    else {
+        return Err(error_json(
+            StatusCode::NOT_FOUND,
+            "no volume registry: this dashboard serves a single volume",
+        ));
+    };
+    if !writes_allowed {
+        return Err(error_json(
+            StatusCode::FORBIDDEN,
+            "remote administration is disabled: the web UI is bound to a non-loopback \
+             address, so the volume-management write routes refuse requests — set \
+             `allow_remote_admin = true` in config.toml to manage volumes remotely",
+        ));
+    }
+    commands.as_ref().ok_or_else(|| {
+        error_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "volume commands are not available: this dashboard runs without the \
+             volume-command seam (the multi-volume cli assembly installs it)",
+        )
+    })
+}
+
 /// The shared body of the three write routes (P1, plan §1.2): the §1.5
 /// write verdict first (403 naming the opt-in key on a non-loopback
 /// bind), then one command through the seam with the write budget.
@@ -931,31 +983,9 @@ const VOLUME_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
 /// absent from the registry — the command's own reply is the authority
 /// on unknown names.
 async fn volume_write_route(state: AppState, name: String, verb: &str) -> Response {
-    let AppState::Multi {
-        commands,
-        writes_allowed,
-        ..
-    } = state
-    else {
-        return error_json(
-            StatusCode::NOT_FOUND,
-            "no volume registry: this dashboard serves a single volume",
-        );
-    };
-    if !writes_allowed {
-        return error_json(
-            StatusCode::FORBIDDEN,
-            "remote administration is disabled: the web UI is bound to a non-loopback \
-             address, so the volume-management write routes refuse requests — set \
-             `allow_remote_admin = true` in config.toml to manage volumes remotely",
-        );
-    }
-    let Some(client) = commands else {
-        return error_json(
-            StatusCode::SERVICE_UNAVAILABLE,
-            "volume commands are not available: this dashboard runs without the \
-             volume-command seam (the multi-volume cli assembly installs it)",
-        );
+    let client = match write_family_gates(&state) {
+        Ok(client) => client,
+        Err(response) => return response,
     };
     let command = format!("{verb} {name}");
     let reply = match tokio::time::timeout(VOLUME_WRITE_TIMEOUT, client(&command)).await {
@@ -1208,6 +1238,117 @@ async fn api_volume_enable(State(state): State<AppState>, Path(name): Path<Strin
 /// telegram gates) ride the family's 409 verbatim.
 async fn api_volume_rebuild(State(state): State<AppState>, Path(name): Path<String>) -> Response {
     volume_write_route(state, name, "REBUILD").await
+}
+
+/// Parses the destroy route's body (P5): `{"confirm": bool,
+/// "purge_local": bool}`, both keys optional and defaulting to `false`
+/// (the safe leg). An entirely EMPTY body is the all-defaults preview
+/// too. A non-JSON body, a non-object body and a wrong-typed flag
+/// answer actionable 400s; unknown members are ignored (forward
+/// compat).
+// Same Response-as-currency allow as `write_family_gates`.
+#[allow(clippy::result_large_err)]
+fn destroy_body(body: &[u8]) -> Result<(bool, bool), Response> {
+    if body.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Ok((false, false));
+    }
+    let value: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(error_json(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "the request body is not valid JSON: {error} — send \
+                     {{\"confirm\": bool, \"purge_local\": bool}}"
+                ),
+            ));
+        }
+    };
+    let serde_json::Value::Object(fields) = value else {
+        return Err(error_json(
+            StatusCode::BAD_REQUEST,
+            "the destroy body must be a JSON object: {\"confirm\": bool, \"purge_local\": bool}",
+        ));
+    };
+    let flag = |key: &str| -> Result<bool, Response> {
+        match fields.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(false),
+            Some(serde_json::Value::Bool(flag)) => Ok(*flag),
+            Some(_) => Err(error_json(
+                StatusCode::BAD_REQUEST,
+                format!("`{key}` must be a boolean in the destroy body (true/false)"),
+            )),
+        }
+    };
+    Ok((flag("confirm")?, flag("purge_local")?))
+}
+
+/// `POST /api/volumes/{name}/destroy` (P5, the delete modal's
+/// transport): the two-leg protocol's HTTP face. A body without
+/// `confirm: true` forwards the bare `DESTROY <name>` — the PREVIEW
+/// leg, which executes nothing — and answers the pinned preview shape
+/// `{"ok": true, "reply": ..., "confirm_required": true}`; a
+/// `confirm: true` body forwards `DESTROY <name> confirm` with the
+/// optional literal `purge_local` third word and answers the family's
+/// plain success shape (the destruction ran — no confirm flag). Budget
+/// [`VOLUME_WRITE_TIMEOUT`] (REMOVE's drain + release windows ≈70s
+/// plus the file deletion's instant); the family gates ([`write_family_gates`])
+/// and the Origin middleware answer before the command is built; the
+/// seam's `ERR:` (a drain refusal, a purge leftover) rides the family
+/// 409 verbatim.
+async fn api_volume_destroy(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let client = match write_family_gates(&state) {
+        Ok(client) => client,
+        Err(response) => return response,
+    };
+    let (confirm, purge_local) = match destroy_body(&body) {
+        Ok(pair) => pair,
+        Err(response) => return response,
+    };
+    let command = if confirm {
+        format!(
+            "DESTROY {name} confirm{}",
+            if purge_local { " purge_local" } else { "" }
+        )
+    } else {
+        format!("DESTROY {name}")
+    };
+    let reply = match tokio::time::timeout(VOLUME_WRITE_TIMEOUT, client(&command)).await {
+        Ok(reply) => reply,
+        Err(_elapsed) => {
+            return error_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "the DESTROY command for '{name}' timed out — the instance is likely busy \
+                     with a long volume command (e.g. a REMOVE draining an upload); retry \
+                     once it settles"
+                ),
+            );
+        }
+    };
+    if !confirm {
+        // The preview leg: the family's success mapping plus the flag
+        // that tells the frontend a confirmation is still owed (the
+        // refusals ride the plain family 409 — an ERR is an ERR on
+        // both legs).
+        return match reply.trim().strip_prefix("OK: ") {
+            Some(payload) => Json(serde_json::json!({
+                "ok": true,
+                "reply": payload.trim(),
+                "confirm_required": true,
+            }))
+            .into_response(),
+            None => error_json(
+                StatusCode::CONFLICT,
+                reply.trim().trim_start_matches("ERR: "),
+            ),
+        };
+    }
+    map_volume_command_reply(&reply)
 }
 
 /// One CONFIGS reply row parsed into its JSON face: a loadable file as

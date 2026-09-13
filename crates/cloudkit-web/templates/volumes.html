@@ -280,6 +280,53 @@
                     </table>
                 </div>
             </section>
+
+            <!-- The P5 delete modal (two steps, web volume management
+                 §1.2): step 1 previews exactly what a destroy does —
+                 and what it never does (the local data directory stays
+                 unless purge_local is ticked; remote data is never
+                 touched); step 2 requires typing the volume's name to
+                 arm the confirm button. Cancel at any point closes the
+                 modal with zero requests. -->
+            <div class="modal" id="delete-modal">
+                <div class="modal-content delm-content">
+                    <button type="button" class="modal-close" id="delm-close" aria-label="Close">&times;</button>
+                    <h3 class="delm-title"><i class="fa-solid fa-triangle-exclamation"></i> Delete Volume</h3>
+
+                    <div id="delete-step-1">
+                        <div class="delm-overview" id="delm-overview"></div>
+                        <ul class="delm-list">
+                            <li class="delm-del"><i class="fa-solid fa-trash"></i> the volume file <code>volumes/<span id="delm-file-name"></span>.toml</code> — and, while the volume runs, its registration and drive</li>
+                            <li class="delm-keep"><i class="fa-solid fa-shield-halved"></i> the volume's local data directory (its db, cache and local root) — <strong>kept by default</strong></li>
+                            <li class="delm-keep"><i class="fa-solid fa-shield-halved"></i> all remote data on the volume's backend — <strong>never touched</strong></li>
+                        </ul>
+                        <label class="delm-purge">
+                            <input type="checkbox" id="delm-purge">
+                            <span>Also delete the volume's local data directory (<code>purge_local</code>) — db, cache and local root go with it</span>
+                        </label>
+                        <p class="delm-warning">
+                            <i class="fa-solid fa-triangle-exclamation"></i>
+                            This permanently removes the volume's configuration. Nothing on the
+                            remote backend is ever deleted; re-creating the volume re-attaches its data.
+                        </p>
+                        <div class="delm-actions">
+                            <button type="button" class="btn" id="delm-cancel-1">Cancel</button>
+                            <button type="button" class="btn btn-primary" id="delm-continue">Continue</button>
+                        </div>
+                    </div>
+
+                    <div id="delete-step-2" hidden>
+                        <p class="delm-typeline">Type the volume name <code id="delm-name-echo"></code> to confirm the deletion:</p>
+                        <input type="text" id="delm-confirm-input" autocomplete="off" spellcheck="false">
+                        <div class="delm-actions">
+                            <button type="button" class="btn" id="delm-cancel-2">Cancel</button>
+                            <button type="button" class="btn btn-danger" id="delm-confirm" disabled>
+                                <i class="fa-solid fa-trash"></i> <span id="delm-confirm-label">Delete volume</span>
+                            </button>
+                        </div>
+                    </div>
+                </div>
+            </div>
         </main>
     </div>
 

@@ -897,3 +897,175 @@ tr.volume-disabled td {
     justify-content: flex-end;
     gap: 0.8rem;
 }
+
+/* The P5 delete modal (two steps): the preview panel, the purge
+   checkbox, the red warning and the typed-name gate — additive glue
+   over the existing tokens (the .modal chassis above is shared with
+   the usage-state media modal). */
+
+/* The destructive primary (btn-primary's danger twin — the same
+   chassis, the danger hue the mini buttons and the error box use). */
+.btn-danger {
+    background: rgba(255, 51, 102, 0.16);
+    border: 1px solid rgba(255, 51, 102, 0.55);
+    color: #ff6688;
+}
+
+.btn-danger:hover:not(:disabled) {
+    background: rgba(255, 51, 102, 0.28);
+}
+
+.delm-content {
+    max-width: 540px;
+}
+
+.delm-title {
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: var(--text-main);
+    margin: 0 0 1rem;
+}
+
+.delm-title i {
+    color: #ff6688;
+    margin-right: 0.4rem;
+}
+
+/* The overview strip: volume name + backend, one line. */
+.delm-overview {
+    display: flex;
+    align-items: center;
+    gap: 0.9rem;
+    padding: 0.7rem 0.9rem;
+    background: var(--bg-main);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    margin-bottom: 1rem;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.9rem;
+}
+
+.delm-overview .delm-name i {
+    color: var(--accent-cyan);
+    margin-right: 0.4rem;
+}
+
+.delm-overview .delm-backend {
+    color: var(--text-muted);
+    font-size: 0.78rem;
+}
+
+/* The goes/stays list: red trash for what a destroy deletes, muted
+   shields for what it keeps. */
+.delm-list {
+    list-style: none;
+    margin: 0 0 1rem;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    font-size: 0.82rem;
+    color: var(--text-main);
+    line-height: 1.45;
+}
+
+.delm-list li {
+    display: flex;
+    gap: 0.55rem;
+    align-items: baseline;
+}
+
+.delm-list li i {
+    font-size: 0.75rem;
+    margin-top: 0.18rem;
+}
+
+.delm-del i {
+    color: #ff6688;
+}
+
+.delm-keep i {
+    color: var(--accent-cyan);
+}
+
+.delm-list code {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.76rem;
+    color: var(--accent-cyan);
+}
+
+/* The purge checkbox (unchecked by default — the safe leg). */
+.delm-purge {
+    display: flex;
+    align-items: baseline;
+    gap: 0.55rem;
+    font-size: 0.8rem;
+    color: var(--text-main);
+    margin-bottom: 0.9rem;
+    cursor: pointer;
+    border: 1px dashed rgba(255, 51, 102, 0.45);
+    border-radius: 10px;
+    padding: 0.6rem 0.8rem;
+}
+
+.delm-purge input {
+    width: 1.05rem;
+    height: 1.05rem;
+    accent-color: #ff3366;
+    flex-shrink: 0;
+    transform: translateY(2px);
+}
+
+.delm-purge code {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.74rem;
+    color: #ff6688;
+}
+
+/* The red warning (the same hue the error box uses). */
+.delm-warning {
+    font-size: 0.78rem;
+    color: #ff6688;
+    line-height: 1.5;
+    margin: 0 0 1.1rem;
+}
+
+.delm-warning i {
+    margin-right: 0.35rem;
+}
+
+.delm-typeline {
+    font-size: 0.84rem;
+    color: var(--text-muted);
+    margin: 0 0 0.6rem;
+}
+
+.delm-typeline code {
+    font-family: "JetBrains Mono", monospace;
+    color: var(--accent-cyan);
+}
+
+#delm-confirm-input {
+    width: 100%;
+    background: var(--bg-main);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    color: var(--text-main);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.9rem;
+    padding: 0.55rem 0.7rem;
+    outline: none;
+    margin-bottom: 1.1rem;
+    box-sizing: border-box;
+}
+
+#delm-confirm-input:focus {
+    border-color: #ff3366;
+}
+
+.delm-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.8rem;
+}
+

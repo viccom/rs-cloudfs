@@ -981,14 +981,25 @@ impl RegistryHandle {
 /// volume-relative `local_root`s resolve to the absolute paths
 /// [`CyDriveConfig::validate`] demands.
 pub fn volume_home(spec: &VolumeConfig) -> Result<PathBuf> {
-    let base = if spec.base_dir.is_absolute() {
-        spec.base_dir.clone()
+    volume_home_under(&spec.base_dir, &spec.name)
+}
+
+/// `<base_dir>/<name>` with the base dir absolutised against the
+/// process cwd — the K21 resolution [`volume_home`] runs, shared with
+/// DESTROY's name-derived lookups (a schema-broken volume file has no
+/// loadable spec, but its home is still `<volumes_dir>/<name>` — the
+/// same directory a healthy spec would resolve to, derived straight
+/// from the name so the preview and the purge leg cannot drift from
+/// the assembly's own anchor).
+fn volume_home_under(base_dir: &Path, name: &str) -> Result<PathBuf> {
+    let base = if base_dir.is_absolute() {
+        base_dir.to_path_buf()
     } else {
         std::env::current_dir()
             .context("resolving the working directory")?
-            .join(&spec.base_dir)
+            .join(base_dir)
     };
-    Ok(base.join(&spec.name))
+    Ok(base.join(name))
 }
 
 /// Resolves one volume-relative path against the volume home (K21):
@@ -2413,6 +2424,46 @@ impl RuntimeVolumeControl {
                 };
             }
         }
+        // DESTROY (P5) carries its two-leg protocol in literal second
+        // and third words (`confirm`, then optionally `purge_local`) —
+        // parsed positionally here, ahead of the three-token match
+        // below (whose mutating arms demand a bare `<name>`).
+        if first_keyword_is(line, "DESTROY") {
+            let rest = line.split_once(char::is_whitespace).map_or("", |(_, r)| r);
+            let mut parts = rest.split_whitespace();
+            // (name, confirmed, purge_local)
+            let invocation = match (parts.next(), parts.next(), parts.next()) {
+                (Some(name), None, None) => Some((name, false, false)),
+                (Some(name), Some("confirm"), None) => Some((name, true, false)),
+                (Some(name), Some("confirm"), Some("purge_local")) => Some((name, true, true)),
+                _ => None,
+            };
+            return match invocation {
+                Some((name, confirmed, purge_local)) => {
+                    // The gate's entry observation point (review H1):
+                    // DESTROY joins the mutating family at keyword
+                    // level (like CREATE/UPDATE's entry) — a
+                    // shutting-down instance accepts no deletion (and
+                    // no preview either: its paths go stale the moment
+                    // the process exits).
+                    if self.watch.fired() {
+                        return "ERR: DESTROY refused — the instance is shutting down; volume \
+                                changes are no longer accepted (`LIST` still answers)\n"
+                            .to_string();
+                    }
+                    if confirmed {
+                        self.destroy_volume(name, purge_local).await
+                    } else {
+                        self.destroy_preview(name)
+                    }
+                }
+                None => "ERR: usage: DESTROY <name> — the preview (nothing executes); DESTROY \
+                         <name> confirm — the destruction (unmount if running, delete the volume \
+                         file); DESTROY <name> confirm purge_local — also delete the volume's \
+                         local data directory (remote data is never touched either way)\n"
+                    .to_string(),
+            };
+        }
         let mut tokens = line.split_whitespace();
         match (tokens.next(), tokens.next(), tokens.next()) {
             (Some("LIST"), None, None) => self.list(),
@@ -2461,7 +2512,7 @@ impl RuntimeVolumeControl {
             (Some("CONFIGS"), _, _) => "ERR: usage: CONFIGS — takes no argument\n".to_string(),
             _ => "ERR: usage: ADD <name> | REMOVE <name> | ENABLE <name> | DISABLE <name> | \
                   SHOW <name> | REBUILD <name> | CREATE <name> <json> | UPDATE <name> <json> | \
-                  LIST | CONFIGS\n"
+                  DESTROY <name> [confirm [purge_local]] | LIST | CONFIGS\n"
                 .to_string(),
         }
     }
@@ -3023,6 +3074,226 @@ impl RuntimeVolumeControl {
                 addition.trim().trim_start_matches("ERR: ")
             ),
         }
+    }
+
+    /// `DESTROY <name>` (web volume management P5, plan §1.2/§2.2): the
+    /// two-leg protocol's PREVIEW — executes nothing, answers the
+    /// preview. An `OK:` (this is a confirmation request, not an
+    /// error): what a confirm would do (the K50 unmount for a running
+    /// volume, the volume file's deletion), what stays by default (the
+    /// local data directory, with its path and the `purge_local` way
+    /// out — 裁决②) and what is never touched (remote data — K49 分档's
+    /// absolute), plus the exact confirmation command.
+    fn destroy_preview(&self, name: &str) -> String {
+        if let Some(refusal) = self.destroy_precheck(name) {
+            return refusal;
+        }
+        let (path, home) = match self.destroy_paths(name) {
+            Ok(pair) => pair,
+            Err(error) => {
+                return format!(
+                    "ERR: resolving the paths of `{name}` failed: {error:#} — nothing was \
+                     executed\n"
+                );
+            }
+        };
+        if !path.is_file() {
+            return format!(
+                "ERR: no volume file for `{name}` at {} — DESTROY reads the volumes_dir; \
+                 `CONFIGS` lists every volume file (a running volume without a file unloads \
+                 via `REMOVE {name}`)\n",
+                path.display()
+            );
+        }
+        let running = self.registry.volume(name).is_some();
+        let unmount = if running {
+            format!(
+                "- unmount: `{name}` is running — the confirm leg unloads it through the \
+                 REMOVE safety order (drain uploads, release the drive, unregister); a busy \
+                 queue aborts the WHOLE destroy\n"
+            )
+        } else {
+            format!(
+                "- unmount: `{name}` is not running — nothing to unload, the confirm leg \
+                 deletes the file directly\n"
+            )
+        };
+        format!(
+            "OK: DESTROY preview for `{name}` — nothing was executed:\n{unmount}\
+             - delete: the volume file {}\n\
+             - kept: the local data directory {} stays by default (`DESTROY {name} confirm \
+             purge_local` deletes it too)\n\
+             - never touched: the data on the volume's remote backend\n\
+             confirm with: `DESTROY {name} confirm`\n",
+            path.display(),
+            home.display()
+        )
+    }
+
+    /// The shared refusal ladder of DESTROY's two legs: the name rules
+    /// (before any path join) and the multi-volume precondition. `Ok`
+    /// means the caller may build the volume file / home paths.
+    fn destroy_precheck(&self, name: &str) -> Option<String> {
+        if !Self::name_is_path_safe(name) {
+            return Some(format!(
+                "ERR: `{name}` is not a volume name — DESTROY takes the file stem of a \
+                 volumes_dir entry (names match ^[a-z][a-z0-9_-]{{0,31}}$)\n"
+            ));
+        }
+        if self.process_cfg.volumes_dir.is_none() {
+            return Some(
+                "ERR: this instance runs single-volume mode (no volumes_dir) — DESTROY \
+                 serves multi-volume instances\n"
+                    .to_string(),
+            );
+        }
+        None
+    }
+
+    /// The `(volume file, home directory)` pair both DESTROY legs
+    /// speak of — the home resolved through the SAME K21 anchor the
+    /// assembly uses ([`volume_home_under`]), derived from the name so
+    /// even a schema-broken file previews and purges the directory a
+    /// healthy spec would resolve to.
+    fn destroy_paths(&self, name: &str) -> Result<(PathBuf, PathBuf)> {
+        let dir = self
+            .process_cfg
+            .volumes_dir
+            .as_deref()
+            .expect("the precheck ruled out single-volume mode");
+        let path = Path::new(dir).join(format!("{name}.toml"));
+        let home = volume_home_under(Path::new(dir), name)?;
+        Ok((path, home))
+    }
+
+    /// `DESTROY <name> confirm [/ purge_local]` (P5, plan §1.2/§2.2):
+    /// the two-leg protocol's EXECUTION. The order is unmount-first,
+    /// file-second — a drain or unmount refusal aborts the WHOLE
+    /// destroy (the volume stays registered, the file survives — never
+    /// a half-destroy, K50's semantics carried into the file
+    /// deletion). The file deletion is idempotent (a hand-deleted file
+    /// continues). The local data directory stays by default;
+    /// `purge_local` deletes the whole home (db, cache, local root) —
+    /// a purge failure does NOT roll back (the file is already gone,
+    /// there is nothing to restore) but the reply says so and names
+    /// the leftover path. Remote data is NEVER touched (K49 分档) —
+    /// the OK says so explicitly.
+    async fn destroy_volume(&self, name: &str, purge_local: bool) -> String {
+        if let Some(refusal) = self.destroy_precheck(name) {
+            return refusal;
+        }
+        let (path, home) = match self.destroy_paths(name) {
+            Ok(pair) => pair,
+            Err(error) => {
+                return format!(
+                    "ERR: resolving the paths of `{name}` failed: {error:#} — nothing was \
+                     changed\n"
+                );
+            }
+        };
+        // Leg ①: a registered volume comes down through the SAME K50
+        // sequence REMOVE runs (drain → release → unregister — 直接调
+        // 用 [`Self::remove_volume`], every H1 observation point
+        // included). Its refusal aborts the whole destroy: the file
+        // must not survive an unmounted volume behind the operator's
+        // back.
+        let mut was_running = false;
+        if self.registry.volume(name).is_some() {
+            was_running = true;
+            let removal = self.remove_volume(name).await;
+            if !removal.starts_with("OK:") {
+                let reason = removal.trim().trim_start_matches("ERR: ");
+                return format!(
+                    "ERR: destroying `{name}` aborted during the unmount: {reason} — the \
+                     volume file {} was NOT deleted and the volume stays; resolve the cause \
+                     and retry `DESTROY {name} confirm`\n",
+                    path.display()
+                );
+            }
+        }
+        // Leg ②: delete the volume file. Idempotent on a missing file
+        // (a hand deletion): the destroy still acknowledges, saying
+        // the file was already gone.
+        let mut file_state = if was_running {
+            "unmounted and unregistered; volume file deleted"
+        } else {
+            "the volume was not running; volume file deleted"
+        };
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                println!(
+                    "Volume {name} destroyed at {} (control DESTROY).",
+                    path.display()
+                );
+                tracing::info!(
+                    volume = name,
+                    file = %path.display(),
+                    "volume file deleted (control DESTROY)"
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                file_state = if was_running {
+                    "unmounted and unregistered; the volume file was already gone"
+                } else {
+                    "the volume was not running; the volume file was already gone"
+                };
+            }
+            Err(error) => {
+                // The unmount (if any) already happened — a mixed
+                // state the reply must spell out with its idempotent
+                // retry.
+                return format!(
+                    "ERR: deleting the volume file {} failed: {error} — {} — retry \
+                     `DESTROY {name} confirm` (idempotent: the unmount, if any, already \
+                     happened)\n",
+                    path.display(),
+                    if was_running {
+                        "the volume IS unmounted but its file survived"
+                    } else {
+                        "the volume was never running and its file survived"
+                    },
+                );
+            }
+        }
+        // The optional purge leg (裁决②): the whole home directory —
+        // db, cache, local root. No rollback on failure (the file is
+        // already deleted); the reply names the leftover.
+        if purge_local {
+            match std::fs::remove_dir_all(&home) {
+                Ok(()) => {
+                    println!(
+                        "Volume {name} local data directory {} purged (control DESTROY).",
+                        home.display()
+                    );
+                    tracing::info!(
+                        volume = name,
+                        home = %home.display(),
+                        "volume local data directory purged (control DESTROY)"
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return format!(
+                        "ERR: volume `{name}` destroyed ({file_state}), but deleting its \
+                         local data directory {} failed: {error} — the data remains at that \
+                         path; close whatever holds it (Explorer windows, editors, a running \
+                         db) and delete it by hand. Remote data was never touched.\n",
+                        home.display()
+                    );
+                }
+            }
+            return format!(
+                "OK: destroyed volume `{name}` ({file_state}; local data directory {} \
+                 deleted; remote data was never touched)\n",
+                home.display()
+            );
+        }
+        format!(
+            "OK: destroyed volume `{name}` ({file_state}; the local data directory is KEPT \
+             at {} — delete it by hand or rerun with purge_local if you want it gone; remote \
+             data was never touched)\n",
+            home.display()
+        )
     }
 
     /// `ADD <name>` (K48's runtime assembly): read `volumes/<name>.toml`

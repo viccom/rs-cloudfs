@@ -24,6 +24,14 @@
 // the stored value), the name locks, the notice spells the REMOVE+ADD
 // re-assembly + comments-loss semantics, and a pending-upload count
 // (the poll's live data) confirms before the save.
+// P5 activates [Delete] on every valid row (invalid rows keep it
+// disabled behind a parse tooltip): a TWO-STEP modal — step 1 previews
+// exactly what a destroy does (the volume file, the registration) and
+// what it never does (the local data directory stays unless purge is
+// ticked; remote data is untouched), step 2 arms the confirm only on a
+// typed exact-name match. The confirm POSTs
+// {confirm: true, purge_local} to /api/volumes/<name>/destroy; cancel
+// at either step closes the modal with zero requests.
 
 const VOLUME_LABELS = {
     telegram: 'Telegram MTProto',
@@ -41,6 +49,7 @@ document.addEventListener("DOMContentLoaded", () => {
     const tbody = document.getElementById("volumes-tbody");
     if (tbody) tbody.addEventListener("click", onVolumeActionClick);
     initVolumeForm();
+    initDeleteModal();
 });
 
 // The write actions: which HTTP route each button posts to.
@@ -227,18 +236,17 @@ function renderVolumesTable(configs, runtime) {
     }).join("");
 }
 
-// The Actions cell (P1+P6, Edit since P4): a running volume offers
-// [Refresh] (rebuild its index from the remote backend — or the muted
-// note where the backend cannot be rebuilt), [Edit] (the edit form,
-// prefilled from SHOW), [Unmount] (runtime removal — the file stays)
-// and [Disable] (file + unmount); a stopped or disabled volume offers
-// [Edit] + [Enable]. An invalid file offers nothing but the Delete
-// placeholder — it needs a hand edit first (SHOW cannot prefill from a
-// file the loader refuses). Delete is the P5 placeholder (two-step
-// confirmation lands there).
+// The Actions cell (P1+P6, Edit since P4, Delete since P5): a running
+// volume offers [Refresh] (rebuild its index from the remote backend —
+// or the muted note where the backend cannot be rebuilt), [Edit] (the
+// edit form, prefilled from SHOW), [Unmount] (runtime removal — the
+// file stays) and [Disable] (file + unmount); a stopped or disabled
+// volume offers [Edit] + [Enable]. Every valid row (invalid included,
+// though its [Delete] is disabled until the file parses) carries
+// [Delete] — the P5 two-step modal.
 function volumeActionButtons(v) {
     if (v.invalid) {
-        return deletePlaceholder(v.name);
+        return deleteControl(v);
     }
     const name = escapeHtml(v.name);
     if (v.running) {
@@ -256,7 +264,7 @@ function volumeActionButtons(v) {
                     title="Write enabled = false to the volume file and unmount it (survives restarts)">
                 <i class="fa-solid fa-power-off"></i> Disable
             </button>
-            ${deletePlaceholder(v.name)}
+            ${deleteControl(v)}
         `;
     }
     return `
@@ -268,16 +276,28 @@ function volumeActionButtons(v) {
                 title="Write enabled = true and assemble the volume now">
             <i class="fa-solid fa-play"></i> Enable
         </button>
-        ${deletePlaceholder(v.name)}
+        ${deleteControl(v)}
     `;
 }
 
-// The P5 Delete placeholder (kept visible, disabled — the two-step
-// confirmation modal lands in that batch).
-function deletePlaceholder(name) {
+// The Delete control (P5): live on every valid row (running, stopped,
+// disabled — the DESTROY command needs no running volume, only the
+// file); an invalid row keeps it disabled with the parse tooltip —
+// the file must be fixed (or removed by hand) first, exactly like
+// Edit's prefill gate.
+function deleteControl(v) {
+    const name = escapeHtml(v.name);
+    if (v.invalid) {
+        return `
+            <button class="btn-mini btn-mini-danger" data-action="delete" data-name="${name}"
+                    disabled title="the volume file cannot be parsed — fix it by hand (or delete volumes/${name}.toml manually)">
+                <i class="fa-solid fa-trash"></i> Delete
+            </button>
+        `;
+    }
     return `
-        <button class="btn-mini btn-mini-danger" data-action="delete" data-name="${escapeHtml(name)}"
-                disabled title="coming in P5">
+        <button class="btn-mini btn-mini-danger" data-action="delete" data-name="${name}"
+                title="Delete this volume for good (two-step confirmation; its local data directory stays unless you tick purge)">
             <i class="fa-solid fa-trash"></i> Delete
         </button>
     `;
@@ -315,6 +335,12 @@ function onVolumeActionClick(event) {
     // Edit is a UI action (the edit form), not a command POST.
     if (button.dataset.action === 'edit') {
         openEditVolumeForm(button.dataset.name);
+        return;
+    }
+    // Delete is the P5 two-step modal — no command POST until its own
+    // typed confirm fires it.
+    if (button.dataset.action === 'delete') {
+        openDeleteModal(button.dataset.name);
         return;
     }
     runVolumeAction(button.dataset.action, button.dataset.name, button);
@@ -796,6 +822,128 @@ async function onVolumeFormSubmit(event) {
     } finally {
         if (submit) submit.disabled = false;
         if (label) label.innerText = idleLabel;
+        await loadVolumesPage();
+    }
+}
+
+// ------------------- the P5 delete modal (two-step confirmation) -----
+
+// The volume the modal is currently about (null = closed).
+let delmName = null;
+
+// Wires the modal's static listeners (idempotent — the harness and the
+// DOMContentLoaded path both call it).
+function initDeleteModal() {
+    const modal = vfEl('delete-modal');
+    if (!modal || modal.dataset.wired) return;
+    modal.dataset.wired = '1';
+    vfEl('delm-close').addEventListener('click', closeDeleteModal);
+    vfEl('delm-cancel-1').addEventListener('click', closeDeleteModal);
+    vfEl('delm-cancel-2').addEventListener('click', closeDeleteModal);
+    vfEl('delm-continue').addEventListener('click', () => deleteModalStep(2));
+    vfEl('delm-confirm').addEventListener('click', onDeleteConfirm);
+    vfEl('delm-confirm-input').addEventListener('input', onDeleteNameInput);
+    // Clicking the backdrop is a cancel too (zero requests).
+    modal.addEventListener('click', (event) => {
+        if (event.target === modal) closeDeleteModal();
+    });
+}
+
+// Opens the modal at step 1 for the named volume: the preview panel
+// (name, backend, what goes, what stays), the purge checkbox reset to
+// its safe default (unchecked), step 2's input cleared. No request
+// fires until the typed confirm.
+function openDeleteModal(name) {
+    delmName = name;
+    const modal = vfEl('delete-modal');
+    if (!modal) return;
+    const row = vfLastRows.find(r => r.name === name);
+    const overview = vfEl('delm-overview');
+    if (overview) {
+        const backend = backendDisplayName(row ? row.backend : '');
+        overview.innerHTML = `
+            <span class="delm-name"><i class="fa-solid fa-database"></i> ${escapeHtml(name)}</span>
+            <span class="delm-backend">${escapeHtml(backend)}</span>
+        `;
+    }
+    const fileSpan = vfEl('delm-file-name');
+    if (fileSpan) fileSpan.textContent = name;
+    const echo = vfEl('delm-name-echo');
+    if (echo) echo.textContent = name;
+    const purge = vfEl('delm-purge');
+    if (purge) purge.checked = false;
+    const input = vfEl('delm-confirm-input');
+    if (input) {
+        input.value = '';
+        input.classList.remove('vf-invalid');
+    }
+    deleteModalStep(1);
+    modal.style.display = 'flex';
+}
+
+// Closes the modal unconditionally — a cancel at ANY step: no request
+// is in flight (the confirm disables itself while one is).
+function closeDeleteModal() {
+    delmName = null;
+    const modal = vfEl('delete-modal');
+    if (modal) modal.style.display = 'none';
+}
+
+// Shows the given step (1 = the preview panel, 2 = the typed confirm).
+function deleteModalStep(step) {
+    const one = vfEl('delete-step-1');
+    const two = vfEl('delete-step-2');
+    if (one) one.hidden = step !== 1;
+    if (two) two.hidden = step !== 2;
+    if (step === 2) {
+        onDeleteNameInput();
+        const input = vfEl('delm-confirm-input');
+        if (input) input.focus();
+    }
+}
+
+// The typed-name gate: the confirm button arms only on an exact match
+// with the volume's name (trimmed — a stray space is a mismatch, not a
+// convenience).
+function onDeleteNameInput() {
+    const input = vfEl('delm-confirm-input');
+    const confirm = vfEl('delm-confirm');
+    if (!input || !confirm || !delmName) return;
+    confirm.disabled = input.value.trim() !== delmName;
+}
+
+// The confirm: ONE POST /api/volumes/<name>/destroy with
+// {confirm: true, purge_local} — the loading label spans the request
+// (draining uploads and removing are one server-side sequence), the
+// reply (OK or ERR — both already actionable) toasts verbatim, the
+// modal closes and the table refreshes whatever state the command left.
+async function onDeleteConfirm() {
+    if (!delmName) return;
+    const name = delmName;
+    const purge = vfEl('delm-purge');
+    const confirm = vfEl('delm-confirm');
+    const label = vfEl('delm-confirm-label');
+    if (confirm) confirm.disabled = true;
+    if (label) label.innerText = 'Removing…';
+    try {
+        const res = await fetch(`/api/volumes/${encodeURIComponent(name)}/destroy`, {
+            method: "POST",
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify({ confirm: true, purge_local: !!(purge && purge.checked) }),
+        });
+        const body = await res.json().catch(() => ({}));
+        if (res.ok && body.ok) {
+            showToast('ok', body.reply || 'Deleted.');
+        } else {
+            // The backend's ERR text is already actionable (a drain
+            // refusal, a purge leftover) — toast it verbatim.
+            showToast('err', body.error || `HTTP ${res.status}`);
+        }
+    } catch (err) {
+        showToast('err', `request failed: ${err}`);
+    } finally {
+        if (label) label.innerText = 'Delete volume';
+        closeDeleteModal();
         await loadVolumesPage();
     }
 }

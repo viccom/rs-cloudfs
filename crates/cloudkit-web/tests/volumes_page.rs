@@ -1477,3 +1477,253 @@ async fn update_route_body_and_family_gates() {
         "actionable error: {body}"
     );
 }
+
+// ------------------------- the P5 destroy route (§1.2 two-leg, plan §3) ---
+
+/// The destroy route's FIRST leg: a body without `confirm: true`
+/// forwards the bare `DESTROY <name>` (the preview — the command
+/// executes nothing) and answers the pinned preview shape
+/// `{"ok": true, "reply": ..., "confirm_required": true}` so the
+/// frontend can render the preview panel without inventing its own
+/// state machine.
+#[tokio::test]
+async fn destroy_route_preview_leg_forwards_and_flags_confirm_required() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let (seam, seen) = recording_seam(
+        "OK: DESTROY preview for `a` — nothing was executed:\n- kept: the local data \
+         directory stays\n- never touched: remote data\nconfirm with: `DESTROY a confirm`\n"
+            .to_string(),
+    );
+    let server = multi_server_with_commands(vec![entry], seam).await;
+    let addr = server.local_addr();
+
+    // The explicit preview body, the empty-object body and the EMPTY
+    // body all mean "not confirmed" (the safe default).
+    for (label, body) in [
+        ("explicit", r#"{"confirm": false}"#),
+        ("empty object", "{}"),
+        ("no body", ""),
+    ] {
+        let resp = send(
+            addr,
+            &request_with_body("POST", "/api/volumes/a/destroy", addr, &[], body),
+        )
+        .await;
+        assert_eq!(status_of(&resp), 200, "preview ok ({label}): {resp}");
+        assert!(resp.contains("application/json"), "json: {resp}");
+        let value: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse body");
+        assert_eq!(
+            value,
+            serde_json::json!({
+                "ok": true,
+                "reply": "DESTROY preview for `a` — nothing was executed:\n- kept: the local data directory stays\n- never touched: remote data\nconfirm with: `DESTROY a confirm`",
+                "confirm_required": true,
+            }),
+            "the pinned preview shape ({label}): {value}"
+        );
+    }
+    // Clone the commands out so the guard dies on its statement (the
+    // clippy await-holding-lock rule does not credit the later drop).
+    let commands = seen
+        .lock()
+        .unwrap_or_else(|poisoned| poisoned.into_inner())
+        .clone();
+    assert_eq!(
+        commands.len(),
+        3,
+        "each preview leg sent the preview command"
+    );
+    assert!(
+        commands.iter().all(|line| line == "DESTROY a"),
+        "the preview command carries no confirm word: {commands:?}"
+    );
+    server.shutdown().await;
+}
+
+/// The destroy route's SECOND leg: `confirm: true` forwards
+/// `DESTROY <name> confirm` — plus the literal `purge_local` third
+/// word when the body asks for it — and answers the family's plain
+/// success shape (no confirm_required flag: the destruction ran). The
+/// seam's ERR: (a drain refusal) rides the family's 409 verbatim.
+#[tokio::test]
+async fn destroy_route_confirm_leg_forwards_purge_local_and_maps_the_reply() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let (seam, seen) = recording_seam(
+        "OK: destroyed volume `a` (the volume was not running; volume file deleted)\n".to_string(),
+    );
+    let server = multi_server_with_commands(vec![entry], seam).await;
+    let addr = server.local_addr();
+
+    let resp = send(
+        addr,
+        &request_with_body(
+            "POST",
+            "/api/volumes/a/destroy",
+            addr,
+            &[],
+            r#"{"confirm": true}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 200, "confirm ok: {resp}");
+    let value: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse body");
+    assert_eq!(
+        value,
+        serde_json::json!({ "ok": true, "reply": "destroyed volume `a` (the volume was not running; volume file deleted)" }),
+        "the family's plain success shape (no confirm_required): {value}"
+    );
+
+    let resp = send(
+        addr,
+        &request_with_body(
+            "POST",
+            "/api/volumes/a/destroy",
+            addr,
+            &[],
+            r#"{"confirm": true, "purge_local": true}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 200, "purge ok: {resp}");
+    assert_eq!(
+        *seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+        vec!["DESTROY a confirm", "DESTROY a confirm purge_local"],
+        "the purge flag rides the command line as the literal third word"
+    );
+    server.shutdown().await;
+
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let server = multi_server_with_commands(
+        vec![entry],
+        canned_seam(
+            "ERR: destroying `a` aborted during the unmount: uploads are still arriving — \
+             the volume file was NOT deleted\n"
+                .to_string(),
+        ),
+    )
+    .await;
+    let addr = server.local_addr();
+    let resp = send(
+        addr,
+        &request_with_body(
+            "POST",
+            "/api/volumes/a/destroy",
+            addr,
+            &[],
+            r#"{"confirm": true}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 409, "ERR maps to 409: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("error json");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("was NOT deleted")),
+        "the refusal text rides verbatim: {body}"
+    );
+    server.shutdown().await;
+}
+
+/// The destroy route's body gate and family gates: a non-JSON body, a
+/// non-object body and wrong-typed flags answer actionable 400s without
+/// reaching the seam; the Origin guard, the remote degrade and the
+/// missing seam answer before the command is built.
+#[tokio::test]
+async fn destroy_route_body_and_family_gates() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let (seam, seen) = recording_seam("OK: unreachable\n".to_string());
+    let server = multi_server_with_commands(vec![entry], seam).await;
+    let addr = server.local_addr();
+    for (label, body) in [
+        ("not JSON", "just words"),
+        ("a bare array", "[1]"),
+        ("a string confirm", r#"{"confirm": "yes"}"#),
+        ("a numeric purge", r#"{"confirm": true, "purge_local": 1}"#),
+    ] {
+        let resp = send(
+            addr,
+            &request_with_body("POST", "/api/volumes/a/destroy", addr, &[], body),
+        )
+        .await;
+        assert_eq!(status_of(&resp), 400, "{label} refused: {resp}");
+    }
+    let resp = send(
+        addr,
+        &request_with_body(
+            "POST",
+            "/api/volumes/a/destroy",
+            addr,
+            &[("Origin", "http://evil.example")],
+            r#"{"confirm": true}"#,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status_of(&resp),
+        403,
+        "cross-origin destroy refused: {resp}"
+    );
+    assert!(
+        seen.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty(),
+        "no broken or foreign request reaches the seam"
+    );
+    server.shutdown().await;
+
+    // Remote degrade: the write family's 403 naming the opt-in key.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let (seam, _seen) = recording_seam("OK: destroyed\n".to_string());
+    let server = WebUiServer::serve_multi_with_remote_admin(
+        RegistryHandle::new(vec![entry]),
+        "0.0.0.0:0".parse().expect("parse the bind address"),
+        Some(seam),
+        false,
+    )
+    .await
+    .expect("serve on a non-loopback binding");
+    let addr = SocketAddr::from(([127, 0, 0, 1], server.local_addr().port()));
+    let resp = send(
+        addr,
+        &request_with_body(
+            "POST",
+            "/api/volumes/a/destroy",
+            addr,
+            &[],
+            r#"{"confirm": true}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 403, "remote destroy withheld: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("error json");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("allow_remote_admin")),
+        "the refusal names the opt-in key: {body}"
+    );
+    server.shutdown().await;
+
+    // No seam: the family's actionable 503.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let server = multi_server(vec![entry]).await;
+    let addr = server.local_addr();
+    let resp = send(
+        addr,
+        &request_with_body("POST", "/api/volumes/a/destroy", addr, &[], "{}"),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 503, "no seam: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("error json");
+    assert!(
+        body["error"].as_str().is_some_and(|msg| !msg.is_empty()),
+        "actionable error: {body}"
+    );
+}

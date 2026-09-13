@@ -21,7 +21,10 @@
 //!   <json>` (its P3/P4 batches — the payload is ONE compact
 //!   single-line JSON object of volume-scoped keys; the line protocol
 //!   reads one line per connection, so a serialized JSON body never
-//!   spans lines) are forwarded to the installed
+//!   spans lines) / `DESTROY <name> [confirm] [purge_local]` (its P5
+//!   batch — the two-leg deletion protocol: without `confirm` the
+//!   handler answers the preview and executes nothing) are forwarded
+//!   to the installed
 //!   [`VolumeCommandHandler`]; its reply is passed through verbatim —
 //!   `OK: ...` or a multi-line `OK:`/`ERR:` block whose text is the
 //!   handler's actionable message. The replies are documented where the
@@ -112,8 +115,10 @@ fn first_token(line: &str) -> &str {
 /// `CONFIGS` since its P1 batch; `REBUILD` since its P2 batch;
 /// `CREATE`/`UPDATE` since its P3/P4 batches — their third span is a
 /// compact single-line JSON payload, parsed positionally by the
-/// handler): the keywords, with or without their argument — the handler
-/// answers malformed shapes with its own usage ERR.
+/// handler; `DESTROY` since its P5 batch — the second/third words are
+/// the literal `confirm`/`purge_local` tokens, parsed positionally by
+/// the handler): the keywords, with or without their argument — the
+/// handler answers malformed shapes with its own usage ERR.
 fn is_volume_command(line: &str) -> bool {
     matches!(
         first_token(line),
@@ -127,6 +132,7 @@ fn is_volume_command(line: &str) -> bool {
             | "REBUILD"
             | "CREATE"
             | "UPDATE"
+            | "DESTROY"
     )
 }
 

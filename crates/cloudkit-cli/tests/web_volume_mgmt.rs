@@ -757,3 +757,158 @@ async fn web_update_route_drives_the_real_command_surface() {
         .expect("shutdown completes")
         .expect("shutdown joins cleanly");
 }
+
+// ----------------------------------------- the P5 destroy route e2e ---
+
+/// The P5 destroy route drives the REAL command surface end to end:
+/// the preview leg (confirm=false) answers the real handler's preview
+/// with `confirm_required: true` and executes nothing; the confirmed
+/// leg unmounts the volume through the K50 sequence, deletes the
+/// volume file, keeps the local data directory by default (裁决②) and
+/// only removes it with `purge_local`. Green-since-birth pin (the
+/// components were each red→green in their own suites; this test pins
+/// their composition).
+#[tokio::test]
+async fn web_destroy_route_drives_the_real_command_surface() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    write_file(
+        &dir.path().join("volumes").join("off.toml"),
+        &format!("{}\nenabled = false\n", volume_toml("222:BBB", 222222)),
+    );
+    // The homes with real bytes: `a` runs (its home was created by the
+    // assembly), `off` never assembles — seed it by hand.
+    fs::create_dir_all(dir.path().join("volumes").join("a").join("cache"))
+        .expect("create the a home cache");
+    fs::write(
+        dir.path().join("volumes").join("a").join("meta.db"),
+        b"fake a db",
+    )
+    .expect("write the a db");
+    write_file(
+        &dir.path().join("volumes").join("off").join("meta.db"),
+        "fake off db",
+    );
+    let _guard = chdir(dir.path());
+
+    let cfg = web_process_config();
+    let specs =
+        cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load volume specs");
+    let injections = vec![(
+        specs[0].clone(),
+        RunOptions::default(),
+        mock_transport().await as Arc<dyn CloudTransport>,
+    )];
+    let handle = cloudkit_cli::run_multi_with_transports_and_commands(
+        &cfg,
+        injections,
+        RuntimeVolumeCommands {
+            dispatch: Some(mock_dispatch()),
+            remove_tuning: RemoveTuning::fast(),
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await
+    .expect("boot with the command surface");
+    let web = handle
+        .web_ui_addr()
+        .expect("the dashboard bound (enable_web_ui = true)");
+    let addr = control_addr();
+
+    // The preview leg: confirm_required flags the real preview text
+    // (nothing executed — the file and the registration stay).
+    let resp = send_http_with_body(
+        "POST",
+        web,
+        "/api/volumes/a/destroy",
+        "{\"confirm\": false}",
+    )
+    .await;
+    assert_eq!(status_of(&resp), 200, "preview ok: {resp}");
+    let body: serde_json::Value = serde_json::from_str(body_of(&resp)).expect("parse body");
+    assert_eq!(body["ok"], serde_json::json!(true), "the ok flag: {body}");
+    assert_eq!(
+        body["confirm_required"],
+        serde_json::json!(true),
+        "the preview flags the owed confirmation: {body}"
+    );
+    let reply = body["reply"].as_str().unwrap_or_default();
+    assert!(
+        reply.contains("nothing was executed") && reply.contains("never touched"),
+        "the real handler's preview text rides verbatim: {body}"
+    );
+    assert!(
+        dir.path().join("volumes").join("a.toml").is_file(),
+        "the preview deleted nothing"
+    );
+    let reply = send_cmd(addr, "LIST").await;
+    assert!(
+        reply.contains("a running"),
+        "the volume stays registered: {reply}"
+    );
+
+    // The confirmed leg on the RUNNING volume: unmount + file deletion
+    // + the home KEPT (裁决②'s default), remote untouched.
+    let resp =
+        send_http_with_body("POST", web, "/api/volumes/a/destroy", "{\"confirm\": true}").await;
+    assert_eq!(status_of(&resp), 200, "confirm ok: {resp}");
+    let body: serde_json::Value = serde_json::from_str(body_of(&resp)).expect("parse body");
+    assert_eq!(body["ok"], serde_json::json!(true), "the ok flag: {body}");
+    assert!(
+        body["confirm_required"].is_null(),
+        "the confirmed leg answers the family's plain shape: {body}"
+    );
+    let reply = body["reply"].as_str().unwrap_or_default();
+    assert!(
+        reply.contains("destroyed volume `a`") && reply.to_lowercase().contains("kept"),
+        "the OK carries the kept-home guarantee: {body}"
+    );
+    assert!(
+        !dir.path().join("volumes").join("a.toml").exists(),
+        "the volume file is gone"
+    );
+    assert!(
+        dir.path()
+            .join("volumes")
+            .join("a")
+            .join("meta.db")
+            .is_file(),
+        "the local data directory survived"
+    );
+    let reply = send_cmd(addr, "LIST").await;
+    assert!(
+        !reply.contains("a running"),
+        "the volume is unregistered: {reply}"
+    );
+
+    // The purged leg on the DISABLED volume: direct file deletion plus
+    // the home's removal (the purge_local third word rides the seam).
+    let resp = send_http_with_body(
+        "POST",
+        web,
+        "/api/volumes/off/destroy",
+        "{\"confirm\": true, \"purge_local\": true}",
+    )
+    .await;
+    assert_eq!(status_of(&resp), 200, "purge ok: {resp}");
+    assert!(
+        !dir.path().join("volumes").join("off.toml").exists(),
+        "the disabled volume's file is gone"
+    );
+    assert!(
+        !dir.path().join("volumes").join("off").exists(),
+        "the purge removed the whole home"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
