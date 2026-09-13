@@ -66,14 +66,30 @@
 //!
 //! - `GET /api/volumes` — the registry listing (name / backend /
 //!   volume_id / drive_letter / webdav_url / status / status_reason /
-//!   quota / total_files / total_bytes), the numbers read from each
-//!   volume's db metadata — never a backend scan (the PCFS Stats
-//!   anti-lesson).
+//!   quota / total_files / total_bytes / pending), the numbers read
+//!   from each volume's db metadata — never a backend scan (the PCFS
+//!   Stats anti-lesson); `pending` is the queue's outstanding upload
+//!   count (`null` on a failed volume — no queue exists).
 //! - `GET /api/stats/summary` — the cross-volume aggregate (Σ files /
 //!   bytes / dirs / uploaded / pending / quota over the RUNNING
 //!   volumes) for the dashboard's summary card. A distinct shape on
-//!   purpose: the frozen 16-key `/api/stats` contract stays a
+//!   a purpose: the frozen 16-key `/api/stats` contract stays a
 //!   per-volume answer.
+//! - `GET /api/volumes/{name}/config` — the named volume's FILE
+//!   configuration through the injected [`VolumeCommandClient`] seam
+//!   (web volume management §1.1): a `SHOW <name>` whose JSON reply
+//!   passes through verbatim, credentials already collapsed to
+//!   `{"set": bool}` markers by the core serializer (write-only — a
+//!   credential VALUE never reaches this layer). The registry gates the
+//!   lookup (a REMOVE'd volume 404s though its file stays), no seam
+//!   answers 503.
+//!
+//! The volume-management family (`/api/volumes`, the config route, and
+//! the P1+ write routes) runs behind a same-origin guard (§1.5 裁决③):
+//! an Origin/Referer naming another site 403s; headerless requests
+//! (non-browser clients) pass. `GET /volumes` (both mode tables —
+//! multi serves the management page, single-volume the explanation
+//! page, 裁决④) stays open like every page/read route.
 //!
 //! Single-volume mode (the `serve` constructor) is untouched: the same
 //! nine-route table, the same bodies, and a stray `?volume=` parameter
@@ -83,15 +99,17 @@
 //! Production binds `127.0.0.1:8088` (the caller's concern); tests bind
 //! `127.0.0.1:0`.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Request, State};
 use axum::http::{header, StatusCode, Uri};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
@@ -205,6 +223,23 @@ pub struct VolumeUiEntry {
     /// The volume's own VFS (`None` for a failed volume).
     pub vfs: Option<Arc<Vfs>>,
 }
+
+/// The volume-command callback seam (web volume management plan §1.1):
+/// the dashboard's route into the cli composition root's serialized
+/// volume-command execution — the raw command line in, the verbatim
+/// reply text out (`OK: ...` / `ERR: ...`), the same contract the
+/// loopback control channel's handler serves. Defined here, structurally
+/// identical to cli's `VolumeCommandHandler`, because web and cli are
+/// both L5 (a web→cli import would be a Cargo cycle); the cli assembly
+/// injects its installed handler as one more `Arc` clone, so web-sent
+/// commands and control-channel commands funnel into the SAME
+/// serialized queue (K48's serialization semantics inherit unchanged).
+pub type VolumeCommandClient = Arc<
+    dyn for<'a> Fn(&'a str) -> Pin<Box<dyn Future<Output = String> + Send + 'a>>
+        + Send
+        + Sync
+        + 'static,
+>;
 
 /// Errors from assembling the dashboard.
 #[derive(Debug, thiserror::Error)]
@@ -349,12 +384,29 @@ impl WebUiServer {
     /// same nine routes (now taking the K23 `?volume=<name>` parameter)
     /// plus the two registry routes `/api/volumes` and
     /// `/api/stats/summary` — every request re-reads the table, so
-    /// later insertions/removals are visible at once.
+    /// later insertions/removals are visible at once. Without the
+    /// command seam (the volume-management routes answer 503).
     pub async fn serve_multi(
         volumes: RegistryHandle,
         addr: SocketAddr,
     ) -> Result<Self, WebUiError> {
-        let app = multi_router(volumes);
+        Self::serve_multi_with_commands(volumes, addr, None).await
+    }
+
+    /// [`WebUiServer::serve_multi`] with the volume-command seam
+    /// installed (web volume management plan §1.1): the dashboard's
+    /// management routes (`GET /api/volumes/{name}/config`, the P1+
+    /// write family) send their commands through `commands` — the SAME
+    /// handler the cli composition root installed on the control
+    /// channel, so both trigger sources serialize behind one queue.
+    /// `None` keeps the read-only dashboard (the seam routes answer
+    /// their actionable 503).
+    pub async fn serve_multi_with_commands(
+        volumes: RegistryHandle,
+        addr: SocketAddr,
+        commands: Option<VolumeCommandClient>,
+    ) -> Result<Self, WebUiError> {
+        let app = multi_router(volumes, commands);
         serve_router(app, addr).await
     }
 
@@ -409,6 +461,11 @@ async fn serve_router(app: axum::Router, addr: SocketAddr) -> Result<WebUiServer
 fn contract_routes(router: axum::Router<AppState>) -> axum::Router<AppState> {
     router
         .route("/", get(index))
+        // The volume-management page (web volume management §1.4) is on
+        // BOTH mode tables by design: the multi-volume mode serves the
+        // management skeleton, the single-volume mode the explanation
+        // page (裁决④) — one handler, state-picked body.
+        .route("/volumes", get(page_volumes))
         .route("/api/files", get(api_files))
         .route("/api/stats", get(api_stats))
         .route("/api/upload", post(api_upload))
@@ -436,11 +493,22 @@ fn router(vfs: Arc<Vfs>, cfg: WebUiConfig) -> axum::Router {
 }
 
 /// Assembles the multi-volume route table: the nine contract routes
-/// (K23 volume-parameter flavour) plus the two registry routes.
-fn multi_router(volumes: RegistryHandle) -> axum::Router {
-    let state = AppState::Multi { volumes };
+/// (K23 volume-parameter flavour) plus the two registry routes and the
+/// volume-management family — `/api/volumes` and the config endpoint
+/// share the same-origin guard (§1.5 裁决③; the P1+ write routes join
+/// this family), the family deliberately NOT spanning the read routes
+/// (downloads stay linkable from anywhere).
+fn multi_router(volumes: RegistryHandle, commands: Option<VolumeCommandClient>) -> axum::Router {
+    let state = AppState::Multi { volumes, commands };
     contract_routes(axum::Router::new())
-        .route("/api/volumes", get(api_volumes))
+        .route(
+            "/api/volumes",
+            get(api_volumes).layer(axum::middleware::from_fn(same_origin_guard)),
+        )
+        .route(
+            "/api/volumes/{name}/config",
+            get(api_volume_config).layer(axum::middleware::from_fn(same_origin_guard)),
+        )
         .route("/api/stats/summary", get(api_stats_summary))
         .with_state(state)
 }
@@ -458,8 +526,13 @@ enum AppState {
     },
     /// The multi-volume boot (K23/K24): the shared table the handlers
     /// re-read per request (RV1) to resolve the `?volume=<name>`
-    /// parameter.
-    Multi { volumes: RegistryHandle },
+    /// parameter, plus the volume-command seam (web volume management
+    /// §1.1) the management routes send through — `None` on a dashboard
+    /// booted without one (those routes answer 503).
+    Multi {
+        volumes: RegistryHandle,
+        commands: Option<VolumeCommandClient>,
+    },
 }
 
 /// One request's volume resolution: the `(vfs, config)` pair the frozen
@@ -500,7 +573,7 @@ impl AppState {
                 vfs: Arc::clone(vfs),
                 cfg: (**cfg).clone(),
             }),
-            AppState::Multi { volumes } => {
+            AppState::Multi { volumes, .. } => {
                 let names = volumes.names();
                 let requested = query
                     .and_then(|q| query_param(q, "volume"))
@@ -580,6 +653,149 @@ async fn static_asset(Path(path): Path<String>) -> Response {
             content_response(mime.as_ref(), file.data.into_owned())
         }
         None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// `GET /volumes` (web volume management §1.4): the configuration-state
+/// page, one handler for both modes — multi-volume serves the
+/// management skeleton (`volumes.html`, filled by `volumes.js` off
+/// `/api/volumes`); a single-volume instance gets the explanation page
+/// (裁决④: its one volume is defined by `config.toml`, there is no
+/// volume registry to manage).
+async fn page_volumes(State(state): State<AppState>) -> Response {
+    let template = match &state {
+        AppState::Multi { .. } => "volumes.html",
+        AppState::Single { .. } => "volumes-single.html",
+    };
+    match Templates::get(template) {
+        Some(file) => content_response("text/html; charset=utf-8", file.data.into_owned()),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+// ------------------------------- the same-origin guard (web volume §1.5) ---
+
+/// The volume-management family's CSRF-shaped defense (裁决③: Origin
+/// checking, not tokens): a state-changing browser request always
+/// carries an Origin (or a Referer) naming the site that issued it, so
+/// a management API call whose Origin/Referer names another site is a
+/// cross-site forgery and answers 403. Requests carrying neither header
+/// (non-browser clients, address-bar navigation) pass — the dashboard
+/// has no session for them to forge. Deliberately scoped to the
+/// `/api/volumes*` family only: the read routes (downloads, stats) and
+/// the pages stay open to foreign links.
+async fn same_origin_guard(request: Request, next: Next) -> Response {
+    match cross_origin_refusal(&request) {
+        Some(message) => error_json(StatusCode::FORBIDDEN, message),
+        None => next.run(request).await,
+    }
+}
+
+/// The refusal verdict for one request: `Some(message)` when an Origin
+/// or Referer header is present and does not name this server's own
+/// authority (compared case-insensitively against the Host header).
+/// `Origin: null` (sandboxed frames) counts as foreign. A missing Host
+/// passes — browsers always send one, so a headerless pair is a
+/// non-browser client, not an attack.
+fn cross_origin_refusal(request: &Request) -> Option<String> {
+    let headers = request.headers();
+    let host = headers.get(header::HOST)?.to_str().ok()?;
+    let (name, value) = if let Some(origin) = headers.get(header::ORIGIN) {
+        ("Origin", origin.to_str().ok()?)
+    } else {
+        let referer = headers.get(header::REFERER)?;
+        ("Referer", referer.to_str().ok()?)
+    };
+    let authority = origin_authority(value);
+    (!authority.eq_ignore_ascii_case(host)).then(|| {
+        format!(
+            "cross-origin request refused: the volume management API only serves this \
+             dashboard's own origin ({name} {value} does not match Host {host})"
+        )
+    })
+}
+
+/// The authority span of an Origin/Referer value — `scheme://authority`
+/// up to the first `/` (the path tail of a Referer never participates).
+/// A value with no parseable scheme degrades to its text up to the
+/// first `/`, which cannot equal a `host:port` pair unless it is one.
+fn origin_authority(value: &str) -> &str {
+    let rest = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))
+        .unwrap_or(value);
+    rest.split('/').next().unwrap_or(rest)
+}
+
+// ------------------------- the volume-command seam routes (web volume §1.1) ---
+
+/// The web-side budget for one seam command (§4's risk mitigation):
+/// SHOW is a fast file read, but the seam serializes behind whatever
+/// the control channel has in flight (a REMOVE draining a large
+/// upload) — the dashboard refuses to park behind it. Deliberately NOT
+/// the control client's 120s budget: that exists for a REMOVE's own
+/// drain windows; this is an in-process callback answering reads.
+const VOLUME_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `GET /api/volumes/{name}/config` (multi-volume mode only; web
+/// volume management §1.1/§1.2): the named volume's FILE configuration
+/// through the command seam — a `SHOW <name>` whose reply JSON passes
+/// through verbatim (core's serializer already collapsed every
+/// credential key to its `{"set": bool}` marker; the value never
+/// reaches this layer, let alone the browser). The registry gates the
+/// lookup — a REMOVE'd volume 404s even though its file stays (K49:
+/// removal is runtime-only). A missing seam answers 503 (a dashboard
+/// booted without volume management), a command that outlives
+/// [`VOLUME_COMMAND_TIMEOUT`] 503s actionably, and the seam's `ERR:`
+/// replies carry their actionable text as 404s.
+async fn api_volume_config(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    let AppState::Multi { volumes, commands } = &state else {
+        return error_json(
+            StatusCode::NOT_FOUND,
+            "no volume registry: this dashboard serves a single volume",
+        );
+    };
+    let names = volumes.names();
+    if volumes.find(&name).is_none() {
+        return volume_routing_error(
+            StatusCode::NOT_FOUND,
+            format!("unknown volume '{name}'"),
+            &names,
+        );
+    }
+    let Some(client) = commands else {
+        return error_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "volume configuration is not available: this dashboard runs without the \
+             volume-command seam (the multi-volume cli assembly installs it)",
+        );
+    };
+    let command = format!("SHOW {name}");
+    let reply = match tokio::time::timeout(VOLUME_COMMAND_TIMEOUT, client(&command)).await {
+        Ok(reply) => reply,
+        Err(_elapsed) => {
+            return error_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "the volume command for '{name}' timed out — the instance is likely busy \
+                     with a long volume command (e.g. a REMOVE draining an upload); retry \
+                     once it settles"
+                ),
+            );
+        }
+    };
+    match reply.strip_prefix("OK: ") {
+        Some(payload) => match serde_json::from_str::<serde_json::Value>(payload.trim()) {
+            Ok(value) => Json(value).into_response(),
+            Err(_) => error_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the SHOW reply was not valid JSON — the volume file may be mid-edit; retry",
+            ),
+        },
+        None => error_json(
+            StatusCode::NOT_FOUND,
+            reply.trim().trim_start_matches("ERR: "),
+        ),
     }
 }
 
@@ -1360,7 +1576,7 @@ async fn api_queue(State(state): State<AppState>, uri: Uri) -> Response {
 /// must not hide its siblings).
 async fn api_volumes(State(state): State<AppState>) -> Response {
     let volumes = match &state {
-        AppState::Multi { volumes } => volumes.snapshot(),
+        AppState::Multi { volumes, .. } => volumes.snapshot(),
         AppState::Single { .. } => {
             // Unreachable through the multi router; the single-volume
             // table never registers this route (its unknown-route 404
@@ -1378,7 +1594,10 @@ async fn api_volumes(State(state): State<AppState>) -> Response {
 }
 
 /// One `/api/volumes` row: the registry identity plus the db metadata
-/// numbers (see [`api_volumes`]).
+/// numbers (see [`api_volumes`]) and the queue's outstanding upload
+/// count (the same `pending=` observable LIST reports — the §4 drain
+/// aid, surfaced for the management page's Pending column; a failed
+/// volume has no queue, so its value is `null`, not 0).
 fn volume_summary_json(entry: &VolumeUiEntry) -> serde_json::Value {
     let (total_files, total_bytes) = match (&entry.status, &entry.vfs) {
         (VolumeUiStatus::Running, Some(vfs)) => match vfs.db().get_stats() {
@@ -1387,6 +1606,10 @@ fn volume_summary_json(entry: &VolumeUiEntry) -> serde_json::Value {
         },
         _ => (None, None),
     };
+    let pending = entry
+        .vfs
+        .as_ref()
+        .map(|vfs| vfs.queue_stats().outstanding());
     let mut body = serde_json::json!({
         "name": entry.name,
         "backend": entry.config.backend,
@@ -1394,6 +1617,7 @@ fn volume_summary_json(entry: &VolumeUiEntry) -> serde_json::Value {
         "drive_letter": entry.config.drive_letter,
         "webdav_url": entry.config.webdav_url,
         "status": entry.status.as_str(),
+        "pending": pending,
         "quota_used": entry.config.quota.as_ref().map(|quota| quota.used),
         "quota_total": entry.config.quota.as_ref().and_then(|quota| quota.total),
         "total_files": total_files,
@@ -1414,7 +1638,7 @@ fn volume_summary_json(entry: &VolumeUiEntry) -> serde_json::Value {
 /// failing the aggregate.
 async fn api_stats_summary(State(state): State<AppState>) -> Response {
     let volumes = match &state {
-        AppState::Multi { volumes } => volumes.snapshot(),
+        AppState::Multi { volumes, .. } => volumes.snapshot(),
         AppState::Single { .. } => {
             return error_json(
                 StatusCode::NOT_FOUND,

@@ -1649,7 +1649,11 @@ pub async fn run_multi_with_transports(
 ///
 /// MV3: with `enable_web_ui` the boot also binds the ONE process-level
 /// dashboard (K24) serving the volume registry — per-volume tabs, the
-/// `/api/volumes` listing and the K23 `?volume=` routing.
+/// `/api/volumes` listing and the K23 `?volume=` routing. The dashboard
+/// receives the SAME volume-command handler the control channel runs
+/// (web volume management §1.1): its management routes send commands
+/// through the shared seam, so both trigger sources serialize behind
+/// one queue.
 pub async fn run_multi_with_transports_and_commands(
     process_cfg: &CyDriveConfig,
     volumes: Vec<(VolumeConfig, RunOptions, Arc<dyn CloudTransport>)>,
@@ -1751,7 +1755,45 @@ pub async fn run_multi_with_transports_and_commands(
     // the volumes keep running without the UI. The boot keeps a clone
     // for the same reason.
     let web_face = cloudkit_web::RegistryHandle::new(ui_entries);
-    let web_ui = bind_multi_web_ui(process_cfg, web_face.clone()).await;
+
+    // The ONE volume-command handler (web volume management plan §1.1):
+    // the same closure serves the control channel AND the dashboard's
+    // command seam — web-sent commands and control-channel commands
+    // funnel into the same serialized execution behind the in-flight
+    // counter (review H1). Built before the dashboard bind so the bind
+    // can inject its `Arc` clone (the web alias is structurally the
+    // same type; cloning shares, it does not re-wrap).
+    let in_flight = Arc::new(InFlightCommands::default());
+    let command_surface = Arc::new(RuntimeVolumeControl {
+        process_cfg: process_cfg.clone(),
+        registry: registry.clone(),
+        webdav: webdav_face.clone(),
+        web: web_face.clone(),
+        live: Arc::clone(&live),
+        watch: Arc::clone(&watch),
+        webdav_available: webdav_addr.is_some(),
+        dispatch: commands.dispatch,
+        mount: commands.mount,
+        tuning: commands.remove_tuning,
+    });
+    let volume_command_handler: control::VolumeCommandHandler = {
+        let surface = Arc::clone(&command_surface);
+        let in_flight = Arc::clone(&in_flight);
+        Arc::new(move |line: &str| {
+            let surface = Arc::clone(&surface);
+            let guard = in_flight.enter();
+            Box::pin(async move {
+                let _in_flight = guard;
+                surface.handle(line).await
+            })
+        })
+    };
+    let web_ui = bind_multi_web_ui(
+        process_cfg,
+        web_face.clone(),
+        Some(Arc::clone(&volume_command_handler)),
+    )
+    .await;
     let web_ui_addr = web_ui.as_ref().map(WebUiServer::local_addr);
 
     // Per-volume mounts (K27 + K40): only volumes that EXPLICITLY set a
@@ -1791,45 +1833,17 @@ pub async fn run_multi_with_transports_and_commands(
     // cwd-anchored location as the single-volume mode (the process
     // config's default db_path anchors the file in the working
     // directory), same optional-component degrade. RV2: the channel
-    // serves the volume commands through the shared runtime state.
-    // Created before the bind (a degraded bind keeps the stop task's
-    // idle barrier working — with no handler installed it is trivially
-    // idle).
-    let in_flight = Arc::new(InFlightCommands::default());
+    // serves the volume commands through the shared runtime state (the
+    // handler built above — the dashboard got the same `Arc`).
+    // The in-flight counter was created before the binds (a degraded
+    // control bind keeps the stop task's idle barrier working — with no
+    // handler installed it is trivially idle).
     let control_file = match control::ControlServer::bind(process_cfg).await {
         Ok(server) => {
             let path = control::control_file_path(process_cfg);
             tracing::info!(addr = %server.local_addr(), "control channel listening");
             let gate = Arc::clone(&watch);
-            let command_surface = Arc::new(RuntimeVolumeControl {
-                process_cfg: process_cfg.clone(),
-                registry: registry.clone(),
-                webdav: webdav_face.clone(),
-                web: web_face.clone(),
-                live: Arc::clone(&live),
-                watch: Arc::clone(&watch),
-                webdav_available: webdav_addr.is_some(),
-                dispatch: commands.dispatch,
-                mount: commands.mount,
-                tuning: commands.remove_tuning,
-            });
-            // Every handler invocation enters under the in-flight
-            // counter (review H1): the stop task's idle barrier waits
-            // these out before draining the live table, so a command
-            // caught mid-sequence by a gate fire hands its entry back
-            // instead of orphaning it.
-            let handler: control::VolumeCommandHandler = {
-                let surface = Arc::clone(&command_surface);
-                let in_flight = Arc::clone(&in_flight);
-                Arc::new(move |line: &str| {
-                    let surface = Arc::clone(&surface);
-                    let guard = in_flight.enter();
-                    Box::pin(async move {
-                        let _in_flight = guard;
-                        surface.handle(line).await
-                    })
-                })
-            };
+            let handler = Arc::clone(&volume_command_handler);
             tokio::spawn(async move {
                 if let Err(error) = server
                     .run_with_commands(move || gate.trigger(), Some(handler))
@@ -1918,10 +1932,13 @@ pub async fn run_multi_with_transports_and_commands(
 /// Binds the single multi-volume dashboard (K24 / MV3) or skips it
 /// (`enable_web_ui` off) or degrades visibly (K22): an address-parse
 /// or bind failure logs an error and returns `None` — the volumes keep
-/// running, only the UI face is gone.
+/// running, only the UI face is gone. `commands` is the volume-command
+/// seam (web volume management §1.1) injected into the dashboard's
+/// management routes — the same `Arc` the control channel runs.
 async fn bind_multi_web_ui(
     process_cfg: &CyDriveConfig,
     volumes: cloudkit_web::RegistryHandle,
+    commands: Option<cloudkit_web::VolumeCommandClient>,
 ) -> Option<WebUiServer> {
     if !process_cfg.enable_web_ui {
         tracing::info!("web UI disabled (enable_web_ui = false)");
@@ -1938,7 +1955,7 @@ async fn bind_multi_web_ui(
             return None;
         }
     };
-    match WebUiServer::serve_multi(volumes, bind).await {
+    match WebUiServer::serve_multi_with_commands(volumes, bind, commands).await {
         Ok(server) => {
             tracing::info!(addr = %server.local_addr(), "multi-volume web UI listening");
             Some(server)
@@ -2204,6 +2221,10 @@ impl RuntimeVolumeControl {
         let mut tokens = line.split_whitespace();
         match (tokens.next(), tokens.next(), tokens.next()) {
             (Some("LIST"), None, None) => self.list(),
+            // SHOW is read-only like LIST (web volume management §1.2):
+            // the shutdown gate refuses mutations, never reads — the
+            // registry and the volume files stay valid through it.
+            (Some("SHOW"), Some(name), None) => self.show_volume(name),
             (Some(cmd @ ("ADD" | "REMOVE")), Some(name), None) => {
                 // The gate's entry observation point (review H1): once
                 // the shutdown gate has fired, the mutating commands are
@@ -2224,11 +2245,11 @@ impl RuntimeVolumeControl {
                     _ => self.remove_volume(name).await,
                 }
             }
-            (Some(cmd @ ("ADD" | "REMOVE")), _, _) => format!(
+            (Some(cmd @ ("ADD" | "REMOVE" | "SHOW")), _, _) => format!(
                 "ERR: usage: {cmd} <name> — exactly one volume name (volume names match \
                  ^[a-z][a-z0-9_-]{{0,31}}$)\n"
             ),
-            _ => "ERR: usage: ADD <name> | REMOVE <name> | LIST\n".to_string(),
+            _ => "ERR: usage: ADD <name> | REMOVE <name> | SHOW <name> | LIST\n".to_string(),
         }
     }
 
@@ -2265,6 +2286,54 @@ impl RuntimeVolumeControl {
         reply
     }
 
+    /// Path-safety precheck before a volume name becomes a file name
+    /// (shared by ADD and SHOW): the full name rules live in
+    /// `load_volume_config`, but this stops `/`, `\`, `.`, `:` and
+    /// whitespace from ever reaching a path join.
+    fn name_is_path_safe(name: &str) -> bool {
+        !name.is_empty()
+            && !name
+                .chars()
+                .any(|c| matches!(c, '/' | '\\' | '.' | ':') || c.is_whitespace())
+    }
+
+    /// `SHOW <name>` (web volume management plan §1.2): the volume
+    /// file's EXPLICIT configuration as one `OK: <single-line JSON>`
+    /// reply — serialized by core's `volume_show_json`, so every
+    /// credential-valued key collapses to `{"set": true/false}` and the
+    /// VALUE never leaves the backend (write-only). Read-only: no gate
+    /// refusal, no registry mutation — a volume file answers SHOW even
+    /// while its volume is unregistered (REMOVE is runtime-only, K49).
+    fn show_volume(&self, name: &str) -> String {
+        if !Self::name_is_path_safe(name) {
+            return format!(
+                "ERR: `{name}` is not a volume name — SHOW takes the file stem of a \
+                 volumes_dir entry (names match ^[a-z][a-z0-9_-]{{0,31}}$)\n"
+            );
+        }
+        let Some(dir) = self.process_cfg.volumes_dir.as_deref() else {
+            return "ERR: this instance runs single-volume mode (no volumes_dir) — \
+                    SHOW serves multi-volume instances\n"
+                .to_string();
+        };
+        let path = Path::new(dir).join(format!("{name}.toml"));
+        if !path.is_file() {
+            return format!(
+                "ERR: no volume file for `{name}` at {} — SHOW reads the volumes_dir \
+                 ({dir}); `LIST` shows the volumes this instance actually serves\n",
+                path.display()
+            );
+        }
+        match cloudkit_core::config::volume_show_json(&path) {
+            Ok(json) => format!("OK: {json}\n"),
+            Err(error) => format!(
+                "ERR: reading the volume file {} failed: {error} — fix the file and \
+                 retry\n",
+                path.display()
+            ),
+        }
+    }
+
     /// `ADD <name>` (K48's runtime assembly): read `volumes/<name>.toml`
     /// (K49: `enabled = false` refuses — the file is the persistent
     /// source of truth), connect the transport through the injected
@@ -2280,13 +2349,9 @@ impl RuntimeVolumeControl {
     /// registered (the assembled volume is quietly torn down — its
     /// workers never served a request).
     async fn add_volume(&self, name: &str) -> String {
-        // Path-safety precheck before the name becomes a file name: the
-        // full name rules live in `load_volume_config`.
-        if name.is_empty()
-            || name
-                .chars()
-                .any(|c| matches!(c, '/' | '\\' | '.' | ':') || c.is_whitespace())
-        {
+        // Path-safety precheck (shared with SHOW): the full name rules
+        // live in `load_volume_config`.
+        if !Self::name_is_path_safe(name) {
             return format!(
                 "ERR: `{name}` is not a volume name — ADD takes the file stem of a \
                  volumes_dir entry (names match ^[a-z][a-z0-9_-]{{0,31}}$)\n"

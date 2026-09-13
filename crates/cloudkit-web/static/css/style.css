@@ -584,3 +584,47 @@ body {
     font-size: 1.5rem;
     cursor: pointer;
 }
+
+
+/* ---------- Volume management page (web volume management P0) ----------
+   The §1.4 configuration-state twin: additive glue over the existing
+   tokens only — no new visual system. */
+
+/* The topbar title block (the slot the usage-state topbar's search
+   box occupies). */
+.topbar-title h2 {
+    font-size: 1.25rem;
+    font-weight: 700;
+    color: var(--text-main);
+}
+
+.topbar-title p {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin-top: 0.25rem;
+}
+
+/* The failed-volume badge (badge-synced's failure twin). */
+.badge-failed {
+    background: rgba(255, 51, 102, 0.15);
+    color: #ff6688;
+}
+
+/* The tabs-row ＋ chip is a link to /volumes, not a button. */
+a.volume-tab.volume-add {
+    text-decoration: none;
+    color: var(--text-muted);
+    font-weight: 700;
+}
+
+a.volume-tab.volume-add:hover {
+    color: var(--accent-cyan);
+}
+
+/* The P0 Add Volume placeholder (the form lands in P3). */
+.btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+}

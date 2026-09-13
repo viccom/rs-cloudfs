@@ -1,0 +1,142 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CyDrive • Volume Management</title>
+    <link rel="icon" type="image/jpeg" href="/static/img/logo.jpg">
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div class="background-glow"></div>
+
+    <div class="app-container">
+        <!-- Sidebar Navigation (the index skeleton; Cloud Drive points
+             back at the usage-state page, Volumes is active here) -->
+        <aside class="sidebar">
+            <div class="brand">
+                <div class="logo-box">
+                    <img src="/static/img/logo.jpg" alt="CyDrive Logo" class="brand-logo-img">
+                </div>
+                <div class="brand-text">
+                    <h2>CyDrive</h2>
+                    <span>v2.0 • CYNET ENGINE</span>
+                    <span id="backend-badge" class="backend-badge" hidden></span>
+                </div>
+            </div>
+
+            <nav class="nav-menu">
+                <a href="/" class="nav-item"><i class="fa-solid fa-hard-drive"></i> Cloud Drive</a>
+                <a href="/volumes" class="nav-item active"><i class="fa-solid fa-database"></i> Volumes</a>
+                <a href="https://github.com/thecynetx/CyDrive" target="_blank" class="nav-item"><i class="fa-brands fa-github"></i> GitHub</a>
+                <a href="https://cynetx.ir" target="_blank" class="nav-item"><i class="fa-solid fa-shield-halved"></i> Cynet Security</a>
+            </nav>
+
+            <!-- Instance-level storage card (裁决⑤): the Σ of every
+                 volume's indexed bytes / quota snapshots, filled by
+                 volumes.js off the ONE /api/volumes response -->
+            <div class="storage-card">
+                <div class="storage-header">
+                    <span>All Volumes</span>
+                    <span id="storage-percent">0%</span>
+                </div>
+                <div class="progress-bar">
+                    <div class="progress-fill" id="storage-bar" style="width: 15%;"></div>
+                </div>
+                <p id="storage-detail">0 MB / Unlimited</p>
+                <div class="drive-badge">
+                    <i class="fa-solid fa-layer-group"></i> <strong id="volume-count">0</strong> volume(s) on this instance
+                </div>
+            </div>
+        </aside>
+
+        <!-- Main Content Area -->
+        <main class="main-content">
+            <!-- Top Bar (configuration state): the page title + the Add
+                 Volume primary button (P0 placeholder — the form lands
+                 in P3) + refresh -->
+            <header class="topbar">
+                <div class="topbar-title">
+                    <h2><i class="fa-solid fa-database"></i> Volume Management</h2>
+                    <p>Registered storage volumes served by this instance</p>
+                </div>
+
+                <div class="topbar-actions">
+                    <button class="btn btn-primary" id="add-volume-btn" disabled title="coming in P3">
+                        <i class="fa-solid fa-plus"></i> Add Volume
+                    </button>
+                    <button class="btn btn-icon" title="Refresh" onclick="loadVolumesPage()"><i class="fa-solid fa-rotate"></i></button>
+                </div>
+            </header>
+
+            <!-- Stats Grid:卷总数 / Running / Failed / Pending 总和 -->
+            <section class="stats-grid">
+                <div class="stat-card">
+                    <div class="stat-icon icon-blue"><i class="fa-solid fa-database"></i></div>
+                    <div class="stat-info">
+                        <h3 id="stat-volume-count">0</h3>
+                        <p>Volumes</p>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon icon-green"><i class="fa-solid fa-circle-check"></i></div>
+                    <div class="stat-info">
+                        <h3 id="stat-volume-running">0</h3>
+                        <p>Running</p>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon icon-purple"><i class="fa-solid fa-circle-exclamation"></i></div>
+                    <div class="stat-info">
+                        <h3 id="stat-volume-failed">0</h3>
+                        <p>Failed</p>
+                    </div>
+                </div>
+                <div class="stat-card">
+                    <div class="stat-icon icon-cyan"><i class="fa-solid fa-rotate"></i></div>
+                    <div class="stat-info">
+                        <h3 id="stat-volume-pending">0</h3>
+                        <p>Pending Uploads</p>
+                    </div>
+                </div>
+            </section>
+
+            <!-- The volume table (files-table chassis): Actions is a
+                 header-only placeholder until the P1+ buttons land -->
+            <section class="files-container">
+                <div class="section-title">
+                    <h3><i class="fa-solid fa-layer-group"></i> Storage Volumes</h3>
+                    <span id="volume-count-label">0 volumes</span>
+                </div>
+
+                <div class="table-responsive">
+                    <table class="files-table">
+                        <thead>
+                            <tr>
+                                <th>Name</th>
+                                <th>Backend</th>
+                                <th>Status</th>
+                                <th>Drive</th>
+                                <th>Pending</th>
+                                <th>Size</th>
+                                <th>Actions</th>
+                            </tr>
+                        </thead>
+                        <tbody id="volumes-tbody">
+                            <tr>
+                                <td colspan="7" class="loading-state">
+                                    <i class="fa-solid fa-circle-notch fa-spin"></i> Loading volumes...
+                                </td>
+                            </tr>
+                        </tbody>
+                    </table>
+                </div>
+            </section>
+        </main>
+    </div>
+
+    <script src="/static/js/volumes.js"></script>
+</body>
+</html>

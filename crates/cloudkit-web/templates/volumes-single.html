@@ -1,0 +1,40 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>CyDrive • Volume Management</title>
+    <link rel="icon" type="image/jpeg" href="/static/img/logo.jpg">
+    <link rel="stylesheet" href="/static/css/style.css">
+    <link href="https://fonts.googleapis.com/css2?family=Outfit:wght@300;400;600;700;800&family=JetBrains+Mono:wght@400;600&display=swap" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.0/css/all.min.css">
+</head>
+<body>
+    <div class="background-glow"></div>
+
+    <div class="app-container">
+        <main class="main-content">
+            <!-- 裁决④: the single-volume instance's /volumes face — there
+                 is no volume registry to manage (the one volume is the
+                 config.toml the process booted on), so the page says
+                 exactly that instead of an empty management table. -->
+            <section class="files-container" id="volumes-single-note">
+                <div class="section-title">
+                    <h3><i class="fa-solid fa-database"></i> Volume Management</h3>
+                </div>
+                <p style="color: var(--text-muted); line-height: 1.7;">
+                    <i class="fa-solid fa-circle-info" style="color: var(--accent-cyan);"></i>
+                    Single-volume mode: this instance serves <strong>one volume defined by
+                    <code>config.toml</code></strong> — there is no volume registry to manage here.
+                </p>
+                <p style="color: var(--text-muted); line-height: 1.7;">
+                    To manage volumes from the dashboard, run the instance in multi-volume mode:
+                    point <code>volumes_dir</code> at a directory of <code>&lt;name&gt;.toml</code>
+                    volume files and restart. The usage-state dashboard for the current volume is
+                    <a href="/" style="color: var(--accent-cyan);">on the home page</a>.
+                </p>
+            </section>
+        </main>
+    </div>
+</body>
+</html>

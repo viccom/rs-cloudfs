@@ -582,6 +582,69 @@ pub fn load_volume_config(path: &Path) -> Result<VolumeConfig, ConfigError> {
     })
 }
 
+/// Serializes one volume file's EXPLICIT configuration as the compact
+/// single-line JSON the control channel's `SHOW <name>` command answers
+/// with (web volume management plan §1.2 / K49 修订): the validated
+/// volume name plus every key the file explicitly sets, verbatim —
+/// EXCEPT the credential-valued keys ([`SECRET_VALUED_KEYS`]), which
+/// collapse to `{"set": true}` / `{"set": false}` markers (write-only
+/// principle: the value never leaves the backend — the reply is what
+/// the dashboard's edit form prefills from). Keys the file leaves
+/// unset appear nowhere (the reply shows the file, not the parsed
+/// config with its defaults).
+///
+/// Validation is [`load_volume_config`]'s whole funnel (name rules,
+/// strict key surface, typed parse) — a half-validated file never
+/// serializes. The file is parsed twice (validated config + raw table
+/// for the explicit keys); a SHOW is a rare, human-scale command, so
+/// the double read is free.
+pub fn volume_show_json(path: &Path) -> Result<String, ConfigError> {
+    let spec = load_volume_config(path)?;
+    let path_str = path_as_str(path);
+    let text = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        path: path_str.clone(),
+        source,
+    })?;
+    let table: toml::Table = toml::from_str(&text).map_err(|err| ConfigError::Parse {
+        path: path_str,
+        message: redact_credential_values(&err.to_string()),
+    })?;
+    let mut body = serde_json::Map::new();
+    body.insert("name".to_string(), serde_json::json!(spec.name));
+    for (key, value) in &table {
+        // Credential keys serialize once below, uniformly (present or
+        // absent) — never through their values.
+        if SECRET_VALUED_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        body.insert(key.clone(), toml_value_json(value));
+    }
+    for key in SECRET_VALUED_KEYS {
+        body.insert(
+            (*key).to_string(),
+            serde_json::json!({ "set": table.contains_key(*key) }),
+        );
+    }
+    serde_json::to_string(&serde_json::Value::Object(body)).map_err(|error| {
+        ConfigError::Invalid(format!(
+            "serializing the volume configuration for SHOW failed: {error}"
+        ))
+    })
+}
+
+/// One explicit toml value as JSON. The strict key surface only admits
+/// scalars, so the structural toml variants are unreachable in practice
+/// — they degrade to their toml text rather than failing the reply.
+fn toml_value_json(value: &toml::Value) -> serde_json::Value {
+    match value {
+        toml::Value::String(text) => serde_json::Value::String(text.clone()),
+        toml::Value::Integer(number) => serde_json::json!(number),
+        toml::Value::Float(number) if number.is_finite() => serde_json::json!(number),
+        toml::Value::Boolean(flag) => serde_json::Value::Bool(*flag),
+        other => serde_json::Value::String(other.to_string()),
+    }
+}
+
 /// Lists the `*.toml` volume files in `dir` (non-recursive), sorted
 /// stably by file name (K19). A missing directory and a directory with
 /// no volume files are both actionable errors — an empty multi-volume

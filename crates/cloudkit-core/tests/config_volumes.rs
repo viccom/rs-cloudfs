@@ -15,8 +15,9 @@ use std::fs;
 use std::path::Path;
 
 use cloudkit_core::config::{
-    discover_volumes, ensure_no_volume_keys_in_process, load_volume_config, load_volumes, Backend,
-    ConfigError, CyDriveConfig, KNOWN_TOML_KEYS, PROCESS_SCOPED_KEYS, VOLUME_SCOPED_KEYS,
+    discover_volumes, ensure_no_volume_keys_in_process, load_volume_config, load_volumes,
+    volume_show_json, Backend, ConfigError, CyDriveConfig, KNOWN_TOML_KEYS, PROCESS_SCOPED_KEYS,
+    VOLUME_SCOPED_KEYS,
 };
 
 // ------------------------------------------------------------- helpers ---
@@ -753,4 +754,74 @@ fn enabled_false_roundtrips_and_default_saves_stay_clean() {
     let reloaded = CyDriveConfig::load_toml(&path).expect("reload");
     assert!(!reloaded.enabled, "the disable must survive the round-trip");
     assert_eq!(reloaded, disabled, "the whole config round-trips");
+}
+
+// ------------------------------------- SHOW serialization (web volume P0) ---
+
+/// The SHOW serializer (web volume management plan §1.2): a volume
+/// file's EXPLICIT keys as one compact JSON line — every
+/// credential-valued key collapsed to `{"set": bool}` (write-only: the
+/// value never leaves the backend), absent credentials reporting
+/// `{"set": false}`, and nothing the file leaves unset appearing at
+/// all (no defaults — the reply shows the file, not the parsed config).
+#[test]
+fn volume_show_json_reports_explicit_keys_and_masks_credentials() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("media.toml");
+    write_file(
+        &file,
+        "backend = \"telegram\"\n\
+         bot_token = \"111:FAKE-TOKEN-MARKER\"\n\
+         chat_id = 4242\n\
+         chunk_size_mb = 8\n",
+    );
+
+    let line = volume_show_json(&file).expect("serialize the volume file");
+    assert!(!line.contains('\n'), "one compact line: {line}");
+    let value: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+    assert_eq!(value["name"], "media", "the validated file stem");
+    assert_eq!(value["backend"], "telegram");
+    assert_eq!(value["chat_id"], 4242);
+    assert_eq!(value["chunk_size_mb"], 8);
+    // An explicit credential collapses to the set marker; an absent one
+    // reports unset; the VALUE must not ride the reply in any form.
+    assert_eq!(value["bot_token"], serde_json::json!({"set": true}));
+    assert_eq!(
+        value["encryption_password"],
+        serde_json::json!({"set": false})
+    );
+    assert!(
+        !line.contains("FAKE-TOKEN-MARKER"),
+        "credential leaked: {line}"
+    );
+    // An ordinary key the file leaves unset stays absent — no defaults.
+    assert!(
+        value.get("drive_letter").is_none(),
+        "no defaulted keys: {value}"
+    );
+}
+
+/// SHOW rejects what `load_volume_config` rejects (the same validation
+/// funnel — name rules, unknown keys, process-level keys): the
+/// serializer never answers half-validated configuration.
+#[test]
+fn volume_show_json_reuses_the_volume_file_validation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let unknown = dir.path().join("bad.toml");
+    write_file(&unknown, "backend = \"local\"\nno_such_key = 1\n");
+    assert!(
+        volume_show_json(&unknown)
+            .expect_err("unknown key must be refused")
+            .to_string()
+            .contains("no_such_key"),
+        "the refusal names the key"
+    );
+
+    let process = dir.path().join("web.toml");
+    write_file(&process, "backend = \"local\"\nweb_ui_port = 9\n");
+    assert!(
+        volume_show_json(&process).is_err(),
+        "a process-level key must be refused"
+    );
 }
