@@ -27,7 +27,9 @@ mime_guess = "2"
 rust-embed = "8"
 serde_json = "1"
 thiserror = "2"
-tokio = { version = "1", features = ["io-util", "net", "rt", "sync"] }
+# "time" since the web volume management P0: the command seam's read
+# budget (5s) — a wedged volume command must not park the dashboard.
+tokio = { version = "1", features = ["io-util", "net", "rt", "sync", "time"] }
 
 [dev-dependencies]
 tempfile = "3"

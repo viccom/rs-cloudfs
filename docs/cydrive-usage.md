@@ -98,6 +98,7 @@ your-dir/
 | `storage_path` / `cache_path` / `db_path` | `./Telegram_Drive` `./Telegram_Cache` `./cydrive_meta.db` | 路径布局 |
 | `webdav_host` / `webdav_port` | `127.0.0.1` / `8080` | WebDAV 监听 |
 | `web_ui_host` / `web_ui_port` | `127.0.0.1` / `8088` | 仪表盘监听；`enable_web_ui = false` 可关 |
+| `allow_remote_admin` | `false` | 仪表盘绑非回环地址（如 `0.0.0.0`）时是否放开卷管理写操作（卸载/启用/禁用/新增/编辑/删除）；不设=远程只读（写路由 403 并提示本键） |
 | `drive_letter` | `Y:` | Windows 挂载盘符 |
 | `auto_mount_drive` | `true` | run 时自动挂载、stop 时自动卸载 |
 | `mount_point` | `$HOME/CyDrive` | Linux 挂载点（绝对路径；Windows 忽略） |

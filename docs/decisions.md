@@ -604,3 +604,13 @@
 - **M5（685e554）**：三个特征测试钉住已声明行为（均直接绿，如实标注 pin）——①慢 REMOVE 在途时控制通道整体让位（PING/LIST 回复都在 REMOVE 完成后），②摘到空表实例继续服务（LIST 0 卷/端口在/PING 活），③**keep-alive 同连接跨摘卷**（207→remove→同连接 404，裸 TCP keep-alive helper，RV1 per-request 分发声明的直接钉子）；webdav 测试 helper 增强 chunked 解码（multistatus 无 Content-Length，纯测试侧）。
 - **审查结论修正（K55 条目的证伪②撤回）**：K55 批曾裁定「cydrive stop 客户端挂起不成立——STOP 在连接任务内即时回执」。M5 特征测试实证：**连接任务的 accept 本身在 handler await 期间不被 poll**——PING/STOP 的回执同样要等在途命令完成（TCP 握手仅在内核 backlog 成功）。K55 M1 的 120s 客户端预算恰好兜住该挂起面；若未来要求 PING/STOP 真即时（探活不被长命令阻塞），需把 PING/STOP 挪出 accept loop，属行为变更留裁决（tracking 挂账）。
 - **批次执行事故如实记录**：M3/M4 首 push 前因 fmt 门禁差两行 soft reset 重 commit（dba923f/83223a0 → 093cd4d/5d68c1b，内容不变）；M5 测试期发现并如实区分一处探针问题（read_response 不认 chunked）与产品行为。
+
+## 2026-09-13 Web 卷管理面 + 运行时 rebuild 落地：K57 入档（feat/web-volume-mgmt，计划 docs/plans/2026-09-13-web-volume-management.md）
+
+- **K48 修订（触发源扩展）**：卷管理触发源 = 控制通道命令（原）**+ web 管理面**——web 经进程内回调缝（`VolumeCommandClient`，与 `VolumeCommandHandler` 逐 token 同型）把命令汇入**同一 mpsc 串行队列**（K48 串行化语义/K50/H1-H3/M1 全套设施免费继承）；协议扩 `SHOW/CONFIGS/ENABLE/DISABLE/REBUILD/CREATE/UPDATE/DESTROY` 八命令（REBUILD 受理后转后台不占队列）。
+- **K49 修订（分档解禁）**：REMOVE 运行态语义不变；CREATE/UPDATE 允许程序写卷 toml——core `render_volume_toml`（显式键保序受控渲染，**不用 save_toml**——铺 29 默认键不可用；toml `preserve_order` 特性开启，已核全仓无键序依赖）；**凭据 write-only**（SHOW 只回 `{"set":bool}`，UPDATE 载荷缺失/空=保留、非空=覆盖，存储凭据值不经手任何日志/回复——M3 纪律延伸到命令载荷）；**DESTROY 永不触碰远端数据**，本地数据目录默认保留、`purge_local` 第三词显式才删；toml 重写丢注释在回复/UI 明示（裁决①：不引 toml_edit）。
+- **K11 增补（rebuild 运行时化）**：运行时 rebuild 允许（WAL 多连接并发设计内；可见性=消费面每请求直查 db 即时生效）；`REBUILD <名>` 后台命令带 **R1-R6 强制约束**（单飞互斥/排空门槛=H2 `outstanding()` 与 REMOVE 同源/后台化不占队列/15min 有界幂等中止/R5 检查点随 REMOVE 与停机联动/加密卷 K11 拒+telegram 拒）；`cydrive rebuild` 多卷检测活实例转发；**no-pruning 边界重申**（周期化与死行清理另行裁决）。运行时并发安全前提 2026-09-12 会话核实（WAL/busy_timeout=5000、requeue 只挑 is_uploaded=0、窄竞态被 R2 消除）。
+- **安全增界（管理写路由）**：`same_origin_guard`（Origin/Referer 同源校验，非同源 403）挂 /api/volumes 写族；**非 loopback 绑定自动降级只读**（`web_ui_host` 非 127.0.0.1/::1 → 写族 403 + 启动 warning），远程管理需显式新进程键 `allow_remote_admin = true`（K19 三清单同步）。
+- **双页布局（负责人裁决：使用态与配置态独立页面）**：`/volumes` 配置页（同 CSS token 体系：实例概览四卡 + 卷表 Name|Backend|Status|Drive|Pending|Size|Actions + 展开式表单卡 + 两步删除 modal）与 `/` 使用态整页跳转互链；单卷模式 `/volumes` 给说明页；顺路修复使用态选中卷被 REMOVE 后 current 悬空 UI 冻结缺陷。
+- **批次与验证**：P0-P6 七批全绿（6972651/72bdfe7/4e07ff2+bf338c2/00c522b/63daf3b/782d63d），workspace 955→1039（+84 测试），winfsp 腿 117/0/1 持平，clippy×3/fmt/裁剪构建/check_layers/scan_secrets 全绿；前端以 jsdom DOM harness 钉住（P0 22 项、P1 16、P5 31 等），真浏览器视觉面待真机窗口复核（挂账）。**执行事故如实记录**：P3/P4 派发两次撞账号 5 小时限额——一次实为异步完成（commit 落盘但报告未达，主会话按未审查处理：亲跑门禁 1026/0/12 + 安全点抽查后放行）；一次中断留半成品（重置丢弃重派）。
+- **挂账**：周期 rebuild、pruning 策略、rebuild_timeout 可配键、管理面鉴权（Origin 之上）、真浏览器视觉复核、写路由超时分支真机验证。

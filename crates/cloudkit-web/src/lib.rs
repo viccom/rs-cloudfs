@@ -66,14 +66,77 @@
 //!
 //! - `GET /api/volumes` — the registry listing (name / backend /
 //!   volume_id / drive_letter / webdav_url / status / status_reason /
-//!   quota / total_files / total_bytes), the numbers read from each
-//!   volume's db metadata — never a backend scan (the PCFS Stats
-//!   anti-lesson).
+//!   quota / total_files / total_bytes / pending), the numbers read
+//!   from each volume's db metadata — never a backend scan (the PCFS
+//!   Stats anti-lesson); `pending` is the queue's outstanding upload
+//!   count (`null` on a failed volume — no queue exists).
 //! - `GET /api/stats/summary` — the cross-volume aggregate (Σ files /
 //!   bytes / dirs / uploaded / pending / quota over the RUNNING
 //!   volumes) for the dashboard's summary card. A distinct shape on
-//!   purpose: the frozen 16-key `/api/stats` contract stays a
+//!   a purpose: the frozen 16-key `/api/stats` contract stays a
 //!   per-volume answer.
+//! - `GET /api/volumes/{name}/config` — the named volume's FILE
+//!   configuration through the injected [`VolumeCommandClient`] seam
+//!   (web volume management §1.1): a `SHOW <name>` whose JSON reply
+//!   passes through verbatim, credentials already collapsed to
+//!   `{"set": bool}` markers by the core serializer (write-only — a
+//!   credential VALUE never reaches this layer). The registry gates the
+//!   lookup (a REMOVE'd volume 404s though its file stays), no seam
+//!   answers 503.
+//! - `GET /api/volumes/configs` (P1) — the configuration FULL set (the
+//!   management page's data source: the registry listing cannot see
+//!   disabled volumes): one `CONFIGS` through the seam, the row lines
+//!   parsed into `{name, backend, enabled, running}` / `{name,
+//!   invalid, reason}` JSON, with the P2 sparse markers `rebuilding`/
+//!   `encrypted` riding as `true` when the row carries them.
+//! - `POST /api/volumes/{name}/remove|disable|enable` (P1) — the
+//!   management write family: one command through the same seam (the
+//!   SAME serialized execution the control channel funnels into), the
+//!   reply mapped to `{"ok": true, "reply": "..."}` or a 409 carrying
+//!   the actionable `ERR:` text. The web-side budget is the control
+//!   client's 120s (a REMOVE legitimately drains uploads first). No
+//!   registry gate: a disabled volume is by definition absent from the
+//!   registry — the command's own reply is the authority.
+//! - `POST /api/volumes/{name}/rebuild` (P6) — the Refresh button's
+//!   member of the same write family: one `REBUILD <name>` whose reply
+//!   is the instance's ACCEPTANCE (the walk is the instance's
+//!   background task, so the 120s budget covers the serialized queue,
+//!   never the walk); the volume's `rebuilding` marker (the configs
+//!   rows above) is the button's live state.
+//! - `POST /api/volumes` (P3) — the Add Volume form's member: the body's
+//!   `name` keys the command and the remaining object rides as the
+//!   compact single-line JSON payload of one `CREATE <name> <json>`; the
+//!   command is the authority on the payload (key space, validation
+//!   before any write, the controlled toml, the ADD leg), the route on
+//!   the body's shape (a non-JSON body or a missing `name` answers 400).
+//!   The 180s assembly budget covers the ADD leg's connect + mount
+//!   windows behind the serialized queue.
+//! - `POST /api/volumes/{name}` (P4) — the edit form's member: the name
+//!   rides the path, the body's object rides verbatim as the payload of
+//!   one `UPDATE <name> <json>` (the command owns the write-only
+//!   credential overlay and the REMOVE+ADD re-assembly with its
+//!   mixed-state replies); the same 180s assembly budget and family
+//!   gates.
+//! - `POST /api/volumes/{name}/destroy` (P5) — the delete modal's
+//!   member: the two-leg protocol's HTTP face. A body without
+//!   `confirm: true` forwards the bare `DESTROY <name>` (the preview —
+//!   the command executes nothing) and answers
+//!   `{"ok": true, "reply": ..., "confirm_required": true}`; a
+//!   confirmed body forwards `DESTROY <name> confirm` with the optional
+//!   literal `purge_local` third word and answers the family's plain
+//!   success shape. Budget 120s (REMOVE's ≈70s windows + the file
+//!   deletion's instant); the family gates answer before the command.
+//!
+//! The volume-management family (`/api/volumes`, the two config
+//! routes, and the write routes) runs behind a same-origin guard (§1.5
+//! 裁决③): an Origin/Referer naming another site 403s; headerless
+//! requests (non-browser clients) pass. The write family additionally
+//! carries the §1.5 non-loopback ruling: bound to a non-loopback
+//! address without the process key `allow_remote_admin = true`, the
+//! write routes 403 naming that key (the management plane degrades to
+//! read-only; the reads and pages stay open). `GET /volumes` (both
+//! mode tables — multi serves the management page, single-volume the
+//! explanation page, 裁决④) stays open like every page/read route.
 //!
 //! Single-volume mode (the `serve` constructor) is untouched: the same
 //! nine-route table, the same bodies, and a stray `?volume=` parameter
@@ -83,15 +146,17 @@
 //! Production binds `127.0.0.1:8088` (the caller's concern); tests bind
 //! `127.0.0.1:0`.
 
+use std::future::Future;
 use std::net::SocketAddr;
 use std::pin::Pin;
 use std::sync::{Arc, Mutex};
 use std::task::{Context, Poll};
-use std::time::SystemTime;
+use std::time::{Duration, SystemTime};
 
 use axum::body::Body;
 use axum::extract::{DefaultBodyLimit, Multipart, Path, Request, State};
 use axum::http::{header, StatusCode, Uri};
+use axum::middleware::Next;
 use axum::response::{IntoResponse, Response};
 use axum::routing::{get, post};
 use axum::Json;
@@ -205,6 +270,23 @@ pub struct VolumeUiEntry {
     /// The volume's own VFS (`None` for a failed volume).
     pub vfs: Option<Arc<Vfs>>,
 }
+
+/// The volume-command callback seam (web volume management plan §1.1):
+/// the dashboard's route into the cli composition root's serialized
+/// volume-command execution — the raw command line in, the verbatim
+/// reply text out (`OK: ...` / `ERR: ...`), the same contract the
+/// loopback control channel's handler serves. Defined here, structurally
+/// identical to cli's `VolumeCommandHandler`, because web and cli are
+/// both L5 (a web→cli import would be a Cargo cycle); the cli assembly
+/// injects its installed handler as one more `Arc` clone, so web-sent
+/// commands and control-channel commands funnel into the SAME
+/// serialized queue (K48's serialization semantics inherit unchanged).
+pub type VolumeCommandClient = Arc<
+    dyn for<'a> Fn(&'a str) -> Pin<Box<dyn Future<Output = String> + Send + 'a>>
+        + Send
+        + Sync
+        + 'static,
+>;
 
 /// Errors from assembling the dashboard.
 #[derive(Debug, thiserror::Error)]
@@ -349,12 +431,60 @@ impl WebUiServer {
     /// same nine routes (now taking the K23 `?volume=<name>` parameter)
     /// plus the two registry routes `/api/volumes` and
     /// `/api/stats/summary` — every request re-reads the table, so
-    /// later insertions/removals are visible at once.
+    /// later insertions/removals are visible at once. Without the
+    /// command seam (the volume-management routes answer 503).
     pub async fn serve_multi(
         volumes: RegistryHandle,
         addr: SocketAddr,
     ) -> Result<Self, WebUiError> {
-        let app = multi_router(volumes);
+        Self::serve_multi_with_commands(volumes, addr, None).await
+    }
+
+    /// [`WebUiServer::serve_multi`] with the volume-command seam
+    /// installed (web volume management plan §1.1): the dashboard's
+    /// management routes (`GET /api/volumes/{name}/config`, the P1+
+    /// write family) send their commands through `commands` — the SAME
+    /// handler the cli composition root installed on the control
+    /// channel, so both trigger sources serialize behind one queue.
+    /// `None` keeps the read-only dashboard (the seam routes answer
+    /// their actionable 503). Equivalent to
+    /// [`WebUiServer::serve_multi_with_remote_admin`] without the
+    /// opt-in: a non-loopback bind keeps the write family withheld.
+    pub async fn serve_multi_with_commands(
+        volumes: RegistryHandle,
+        addr: SocketAddr,
+        commands: Option<VolumeCommandClient>,
+    ) -> Result<Self, WebUiError> {
+        Self::serve_multi_with_remote_admin(volumes, addr, commands, false).await
+    }
+
+    /// [`WebUiServer::serve_multi_with_commands`] plus the §1.5
+    /// remote-administration ruling: the management WRITE family
+    /// (`POST /api/volumes/{name}/{remove,enable,disable}`) serves only
+    /// when the bind address is loopback OR the operator passed
+    /// `allow_remote_admin = true` (the process key of the same name,
+    /// threaded in by the cli assembly). A non-loopback bind without the
+    /// opt-in degrades the management plane to read-only — the write
+    /// routes 403 naming the key, the reads (listing, configs, config)
+    /// stay open — with a startup warning.
+    pub async fn serve_multi_with_remote_admin(
+        volumes: RegistryHandle,
+        addr: SocketAddr,
+        commands: Option<VolumeCommandClient>,
+        allow_remote_admin: bool,
+    ) -> Result<Self, WebUiError> {
+        let writes_allowed = addr.ip().is_loopback() || allow_remote_admin;
+        if !writes_allowed {
+            // The crate's log face is eprintln (the accept-loop error
+            // precedent); the cli assembly's tracing carries the same
+            // fact on its own.
+            eprintln!(
+                "[web-ui] bound to a non-loopback address ({addr}): the \
+                 volume-management write routes are disabled (403) — set \
+                 allow_remote_admin = true in config.toml to manage volumes remotely"
+            );
+        }
+        let app = multi_router(volumes, commands, writes_allowed);
         serve_router(app, addr).await
     }
 
@@ -409,6 +539,11 @@ async fn serve_router(app: axum::Router, addr: SocketAddr) -> Result<WebUiServer
 fn contract_routes(router: axum::Router<AppState>) -> axum::Router<AppState> {
     router
         .route("/", get(index))
+        // The volume-management page (web volume management §1.4) is on
+        // BOTH mode tables by design: the multi-volume mode serves the
+        // management skeleton, the single-volume mode the explanation
+        // page (裁决④) — one handler, state-picked body.
+        .route("/volumes", get(page_volumes))
         .route("/api/files", get(api_files))
         .route("/api/stats", get(api_stats))
         .route("/api/upload", post(api_upload))
@@ -436,11 +571,62 @@ fn router(vfs: Arc<Vfs>, cfg: WebUiConfig) -> axum::Router {
 }
 
 /// Assembles the multi-volume route table: the nine contract routes
-/// (K23 volume-parameter flavour) plus the two registry routes.
-fn multi_router(volumes: RegistryHandle) -> axum::Router {
-    let state = AppState::Multi { volumes };
+/// (K23 volume-parameter flavour) plus the two registry routes and the
+/// volume-management family — `/api/volumes`, the config endpoint, the
+/// configs listing and the P1 write routes share the same-origin guard
+/// (§1.5 裁决③), the family deliberately NOT spanning the read routes
+/// (downloads stay linkable from anywhere). `writes_allowed` is the
+/// §1.5 verdict (loopback bind or the `allow_remote_admin` opt-in);
+/// the write handlers 403 when it is `false`.
+fn multi_router(
+    volumes: RegistryHandle,
+    commands: Option<VolumeCommandClient>,
+    writes_allowed: bool,
+) -> axum::Router {
+    let state = AppState::Multi {
+        volumes,
+        commands,
+        writes_allowed,
+    };
     contract_routes(axum::Router::new())
-        .route("/api/volumes", get(api_volumes))
+        .route(
+            "/api/volumes",
+            get(api_volumes)
+                .post(api_volume_create)
+                .layer(axum::middleware::from_fn(same_origin_guard)),
+        )
+        .route(
+            "/api/volumes/configs",
+            get(api_volume_configs).layer(axum::middleware::from_fn(same_origin_guard)),
+        )
+        .route(
+            "/api/volumes/{name}/config",
+            get(api_volume_config).layer(axum::middleware::from_fn(same_origin_guard)),
+        )
+        .route(
+            "/api/volumes/{name}/remove",
+            post(api_volume_remove).layer(axum::middleware::from_fn(same_origin_guard)),
+        )
+        .route(
+            "/api/volumes/{name}/disable",
+            post(api_volume_disable).layer(axum::middleware::from_fn(same_origin_guard)),
+        )
+        .route(
+            "/api/volumes/{name}/enable",
+            post(api_volume_enable).layer(axum::middleware::from_fn(same_origin_guard)),
+        )
+        .route(
+            "/api/volumes/{name}/rebuild",
+            post(api_volume_rebuild).layer(axum::middleware::from_fn(same_origin_guard)),
+        )
+        .route(
+            "/api/volumes/{name}/destroy",
+            post(api_volume_destroy).layer(axum::middleware::from_fn(same_origin_guard)),
+        )
+        .route(
+            "/api/volumes/{name}",
+            post(api_volume_update).layer(axum::middleware::from_fn(same_origin_guard)),
+        )
         .route("/api/stats/summary", get(api_stats_summary))
         .with_state(state)
 }
@@ -458,8 +644,16 @@ enum AppState {
     },
     /// The multi-volume boot (K23/K24): the shared table the handlers
     /// re-read per request (RV1) to resolve the `?volume=<name>`
-    /// parameter.
-    Multi { volumes: RegistryHandle },
+    /// parameter, plus the volume-command seam (web volume management
+    /// §1.1) the management routes send through — `None` on a dashboard
+    /// booted without one (those routes answer 503) — and the §1.5
+    /// write verdict (loopback bind or the `allow_remote_admin`
+    /// opt-in; the write routes 403 when `false`).
+    Multi {
+        volumes: RegistryHandle,
+        commands: Option<VolumeCommandClient>,
+        writes_allowed: bool,
+    },
 }
 
 /// One request's volume resolution: the `(vfs, config)` pair the frozen
@@ -500,7 +694,7 @@ impl AppState {
                 vfs: Arc::clone(vfs),
                 cfg: (**cfg).clone(),
             }),
-            AppState::Multi { volumes } => {
+            AppState::Multi { volumes, .. } => {
                 let names = volumes.names();
                 let requested = query
                     .and_then(|q| query_param(q, "volume"))
@@ -580,6 +774,685 @@ async fn static_asset(Path(path): Path<String>) -> Response {
             content_response(mime.as_ref(), file.data.into_owned())
         }
         None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// `GET /volumes` (web volume management §1.4): the configuration-state
+/// page, one handler for both modes — multi-volume serves the
+/// management skeleton (`volumes.html`, filled by `volumes.js` off
+/// `/api/volumes`); a single-volume instance gets the explanation page
+/// (裁决④: its one volume is defined by `config.toml`, there is no
+/// volume registry to manage).
+async fn page_volumes(State(state): State<AppState>) -> Response {
+    let template = match &state {
+        AppState::Multi { .. } => "volumes.html",
+        AppState::Single { .. } => "volumes-single.html",
+    };
+    match Templates::get(template) {
+        Some(file) => content_response("text/html; charset=utf-8", file.data.into_owned()),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+// ------------------------------- the same-origin guard (web volume §1.5) ---
+
+/// The volume-management family's CSRF-shaped defense (裁决③: Origin
+/// checking, not tokens): a state-changing browser request always
+/// carries an Origin (or a Referer) naming the site that issued it, so
+/// a management API call whose Origin/Referer names another site is a
+/// cross-site forgery and answers 403. Requests carrying neither header
+/// (non-browser clients, address-bar navigation) pass — the dashboard
+/// has no session for them to forge. Deliberately scoped to the
+/// `/api/volumes*` family only: the read routes (downloads, stats) and
+/// the pages stay open to foreign links.
+async fn same_origin_guard(request: Request, next: Next) -> Response {
+    match cross_origin_refusal(&request) {
+        Some(message) => error_json(StatusCode::FORBIDDEN, message),
+        None => next.run(request).await,
+    }
+}
+
+/// The refusal verdict for one request: `Some(message)` when an Origin
+/// or Referer header is present and does not name this server's own
+/// authority (compared case-insensitively against the Host header).
+/// `Origin: null` (sandboxed frames) counts as foreign. A missing Host
+/// passes — browsers always send one, so a headerless pair is a
+/// non-browser client, not an attack.
+fn cross_origin_refusal(request: &Request) -> Option<String> {
+    let headers = request.headers();
+    let host = headers.get(header::HOST)?.to_str().ok()?;
+    let (name, value) = if let Some(origin) = headers.get(header::ORIGIN) {
+        ("Origin", origin.to_str().ok()?)
+    } else {
+        let referer = headers.get(header::REFERER)?;
+        ("Referer", referer.to_str().ok()?)
+    };
+    let authority = origin_authority(value);
+    (!authority.eq_ignore_ascii_case(host)).then(|| {
+        format!(
+            "cross-origin request refused: the volume management API only serves this \
+             dashboard's own origin ({name} {value} does not match Host {host})"
+        )
+    })
+}
+
+/// The authority span of an Origin/Referer value — `scheme://authority`
+/// up to the first `/` (the path tail of a Referer never participates).
+/// A value with no parseable scheme degrades to its text up to the
+/// first `/`, which cannot equal a `host:port` pair unless it is one.
+fn origin_authority(value: &str) -> &str {
+    let rest = value
+        .strip_prefix("http://")
+        .or_else(|| value.strip_prefix("https://"))
+        .unwrap_or(value);
+    rest.split('/').next().unwrap_or(rest)
+}
+
+// ------------------------- the volume-command seam routes (web volume §1.1) ---
+
+/// The web-side budget for one seam command (§4's risk mitigation):
+/// SHOW is a fast file read, but the seam serializes behind whatever
+/// the control channel has in flight (a REMOVE draining a large
+/// upload) — the dashboard refuses to park behind it. Deliberately NOT
+/// the control client's 120s budget: that exists for a REMOVE's own
+/// drain windows; this is an in-process callback answering reads.
+const VOLUME_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// `GET /api/volumes/{name}/config` (multi-volume mode only; web
+/// volume management §1.1/§1.2): the named volume's FILE configuration
+/// through the command seam — a `SHOW <name>` whose reply JSON passes
+/// through verbatim (core's serializer already collapsed every
+/// credential key to its `{"set": bool}` marker; the value never
+/// reaches this layer, let alone the browser). The registry gates the
+/// lookup — a REMOVE'd volume 404s even though its file stays (K49:
+/// removal is runtime-only). A missing seam answers 503 (a dashboard
+/// booted without volume management), a command that outlives
+/// [`VOLUME_COMMAND_TIMEOUT`] 503s actionably, and the seam's `ERR:`
+/// replies carry their actionable text as 404s.
+async fn api_volume_config(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    let AppState::Multi {
+        volumes, commands, ..
+    } = &state
+    else {
+        return error_json(
+            StatusCode::NOT_FOUND,
+            "no volume registry: this dashboard serves a single volume",
+        );
+    };
+    let names = volumes.names();
+    if volumes.find(&name).is_none() {
+        return volume_routing_error(
+            StatusCode::NOT_FOUND,
+            format!("unknown volume '{name}'"),
+            &names,
+        );
+    }
+    let Some(client) = commands else {
+        return error_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "volume configuration is not available: this dashboard runs without the \
+             volume-command seam (the multi-volume cli assembly installs it)",
+        );
+    };
+    let command = format!("SHOW {name}");
+    let reply = match tokio::time::timeout(VOLUME_COMMAND_TIMEOUT, client(&command)).await {
+        Ok(reply) => reply,
+        Err(_elapsed) => {
+            return error_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "the volume command for '{name}' timed out — the instance is likely busy \
+                     with a long volume command (e.g. a REMOVE draining an upload); retry \
+                     once it settles"
+                ),
+            );
+        }
+    };
+    match reply.strip_prefix("OK: ") {
+        Some(payload) => match serde_json::from_str::<serde_json::Value>(payload.trim()) {
+            Ok(value) => Json(value).into_response(),
+            Err(_) => error_json(
+                StatusCode::INTERNAL_SERVER_ERROR,
+                "the SHOW reply was not valid JSON — the volume file may be mid-edit; retry",
+            ),
+        },
+        None => error_json(
+            StatusCode::NOT_FOUND,
+            reply.trim().trim_start_matches("ERR: "),
+        ),
+    }
+}
+
+// --------------------------- the P1 write family + configs (web volume §1.2/§1.5) ---
+
+/// The write-family seam budget: a REMOVE legitimately waits out its
+/// 60s drain + 10s unmount windows (K50), so the web call carries the
+/// control client's own 120s budget (M1 `EXCHANGE_BUDGET` semantics)
+/// instead of the read family's 5s — the dashboard parks behind a long
+/// command rather than giving up on it.
+const VOLUME_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The write family's shared gate ladder (P1 §1.5, extracted for the
+/// P5 destroy route): the single-volume 404, the non-loopback write
+/// verdict 403 (naming the opt-in key) and the missing-seam 503 —
+/// answered in that order, BEFORE any command is built. `Ok` hands
+/// back the seam client.
+// axum's Response IS the handler currency here (the `resolve`
+// precedent: every refusal goes straight back as the handler's return
+// value); boxing it would trade a per-request indirection for a lint's
+// byte count.
+#[allow(clippy::result_large_err)]
+fn write_family_gates(state: &AppState) -> Result<&VolumeCommandClient, Response> {
+    let AppState::Multi {
+        commands,
+        writes_allowed,
+        ..
+    } = state
+    else {
+        return Err(error_json(
+            StatusCode::NOT_FOUND,
+            "no volume registry: this dashboard serves a single volume",
+        ));
+    };
+    if !writes_allowed {
+        return Err(error_json(
+            StatusCode::FORBIDDEN,
+            "remote administration is disabled: the web UI is bound to a non-loopback \
+             address, so the volume-management write routes refuse requests — set \
+             `allow_remote_admin = true` in config.toml to manage volumes remotely",
+        ));
+    }
+    commands.as_ref().ok_or_else(|| {
+        error_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "volume commands are not available: this dashboard runs without the \
+             volume-command seam (the multi-volume cli assembly installs it)",
+        )
+    })
+}
+
+/// The shared body of the three write routes (P1, plan §1.2): the §1.5
+/// write verdict first (403 naming the opt-in key on a non-loopback
+/// bind), then one command through the seam with the write budget.
+/// Replies: the pinned success shape `{"ok": true, "reply": "..."}` (the
+/// `OK: ` prefix stripped — the dashboard toasts the text verbatim), a
+/// seam `ERR:` as 409 with its actionable text (a refused mutation is a
+/// conflict; the reply text is what the operator needs), a missing seam
+/// the family 503, a command that outlives the budget the busy 503.
+/// No registry gate on purpose: a DISABLED volume is by definition
+/// absent from the registry — the command's own reply is the authority
+/// on unknown names.
+async fn volume_write_route(state: AppState, name: String, verb: &str) -> Response {
+    let client = match write_family_gates(&state) {
+        Ok(client) => client,
+        Err(response) => return response,
+    };
+    let command = format!("{verb} {name}");
+    let reply = match tokio::time::timeout(VOLUME_WRITE_TIMEOUT, client(&command)).await {
+        Ok(reply) => reply,
+        Err(_elapsed) => {
+            return error_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "the {verb} command for '{name}' timed out — the instance is likely busy \
+                     with a long volume command (e.g. a REMOVE draining an upload); retry \
+                     once it settles"
+                ),
+            );
+        }
+    };
+    map_volume_command_reply(&reply)
+}
+
+/// The write family's shared seam-reply mapping: an `OK: ` prefix
+/// becomes the pinned success shape `{"ok": true, "reply": "..."}` (the
+/// prefix stripped — the dashboard toasts the text verbatim); anything
+/// else is the seam's actionable `ERR:` as 409 (a refused mutation is a
+/// conflict; the reply text is what the operator needs).
+fn map_volume_command_reply(reply: &str) -> Response {
+    match reply.trim().strip_prefix("OK: ") {
+        Some(payload) => Json(serde_json::json!({
+            "ok": true,
+            "reply": payload.trim(),
+        }))
+        .into_response(),
+        None => error_json(
+            StatusCode::CONFLICT,
+            reply.trim().trim_start_matches("ERR: "),
+        ),
+    }
+}
+
+/// The CREATE/UPDATE seam budget (P3/P4): these commands carry a whole
+/// assembly behind the serialized queue. A CREATE runs the ADD leg (the
+/// telegram connect budget alone is 90s, plus the mount); an UPDATE runs
+/// REMOVE first (60s drain + 10s release ≈ 70s) and THEN the ADD leg.
+/// 180s covers remove 70s + add 90s with margin — the M1
+/// `EXCHANGE_BUDGET` philosophy one step wider than the P1 family's
+/// 120s, which predates the assembly-carrying commands.
+const VOLUME_ASSEMBLY_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// `POST /api/volumes` (P3, the Add Volume form's transport): the body
+/// is the form's JSON object — its `name` keys the command line, every
+/// other member rides as the compact single-line JSON payload of one
+/// `CREATE <name> <json>` through the seam (the command is the authority
+/// on the payload's semantics — key space, validation, the controlled
+/// toml write; the route is the authority on the HTTP body's shape).
+/// Budget [`VOLUME_ASSEMBLY_TIMEOUT`]; success/ERR mapping shared with
+/// the write family ([`map_volume_command_reply`]); the §1.5 gates
+/// (Origin middleware on the route, the write verdict, the seam) answer
+/// before the command is built. Credentials ride the body the same way
+/// they ride the volume file — the loopback trust face — and never ride
+/// any reply (the command's refusals name keys, M3).
+async fn api_volume_create(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
+    let AppState::Multi {
+        commands,
+        writes_allowed,
+        ..
+    } = state
+    else {
+        return error_json(
+            StatusCode::NOT_FOUND,
+            "no volume registry: this dashboard serves a single volume",
+        );
+    };
+    if !writes_allowed {
+        return error_json(
+            StatusCode::FORBIDDEN,
+            "remote administration is disabled: the web UI is bound to a non-loopback \
+             address, so the volume-management write routes refuse requests — set \
+             `allow_remote_admin = true` in config.toml to manage volumes remotely",
+        );
+    }
+    let Some(client) = commands else {
+        return error_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "volume commands are not available: this dashboard runs without the \
+             volume-command seam (the multi-volume cli assembly installs it)",
+        );
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                format!("the request body is not valid JSON: {error} — send the form object"),
+            );
+        }
+    };
+    let serde_json::Value::Object(fields) = value else {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "the create body must be a JSON object (the form's fields plus its `name`)",
+        );
+    };
+    let name = match fields.get("name") {
+        Some(serde_json::Value::String(name)) if !name.trim().is_empty() => name.clone(),
+        _ => {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                "the create body needs a non-empty string `name` (the new volume's name)",
+            );
+        }
+    };
+    let mut payload = fields;
+    payload.remove("name");
+    // Compact serialization: the control channel's line protocol carries
+    // the payload as ONE line (a serialized JSON body never spans lines
+    // — newlines ride as escapes).
+    let json = match serde_json::to_string(&payload) {
+        Ok(json) => json,
+        Err(error) => {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                format!("serializing the form payload failed: {error}"),
+            );
+        }
+    };
+    let command = format!("CREATE {name} {json}");
+    let reply = match tokio::time::timeout(VOLUME_ASSEMBLY_TIMEOUT, client(&command)).await {
+        Ok(reply) => reply,
+        Err(_elapsed) => {
+            return error_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "the CREATE command for '{name}' timed out — the instance is likely busy \
+                     or the new volume's backend is slow to connect; the volume file may \
+                     still have been written — check the volume list and retry once it \
+                     settles"
+                ),
+            );
+        }
+    };
+    map_volume_command_reply(&reply)
+}
+
+/// `POST /api/volumes/{name}` (P4, the edit form's transport): the name
+/// rides the PATH, the body is the fields object verbatim — one compact
+/// `UPDATE <name> <json>` through the seam. The command is the
+/// authority on the payload's semantics (the write-only credential
+/// overlay — an empty string keeps the stored value; the file-first
+/// rewrite; the REMOVE+ADD re-assembly and its mixed-state replies);
+/// the route is the authority on the HTTP body's shape (a non-JSON or
+/// non-object body answers 400). Budget [`VOLUME_ASSEMBLY_TIMEOUT`]
+/// (REMOVE's drain + the ADD leg); the family gates answer before the
+/// command is built.
+async fn api_volume_update(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let AppState::Multi {
+        commands,
+        writes_allowed,
+        ..
+    } = state
+    else {
+        return error_json(
+            StatusCode::NOT_FOUND,
+            "no volume registry: this dashboard serves a single volume",
+        );
+    };
+    if !writes_allowed {
+        return error_json(
+            StatusCode::FORBIDDEN,
+            "remote administration is disabled: the web UI is bound to a non-loopback \
+             address, so the volume-management write routes refuse requests — set \
+             `allow_remote_admin = true` in config.toml to manage volumes remotely",
+        );
+    }
+    let Some(client) = commands else {
+        return error_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "volume commands are not available: this dashboard runs without the \
+             volume-command seam (the multi-volume cli assembly installs it)",
+        );
+    };
+    let fields: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                format!("the request body is not valid JSON: {error} — send the form object"),
+            );
+        }
+    };
+    if !fields.is_object() {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "the update body must be a JSON object of the volume keys to change",
+        );
+    }
+    // Compact serialization: the control channel's line protocol carries
+    // the payload as ONE line.
+    let json = match serde_json::to_string(&fields) {
+        Ok(json) => json,
+        Err(error) => {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                format!("serializing the form payload failed: {error}"),
+            );
+        }
+    };
+    let command = format!("UPDATE {name} {json}");
+    let reply = match tokio::time::timeout(VOLUME_ASSEMBLY_TIMEOUT, client(&command)).await {
+        Ok(reply) => reply,
+        Err(_elapsed) => {
+            return error_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "the UPDATE command for '{name}' timed out — the instance is likely busy \
+                     with a long volume command; the volume file may still have been \
+                     rewritten — check the volume list and retry once it settles"
+                ),
+            );
+        }
+    };
+    map_volume_command_reply(&reply)
+}
+
+/// `POST /api/volumes/{name}/remove` (P1): an unmount through the same
+/// K50 sequence the control channel's REMOVE runs (the seam forwards to
+/// the identical handler).
+async fn api_volume_remove(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    volume_write_route(state, name, "REMOVE").await
+}
+
+/// `POST /api/volumes/{name}/disable` (P1): `enabled = false` written to
+/// the volume file first, then the same unmount as REMOVE.
+async fn api_volume_disable(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    volume_write_route(state, name, "DISABLE").await
+}
+
+/// `POST /api/volumes/{name}/enable` (P1): `enabled = true` written,
+/// then the volume re-assembles through the runtime ADD path.
+async fn api_volume_enable(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    volume_write_route(state, name, "ENABLE").await
+}
+
+/// `POST /api/volumes/{name}/rebuild` (P6, the Refresh button): one
+/// `REBUILD <name>` through the seam — the reply is the instance's
+/// ACCEPTANCE (R3: the walk runs as its background task, so the write
+/// budget only ever covers the serialized queue, never the walk). The
+/// seam's `ERR:` refusals (already running, undrained queue, the K11/
+/// telegram gates) ride the family's 409 verbatim.
+async fn api_volume_rebuild(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    volume_write_route(state, name, "REBUILD").await
+}
+
+/// Parses the destroy route's body (P5): `{"confirm": bool,
+/// "purge_local": bool}`, both keys optional and defaulting to `false`
+/// (the safe leg). An entirely EMPTY body is the all-defaults preview
+/// too. A non-JSON body, a non-object body and a wrong-typed flag
+/// answer actionable 400s; unknown members are ignored (forward
+/// compat).
+// Same Response-as-currency allow as `write_family_gates`.
+#[allow(clippy::result_large_err)]
+fn destroy_body(body: &[u8]) -> Result<(bool, bool), Response> {
+    if body.iter().all(|byte| byte.is_ascii_whitespace()) {
+        return Ok((false, false));
+    }
+    let value: serde_json::Value = match serde_json::from_slice(body) {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(error_json(
+                StatusCode::BAD_REQUEST,
+                format!(
+                    "the request body is not valid JSON: {error} — send \
+                     {{\"confirm\": bool, \"purge_local\": bool}}"
+                ),
+            ));
+        }
+    };
+    let serde_json::Value::Object(fields) = value else {
+        return Err(error_json(
+            StatusCode::BAD_REQUEST,
+            "the destroy body must be a JSON object: {\"confirm\": bool, \"purge_local\": bool}",
+        ));
+    };
+    let flag = |key: &str| -> Result<bool, Response> {
+        match fields.get(key) {
+            None | Some(serde_json::Value::Null) => Ok(false),
+            Some(serde_json::Value::Bool(flag)) => Ok(*flag),
+            Some(_) => Err(error_json(
+                StatusCode::BAD_REQUEST,
+                format!("`{key}` must be a boolean in the destroy body (true/false)"),
+            )),
+        }
+    };
+    Ok((flag("confirm")?, flag("purge_local")?))
+}
+
+/// `POST /api/volumes/{name}/destroy` (P5, the delete modal's
+/// transport): the two-leg protocol's HTTP face. A body without
+/// `confirm: true` forwards the bare `DESTROY <name>` — the PREVIEW
+/// leg, which executes nothing — and answers the pinned preview shape
+/// `{"ok": true, "reply": ..., "confirm_required": true}`; a
+/// `confirm: true` body forwards `DESTROY <name> confirm` with the
+/// optional literal `purge_local` third word and answers the family's
+/// plain success shape (the destruction ran — no confirm flag). Budget
+/// [`VOLUME_WRITE_TIMEOUT`] (REMOVE's drain + release windows ≈70s
+/// plus the file deletion's instant); the family gates ([`write_family_gates`])
+/// and the Origin middleware answer before the command is built; the
+/// seam's `ERR:` (a drain refusal, a purge leftover) rides the family
+/// 409 verbatim.
+async fn api_volume_destroy(
+    State(state): State<AppState>,
+    Path(name): Path<String>,
+    body: axum::body::Bytes,
+) -> Response {
+    let client = match write_family_gates(&state) {
+        Ok(client) => client,
+        Err(response) => return response,
+    };
+    let (confirm, purge_local) = match destroy_body(&body) {
+        Ok(pair) => pair,
+        Err(response) => return response,
+    };
+    let command = if confirm {
+        format!(
+            "DESTROY {name} confirm{}",
+            if purge_local { " purge_local" } else { "" }
+        )
+    } else {
+        format!("DESTROY {name}")
+    };
+    let reply = match tokio::time::timeout(VOLUME_WRITE_TIMEOUT, client(&command)).await {
+        Ok(reply) => reply,
+        Err(_elapsed) => {
+            return error_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "the DESTROY command for '{name}' timed out — the instance is likely busy \
+                     with a long volume command (e.g. a REMOVE draining an upload); retry \
+                     once it settles"
+                ),
+            );
+        }
+    };
+    if !confirm {
+        // The preview leg: the family's success mapping plus the flag
+        // that tells the frontend a confirmation is still owed (the
+        // refusals ride the plain family 409 — an ERR is an ERR on
+        // both legs).
+        return match reply.trim().strip_prefix("OK: ") {
+            Some(payload) => Json(serde_json::json!({
+                "ok": true,
+                "reply": payload.trim(),
+                "confirm_required": true,
+            }))
+            .into_response(),
+            None => error_json(
+                StatusCode::CONFLICT,
+                reply.trim().trim_start_matches("ERR: "),
+            ),
+        };
+    }
+    map_volume_command_reply(&reply)
+}
+
+/// One CONFIGS reply row parsed into its JSON face: a loadable file as
+/// `{name, backend, enabled, running}` plus the P2 sparse markers —
+/// `rebuilding: true` while a background REBUILD is in flight and
+/// `encrypted: true` while the file carries `enable_encryption` (the
+/// Refresh button's gating pair, P6; emitted only when true so a quiet
+/// row keeps its P1 shape) — and a schema-broken one as
+/// `{name, invalid: true, reason}` (the reason is display text — a
+/// re-parse failure keeps the row with the invalid marker rather than
+/// dropping it).
+fn configs_row_json(line: &str) -> serde_json::Value {
+    let mut tokens = line.split_whitespace();
+    let name = tokens.next().unwrap_or_default();
+    match tokens.next() {
+        Some("invalid") => {
+            // The row wraps its reason in parentheses; unwrap the pair.
+            let reason = tokens.collect::<Vec<_>>().join(" ");
+            let reason = reason
+                .strip_prefix('(')
+                .and_then(|inner| inner.strip_suffix(')'))
+                .unwrap_or(&reason);
+            serde_json::json!({
+                "name": name,
+                "invalid": true,
+                "reason": reason,
+            })
+        }
+        Some(backend) => {
+            let enabled = tokens
+                .next()
+                .and_then(|flag| flag.strip_prefix("enabled="))
+                .and_then(|flag| flag.parse::<bool>().ok());
+            let running = tokens.next() == Some("running");
+            // The sparse markers (P2): whatever trailing tokens the row
+            // carries; unknown ones stay ignored for forward compat.
+            let (mut encrypted, mut rebuilding) = (false, false);
+            for marker in tokens {
+                match marker {
+                    "encrypted" => encrypted = true,
+                    "rebuilding" => rebuilding = true,
+                    _ => {}
+                }
+            }
+            let mut row = serde_json::json!({
+                "name": name,
+                "backend": backend,
+                "enabled": enabled,
+                "running": running,
+            });
+            // Inserted only when true — the object stays byte-equal to
+            // the P1 shape for quiet rows (the pins and the frontend's
+            // `=== true` reads both rely on the absence).
+            if encrypted {
+                row["encrypted"] = serde_json::json!(true);
+            }
+            if rebuilding {
+                row["rebuilding"] = serde_json::json!(true);
+            }
+            row
+        }
+        None => serde_json::json!({ "name": name, "invalid": true, "reason": "" }),
+    }
+}
+
+/// `GET /api/volumes/configs` (P1, the config page's data source): one
+/// `CONFIGS` through the seam (the configuration FULL set — `/api/volumes`
+/// reads the registry, which cannot see disabled volumes), the reply's
+/// row lines parsed into JSON. The read budget suffices: CONFIGS is a
+/// directory scan plus file parses. An `ERR:` reply carries its text as
+/// a 404 (the config endpoint's mapping), a missing seam the family 503.
+async fn api_volume_configs(State(state): State<AppState>) -> Response {
+    let AppState::Multi { commands, .. } = &state else {
+        return error_json(
+            StatusCode::NOT_FOUND,
+            "no volume registry: this dashboard serves a single volume",
+        );
+    };
+    let Some(client) = commands else {
+        return error_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "volume configurations are not available: this dashboard runs without the \
+             volume-command seam (the multi-volume cli assembly installs it)",
+        );
+    };
+    let reply = match tokio::time::timeout(VOLUME_COMMAND_TIMEOUT, client("CONFIGS")).await {
+        Ok(reply) => reply,
+        Err(_elapsed) => {
+            return error_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the CONFIGS listing timed out — the instance is likely busy with a long \
+                 volume command (e.g. a REMOVE draining an upload); retry once it settles",
+            );
+        }
+    };
+    match reply.strip_prefix("OK: ") {
+        Some(rows) => Json(serde_json::Value::Array(
+            rows.lines().skip(1).map(configs_row_json).collect(),
+        ))
+        .into_response(),
+        None => error_json(
+            StatusCode::NOT_FOUND,
+            reply.trim().trim_start_matches("ERR: "),
+        ),
     }
 }
 
@@ -1360,7 +2233,7 @@ async fn api_queue(State(state): State<AppState>, uri: Uri) -> Response {
 /// must not hide its siblings).
 async fn api_volumes(State(state): State<AppState>) -> Response {
     let volumes = match &state {
-        AppState::Multi { volumes } => volumes.snapshot(),
+        AppState::Multi { volumes, .. } => volumes.snapshot(),
         AppState::Single { .. } => {
             // Unreachable through the multi router; the single-volume
             // table never registers this route (its unknown-route 404
@@ -1378,7 +2251,10 @@ async fn api_volumes(State(state): State<AppState>) -> Response {
 }
 
 /// One `/api/volumes` row: the registry identity plus the db metadata
-/// numbers (see [`api_volumes`]).
+/// numbers (see [`api_volumes`]) and the queue's outstanding upload
+/// count (the same `pending=` observable LIST reports — the §4 drain
+/// aid, surfaced for the management page's Pending column; a failed
+/// volume has no queue, so its value is `null`, not 0).
 fn volume_summary_json(entry: &VolumeUiEntry) -> serde_json::Value {
     let (total_files, total_bytes) = match (&entry.status, &entry.vfs) {
         (VolumeUiStatus::Running, Some(vfs)) => match vfs.db().get_stats() {
@@ -1387,6 +2263,10 @@ fn volume_summary_json(entry: &VolumeUiEntry) -> serde_json::Value {
         },
         _ => (None, None),
     };
+    let pending = entry
+        .vfs
+        .as_ref()
+        .map(|vfs| vfs.queue_stats().outstanding());
     let mut body = serde_json::json!({
         "name": entry.name,
         "backend": entry.config.backend,
@@ -1394,6 +2274,7 @@ fn volume_summary_json(entry: &VolumeUiEntry) -> serde_json::Value {
         "drive_letter": entry.config.drive_letter,
         "webdav_url": entry.config.webdav_url,
         "status": entry.status.as_str(),
+        "pending": pending,
         "quota_used": entry.config.quota.as_ref().map(|quota| quota.used),
         "quota_total": entry.config.quota.as_ref().and_then(|quota| quota.total),
         "total_files": total_files,
@@ -1414,7 +2295,7 @@ fn volume_summary_json(entry: &VolumeUiEntry) -> serde_json::Value {
 /// failing the aggregate.
 async fn api_stats_summary(State(state): State<AppState>) -> Response {
     let volumes = match &state {
-        AppState::Multi { volumes } => volumes.snapshot(),
+        AppState::Multi { volumes, .. } => volumes.snapshot(),
         AppState::Single { .. } => {
             return error_json(
                 StatusCode::NOT_FOUND,

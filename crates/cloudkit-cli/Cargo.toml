@@ -103,6 +103,13 @@ hyper-rustls = { version = "0.27", default-features = false, features = [
     "webpki-roots",
 ] }
 serde_json = "1"
+# The CREATE/UPDATE payload conversion builds core's `toml::Table`
+# (render_volume_toml's input type). The `preserve_order` feature MUST
+# match core's — toml's Table is a different concrete type (IndexMap vs
+# BTreeMap) without it, and a mismatched build would not compile. Same
+# version line as core; already in the lock tree, zero new packages
+# (web volume management P3).
+toml = { version = "1.1.4", features = ["preserve_order"] }
 # OS credential vault (M5). keyring 3.x has no default features: the
 # platform store must be picked per target below (the base dep keeps the
 # crate linkable everywhere; CyDrive's supported platforms all carry a
@@ -127,6 +134,10 @@ tokio = { version = "1", features = [
 # same 0.3 line cloudkit-webdav/web already carry (already in the lock
 # tree, zero new packages).
 futures-util = "0.3"
+# Local-time HH:MM:SS for the REBUILD already-running reply (web volume
+# management P2/R1) — clock-only, no serde; already in the lock tree
+# via dav-server/grammers, zero new packages.
+chrono = { version = "0.4", default-features = false, features = ["clock"] }
 tracing = "0.1"
 
 # Platform credential stores: Windows Credential Manager, macOS Keychain,

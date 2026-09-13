@@ -12,12 +12,24 @@
 //!   read-to-EOF sees it the moment the shutdown starts);
 //! - `PING` answers `OK: cydrive <version>` and disturbs nothing (the
 //!   payload `cydrive status` shows on its instance row);
-//! - `ADD <name>` / `REMOVE <name>` / `LIST` (runtime-volumes K48) are
-//!   forwarded to the installed [`VolumeCommandHandler`]; its reply is
-//!   passed through verbatim — `OK: ...` or a multi-line `OK:`/`ERR:`
-//!   block whose text is the handler's actionable message. The replies
-//!   are documented where the handler lives ([`crate`]'s multi-volume
-//!   boot); the transport layer adds nothing to them;
+//! - `ADD <name>` / `REMOVE <name>` / `LIST` / `SHOW <name>`
+//!   (runtime-volumes K48; `SHOW` since the web volume management plan
+//!   §1.2) / `ENABLE <name>` / `DISABLE <name>` / `CONFIGS` (the same
+//!   plan's P1 batch) / `REBUILD <name>` (its P2 batch — the handler
+//!   accepts the rebuild and answers immediately; the work runs in a
+//!   background task) / `CREATE <name> <json>` / `UPDATE <name>
+//!   <json>` (its P3/P4 batches — the payload is ONE compact
+//!   single-line JSON object of volume-scoped keys; the line protocol
+//!   reads one line per connection, so a serialized JSON body never
+//!   spans lines) / `DESTROY <name> [confirm] [purge_local]` (its P5
+//!   batch — the two-leg deletion protocol: without `confirm` the
+//!   handler answers the preview and executes nothing) are forwarded
+//!   to the installed
+//!   [`VolumeCommandHandler`]; its reply is passed through verbatim —
+//!   `OK: ...` or a multi-line `OK:`/`ERR:` block whose text is the
+//!   handler's actionable message. The replies are documented where the
+//!   handler lives ([`crate`]'s multi-volume boot); the transport layer
+//!   adds nothing to them;
 //! - anything else answers `ERR: unknown command`. An instance without a
 //!   handler answers the volume commands with the actionable
 //!   "not available" ERR instead of routing them.
@@ -98,11 +110,30 @@ fn first_token(line: &str) -> &str {
     line.split_whitespace().next().unwrap_or("")
 }
 
-/// `true` for the lines the volume-command surface owns (K48): the
-/// three keywords, with or without their argument — the handler answers
-/// malformed shapes with its own usage ERR.
+/// `true` for the lines the volume-command surface owns (K48; `SHOW`
+/// since the web volume management plan §1.2; `ENABLE`/`DISABLE`/
+/// `CONFIGS` since its P1 batch; `REBUILD` since its P2 batch;
+/// `CREATE`/`UPDATE` since its P3/P4 batches — their third span is a
+/// compact single-line JSON payload, parsed positionally by the
+/// handler; `DESTROY` since its P5 batch — the second/third words are
+/// the literal `confirm`/`purge_local` tokens, parsed positionally by
+/// the handler): the keywords, with or without their argument — the
+/// handler answers malformed shapes with its own usage ERR.
 fn is_volume_command(line: &str) -> bool {
-    matches!(first_token(line), "ADD" | "REMOVE" | "LIST")
+    matches!(
+        first_token(line),
+        "ADD"
+            | "REMOVE"
+            | "SHOW"
+            | "LIST"
+            | "ENABLE"
+            | "DISABLE"
+            | "CONFIGS"
+            | "REBUILD"
+            | "CREATE"
+            | "UPDATE"
+            | "DESTROY"
+    )
 }
 
 /// A running instance's loopback control listener (contract C1): the
@@ -144,7 +175,7 @@ impl ControlServer {
     /// `STOP` (trimmed) is answered `OK: shutting down`, the connection
     /// is closed, and `shutdown` fires; a line reading `PING` is answered
     /// with [`ping_reply`]'s version line and fires nothing; a volume
-    /// command (`ADD`/`REMOVE`/`LIST`, K48) is forwarded to the
+    /// command (`ADD`/`REMOVE`/`SHOW`/`LIST`) is forwarded to the
     /// installed handler and its reply written verbatim; any other line
     /// answers `ERR: unknown command`. The loop keeps serving after
     /// a STOP, so later `STOP`s fire the callback again — **the callback
@@ -163,7 +194,7 @@ impl ControlServer {
     }
 
     /// [`ControlServer::run`] with the volume-command surface installed
-    /// (K48): `ADD`/`REMOVE`/`LIST` lines route to `handler`, whose
+    /// (K48): `ADD`/`REMOVE`/`SHOW`/`LIST` lines route to `handler`, whose
     /// reply is written to the connection verbatim; without a handler
     /// those lines get the actionable "not available" ERR. The STOP and
     /// PING branches are untouched by the handler's presence. A

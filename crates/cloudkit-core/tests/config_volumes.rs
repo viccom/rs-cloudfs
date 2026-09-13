@@ -15,8 +15,10 @@ use std::fs;
 use std::path::Path;
 
 use cloudkit_core::config::{
-    discover_volumes, ensure_no_volume_keys_in_process, load_volume_config, load_volumes, Backend,
-    ConfigError, CyDriveConfig, KNOWN_TOML_KEYS, PROCESS_SCOPED_KEYS, VOLUME_SCOPED_KEYS,
+    discover_volumes, ensure_no_volume_keys_in_process, is_valid_volume_name, json_value_to_toml,
+    load_volume_config, load_volumes, parse_volume_toml, render_volume_toml, volume_show_json,
+    write_volume_enabled, Backend, ConfigError, CyDriveConfig, KNOWN_TOML_KEYS,
+    PROCESS_SCOPED_KEYS, VOLUME_SCOPED_KEYS,
 };
 
 // ------------------------------------------------------------- helpers ---
@@ -75,7 +77,8 @@ fn key_partition_bipartitions_known_toml_keys_exactly() {
 #[test]
 fn process_scoped_keys_are_the_process_globals() {
     // K19/§2: process-level keys are the web endpoints, the dashboard
-    // switch, the (new) volumes directory and the mount pair — the
+    // switch (+ its remote-administration opt-in, web volume management
+    // §1.5), the (new) volumes directory and the mount pair — the
     // master switch and the backend selector (both govern the whole
     // multi-volume mount gate, so a per-volume spelling would leave
     // sibling mounts ungoverned by two different policies with no single
@@ -92,6 +95,7 @@ fn process_scoped_keys_are_the_process_globals() {
             "enable_web_ui",
             "auto_mount_drive",
             "mount_backend",
+            "allow_remote_admin",
         ],
         "the process-scoped key set must stay deliberate — new keys join \
          exactly one side of the partition"
@@ -753,4 +757,473 @@ fn enabled_false_roundtrips_and_default_saves_stay_clean() {
     let reloaded = CyDriveConfig::load_toml(&path).expect("reload");
     assert!(!reloaded.enabled, "the disable must survive the round-trip");
     assert_eq!(reloaded, disabled, "the whole config round-trips");
+}
+
+// ------------------------------------- SHOW serialization (web volume P0) ---
+
+/// The SHOW serializer (web volume management plan §1.2): a volume
+/// file's EXPLICIT keys as one compact JSON line — every
+/// credential-valued key collapsed to `{"set": bool}` (write-only: the
+/// value never leaves the backend), absent credentials reporting
+/// `{"set": false}`, and nothing the file leaves unset appearing at
+/// all (no defaults — the reply shows the file, not the parsed config).
+#[test]
+fn volume_show_json_reports_explicit_keys_and_masks_credentials() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("media.toml");
+    write_file(
+        &file,
+        "backend = \"telegram\"\n\
+         bot_token = \"111:FAKE-TOKEN-MARKER\"\n\
+         chat_id = 4242\n\
+         chunk_size_mb = 8\n",
+    );
+
+    let line = volume_show_json(&file).expect("serialize the volume file");
+    assert!(!line.contains('\n'), "one compact line: {line}");
+    let value: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+    assert_eq!(value["name"], "media", "the validated file stem");
+    assert_eq!(value["backend"], "telegram");
+    assert_eq!(value["chat_id"], 4242);
+    assert_eq!(value["chunk_size_mb"], 8);
+    // An explicit credential collapses to the set marker; an absent one
+    // reports unset; the VALUE must not ride the reply in any form.
+    assert_eq!(value["bot_token"], serde_json::json!({"set": true}));
+    assert_eq!(
+        value["encryption_password"],
+        serde_json::json!({"set": false})
+    );
+    assert!(
+        !line.contains("FAKE-TOKEN-MARKER"),
+        "credential leaked: {line}"
+    );
+    // An ordinary key the file leaves unset stays absent — no defaults.
+    assert!(
+        value.get("drive_letter").is_none(),
+        "no defaulted keys: {value}"
+    );
+}
+
+/// SHOW rejects what `load_volume_config` rejects (the same validation
+/// funnel — name rules, unknown keys, process-level keys): the
+/// serializer never answers half-validated configuration.
+#[test]
+fn volume_show_json_reuses_the_volume_file_validation() {
+    let dir = tempfile::tempdir().expect("tempdir");
+
+    let unknown = dir.path().join("bad.toml");
+    write_file(&unknown, "backend = \"local\"\nno_such_key = 1\n");
+    assert!(
+        volume_show_json(&unknown)
+            .expect_err("unknown key must be refused")
+            .to_string()
+            .contains("no_such_key"),
+        "the refusal names the key"
+    );
+
+    let process = dir.path().join("web.toml");
+    write_file(&process, "backend = \"local\"\nweb_ui_port = 9\n");
+    assert!(
+        volume_show_json(&process).is_err(),
+        "a process-level key must be refused"
+    );
+}
+
+// ------------------------------- controlled toml re-rendering (web volume P1) ---
+
+/// The controlled renderer (web volume management plan §1.2): a volume
+/// file's EXPLICIT keys re-render as toml in the file's own order, no
+/// default keys paved in (the setup hand-written-template philosophy —
+/// `save_toml`'s 29-key paving is unusable for volume files).
+#[test]
+fn render_volume_toml_preserves_explicit_keys_in_order_without_defaults() {
+    let explicit: toml::Table = toml::from_str(
+        "backend = \"local\"\nlocal_root = \"root\"\ndrive_letter = \"V\"\nenabled = true\n",
+    )
+    .expect("parse the explicit table");
+
+    let rendered = render_volume_toml(&explicit, &toml::Table::new());
+    let lines: Vec<&str> = rendered.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "backend = \"local\"",
+            "local_root = \"root\"",
+            "drive_letter = \"V\"",
+            "enabled = true",
+        ],
+        "explicit keys in file order, one `key = value` per line: {rendered}"
+    );
+    assert!(
+        !rendered.contains("cache_path") && !rendered.contains("chat_id"),
+        "keys the file leaves unset must not appear (no defaults): {rendered}"
+    );
+}
+
+/// The overlay semantics: an overrides key REPLACES its explicit twin in
+/// place (order retained) and APPENDS when the file did not set it — the
+/// ENABLE/DISABLE write is exactly "same file, one key different".
+#[test]
+fn render_volume_toml_overlays_changed_keys_in_place_and_appends_new_ones() {
+    let explicit: toml::Table = toml::from_str(
+        "backend = \"telegram\"\nenabled = true\nchat_id = 42\nbot_token = \"111:AAA\"\n",
+    )
+    .expect("parse the explicit table");
+    let overrides: toml::Table = toml::from_str("enabled = false\n").expect("parse overrides");
+
+    let rendered = render_volume_toml(&explicit, &overrides);
+    let lines: Vec<&str> = rendered.lines().collect();
+    assert_eq!(
+        lines,
+        vec![
+            "backend = \"telegram\"",
+            "enabled = false",
+            "chat_id = 42",
+            "bot_token = \"111:AAA\"",
+        ],
+        "the overlaid key keeps its position; the credential survives verbatim: {rendered}"
+    );
+
+    // The appended-new-key arm: a file that never set `enabled`.
+    let no_flag: toml::Table =
+        toml::from_str("backend = \"local\"\nlocal_root = \"root\"\n").expect("parse");
+    let rendered = render_volume_toml(&no_flag, &overrides);
+    assert_eq!(
+        rendered.lines().collect::<Vec<_>>(),
+        vec![
+            "backend = \"local\"",
+            "local_root = \"root\"",
+            "enabled = false"
+        ],
+        "an overrides key the file lacks lands at the end: {rendered}"
+    );
+}
+
+/// The round-trip contract: rendered output re-loads through the FULL
+/// volume-file funnel (`load_volume_config`), and the flag the overlay
+/// wrote is what the reloaded settings report — DISABLE's file side in
+/// one test.
+#[test]
+fn render_volume_toml_output_reloads_through_load_volume_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("media.toml");
+    write_file(
+        &file,
+        "backend = \"local\"\nlocal_root = \"root\"\ndrive_letter = \"V\"\n",
+    );
+    let text = fs::read_to_string(&file).expect("read the file back");
+    let explicit: toml::Table = toml::from_str(&text).expect("parse the explicit table");
+    let overrides: toml::Table = toml::from_str("enabled = false\n").expect("parse overrides");
+
+    let rendered = render_volume_toml(&explicit, &overrides);
+    write_file(&file, &rendered);
+
+    let spec = load_volume_config(&file).expect("rendered output reloads");
+    assert!(
+        !spec.settings.enabled,
+        "the overlaid enabled = false is what the reloaded config reports"
+    );
+    assert_eq!(spec.settings.backend, Backend::Local, "siblings untouched");
+    // Idempotence: re-rendering the reloaded file with the same overlay
+    // is byte-stable (DISABLE on an already-disabled file writes the
+    // same bytes).
+    let text = fs::read_to_string(&file).expect("re-read");
+    let explicit: toml::Table = toml::from_str(&text).expect("re-parse");
+    assert_eq!(
+        render_volume_toml(&explicit, &overrides),
+        rendered,
+        "the render is idempotent"
+    );
+}
+
+/// The ENABLE/DISABLE file write (web volume management §1.2, the
+/// controlled-rewrite narrow form): validates through the full funnel
+/// first, then rewrites the file with the flag overlaid — comments are
+/// lost (裁决①, accepted and to be surfaced by callers), everything the
+/// file set explicitly survives.
+#[test]
+fn write_volume_enabled_flips_the_flag_and_keeps_explicit_keys() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("media.toml");
+    write_file(
+        &file,
+        "# a comment that will not survive (accepted, 裁决①)\n\
+         backend = \"telegram\"\n\
+         bot_token = \"111:FAKE-TOKEN-MARKER\"\n\
+         chat_id = 4242\n",
+    );
+
+    write_volume_enabled(&file, false).expect("the disable write lands");
+    let text = fs::read_to_string(&file).expect("read the rewritten file");
+    assert!(
+        text.contains("enabled = false"),
+        "the flag is written: {text}"
+    );
+    assert!(
+        text.contains("bot_token = \"111:FAKE-TOKEN-MARKER\""),
+        "the explicit credential survives verbatim: {text}"
+    );
+    assert!(
+        !text.contains("a comment that will not survive"),
+        "comments are dropped (accepted, surfaced by callers)"
+    );
+    let spec = load_volume_config(&file).expect("the rewritten file reloads");
+    assert!(!spec.settings.enabled, "the flag took effect");
+
+    // Flip back: ENABLE writes true over the disabled file.
+    write_volume_enabled(&file, true).expect("the enable write lands");
+    let spec = load_volume_config(&file).expect("reload");
+    assert!(spec.settings.enabled, "the flag flipped back");
+}
+
+/// `write_volume_enabled` never touches a file the funnel would refuse
+/// (unknown key, process key, broken name): a half-validated file must
+/// not be "repaired" by a rewrite that cannot know what it destroyed.
+#[test]
+fn write_volume_enabled_refuses_files_the_funnel_rejects() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let unknown = dir.path().join("bad.toml");
+    write_file(&unknown, "backend = \"local\"\nno_such_key = 1\n");
+    assert!(
+        write_volume_enabled(&unknown, false)
+            .expect_err("unknown key must be refused")
+            .to_string()
+            .contains("no_such_key"),
+        "the refusal names the key"
+    );
+
+    let missing = dir.path().join("ghost.toml");
+    assert!(
+        write_volume_enabled(&missing, true).is_err(),
+        "a missing file is a Read error, not a fresh write"
+    );
+}
+
+// -------------------------------- allow_remote_admin key (web volume P1) ---
+// Web volume management §1.5: binding the web UI to a non-loopback
+// address degrades the volume-management WRITE routes to 403 unless the
+// process key `allow_remote_admin = true` opts in. The key is
+// process-scoped (K19 partition — it governs the one dashboard), false
+// by default (the safe binding is loopback), and rejected by the legacy
+// config.json like every Rust-added tuning key.
+
+#[test]
+fn allow_remote_admin_parses_as_a_process_scoped_key() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    write_file(
+        &path,
+        "volumes_dir = \"volumes\"\nwebdav_port = 8080\nallow_remote_admin = true\n",
+    );
+
+    let cfg = CyDriveConfig::load_toml(&path).expect("the key parses in config.toml");
+    assert!(cfg.allow_remote_admin, "the file value loads");
+    assert!(
+        !CyDriveConfig::default().allow_remote_admin,
+        "the default is the safe loopback-only stance"
+    );
+
+    // The K19 partition: process-scoped, so it may sit in the process
+    // config of a multi-volume boot and never in a volume file.
+    assert!(PROCESS_SCOPED_KEYS.contains(&"allow_remote_admin"));
+    assert!(!VOLUME_SCOPED_KEYS.contains(&"allow_remote_admin"));
+    ensure_no_volume_keys_in_process(&[
+        "volumes_dir".to_string(),
+        "allow_remote_admin".to_string(),
+    ])
+    .expect("the process config may carry the key");
+}
+
+#[test]
+fn allow_remote_admin_is_rejected_by_legacy_json() {
+    // The tier-1 precedent: a Rust-added key the legacy loader cannot
+    // honour must fail loudly, not be silently swallowed.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.json");
+    fs::write(&path, r#"{ "allow_remote_admin": true }"#).expect("write config.json");
+
+    let err = CyDriveConfig::load_legacy_json(&path)
+        .expect_err("legacy json must reject the allow_remote_admin key");
+    assert!(
+        matches!(err, ConfigError::Parse { .. }),
+        "expected Parse error, got: {err:?}"
+    );
+    let message = err.to_string();
+    assert!(
+        message.contains("allow_remote_admin"),
+        "error must name the rejected key: {message}"
+    );
+}
+
+// --------------------- the CREATE/UPDATE payload primitives (web volume P3) ---
+
+/// `json_value_to_toml` is the INVERSE of the SHOW serializer's scalar
+/// mapping (web volume management §1.2): a SHOW reply's plain (non
+/// credential-marker) values, converted back, are the original toml
+/// values — what a CREATE built from a form round-trips through. The
+/// end-to-end form: a volume file with one value of every scalar kind →
+/// `volume_show_json` → per-key `json_value_to_toml` → the same toml
+/// values back.
+#[test]
+fn json_value_to_toml_inverts_the_show_serializer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("media.toml");
+    write_file(
+        &file,
+        "backend = \"telegram\"\n\
+         chat_id = 4242\n\
+         enable_encryption = true\n\
+         chunk_size_mb = 8\n",
+    );
+
+    let shown: serde_json::Value =
+        serde_json::from_str(&volume_show_json(&file).expect("serialize")).expect("json");
+    let table: toml::Table = toml::from_str(&fs::read_to_string(&file).expect("read")).expect("t");
+    for (key, original) in &table {
+        let shown_value = shown
+            .get(key)
+            .unwrap_or_else(|| panic!("SHOW reported nothing for `{key}`: {shown}"));
+        let converted = json_value_to_toml(key, shown_value)
+            .unwrap_or_else(|error| panic!("`{key}` must convert ({shown_value}): {error}"))
+            .unwrap_or_else(|| panic!("`{key}` must convert to a value, not unset"));
+        assert_eq!(
+            &converted, original,
+            "json → toml inverts the SHOW serialization for `{key}`"
+        );
+    }
+}
+
+/// The write-only/leave-alone affordance (K49 分档): JSON `null` and the
+/// empty string convert to "unset" — a form field the operator left
+/// empty writes NO key (CREATE) and overwrites nothing (UPDATE).
+#[test]
+fn json_value_to_toml_maps_null_and_empty_strings_to_unset() {
+    for empty in [serde_json::json!(null), serde_json::json!("")] {
+        assert_eq!(
+            json_value_to_toml("bot_token", &empty).expect("null/empty convert"),
+            None,
+            "the write-only affordance: {empty}"
+        );
+    }
+    // Everything else stays a value — including "0"-like and false-y ones.
+    assert_eq!(
+        json_value_to_toml("enable_encryption", &serde_json::json!(false)).expect("bool converts"),
+        Some(toml::Value::Boolean(false))
+    );
+    assert_eq!(
+        json_value_to_toml("chat_id", &serde_json::json!(0)).expect("zero converts"),
+        Some(toml::Value::Integer(0))
+    );
+}
+
+/// Type errors are actionable and NEVER echo the offending value (the M3
+/// discipline — a payload may carry credentials): the refusal names the
+/// key and the JSON shape it got. Arrays and objects are not scalars; an
+/// integer past toml's i64 range cannot be a config value.
+#[test]
+fn json_value_to_toml_type_errors_name_the_key_without_the_value() {
+    for wrong in [
+        serde_json::json!(["a", "b"]),
+        serde_json::json!({ "nested": 1 }),
+    ] {
+        let error = json_value_to_toml("bot_token", &wrong)
+            .expect_err("a structural JSON value must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("bot_token"),
+            "the refusal names the key: {message}"
+        );
+        assert!(
+            !message.contains("a\", \"b") && !message.contains("nested"),
+            "the refusal never echoes the value: {message}"
+        );
+    }
+    let error = json_value_to_toml(
+        "chat_id",
+        &serde_json::from_str::<serde_json::Value>("18446744073709551615").expect("u64 max"),
+    )
+    .expect_err("past i64::MAX no config integer exists");
+    assert!(
+        error.to_string().contains("chat_id"),
+        "the out-of-range refusal names the key: {error}"
+    );
+}
+
+/// `parse_volume_toml` is the extracted parse segment of
+/// `load_volume_config` (zero-drift: every `load_volume_config` test
+/// above keeps passing against the delegated loader). Directly on a
+/// string — the CREATE/UPDATE pre-write validation runs it on RENDERED
+/// toml before anything touches the disk: the name rules, the strict key
+/// surface (unknown keys, process-level keys with their guidance) and
+/// the typed parse all answer without a file.
+#[test]
+fn parse_volume_toml_validates_a_rendered_string_directly() {
+    let path = Path::new("volumes/media.toml");
+    let spec = parse_volume_toml(
+        path,
+        "media",
+        "backend = \"local\"\nlocal_root = \"root\"\n",
+    )
+    .expect("a legal body parses");
+    assert_eq!(spec.name, "media");
+    assert_eq!(spec.settings.backend, Backend::Local);
+    assert_eq!(
+        spec.file_path, path,
+        "the caller's target path rides the spec"
+    );
+
+    // The name rules, verbatim from the file loader.
+    let error = parse_volume_toml(path, "Bad-Name", "").expect_err("the name rules apply");
+    assert!(
+        error.to_string().contains("Bad-Name"),
+        "the refusal names the name: {error}"
+    );
+
+    // The strict key surface, verbatim.
+    let error = parse_volume_toml(path, "media", "backend = \"local\"\nno_such_key = 1\n")
+        .expect_err("unknown keys are refused");
+    assert!(
+        error.to_string().contains("no_such_key"),
+        "the refusal names the key: {error}"
+    );
+    let error = parse_volume_toml(path, "media", "backend = \"local\"\nweb_ui_port = 9\n")
+        .expect_err("process keys are refused");
+    assert!(
+        error.to_string().contains("config.toml"),
+        "the refusal points process keys at config.toml: {error}"
+    );
+
+    // The typed parse, verbatim (a wrong-typed value is a Parse error).
+    let error = parse_volume_toml(path, "media", "backend = \"local\"\nchat_id = \"many\"\n")
+        .expect_err("wrong types are refused");
+    assert!(
+        matches!(error, ConfigError::Parse { .. }),
+        "expected a Parse error, got: {error:?}"
+    );
+}
+
+/// The published name rule: the same regex the volume files enforce —
+/// CREATE's precheck (and the dashboard's slug field) reuse it, so the
+/// three surfaces cannot drift.
+#[test]
+fn is_valid_volume_name_pins_the_slug_rule() {
+    for good in ["a", "media", "b-2", "x_9", &"m".repeat(32)] {
+        assert!(is_valid_volume_name(good), "`{good}` must be valid");
+    }
+    for bad in [
+        "",
+        "A",
+        "1a",
+        "aB",
+        "a b",
+        "a/b",
+        "a\\b",
+        "a.b",
+        "a:b",
+        "-a",
+        "_a",
+        &"m".repeat(33),
+    ] {
+        assert!(!is_valid_volume_name(bad), "`{bad}` must be refused");
+    }
 }

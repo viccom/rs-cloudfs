@@ -666,7 +666,12 @@ fn stats_cmd() -> Result<()> {
 /// the driver from the `backend` key and bootstrap the index. One-shot
 /// command: no tracing subscriber, its own output (the stats/doctor
 /// convention). Multi-volume mode rebuilds every rebuildable volume
-/// from its own backend (telegram volumes skip — shadow index).
+/// from its own backend (telegram volumes skip — shadow index) —
+/// UNLESS a multi-volume instance is live in this working directory
+/// (P2): then one `REBUILD <name>` per non-telegram volume rides the
+/// control channel and the live instance's background tasks do the
+/// work against the very dbs it is serving (the offline pass would
+/// race its writers for nothing).
 async fn rebuild_cmd() -> Result<()> {
     match discover_config_with_volumes().context("config discovery failed")? {
         DiscoveredConfig::Single(cfg) => {
@@ -678,7 +683,20 @@ async fn rebuild_cmd() -> Result<()> {
                 cfg.backend.as_str()
             );
         }
-        DiscoveredConfig::Multi { volumes, .. } => {
+        DiscoveredConfig::Multi { process, volumes } => {
+            // The P2 forward: a live instance owns these dbs — the
+            // per-volume replies (acceptances and refusals alike) ride
+            // the report; no instance keeps the offline pass untouched.
+            if let Some(rows) = cloudkit_cli::rebuild_forward_live(&process, &volumes).await? {
+                for (name, line) in rows {
+                    println!("volume {name}: {line}");
+                }
+                println!(
+                    "rebuild pass forwarded to the running instance — the results log there \
+                     when each background rebuild finishes"
+                );
+                return Ok(());
+            }
             let reports = cloudkit_cli::run_rebuild_multi(&volumes).await?;
             for (name, result) in reports {
                 match result {

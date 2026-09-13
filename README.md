@@ -42,7 +42,7 @@ cargo build --release
 baidu 实例最小配置（config.toml）：`backend = "baidu"` + `baidu_app_key/baidu_app_secret/baidu_refresh_token`（或 env `CYDRIVE_BAIDU_*`，access_token 缺省由 refresh 换取）；`baidu_root` 默认 `/apps/cloudfs`。
 local 实例：`backend = "local"` + `local_root = "<绝对路径>"`。
 **全参数示例配置**（凭据已脱敏占位，可用 `cydrive status` 验证解析）：单卷 [`examples/single-volume.example.toml`](examples/single-volume.example.toml)（36 键全览，注释分组）；多卷 [`examples/multi-volume/`](examples/multi-volume/)（进程级 `config.example.toml` + 4 卷矩阵 `volumes/`：baidu-enc / baidu-plain / local-enc / local-plain——同后端多卷×加密开关，层次在文件布局：进程级键与卷级键分文件，见下节）。
-权威后端（baidu/local）冷启动可 `cydrive rebuild` 从后端重建索引（明文集；加密实例走 sync）。
+权威后端（baidu/local）冷启动可 `cydrive rebuild` 从后端重建索引（明文集；加密实例走 sync）。多卷模式下若实例在运行，rebuild 自动经控制通道转发为各卷的后台 `REBUILD <名>`（受理即回，进度看 `LIST` 的 `rebuilding` 标记；实例不在线则照旧离线重建）。
 新后端接入指南：[docs/standards/driver-onboarding.md](docs/standards/driver-onboarding.md)（conformance 套件 + 装配点 + E2E 拓扑）。
 
 ### 按需裁剪驱动（feature 门控）
@@ -119,8 +119,9 @@ drive_letter = "Z"
 
 - **挂载**：单 WebDAV 端口，每卷一个子路径 `http://127.0.0.1:8080/vol/<name>`（声明了 `drive_letter` 的卷按 `cydrive run` 自动挂载为各自盘符）。
 - **仪表盘**：单端口 `:8088`，卷切换 tabs + 跨卷汇总；API 带 `?volume=<name>`（多卷下无参卷作用 API 返回 400 + 卷清单）。
+- **卷管理页 `/volumes`**（配置态，与使用态首页互跳）：卷表（Name/Backend/Status/Drive/Pending/Size + Actions）+ 四张统计卡 + 实例级总用量卡，4s 轮询 `/api/volumes`（行带 `pending` 队列计数；Failed 卷为 `null`）。Actions 列：[Refresh]（从远端后端后台重建索引；telegram/加密卷不支持，tooltip 指 `cydrive sync`）、[Edit]、[Unmount]/[Enable]/[Disable]、[Delete]（删除卷，两步确认 modal：第一步预告面板（将删卷文件+注册/盘符；**本地数据目录默认保留、远端数据永不触碰**）+ purge_local 复选框，第二步输入卷名逐字匹配才能确认）。**新增/编辑表单**（Add Volume 按钮 / `/volumes#add` 锚点 / 表内 [Edit]）：backend 三选一切换凭据组（telegram token+chat / baidu 四键 / local 根目录），盘符可空（=不声明）、高级折叠区（加密三键/chunk/sync 三键——留空=不写键走默认）；校验权威在后端命令，ERR 原文红框回显且表单保留值；编辑由 `SHOW` 预填（**凭据只读占位符「已设置（留空=不修改）/未设置」，值永不出后端**），保存=REMOVE+ADD 重装配（顶部明示 + pending 上传时 confirm + 注释丢失提示）。写路由族 `POST /api/volumes`（新增）、`POST /api/volumes/<name>`（编辑）与 `POST /api/volumes/<name>/destroy`（删除，body `{"confirm":bool,"purge_local":bool}`——confirm 缺省 false 回预告与 `confirm_required:true`，true 才执行）经进程内回调缝走与控制通道同一串行队列（180s 装配预算 / destroy 120s）；非 loopback 绑定默认只读（`allow_remote_admin = true` 显式解禁）。只读配置端点 `GET /api/volumes/<name>/config` 同缝走 `SHOW`（**凭据值永不出后端**——回复里凭据键只有 `{"set": true/false}`）。单卷实例访问 `/volumes` 得到说明页。`/api/volumes*` 族挂同源（Origin/Referer）校验，跨源 403。
 - 运维：`cydrive volumes` 列卷清单、`cydrive doctor` 逐卷体检、`cydrive status` 逐卷 db 统计 + 在线实例的运行态卷表、`cydrive setup --multi` 生成骨架；`cydrive stop` 一次停全部卷。
-- **运行态装卸**（不停进程）：回环控制通道支持 `ADD <name>`（按 `volumes/<name>.toml` 装配并挂载，`enabled = false` 或凭据/盘符有问题则拒绝且不影响兄弟卷）、`REMOVE <name>`（排空上传 → 卸盘符 → 摘除，超时/占用即中止、卷保持完好；不碰卷文件，重启后按文件回来——持久禁用 = 手编 `enabled = false`）、`LIST`（卷名/状态/盘符/backend/pending 一行一卷）。命令串行处理，回复 `OK:`/`ERR:` 可行动文本；`cydrive status` 的多卷输出已带 LIST 转发。
+- **运行态装卸**（不停进程）：回环控制通道支持 `ADD <name>`（按 `volumes/<name>.toml` 装配并挂载，`enabled = false` 或凭据/盘符有问题则拒绝且不影响兄弟卷）、`REMOVE <name>`（排空上传 → 卸盘符 → 摘除，超时/占用即中止、卷保持完好；不碰卷文件，重启后按文件回来）、`ENABLE/DISABLE <name>`（写 `enabled` 键 + 装配/卸载——持久禁用的命令形态）、`REBUILD <name>`（后台重建索引，受理即回）、`CREATE <name> <json>` / `UPDATE <name> <json>`（受控生成/重写卷 toml：键空间=卷级键、写盘前全量校验（拒绝不落盘）、凭据 write-only（UPDATE 载荷空串/缺失=保留原值）、UPDATE 保存=REMOVE+ADD 重装配且回复明示手写注释丢失）、`LIST`（卷名/状态/盘符/backend/pending 一行一卷）、`SHOW <name>`（卷文件显式配置的单行 JSON，凭据只回 set 布尔）、`CONFIGS`（卷文件全集行）、`DESTROY <name>`（两段删除：裸命令=零副作用预告（含保留/远端声明与确认指路）；`DESTROY <name> confirm` 才执行——运行中先走 REMOVE 同一安全序（排空拒绝=整体拒绝绝不半删）再删卷文件（幂等）；`confirm purge_local` 第三词才连带删本地数据目录（`volumes/<name>/` 整目录；失败不回滚但回复明示残留路径）；**远端数据永不触碰**）。命令串行处理，回复 `OK:`/`ERR:` 可行动文本；`cydrive status` 的多卷输出已带 LIST 转发。
 - 注意：多卷模式下 `CYDRIVE_*` 配置覆盖 env 被忽略（K28，防跨卷串味）；单卷模式行为与旧版字节兼容。
 
 多机同步（可选）：部署 `cydrive-sync-server`（[部署文档](docs/sync-server-deployment.md)）→ 各机 config.toml 写 `sync_url`/`sync_secret`，上传成功后秒级同步到其他机器。

@@ -76,6 +76,7 @@ pub const KNOWN_TOML_KEYS: &[&str] = &[
     "web_ui_host",
     "web_ui_port",
     "enable_web_ui",
+    "allow_remote_admin",
     "drive_letter",
     "auto_mount_drive",
     "mount_backend",
@@ -139,6 +140,7 @@ const LEGACY_REJECTED_KEYS: &[&str] = &[
     "local_root",
     "volumes_dir",
     "enabled",
+    "allow_remote_admin",
 ];
 
 /// Client-side encryption container scheme (Batch E / E-4, foundation D7).
@@ -276,6 +278,9 @@ pub const PROCESS_SCOPED_KEYS: &[&str] = &[
     // claim, so a per-volume spelling would leave sibling mounts under a
     // different backend with no single place to reason about them.
     "mount_backend",
+    // The dashboard's remote-administration opt-in (web volume
+    // management §1.5): one switch for the ONE process dashboard.
+    "allow_remote_admin",
 ];
 
 /// Volume-scoped keys (Phase 2.5 / K19): everything a single storage
@@ -354,7 +359,9 @@ pub struct VolumeConfig {
 /// letter first, then lowercase letters/digits/`_`/`-`, at most 32
 /// characters (K19; the name doubles as the URL segment, the mount
 /// label and the dashboard tab, so it stays a conservative slug).
-fn is_valid_volume_name(name: &str) -> bool {
+/// Public (web volume management P3) so the CREATE precheck and the
+/// dashboard's slug field enforce the ONE rule the volume files do.
+pub fn is_valid_volume_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     match bytes.first() {
         Some(&first) if first.is_ascii_lowercase() => {}
@@ -503,41 +510,39 @@ fn mask_backtick_value_spans(message: &str) -> String {
     out
 }
 
-/// Loads a single volume file (Phase 2.5 / K19). The volume name is the
-/// file stem; the body accepts exactly the [`VOLUME_SCOPED_KEYS`] subset
-/// of the strict `config.toml` surface (unknown keys rejected with the
-/// same wording) — a process-scoped key is rejected with guidance
-/// pointing back at `config.toml`.
-///
-/// No path absolutisation happens here (see [`VolumeConfig`]); the
-/// settings validate through the same parse-time type checks as
-/// `config.toml` (wrong-typed values, unknown enum variants), while the
-/// full cross-field [`CyDriveConfig::validate`] run belongs to the
-/// assembly layer, after the credential chain has resolved.
-pub fn load_volume_config(path: &Path) -> Result<VolumeConfig, ConfigError> {
-    let path_str = path_as_str(path);
-    let name = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .ok_or_else(|| {
-            ConfigError::Invalid(format!(
-                "invalid volume file {path_str}: the file name must be valid UTF-8"
-            ))
-        })?
-        .to_string();
-    if !is_valid_volume_name(&name) {
-        return Err(ConfigError::Invalid(format!(
-            "invalid volume name `{name}`: volume names must match \
-             ^[a-z][a-z0-9_-]{{0,31}}$ (a lowercase letter first, then lowercase \
-             letters/digits/`_`/`-`, at most 32 characters) — rename the volume \
-             file {path_str}"
-        )));
+/// The invalid-name refusal shared by [`load_volume_config`]'s early
+/// check and [`parse_volume_toml`] (one construction point — the two
+/// cannot drift apart).
+fn invalid_volume_name_error(name: &str, path: &Path) -> ConfigError {
+    ConfigError::Invalid(format!(
+        "invalid volume name `{name}`: volume names must match \
+         ^[a-z][a-z0-9_-]{{0,31}}$ (a lowercase letter first, then lowercase \
+         letters/digits/`_`/`-`, at most 32 characters) — rename the volume \
+         file {}",
+        path.display()
+    ))
+}
+
+/// Parses and validates one volume-file BODY against the strict
+/// volume-file surface — the extracted parse segment of
+/// [`load_volume_config`] (web volume management P3: the loader now
+/// reads the file and delegates here, zero drift — the existing
+/// loader suite pins the shared texts). Direct callers are the
+/// CREATE/UPDATE pre-write validation: `render_volume_toml` output is
+/// checked through this funnel BEFORE anything touches the disk (the
+/// name rules, the strict key surface with its `config.toml`
+/// guidance, the typed parse — the full cross-field
+/// [`CyDriveConfig::validate`] stays the caller's second step, exactly
+/// like the assembly layer runs it after a file load). `path` is the
+/// CALLER's target (a CREATE's not-yet-written file): it rides the
+/// returned [`VolumeConfig`] and the error texts, and anchors
+/// `base_dir`; it need not exist.
+pub fn parse_volume_toml(path: &Path, name: &str, text: &str) -> Result<VolumeConfig, ConfigError> {
+    if !is_valid_volume_name(name) {
+        return Err(invalid_volume_name_error(name, path));
     }
-    let text = fs::read_to_string(path).map_err(|source| ConfigError::Read {
-        path: path_str.clone(),
-        source,
-    })?;
-    let table: toml::Table = toml::from_str(&text).map_err(|err| ConfigError::Parse {
+    let path_str = path_as_str(path);
+    let table: toml::Table = toml::from_str(text).map_err(|err| ConfigError::Parse {
         path: path_str.clone(),
         // Review M3: the toml error embeds the offending source line —
         // a broken-quote credential line would leak its value into the
@@ -574,12 +579,225 @@ pub fn load_volume_config(path: &Path) -> Result<VolumeConfig, ConfigError> {
         _ => PathBuf::from("."),
     };
     Ok(VolumeConfig {
-        name,
+        name: name.to_string(),
         file_path: path.to_path_buf(),
         base_dir,
         explicit_drive_letter,
         settings,
     })
+}
+
+/// Loads a single volume file (Phase 2.5 / K19). The volume name is the
+/// file stem; the body accepts exactly the [`VOLUME_SCOPED_KEYS`] subset
+/// of the strict `config.toml` surface (unknown keys rejected with the
+/// same wording) — a process-scoped key is rejected with guidance
+/// pointing back at `config.toml`.
+///
+/// No path absolutisation happens here (see [`VolumeConfig`]); the
+/// settings validate through the same parse-time type checks as
+/// `config.toml` (wrong-typed values, unknown enum variants), while the
+/// full cross-field [`CyDriveConfig::validate`] run belongs to the
+/// assembly layer, after the credential chain has resolved.
+pub fn load_volume_config(path: &Path) -> Result<VolumeConfig, ConfigError> {
+    let path_str = path_as_str(path);
+    let name = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "invalid volume file {path_str}: the file name must be valid UTF-8"
+            ))
+        })?
+        .to_string();
+    // The name check stays BEFORE the read (the pre-refactor error
+    // ordering: a bad name reports the name even when the file is also
+    // missing); parse_volume_toml re-checks it in its own funnel.
+    if !is_valid_volume_name(&name) {
+        return Err(invalid_volume_name_error(&name, path));
+    }
+    let text = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        path: path_str,
+        source,
+    })?;
+    parse_volume_toml(path, &name, &text)
+}
+
+/// Serializes one volume file's EXPLICIT configuration as the compact
+/// single-line JSON the control channel's `SHOW <name>` command answers
+/// with (web volume management plan §1.2 / K49 修订): the validated
+/// volume name plus every key the file explicitly sets, verbatim —
+/// EXCEPT the credential-valued keys ([`SECRET_VALUED_KEYS`]), which
+/// collapse to `{"set": true}` / `{"set": false}` markers (write-only
+/// principle: the value never leaves the backend — the reply is what
+/// the dashboard's edit form prefills from). Keys the file leaves
+/// unset appear nowhere (the reply shows the file, not the parsed
+/// config with its defaults).
+///
+/// Validation is [`load_volume_config`]'s whole funnel (name rules,
+/// strict key surface, typed parse) — a half-validated file never
+/// serializes. The file is parsed twice (validated config + raw table
+/// for the explicit keys); a SHOW is a rare, human-scale command, so
+/// the double read is free.
+pub fn volume_show_json(path: &Path) -> Result<String, ConfigError> {
+    let spec = load_volume_config(path)?;
+    let path_str = path_as_str(path);
+    let text = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        path: path_str.clone(),
+        source,
+    })?;
+    let table: toml::Table = toml::from_str(&text).map_err(|err| ConfigError::Parse {
+        path: path_str,
+        message: redact_credential_values(&err.to_string()),
+    })?;
+    let mut body = serde_json::Map::new();
+    body.insert("name".to_string(), serde_json::json!(spec.name));
+    for (key, value) in &table {
+        // Credential keys serialize once below, uniformly (present or
+        // absent) — never through their values.
+        if SECRET_VALUED_KEYS.contains(&key.as_str()) {
+            continue;
+        }
+        body.insert(key.clone(), toml_value_json(value));
+    }
+    for key in SECRET_VALUED_KEYS {
+        body.insert(
+            (*key).to_string(),
+            serde_json::json!({ "set": table.contains_key(*key) }),
+        );
+    }
+    serde_json::to_string(&serde_json::Value::Object(body)).map_err(|error| {
+        ConfigError::Invalid(format!(
+            "serializing the volume configuration for SHOW failed: {error}"
+        ))
+    })
+}
+
+/// One explicit toml value as JSON. The strict key surface only admits
+/// scalars, so the structural toml variants are unreachable in practice
+/// — they degrade to their toml text rather than failing the reply.
+fn toml_value_json(value: &toml::Value) -> serde_json::Value {
+    match value {
+        toml::Value::String(text) => serde_json::Value::String(text.clone()),
+        toml::Value::Integer(number) => serde_json::json!(number),
+        toml::Value::Float(number) if number.is_finite() => serde_json::json!(number),
+        toml::Value::Boolean(flag) => serde_json::Value::Bool(*flag),
+        other => serde_json::Value::String(other.to_string()),
+    }
+}
+
+/// One JSON payload value as a toml value — [`toml_value_json`]'s
+/// inverse (web volume management P3: the CREATE/UPDATE payload
+/// conversion; pinned by a round-trip test through the SHOW
+/// serializer). `Ok(None)` is the **unset** affordance (K49 分档): JSON
+/// `null` and the empty string mean "this key is not being set" — a
+/// CREATE writes no such key (no paved defaults) and an UPDATE
+/// overlays nothing over the file's value, which is exactly the
+/// write-only credential rule (`present and non-empty = overwrite,
+/// missing or empty = keep`). Errors are actionable and NEVER echo the
+/// offending value (the M3 discipline — the payload may carry
+/// credentials): they name the key and the JSON shape it got; a float
+/// passes through as a toml float and is rejected by the caller's
+/// typed parse (no config key is float-shaped).
+pub fn json_value_to_toml(
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<Option<toml::Value>, ConfigError> {
+    use serde_json::Value as Json;
+    let converted = match value {
+        Json::Null => None,
+        Json::String(text) if text.is_empty() => None,
+        Json::String(text) => Some(toml::Value::String(text.clone())),
+        Json::Bool(flag) => Some(toml::Value::Boolean(*flag)),
+        Json::Number(number) => {
+            if let Some(int) = number.as_i64() {
+                Some(toml::Value::Integer(int))
+            } else if number.as_u64().is_some() {
+                // Past i64::MAX there is no toml integer to hold it (the
+                // u64 range toml deliberately lacks); refuse with the key
+                // named rather than silently rounding through f64.
+                return Err(ConfigError::Invalid(format!(
+                    "key `{key}`: the value is an integer too large for toml \
+                     (i64 range at most)"
+                )));
+            } else {
+                match number.as_f64() {
+                    Some(float) => Some(toml::Value::Float(float)),
+                    None => {
+                        return Err(ConfigError::Invalid(format!(
+                            "key `{key}`: the number has no toml representation"
+                        )));
+                    }
+                }
+            }
+        }
+        other => {
+            return Err(ConfigError::Invalid(format!(
+                "key `{key}`: the value must be a toml scalar (a string, a whole \
+                 number or a boolean), not a JSON {}",
+                json_shape_name(other),
+            )));
+        }
+    };
+    Ok(converted)
+}
+
+/// The JSON shape word for [`json_value_to_toml`]'s refusals ("array" /
+/// "object" — the only shapes that reach it; null, strings, numbers and
+/// booleans all convert).
+fn json_shape_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+        _ => "value",
+    }
+}
+
+/// Renders a volume file's EXPLICIT keys back as toml — the controlled
+/// rewrite primitive behind ENABLE/DISABLE (web volume management plan
+/// §1.2's narrow UPDATE form; CREATE/UPDATE in P3/P4 reuse it). The
+/// explicit keys render in the file's own order (one `key = value` per
+/// line, values through toml's own value serialization), an overrides
+/// key REPLACES its explicit twin in place or APPENDS when the file
+/// never set it, and **no default keys are paved** — the same philosophy
+/// as the setup hand-written template ([`CyDriveConfig::save_toml`]'s
+/// 29-key paving would drown a hand-maintained volume file). Comments
+/// are lost (裁决①: accepted, callers must surface it); the output
+/// re-parses through [`load_volume_config`] (pinned by tests).
+pub fn render_volume_toml(explicit: &toml::Table, overrides: &toml::Table) -> String {
+    let mut text = String::new();
+    for (key, value) in explicit {
+        let value = overrides.get(key).unwrap_or(value);
+        text.push_str(&format!("{key} = {value}\n"));
+    }
+    for (key, value) in overrides {
+        if !explicit.contains_key(key) {
+            text.push_str(&format!("{key} = {value}\n"));
+        }
+    }
+    text
+}
+
+/// The ENABLE/DISABLE file write (web volume management §1.2): rewrite
+/// one volume file with the `enabled` flag overlaid through
+/// [`render_volume_toml`]. The file is validated through the FULL
+/// [`load_volume_config`] funnel first — a half-validated file is never
+/// "repaired" by a rewrite that cannot know what it would destroy — and
+/// the raw table is then re-read for the render (the SHOW serializer's
+/// double-read precedent; a toggle is a rare, human-scale command).
+pub fn write_volume_enabled(path: &Path, enabled: bool) -> Result<(), ConfigError> {
+    load_volume_config(path)?;
+    let text = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        path: path_as_str(path),
+        source,
+    })?;
+    let explicit: toml::Table = toml::from_str(&text).map_err(|err| ConfigError::Parse {
+        path: path_as_str(path),
+        message: redact_credential_values(&err.to_string()),
+    })?;
+    let mut overrides = toml::Table::new();
+    overrides.insert("enabled".to_string(), toml::Value::Boolean(enabled));
+    fs::write(path, render_volume_toml(&explicit, &overrides))?;
+    Ok(())
 }
 
 /// Lists the `*.toml` volume files in `dir` (non-recursive), sorted
@@ -744,6 +962,14 @@ fn is_enabled(value: &bool) -> bool {
     *value
 }
 
+/// `skip_serializing_if` predicate for `allow_remote_admin`: the default
+/// (`false`, the safe stance) is omitted — a `setup`-written process
+/// config stays byte-identical to the pre-key form; an explicit `true`
+/// (the remote-administration opt-in) survives the round-trip.
+fn is_default_allow_remote_admin(value: &bool) -> bool {
+    !*value
+}
+
 /// Default `baidu_root` (Phase 2 / K17): the Baidu app-dir root
 /// (ck-baidu `DEFAULT_ROOT` — the driver crate owns the value, this
 /// mirrors it for the config default; the composition root passes the
@@ -813,6 +1039,20 @@ pub struct CyDriveConfig {
     pub web_ui_port: u16,
     /// Whether to start the web dashboard at all.
     pub enable_web_ui: bool,
+    /// Whether the dashboard's volume-management WRITE routes
+    /// (`POST /api/volumes/<name>/{remove,enable,disable}`) stay enabled
+    /// when the web UI binds a non-loopback `web_ui_host` (web volume
+    /// management plan §1.5). A **process-scoped** key (K19 partition:
+    /// one switch for the ONE process dashboard). The default — `false`
+    /// — is the safe stance: a remotely reachable dashboard refuses
+    /// volume mutations (403 naming this key) unless the operator
+    /// explicitly opts in, so binding `0.0.0.0` for read-only browsing
+    /// never silently opens volume administration to the network.
+    /// `validate` adds no rule — a bool has no invalid value.
+    /// Serialization emits the key only when `true` (a `setup`-written
+    /// process config stays byte-identical to the pre-key form).
+    #[serde(default, skip_serializing_if = "is_default_allow_remote_admin")]
+    pub allow_remote_admin: bool,
     /// Windows drive letter to mount, canonical form `"X:"`.
     pub drive_letter: String,
     /// Whether to auto-mount the drive on startup.
@@ -966,6 +1206,7 @@ impl Default for CyDriveConfig {
             web_ui_host: "127.0.0.1".to_string(),
             web_ui_port: 8088,
             enable_web_ui: true,
+            allow_remote_admin: false,
             drive_letter: "Y:".to_string(),
             auto_mount_drive: true,
             mount_backend: MountBackend::default(),

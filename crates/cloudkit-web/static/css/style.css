@@ -584,3 +584,488 @@ body {
     font-size: 1.5rem;
     cursor: pointer;
 }
+
+
+/* ---------- Volume management page (web volume management P0) ----------
+   The §1.4 configuration-state twin: additive glue over the existing
+   tokens only — no new visual system. */
+
+/* The topbar title block (the slot the usage-state topbar's search
+   box occupies). */
+.topbar-title h2 {
+    font-size: 1.25rem;
+    font-weight: 700;
+    color: var(--text-main);
+}
+
+.topbar-title p {
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin-top: 0.25rem;
+}
+
+/* The failed-volume badge (badge-synced's failure twin). */
+.badge-failed {
+    background: rgba(255, 51, 102, 0.15);
+    color: #ff6688;
+}
+
+/* The tabs-row ＋ chip is a link to /volumes, not a button. */
+a.volume-tab.volume-add {
+    text-decoration: none;
+    color: var(--text-muted);
+    font-weight: 700;
+}
+
+a.volume-tab.volume-add:hover {
+    color: var(--accent-cyan);
+}
+
+/* The P0 Add Volume placeholder (the form lands in P3). */
+.btn:disabled {
+    opacity: 0.5;
+    cursor: not-allowed;
+    transform: none;
+    box-shadow: none;
+}
+
+/* ------------------------- P1: the volume table's live faces (web volume mgmt) --- */
+
+/* The mini action buttons of the volume table's Actions column. */
+.btn-mini {
+    padding: 0.35rem 0.7rem;
+    border-radius: 8px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    cursor: pointer;
+    border: 1px solid var(--border-color);
+    background: var(--bg-card);
+    color: var(--text-main);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    transition: all 0.2s ease;
+    margin-right: 0.35rem;
+}
+
+.btn-mini:hover {
+    color: var(--accent-cyan);
+    border-color: var(--accent-cyan);
+}
+
+.btn-mini-danger:hover {
+    color: #ff6688;
+    border-color: #ff6688;
+}
+
+.btn-mini:disabled {
+    opacity: 0.5;
+    cursor: wait;
+}
+
+/* The P6 muted note: the Refresh slot of a volume whose index cannot
+   be rebuilt from its backend (telegram's shadow index, encrypted
+   volumes) — a receding icon whose tooltip carries the guidance. */
+.volume-note {
+    display: inline-flex;
+    align-items: center;
+    margin-right: 0.35rem;
+    color: var(--text-muted);
+    opacity: 0.45;
+    cursor: help;
+    font-size: 0.78rem;
+}
+
+/* A disabled volume's whole row recedes. */
+tr.volume-disabled td {
+    opacity: 0.5;
+}
+
+/* The Stopped badge: configured, not currently served (unmounted at
+   runtime; one Enable away from running). */
+.badge-stopped {
+    background: rgba(139, 155, 180, 0.15);
+    color: var(--text-muted);
+}
+
+/* The Disabled badge: enabled = false in the volume file — no mount,
+   no route, skipped at boot. */
+.badge-disabled {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-muted);
+}
+
+/* The toast stack (top-right, slide-in, 4s self-destruct). */
+#toast-host {
+    position: fixed;
+    top: 1.2rem;
+    right: 1.2rem;
+    z-index: 1200;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    max-width: 420px;
+}
+
+.toast {
+    display: flex;
+    gap: 0.6rem;
+    align-items: flex-start;
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-left: 3px solid var(--accent-cyan);
+    padding: 0.8rem 1rem;
+    border-radius: 10px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+    font-size: 0.85rem;
+    color: var(--text-main);
+    animation: toast-in 0.25s ease;
+}
+
+.toast i {
+    color: var(--accent-cyan);
+    margin-top: 0.1rem;
+}
+
+.toast-err {
+    border-left-color: #ff3366;
+}
+
+.toast-err i {
+    color: #ff6688;
+}
+
+.toast-out {
+    opacity: 0;
+    transform: translateX(12px);
+    transition: all 0.35s ease;
+}
+
+@keyframes toast-in {
+    from {
+        opacity: 0;
+        transform: translateX(16px);
+    }
+    to {
+        opacity: 1;
+        transform: none;
+    }
+}
+
+/* ----------------- P3/P4: the volume form card (web volume mgmt §1.2) ---
+   Additive glue over the existing tokens; the form renders inside a
+   files-container chassis above the table. */
+
+.volume-form-card {
+    margin-bottom: 1.4rem;
+}
+
+.volume-form-notice {
+    font-size: 0.82rem;
+    color: var(--text-muted);
+    border: 1px dashed var(--border-color);
+    border-radius: 10px;
+    padding: 0.7rem 0.9rem;
+    margin: 0.2rem 0 1rem;
+    line-height: 1.5;
+}
+
+.volume-form-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 0.9rem 1.2rem;
+    margin-bottom: 1rem;
+}
+
+.volume-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+}
+
+.volume-field > span em {
+    color: #ff6688;
+    font-style: normal;
+}
+
+.volume-field input,
+.volume-field select {
+    background: var(--bg-main);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    color: var(--text-main);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.85rem;
+    padding: 0.55rem 0.7rem;
+    outline: none;
+    transition: border-color 0.2s ease;
+}
+
+.volume-field input:focus,
+.volume-field select:focus {
+    border-color: var(--accent-cyan);
+}
+
+.volume-field input.vf-invalid {
+    border-color: #ff3366;
+}
+
+.volume-field-check {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.6rem;
+}
+
+.volume-field-check input {
+    width: 1.05rem;
+    height: 1.05rem;
+    accent-color: var(--accent-cyan);
+}
+
+.vf-hint {
+    font-size: 0.7rem;
+    opacity: 0.75;
+}
+
+.vf-hint.vf-hint-bad {
+    color: #ff6688;
+    opacity: 1;
+}
+
+.volume-fieldset {
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    padding: 0.8rem 1rem 1rem;
+    margin: 0 0 1rem;
+}
+
+.volume-fieldset legend {
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: var(--text-muted);
+    padding: 0 0.4rem;
+}
+
+.volume-fieldset legend em {
+    color: #ff6688;
+    font-style: normal;
+}
+
+.vf-radios {
+    display: flex;
+    gap: 1.6rem;
+    font-size: 0.82rem;
+    color: var(--text-main);
+    flex-wrap: wrap;
+}
+
+.vf-radios input {
+    accent-color: var(--accent-cyan);
+    margin-right: 0.4rem;
+}
+
+.vf-advanced summary {
+    cursor: pointer;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin-bottom: 0.8rem;
+    user-select: none;
+}
+
+.vf-advanced summary:hover {
+    color: var(--accent-cyan);
+}
+
+.vf-error {
+    border: 1px solid rgba(255, 51, 102, 0.5);
+    border-left: 3px solid #ff3366;
+    background: rgba(255, 51, 102, 0.08);
+    color: #ff6688;
+    border-radius: 10px;
+    font-size: 0.82rem;
+    padding: 0.8rem 1rem;
+    margin-bottom: 1rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+    line-height: 1.5;
+}
+
+.volume-form-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.8rem;
+}
+
+/* The P5 delete modal (two steps): the preview panel, the purge
+   checkbox, the red warning and the typed-name gate — additive glue
+   over the existing tokens (the .modal chassis above is shared with
+   the usage-state media modal). */
+
+/* The destructive primary (btn-primary's danger twin — the same
+   chassis, the danger hue the mini buttons and the error box use). */
+.btn-danger {
+    background: rgba(255, 51, 102, 0.16);
+    border: 1px solid rgba(255, 51, 102, 0.55);
+    color: #ff6688;
+}
+
+.btn-danger:hover:not(:disabled) {
+    background: rgba(255, 51, 102, 0.28);
+}
+
+.delm-content {
+    max-width: 540px;
+}
+
+.delm-title {
+    font-size: 1.1rem;
+    font-weight: 700;
+    color: var(--text-main);
+    margin: 0 0 1rem;
+}
+
+.delm-title i {
+    color: #ff6688;
+    margin-right: 0.4rem;
+}
+
+/* The overview strip: volume name + backend, one line. */
+.delm-overview {
+    display: flex;
+    align-items: center;
+    gap: 0.9rem;
+    padding: 0.7rem 0.9rem;
+    background: var(--bg-main);
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    margin-bottom: 1rem;
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.9rem;
+}
+
+.delm-overview .delm-name i {
+    color: var(--accent-cyan);
+    margin-right: 0.4rem;
+}
+
+.delm-overview .delm-backend {
+    color: var(--text-muted);
+    font-size: 0.78rem;
+}
+
+/* The goes/stays list: red trash for what a destroy deletes, muted
+   shields for what it keeps. */
+.delm-list {
+    list-style: none;
+    margin: 0 0 1rem;
+    padding: 0;
+    display: flex;
+    flex-direction: column;
+    gap: 0.5rem;
+    font-size: 0.82rem;
+    color: var(--text-main);
+    line-height: 1.45;
+}
+
+.delm-list li {
+    display: flex;
+    gap: 0.55rem;
+    align-items: baseline;
+}
+
+.delm-list li i {
+    font-size: 0.75rem;
+    margin-top: 0.18rem;
+}
+
+.delm-del i {
+    color: #ff6688;
+}
+
+.delm-keep i {
+    color: var(--accent-cyan);
+}
+
+.delm-list code {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.76rem;
+    color: var(--accent-cyan);
+}
+
+/* The purge checkbox (unchecked by default — the safe leg). */
+.delm-purge {
+    display: flex;
+    align-items: baseline;
+    gap: 0.55rem;
+    font-size: 0.8rem;
+    color: var(--text-main);
+    margin-bottom: 0.9rem;
+    cursor: pointer;
+    border: 1px dashed rgba(255, 51, 102, 0.45);
+    border-radius: 10px;
+    padding: 0.6rem 0.8rem;
+}
+
+.delm-purge input {
+    width: 1.05rem;
+    height: 1.05rem;
+    accent-color: #ff3366;
+    flex-shrink: 0;
+    transform: translateY(2px);
+}
+
+.delm-purge code {
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.74rem;
+    color: #ff6688;
+}
+
+/* The red warning (the same hue the error box uses). */
+.delm-warning {
+    font-size: 0.78rem;
+    color: #ff6688;
+    line-height: 1.5;
+    margin: 0 0 1.1rem;
+}
+
+.delm-warning i {
+    margin-right: 0.35rem;
+}
+
+.delm-typeline {
+    font-size: 0.84rem;
+    color: var(--text-muted);
+    margin: 0 0 0.6rem;
+}
+
+.delm-typeline code {
+    font-family: "JetBrains Mono", monospace;
+    color: var(--accent-cyan);
+}
+
+#delm-confirm-input {
+    width: 100%;
+    background: var(--bg-main);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    color: var(--text-main);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.9rem;
+    padding: 0.55rem 0.7rem;
+    outline: none;
+    margin-bottom: 1.1rem;
+    box-sizing: border-box;
+}
+
+#delm-confirm-input:focus {
+    border-color: #ff3366;
+}
+
+.delm-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.8rem;
+}
+

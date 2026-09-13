@@ -42,6 +42,9 @@ document.addEventListener("DOMContentLoaded", async () => {
 
 // Boot probe: a parameterless /api/stats answers 200 on a single-volume
 // dashboard and 400 + the volume list on a registry dashboard (K23).
+// The remembered selection (localStorage, web volume management §1.4)
+// restores across the / ↔ /volumes page hops — only while the volume
+// still runs; a stale memory falls back to the first running volume.
 async function detectMultiVolumeMode() {
     try {
         const res = await fetch("/api/stats");
@@ -50,8 +53,11 @@ async function detectMultiVolumeMode() {
             if (body && Array.isArray(body.volumes)) {
                 volumeState.multi = true;
                 await refreshVolumes();
+                const remembered = recallVolume();
+                const rememberedOk = remembered && volumeState.volumes.some(
+                    v => v.name === remembered && v.status === 'running');
                 const first = volumeState.volumes.find(v => v.status === 'running');
-                volumeState.current = first ? first.name : null;
+                volumeState.current = rememberedOk ? remembered : (first ? first.name : null);
                 renderVolumeTabs();
                 updateSummaryCard();
             }
@@ -130,12 +136,15 @@ async function loadDriveData() {
 // The volume switcher: one chip per registry volume — name + backend
 // badge + status dot. Failed volumes are disabled but visible, with
 // the server-reported reason as the tooltip (K22: failures are shown,
-// never silently dropped).
+// never silently dropped). The row-end ＋ links to the management page
+// (web volume management §1.4; the #add anchor lands with the P3
+// form). After every redraw the current selection is revalidated
+// (ensureCurrentVolume).
 function renderVolumeTabs() {
     const bar = document.getElementById("volume-tabs");
     if (!bar || !volumeState.multi) return;
     bar.hidden = false;
-    bar.innerHTML = volumeState.volumes.map(v => {
+    const chips = volumeState.volumes.map(v => {
         const failed = v.status === 'failed';
         const active = v.name === volumeState.current ? " active" : "";
         const reason = failed && v.status_reason
@@ -148,13 +157,46 @@ function renderVolumeTabs() {
             ? `<button class="volume-tab failed" disabled${reason}>${label}</button>`
             : `<button class="volume-tab${active}" onclick="switchVolume('${escapeHtml(v.name)}')"${reason}>${label}</button>`;
     }).join("");
+    bar.innerHTML = `${chips}<a href="/volumes" class="volume-tab volume-add" title="Manage volumes">＋</a>`;
+    ensureCurrentVolume();
+}
+
+// The current-selection fallback (plan §1.4 顺带修复): a volume that
+// was REMOVE'd server-side leaves volumeState.current dangling — the
+// tabs would render no active chip and every volume-scoped fetch would
+// 404, freezing the UI. When the selection no longer names a registry
+// volume, fall back to the first running one (the first entry when
+// nothing runs), persist it, redraw the tabs and reload the data once.
+function ensureCurrentVolume() {
+    if (!volumeState.multi) return;
+    const names = volumeState.volumes.map(v => v.name);
+    if (volumeState.current && names.includes(volumeState.current)) return;
+    const fallback = volumeState.volumes.find(v => v.status === 'running')
+        || volumeState.volumes[0]
+        || null;
+    if (!fallback) return; // empty registry: nothing to fall back to
+    volumeState.current = fallback.name;
+    rememberVolume(volumeState.current);
+    renderVolumeTabs();
+    loadDriveData();
 }
 
 function switchVolume(name) {
     if (volumeState.current === name) return;
     volumeState.current = name;
+    rememberVolume(name);
     renderVolumeTabs();
     loadDriveData();
+}
+
+// The remembered selection's persistence (localStorage may be disabled
+// in hostile embedders — a failed write must never break the UI).
+function rememberVolume(name) {
+    try { localStorage.setItem('cydrive.volume', name); } catch (err) { /* storage off */ }
+}
+
+function recallVolume() {
+    try { return localStorage.getItem('cydrive.volume'); } catch (err) { return null; }
 }
 
 // The cross-volume aggregate card: client-side sums over the ONE

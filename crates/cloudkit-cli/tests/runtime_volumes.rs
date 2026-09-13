@@ -1793,3 +1793,476 @@ async fn removing_every_volume_leaves_the_empty_instance_serving() {
         .expect("shutdown completes")
         .expect("shutdown joins cleanly");
 }
+
+// --------------------- 6. ENABLE / DISABLE / CONFIGS (web volume P1) ---
+
+/// An instant mount stub (the blocked stub's success arm without the
+/// parking): the DISABLE test only needs a mount present in the live
+/// table, not its timing.
+fn instant_mount_stub() -> RuntimeMount {
+    Arc::new(move |name: &str, letter: &str| {
+        let volume = name.to_string();
+        let letter = format!("{}:", letter.trim_end_matches(':').to_ascii_uppercase());
+        Box::pin(async move {
+            VolumeMounts {
+                mounted: vec![MountedVolume {
+                    volume,
+                    letter,
+                    backend: MountedBackend::WebDav,
+                }],
+                winfsp: Default::default(),
+            }
+        })
+    })
+}
+
+/// `DISABLE <name>` (web volume management P1): the file write lands
+/// FIRST (the persistent source of truth — a failed write must never
+/// touch the runtime), then the volume comes down through the SAME K50
+/// sequence REMOVE runs: the drive release executes, the volume leaves
+/// every face (LIST, the WebDAV route) and `enabled = false` is what the
+/// file on disk says.
+#[tokio::test]
+async fn disable_writes_the_file_releases_the_drive_and_unregisters_everywhere() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    write_file(
+        &dir.path().join("volumes").join("m.toml"),
+        &format!("{}drive_letter = \"Q\"\n", volume_toml("222:BBB", 222222)),
+    );
+    let _guard = chdir(dir.path());
+
+    let specs = {
+        let mut v =
+            cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load volume specs");
+        v.retain(|spec| spec.name == "a");
+        v
+    };
+    let handle = boot_with_commands(
+        mount_process_config(),
+        specs,
+        vec![mock_transport().await],
+        RuntimeVolumeCommands {
+            dispatch: Some(mock_dispatch()),
+            mount: Some(instant_mount_stub()),
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await;
+    let addr = control_addr();
+    let webdav = handle.webdav_addr().expect("webdav bound");
+
+    // Bring `m` up at runtime with a mounted (stubbed) drive.
+    let reply = send_cmd(addr, "ADD m").await;
+    assert!(
+        reply.starts_with("OK:") && reply.contains("mounted Q:"),
+        "the runtime ADD mounts the stubbed drive: {reply}"
+    );
+
+    // Swap the (would-be net-use) release for the probe, then DISABLE.
+    let released = Arc::new(AtomicBool::new(false));
+    let released_for_probe = Arc::clone(&released);
+    assert!(
+        handle.live_table().set_release(
+            "m",
+            Box::new(FakeRelease {
+                attempts: Arc::new(AtomicUsize::new(0)),
+                released: released_for_probe,
+                succeed: true,
+            })
+        ),
+        "the probe injects into the mounted volume"
+    );
+
+    let reply = send_cmd(addr, "DISABLE m").await;
+    assert!(
+        reply.starts_with("OK:") && reply.contains("disabled volume `m`"),
+        "the DISABLE acknowledges and names the volume: {reply}"
+    );
+    assert!(
+        released.load(Ordering::SeqCst),
+        "the drive release ran (the same K50 step-2 REMOVE runs)"
+    );
+    let file = fs::read_to_string(dir.path().join("volumes").join("m.toml"))
+        .expect("read the volume file");
+    assert!(
+        file.contains("enabled = false"),
+        "the file carries the persistent disable: {file}"
+    );
+    assert!(
+        file.contains("bot_token = \"222:BBB\""),
+        "the explicit keys survive the rewrite: {file}"
+    );
+    let reply = send_cmd(addr, "LIST").await;
+    assert_eq!(
+        list_rows(&reply),
+        vec!["a running - telegram pending=0".to_string()],
+        "the registry face dropped m: {reply}"
+    );
+    let resp = send_http(webdav, &http_request("PROPFIND", "/vol/m/", webdav)).await;
+    assert_eq!(status_of(&resp), 404, "the WebDAV face dropped m: {resp}");
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+/// A volume that was not running (already stopped, or REMOVEd) still
+/// DISABLEs: the file write is the whole action, the reply says the
+/// runtime was untouched.
+#[tokio::test]
+async fn disable_of_a_stopped_volume_only_writes_the_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    write_file(
+        &dir.path().join("volumes").join("off.toml"),
+        &volume_toml("222:BBB", 222222),
+    );
+    let _guard = chdir(dir.path());
+
+    let specs = {
+        let mut v =
+            cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load volume specs");
+        v.retain(|spec| spec.name == "a");
+        v
+    };
+    let handle = boot_with_commands(
+        process_config(),
+        specs,
+        vec![mock_transport().await],
+        RuntimeVolumeCommands::default(),
+    )
+    .await;
+    let addr = control_addr();
+
+    let reply = send_cmd(addr, "DISABLE off").await;
+    assert!(
+        reply.starts_with("OK:") && reply.contains("was not running"),
+        "a stopped volume disables file-only: {reply}"
+    );
+    let file = fs::read_to_string(dir.path().join("volumes").join("off.toml"))
+        .expect("read the volume file");
+    assert!(
+        file.contains("enabled = false"),
+        "the file carries the disable: {file}"
+    );
+    // Idempotent: a second DISABLE of the now-disabled file answers OK.
+    let reply = send_cmd(addr, "DISABLE off").await;
+    assert!(
+        reply.starts_with("OK:"),
+        "second DISABLE is idempotent: {reply}"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+/// The K50 philosophy on the write side: a failed file write must not
+/// touch the runtime (the persistent file is the source of truth — a
+/// runtime disable the file contradicts would resurrect on the next
+/// boot). A read-only volume file forces the write failure.
+#[tokio::test]
+#[allow(clippy::permissions_set_readonly_false)] // restoring the write bit a Windows-readonly test file cleared; the TempDir's scratch file carries no permission meaning on any platform
+async fn disable_write_failure_leaves_the_runtime_untouched() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    let file = dir.path().join("volumes").join("a.toml");
+    write_file(&file, &volume_toml("111:AAA", 111111));
+    let _guard = chdir(dir.path());
+
+    let specs =
+        cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load volume specs");
+    let handle = boot_with_commands(
+        process_config(),
+        specs,
+        vec![mock_transport().await],
+        RuntimeVolumeCommands::default(),
+    )
+    .await;
+    let addr = control_addr();
+
+    // Make the volume file unwritable (the Windows readonly attribute
+    // denies fs::write).
+    let mut perms = fs::metadata(&file).expect("file metadata").permissions();
+    perms.set_readonly(true);
+    fs::set_permissions(&file, perms).expect("make the file read-only");
+
+    let reply = send_cmd(addr, "DISABLE a").await;
+    let mut perms = fs::metadata(&file).expect("file metadata").permissions();
+    perms.set_readonly(false);
+    let _ = fs::set_permissions(&file, perms); // restore for the TempDir drop
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("writing"),
+        "the write failure is the refusal: {reply}"
+    );
+    assert!(
+        reply.contains("nothing was changed"),
+        "the refusal says the runtime is untouched: {reply}"
+    );
+    let reply = send_cmd(addr, "LIST").await;
+    assert_eq!(
+        list_rows(&reply),
+        vec!["a running - telegram pending=0".to_string()],
+        "the volume keeps running exactly as before: {reply}"
+    );
+    let text = fs::read_to_string(&file).expect("read the file");
+    assert!(
+        !text.contains("enabled = false"),
+        "the file was not rewritten: {text}"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+/// `ENABLE <name>` re-assembles a disabled volume through the runtime
+/// ADD path and flips the file back — the DISABLE twin. The refusals
+/// keep ADD's shape: a name without a file names the volumes_dir, and an
+/// already-registered volume is refused.
+#[tokio::test]
+async fn enable_reassembles_the_disabled_volume() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    write_file(
+        &dir.path().join("volumes").join("off.toml"),
+        &format!("enabled = false\n{}", volume_toml("222:BBB", 222222)),
+    );
+    let _guard = chdir(dir.path());
+
+    let specs = {
+        let mut v =
+            cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load volume specs");
+        v.retain(|spec| spec.name == "a");
+        v
+    };
+    let handle = boot_with_commands(
+        process_config(),
+        specs,
+        vec![mock_transport().await],
+        RuntimeVolumeCommands {
+            dispatch: Some(mock_dispatch()),
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await;
+    let addr = control_addr();
+
+    // ENABLE of the never-booted disabled file: the file flips and the
+    // volume assembles.
+    let reply = send_cmd(addr, "ENABLE off").await;
+    assert!(
+        reply.starts_with("OK:") && reply.contains("added volume `off`"),
+        "the ENABLE assembles through the ADD path: {reply}"
+    );
+    let file = fs::read_to_string(dir.path().join("volumes").join("off.toml"))
+        .expect("read the volume file");
+    assert!(
+        file.contains("enabled = true"),
+        "the file flipped back: {file}"
+    );
+    let reply = send_cmd(addr, "LIST").await;
+    assert_eq!(
+        list_rows(&reply),
+        vec![
+            "a running - telegram pending=0".to_string(),
+            "off running - telegram pending=0".to_string(),
+        ],
+        "both volumes run: {reply}"
+    );
+
+    // Refusals keep ADD's shapes.
+    let reply = send_cmd(addr, "ENABLE ghost").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("no volume file"),
+        "a missing file names the fact: {reply}"
+    );
+    let reply = send_cmd(addr, "ENABLE a").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("already registered"),
+        "an already-running volume is refused: {reply}"
+    );
+    let reply = send_cmd(addr, "ENABLE").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("usage") && reply.contains("ENABLE <name>"),
+        "malformed shapes get the usage line: {reply}"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+/// `CONFIGS` is the configuration FULL set (the config page's data
+/// source — LIST is the runtime registry and cannot see disabled
+/// volumes): every `*.toml` under the volumes_dir, one row per file,
+/// with the runtime join (running/absent), and a schema-broken file
+/// reporting `invalid` on its row without failing the whole listing.
+#[tokio::test]
+async fn configs_lists_running_disabled_and_invalid_rows() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    let _guard = chdir(dir.path());
+
+    let specs =
+        cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load volume specs");
+    let handle = boot_with_commands(
+        process_config(),
+        specs,
+        vec![mock_transport().await],
+        RuntimeVolumeCommands::default(),
+    )
+    .await;
+    let addr = control_addr();
+
+    // Late-arriving files: a disabled volume and a schema-broken one
+    // (written after the boot — CONFIGS scans the directory live).
+    write_file(
+        &dir.path().join("volumes").join("broken.toml"),
+        "backend = \"local\"\nno_such_key = 1\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("off.toml"),
+        &format!("enabled = false\n{}", volume_toml("222:BBB", 222222)),
+    );
+
+    let reply = send_cmd(addr, "CONFIGS").await;
+    assert!(
+        reply.starts_with("OK: 3 volume file(s)"),
+        "the header counts every file: {reply}"
+    );
+    let rows = list_rows(&reply);
+    assert_eq!(
+        rows[0], "a telegram enabled=true running",
+        "the running volume row: {reply}"
+    );
+    assert!(
+        rows[1].starts_with("broken invalid ("),
+        "the broken file reports invalid on its row: {reply}"
+    );
+    assert!(
+        rows[1].contains("no_such_key"),
+        "the invalid row carries the refusal reason: {reply}"
+    );
+    assert_eq!(
+        rows[2], "off telegram enabled=false absent",
+        "the disabled volume row (absent from the runtime): {reply}"
+    );
+
+    // Usage: CONFIGS takes no argument.
+    let reply = send_cmd(addr, "CONFIGS a").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("usage"),
+        "CONFIGS with an argument gets the usage line: {reply}"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+/// The H1 entry gate covers the new mutations: after the stop gate
+/// fires, ENABLE and DISABLE are refused with the shutdown reason while
+/// the read-only CONFIGS keeps answering (the LIST twin).
+#[tokio::test]
+async fn enable_disable_refused_after_the_stop_gate_fires() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    write_file(
+        &dir.path().join("volumes").join("b.toml"),
+        &volume_toml("333:CCC", 333333),
+    );
+    let _guard = chdir(dir.path());
+
+    let specs = {
+        let mut v =
+            cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load volume specs");
+        v.retain(|spec| spec.name == "a");
+        v
+    };
+    let handle = boot_with_commands(
+        process_config(),
+        specs,
+        vec![mock_transport().await],
+        RuntimeVolumeCommands {
+            dispatch: Some(mock_dispatch()),
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await;
+    let addr = control_addr();
+
+    let reply = send_cmd(addr, "STOP").await;
+    assert!(reply.starts_with("OK:"), "STOP acknowledges: {reply}");
+
+    let reply = send_cmd(addr, "ENABLE b").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("shutting down"),
+        "ENABLE after the gate is refused: {reply}"
+    );
+    let reply = send_cmd(addr, "DISABLE a").await;
+    assert!(
+        reply.starts_with("ERR:") && reply.contains("shutting down"),
+        "DISABLE after the gate is refused: {reply}"
+    );
+    let file = fs::read_to_string(dir.path().join("volumes").join("a.toml"))
+        .expect("read the volume file");
+    assert!(
+        !file.contains("enabled = false"),
+        "the gate refusal left the file untouched: {file}"
+    );
+    let reply = send_cmd(addr, "CONFIGS").await;
+    assert!(
+        reply.starts_with("OK:"),
+        "the read-only CONFIGS still answers: {reply}"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}

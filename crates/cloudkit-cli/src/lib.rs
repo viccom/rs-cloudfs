@@ -981,14 +981,25 @@ impl RegistryHandle {
 /// volume-relative `local_root`s resolve to the absolute paths
 /// [`CyDriveConfig::validate`] demands.
 pub fn volume_home(spec: &VolumeConfig) -> Result<PathBuf> {
-    let base = if spec.base_dir.is_absolute() {
-        spec.base_dir.clone()
+    volume_home_under(&spec.base_dir, &spec.name)
+}
+
+/// `<base_dir>/<name>` with the base dir absolutised against the
+/// process cwd — the K21 resolution [`volume_home`] runs, shared with
+/// DESTROY's name-derived lookups (a schema-broken volume file has no
+/// loadable spec, but its home is still `<volumes_dir>/<name>` — the
+/// same directory a healthy spec would resolve to, derived straight
+/// from the name so the preview and the purge leg cannot drift from
+/// the assembly's own anchor).
+fn volume_home_under(base_dir: &Path, name: &str) -> Result<PathBuf> {
+    let base = if base_dir.is_absolute() {
+        base_dir.to_path_buf()
     } else {
         std::env::current_dir()
             .context("resolving the working directory")?
-            .join(&spec.base_dir)
+            .join(base_dir)
     };
-    Ok(base.join(&spec.name))
+    Ok(base.join(name))
 }
 
 /// Resolves one volume-relative path against the volume home (K21):
@@ -1519,6 +1530,56 @@ impl RemoveTuning {
     }
 }
 
+/// R4's bounded-rebuild knobs (P2, `RebuildTuning`'s own row in
+/// [`RuntimeVolumeCommands`]): the whole background rebuild runs under
+/// `timeout` — an interrupted pass keeps its upserted rows (the rel_path
+/// conflict key makes the merge idempotent, a rerun continues where it
+/// stopped) — and the R5 checkpoint (registry presence + shutdown gate)
+/// is audited every `checkpoint_interval`. Deliberately NOT config
+/// keys (可配性挂账): a struct injection keeps the surface at zero while
+/// the tests reach millisecond scale through [`RebuildTuning::fast`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RebuildTuning {
+    /// The whole background rebuild's budget (default 15 minutes).
+    pub timeout: Duration,
+    /// The R5 checkpoint cadence.
+    pub checkpoint_interval: Duration,
+}
+
+impl Default for RebuildTuning {
+    fn default() -> Self {
+        Self {
+            timeout: Duration::from_secs(15 * 60),
+            checkpoint_interval: Duration::from_secs(1),
+        }
+    }
+}
+
+impl RebuildTuning {
+    /// Millisecond-scale windows for the tests (never production).
+    pub fn fast() -> Self {
+        Self {
+            timeout: Duration::from_millis(300),
+            checkpoint_interval: Duration::from_millis(50),
+        }
+    }
+}
+
+/// The boxed outcome future of one [`RuntimeRebuild`] call (P2).
+pub type RuntimeRebuildFuture =
+    std::pin::Pin<Box<dyn Future<Output = Result<rebuild::RebuildOutcome>> + Send + 'static>>;
+
+/// The background rebuild executor behind a seam (P2, the mount seam's
+/// twin): receives the volume's name and its RESOLVED settings, answers
+/// the rebuild outcome. Production (`None` in
+/// [`RuntimeVolumeCommands`]) runs the SAME `run_rebuild_command` the
+/// offline `cydrive rebuild` uses (K11 gate + db open + the recursive
+/// walk); the tests inject fakes that park on channels, fail, or count
+/// calls — the R4/R5 supervision (timeout + checkpoint abort) lives
+/// AROUND the executor, so a fake exercises it without a real backend.
+pub type RuntimeRebuild =
+    Arc<dyn Fn(&str, &CyDriveConfig) -> RuntimeRebuildFuture + Send + Sync + 'static>;
+
 /// The RV2 boot extras: what the runtime-volume command surface needs
 /// beyond the plain boot. [`Default`] (no dispatch, production tuning)
 /// is exactly what [`run_multi_with_transports`] passes — LIST/REMOVE
@@ -1535,6 +1596,12 @@ pub struct RuntimeVolumeCommands {
     /// the real K27/K40 mount pass; the tests inject a stub that blocks
     /// or fails the mount to pin the publish-after-mount ordering.
     pub mount: Option<RuntimeMount>,
+    /// The P2 background-rebuild waits (tests shrink them).
+    pub rebuild_tuning: RebuildTuning,
+    /// The background rebuild executor (P2): `None` (production) runs
+    /// the real `run_rebuild_command`; the tests inject parking or
+    /// failing fakes through the seam.
+    pub rebuild: Option<RuntimeRebuild>,
 }
 
 /// The single-volume assembly result (RV2's 单卷装配): everything ONE
@@ -1649,7 +1716,11 @@ pub async fn run_multi_with_transports(
 ///
 /// MV3: with `enable_web_ui` the boot also binds the ONE process-level
 /// dashboard (K24) serving the volume registry — per-volume tabs, the
-/// `/api/volumes` listing and the K23 `?volume=` routing.
+/// `/api/volumes` listing and the K23 `?volume=` routing. The dashboard
+/// receives the SAME volume-command handler the control channel runs
+/// (web volume management §1.1): its management routes send commands
+/// through the shared seam, so both trigger sources serialize behind
+/// one queue.
 pub async fn run_multi_with_transports_and_commands(
     process_cfg: &CyDriveConfig,
     volumes: Vec<(VolumeConfig, RunOptions, Arc<dyn CloudTransport>)>,
@@ -1751,7 +1822,57 @@ pub async fn run_multi_with_transports_and_commands(
     // the volumes keep running without the UI. The boot keeps a clone
     // for the same reason.
     let web_face = cloudkit_web::RegistryHandle::new(ui_entries);
-    let web_ui = bind_multi_web_ui(process_cfg, web_face.clone()).await;
+
+    // The ONE volume-command handler (web volume management plan §1.1):
+    // the same closure serves the control channel AND the dashboard's
+    // command seam — web-sent commands and control-channel commands
+    // funnel into the same serialized execution behind the in-flight
+    // counter (review H1). Built before the dashboard bind so the bind
+    // can inject its `Arc` clone (the web alias is structurally the
+    // same type; cloning shares, it does not re-wrap).
+    let in_flight = Arc::new(InFlightCommands::default());
+    // The P2 rebuild executor resolution: the injected seam or the
+    // production `run_rebuild_command` closure (the same body the
+    // offline `cydrive rebuild` runs — K11 gate + db open + walk).
+    let rebuild_executor: RuntimeRebuild = commands.rebuild.clone().unwrap_or_else(|| {
+        Arc::new(|_name: &str, settings: &CyDriveConfig| {
+            let settings = settings.clone();
+            Box::pin(async move { run_rebuild_command(&settings).await })
+        })
+    });
+    let command_surface = Arc::new(RuntimeVolumeControl {
+        process_cfg: process_cfg.clone(),
+        registry: registry.clone(),
+        webdav: webdav_face.clone(),
+        web: web_face.clone(),
+        live: Arc::clone(&live),
+        watch: Arc::clone(&watch),
+        webdav_available: webdav_addr.is_some(),
+        dispatch: commands.dispatch,
+        mount: commands.mount,
+        tuning: commands.remove_tuning,
+        rebuilds: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+        rebuild_tuning: commands.rebuild_tuning,
+        rebuild: rebuild_executor,
+    });
+    let volume_command_handler: control::VolumeCommandHandler = {
+        let surface = Arc::clone(&command_surface);
+        let in_flight = Arc::clone(&in_flight);
+        Arc::new(move |line: &str| {
+            let surface = Arc::clone(&surface);
+            let guard = in_flight.enter();
+            Box::pin(async move {
+                let _in_flight = guard;
+                surface.handle(line).await
+            })
+        })
+    };
+    let web_ui = bind_multi_web_ui(
+        process_cfg,
+        web_face.clone(),
+        Some(Arc::clone(&volume_command_handler)),
+    )
+    .await;
     let web_ui_addr = web_ui.as_ref().map(WebUiServer::local_addr);
 
     // Per-volume mounts (K27 + K40): only volumes that EXPLICITLY set a
@@ -1791,45 +1912,17 @@ pub async fn run_multi_with_transports_and_commands(
     // cwd-anchored location as the single-volume mode (the process
     // config's default db_path anchors the file in the working
     // directory), same optional-component degrade. RV2: the channel
-    // serves the volume commands through the shared runtime state.
-    // Created before the bind (a degraded bind keeps the stop task's
-    // idle barrier working — with no handler installed it is trivially
-    // idle).
-    let in_flight = Arc::new(InFlightCommands::default());
+    // serves the volume commands through the shared runtime state (the
+    // handler built above — the dashboard got the same `Arc`).
+    // The in-flight counter was created before the binds (a degraded
+    // control bind keeps the stop task's idle barrier working — with no
+    // handler installed it is trivially idle).
     let control_file = match control::ControlServer::bind(process_cfg).await {
         Ok(server) => {
             let path = control::control_file_path(process_cfg);
             tracing::info!(addr = %server.local_addr(), "control channel listening");
             let gate = Arc::clone(&watch);
-            let command_surface = Arc::new(RuntimeVolumeControl {
-                process_cfg: process_cfg.clone(),
-                registry: registry.clone(),
-                webdav: webdav_face.clone(),
-                web: web_face.clone(),
-                live: Arc::clone(&live),
-                watch: Arc::clone(&watch),
-                webdav_available: webdav_addr.is_some(),
-                dispatch: commands.dispatch,
-                mount: commands.mount,
-                tuning: commands.remove_tuning,
-            });
-            // Every handler invocation enters under the in-flight
-            // counter (review H1): the stop task's idle barrier waits
-            // these out before draining the live table, so a command
-            // caught mid-sequence by a gate fire hands its entry back
-            // instead of orphaning it.
-            let handler: control::VolumeCommandHandler = {
-                let surface = Arc::clone(&command_surface);
-                let in_flight = Arc::clone(&in_flight);
-                Arc::new(move |line: &str| {
-                    let surface = Arc::clone(&surface);
-                    let guard = in_flight.enter();
-                    Box::pin(async move {
-                        let _in_flight = guard;
-                        surface.handle(line).await
-                    })
-                })
-            };
+            let handler = Arc::clone(&volume_command_handler);
             tokio::spawn(async move {
                 if let Err(error) = server
                     .run_with_commands(move || gate.trigger(), Some(handler))
@@ -1918,10 +2011,16 @@ pub async fn run_multi_with_transports_and_commands(
 /// Binds the single multi-volume dashboard (K24 / MV3) or skips it
 /// (`enable_web_ui` off) or degrades visibly (K22): an address-parse
 /// or bind failure logs an error and returns `None` — the volumes keep
-/// running, only the UI face is gone.
+/// running, only the UI face is gone. `commands` is the volume-command
+/// seam (web volume management §1.1) injected into the dashboard's
+/// management routes — the same `Arc` the control channel runs. The
+/// §1.5 remote-administration ruling rides along: a non-loopback bind
+/// keeps the management write family withheld unless the process key
+/// `allow_remote_admin = true` opts in.
 async fn bind_multi_web_ui(
     process_cfg: &CyDriveConfig,
     volumes: cloudkit_web::RegistryHandle,
+    commands: Option<cloudkit_web::VolumeCommandClient>,
 ) -> Option<WebUiServer> {
     if !process_cfg.enable_web_ui {
         tracing::info!("web UI disabled (enable_web_ui = false)");
@@ -1938,7 +2037,14 @@ async fn bind_multi_web_ui(
             return None;
         }
     };
-    match WebUiServer::serve_multi(volumes, bind).await {
+    match WebUiServer::serve_multi_with_remote_admin(
+        volumes,
+        bind,
+        commands,
+        process_cfg.allow_remote_admin,
+    )
+    .await
+    {
         Ok(server) => {
             tracing::info!(addr = %server.local_addr(), "multi-volume web UI listening");
             Some(server)
@@ -2171,6 +2277,79 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// `true` when the control line's first token is exactly `keyword` (the
+/// connection layer trims the line, so the keyword starts at byte 0;
+/// the match must end at whitespace so `CREATEX` never routes as
+/// `CREATE`).
+fn first_keyword_is(line: &str, keyword: &str) -> bool {
+    let rest = line.strip_prefix(keyword);
+    rest.is_some_and(|rest| rest.starts_with(char::is_whitespace) || rest.is_empty())
+}
+
+/// Splits `name <payload>` — the span after a CREATE/UPDATE keyword —
+/// into the volume name and the payload REST OF THE LINE verbatim (the
+/// payload is JSON whose strings may carry meaningful runs of whitespace;
+/// the whitespace-token splitting of the other commands would mangle
+/// them). `None` when there is no name token at all.
+fn split_name_payload(rest: &str) -> Option<(&str, &str)> {
+    let rest = rest.trim_start();
+    let (name, tail) = rest.split_once(char::is_whitespace)?;
+    Some((name, tail.trim_start()))
+}
+
+/// Converts one CREATE/UPDATE payload — a compact single-line JSON
+/// object — into the toml::Table the controlled renderer consumes (web
+/// volume management §1.2, P3). The key space is exactly
+/// [`VOLUME_SCOPED_KEYS`] (a process-level key is refused with its
+/// config.toml pointer, an unknown key with its own refusal); values go
+/// through [`cloudkit_core::config::json_value_to_toml`], whose
+/// null/empty-string → unset rule IS the write-only affordance (a
+/// credential the form left empty overlays nothing) and whose type
+/// refusals name the key, never the value (M3 — the payload may carry
+/// credentials). Every refusal text is a complete `ERR: ...\n` reply.
+fn volume_payload_table(payload: &str) -> Result<toml::Table, String> {
+    let value: serde_json::Value = match serde_json::from_str(payload) {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(format!(
+                "ERR: the payload is not valid JSON: {error} — send one compact single-line \
+                 JSON object of volume keys\n"
+            ));
+        }
+    };
+    let serde_json::Value::Object(fields) = value else {
+        return Err(
+            "ERR: the payload must be a JSON object of volume keys, not a bare value\n".to_string(),
+        );
+    };
+    let mut table = toml::Table::new();
+    for (key, value) in fields {
+        if cloudkit_core::config::PROCESS_SCOPED_KEYS.contains(&key.as_str()) {
+            return Err(format!(
+                "ERR: key `{key}` is a process-level setting and belongs in config.toml, not \
+                 in a volume — remove it from the payload\n"
+            ));
+        }
+        if !cloudkit_core::config::VOLUME_SCOPED_KEYS.contains(&key.as_str()) {
+            return Err(format!(
+                "ERR: unknown key `{key}` — the payload accepts volume-scoped keys only \
+                 (the backend selector, its credentials, the tuning keys, `enabled`)\n"
+            ));
+        }
+        match cloudkit_core::config::json_value_to_toml(&key, &value) {
+            Ok(Some(converted)) => {
+                table.insert(key, converted);
+            }
+            // null / empty string: the write-only leave-alone rule — no
+            // key in the table, so CREATE writes nothing and UPDATE
+            // overlays nothing.
+            Ok(None) => {}
+            Err(error) => return Err(format!("ERR: {error}\n")),
+        }
+    }
+    Ok(table)
+}
+
 /// The state the control channel's `ADD`/`REMOVE`/`LIST` commands act
 /// through (RV2 / K48): the cli master registry (the truth), the two
 /// face tables (the WebDAV dispatch and dashboard projections), the live
@@ -2194,6 +2373,17 @@ struct RuntimeVolumeControl {
     /// pass (`None`), tests inject blockers/failures.
     mount: Option<RuntimeMount>,
     tuning: RemoveTuning,
+    /// P2/R1: the per-volume rebuild state — a name present here has a
+    /// background rebuild in flight; the value is its wall-clock start
+    /// (the already-running refusal renders it `HH:MM:SS`). Guarded by
+    /// a std Mutex touched from the serialized handler AND the
+    /// background task's exit path; no await ever holds it.
+    rebuilds: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::SystemTime>>>,
+    /// The P2 rebuild waits (tests shrink them).
+    rebuild_tuning: RebuildTuning,
+    /// The resolved P2 executor (the injected seam or the production
+    /// `run_rebuild_command` closure).
+    rebuild: RuntimeRebuild,
 }
 
 impl RuntimeVolumeControl {
@@ -2201,18 +2391,104 @@ impl RuntimeVolumeControl {
     /// contract: every command answers, errors are actionable text, the
     /// connection never carries state across commands).
     async fn handle(&self, line: &str) -> String {
+        // CREATE/UPDATE carry a JSON payload as their third span — the
+        // payload is split off POSITIONALLY so its own whitespace
+        // (significant inside JSON strings) survives verbatim; the
+        // whitespace-token match below would mangle it.
+        for keyword in ["CREATE", "UPDATE"] {
+            if first_keyword_is(line, keyword) {
+                let rest = line.split_once(char::is_whitespace).map_or("", |(_, r)| r);
+                return match split_name_payload(rest) {
+                    Some((name, payload)) if !payload.is_empty() => {
+                        // The H1 gate entry point — the mutating family's
+                        // shared refusal (see the match arm below for the
+                        // rationale).
+                        if self.watch.fired() {
+                            return format!(
+                                "ERR: {keyword} refused — the instance is shutting down; \
+                                 volume changes are no longer accepted (`LIST` still \
+                                 answers)\n"
+                            );
+                        }
+                        match keyword {
+                            "CREATE" => self.create_volume(name, payload).await,
+                            _ => self.update_volume(name, payload).await,
+                        }
+                    }
+                    _ => format!(
+                        "ERR: usage: {keyword} <name> <json> — a volume name and one compact \
+                         JSON object of volume keys (e.g. {{\"backend\": \"local\", \
+                         \"local_root\": \"C:/data\"}}); volume names match \
+                         ^[a-z][a-z0-9_-]{{0,31}}$\n"
+                    ),
+                };
+            }
+        }
+        // DESTROY (P5) carries its two-leg protocol in literal second
+        // and third words (`confirm`, then optionally `purge_local`) —
+        // parsed positionally here, ahead of the three-token match
+        // below (whose mutating arms demand a bare `<name>`).
+        if first_keyword_is(line, "DESTROY") {
+            let rest = line.split_once(char::is_whitespace).map_or("", |(_, r)| r);
+            let mut parts = rest.split_whitespace();
+            // (name, confirmed, purge_local)
+            let invocation = match (parts.next(), parts.next(), parts.next()) {
+                (Some(name), None, None) => Some((name, false, false)),
+                (Some(name), Some("confirm"), None) => Some((name, true, false)),
+                (Some(name), Some("confirm"), Some("purge_local")) => Some((name, true, true)),
+                _ => None,
+            };
+            return match invocation {
+                Some((name, confirmed, purge_local)) => {
+                    // The gate's entry observation point (review H1):
+                    // DESTROY joins the mutating family at keyword
+                    // level (like CREATE/UPDATE's entry) — a
+                    // shutting-down instance accepts no deletion (and
+                    // no preview either: its paths go stale the moment
+                    // the process exits).
+                    if self.watch.fired() {
+                        return "ERR: DESTROY refused — the instance is shutting down; volume \
+                                changes are no longer accepted (`LIST` still answers)\n"
+                            .to_string();
+                    }
+                    if confirmed {
+                        self.destroy_volume(name, purge_local).await
+                    } else {
+                        self.destroy_preview(name)
+                    }
+                }
+                None => "ERR: usage: DESTROY <name> — the preview (nothing executes); DESTROY \
+                         <name> confirm — the destruction (unmount if running, delete the volume \
+                         file); DESTROY <name> confirm purge_local — also delete the volume's \
+                         local data directory (remote data is never touched either way)\n"
+                    .to_string(),
+            };
+        }
         let mut tokens = line.split_whitespace();
         match (tokens.next(), tokens.next(), tokens.next()) {
             (Some("LIST"), None, None) => self.list(),
-            (Some(cmd @ ("ADD" | "REMOVE")), Some(name), None) => {
+            // SHOW and CONFIGS are read-only like LIST (web volume
+            // management §1.2): the shutdown gate refuses mutations,
+            // never reads — the registry and the volume files stay valid
+            // through it.
+            (Some("SHOW"), Some(name), None) => self.show_volume(name),
+            (Some("CONFIGS"), None, None) => self.configs(),
+            (
+                Some(cmd @ ("ADD" | "REMOVE" | "ENABLE" | "DISABLE" | "REBUILD")),
+                Some(name),
+                None,
+            ) => {
                 // The gate's entry observation point (review H1): once
                 // the shutdown gate has fired, the mutating commands are
                 // refused — the stop task's idle barrier is waiting for
                 // in-flight commands to settle, and a fresh mutation
-                // would race its `take_all`. LIST is read-only and the
-                // registry stays valid through the shutdown, so it keeps
-                // answering. The refusal still goes back over the reply
-                // channel (the connection task parks on the one-shot).
+                // would race its `take_all`. LIST (and the other reads)
+                // is read-only and the registry stays valid through the
+                // shutdown, so it keeps answering. REBUILD joins the
+                // mutating family (P2): a shutting-down instance accepts
+                // no new background work. The refusal still goes back
+                // over the reply channel (the connection task parks on
+                // the one-shot).
                 if self.watch.fired() {
                     return format!(
                         "ERR: {cmd} refused — the instance is shutting down; volume changes \
@@ -2221,23 +2497,34 @@ impl RuntimeVolumeControl {
                 }
                 match cmd {
                     "ADD" => self.add_volume(name).await,
-                    _ => self.remove_volume(name).await,
+                    "REMOVE" => self.remove_volume(name).await,
+                    "DISABLE" => self.disable_volume(name).await,
+                    "REBUILD" => self.rebuild_volume(name).await,
+                    _ => self.enable_volume(name).await,
                 }
             }
-            (Some(cmd @ ("ADD" | "REMOVE")), _, _) => format!(
-                "ERR: usage: {cmd} <name> — exactly one volume name (volume names match \
+            (Some(cmd @ ("ADD" | "REMOVE" | "SHOW" | "ENABLE" | "DISABLE" | "REBUILD")), _, _) => {
+                format!(
+                    "ERR: usage: {cmd} <name> — exactly one volume name (volume names match \
                  ^[a-z][a-z0-9_-]{{0,31}}$)\n"
-            ),
-            _ => "ERR: usage: ADD <name> | REMOVE <name> | LIST\n".to_string(),
+                )
+            }
+            (Some("CONFIGS"), _, _) => "ERR: usage: CONFIGS — takes no argument\n".to_string(),
+            _ => "ERR: usage: ADD <name> | REMOVE <name> | ENABLE <name> | DISABLE <name> | \
+                  SHOW <name> | REBUILD <name> | CREATE <name> <json> | UPDATE <name> <json> | \
+                  DESTROY <name> [confirm [purge_local]] | LIST | CONFIGS\n"
+                .to_string(),
         }
     }
 
     /// `LIST`: one line per registered volume —
     /// `name status letter backend pending=N` (K49's runtime read; the
     /// pending count is the §4 drain aid: the queue jobs REMOVE's drain
-    /// step would wait for). The letter/backend columns name the actual
-    /// mount; an unmounted volume carries `-` and its configured
-    /// backend. A failed entry has no queue — `pending=-`.
+    /// step would wait for), with a trailing `rebuilding` marker while
+    /// the volume has a background REBUILD in flight (P2/R1's progress
+    /// face). The letter/backend columns name the actual mount; an
+    /// unmounted volume carries `-` and its configured backend. A
+    /// failed entry has no queue — `pending=-`.
     fn list(&self) -> String {
         let volumes = self.registry.volumes();
         let mut reply = format!("OK: {} volume(s)\n", volumes.len());
@@ -2257,12 +2544,756 @@ impl RuntimeVolumeControl {
                 Some(vfs) => format!("pending={}", vfs.queue_stats().outstanding()),
                 None => "pending=-".to_string(),
             };
+            let rebuilding = self
+                .rebuilds
+                .lock()
+                .map(|map| map.contains_key(&name))
+                .unwrap_or(false);
             reply.push_str(&format!(
-                "{name} {} {letter} {backend} {pending}\n",
-                status.as_str()
+                "{name} {} {letter} {backend} {pending}{}\n",
+                status.as_str(),
+                if rebuilding { " rebuilding" } else { "" }
             ));
         }
         reply
+    }
+
+    /// Path-safety precheck before a volume name becomes a file name
+    /// (shared by ADD and SHOW): the full name rules live in
+    /// `load_volume_config`, but this stops `/`, `\`, `.`, `:` and
+    /// whitespace from ever reaching a path join.
+    fn name_is_path_safe(name: &str) -> bool {
+        !name.is_empty()
+            && !name
+                .chars()
+                .any(|c| matches!(c, '/' | '\\' | '.' | ':') || c.is_whitespace())
+    }
+
+    /// `SHOW <name>` (web volume management plan §1.2): the volume
+    /// file's EXPLICIT configuration as one `OK: <single-line JSON>`
+    /// reply — serialized by core's `volume_show_json`, so every
+    /// credential-valued key collapses to `{"set": true/false}` and the
+    /// VALUE never leaves the backend (write-only). Read-only: no gate
+    /// refusal, no registry mutation — a volume file answers SHOW even
+    /// while its volume is unregistered (REMOVE is runtime-only, K49).
+    fn show_volume(&self, name: &str) -> String {
+        if !Self::name_is_path_safe(name) {
+            return format!(
+                "ERR: `{name}` is not a volume name — SHOW takes the file stem of a \
+                 volumes_dir entry (names match ^[a-z][a-z0-9_-]{{0,31}}$)\n"
+            );
+        }
+        let Some(dir) = self.process_cfg.volumes_dir.as_deref() else {
+            return "ERR: this instance runs single-volume mode (no volumes_dir) — \
+                    SHOW serves multi-volume instances\n"
+                .to_string();
+        };
+        let path = Path::new(dir).join(format!("{name}.toml"));
+        if !path.is_file() {
+            return format!(
+                "ERR: no volume file for `{name}` at {} — SHOW reads the volumes_dir \
+                 ({dir}); `LIST` shows the volumes this instance actually serves\n",
+                path.display()
+            );
+        }
+        match cloudkit_core::config::volume_show_json(&path) {
+            Ok(json) => format!("OK: {json}\n"),
+            Err(error) => format!(
+                "ERR: reading the volume file {} failed: {error} — fix the file and \
+                 retry\n",
+                path.display()
+            ),
+        }
+    }
+
+    /// `CONFIGS` (web volume management P1): the configuration FULL set —
+    /// every `*.toml` under the volumes_dir, one row per file, joined
+    /// against the runtime registry. LIST cannot serve the dashboard's
+    /// configuration page: it reads the registry, and a disabled volume
+    /// is by definition absent from it. Row shapes (the web endpoint
+    /// parses them back):
+    ///
+    /// - loadable file: `<name> <backend> enabled=<bool> running|absent`
+    ///   (running = the registry has the name) with two trailing
+    ///   sparse markers — `encrypted` while the file carries
+    ///   `enable_encryption` (the web Refresh button's gating data,
+    ///   P6) and `rebuilding` while a background REBUILD is in flight
+    ///   (P2/R1's progress face);
+    /// - schema-broken file: `<name> invalid (<reason>)` — one broken
+    ///   file must not take the whole listing down (the K22 spirit).
+    fn configs(&self) -> String {
+        let Some(dir) = self.process_cfg.volumes_dir.as_deref() else {
+            return "ERR: this instance runs single-volume mode (no volumes_dir) — \
+                    CONFIGS serves multi-volume instances\n"
+                .to_string();
+        };
+        let files = match cloudkit_core::config::discover_volumes(Path::new(dir)) {
+            Ok(files) => files,
+            Err(error) => return format!("ERR: {error}\n"),
+        };
+        let mut reply = format!("OK: {} volume file(s)\n", files.len());
+        for path in files {
+            let name = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match cloudkit_core::config::load_volume_config(&path) {
+                Ok(spec) => {
+                    let running = if self.registry.volume(&spec.name).is_some() {
+                        "running"
+                    } else {
+                        "absent"
+                    };
+                    // The sparse markers: emitted only when true, so a
+                    // quiet row keeps its P1 shape byte-for-byte.
+                    let mut markers = String::new();
+                    if spec.settings.enable_encryption {
+                        markers.push_str(" encrypted");
+                    }
+                    if self
+                        .rebuilds
+                        .lock()
+                        .map(|map| map.contains_key(&spec.name))
+                        .unwrap_or(false)
+                    {
+                        markers.push_str(" rebuilding");
+                    }
+                    reply.push_str(&format!(
+                        "{} {} enabled={} {running}{markers}\n",
+                        spec.name,
+                        spec.settings.backend.as_str(),
+                        spec.settings.enabled
+                    ));
+                }
+                Err(error) => {
+                    // The reason is already credential-scrubbed (the
+                    // load funnel's M3 funnel); it may be multi-line
+                    // (toml embeds the offending source) — the row
+                    // protocol is line-oriented, so newlines fold.
+                    let reason = error.to_string().replace('\n', " ");
+                    reply.push_str(&format!("{name} invalid ({reason})\n"));
+                }
+            }
+        }
+        reply
+    }
+
+    /// The shared file-write segment of `ENABLE`/`DISABLE` (web volume
+    /// management P1): validate through the full funnel, rewrite with
+    /// the flag overlaid. `Err` carries the actionable refusal — the
+    /// caller must not touch the runtime when it fires (the persistent
+    /// file is the source of truth, K49).
+    fn persist_enabled_flag(&self, name: &str, path: &Path, enabled: bool) -> Result<(), String> {
+        match cloudkit_core::config::write_volume_enabled(path, enabled) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(format!(
+                "ERR: {} `{name}` failed writing the volume file {}: {error} — \
+                 nothing was changed at runtime (the volume file is the persistent \
+                 source of truth); fix the file and retry\n",
+                if enabled { "ENABLE" } else { "DISABLE" },
+                path.display()
+            )),
+        }
+    }
+
+    /// `DISABLE <name>` (web volume management P1): the narrow UPDATE —
+    /// write `enabled = false` into the volume file FIRST, then, if the
+    /// volume is running, take it down through the SAME K50 sequence
+    /// `REMOVE` runs (直接调用 [`Self::remove_volume`] — the drain /
+    /// release / unregister steps and every H1 observation point are
+    /// reused, not duplicated). The write-first order is the K50
+    /// philosophy: the persistent file is the source of truth, so a
+    /// failed write leaves the runtime untouched; an unmount that fails
+    /// after a successful write leaves a disabled file under a still
+    /// running volume, which the idempotent retry (write is a no-op,
+    /// unmount re-runs) resolves.
+    async fn disable_volume(&self, name: &str) -> String {
+        if !Self::name_is_path_safe(name) {
+            return format!(
+                "ERR: `{name}` is not a volume name — DISABLE takes the file stem of a \
+                 volumes_dir entry (names match ^[a-z][a-z0-9_-]{{0,31}}$)\n"
+            );
+        }
+        let Some(dir) = self.process_cfg.volumes_dir.as_deref() else {
+            return "ERR: this instance runs single-volume mode (no volumes_dir) — \
+                    DISABLE serves multi-volume instances\n"
+                .to_string();
+        };
+        let path = Path::new(dir).join(format!("{name}.toml"));
+        if !path.is_file() {
+            return format!(
+                "ERR: no volume file for `{name}` at {} — DISABLE reads the volumes_dir \
+                 ({dir}); `CONFIGS` lists every volume file\n",
+                path.display()
+            );
+        }
+        if let Err(refusal) = self.persist_enabled_flag(name, &path, false) {
+            return refusal;
+        }
+        if self.registry.volume(name).is_none() {
+            return format!(
+                "OK: disabled volume `{name}` (enabled = false written to {}; the \
+                 volume was not running)\n",
+                path.display()
+            );
+        }
+        let removal = self.remove_volume(name).await;
+        if removal.starts_with("OK:") {
+            return format!(
+                "OK: disabled volume `{name}` (enabled = false written to {}; volume \
+                 unmounted and unregistered — the file keeps it disabled across \
+                 restarts)\n",
+                path.display()
+            );
+        }
+        let reason = removal.trim().trim_start_matches("ERR: ");
+        format!(
+            "ERR: disabling `{name}` wrote the file (enabled = false at {}) but the \
+             unmount failed: {reason} — retry `DISABLE {name}` once the cause is \
+             resolved (the file write is idempotent)\n",
+            path.display()
+        )
+    }
+
+    /// `ENABLE <name>` (web volume management P1): write `enabled = true`
+    /// into the volume file, then assemble through the SAME runtime ADD
+    /// path ([`Self::add_volume`] verbatim reply — its refusals are
+    /// already actionable: a duplicate registration, a missing file, a
+    /// bad name). The write-first order mirrors DISABLE's: a failed
+    /// write never reaches the runtime.
+    async fn enable_volume(&self, name: &str) -> String {
+        if !Self::name_is_path_safe(name) {
+            return format!(
+                "ERR: `{name}` is not a volume name — ENABLE takes the file stem of a \
+                 volumes_dir entry (names match ^[a-z][a-z0-9_-]{{0,31}}$)\n"
+            );
+        }
+        let Some(dir) = self.process_cfg.volumes_dir.as_deref() else {
+            return "ERR: this instance runs single-volume mode (no volumes_dir) — \
+                    ENABLE serves multi-volume instances\n"
+                .to_string();
+        };
+        let path = Path::new(dir).join(format!("{name}.toml"));
+        if !path.is_file() {
+            return format!(
+                "ERR: no volume file for `{name}` at {} — ENABLE reads the volumes_dir \
+                 ({dir}); `CONFIGS` lists every volume file\n",
+                path.display()
+            );
+        }
+        if let Err(refusal) = self.persist_enabled_flag(name, &path, true) {
+            return refusal;
+        }
+        self.add_volume(name).await
+    }
+
+    /// `CREATE <name> <json>` (web volume management P3, plan §1.2):
+    /// validate the name, refuse an existing file (UPDATE's territory),
+    /// convert the payload through [`volume_payload_table`], render the
+    /// controlled toml and run it through the FULL validation funnel —
+    /// [`parse_volume_toml`] plus the cross-field `validate()` — BEFORE
+    /// anything touches the disk (a refusal never creates a file). The
+    /// write then lands through the "persistent file is the source of
+    /// truth" order (K49's philosophy): `fs::write` FIRST, then the
+    /// runtime assembly through the SAME [`Self::add_volume`] the
+    /// control channel runs (mount claim, H3 publish-after-mount, every
+    /// gate included) — so a failed ASSEMBLY leaves a saved file and a
+    /// retryable state, exactly what the refusal then says.
+    ///
+    /// Credential discipline: the payload MAY carry credentials (the
+    /// loopback channel is the same trust face as hand-editing the
+    /// volume file), but no reply or log line carries a VALUE — the
+    /// refusals above name keys (M3), and the tracing line logs the
+    /// field-name list only.
+    async fn create_volume(&self, name: &str, payload: &str) -> String {
+        // The name precheck: the ONE rule the volume files enforce
+        // (core's), before the name ever reaches a path join.
+        if !cloudkit_core::config::is_valid_volume_name(name) {
+            return format!(
+                "ERR: invalid volume name `{name}`: volume names must match \
+                 ^[a-z][a-z0-9_-]{{0,31}}$ (a lowercase letter first, then lowercase \
+                 letters/digits/`_`/`-`, at most 32 characters) — no volume file was \
+                 written\n"
+            );
+        }
+        let Some(dir) = self.process_cfg.volumes_dir.as_deref() else {
+            return "ERR: this instance runs single-volume mode (no volumes_dir) — CREATE \
+                    serves multi-volume instances\n"
+                .to_string();
+        };
+        let path = Path::new(dir).join(format!("{name}.toml"));
+        if path.exists() {
+            return format!(
+                "ERR: a volume file for `{name}` already exists at {} — edit it instead \
+                 (`UPDATE {name} <json>` from the dashboard, or hand-edit the file)\n",
+                path.display()
+            );
+        }
+        let table = match volume_payload_table(payload) {
+            Ok(table) => table,
+            Err(refusal) => return refusal,
+        };
+        // The pre-write validation funnel: the rendered file must parse
+        // AND cross-field validate before `fs::write` (a refusal writes
+        // nothing — pinned by tests).
+        let text = cloudkit_core::config::render_volume_toml(&table, &toml::Table::new());
+        let spec = match cloudkit_core::config::parse_volume_toml(&path, name, &text) {
+            Ok(spec) => spec,
+            Err(error) => {
+                return format!(
+                    "ERR: the generated volume file is invalid: {error} — nothing was \
+                     written; fix the payload and retry\n"
+                );
+            }
+        };
+        if let Err(error) = spec.settings.validate() {
+            return format!(
+                "ERR: invalid volume settings: {error} — nothing was written; fix the \
+                 payload and retry\n"
+            );
+        }
+        // The field-name list only — no payload VALUE ever reaches a log
+        // line (M3).
+        let fields: Vec<&str> = table.keys().map(String::as_str).collect();
+        tracing::info!(
+            volume = name,
+            fields = ?fields,
+            "CREATE: writing a new volume file (field names only, by policy)"
+        );
+        if let Err(error) = std::fs::write(&path, text) {
+            return format!(
+                "ERR: writing the volume file {} failed: {error} — nothing was changed at \
+                 runtime\n",
+                path.display()
+            );
+        }
+        println!(
+            "Volume {name} created at {} (control CREATE).",
+            path.display()
+        );
+        // A created-disabled volume never touches the runtime: the file
+        // is the whole action (the ENABLE retry is the documented way
+        // up).
+        if !spec.settings.enabled {
+            return format!(
+                "OK: created volume `{name}` (disabled; file at {}) — `ENABLE {name}` \
+                 starts it\n",
+                path.display()
+            );
+        }
+        // The runtime leg: the SAME add_volume the control channel's ADD
+        // runs (assembly, mount claim, H3 semantics included).
+        let addition = self.add_volume(name).await;
+        let state = addition
+            .trim()
+            .strip_prefix(&format!("OK: added volume `{name}` "));
+        match state {
+            Some(state) => format!(
+                "OK: created volume `{name}` (file at {}; {})\n",
+                path.display(),
+                state.trim()
+            ),
+            None => format!(
+                "ERR: the volume file was saved at {}, but assembling the volume failed: \
+                 {} — fix the file (or send `UPDATE {name} <json>` with corrected fields) \
+                 and retry with `ENABLE {name}` (or `ADD {name}`)\n",
+                path.display(),
+                addition.trim().trim_start_matches("ERR: ")
+            ),
+        }
+    }
+
+    /// `UPDATE <name> <json>` (web volume management P4, plan §1.2): the
+    /// payload names the fields to CHANGE; a credential key that is
+    /// present and non-empty overwrites while a missing or empty one
+    /// keeps the stored value (the write-only rule — the overlay works
+    /// on the toml::Table level, so the stored credential values never
+    /// pass through anything that logs). The order is
+    /// file-first-K50-philosophy: validate the OLD file through the
+    /// full funnel (a half-validated file is never "repaired" by a
+    /// rewrite), overlay + render + validate the MERGED text before the
+    /// write, `fs::write`, then the re-assembly — REMOVE (the same K50
+    /// sequence) + ADD — for a volume that is registered and stays
+    /// enabled; every mixed state the re-assembly can leave (file new /
+    /// runtime old, file new / volume down) answers with its own
+    /// actionable text and the comments-loss note (裁决①: the rewrite
+    /// drops hand-written comments — surfaced, not preserved).
+    async fn update_volume(&self, name: &str, payload: &str) -> String {
+        if !Self::name_is_path_safe(name) {
+            return format!(
+                "ERR: `{name}` is not a volume name — UPDATE takes the file stem of a \
+                 volumes_dir entry (names match ^[a-z][a-z0-9_-]{{0,31}}$)\n"
+            );
+        }
+        let Some(dir) = self.process_cfg.volumes_dir.as_deref() else {
+            return "ERR: this instance runs single-volume mode (no volumes_dir) — UPDATE \
+                    serves multi-volume instances\n"
+                .to_string();
+        };
+        let path = Path::new(dir).join(format!("{name}.toml"));
+        if !path.is_file() {
+            return format!(
+                "ERR: no volume file for `{name}` at {} — UPDATE edits an existing volume \
+                 (`CREATE {name} <json>` writes a new one)\n",
+                path.display()
+            );
+        }
+        // The full funnel on the OLD file first: a half-validated file is
+        // never rewritten (the write_volume_enabled precedent).
+        if let Err(error) = cloudkit_core::config::load_volume_config(&path) {
+            return format!(
+                "ERR: reading the volume file {} failed: {error} — UPDATE never rewrites \
+                 a file the loader would refuse; fix it by hand and retry\n",
+                path.display()
+            );
+        }
+        let text = match std::fs::read_to_string(&path) {
+            Ok(text) => text,
+            Err(error) => {
+                return format!(
+                    "ERR: reading the volume file {} failed: {error}\n",
+                    path.display()
+                );
+            }
+        };
+        let explicit: toml::Table = match toml::from_str(&text) {
+            Ok(table) => table,
+            Err(error) => {
+                return format!(
+                    "ERR: re-reading the volume file {} failed: {error}\n",
+                    path.display()
+                );
+            }
+        };
+        let overlay = match volume_payload_table(payload) {
+            Ok(table) => table,
+            Err(refusal) => return refusal,
+        };
+        if overlay.is_empty() {
+            return "ERR: the payload sets no fields to change — send at least one volume \
+                    key (a credential left empty means keep, not clear)\n"
+                .to_string();
+        }
+        let merged = cloudkit_core::config::render_volume_toml(&explicit, &overlay);
+        let spec = match cloudkit_core::config::parse_volume_toml(&path, name, &merged) {
+            Ok(spec) => spec,
+            Err(error) => {
+                return format!(
+                    "ERR: the merged volume file is invalid: {error} — nothing was \
+                     written; fix the payload and retry\n"
+                );
+            }
+        };
+        if let Err(error) = spec.settings.validate() {
+            return format!(
+                "ERR: invalid volume settings: {error} — nothing was written; fix the \
+                 payload and retry\n"
+            );
+        }
+        // The field-name list only — the overlay's (or the file's)
+        // credential values never reach a log line (M3).
+        let fields: Vec<&str> = overlay.keys().map(String::as_str).collect();
+        tracing::info!(
+            volume = name,
+            fields = ?fields,
+            "UPDATE: rewriting the volume file (field names only, by policy)"
+        );
+        if let Err(error) = std::fs::write(&path, &merged) {
+            return format!(
+                "ERR: writing the volume file {} failed: {error} — the runtime was not \
+                 touched (the volume keeps its current configuration)\n",
+                path.display()
+            );
+        }
+        println!(
+            "Volume {name} updated at {} (control UPDATE).",
+            path.display()
+        );
+        let comments = "note: the volume file was rewritten — hand-written comments are lost";
+        // A file that ended up disabled: the DISABLE semantics (no
+        // re-add), through the same remove_volume.
+        if !spec.settings.enabled {
+            if self.registry.volume(name).is_none() {
+                return format!(
+                    "OK: updated volume `{name}` (file at {}; the volume is not running \
+                     and its file keeps enabled = false — `ENABLE {name}` starts it on \
+                     the new settings); {comments}\n",
+                    path.display()
+                );
+            }
+            let removal = self.remove_volume(name).await;
+            if removal.starts_with("OK:") {
+                return format!(
+                    "OK: updated volume `{name}` (enabled = false at {}; the volume was \
+                     unmounted); {comments}\n",
+                    path.display()
+                );
+            }
+            let reason = removal.trim().trim_start_matches("ERR: ");
+            return format!(
+                "ERR: the file was updated (enabled = false at {}) but the unmount \
+                 failed: {reason} — retry `DISABLE {name}` (the file write is \
+                 idempotent); {comments}\n",
+                path.display()
+            );
+        }
+        // A volume that is not registered: the file write is the whole
+        // action — assembling what ENABLE owns is not UPDATE's business.
+        if self.registry.volume(name).is_none() {
+            return format!(
+                "OK: updated volume `{name}` (file at {}; the volume is not running — \
+                 `ENABLE {name}` starts it on the new settings); {comments}\n",
+                path.display()
+            );
+        }
+        // The re-assembly: REMOVE (the same K50 sequence) then ADD. Each
+        // mixed state the two legs can leave answers with its own text.
+        let removal = self.remove_volume(name).await;
+        if !removal.starts_with("OK:") {
+            let reason = removal.trim().trim_start_matches("ERR: ");
+            return format!(
+                "ERR: the volume file was updated ({}) but the volume still runs its \
+                 OLD configuration: {reason} — drain the pending uploads (`LIST` shows \
+                 the count) and retry `REMOVE {name}` + `ENABLE {name}`; {comments}\n",
+                path.display()
+            );
+        }
+        let addition = self.add_volume(name).await;
+        let state = addition
+            .trim()
+            .strip_prefix(&format!("OK: added volume `{name}` "));
+        match state {
+            Some(state) => format!(
+                "OK: updated volume `{name}` (re-assembled: {}); {comments}\n",
+                state.trim()
+            ),
+            None => format!(
+                "ERR: the volume file was updated ({}) and the volume is now UNMOUNTED: \
+                 {} — fix the file and `ENABLE {name}`; {comments}\n",
+                path.display(),
+                addition.trim().trim_start_matches("ERR: ")
+            ),
+        }
+    }
+
+    /// `DESTROY <name>` (web volume management P5, plan §1.2/§2.2): the
+    /// two-leg protocol's PREVIEW — executes nothing, answers the
+    /// preview. An `OK:` (this is a confirmation request, not an
+    /// error): what a confirm would do (the K50 unmount for a running
+    /// volume, the volume file's deletion), what stays by default (the
+    /// local data directory, with its path and the `purge_local` way
+    /// out — 裁决②) and what is never touched (remote data — K49 分档's
+    /// absolute), plus the exact confirmation command.
+    fn destroy_preview(&self, name: &str) -> String {
+        if let Some(refusal) = self.destroy_precheck(name) {
+            return refusal;
+        }
+        let (path, home) = match self.destroy_paths(name) {
+            Ok(pair) => pair,
+            Err(error) => {
+                return format!(
+                    "ERR: resolving the paths of `{name}` failed: {error:#} — nothing was \
+                     executed\n"
+                );
+            }
+        };
+        if !path.is_file() {
+            return format!(
+                "ERR: no volume file for `{name}` at {} — DESTROY reads the volumes_dir; \
+                 `CONFIGS` lists every volume file (a running volume without a file unloads \
+                 via `REMOVE {name}`)\n",
+                path.display()
+            );
+        }
+        let running = self.registry.volume(name).is_some();
+        let unmount = if running {
+            format!(
+                "- unmount: `{name}` is running — the confirm leg unloads it through the \
+                 REMOVE safety order (drain uploads, release the drive, unregister); a busy \
+                 queue aborts the WHOLE destroy\n"
+            )
+        } else {
+            format!(
+                "- unmount: `{name}` is not running — nothing to unload, the confirm leg \
+                 deletes the file directly\n"
+            )
+        };
+        format!(
+            "OK: DESTROY preview for `{name}` — nothing was executed:\n{unmount}\
+             - delete: the volume file {}\n\
+             - kept: the local data directory {} stays by default (`DESTROY {name} confirm \
+             purge_local` deletes it too)\n\
+             - never touched: the data on the volume's remote backend\n\
+             confirm with: `DESTROY {name} confirm`\n",
+            path.display(),
+            home.display()
+        )
+    }
+
+    /// The shared refusal ladder of DESTROY's two legs: the name rules
+    /// (before any path join) and the multi-volume precondition. `Ok`
+    /// means the caller may build the volume file / home paths.
+    fn destroy_precheck(&self, name: &str) -> Option<String> {
+        if !Self::name_is_path_safe(name) {
+            return Some(format!(
+                "ERR: `{name}` is not a volume name — DESTROY takes the file stem of a \
+                 volumes_dir entry (names match ^[a-z][a-z0-9_-]{{0,31}}$)\n"
+            ));
+        }
+        if self.process_cfg.volumes_dir.is_none() {
+            return Some(
+                "ERR: this instance runs single-volume mode (no volumes_dir) — DESTROY \
+                 serves multi-volume instances\n"
+                    .to_string(),
+            );
+        }
+        None
+    }
+
+    /// The `(volume file, home directory)` pair both DESTROY legs
+    /// speak of — the home resolved through the SAME K21 anchor the
+    /// assembly uses ([`volume_home_under`]), derived from the name so
+    /// even a schema-broken file previews and purges the directory a
+    /// healthy spec would resolve to.
+    fn destroy_paths(&self, name: &str) -> Result<(PathBuf, PathBuf)> {
+        let dir = self
+            .process_cfg
+            .volumes_dir
+            .as_deref()
+            .expect("the precheck ruled out single-volume mode");
+        let path = Path::new(dir).join(format!("{name}.toml"));
+        let home = volume_home_under(Path::new(dir), name)?;
+        Ok((path, home))
+    }
+
+    /// `DESTROY <name> confirm [/ purge_local]` (P5, plan §1.2/§2.2):
+    /// the two-leg protocol's EXECUTION. The order is unmount-first,
+    /// file-second — a drain or unmount refusal aborts the WHOLE
+    /// destroy (the volume stays registered, the file survives — never
+    /// a half-destroy, K50's semantics carried into the file
+    /// deletion). The file deletion is idempotent (a hand-deleted file
+    /// continues). The local data directory stays by default;
+    /// `purge_local` deletes the whole home (db, cache, local root) —
+    /// a purge failure does NOT roll back (the file is already gone,
+    /// there is nothing to restore) but the reply says so and names
+    /// the leftover path. Remote data is NEVER touched (K49 分档) —
+    /// the OK says so explicitly.
+    async fn destroy_volume(&self, name: &str, purge_local: bool) -> String {
+        if let Some(refusal) = self.destroy_precheck(name) {
+            return refusal;
+        }
+        let (path, home) = match self.destroy_paths(name) {
+            Ok(pair) => pair,
+            Err(error) => {
+                return format!(
+                    "ERR: resolving the paths of `{name}` failed: {error:#} — nothing was \
+                     changed\n"
+                );
+            }
+        };
+        // Leg ①: a registered volume comes down through the SAME K50
+        // sequence REMOVE runs (drain → release → unregister — 直接调
+        // 用 [`Self::remove_volume`], every H1 observation point
+        // included). Its refusal aborts the whole destroy: the file
+        // must not survive an unmounted volume behind the operator's
+        // back.
+        let mut was_running = false;
+        if self.registry.volume(name).is_some() {
+            was_running = true;
+            let removal = self.remove_volume(name).await;
+            if !removal.starts_with("OK:") {
+                let reason = removal.trim().trim_start_matches("ERR: ");
+                return format!(
+                    "ERR: destroying `{name}` aborted during the unmount: {reason} — the \
+                     volume file {} was NOT deleted and the volume stays; resolve the cause \
+                     and retry `DESTROY {name} confirm`\n",
+                    path.display()
+                );
+            }
+        }
+        // Leg ②: delete the volume file. Idempotent on a missing file
+        // (a hand deletion): the destroy still acknowledges, saying
+        // the file was already gone.
+        let mut file_state = if was_running {
+            "unmounted and unregistered; volume file deleted"
+        } else {
+            "the volume was not running; volume file deleted"
+        };
+        match std::fs::remove_file(&path) {
+            Ok(()) => {
+                println!(
+                    "Volume {name} destroyed at {} (control DESTROY).",
+                    path.display()
+                );
+                tracing::info!(
+                    volume = name,
+                    file = %path.display(),
+                    "volume file deleted (control DESTROY)"
+                );
+            }
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+                file_state = if was_running {
+                    "unmounted and unregistered; the volume file was already gone"
+                } else {
+                    "the volume was not running; the volume file was already gone"
+                };
+            }
+            Err(error) => {
+                // The unmount (if any) already happened — a mixed
+                // state the reply must spell out with its idempotent
+                // retry.
+                return format!(
+                    "ERR: deleting the volume file {} failed: {error} — {} — retry \
+                     `DESTROY {name} confirm` (idempotent: the unmount, if any, already \
+                     happened)\n",
+                    path.display(),
+                    if was_running {
+                        "the volume IS unmounted but its file survived"
+                    } else {
+                        "the volume was never running and its file survived"
+                    },
+                );
+            }
+        }
+        // The optional purge leg (裁决②): the whole home directory —
+        // db, cache, local root. No rollback on failure (the file is
+        // already deleted); the reply names the leftover.
+        if purge_local {
+            match std::fs::remove_dir_all(&home) {
+                Ok(()) => {
+                    println!(
+                        "Volume {name} local data directory {} purged (control DESTROY).",
+                        home.display()
+                    );
+                    tracing::info!(
+                        volume = name,
+                        home = %home.display(),
+                        "volume local data directory purged (control DESTROY)"
+                    );
+                }
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    return format!(
+                        "ERR: volume `{name}` destroyed ({file_state}), but deleting its \
+                         local data directory {} failed: {error} — the data remains at that \
+                         path; close whatever holds it (Explorer windows, editors, a running \
+                         db) and delete it by hand. Remote data was never touched.\n",
+                        home.display()
+                    );
+                }
+            }
+            return format!(
+                "OK: destroyed volume `{name}` ({file_state}; local data directory {} \
+                 deleted; remote data was never touched)\n",
+                home.display()
+            );
+        }
+        format!(
+            "OK: destroyed volume `{name}` ({file_state}; the local data directory is KEPT \
+             at {} — delete it by hand or rerun with purge_local if you want it gone; remote \
+             data was never touched)\n",
+            home.display()
+        )
     }
 
     /// `ADD <name>` (K48's runtime assembly): read `volumes/<name>.toml`
@@ -2280,13 +3311,9 @@ impl RuntimeVolumeControl {
     /// registered (the assembled volume is quietly torn down — its
     /// workers never served a request).
     async fn add_volume(&self, name: &str) -> String {
-        // Path-safety precheck before the name becomes a file name: the
-        // full name rules live in `load_volume_config`.
-        if name.is_empty()
-            || name
-                .chars()
-                .any(|c| matches!(c, '/' | '\\' | '.' | ':') || c.is_whitespace())
-        {
+        // Path-safety precheck (shared with SHOW): the full name rules
+        // live in `load_volume_config`.
+        if !Self::name_is_path_safe(name) {
             return format!(
                 "ERR: `{name}` is not a volume name — ADD takes the file stem of a \
                  volumes_dir entry (names match ^[a-z][a-z0-9_-]{{0,31}}$)\n"
@@ -2651,6 +3678,278 @@ impl RuntimeVolumeControl {
         println!("Volume {name} removed at runtime (control REMOVE).");
         tracing::info!(volume = name, "volume removed at runtime (control REMOVE)");
         format!("OK: removed volume `{name}`\n")
+    }
+
+    /// `REBUILD <name>` (web volume management P2, plan §1.3 R1–R6):
+    /// the gates run SYNCHRONOUSLY — a volume must be registered and
+    /// running (its live VFS answers the queue read), no rebuild may
+    /// already be in flight (R1), an encrypted volume is refused with
+    /// the K11 sync guidance and a telegram volume with the
+    /// shadow-index refusal (R6 — both actionable, neither background
+    /// work), and the upload queue must be drained (R2 — the same
+    /// `outstanding()` the REMOVE drain judges by). Everything past
+    /// the gates is ACCEPTED, not executed: the marker goes up, the
+    /// background task spawns (R3), and the reply is immediate — the
+    /// command queue is never parked behind a walk. The background
+    /// task owns the R4 budget and the R5 checkpoints; its result
+    /// arrives as a log line, never on this reply.
+    async fn rebuild_volume(&self, name: &str) -> String {
+        if !Self::name_is_path_safe(name) {
+            return format!(
+                "ERR: `{name}` is not a volume name — REBUILD takes the file stem of a \
+                 volumes_dir entry (names match ^[a-z][a-z0-9_-]{{0,31}}$)\n"
+            );
+        }
+        let Some(runtime) = self.registry.volume(name) else {
+            return format!(
+                "ERR: no volume registered under `{name}` — `LIST` shows the current set\n"
+            );
+        };
+        let Some(vfs) = runtime.vfs().cloned() else {
+            return format!(
+                "ERR: volume `{name}` is not running (its assembly failed) — fix the \
+                 volume file, re-add it, and retry\n"
+            );
+        };
+        // R1: the single-flight marker (the reply renders the start).
+        if let Some(started) = self
+            .rebuilds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(name)
+            .copied()
+        {
+            return format!(
+                "ERR: rebuild already running on `{name}` (started {}) — `LIST` shows its \
+                 progress\n",
+                format_start_clock(started)
+            );
+        }
+        // R6's synchronous gates, in the offline rebuild's own order
+        // (telegram first, then the K11 plaintext gate) — with the
+        // same texts, so the two surfaces cannot drift.
+        let settings = &runtime.spec().settings;
+        if settings.backend == Backend::Telegram {
+            return format!("ERR: {TELEGRAM_REBUILD_REFUSAL}\n");
+        }
+        if let Err(error) = rebuild::ensure_plaintext_instance(settings) {
+            return format!("ERR: {error}\n");
+        }
+        // R2: the drained-queue threshold (H2's `outstanding()`, the
+        // same observable the REMOVE drain waits on).
+        let outstanding = vfs.queue_stats().outstanding();
+        if outstanding > 0 {
+            return format!(
+                "ERR: volume `{name}` has {outstanding} upload(s) in flight — rebuild \
+                 needs a drained queue; wait or see `LIST` pending\n"
+            );
+        }
+        // The volume's RESOLVED settings (K21 paths; the gates above
+        // read the raw spec because they never touch a path).
+        let resolved = match resolve_volume_settings(runtime.spec()) {
+            Ok(resolved) => resolved,
+            Err(error) => {
+                return format!(
+                    "ERR: resolving volume `{name}`'s paths failed: {error:#} — nothing was \
+                     changed; fix the volume file and retry\n"
+                );
+            }
+        };
+        // R1 + R3: the marker goes up and the task detaches. The
+        // command loop is serialized, so a second REBUILD cannot race
+        // this insert; the background task's exit path is the only
+        // other writer, and it removes only its own name.
+        self.rebuilds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .insert(name.to_string(), std::time::SystemTime::now());
+        tokio::spawn(
+            RebuildTask {
+                name: name.to_string(),
+                settings: resolved,
+                registry: self.registry.clone(),
+                watch: Arc::clone(&self.watch),
+                rebuilds: Arc::clone(&self.rebuilds),
+                tuning: self.rebuild_tuning,
+                run: Arc::clone(&self.rebuild),
+            }
+            .run(),
+        );
+        format!(
+            "OK: rebuild of `{name}` started in background — `LIST` shows progress; the \
+             result logs when done\n"
+        )
+    }
+}
+
+/// The wall-clock start of an in-flight rebuild as `HH:MM:SS` (local
+/// time — the operator-facing reading of R1's already-running reply).
+fn format_start_clock(started: std::time::SystemTime) -> String {
+    let local: chrono::DateTime<chrono::Local> = started.into();
+    local.format("%H:%M:%S").to_string()
+}
+
+/// How one background rebuild ended (P2/R3–R5) — each exit has its own
+/// one-line report; every one of them resets the R1 marker.
+enum RebuildExit {
+    /// The executor answered (either arm of its Result).
+    Done(Result<rebuild::RebuildOutcome>),
+    /// The R4 budget ran out (the idempotent-merge world: rows stay).
+    TimedOut(Duration),
+    /// The R5 checkpoint found the volume REMOVEd.
+    VolumeGone,
+    /// The R5 checkpoint found the shutdown gate fired.
+    ShuttingDown,
+    /// The executor's task panicked (contained, like a command panic).
+    Panicked(String),
+}
+
+/// One detached background rebuild (P2/R3): owns the volume's resolved
+/// settings and the executor, supervises it with the R4 budget and the
+/// R5 checkpoints, and reports the outcome as one println + tracing
+/// line (the acceptance reply already went out; this task's logs ARE
+/// the result surface). On EVERY exit the R1 marker comes off, making
+/// the volume re-acceptable — including the abort exits, because the
+/// rebuild's upserts are idempotent (the rel_path conflict key: a
+/// rerun re-merges exactly what the interrupted pass had written).
+struct RebuildTask {
+    name: String,
+    settings: CyDriveConfig,
+    registry: RegistryHandle,
+    watch: Arc<ShutdownWatch>,
+    rebuilds: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::SystemTime>>>,
+    tuning: RebuildTuning,
+    run: RuntimeRebuild,
+}
+
+impl RebuildTask {
+    /// The supervision loop: the executor runs on its own spawned task
+    /// (so an abort can DROP it mid-await — the R5 semantics), with
+    /// the checkpoint ticking between the registry presence and the
+    /// shutdown gate, and the R4 deadline over the whole pass. The
+    /// checkpoint cadence is the plan's "periodic checkpoint" stand-in
+    /// for the per-page hook: `rebuild_from_backend` has no
+    /// page-granularity seam, and a sub-second cadence bounds the
+    /// abort latency as tightly without touching core's walk (the
+    /// trade-off: a page walking slower than the cadence aborts on the
+    /// NEXT tick, not mid-list — accepted, one tick's worth).
+    async fn run(self) {
+        let deadline = tokio::time::Instant::now() + self.tuning.timeout;
+        let mut work = tokio::spawn((self.run)(&self.name, &self.settings));
+        let mut checkpoints = tokio::time::interval(self.tuning.checkpoint_interval);
+        checkpoints.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+        let exit = loop {
+            tokio::select! {
+                joined = &mut work => {
+                    break match joined {
+                        Ok(outcome) => RebuildExit::Done(outcome),
+                        Err(panic) => RebuildExit::Panicked(
+                            panic
+                                .try_into_panic()
+                                .map(|payload| {
+                                    payload
+                                        .downcast_ref::<&str>()
+                                        .map(|str| (*str).to_string())
+                                        .or_else(|| {
+                                            payload.downcast_ref::<String>().cloned()
+                                        })
+                                        .unwrap_or_else(|| {
+                                            "<non-string panic payload>".to_string()
+                                        })
+                                })
+                                .unwrap_or_else(|cancelled| format!("aborted: {cancelled}")),
+                        ),
+                    };
+                }
+                _ = checkpoints.tick() => {
+                    // R5's two observables, the H1 gate's own reading
+                    // points: the shutdown gate and the registry entry.
+                    if self.watch.fired() {
+                        work.abort();
+                        let _ = work.await;
+                        break RebuildExit::ShuttingDown;
+                    }
+                    if self.registry.volume(&self.name).is_none() {
+                        work.abort();
+                        let _ = work.await;
+                        break RebuildExit::VolumeGone;
+                    }
+                }
+                _ = tokio::time::sleep_until(deadline) => {
+                    work.abort();
+                    let _ = work.await;
+                    break RebuildExit::TimedOut(self.tuning.timeout);
+                }
+            }
+        };
+        // R1's reset on every exit path — the marker's whole lifetime
+        // is this task's run (the handler only inserts what this
+        // removes; the serialized command loop cannot interleave).
+        self.rebuilds
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .remove(&self.name);
+        let name = &self.name;
+        match exit {
+            RebuildExit::Done(Ok(outcome)) => {
+                println!(
+                    "Volume {name} rebuild finished: {} file row(s), {} directory row(s).",
+                    outcome.files, outcome.dirs
+                );
+                tracing::info!(
+                    volume = name,
+                    files = outcome.files,
+                    dirs = outcome.dirs,
+                    "background rebuild finished"
+                );
+            }
+            RebuildExit::Done(Err(error)) => {
+                println!("Volume {name} rebuild failed: {error:#}.");
+                tracing::warn!(volume = name, %error, "background rebuild failed");
+            }
+            RebuildExit::TimedOut(budget) => {
+                println!(
+                    "Volume {name} rebuild interrupted; rerun REBUILD to continue (the \
+                     {budget:?} budget ran out — the rows already rebuilt are kept, the \
+                     merge is idempotent)."
+                );
+                tracing::warn!(
+                    volume = name,
+                    ?budget,
+                    "background rebuild interrupted by its budget; the pass is resumable"
+                );
+            }
+            RebuildExit::VolumeGone => {
+                println!(
+                    "Volume {name} rebuild aborted — the volume was removed at runtime \
+                     (nothing to resume; re-add the volume and REBUILD again)."
+                );
+                tracing::info!(
+                    volume = name,
+                    "background rebuild aborted: the volume was removed at runtime"
+                );
+            }
+            RebuildExit::ShuttingDown => {
+                println!(
+                    "Volume {name} rebuild interrupted; rerun REBUILD to continue (the \
+                     instance is shutting down — the rows already rebuilt are kept)."
+                );
+                tracing::info!(
+                    volume = name,
+                    "background rebuild interrupted by the shutdown gate; the pass is \
+                     resumable"
+                );
+            }
+            RebuildExit::Panicked(reason) => {
+                println!("Volume {name} rebuild task panicked: {reason}.");
+                tracing::error!(
+                    volume = name,
+                    %reason,
+                    "background rebuild task panicked; the marker was reset — a rerun is \
+                     safe"
+                );
+            }
+        }
     }
 }
 
@@ -3179,6 +4478,62 @@ pub async fn run_rebuild_with_driver(
     rebuild::rebuild_from_backend(driver, &db, &cloudkit_storage::RelPath::root())
         .await
         .context("rebuilding the index from the backend")
+}
+
+/// The P2 CLI forward: when a multi-volume instance is LIVE in this
+/// working directory (control file present + PING answers — the status
+/// forward's discovery pair), `cydrive rebuild` does not rebuild
+/// offline against files the instance is actively serving — it
+/// forwards one `REBUILD <name>` per non-telegram volume over the
+/// control channel and reports the per-volume replies (the instance's
+/// background task does the work; its reply is the acceptance). A
+/// telegram volume keeps the shadow-index refusal line, the same
+/// wording the offline pass prints.
+///
+/// `Ok(None)` = no live instance (no control file, or the address is
+/// dead): the caller keeps the existing offline pass untouched —
+/// zero drift for the not-running case. A live instance whose reply
+/// fails to arrive mid-forward reports the transport error on that
+/// volume's row without failing the others (the K22 spirit).
+pub async fn rebuild_forward_live(
+    process_cfg: &CyDriveConfig,
+    volumes: &[VolumeConfig],
+) -> Result<Option<Vec<(String, String)>>> {
+    let addr = match control::read_control_addr(process_cfg) {
+        Ok(addr) => addr,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => {
+            return Err(error).with_context(|| {
+                format!(
+                    "reading the control file {}",
+                    control::control_file_path(process_cfg).display()
+                )
+            });
+        }
+    };
+    if control::send_ping(addr).await.is_err() {
+        // A stale port file: nothing is listening — the offline pass
+        // (whose own boot guard removes the file) is the right answer.
+        return Ok(None);
+    }
+    let mut rows = Vec::new();
+    for spec in volumes {
+        if spec.settings.backend == Backend::Telegram {
+            rows.push((
+                spec.name.clone(),
+                format!("NOT rebuilt — {TELEGRAM_REBUILD_REFUSAL}"),
+            ));
+            continue;
+        }
+        match control::send_command(addr, &format!("REBUILD {}", spec.name)).await {
+            Ok(reply) => rows.push((spec.name.clone(), reply.trim().to_owned())),
+            Err(error) => rows.push((
+                spec.name.clone(),
+                format!("NOT rebuilt — forwarding the rebuild failed: {error}"),
+            )),
+        }
+    }
+    Ok(Some(rows))
 }
 
 // ------------------------------- backend dispatch (B3b 段二b unit 5) ---
