@@ -315,12 +315,14 @@ async fn volumes_page_serves_the_management_skeleton() {
     }
 }
 
-/// UI polish round 2: the config section's submenu rides above the page
-/// pill on the config-side pages — both entries present, the exact-path
-/// active entry is `/volumes` here, and the system entry carries the
-/// read-only badge.
+/// UI consistency batch (负责人 fix): the config section's mid-sidebar
+/// block is the dashboard's views-section twin — the same nav-menu
+/// vocabulary (the small section label + flat nav-item entries), the
+/// config-submenu special block gone wholesale; the exact-path active
+/// entry is `/volumes` here and the read-only badge lives inside the
+/// system entry.
 #[tokio::test]
-async fn volumes_page_carries_the_config_submenu() {
+async fn volumes_page_carries_the_config_section_as_nav_items() {
     let dir = tempfile::tempdir().expect("temp dir");
     let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
     let server = multi_server(vec![entry]).await;
@@ -329,26 +331,39 @@ async fn volumes_page_carries_the_config_submenu() {
     let resp = send(addr, &request("GET", "/volumes", addr, &[])).await;
     assert_eq!(status_of(&resp), 200, "ok: {resp}");
     let body = body_of(&resp);
-    let submenu = body
-        .split("config-submenu")
+    assert!(
+        !body.contains("config-sub"),
+        "the config-submenu special block is gone wholesale: {body}"
+    );
+    let section = body
+        .split("nav-section-title")
         .nth(1)
         .and_then(|rest| rest.split("</nav>").next())
-        .expect("the config submenu block");
+        .expect("the config section block");
     assert!(
-        submenu.contains("href=\"/volumes\"") && submenu.contains("href=\"/volumes/system\""),
-        "both config pages are listed: {submenu}"
+        section.contains("data-i18n=\"sidebar.section_config\""),
+        "the section label shares the views section's small-label style: {section}"
     );
     assert!(
-        submenu.contains("href=\"/volumes\" class=\"config-sub active\""),
-        "the volume-management entry is the active one on /volumes: {submenu}"
+        section.contains("href=\"/volumes\" class=\"nav-item active\""),
+        "the volume entry is the exact-path active nav-item on /volumes: {section}"
     );
     assert!(
-        !submenu.contains("href=\"/volumes/system\" class=\"config-sub active\""),
-        "exact-path matching: the system entry stays inactive here: {submenu}"
+        !section.contains("href=\"/volumes/system\" class=\"nav-item active\""),
+        "exact-path matching: the system entry stays inactive here: {section}"
+    );
+    let system_item = section
+        .split("href=\"/volumes/system\"")
+        .nth(1)
+        .and_then(|rest| rest.split("</a>").next())
+        .expect("the system entry");
+    assert!(
+        system_item.contains("class=\"nav-item\""),
+        "the system entry is a flat nav-item: {system_item}"
     );
     assert!(
-        submenu.contains("ro-badge"),
-        "the system entry carries the read-only badge: {submenu}"
+        system_item.contains("ro-badge") && system_item.contains("data-i18n=\"config.readonly\""),
+        "the read-only badge lives inside the system entry: {system_item}"
     );
 }
 
@@ -395,9 +410,10 @@ async fn volumes_page_in_single_volume_mode_is_the_explanation_page() {
 /// UI polish round 2, item 4: `GET /volumes/system` (multi-volume mode)
 /// serves the read-only system-parameters skeleton — the system title +
 /// its read-only subtitle, the instance section's four faces, the
-/// collapsible volume-parameter cards host, the config submenu (system
-/// entry active, read-only badge), NO primary action button, and its
-/// own script behind i18n.js.
+/// collapsible volume-parameter cards host, the config section in the
+/// shared nav-item vocabulary (system entry exact-path active,
+/// read-only badge), NO primary action button, and its own script
+/// behind i18n.js.
 #[tokio::test]
 async fn system_page_serves_the_readonly_skeleton() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -421,16 +437,22 @@ async fn system_page_serves_the_readonly_skeleton() {
         "id=\"sys-running\"",
         // The per-volume collapsible cards host.
         "id=\"sys-volume-cards\"",
-        // The config submenu: this page's entry active, both listed.
-        "config-submenu",
-        "href=\"/volumes/system\" class=\"config-sub active\"",
-        "href=\"/volumes\" class=\"config-sub\"",
+        // The config section in the views section's nav-item vocabulary:
+        // the small section label, this page's entry exact-path active,
+        // both pages listed, the read-only badge.
+        "data-i18n=\"sidebar.section_config\"",
+        "href=\"/volumes/system\" class=\"nav-item active\"",
+        "href=\"/volumes\" class=\"nav-item\"",
         "ro-badge",
         // The page pill's configuration segment is the active one.
         "data-i18n=\"pages.config\"",
     ] {
         assert!(body.contains(marker), "skeleton needs `{marker}`: {body}");
     }
+    assert!(
+        !body.contains("config-sub"),
+        "the config-submenu special block is gone here too: {body}"
+    );
     // Read-only by construction: no primary action button in the topbar
     // (the language pill and the round refresh are the only controls).
     let topbar = body
@@ -717,11 +739,16 @@ async fn index_page_is_bilingual_ready_and_storage_card_moved() {
         pages.contains("page-seg active") && pages.contains("href=\"/\""),
         "Files is the active page segment: {pages}"
     );
-    // UI polish round 2 (item 3): the usage-state page carries NO config
-    // submenu — it is the config section's affordance alone.
+    // UI consistency: the usage-state page keeps the views section and
+    // carries NO config section — the config vocabulary is the
+    // config-side pages' affordance alone.
     assert!(
-        !body.contains("config-submenu"),
-        "the config submenu stays off the index page: {body}"
+        !body.contains("config-sub") && !body.contains("sidebar.section_config"),
+        "the config section stays off the index page: {body}"
+    );
+    assert!(
+        body.contains("data-i18n=\"sidebar.views\"") && body.contains("class=\"nav-item\""),
+        "the views section stays in the shared nav-item vocabulary: {body}"
     );
     // UI polish round 2 (item 1): the topbar is the main-content's FIRST
     // child — the volume tabs row follows it (one visual order across

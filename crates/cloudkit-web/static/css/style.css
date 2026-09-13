@@ -1237,46 +1237,12 @@ tr.volume-disabled td {
 }
 
 /* ------------------- UI polish round 2 (负责人 four-item feedback) -------
-   The config section submenu (item 3), the pagination size select
-   (item 2) and the read-only system-parameters page's faces (item 4) —
-   additive glue over the existing tokens only. */
+   The pagination size select (item 2) and the read-only
+   system-parameters page's faces (item 4) — additive glue over the
+   existing tokens only. */
 
-/* The config section submenu: rides above the page pill on the
-   config-side pages (/volumes, /volumes/system) — the section's two
-   page entries, the exact-path-active one highlighted, the system
-   entry carrying the read-only badge. The index page carries none. */
-.config-submenu {
-    display: flex;
-    flex-direction: column;
-    gap: 0.25rem;
-    margin-bottom: 0.75rem;
-}
-
-.config-sub {
-    display: flex;
-    align-items: center;
-    gap: 0.5rem;
-    padding: 0.45rem 0.75rem;
-    border-radius: 8px;
-    color: var(--text-muted);
-    text-decoration: none;
-    font-size: 0.82rem;
-    font-weight: 600;
-    white-space: nowrap;
-    transition: all 0.2s ease;
-}
-
-.config-sub:hover {
-    color: var(--text-main);
-    background: rgba(0, 243, 255, 0.06);
-}
-
-.config-sub.active {
-    background: rgba(0, 243, 255, 0.1);
-    color: var(--accent-cyan);
-}
-
-/* The read-only badge on the system entry: a small muted outline pill
+/* The read-only badge on the system entry (the config section's
+   nav-item row on the config-side pages): a small muted outline pill
    pushed to the row's far end. */
 .ro-badge {
     margin-left: auto;

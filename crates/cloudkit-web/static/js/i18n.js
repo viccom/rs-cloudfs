@@ -15,10 +15,12 @@ const LANG = {
     en: {
         // --- sidebar / navigation -------------------------------------
         'sidebar.views': 'Views',
+        // The config-side pages' mid-sidebar section label (the views
+        // label's twin — the pages below it are flat nav-items too).
+        'sidebar.section_config': 'Configuration',
         'page.files': 'Files',
-        // The page pill's second segment: the config SECTION (not the
-        // one management page — the section submenu below names its
-        // pages exactly).
+        // The page pill's second segment: the config SECTION (the
+        // sidebar's config section names its pages exactly).
         'pages.config': 'Configuration',
         'config.volumes': 'Volume Management',
         'config.system': 'System Parameters',
@@ -245,8 +247,11 @@ hand-written comments are lost. Credential fields left empty keep their stored v
     zh: {
         // --- 侧栏 / 导航 ---------------------------------------------
         'sidebar.views': '视图',
+        // 配置侧页面侧栏中部的节标签（视图标签的孪生——其下各项同为平铺
+        // nav-item）。
+        'sidebar.section_config': '配置',
         'page.files': '文件管理',
-        // 页面 pill 第二段：配置「分区」（其下的子菜单精确点名各页）。
+        // 页面 pill 第二段：配置「分区」（侧栏配置节精确点名各页）。
         'pages.config': '配置管理',
         'config.volumes': '卷管理',
         'config.system': '系统参数',

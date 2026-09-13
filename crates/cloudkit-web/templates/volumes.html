@@ -30,17 +30,21 @@
                 </div>
             </div>
 
+            <!-- The configuration section (the dashboard's views-section
+                 twin — the same sidebar vocabulary: one small section
+                 label + flat nav-item entries; the exact-path-active
+                 entry highlights, the system entry carries the
+                 read-only badge at the row's end). -->
+            <nav class="nav-menu">
+                <div class="nav-section-title" data-i18n="sidebar.section_config">Configuration</div>
+                <a href="/volumes" class="nav-item active"><i class="fa-solid fa-database"></i> <span data-i18n="config.volumes">Volume Management</span></a>
+                <a href="/volumes/system" class="nav-item"><i class="fa-solid fa-sliders"></i> <span data-i18n="config.system">System Parameters</span> <span class="ro-badge" data-i18n="config.readonly">Read-only</span></a>
+            </nav>
+
             <!-- The page switcher (bottom-anchored): the aggregate
                  storage line that used to close this sidebar moved up
-                 into the stats grid's Total Storage card. On the
-                 config-side pages the section's own submenu rides above
-                 the pill — the exact-path-active page entry, the system
-                 page's entry carrying the read-only badge. -->
+                 into the stats grid's Total Storage card. -->
             <nav class="sidebar-pages" aria-label="Pages">
-                <div class="config-submenu" role="group" aria-label="Configuration">
-                    <a href="/volumes" class="config-sub active"><span data-i18n="config.volumes">Volume Management</span></a>
-                    <a href="/volumes/system" class="config-sub"><span data-i18n="config.system">System Parameters</span> <span class="ro-badge" data-i18n="config.readonly">Read-only</span></a>
-                </div>
                 <div class="page-switch" role="group" aria-label="Page switch">
                     <a href="/" class="page-seg"><i class="fa-solid fa-folder"></i> <span data-i18n="page.files">Files</span></a>
                     <a href="/volumes" class="page-seg active"><i class="fa-solid fa-database"></i> <span data-i18n="pages.config">Configuration</span></a>
