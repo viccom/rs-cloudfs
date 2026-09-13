@@ -751,3 +751,149 @@ tr.volume-disabled td {
         transform: none;
     }
 }
+
+/* ----------------- P3/P4: the volume form card (web volume mgmt §1.2) ---
+   Additive glue over the existing tokens; the form renders inside a
+   files-container chassis above the table. */
+
+.volume-form-card {
+    margin-bottom: 1.4rem;
+}
+
+.volume-form-notice {
+    font-size: 0.82rem;
+    color: var(--text-muted);
+    border: 1px dashed var(--border-color);
+    border-radius: 10px;
+    padding: 0.7rem 0.9rem;
+    margin: 0.2rem 0 1rem;
+    line-height: 1.5;
+}
+
+.volume-form-grid {
+    display: grid;
+    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+    gap: 0.9rem 1.2rem;
+    margin-bottom: 1rem;
+}
+
+.volume-field {
+    display: flex;
+    flex-direction: column;
+    gap: 0.3rem;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+}
+
+.volume-field > span em {
+    color: #ff6688;
+    font-style: normal;
+}
+
+.volume-field input,
+.volume-field select {
+    background: var(--bg-main);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    color: var(--text-main);
+    font-family: "JetBrains Mono", monospace;
+    font-size: 0.85rem;
+    padding: 0.55rem 0.7rem;
+    outline: none;
+    transition: border-color 0.2s ease;
+}
+
+.volume-field input:focus,
+.volume-field select:focus {
+    border-color: var(--accent-cyan);
+}
+
+.volume-field input.vf-invalid {
+    border-color: #ff3366;
+}
+
+.volume-field-check {
+    flex-direction: row;
+    align-items: center;
+    gap: 0.6rem;
+}
+
+.volume-field-check input {
+    width: 1.05rem;
+    height: 1.05rem;
+    accent-color: var(--accent-cyan);
+}
+
+.vf-hint {
+    font-size: 0.7rem;
+    opacity: 0.75;
+}
+
+.vf-hint.vf-hint-bad {
+    color: #ff6688;
+    opacity: 1;
+}
+
+.volume-fieldset {
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    padding: 0.8rem 1rem 1rem;
+    margin: 0 0 1rem;
+}
+
+.volume-fieldset legend {
+    font-size: 0.78rem;
+    font-weight: 700;
+    color: var(--text-muted);
+    padding: 0 0.4rem;
+}
+
+.volume-fieldset legend em {
+    color: #ff6688;
+    font-style: normal;
+}
+
+.vf-radios {
+    display: flex;
+    gap: 1.6rem;
+    font-size: 0.82rem;
+    color: var(--text-main);
+    flex-wrap: wrap;
+}
+
+.vf-radios input {
+    accent-color: var(--accent-cyan);
+    margin-right: 0.4rem;
+}
+
+.vf-advanced summary {
+    cursor: pointer;
+    font-size: 0.8rem;
+    color: var(--text-muted);
+    margin-bottom: 0.8rem;
+    user-select: none;
+}
+
+.vf-advanced summary:hover {
+    color: var(--accent-cyan);
+}
+
+.vf-error {
+    border: 1px solid rgba(255, 51, 102, 0.5);
+    border-left: 3px solid #ff3366;
+    background: rgba(255, 51, 102, 0.08);
+    color: #ff6688;
+    border-radius: 10px;
+    font-size: 0.82rem;
+    padding: 0.8rem 1rem;
+    margin-bottom: 1rem;
+    white-space: pre-wrap;
+    word-break: break-word;
+    line-height: 1.5;
+}
+
+.volume-form-actions {
+    display: flex;
+    justify-content: flex-end;
+    gap: 0.8rem;
+}

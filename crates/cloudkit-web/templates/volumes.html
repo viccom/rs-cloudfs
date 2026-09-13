@@ -55,8 +55,8 @@
         <!-- Main Content Area -->
         <main class="main-content">
             <!-- Top Bar (configuration state): the page title + the Add
-                 Volume primary button (P0 placeholder — the form lands
-                 in P3) + refresh -->
+                 Volume primary button (opens the P3 form card) +
+                 refresh -->
             <header class="topbar">
                 <div class="topbar-title">
                     <h2><i class="fa-solid fa-database"></i> Volume Management</h2>
@@ -64,12 +64,158 @@
                 </div>
 
                 <div class="topbar-actions">
-                    <button class="btn btn-primary" id="add-volume-btn" disabled title="coming in P3">
+                    <button class="btn btn-primary" id="add-volume-btn" title="Create a new volume file and assemble it">
                         <i class="fa-solid fa-plus"></i> Add Volume
                     </button>
                     <button class="btn btn-icon" title="Refresh" onclick="loadVolumesPage()"><i class="fa-solid fa-rotate"></i></button>
                 </div>
             </header>
+
+            <!-- The volume form card (web volume management §1.2, P3):
+                 one card, two modes — CREATE (the Add Volume button /
+                 the /volumes#add anchor) and EDIT (a table row's [Edit]
+                 button, prefilled from SHOW). The backend radio swaps
+                 the credential group; the advanced section's empty
+                 fields write no keys (the backend's defaults rule).
+                 Authoritative validation is the CREATE/UPDATE command —
+                 its ERR text renders in the red box and the form keeps
+                 its values. -->
+            <section class="files-container volume-form-card" id="volume-form-card" hidden>
+                <div class="section-title">
+                    <h3 id="volume-form-title"><i class="fa-solid fa-plus"></i> Add Volume</h3>
+                    <button type="button" class="btn-mini" id="volume-form-cancel">Cancel</button>
+                </div>
+
+                <p class="volume-form-notice" id="volume-form-notice" hidden></p>
+
+                <form id="volume-form" novalidate>
+                    <div class="volume-form-grid">
+                        <label class="volume-field">
+                            <span>Volume name <em>*</em></span>
+                            <input type="text" id="vf-name" maxlength="32" autocomplete="off"
+                                   placeholder="lowercase slug, e.g. media" spellcheck="false">
+                            <small class="vf-hint" id="vf-name-hint">a–z, 0–9, _ and - ; starts with a letter, up to 32 chars</small>
+                        </label>
+                        <label class="volume-field">
+                            <span>Drive letter</span>
+                            <input type="text" id="vf-drive" maxlength="2" autocomplete="off"
+                                   placeholder="optional, e.g. Q (empty = no drive claim)" spellcheck="false">
+                            <small class="vf-hint">empty = the volume serves /vol/&lt;name&gt; only</small>
+                        </label>
+                        <label class="volume-field volume-field-check">
+                            <span>Enabled at create</span>
+                            <input type="checkbox" id="vf-enabled" checked>
+                            <small class="vf-hint">off = write the file disabled</small>
+                        </label>
+                    </div>
+
+                    <fieldset class="volume-fieldset">
+                        <legend>Backend <em>*</em></legend>
+                        <div class="vf-radios" id="vf-backend">
+                            <label><input type="radio" name="vf-backend" value="telegram" checked> Telegram MTProto</label>
+                            <label><input type="radio" name="vf-backend" value="baidu"> Baidu Netdisk</label>
+                            <label><input type="radio" name="vf-backend" value="local"> Local Disk</label>
+                        </div>
+                    </fieldset>
+
+                    <fieldset class="volume-fieldset vf-cred-group" id="vf-group-telegram">
+                        <legend>Telegram credentials</legend>
+                        <div class="volume-form-grid">
+                            <label class="volume-field">
+                                <span>Bot token <em>*</em></span>
+                                <input type="password" id="vf-bot-token" autocomplete="new-password"
+                                       placeholder="<id>:<secret> from @BotFather">
+                            </label>
+                            <label class="volume-field">
+                                <span>Chat ID <em>*</em></span>
+                                <input type="text" id="vf-chat-id" inputmode="numeric" autocomplete="off" placeholder="e.g. 4242">
+                            </label>
+                        </div>
+                    </fieldset>
+
+                    <fieldset class="volume-fieldset vf-cred-group" id="vf-group-baidu" hidden>
+                        <legend>Baidu credentials</legend>
+                        <div class="volume-form-grid">
+                            <label class="volume-field">
+                                <span>App key <em>*</em></span>
+                                <input type="password" id="vf-baidu-app-key" autocomplete="new-password">
+                            </label>
+                            <label class="volume-field">
+                                <span>App secret <em>*</em></span>
+                                <input type="password" id="vf-baidu-app-secret" autocomplete="new-password">
+                            </label>
+                            <label class="volume-field">
+                                <span>Access token <em>*</em></span>
+                                <input type="password" id="vf-baidu-access-token" autocomplete="new-password">
+                            </label>
+                            <label class="volume-field">
+                                <span>Refresh token <em>*</em></span>
+                                <input type="password" id="vf-baidu-refresh-token" autocomplete="new-password">
+                            </label>
+                            <label class="volume-field">
+                                <span>App root</span>
+                                <input type="text" id="vf-baidu-root" placeholder="/apps/cloudfs (default)">
+                            </label>
+                        </div>
+                    </fieldset>
+
+                    <fieldset class="volume-fieldset vf-cred-group" id="vf-group-local" hidden>
+                        <legend>Local backend</legend>
+                        <div class="volume-form-grid">
+                            <label class="volume-field">
+                                <span>Local root <em>*</em></span>
+                                <input type="text" id="vf-local-root" autocomplete="off"
+                                       placeholder="absolute path, e.g. C:\data\cloudfs">
+                            </label>
+                        </div>
+                    </fieldset>
+
+                    <details class="vf-advanced" id="vf-advanced">
+                        <summary>Advanced (empty fields keep the defaults)</summary>
+                        <div class="volume-form-grid">
+                            <label class="volume-field volume-field-check">
+                                <span>Enable encryption</span>
+                                <input type="checkbox" id="vf-enc">
+                            </label>
+                            <label class="volume-field">
+                                <span>Encryption password</span>
+                                <input type="password" id="vf-enc-pass" autocomplete="new-password">
+                            </label>
+                            <label class="volume-field">
+                                <span>Scheme</span>
+                                <select id="vf-enc-scheme">
+                                    <option value="gcm">gcm (default, v1)</option>
+                                    <option value="aead_v2">aead_v2 (streaming, v2)</option>
+                                </select>
+                            </label>
+                            <label class="volume-field">
+                                <span>Chunk size (MB)</span>
+                                <input type="text" id="vf-chunk" inputmode="numeric" autocomplete="off" placeholder="1900 (default)">
+                            </label>
+                            <label class="volume-field">
+                                <span>Sync URL</span>
+                                <input type="text" id="vf-sync-url" autocomplete="off" placeholder="https://sync.example.org:8290">
+                            </label>
+                            <label class="volume-field">
+                                <span>Sync secret</span>
+                                <input type="password" id="vf-sync-secret" autocomplete="new-password">
+                            </label>
+                            <label class="volume-field">
+                                <span>Sync interval (s)</span>
+                                <input type="text" id="vf-sync-interval" inputmode="numeric" autocomplete="off" placeholder="300 (default)">
+                            </label>
+                        </div>
+                    </details>
+
+                    <div class="vf-error" id="vf-error" hidden></div>
+
+                    <div class="volume-form-actions">
+                        <button type="submit" class="btn btn-primary" id="vf-submit">
+                            <i class="fa-solid fa-plus"></i> <span id="vf-submit-label">Create volume</span>
+                        </button>
+                    </div>
+                </form>
+            </section>
 
             <!-- Stats Grid:卷总数 / Running / Failed / Pending 总和 -->
             <section class="stats-grid">

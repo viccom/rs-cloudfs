@@ -13,6 +13,12 @@
 // deleted), its loading state driven by the row's `rebuilding` marker
 // (the poll data), and a muted tooltip note where a backend cannot be
 // rebuilt (telegram's shadow index, encrypted volumes → cydrive sync).
+// P3 adds the volume form card (Add Volume): the backend radio swaps
+// the credential group, the advanced section's empty fields write no
+// keys (the backend's defaults rule), the form's checks are UX-level
+// only (slug shape + the starred requireds) — the CREATE command is the
+// authority and its ERR text renders in the form's red box with the
+// values kept.
 
 const VOLUME_LABELS = {
     telegram: 'Telegram MTProto',
@@ -29,6 +35,7 @@ document.addEventListener("DOMContentLoaded", () => {
     setInterval(loadVolumesPage, 4000);
     const tbody = document.getElementById("volumes-tbody");
     if (tbody) tbody.addEventListener("click", onVolumeActionClick);
+    initVolumeForm();
 });
 
 // The write actions: which HTTP route each button posts to.
@@ -357,4 +364,258 @@ function formatBytes(bytes, decimals = 2) {
 
 function escapeHtml(text) {
     return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+// ------------------------- the volume form card (web volume mgmt P3) -----
+
+// The backend radio → credential group map.
+const VF_CRED_GROUPS = {
+    telegram: 'vf-group-telegram',
+    baidu: 'vf-group-baidu',
+    local: 'vf-group-local',
+};
+
+// The starred requireds per backend (UX-level only — the CREATE command
+// is the authority and its ERR text renders in the red box).
+const VF_REQUIRED = {
+    telegram: ['vf-bot-token', 'vf-chat-id'],
+    baidu: ['vf-baidu-app-key', 'vf-baidu-app-secret', 'vf-baidu-access-token', 'vf-baidu-refresh-token'],
+    local: ['vf-local-root'],
+};
+
+// String fields: input id → payload key (collected only when non-empty —
+// an empty string writes no key, the backend's default rules).
+const VF_STRINGS = {
+    'vf-drive': 'drive_letter',
+    'vf-bot-token': 'bot_token',
+    'vf-baidu-app-key': 'baidu_app_key',
+    'vf-baidu-app-secret': 'baidu_app_secret',
+    'vf-baidu-access-token': 'baidu_access_token',
+    'vf-baidu-refresh-token': 'baidu_refresh_token',
+    'vf-baidu-root': 'baidu_root',
+    'vf-local-root': 'local_root',
+    'vf-enc-pass': 'encryption_password',
+    'vf-sync-url': 'sync_url',
+    'vf-sync-secret': 'sync_secret',
+};
+
+// Numeric fields: input id → payload key (collected only when non-empty
+// and whole-number shaped).
+const VF_NUMBERS = {
+    'vf-chat-id': 'chat_id',
+    'vf-chunk': 'chunk_size_mb',
+    'vf-sync-interval': 'sync_interval_secs',
+};
+
+// The form card's current mode: null (closed) or 'create' (the edit
+// mode lands in the P4 batch on this same card).
+let vfMode = null;
+
+function vfEl(id) {
+    return document.getElementById(id);
+}
+
+function vfValue(id) {
+    const el = vfEl(id);
+    return el ? el.value.trim() : '';
+}
+
+// Wires the form card's static listeners (idempotent — the harness and
+// the DOMContentLoaded path both call it).
+function initVolumeForm() {
+    const addBtn = vfEl('add-volume-btn');
+    if (addBtn && !addBtn.dataset.wired) {
+        addBtn.dataset.wired = '1';
+        addBtn.addEventListener('click', () => openVolumeForm('create'));
+    }
+    const cancel = vfEl('volume-form-cancel');
+    if (cancel && !cancel.dataset.wired) {
+        cancel.dataset.wired = '1';
+        cancel.addEventListener('click', closeVolumeForm);
+    }
+    const form = vfEl('volume-form');
+    if (form && !form.dataset.wired) {
+        form.dataset.wired = '1';
+        form.addEventListener('submit', onVolumeFormSubmit);
+    }
+    const name = vfEl('vf-name');
+    if (name && !name.dataset.wired) {
+        name.dataset.wired = '1';
+        name.addEventListener('input', vfCheckName);
+    }
+    const backend = vfEl('vf-backend');
+    if (backend && !backend.dataset.wired) {
+        backend.dataset.wired = '1';
+        backend.addEventListener('change', vfSwapCredentialGroups);
+    }
+    // The /volumes#add anchor opens the form (the usage-state page's ＋
+    // chip target — the P0 hook).
+    if (vfMode === null && location.hash === '#add') openVolumeForm('create');
+}
+
+// Opens the card in the given mode ('create' resets everything).
+function openVolumeForm(mode) {
+    vfMode = mode;
+    const card = vfEl('volume-form-card');
+    if (!card) return;
+    card.hidden = false;
+    vfHideError();
+    const title = vfEl('volume-form-title');
+    const submitLabel = vfEl('vf-submit-label');
+    const nameInput = vfEl('vf-name');
+    if (mode === 'create') {
+        if (title) title.innerHTML = '<i class="fa-solid fa-plus"></i> Add Volume';
+        if (submitLabel) submitLabel.innerText = 'Create volume';
+        resetVolumeForm();
+    }
+    if (nameInput) nameInput.focus();
+    card.scrollIntoView({ behavior: 'smooth', block: 'start' });
+}
+
+function closeVolumeForm() {
+    vfMode = null;
+    const card = vfEl('volume-form-card');
+    if (card) card.hidden = true;
+}
+
+function resetVolumeForm() {
+    const form = vfEl('volume-form');
+    if (form) form.reset();
+    // reset() leaves the DOM's checked/default state; force the dynamic
+    // pieces explicitly so a previous open never bleeds through.
+    const enabled = vfEl('vf-enabled');
+    if (enabled) enabled.checked = true;
+    const scheme = vfEl('vf-enc-scheme');
+    if (scheme) scheme.value = 'gcm';
+    const name = vfEl('vf-name');
+    if (name) vfCheckName();
+    vfSwapCredentialGroups();
+    vfHideError();
+}
+
+// Live slug check (UX-level; the CREATE command re-validates with the
+// same rule server-side).
+const VF_NAME_RULE = /^[a-z][a-z0-9_-]{0,31}$/;
+
+function vfCheckName() {
+    const input = vfEl('vf-name');
+    const hint = vfEl('vf-name-hint');
+    if (!input || !hint) return;
+    const value = input.value.trim();
+    const bad = value !== '' && !VF_NAME_RULE.test(value);
+    input.classList.toggle('vf-invalid', bad);
+    hint.classList.toggle('vf-hint-bad', bad);
+    if (bad) hint.innerText = 'names start with a lowercase letter; only a-z, 0-9, _ and -; up to 32 chars';
+    else hint.innerText = 'a–z, 0–9, _ and - ; starts with a letter, up to 32 chars';
+}
+
+function vfSwapCredentialGroups() {
+    const backend = vfBackend();
+    for (const [name, id] of Object.entries(VF_CRED_GROUPS)) {
+        const group = vfEl(id);
+        if (group) group.hidden = name !== backend;
+    }
+}
+
+function vfBackend() {
+    const radio = document.querySelector('input[name="vf-backend"]:checked');
+    return radio ? radio.value : 'telegram';
+}
+
+function vfShowError(text) {
+    const box = vfEl('vf-error');
+    if (!box) return;
+    box.innerText = text;
+    box.hidden = false;
+}
+
+function vfHideError() {
+    const box = vfEl('vf-error');
+    if (box) box.hidden = true;
+}
+
+// UX-level validation: the slug shape and the starred requireds of the
+// CHOSEN backend (the authority is the CREATE command — everything else
+// rides its ERR text into the red box).
+function vfValidate() {
+    const name = vfValue('vf-name');
+    if (!VF_NAME_RULE.test(name)) {
+        return 'Pick a volume name first: a lowercase letter, then a-z/0-9/_/- , up to 32 characters.';
+    }
+    for (const id of VF_REQUIRED[vfBackend()] || []) {
+        if (!vfValue(id)) {
+            const el = vfEl(id);
+            const label = el ? (el.closest('.volume-field')?.querySelector('span')?.innerText || id) : id;
+            return `The ${label.trim().replace('*', '')} field is required for this backend.`;
+        }
+    }
+    for (const id of Object.keys(VF_NUMBERS)) {
+        const raw = vfValue(id);
+        if (raw !== '' && !/^-?\d+$/.test(raw)) {
+            return `"${raw}" is not a whole number — the ${VF_NUMBERS[id]} field takes digits only.`;
+        }
+    }
+    return '';
+}
+
+// Collects the payload object (every key the form sets; empty strings
+// and unset numbers are OMITTED — they would write no key server-side).
+function vfCollectPayload() {
+    const payload = {};
+    for (const [id, key] of Object.entries(VF_STRINGS)) {
+        const value = vfValue(id);
+        if (value !== '') payload[key] = value;
+    }
+    for (const [id, key] of Object.entries(VF_NUMBERS)) {
+        const raw = vfValue(id);
+        if (raw !== '') payload[key] = Number(raw);
+    }
+    const enabled = vfEl('vf-enabled');
+    if (enabled) payload.enabled = enabled.checked;
+    const enc = vfEl('vf-enc');
+    if (enc) payload.enable_encryption = enc.checked;
+    const scheme = vfEl('vf-enc-scheme');
+    if (scheme && scheme.value !== 'gcm') payload.encryption_scheme = scheme.value;
+    const backend = vfBackend();
+    if (backend) payload.backend = backend;
+    return payload;
+}
+
+async function onVolumeFormSubmit(event) {
+    event.preventDefault();
+    if (!vfMode) return;
+    vfHideError();
+    const problem = vfValidate();
+    if (problem) {
+        vfShowError(problem);
+        return;
+    }
+    const submit = vfEl('vf-submit');
+    const label = vfEl('vf-submit-label');
+    if (submit) submit.disabled = true;
+    if (label) label.innerText = 'Creating…';
+    try {
+        const payload = vfCollectPayload();
+        payload.name = vfValue('vf-name');
+        const response = await fetch('/api/volumes', {
+            method: 'POST',
+            headers: { 'Content-Type': 'application/json' },
+            body: JSON.stringify(payload),
+        });
+        const body = await response.json().catch(() => ({}));
+        if (response.ok && body.ok) {
+            showToast('ok', body.reply || 'Done.');
+            closeVolumeForm();
+        } else {
+            // The backend's ERR text is already actionable — keep the
+            // form (and every entered value) and show it in the red box.
+            vfShowError(body.error || `HTTP ${response.status}`);
+        }
+    } catch (err) {
+        vfShowError(`request failed: ${err}`);
+    } finally {
+        if (submit) submit.disabled = false;
+        if (label) label.innerText = 'Create volume';
+        await loadVolumesPage();
+    }
 }

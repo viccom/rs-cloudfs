@@ -103,6 +103,14 @@
 //!   background task, so the 120s budget covers the serialized queue,
 //!   never the walk); the volume's `rebuilding` marker (the configs
 //!   rows above) is the button's live state.
+//! - `POST /api/volumes` (P3) — the Add Volume form's member: the body's
+//!   `name` keys the command and the remaining object rides as the
+//!   compact single-line JSON payload of one `CREATE <name> <json>`; the
+//!   command is the authority on the payload (key space, validation
+//!   before any write, the controlled toml, the ADD leg), the route on
+//!   the body's shape (a non-JSON body or a missing `name` answers 400).
+//!   The 180s assembly budget covers the ADD leg's connect + mount
+//!   windows behind the serialized queue.
 //!
 //! The volume-management family (`/api/volumes`, the two config
 //! routes, and the write routes) runs behind a same-origin guard (§1.5
@@ -568,7 +576,9 @@ fn multi_router(
     contract_routes(axum::Router::new())
         .route(
             "/api/volumes",
-            get(api_volumes).layer(axum::middleware::from_fn(same_origin_guard)),
+            get(api_volumes)
+                .post(api_volume_create)
+                .layer(axum::middleware::from_fn(same_origin_guard)),
         )
         .route(
             "/api/volumes/configs",
@@ -951,6 +961,15 @@ async fn volume_write_route(state: AppState, name: String, verb: &str) -> Respon
             );
         }
     };
+    map_volume_command_reply(&reply)
+}
+
+/// The write family's shared seam-reply mapping: an `OK: ` prefix
+/// becomes the pinned success shape `{"ok": true, "reply": "..."}` (the
+/// prefix stripped — the dashboard toasts the text verbatim); anything
+/// else is the seam's actionable `ERR:` as 409 (a refused mutation is a
+/// conflict; the reply text is what the operator needs).
+fn map_volume_command_reply(reply: &str) -> Response {
     match reply.trim().strip_prefix("OK: ") {
         Some(payload) => Json(serde_json::json!({
             "ok": true,
@@ -962,6 +981,110 @@ async fn volume_write_route(state: AppState, name: String, verb: &str) -> Respon
             reply.trim().trim_start_matches("ERR: "),
         ),
     }
+}
+
+/// The CREATE/UPDATE seam budget (P3/P4): these commands carry a whole
+/// assembly behind the serialized queue. A CREATE runs the ADD leg (the
+/// telegram connect budget alone is 90s, plus the mount); an UPDATE runs
+/// REMOVE first (60s drain + 10s release ≈ 70s) and THEN the ADD leg.
+/// 180s covers remove 70s + add 90s with margin — the M1
+/// `EXCHANGE_BUDGET` philosophy one step wider than the P1 family's
+/// 120s, which predates the assembly-carrying commands.
+const VOLUME_ASSEMBLY_TIMEOUT: Duration = Duration::from_secs(180);
+
+/// `POST /api/volumes` (P3, the Add Volume form's transport): the body
+/// is the form's JSON object — its `name` keys the command line, every
+/// other member rides as the compact single-line JSON payload of one
+/// `CREATE <name> <json>` through the seam (the command is the authority
+/// on the payload's semantics — key space, validation, the controlled
+/// toml write; the route is the authority on the HTTP body's shape).
+/// Budget [`VOLUME_ASSEMBLY_TIMEOUT`]; success/ERR mapping shared with
+/// the write family ([`map_volume_command_reply`]); the §1.5 gates
+/// (Origin middleware on the route, the write verdict, the seam) answer
+/// before the command is built. Credentials ride the body the same way
+/// they ride the volume file — the loopback trust face — and never ride
+/// any reply (the command's refusals name keys, M3).
+async fn api_volume_create(State(state): State<AppState>, body: axum::body::Bytes) -> Response {
+    let AppState::Multi {
+        commands,
+        writes_allowed,
+        ..
+    } = state
+    else {
+        return error_json(
+            StatusCode::NOT_FOUND,
+            "no volume registry: this dashboard serves a single volume",
+        );
+    };
+    if !writes_allowed {
+        return error_json(
+            StatusCode::FORBIDDEN,
+            "remote administration is disabled: the web UI is bound to a non-loopback \
+             address, so the volume-management write routes refuse requests — set \
+             `allow_remote_admin = true` in config.toml to manage volumes remotely",
+        );
+    }
+    let Some(client) = commands else {
+        return error_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "volume commands are not available: this dashboard runs without the \
+             volume-command seam (the multi-volume cli assembly installs it)",
+        );
+    };
+    let value: serde_json::Value = match serde_json::from_slice(&body) {
+        Ok(value) => value,
+        Err(error) => {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                format!("the request body is not valid JSON: {error} — send the form object"),
+            );
+        }
+    };
+    let serde_json::Value::Object(fields) = value else {
+        return error_json(
+            StatusCode::BAD_REQUEST,
+            "the create body must be a JSON object (the form's fields plus its `name`)",
+        );
+    };
+    let name = match fields.get("name") {
+        Some(serde_json::Value::String(name)) if !name.trim().is_empty() => name.clone(),
+        _ => {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                "the create body needs a non-empty string `name` (the new volume's name)",
+            );
+        }
+    };
+    let mut payload = fields;
+    payload.remove("name");
+    // Compact serialization: the control channel's line protocol carries
+    // the payload as ONE line (a serialized JSON body never spans lines
+    // — newlines ride as escapes).
+    let json = match serde_json::to_string(&payload) {
+        Ok(json) => json,
+        Err(error) => {
+            return error_json(
+                StatusCode::BAD_REQUEST,
+                format!("serializing the form payload failed: {error}"),
+            );
+        }
+    };
+    let command = format!("CREATE {name} {json}");
+    let reply = match tokio::time::timeout(VOLUME_ASSEMBLY_TIMEOUT, client(&command)).await {
+        Ok(reply) => reply,
+        Err(_elapsed) => {
+            return error_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "the CREATE command for '{name}' timed out — the instance is likely busy \
+                     or the new volume's backend is slow to connect; the volume file may \
+                     still have been written — check the volume list and retry once it \
+                     settles"
+                ),
+            );
+        }
+    };
+    map_volume_command_reply(&reply)
 }
 
 /// `POST /api/volumes/{name}/remove` (P1): an unmount through the same

@@ -136,11 +136,17 @@ async fn send_http(addr: SocketAddr, target: &str) -> String {
 
 /// [`send_http`] with the method injectable (the P1 write routes POST).
 async fn send_http_method(method: &str, addr: SocketAddr, target: &str) -> String {
+    send_http_with_body(method, addr, target, "").await
+}
+
+/// [`send_http`] with a request body (the P3 create route's JSON).
+async fn send_http_with_body(method: &str, addr: SocketAddr, target: &str, body: &str) -> String {
     let mut stream = TcpStream::connect(addr).await.expect("connect to server");
     let request = format!(
         "{method} {target} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\
-         Content-Length: 0\r\n\r\n",
-        addr.port()
+         Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        addr.port(),
+        body.len()
     );
     stream
         .write_all(request.as_bytes())
@@ -553,6 +559,111 @@ async fn web_write_routes_drive_the_real_command_surface() {
     assert!(
         body["error"].as_str().is_some_and(|m| m.contains("ghost")),
         "the refusal names the volume: {body}"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+// ------------------------------------------- the P3 create route e2e ---
+
+/// The P3 create route drives the REAL command surface end to end (the
+/// seam's other side is the cli composition root's own handler): the
+/// form's JSON creates the volume file under volumes_dir, assembles the
+/// volume through the runtime ADD path, and the reply carries the mount
+/// state — with a credential VALUE never riding the HTTP response.
+/// Green-since-birth pin: the components were each red→green in their
+/// own suites; this test pins their composition.
+#[tokio::test]
+async fn web_create_route_drives_the_real_command_surface() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:AAA", 111111),
+    );
+    let _guard = chdir(dir.path());
+
+    let cfg = web_process_config();
+    let specs =
+        cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load volume specs");
+    let injections = vec![(
+        specs[0].clone(),
+        RunOptions::default(),
+        mock_transport().await as Arc<dyn CloudTransport>,
+    )];
+    let handle = cloudkit_cli::run_multi_with_transports_and_commands(
+        &cfg,
+        injections,
+        RuntimeVolumeCommands {
+            dispatch: Some(mock_dispatch()),
+            remove_tuning: RemoveTuning::fast(),
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await
+    .expect("boot with the command surface");
+    let web = handle
+        .web_ui_addr()
+        .expect("the dashboard bound (enable_web_ui = true)");
+    let addr = control_addr();
+
+    // Create `made` through the web route: file + runtime + reply all
+    // agree.
+    let resp = send_http_with_body(
+        "POST",
+        web,
+        "/api/volumes",
+        "{\"name\":\"made\",\"backend\":\"telegram\",\"bot_token\":\"222:FAKE-CREATED-VIA-WEB\",\"chat_id\":222222}",
+    )
+    .await;
+    assert_eq!(status_of(&resp), 200, "create ok: {resp}");
+    assert!(
+        !resp.contains("FAKE-CREATED-VIA-WEB"),
+        "the credential value never rides the HTTP response: {resp}"
+    );
+    let body: serde_json::Value = serde_json::from_str(body_of(&resp)).expect("parse body");
+    assert_eq!(body["ok"], serde_json::json!(true), "the ok flag: {body}");
+    assert!(
+        body["reply"]
+            .as_str()
+            .is_some_and(|r| r.contains("created volume `made`")),
+        "the reply names the created volume: {body}"
+    );
+
+    let file = fs::read_to_string(dir.path().join("volumes").join("made.toml"))
+        .expect("the created volume file");
+    assert!(
+        file.contains("bot_token = \"222:FAKE-CREATED-VIA-WEB\"")
+            && file.contains("chat_id = 222222"),
+        "the file carries the payload's keys: {file}"
+    );
+    let reply = send_cmd(addr, "LIST").await;
+    assert!(
+        reply.contains("made running"),
+        "the created volume is registered: {reply}"
+    );
+
+    // A duplicate create answers the 409 with the actionable refusal.
+    let resp = send_http_with_body(
+        "POST",
+        web,
+        "/api/volumes",
+        "{\"name\":\"made\",\"backend\":\"telegram\",\"bot_token\":\"9:9\",\"chat_id\":9}",
+    )
+    .await;
+    assert_eq!(status_of(&resp), 409, "duplicate create conflicts: {resp}");
+    let body: serde_json::Value = serde_json::from_str(body_of(&resp)).expect("error json");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|m| m.contains("already exists")),
+        "the refusal is the command's own text: {body}"
     );
 
     timeout(Duration::from_secs(30), handle.shutdown())

@@ -103,6 +103,13 @@ hyper-rustls = { version = "0.27", default-features = false, features = [
     "webpki-roots",
 ] }
 serde_json = "1"
+# The CREATE/UPDATE payload conversion builds core's `toml::Table`
+# (render_volume_toml's input type). The `preserve_order` feature MUST
+# match core's — toml's Table is a different concrete type (IndexMap vs
+# BTreeMap) without it, and a mismatched build would not compile. Same
+# version line as core; already in the lock tree, zero new packages
+# (web volume management P3).
+toml = { version = "1.1.4", features = ["preserve_order"] }
 # OS credential vault (M5). keyring 3.x has no default features: the
 # platform store must be picked per target below (the base dep keeps the
 # crate linkable everywhere; CyDrive's supported platforms all carry a

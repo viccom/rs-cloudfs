@@ -15,9 +15,10 @@ use std::fs;
 use std::path::Path;
 
 use cloudkit_core::config::{
-    discover_volumes, ensure_no_volume_keys_in_process, load_volume_config, load_volumes,
-    render_volume_toml, volume_show_json, write_volume_enabled, Backend, ConfigError,
-    CyDriveConfig, KNOWN_TOML_KEYS, PROCESS_SCOPED_KEYS, VOLUME_SCOPED_KEYS,
+    discover_volumes, ensure_no_volume_keys_in_process, is_valid_volume_name, json_value_to_toml,
+    load_volume_config, load_volumes, parse_volume_toml, render_volume_toml, volume_show_json,
+    write_volume_enabled, Backend, ConfigError, CyDriveConfig, KNOWN_TOML_KEYS,
+    PROCESS_SCOPED_KEYS, VOLUME_SCOPED_KEYS,
 };
 
 // ------------------------------------------------------------- helpers ---
@@ -1052,4 +1053,177 @@ fn allow_remote_admin_is_rejected_by_legacy_json() {
         message.contains("allow_remote_admin"),
         "error must name the rejected key: {message}"
     );
+}
+
+// --------------------- the CREATE/UPDATE payload primitives (web volume P3) ---
+
+/// `json_value_to_toml` is the INVERSE of the SHOW serializer's scalar
+/// mapping (web volume management §1.2): a SHOW reply's plain (non
+/// credential-marker) values, converted back, are the original toml
+/// values — what a CREATE built from a form round-trips through. The
+/// end-to-end form: a volume file with one value of every scalar kind →
+/// `volume_show_json` → per-key `json_value_to_toml` → the same toml
+/// values back.
+#[test]
+fn json_value_to_toml_inverts_the_show_serializer() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("media.toml");
+    write_file(
+        &file,
+        "backend = \"telegram\"\n\
+         chat_id = 4242\n\
+         enable_encryption = true\n\
+         chunk_size_mb = 8\n",
+    );
+
+    let shown: serde_json::Value =
+        serde_json::from_str(&volume_show_json(&file).expect("serialize")).expect("json");
+    let table: toml::Table = toml::from_str(&fs::read_to_string(&file).expect("read")).expect("t");
+    for (key, original) in &table {
+        let shown_value = shown
+            .get(key)
+            .unwrap_or_else(|| panic!("SHOW reported nothing for `{key}`: {shown}"));
+        let converted = json_value_to_toml(key, shown_value)
+            .unwrap_or_else(|error| panic!("`{key}` must convert ({shown_value}): {error}"))
+            .unwrap_or_else(|| panic!("`{key}` must convert to a value, not unset"));
+        assert_eq!(
+            &converted, original,
+            "json → toml inverts the SHOW serialization for `{key}`"
+        );
+    }
+}
+
+/// The write-only/leave-alone affordance (K49 分档): JSON `null` and the
+/// empty string convert to "unset" — a form field the operator left
+/// empty writes NO key (CREATE) and overwrites nothing (UPDATE).
+#[test]
+fn json_value_to_toml_maps_null_and_empty_strings_to_unset() {
+    for empty in [serde_json::json!(null), serde_json::json!("")] {
+        assert_eq!(
+            json_value_to_toml("bot_token", &empty).expect("null/empty convert"),
+            None,
+            "the write-only affordance: {empty}"
+        );
+    }
+    // Everything else stays a value — including "0"-like and false-y ones.
+    assert_eq!(
+        json_value_to_toml("enable_encryption", &serde_json::json!(false)).expect("bool converts"),
+        Some(toml::Value::Boolean(false))
+    );
+    assert_eq!(
+        json_value_to_toml("chat_id", &serde_json::json!(0)).expect("zero converts"),
+        Some(toml::Value::Integer(0))
+    );
+}
+
+/// Type errors are actionable and NEVER echo the offending value (the M3
+/// discipline — a payload may carry credentials): the refusal names the
+/// key and the JSON shape it got. Arrays and objects are not scalars; an
+/// integer past toml's i64 range cannot be a config value.
+#[test]
+fn json_value_to_toml_type_errors_name_the_key_without_the_value() {
+    for wrong in [
+        serde_json::json!(["a", "b"]),
+        serde_json::json!({ "nested": 1 }),
+    ] {
+        let error = json_value_to_toml("bot_token", &wrong)
+            .expect_err("a structural JSON value must be refused");
+        let message = error.to_string();
+        assert!(
+            message.contains("bot_token"),
+            "the refusal names the key: {message}"
+        );
+        assert!(
+            !message.contains("a\", \"b") && !message.contains("nested"),
+            "the refusal never echoes the value: {message}"
+        );
+    }
+    let error = json_value_to_toml(
+        "chat_id",
+        &serde_json::from_str::<serde_json::Value>("18446744073709551615").expect("u64 max"),
+    )
+    .expect_err("past i64::MAX no config integer exists");
+    assert!(
+        error.to_string().contains("chat_id"),
+        "the out-of-range refusal names the key: {error}"
+    );
+}
+
+/// `parse_volume_toml` is the extracted parse segment of
+/// `load_volume_config` (zero-drift: every `load_volume_config` test
+/// above keeps passing against the delegated loader). Directly on a
+/// string — the CREATE/UPDATE pre-write validation runs it on RENDERED
+/// toml before anything touches the disk: the name rules, the strict key
+/// surface (unknown keys, process-level keys with their guidance) and
+/// the typed parse all answer without a file.
+#[test]
+fn parse_volume_toml_validates_a_rendered_string_directly() {
+    let path = Path::new("volumes/media.toml");
+    let spec = parse_volume_toml(
+        path,
+        "media",
+        "backend = \"local\"\nlocal_root = \"root\"\n",
+    )
+    .expect("a legal body parses");
+    assert_eq!(spec.name, "media");
+    assert_eq!(spec.settings.backend, Backend::Local);
+    assert_eq!(
+        spec.file_path, path,
+        "the caller's target path rides the spec"
+    );
+
+    // The name rules, verbatim from the file loader.
+    let error = parse_volume_toml(path, "Bad-Name", "").expect_err("the name rules apply");
+    assert!(
+        error.to_string().contains("Bad-Name"),
+        "the refusal names the name: {error}"
+    );
+
+    // The strict key surface, verbatim.
+    let error = parse_volume_toml(path, "media", "backend = \"local\"\nno_such_key = 1\n")
+        .expect_err("unknown keys are refused");
+    assert!(
+        error.to_string().contains("no_such_key"),
+        "the refusal names the key: {error}"
+    );
+    let error = parse_volume_toml(path, "media", "backend = \"local\"\nweb_ui_port = 9\n")
+        .expect_err("process keys are refused");
+    assert!(
+        error.to_string().contains("config.toml"),
+        "the refusal points process keys at config.toml: {error}"
+    );
+
+    // The typed parse, verbatim (a wrong-typed value is a Parse error).
+    let error = parse_volume_toml(path, "media", "backend = \"local\"\nchat_id = \"many\"\n")
+        .expect_err("wrong types are refused");
+    assert!(
+        matches!(error, ConfigError::Parse { .. }),
+        "expected a Parse error, got: {error:?}"
+    );
+}
+
+/// The published name rule: the same regex the volume files enforce —
+/// CREATE's precheck (and the dashboard's slug field) reuse it, so the
+/// three surfaces cannot drift.
+#[test]
+fn is_valid_volume_name_pins_the_slug_rule() {
+    for good in ["a", "media", "b-2", "x_9", &"m".repeat(32)] {
+        assert!(is_valid_volume_name(good), "`{good}` must be valid");
+    }
+    for bad in [
+        "",
+        "A",
+        "1a",
+        "aB",
+        "a b",
+        "a/b",
+        "a\\b",
+        "a.b",
+        "a:b",
+        "-a",
+        "_a",
+        &"m".repeat(33),
+    ] {
+        assert!(!is_valid_volume_name(bad), "`{bad}` must be refused");
+    }
 }

@@ -2266,6 +2266,79 @@ impl Drop for InFlightGuard {
     }
 }
 
+/// `true` when the control line's first token is exactly `keyword` (the
+/// connection layer trims the line, so the keyword starts at byte 0;
+/// the match must end at whitespace so `CREATEX` never routes as
+/// `CREATE`).
+fn first_keyword_is(line: &str, keyword: &str) -> bool {
+    let rest = line.strip_prefix(keyword);
+    rest.is_some_and(|rest| rest.starts_with(char::is_whitespace) || rest.is_empty())
+}
+
+/// Splits `name <payload>` — the span after a CREATE/UPDATE keyword —
+/// into the volume name and the payload REST OF THE LINE verbatim (the
+/// payload is JSON whose strings may carry meaningful runs of whitespace;
+/// the whitespace-token splitting of the other commands would mangle
+/// them). `None` when there is no name token at all.
+fn split_name_payload(rest: &str) -> Option<(&str, &str)> {
+    let rest = rest.trim_start();
+    let (name, tail) = rest.split_once(char::is_whitespace)?;
+    Some((name, tail.trim_start()))
+}
+
+/// Converts one CREATE/UPDATE payload — a compact single-line JSON
+/// object — into the toml::Table the controlled renderer consumes (web
+/// volume management §1.2, P3). The key space is exactly
+/// [`VOLUME_SCOPED_KEYS`] (a process-level key is refused with its
+/// config.toml pointer, an unknown key with its own refusal); values go
+/// through [`cloudkit_core::config::json_value_to_toml`], whose
+/// null/empty-string → unset rule IS the write-only affordance (a
+/// credential the form left empty overlays nothing) and whose type
+/// refusals name the key, never the value (M3 — the payload may carry
+/// credentials). Every refusal text is a complete `ERR: ...\n` reply.
+fn volume_payload_table(payload: &str) -> Result<toml::Table, String> {
+    let value: serde_json::Value = match serde_json::from_str(payload) {
+        Ok(value) => value,
+        Err(error) => {
+            return Err(format!(
+                "ERR: the payload is not valid JSON: {error} — send one compact single-line \
+                 JSON object of volume keys\n"
+            ));
+        }
+    };
+    let serde_json::Value::Object(fields) = value else {
+        return Err(
+            "ERR: the payload must be a JSON object of volume keys, not a bare value\n".to_string(),
+        );
+    };
+    let mut table = toml::Table::new();
+    for (key, value) in fields {
+        if cloudkit_core::config::PROCESS_SCOPED_KEYS.contains(&key.as_str()) {
+            return Err(format!(
+                "ERR: key `{key}` is a process-level setting and belongs in config.toml, not \
+                 in a volume — remove it from the payload\n"
+            ));
+        }
+        if !cloudkit_core::config::VOLUME_SCOPED_KEYS.contains(&key.as_str()) {
+            return Err(format!(
+                "ERR: unknown key `{key}` — the payload accepts volume-scoped keys only \
+                 (the backend selector, its credentials, the tuning keys, `enabled`)\n"
+            ));
+        }
+        match cloudkit_core::config::json_value_to_toml(&key, &value) {
+            Ok(Some(converted)) => {
+                table.insert(key, converted);
+            }
+            // null / empty string: the write-only leave-alone rule — no
+            // key in the table, so CREATE writes nothing and UPDATE
+            // overlays nothing.
+            Ok(None) => {}
+            Err(error) => return Err(format!("ERR: {error}\n")),
+        }
+    }
+    Ok(table)
+}
+
 /// The state the control channel's `ADD`/`REMOVE`/`LIST` commands act
 /// through (RV2 / K48): the cli master registry (the truth), the two
 /// face tables (the WebDAV dispatch and dashboard projections), the live
@@ -2307,6 +2380,30 @@ impl RuntimeVolumeControl {
     /// contract: every command answers, errors are actionable text, the
     /// connection never carries state across commands).
     async fn handle(&self, line: &str) -> String {
+        // CREATE carries a JSON payload as its third span — the payload
+        // is split off POSITIONALLY so its own whitespace (significant
+        // inside JSON strings) survives verbatim; the whitespace-token
+        // match below would mangle it.
+        if first_keyword_is(line, "CREATE") {
+            let rest = line.split_once(char::is_whitespace).map_or("", |(_, r)| r);
+            return match split_name_payload(rest) {
+                Some((name, payload)) if !payload.is_empty() => {
+                    // The H1 gate entry point — the mutating family's
+                    // shared refusal (see the match arm below for the
+                    // rationale).
+                    if self.watch.fired() {
+                        return "ERR: CREATE refused — the instance is shutting down; volume \
+                                changes are no longer accepted (`LIST` still answers)\n"
+                            .to_string();
+                    }
+                    self.create_volume(name, payload).await
+                }
+                _ => "ERR: usage: CREATE <name> <json> — a volume name and one compact JSON \
+                      object of volume keys (e.g. {\"backend\": \"local\", \"local_root\": \
+                      \"C:/data\"}); volume names match ^[a-z][a-z0-9_-]{0,31}$\n"
+                    .to_string(),
+            };
+        }
         let mut tokens = line.split_whitespace();
         match (tokens.next(), tokens.next(), tokens.next()) {
             (Some("LIST"), None, None) => self.list(),
@@ -2354,7 +2451,7 @@ impl RuntimeVolumeControl {
             }
             (Some("CONFIGS"), _, _) => "ERR: usage: CONFIGS — takes no argument\n".to_string(),
             _ => "ERR: usage: ADD <name> | REMOVE <name> | ENABLE <name> | DISABLE <name> | \
-                  SHOW <name> | REBUILD <name> | LIST | CONFIGS\n"
+                  SHOW <name> | REBUILD <name> | CREATE <name> <json> | LIST | CONFIGS\n"
                 .to_string(),
         }
     }
@@ -2627,6 +2724,122 @@ impl RuntimeVolumeControl {
             return refusal;
         }
         self.add_volume(name).await
+    }
+
+    /// `CREATE <name> <json>` (web volume management P3, plan §1.2):
+    /// validate the name, refuse an existing file (UPDATE's territory),
+    /// convert the payload through [`volume_payload_table`], render the
+    /// controlled toml and run it through the FULL validation funnel —
+    /// [`parse_volume_toml`] plus the cross-field `validate()` — BEFORE
+    /// anything touches the disk (a refusal never creates a file). The
+    /// write then lands through the "persistent file is the source of
+    /// truth" order (K49's philosophy): `fs::write` FIRST, then the
+    /// runtime assembly through the SAME [`Self::add_volume`] the
+    /// control channel runs (mount claim, H3 publish-after-mount, every
+    /// gate included) — so a failed ASSEMBLY leaves a saved file and a
+    /// retryable state, exactly what the refusal then says.
+    ///
+    /// Credential discipline: the payload MAY carry credentials (the
+    /// loopback channel is the same trust face as hand-editing the
+    /// volume file), but no reply or log line carries a VALUE — the
+    /// refusals above name keys (M3), and the tracing line logs the
+    /// field-name list only.
+    async fn create_volume(&self, name: &str, payload: &str) -> String {
+        // The name precheck: the ONE rule the volume files enforce
+        // (core's), before the name ever reaches a path join.
+        if !cloudkit_core::config::is_valid_volume_name(name) {
+            return format!(
+                "ERR: invalid volume name `{name}`: volume names must match \
+                 ^[a-z][a-z0-9_-]{{0,31}}$ (a lowercase letter first, then lowercase \
+                 letters/digits/`_`/`-`, at most 32 characters) — no volume file was \
+                 written\n"
+            );
+        }
+        let Some(dir) = self.process_cfg.volumes_dir.as_deref() else {
+            return "ERR: this instance runs single-volume mode (no volumes_dir) — CREATE \
+                    serves multi-volume instances\n"
+                .to_string();
+        };
+        let path = Path::new(dir).join(format!("{name}.toml"));
+        if path.exists() {
+            return format!(
+                "ERR: a volume file for `{name}` already exists at {} — edit it instead \
+                 (`UPDATE {name} <json>` from the dashboard, or hand-edit the file)\n",
+                path.display()
+            );
+        }
+        let table = match volume_payload_table(payload) {
+            Ok(table) => table,
+            Err(refusal) => return refusal,
+        };
+        // The pre-write validation funnel: the rendered file must parse
+        // AND cross-field validate before `fs::write` (a refusal writes
+        // nothing — pinned by tests).
+        let text = cloudkit_core::config::render_volume_toml(&table, &toml::Table::new());
+        let spec = match cloudkit_core::config::parse_volume_toml(&path, name, &text) {
+            Ok(spec) => spec,
+            Err(error) => {
+                return format!(
+                    "ERR: the generated volume file is invalid: {error} — nothing was \
+                     written; fix the payload and retry\n"
+                );
+            }
+        };
+        if let Err(error) = spec.settings.validate() {
+            return format!(
+                "ERR: invalid volume settings: {error} — nothing was written; fix the \
+                 payload and retry\n"
+            );
+        }
+        // The field-name list only — no payload VALUE ever reaches a log
+        // line (M3).
+        let fields: Vec<&str> = table.keys().map(String::as_str).collect();
+        tracing::info!(
+            volume = name,
+            fields = ?fields,
+            "CREATE: writing a new volume file (field names only, by policy)"
+        );
+        if let Err(error) = std::fs::write(&path, text) {
+            return format!(
+                "ERR: writing the volume file {} failed: {error} — nothing was changed at \
+                 runtime\n",
+                path.display()
+            );
+        }
+        println!(
+            "Volume {name} created at {} (control CREATE).",
+            path.display()
+        );
+        // A created-disabled volume never touches the runtime: the file
+        // is the whole action (the ENABLE retry is the documented way
+        // up).
+        if !spec.settings.enabled {
+            return format!(
+                "OK: created volume `{name}` (disabled; file at {}) — `ENABLE {name}` \
+                 starts it\n",
+                path.display()
+            );
+        }
+        // The runtime leg: the SAME add_volume the control channel's ADD
+        // runs (assembly, mount claim, H3 semantics included).
+        let addition = self.add_volume(name).await;
+        let state = addition
+            .trim()
+            .strip_prefix(&format!("OK: added volume `{name}` "));
+        match state {
+            Some(state) => format!(
+                "OK: created volume `{name}` (file at {}; {})\n",
+                path.display(),
+                state.trim()
+            ),
+            None => format!(
+                "ERR: the volume file was saved at {}, but assembling the volume failed: \
+                 {} — fix the file (or send `UPDATE {name} <json>` with corrected fields) \
+                 and retry with `ENABLE {name}` (or `ADD {name}`)\n",
+                path.display(),
+                addition.trim().trim_start_matches("ERR: ")
+            ),
+        }
     }
 
     /// `ADD <name>` (K48's runtime assembly): read `volumes/<name>.toml`

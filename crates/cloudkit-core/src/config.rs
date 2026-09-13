@@ -359,7 +359,9 @@ pub struct VolumeConfig {
 /// letter first, then lowercase letters/digits/`_`/`-`, at most 32
 /// characters (K19; the name doubles as the URL segment, the mount
 /// label and the dashboard tab, so it stays a conservative slug).
-fn is_valid_volume_name(name: &str) -> bool {
+/// Public (web volume management P3) so the CREATE precheck and the
+/// dashboard's slug field enforce the ONE rule the volume files do.
+pub fn is_valid_volume_name(name: &str) -> bool {
     let bytes = name.as_bytes();
     match bytes.first() {
         Some(&first) if first.is_ascii_lowercase() => {}
@@ -508,41 +510,39 @@ fn mask_backtick_value_spans(message: &str) -> String {
     out
 }
 
-/// Loads a single volume file (Phase 2.5 / K19). The volume name is the
-/// file stem; the body accepts exactly the [`VOLUME_SCOPED_KEYS`] subset
-/// of the strict `config.toml` surface (unknown keys rejected with the
-/// same wording) — a process-scoped key is rejected with guidance
-/// pointing back at `config.toml`.
-///
-/// No path absolutisation happens here (see [`VolumeConfig`]); the
-/// settings validate through the same parse-time type checks as
-/// `config.toml` (wrong-typed values, unknown enum variants), while the
-/// full cross-field [`CyDriveConfig::validate`] run belongs to the
-/// assembly layer, after the credential chain has resolved.
-pub fn load_volume_config(path: &Path) -> Result<VolumeConfig, ConfigError> {
-    let path_str = path_as_str(path);
-    let name = path
-        .file_stem()
-        .and_then(|stem| stem.to_str())
-        .ok_or_else(|| {
-            ConfigError::Invalid(format!(
-                "invalid volume file {path_str}: the file name must be valid UTF-8"
-            ))
-        })?
-        .to_string();
-    if !is_valid_volume_name(&name) {
-        return Err(ConfigError::Invalid(format!(
-            "invalid volume name `{name}`: volume names must match \
-             ^[a-z][a-z0-9_-]{{0,31}}$ (a lowercase letter first, then lowercase \
-             letters/digits/`_`/`-`, at most 32 characters) — rename the volume \
-             file {path_str}"
-        )));
+/// The invalid-name refusal shared by [`load_volume_config`]'s early
+/// check and [`parse_volume_toml`] (one construction point — the two
+/// cannot drift apart).
+fn invalid_volume_name_error(name: &str, path: &Path) -> ConfigError {
+    ConfigError::Invalid(format!(
+        "invalid volume name `{name}`: volume names must match \
+         ^[a-z][a-z0-9_-]{{0,31}}$ (a lowercase letter first, then lowercase \
+         letters/digits/`_`/`-`, at most 32 characters) — rename the volume \
+         file {}",
+        path.display()
+    ))
+}
+
+/// Parses and validates one volume-file BODY against the strict
+/// volume-file surface — the extracted parse segment of
+/// [`load_volume_config`] (web volume management P3: the loader now
+/// reads the file and delegates here, zero drift — the existing
+/// loader suite pins the shared texts). Direct callers are the
+/// CREATE/UPDATE pre-write validation: `render_volume_toml` output is
+/// checked through this funnel BEFORE anything touches the disk (the
+/// name rules, the strict key surface with its `config.toml`
+/// guidance, the typed parse — the full cross-field
+/// [`CyDriveConfig::validate`] stays the caller's second step, exactly
+/// like the assembly layer runs it after a file load). `path` is the
+/// CALLER's target (a CREATE's not-yet-written file): it rides the
+/// returned [`VolumeConfig`] and the error texts, and anchors
+/// `base_dir`; it need not exist.
+pub fn parse_volume_toml(path: &Path, name: &str, text: &str) -> Result<VolumeConfig, ConfigError> {
+    if !is_valid_volume_name(name) {
+        return Err(invalid_volume_name_error(name, path));
     }
-    let text = fs::read_to_string(path).map_err(|source| ConfigError::Read {
-        path: path_str.clone(),
-        source,
-    })?;
-    let table: toml::Table = toml::from_str(&text).map_err(|err| ConfigError::Parse {
+    let path_str = path_as_str(path);
+    let table: toml::Table = toml::from_str(text).map_err(|err| ConfigError::Parse {
         path: path_str.clone(),
         // Review M3: the toml error embeds the offending source line —
         // a broken-quote credential line would leak its value into the
@@ -579,12 +579,47 @@ pub fn load_volume_config(path: &Path) -> Result<VolumeConfig, ConfigError> {
         _ => PathBuf::from("."),
     };
     Ok(VolumeConfig {
-        name,
+        name: name.to_string(),
         file_path: path.to_path_buf(),
         base_dir,
         explicit_drive_letter,
         settings,
     })
+}
+
+/// Loads a single volume file (Phase 2.5 / K19). The volume name is the
+/// file stem; the body accepts exactly the [`VOLUME_SCOPED_KEYS`] subset
+/// of the strict `config.toml` surface (unknown keys rejected with the
+/// same wording) — a process-scoped key is rejected with guidance
+/// pointing back at `config.toml`.
+///
+/// No path absolutisation happens here (see [`VolumeConfig`]); the
+/// settings validate through the same parse-time type checks as
+/// `config.toml` (wrong-typed values, unknown enum variants), while the
+/// full cross-field [`CyDriveConfig::validate`] run belongs to the
+/// assembly layer, after the credential chain has resolved.
+pub fn load_volume_config(path: &Path) -> Result<VolumeConfig, ConfigError> {
+    let path_str = path_as_str(path);
+    let name = path
+        .file_stem()
+        .and_then(|stem| stem.to_str())
+        .ok_or_else(|| {
+            ConfigError::Invalid(format!(
+                "invalid volume file {path_str}: the file name must be valid UTF-8"
+            ))
+        })?
+        .to_string();
+    // The name check stays BEFORE the read (the pre-refactor error
+    // ordering: a bad name reports the name even when the file is also
+    // missing); parse_volume_toml re-checks it in its own funnel.
+    if !is_valid_volume_name(&name) {
+        return Err(invalid_volume_name_error(&name, path));
+    }
+    let text = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        path: path_str,
+        source,
+    })?;
+    parse_volume_toml(path, &name, &text)
 }
 
 /// Serializes one volume file's EXPLICIT configuration as the compact
@@ -647,6 +682,73 @@ fn toml_value_json(value: &toml::Value) -> serde_json::Value {
         toml::Value::Float(number) if number.is_finite() => serde_json::json!(number),
         toml::Value::Boolean(flag) => serde_json::Value::Bool(*flag),
         other => serde_json::Value::String(other.to_string()),
+    }
+}
+
+/// One JSON payload value as a toml value — [`toml_value_json`]'s
+/// inverse (web volume management P3: the CREATE/UPDATE payload
+/// conversion; pinned by a round-trip test through the SHOW
+/// serializer). `Ok(None)` is the **unset** affordance (K49 分档): JSON
+/// `null` and the empty string mean "this key is not being set" — a
+/// CREATE writes no such key (no paved defaults) and an UPDATE
+/// overlays nothing over the file's value, which is exactly the
+/// write-only credential rule (`present and non-empty = overwrite,
+/// missing or empty = keep`). Errors are actionable and NEVER echo the
+/// offending value (the M3 discipline — the payload may carry
+/// credentials): they name the key and the JSON shape it got; a float
+/// passes through as a toml float and is rejected by the caller's
+/// typed parse (no config key is float-shaped).
+pub fn json_value_to_toml(
+    key: &str,
+    value: &serde_json::Value,
+) -> Result<Option<toml::Value>, ConfigError> {
+    use serde_json::Value as Json;
+    let converted = match value {
+        Json::Null => None,
+        Json::String(text) if text.is_empty() => None,
+        Json::String(text) => Some(toml::Value::String(text.clone())),
+        Json::Bool(flag) => Some(toml::Value::Boolean(*flag)),
+        Json::Number(number) => {
+            if let Some(int) = number.as_i64() {
+                Some(toml::Value::Integer(int))
+            } else if number.as_u64().is_some() {
+                // Past i64::MAX there is no toml integer to hold it (the
+                // u64 range toml deliberately lacks); refuse with the key
+                // named rather than silently rounding through f64.
+                return Err(ConfigError::Invalid(format!(
+                    "key `{key}`: the value is an integer too large for toml \
+                     (i64 range at most)"
+                )));
+            } else {
+                match number.as_f64() {
+                    Some(float) => Some(toml::Value::Float(float)),
+                    None => {
+                        return Err(ConfigError::Invalid(format!(
+                            "key `{key}`: the number has no toml representation"
+                        )));
+                    }
+                }
+            }
+        }
+        other => {
+            return Err(ConfigError::Invalid(format!(
+                "key `{key}`: the value must be a toml scalar (a string, a whole \
+                 number or a boolean), not a JSON {}",
+                json_shape_name(other),
+            )));
+        }
+    };
+    Ok(converted)
+}
+
+/// The JSON shape word for [`json_value_to_toml`]'s refusals ("array" /
+/// "object" — the only shapes that reach it; null, strings, numbers and
+/// booleans all convert).
+fn json_shape_name(value: &serde_json::Value) -> &'static str {
+    match value {
+        serde_json::Value::Array(_) => "array",
+        serde_json::Value::Object(_) => "object",
+        _ => "value",
     }
 }
 

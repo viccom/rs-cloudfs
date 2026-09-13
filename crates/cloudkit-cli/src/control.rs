@@ -17,7 +17,11 @@
 //!   §1.2) / `ENABLE <name>` / `DISABLE <name>` / `CONFIGS` (the same
 //!   plan's P1 batch) / `REBUILD <name>` (its P2 batch — the handler
 //!   accepts the rebuild and answers immediately; the work runs in a
-//!   background task) are forwarded to the installed
+//!   background task) / `CREATE <name> <json>` / `UPDATE <name>
+//!   <json>` (its P3/P4 batches — the payload is ONE compact
+//!   single-line JSON object of volume-scoped keys; the line protocol
+//!   reads one line per connection, so a serialized JSON body never
+//!   spans lines) are forwarded to the installed
 //!   [`VolumeCommandHandler`]; its reply is passed through verbatim —
 //!   `OK: ...` or a multi-line `OK:`/`ERR:` block whose text is the
 //!   handler's actionable message. The replies are documented where the
@@ -105,13 +109,24 @@ fn first_token(line: &str) -> &str {
 
 /// `true` for the lines the volume-command surface owns (K48; `SHOW`
 /// since the web volume management plan §1.2; `ENABLE`/`DISABLE`/
-/// `CONFIGS` since its P1 batch; `REBUILD` since its P2 batch): the
-/// keywords, with or without their argument — the handler answers
-/// malformed shapes with its own usage ERR.
+/// `CONFIGS` since its P1 batch; `REBUILD` since its P2 batch;
+/// `CREATE`/`UPDATE` since its P3/P4 batches — their third span is a
+/// compact single-line JSON payload, parsed positionally by the
+/// handler): the keywords, with or without their argument — the handler
+/// answers malformed shapes with its own usage ERR.
 fn is_volume_command(line: &str) -> bool {
     matches!(
         first_token(line),
-        "ADD" | "REMOVE" | "SHOW" | "LIST" | "ENABLE" | "DISABLE" | "CONFIGS" | "REBUILD"
+        "ADD"
+            | "REMOVE"
+            | "SHOW"
+            | "LIST"
+            | "ENABLE"
+            | "DISABLE"
+            | "CONFIGS"
+            | "REBUILD"
+            | "CREATE"
+            | "UPDATE"
     )
 }
 

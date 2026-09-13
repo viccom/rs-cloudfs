@@ -264,8 +264,9 @@ fn write_volume_file(dir: &Path, name: &str) {
 
 /// §1.4: the multi-volume `/volumes` page serves the management
 /// skeleton — the sidebar nav (Cloud Drive back-link, Volumes active),
-/// the four stat cards, the Add Volume button (disabled until P3) and
-/// the seven-column volume table, wired to its own script.
+/// the four stat cards, the Add Volume button (live since P3 — the
+/// placeholder pin retired with the placeholder) with its form card,
+/// and the seven-column volume table, wired to its own script.
 #[tokio::test]
 async fn volumes_page_serves_the_management_skeleton() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -285,7 +286,19 @@ async fn volumes_page_serves_the_management_skeleton() {
         "id=\"stat-volume-failed\"",
         "id=\"stat-volume-pending\"",
         "id=\"add-volume-btn\"",
-        "coming in P3",
+        // The P3 form card: the volume form with its backend radio, the
+        // credential groups and the advanced section.
+        "id=\"volume-form-card\"",
+        "id=\"volume-form\"",
+        "name=\"vf-backend\"",
+        "id=\"vf-group-telegram\"",
+        "id=\"vf-group-baidu\"",
+        "id=\"vf-group-local\"",
+        "id=\"vf-name\"",
+        "id=\"vf-drive\"",
+        "id=\"vf-enabled\"",
+        "id=\"vf-advanced\"",
+        "id=\"vf-error\"",
         "id=\"volumes-tbody\"",
         "<th>Name</th>",
         "<th>Backend</th>",
@@ -1059,4 +1072,240 @@ async fn configs_endpoint_parses_the_sparse_rebuild_markers() {
         "the sparse markers ride their rows: {rows}"
     );
     server.shutdown().await;
+}
+
+// --------------------------- the P3 create route (web volume §1.2/§1.5) ---
+
+/// Builds an HTTP/1.1 request carrying a JSON body (the create/update
+/// routes' transport).
+fn request_with_body(
+    method: &str,
+    target: &str,
+    addr: SocketAddr,
+    extra: &[(&str, &str)],
+    body: &str,
+) -> String {
+    let mut req = format!(
+        "{method} {target} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n",
+        addr.port()
+    );
+    for (name, value) in extra {
+        req.push_str(&format!("{name}: {value}\r\n"));
+    }
+    req.push_str(&format!(
+        "Content-Type: application/json\r\nContent-Length: {}\r\n\r\n{body}",
+        body.len()
+    ));
+    req
+}
+
+/// `POST /api/volumes` (P3, the Add Volume form's transport): the body's
+/// `name` keys the command line and the REST of the object rides as the
+/// compact single-line JSON payload — `CREATE <name> <json>` through the
+/// seam — with the family's write budget, the pinned success shape and
+/// the ERR→409 mapping.
+#[tokio::test]
+async fn create_route_forwards_the_payload_through_the_seam() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let (seam, seen) =
+        recording_seam("OK: created volume `newvol` (file at volumes/newvol.toml)\n".to_string());
+    let server = multi_server_with_commands(vec![entry], seam).await;
+    let addr = server.local_addr();
+
+    let resp = send(
+        addr,
+        &request_with_body(
+            "POST",
+            "/api/volumes",
+            addr,
+            &[],
+            r#"{"name": "newvol", "backend": "local", "local_root": "C:/data"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 200, "create ok: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse body");
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "ok": true,
+            "reply": "created volume `newvol` (file at volumes/newvol.toml)"
+        }),
+        "the pinned success shape: {body}"
+    );
+    assert_eq!(
+        *seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+        vec!["CREATE newvol {\"backend\":\"local\",\"local_root\":\"C:/data\"}".to_string()],
+        "the name keys the command; the remaining object rides as one compact JSON payload"
+    );
+    server.shutdown().await;
+}
+
+/// The create route maps the seam's `ERR:` replies to the family's 409
+/// with the actionable text verbatim (a refused create — an existing
+/// file, a validation refusal — is a conflict the form shows inline).
+#[tokio::test]
+async fn create_route_maps_err_replies_to_409() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let server = multi_server_with_commands(
+        vec![entry],
+        canned_seam(
+            "ERR: a volume file for `a` already exists at volumes/a.toml — edit it instead\n"
+                .to_string(),
+        ),
+    )
+    .await;
+    let addr = server.local_addr();
+
+    let resp = send(
+        addr,
+        &request_with_body(
+            "POST",
+            "/api/volumes",
+            addr,
+            &[],
+            r#"{"name": "a", "backend": "local", "local_root": "C:/data"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 409, "ERR maps to 409: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("error json");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("already exists")),
+        "the ERR text rides verbatim: {body}"
+    );
+    server.shutdown().await;
+}
+
+/// The create route's own shape checks (the seam is the authority on the
+/// PAYLOAD's semantics; the route is the authority on the HTTP body): a
+/// non-JSON body, a JSON non-object and a missing/non-string `name` each
+/// answer an actionable 400 without reaching the seam.
+#[tokio::test]
+async fn create_route_rejects_broken_bodies_before_the_seam() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let (seam, seen) = recording_seam("OK: unreachable\n".to_string());
+    let server = multi_server_with_commands(vec![entry], seam).await;
+    let addr = server.local_addr();
+
+    for (label, body) in [
+        ("not JSON", "create me a volume"),
+        ("a bare JSON array", "[1, 2]"),
+        ("no name", r#"{"backend": "local"}"#),
+        ("a non-string name", r#"{"name": 42}""#),
+    ] {
+        let resp = send(
+            addr,
+            &request_with_body("POST", "/api/volumes", addr, &[], body),
+        )
+        .await;
+        assert_eq!(status_of(&resp), 400, "{label} refused: {resp}");
+        let parsed: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("json");
+        assert!(
+            parsed["error"].as_str().is_some_and(|msg| !msg.is_empty()),
+            "{label} refusal is actionable: {parsed}"
+        );
+    }
+    assert!(
+        seen.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty(),
+        "no broken body reaches the seam"
+    );
+    server.shutdown().await;
+}
+
+/// The create route joins the write family's gates wholesale (P1's
+/// middleware family): a foreign Origin 403s BEFORE the seam, a
+/// non-loopback binding without `allow_remote_admin` 403s naming the
+/// key, and a seam-less dashboard 503s.
+#[tokio::test]
+async fn create_route_inherits_origin_remote_and_seam_gates() {
+    // Origin: refused before the seam is reached.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let (seam, seen) = recording_seam("OK: created\n".to_string());
+    let server = multi_server_with_commands(vec![entry], seam).await;
+    let addr = server.local_addr();
+    let resp = send(
+        addr,
+        &request_with_body(
+            "POST",
+            "/api/volumes",
+            addr,
+            &[("Origin", "http://evil.example")],
+            r#"{"name": "x", "backend": "local", "local_root": "C:/d"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 403, "cross-origin create refused: {resp}");
+    assert!(
+        seen.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty(),
+        "the guard refuses before the seam is reached"
+    );
+    server.shutdown().await;
+
+    // Remote degrade: a non-loopback binding withholds the write.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let (seam, _seen) = recording_seam("OK: created\n".to_string());
+    let server = WebUiServer::serve_multi_with_remote_admin(
+        RegistryHandle::new(vec![entry]),
+        "0.0.0.0:0".parse().expect("parse the bind address"),
+        Some(seam),
+        false,
+    )
+    .await
+    .expect("serve on a non-loopback binding");
+    let addr = SocketAddr::from(([127, 0, 0, 1], server.local_addr().port()));
+    let resp = send(
+        addr,
+        &request_with_body(
+            "POST",
+            "/api/volumes",
+            addr,
+            &[],
+            r#"{"name": "x", "backend": "local", "local_root": "C:/d"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 403, "remote create withheld: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("error json");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("allow_remote_admin")),
+        "the refusal names the opt-in key: {body}"
+    );
+    server.shutdown().await;
+
+    // No seam: the family's 503.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let server = multi_server(vec![entry]).await;
+    let addr = server.local_addr();
+    let resp = send(
+        addr,
+        &request_with_body(
+            "POST",
+            "/api/volumes",
+            addr,
+            &[],
+            r#"{"name": "x", "backend": "local", "local_root": "C:/d"}"#,
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 503, "no seam: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("error json");
+    assert!(
+        body["error"].as_str().is_some_and(|msg| !msg.is_empty()),
+        "actionable error: {body}"
+    );
 }
