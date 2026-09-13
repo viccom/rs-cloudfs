@@ -300,13 +300,15 @@ async fn volumes_page_serves_the_management_skeleton() {
         "id=\"vf-advanced\"",
         "id=\"vf-error\"",
         "id=\"volumes-tbody\"",
-        "<th>Name</th>",
-        "<th>Backend</th>",
-        "<th>Status</th>",
-        "<th>Drive</th>",
-        "<th>Pending</th>",
-        "<th>Size</th>",
-        "<th>Actions</th>",
+        // The table headers keep their English text (the i18n contract);
+        // each now carries its data-i18n hook (mechanical adaptation).
+        "<th data-i18n=\"table.name\">Name</th>",
+        "<th data-i18n=\"table.backend\">Backend</th>",
+        "<th data-i18n=\"table.status\">Status</th>",
+        "<th data-i18n=\"table.drive\">Drive</th>",
+        "<th data-i18n=\"table.pending\">Pending</th>",
+        "<th data-i18n=\"table.size\">Size</th>",
+        "<th data-i18n=\"table.actions\">Actions</th>",
         "/static/js/volumes.js",
     ] {
         assert!(body.contains(marker), "skeleton needs `{marker}`: {body}");
@@ -387,6 +389,133 @@ async fn static_tree_serves_the_volumes_script() {
     assert!(
         body_of(&resp).contains("loadVolumesPage"),
         "the real script body, not a stub: {resp}"
+    );
+}
+
+/// The i18n/layout batch (2026-09-13 UX follow-up): the `/volumes` page
+/// carries the `data-i18n` hooks and the dual-segment language pill,
+/// loads `i18n.js` before its page script, anchors the bottom page
+/// switcher, and the external links (GitHub / Cynet Security) are gone.
+/// Static element text stays English — the raw-HTML contract the tests
+/// above pin is untouched; zh is a JS overlay.
+#[tokio::test]
+async fn volumes_page_is_bilingual_ready_and_prunes_external_links() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let server = multi_server(vec![entry]).await;
+    let addr = server.local_addr();
+
+    let resp = send(addr, &request("GET", "/volumes", addr, &[])).await;
+    assert_eq!(status_of(&resp), 200, "ok: {resp}");
+    let body = body_of(&resp);
+    for marker in [
+        "data-i18n=",
+        "data-i18n-placeholder=",
+        "data-i18n-title=",
+        // The dual-segment pill (`[中|EN]`) in the topbar actions.
+        "lang-pill",
+        "data-lang=\"zh\"",
+        "data-lang=\"en\"",
+        // i18n.js loads before the page script.
+        "/static/js/i18n.js",
+        // The bottom-anchored page switcher (Files / Volumes).
+        "sidebar-pages",
+        "href=\"/\"",
+        "href=\"/volumes\"",
+    ] {
+        assert!(
+            body.contains(marker),
+            "i18n/layout needs `{marker}`: {body}"
+        );
+    }
+    assert!(
+        body.contains("<script src=\"/static/js/i18n.js\"></script>"),
+        "i18n.js is a loaded script, not a stray string: {body}"
+    );
+    assert!(
+        body.find("<script src=\"/static/js/i18n.js\"").unwrap()
+            < body.find("<script src=\"/static/js/volumes.js\"").unwrap(),
+        "i18n.js loads before volumes.js: {body}"
+    );
+    for gone in ["github.com", "cynetx.ir", "Cynet Security"] {
+        assert!(
+            !body.contains(gone),
+            "the external link `{gone}` is pruned: {body}"
+        );
+    }
+    // The sidebar storage card is gone; its aggregate moved into the
+    // stats grid's fifth card.
+    assert!(
+        !body.contains("class=\"storage-card\""),
+        "the sidebar storage card is gone: {body}"
+    );
+    assert!(
+        body.contains("id=\"stat-total-storage\""),
+        "the Total Storage stat card: {body}"
+    );
+    // This page's switcher chip: Volumes active, Files not.
+    let pages = body.split("sidebar-pages").nth(1).expect("the pages block");
+    assert!(
+        pages.contains("nav-item active") && pages.contains("href=\"/volumes\""),
+        "Volumes is the active page chip: {pages}"
+    );
+}
+
+/// The index page's half of the i18n/layout batch: the same i18n hooks
+/// and pill, the pruned external links, and the sidebar storage card's
+/// content migrated into the stats grid (the `storage-*` ids survive —
+/// app.js keeps filling them — but the sidebar chassis is gone).
+#[tokio::test]
+async fn index_page_is_bilingual_ready_and_storage_card_moved() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let server = multi_server(vec![entry]).await;
+    let addr = server.local_addr();
+
+    let resp = send(addr, &request("GET", "/", addr, &[])).await;
+    assert_eq!(status_of(&resp), 200, "ok: {resp}");
+    let body = body_of(&resp);
+    for marker in [
+        "data-i18n=",
+        "lang-pill",
+        "data-lang=\"zh\"",
+        "data-lang=\"en\"",
+        "<script src=\"/static/js/i18n.js\"></script>",
+        "sidebar-pages",
+        // The migrated storage card keeps its ids inside the stats grid.
+        "id=\"storage-percent\"",
+        "id=\"storage-detail\"",
+        "id=\"drive-letter\"",
+    ] {
+        assert!(
+            body.contains(marker),
+            "i18n/layout needs `{marker}`: {body}"
+        );
+    }
+    for gone in ["github.com", "cynetx.ir", "Cynet Security"] {
+        assert!(
+            !body.contains(gone),
+            "the external link `{gone}` is pruned: {body}"
+        );
+    }
+    assert!(
+        !body.contains("class=\"storage-card\""),
+        "the sidebar storage card chassis is gone: {body}"
+    );
+    // Cloud Drive left the middle nav (merged into the bottom switcher);
+    // the two filter items stay as the views section.
+    assert!(
+        !body.contains("filterType('all')"),
+        "the Cloud Drive filter item is gone: {body}"
+    );
+    assert!(
+        body.contains("filterType('media')") && body.contains("filterType('documents')"),
+        "the view filter items stay: {body}"
+    );
+    let pages = body.split("sidebar-pages").nth(1).expect("the pages block");
+    assert!(
+        pages.contains("nav-item active") && pages.contains("href=\"/\""),
+        "Files is the active page chip: {pages}"
     );
 }
 

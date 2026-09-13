@@ -13,8 +13,9 @@
     <div class="background-glow"></div>
 
     <div class="app-container">
-        <!-- Sidebar Navigation (the index skeleton; Cloud Drive points
-             back at the usage-state page, Volumes is active here) -->
+        <!-- Sidebar (the index skeleton minus the view filters): the
+             page switcher is the ONLY nav now, anchored at the
+             sidebar's bottom via flex — Volumes is active here -->
         <aside class="sidebar">
             <div class="brand">
                 <div class="logo-box">
@@ -27,47 +28,39 @@
                 </div>
             </div>
 
-            <nav class="nav-menu">
-                <a href="/" class="nav-item"><i class="fa-solid fa-hard-drive"></i> Cloud Drive</a>
-                <a href="/volumes" class="nav-item active"><i class="fa-solid fa-database"></i> Volumes</a>
-                <a href="https://github.com/thecynetx/CyDrive" target="_blank" class="nav-item"><i class="fa-brands fa-github"></i> GitHub</a>
-                <a href="https://cynetx.ir" target="_blank" class="nav-item"><i class="fa-solid fa-shield-halved"></i> Cynet Security</a>
+            <!-- The page switcher (bottom-anchored): the aggregate
+                 storage line that used to close this sidebar moved up
+                 into the stats grid's Total Storage card -->
+            <nav class="sidebar-pages" aria-label="Pages">
+                <div class="nav-section-title" data-i18n="sidebar.pages">Pages</div>
+                <a href="/" class="nav-item"><i class="fa-solid fa-hard-drive"></i> <span data-i18n="page.files">Files</span></a>
+                <a href="/volumes" class="nav-item active"><i class="fa-solid fa-database"></i> <span data-i18n="page.volumes">Volumes</span></a>
             </nav>
-
-            <!-- Instance-level storage card (裁决⑤): the Σ of every
-                 volume's indexed bytes / quota snapshots, filled by
-                 volumes.js off the ONE /api/volumes response -->
-            <div class="storage-card">
-                <div class="storage-header">
-                    <span>All Volumes</span>
-                    <span id="storage-percent">0%</span>
-                </div>
-                <div class="progress-bar">
-                    <div class="progress-fill" id="storage-bar" style="width: 15%;"></div>
-                </div>
-                <p id="storage-detail">0 MB / Unlimited</p>
-                <div class="drive-badge">
-                    <i class="fa-solid fa-layer-group"></i> <strong id="volume-count">0</strong> volume(s) on this instance
-                </div>
-            </div>
         </aside>
 
         <!-- Main Content Area -->
         <main class="main-content">
             <!-- Top Bar (configuration state): the page title + the Add
                  Volume primary button (opens the P3 form card) +
-                 refresh -->
+                 refresh, plus the bilingual switch pill -->
             <header class="topbar">
                 <div class="topbar-title">
-                    <h2><i class="fa-solid fa-database"></i> Volume Management</h2>
-                    <p>Registered storage volumes served by this instance</p>
+                    <h2><i class="fa-solid fa-database"></i> <span data-i18n="volumes.title">Volume Management</span></h2>
+                    <p data-i18n="volumes.subtitle">Registered storage volumes served by this instance</p>
                 </div>
 
                 <div class="topbar-actions">
-                    <button class="btn btn-primary" id="add-volume-btn" title="Create a new volume file and assemble it">
-                        <i class="fa-solid fa-plus"></i> Add Volume
+                    <!-- The bilingual switch: the active language's
+                         segment highlights (i18n.js); a click stores the
+                         choice and reloads -->
+                    <div class="lang-pill" role="group" aria-label="Language">
+                        <button type="button" class="lang-seg" data-lang="zh" onclick="setLang('zh')">中</button>
+                        <button type="button" class="lang-seg active" data-lang="en" onclick="setLang('en')">EN</button>
+                    </div>
+                    <button class="btn btn-primary" id="add-volume-btn" title="Create a new volume file and assemble it" data-i18n-title="volumes.add_volume_title">
+                        <i class="fa-solid fa-plus"></i> <span data-i18n="volumes.add_volume">Add Volume</span>
                     </button>
-                    <button class="btn btn-icon" title="Refresh" onclick="loadVolumesPage()"><i class="fa-solid fa-rotate"></i></button>
+                    <button class="btn btn-icon" title="Refresh" data-i18n-title="common.refresh" onclick="loadVolumesPage()"><i class="fa-solid fa-rotate"></i></button>
                 </div>
             </header>
 
@@ -82,8 +75,8 @@
                  its values. -->
             <section class="files-container volume-form-card" id="volume-form-card" hidden>
                 <div class="section-title">
-                    <h3 id="volume-form-title"><i class="fa-solid fa-plus"></i> Add Volume</h3>
-                    <button type="button" class="btn-mini" id="volume-form-cancel">Cancel</button>
+                    <h3 id="volume-form-title"><i class="fa-solid fa-plus"></i> <span data-i18n="volumes.add_volume">Add Volume</span></h3>
+                    <button type="button" class="btn-mini" id="volume-form-cancel" data-i18n="common.cancel">Cancel</button>
                 </div>
 
                 <p class="volume-form-notice" id="volume-form-notice" hidden></p>
@@ -91,79 +84,79 @@
                 <form id="volume-form" novalidate>
                     <div class="volume-form-grid">
                         <label class="volume-field">
-                            <span>Volume name <em>*</em></span>
+                            <span><span data-i18n="volumes.form.name">Volume name</span> <em>*</em></span>
                             <input type="text" id="vf-name" maxlength="32" autocomplete="off"
-                                   placeholder="lowercase slug, e.g. media" spellcheck="false">
-                            <small class="vf-hint" id="vf-name-hint">a–z, 0–9, _ and - ; starts with a letter, up to 32 chars</small>
+                                   placeholder="lowercase slug, e.g. media" data-i18n-placeholder="volumes.form.placeholder_name" spellcheck="false">
+                            <small class="vf-hint" id="vf-name-hint" data-i18n="volumes.form.hint_name">a–z, 0–9, _ and - ; starts with a letter, up to 32 chars</small>
                         </label>
                         <label class="volume-field">
-                            <span>Drive letter</span>
+                            <span data-i18n="volumes.form.drive_letter">Drive letter</span>
                             <input type="text" id="vf-drive" maxlength="2" autocomplete="off"
-                                   placeholder="optional, e.g. Q (empty = no drive claim)" spellcheck="false">
-                            <small class="vf-hint">empty = the volume serves /vol/&lt;name&gt; only</small>
+                                   placeholder="optional, e.g. Q (empty = no drive claim)" data-i18n-placeholder="volumes.form.placeholder_drive" spellcheck="false">
+                            <small class="vf-hint" data-i18n="volumes.form.hint_drive">empty = the volume serves /vol/&lt;name&gt; only</small>
                         </label>
                         <label class="volume-field volume-field-check">
-                            <span>Enabled at create</span>
+                            <span data-i18n="volumes.form.enabled_at_create">Enabled at create</span>
                             <input type="checkbox" id="vf-enabled" checked>
-                            <small class="vf-hint">off = write the file disabled</small>
+                            <small class="vf-hint" data-i18n="volumes.form.hint_enabled">off = write the file disabled</small>
                         </label>
                     </div>
 
                     <fieldset class="volume-fieldset">
-                        <legend>Backend <em>*</em></legend>
+                        <legend><span data-i18n="volumes.form.backend">Backend</span> <em>*</em></legend>
                         <div class="vf-radios" id="vf-backend">
-                            <label><input type="radio" name="vf-backend" value="telegram" checked> Telegram MTProto</label>
-                            <label><input type="radio" name="vf-backend" value="baidu"> Baidu Netdisk</label>
-                            <label><input type="radio" name="vf-backend" value="local"> Local Disk</label>
+                            <label><input type="radio" name="vf-backend" value="telegram" checked> <span data-i18n="backend.telegram">Telegram MTProto</span></label>
+                            <label><input type="radio" name="vf-backend" value="baidu"> <span data-i18n="backend.baidu">Baidu Netdisk</span></label>
+                            <label><input type="radio" name="vf-backend" value="local"> <span data-i18n="backend.local">Local Disk</span></label>
                         </div>
                     </fieldset>
 
                     <fieldset class="volume-fieldset vf-cred-group" id="vf-group-telegram">
-                        <legend>Telegram credentials</legend>
+                        <legend data-i18n="volumes.form.cred_telegram">Telegram credentials</legend>
                         <div class="volume-form-grid">
                             <label class="volume-field">
-                                <span>Bot token <em>*</em></span>
+                                <span><span data-i18n="volumes.form.bot_token">Bot token</span> <em>*</em></span>
                                 <input type="password" id="vf-bot-token" autocomplete="new-password"
                                        placeholder="<id>:<secret> from @BotFather">
                             </label>
                             <label class="volume-field">
-                                <span>Chat ID <em>*</em></span>
+                                <span><span data-i18n="volumes.form.chat_id">Chat ID</span> <em>*</em></span>
                                 <input type="text" id="vf-chat-id" inputmode="numeric" autocomplete="off" placeholder="e.g. 4242">
                             </label>
                         </div>
                     </fieldset>
 
                     <fieldset class="volume-fieldset vf-cred-group" id="vf-group-baidu" hidden>
-                        <legend>Baidu credentials</legend>
+                        <legend data-i18n="volumes.form.cred_baidu">Baidu credentials</legend>
                         <div class="volume-form-grid">
                             <label class="volume-field">
-                                <span>App key <em>*</em></span>
+                                <span><span data-i18n="volumes.form.app_key">App key</span> <em>*</em></span>
                                 <input type="password" id="vf-baidu-app-key" autocomplete="new-password">
                             </label>
                             <label class="volume-field">
-                                <span>App secret <em>*</em></span>
+                                <span><span data-i18n="volumes.form.app_secret">App secret</span> <em>*</em></span>
                                 <input type="password" id="vf-baidu-app-secret" autocomplete="new-password">
                             </label>
                             <label class="volume-field">
-                                <span>Access token <em>*</em></span>
+                                <span><span data-i18n="volumes.form.access_token">Access token</span> <em>*</em></span>
                                 <input type="password" id="vf-baidu-access-token" autocomplete="new-password">
                             </label>
                             <label class="volume-field">
-                                <span>Refresh token <em>*</em></span>
+                                <span><span data-i18n="volumes.form.refresh_token">Refresh token</span> <em>*</em></span>
                                 <input type="password" id="vf-baidu-refresh-token" autocomplete="new-password">
                             </label>
                             <label class="volume-field">
-                                <span>App root</span>
+                                <span data-i18n="volumes.form.app_root">App root</span>
                                 <input type="text" id="vf-baidu-root" placeholder="/apps/cloudfs (default)">
                             </label>
                         </div>
                     </fieldset>
 
                     <fieldset class="volume-fieldset vf-cred-group" id="vf-group-local" hidden>
-                        <legend>Local backend</legend>
+                        <legend data-i18n="volumes.form.cred_local">Local backend</legend>
                         <div class="volume-form-grid">
                             <label class="volume-field">
-                                <span>Local root <em>*</em></span>
+                                <span><span data-i18n="volumes.form.local_root">Local root</span> <em>*</em></span>
                                 <input type="text" id="vf-local-root" autocomplete="off"
                                        placeholder="absolute path, e.g. C:\data\cloudfs">
                             </label>
@@ -171,37 +164,37 @@
                     </fieldset>
 
                     <details class="vf-advanced" id="vf-advanced">
-                        <summary>Advanced (empty fields keep the defaults)</summary>
+                        <summary data-i18n="volumes.form.advanced">Advanced (empty fields keep the defaults)</summary>
                         <div class="volume-form-grid">
                             <label class="volume-field volume-field-check">
-                                <span>Enable encryption</span>
+                                <span data-i18n="volumes.form.enable_encryption">Enable encryption</span>
                                 <input type="checkbox" id="vf-enc">
                             </label>
                             <label class="volume-field">
-                                <span>Encryption password</span>
+                                <span data-i18n="volumes.form.encryption_password">Encryption password</span>
                                 <input type="password" id="vf-enc-pass" autocomplete="new-password">
                             </label>
                             <label class="volume-field">
-                                <span>Scheme</span>
+                                <span data-i18n="volumes.form.scheme">Scheme</span>
                                 <select id="vf-enc-scheme">
                                     <option value="gcm">gcm (default, v1)</option>
                                     <option value="aead_v2">aead_v2 (streaming, v2)</option>
                                 </select>
                             </label>
                             <label class="volume-field">
-                                <span>Chunk size (MB)</span>
+                                <span data-i18n="volumes.form.chunk_size">Chunk size (MB)</span>
                                 <input type="text" id="vf-chunk" inputmode="numeric" autocomplete="off" placeholder="1900 (default)">
                             </label>
                             <label class="volume-field">
-                                <span>Sync URL</span>
+                                <span data-i18n="volumes.form.sync_url">Sync URL</span>
                                 <input type="text" id="vf-sync-url" autocomplete="off" placeholder="https://sync.example.org:8290">
                             </label>
                             <label class="volume-field">
-                                <span>Sync secret</span>
+                                <span data-i18n="volumes.form.sync_secret">Sync secret</span>
                                 <input type="password" id="vf-sync-secret" autocomplete="new-password">
                             </label>
                             <label class="volume-field">
-                                <span>Sync interval (s)</span>
+                                <span data-i18n="volumes.form.sync_interval">Sync interval (s)</span>
                                 <input type="text" id="vf-sync-interval" inputmode="numeric" autocomplete="off" placeholder="300 (default)">
                             </label>
                         </div>
@@ -211,40 +204,51 @@
 
                     <div class="volume-form-actions">
                         <button type="submit" class="btn btn-primary" id="vf-submit">
-                            <i class="fa-solid fa-plus"></i> <span id="vf-submit-label">Create volume</span>
+                            <i class="fa-solid fa-plus"></i> <span id="vf-submit-label" data-i18n="volumes.create_volume">Create volume</span>
                         </button>
                     </div>
                 </form>
             </section>
 
-            <!-- Stats Grid:卷总数 / Running / Failed / Pending 总和 -->
+            <!-- Stats Grid: 卷总数 / Running / Failed / Pending 总和 /
+                 Total Storage (the sidebar aggregate card's new home) -->
             <section class="stats-grid">
                 <div class="stat-card">
                     <div class="stat-icon icon-blue"><i class="fa-solid fa-database"></i></div>
                     <div class="stat-info">
                         <h3 id="stat-volume-count">0</h3>
-                        <p>Volumes</p>
+                        <p data-i18n="volumes.stat.volumes">Volumes</p>
                     </div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-icon icon-green"><i class="fa-solid fa-circle-check"></i></div>
                     <div class="stat-info">
                         <h3 id="stat-volume-running">0</h3>
-                        <p>Running</p>
+                        <p data-i18n="volumes.stat.running">Running</p>
                     </div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-icon icon-purple"><i class="fa-solid fa-circle-exclamation"></i></div>
                     <div class="stat-info">
                         <h3 id="stat-volume-failed">0</h3>
-                        <p>Failed</p>
+                        <p data-i18n="volumes.stat.failed">Failed</p>
                     </div>
                 </div>
                 <div class="stat-card">
                     <div class="stat-icon icon-cyan"><i class="fa-solid fa-rotate"></i></div>
                     <div class="stat-info">
                         <h3 id="stat-volume-pending">0</h3>
-                        <p>Pending Uploads</p>
+                        <p data-i18n="volumes.stat.pending">Pending Uploads</p>
+                    </div>
+                </div>
+                <!-- Instance-level storage (裁决⑤): Σ of every running
+                     volume's indexed bytes as the headline, the quota
+                     ratio (or ∞) in the detail line -->
+                <div class="stat-card">
+                    <div class="stat-icon icon-green"><i class="fa-solid fa-layer-group"></i></div>
+                    <div class="stat-info">
+                        <h3 id="stat-total-storage">0 B</h3>
+                        <p id="stat-storage-detail" data-i18n="common.all_volumes">All volumes</p>
                     </div>
                 </div>
             </section>
@@ -253,7 +257,7 @@
                  header-only placeholder until the P1+ buttons land -->
             <section class="files-container">
                 <div class="section-title">
-                    <h3><i class="fa-solid fa-layer-group"></i> Storage Volumes</h3>
+                    <h3><i class="fa-solid fa-layer-group"></i> <span data-i18n="volumes.storage_volumes">Storage Volumes</span></h3>
                     <span id="volume-count-label">0 volumes</span>
                 </div>
 
@@ -261,19 +265,19 @@
                     <table class="files-table">
                         <thead>
                             <tr>
-                                <th>Name</th>
-                                <th>Backend</th>
-                                <th>Status</th>
-                                <th>Drive</th>
-                                <th>Pending</th>
-                                <th>Size</th>
-                                <th>Actions</th>
+                                <th data-i18n="table.name">Name</th>
+                                <th data-i18n="table.backend">Backend</th>
+                                <th data-i18n="table.status">Status</th>
+                                <th data-i18n="table.drive">Drive</th>
+                                <th data-i18n="table.pending">Pending</th>
+                                <th data-i18n="table.size">Size</th>
+                                <th data-i18n="table.actions">Actions</th>
                             </tr>
                         </thead>
                         <tbody id="volumes-tbody">
                             <tr>
                                 <td colspan="7" class="loading-state">
-                                    <i class="fa-solid fa-circle-notch fa-spin"></i> Loading volumes...
+                                    <i class="fa-solid fa-circle-notch fa-spin"></i> <span data-i18n="volumes.loading">Loading volumes...</span>
                                 </td>
                             </tr>
                         </tbody>
@@ -291,37 +295,37 @@
             <div class="modal" id="delete-modal">
                 <div class="modal-content delm-content">
                     <button type="button" class="modal-close" id="delm-close" aria-label="Close">&times;</button>
-                    <h3 class="delm-title"><i class="fa-solid fa-triangle-exclamation"></i> Delete Volume</h3>
+                    <h3 class="delm-title"><i class="fa-solid fa-triangle-exclamation"></i> <span data-i18n="volumes.delm.title">Delete Volume</span></h3>
 
                     <div id="delete-step-1">
                         <div class="delm-overview" id="delm-overview"></div>
                         <ul class="delm-list">
-                            <li class="delm-del"><i class="fa-solid fa-trash"></i> the volume file <code>volumes/<span id="delm-file-name"></span>.toml</code> — and, while the volume runs, its registration and drive</li>
-                            <li class="delm-keep"><i class="fa-solid fa-shield-halved"></i> the volume's local data directory (its db, cache and local root) — <strong>kept by default</strong></li>
-                            <li class="delm-keep"><i class="fa-solid fa-shield-halved"></i> all remote data on the volume's backend — <strong>never touched</strong></li>
+                            <li class="delm-del"><i class="fa-solid fa-trash"></i> <span data-i18n="volumes.delm.file_1">the volume file</span> <code>volumes/<span id="delm-file-name"></span>.toml</code> <span data-i18n="volumes.delm.file_2">— and, while the volume runs, its registration and drive</span></li>
+                            <li class="delm-keep"><i class="fa-solid fa-shield-halved"></i> <span data-i18n="volumes.delm.keep_local_1">the volume's local data directory (its db, cache and local root) — </span><strong data-i18n="volumes.delm.kept_by_default">kept by default</strong></li>
+                            <li class="delm-keep"><i class="fa-solid fa-shield-halved"></i> <span data-i18n="volumes.delm.keep_remote_1">all remote data on the volume's backend — </span><strong data-i18n="volumes.delm.never_touched">never touched</strong></li>
                         </ul>
                         <label class="delm-purge">
                             <input type="checkbox" id="delm-purge">
-                            <span>Also delete the volume's local data directory (<code>purge_local</code>) — db, cache and local root go with it</span>
+                            <span><span data-i18n="volumes.delm.purge_1">Also delete the volume's local data directory (</span><code>purge_local</code><span data-i18n="volumes.delm.purge_2">) — db, cache and local root go with it</span></span>
                         </label>
                         <p class="delm-warning">
                             <i class="fa-solid fa-triangle-exclamation"></i>
-                            This permanently removes the volume's configuration. Nothing on the
-                            remote backend is ever deleted; re-creating the volume re-attaches its data.
+                            <span data-i18n="volumes.delm.warning">This permanently removes the volume's configuration. Nothing on the
+                            remote backend is ever deleted; re-creating the volume re-attaches its data.</span>
                         </p>
                         <div class="delm-actions">
-                            <button type="button" class="btn" id="delm-cancel-1">Cancel</button>
-                            <button type="button" class="btn btn-primary" id="delm-continue">Continue</button>
+                            <button type="button" class="btn" id="delm-cancel-1" data-i18n="common.cancel">Cancel</button>
+                            <button type="button" class="btn btn-primary" id="delm-continue" data-i18n="common.continue">Continue</button>
                         </div>
                     </div>
 
                     <div id="delete-step-2" hidden>
-                        <p class="delm-typeline">Type the volume name <code id="delm-name-echo"></code> to confirm the deletion:</p>
+                        <p class="delm-typeline"><span data-i18n="volumes.delm.type_1">Type the volume name</span> <code id="delm-name-echo"></code> <span data-i18n="volumes.delm.type_2">to confirm the deletion:</span></p>
                         <input type="text" id="delm-confirm-input" autocomplete="off" spellcheck="false">
                         <div class="delm-actions">
-                            <button type="button" class="btn" id="delm-cancel-2">Cancel</button>
+                            <button type="button" class="btn" id="delm-cancel-2" data-i18n="common.cancel">Cancel</button>
                             <button type="button" class="btn btn-danger" id="delm-confirm" disabled>
-                                <i class="fa-solid fa-trash"></i> <span id="delm-confirm-label">Delete volume</span>
+                                <i class="fa-solid fa-trash"></i> <span id="delm-confirm-label" data-i18n="volumes.delm.confirm">Delete volume</span>
                             </button>
                         </div>
                     </div>
@@ -330,6 +334,7 @@
         </main>
     </div>
 
+    <script src="/static/js/i18n.js"></script>
     <script src="/static/js/volumes.js"></script>
 </body>
 </html>
