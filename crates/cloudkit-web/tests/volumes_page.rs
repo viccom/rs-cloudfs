@@ -418,8 +418,12 @@ async fn volumes_page_is_bilingual_ready_and_prunes_external_links() {
         "data-lang=\"en\"",
         // i18n.js loads before the page script.
         "/static/js/i18n.js",
-        // The bottom-anchored page switcher (Files / Volumes).
+        // The bottom-anchored page switcher (Files / Volumes) — since
+        // the ui-polish batch a single two-segment pill (the sidebar
+        // twin of the language pill).
         "sidebar-pages",
+        "page-switch",
+        "page-seg",
         "href=\"/\"",
         "href=\"/volumes\"",
     ] {
@@ -453,11 +457,17 @@ async fn volumes_page_is_bilingual_ready_and_prunes_external_links() {
         body.contains("id=\"stat-total-storage\""),
         "the Total Storage stat card: {body}"
     );
-    // This page's switcher chip: Volumes active, Files not.
+    // This page's switcher pill: Volumes is the active segment.
     let pages = body.split("sidebar-pages").nth(1).expect("the pages block");
     assert!(
-        pages.contains("nav-item active") && pages.contains("href=\"/volumes\""),
-        "Volumes is the active page chip: {pages}"
+        pages.contains("page-seg active") && pages.contains("href=\"/volumes\""),
+        "Volumes is the active page segment: {pages}"
+    );
+    // The topbar keeps its unified shape: the title block on the left
+    // (title + subtitle), actions on the right.
+    assert!(
+        body.contains("class=\"topbar-title\""),
+        "the topbar's title block: {body}"
     );
 }
 
@@ -465,6 +475,13 @@ async fn volumes_page_is_bilingual_ready_and_prunes_external_links() {
 /// and pill, the pruned external links, and the sidebar storage card's
 /// content migrated into the stats grid (the `storage-*` ids survive —
 /// app.js keeps filling them — but the sidebar chassis is gone).
+///
+/// The ui-polish batch (2026-09-12 feedback) adds: the two-segment
+/// page-switch pill, the topbar in the same shape as /volumes (title
+/// left, actions right — the search lives in the files section-title
+/// row now), no cross-volume summary card (five stat cards), the
+/// WebDAV card's demoted URL line, and the pagination host under the
+/// files table.
 #[tokio::test]
 async fn index_page_is_bilingual_ready_and_storage_card_moved() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -481,11 +498,23 @@ async fn index_page_is_bilingual_ready_and_storage_card_moved() {
         "data-lang=\"zh\"",
         "data-lang=\"en\"",
         "<script src=\"/static/js/i18n.js\"></script>",
+        // The two-segment page switch pill at the sidebar's bottom.
         "sidebar-pages",
+        "page-switch",
+        "page-seg",
         // The migrated storage card keeps its ids inside the stats grid.
         "id=\"storage-percent\"",
         "id=\"storage-detail\"",
         "id=\"drive-letter\"",
+        // The unified topbar's title block.
+        "class=\"topbar-title\"",
+        // The WebDAV card: the short headline, the URL demoted to a
+        // muted mono line the app.js wiring still fills.
+        "data-i18n=\"webdav.running\"",
+        "id=\"webdav-endpoint\"",
+        "class=\"webdav-url\"",
+        // The pagination controls are JS-rendered into this static host.
+        "id=\"pagination\"",
     ] {
         assert!(
             body.contains(marker),
@@ -502,6 +531,12 @@ async fn index_page_is_bilingual_ready_and_storage_card_moved() {
         !body.contains("class=\"storage-card\""),
         "the sidebar storage card chassis is gone: {body}"
     );
+    // The cross-volume aggregate card is gone for good (负责人 feedback:
+    // the stats grid keeps exactly five cards).
+    assert!(
+        !body.contains("summary-card"),
+        "the cross-volume summary card is gone from the index: {body}"
+    );
     // Cloud Drive left the middle nav (merged into the bottom switcher);
     // the two filter items stay as the views section.
     assert!(
@@ -512,10 +547,34 @@ async fn index_page_is_bilingual_ready_and_storage_card_moved() {
         body.contains("filterType('media')") && body.contains("filterType('documents')"),
         "the view filter items stay: {body}"
     );
+    // This page's switcher pill: Files is the active segment.
     let pages = body.split("sidebar-pages").nth(1).expect("the pages block");
     assert!(
-        pages.contains("nav-item active") && pages.contains("href=\"/\""),
-        "Files is the active page chip: {pages}"
+        pages.contains("page-seg active") && pages.contains("href=\"/\""),
+        "Files is the active page segment: {pages}"
+    );
+    // The search box moved out of the topbar into the files section's
+    // title row (title left, search right) — the topbar block itself
+    // carries no search input, and the input sits after the section.
+    let topbar = body
+        .split("<header class=\"topbar\">")
+        .nth(1)
+        .and_then(|rest| rest.split("</header>").next())
+        .expect("the topbar block")
+        .to_string();
+    assert!(
+        !topbar.contains("search-input"),
+        "the search left the topbar: {topbar}"
+    );
+    let search_at = body
+        .find("id=\"search-input\"")
+        .expect("the search input somewhere");
+    let section_at = body
+        .find("class=\"section-title\"")
+        .expect("the files section title");
+    assert!(
+        search_at > section_at,
+        "the search lives in the section-title row: search {search_at} vs section {section_at}"
     );
 }
 

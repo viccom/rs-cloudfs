@@ -14,7 +14,6 @@
 const LANG = {
     en: {
         // --- sidebar / navigation -------------------------------------
-        'sidebar.pages': 'Pages',
         'sidebar.views': 'Views',
         'page.files': 'Files',
         'page.volumes': 'Volumes',
@@ -42,15 +41,15 @@ const LANG = {
         'table.pending': 'Pending',
 
         // --- index (usage-state dashboard) -----------------------------
+        'index.topbar_subtitle': "Files on this instance's storage volumes",
         'index.search_placeholder': 'Search files, documents, videos in CyDrive...',
         'index.upload_file': 'Upload File',
         'index.refresh_drive': 'Refresh Drive',
         'index.total_files': 'Total Files Stored',
         'index.total_size': 'Total Cloud Volume',
         'index.active': 'Active',
+        'webdav.running': 'Running',
         'index.webdav_service': 'WebDAV Service',
-        'index.file_one': 'file',
-        'index.file_many': 'files',
         'index.drop_here': 'Drag & Drop Files Here',
         'index.drop_sub': 'Instantly syncs to your Windows Drive & Telegram Cloud',
         'index.drop_sub_backend': 'Instantly syncs to your Windows Drive & {backend}',
@@ -75,6 +74,12 @@ const LANG = {
         'index.delete_failed_alert': 'Could not delete file from cloud.',
         'status.synced': 'Synced',
         'status.syncing': 'Syncing',
+
+        // --- the files table's client-side pagination --------------------
+        'pagination.prev': 'Prev',
+        'pagination.next': 'Next',
+        'pagination.page_x_of_y': 'Page {x} / {y}',
+        'pagination.total': '{n} total',
 
         // --- volumes (configuration-state page) ------------------------
         'volumes.title': 'Volume Management',
@@ -188,7 +193,6 @@ hand-written comments are lost. Credential fields left empty keep their stored v
 
     zh: {
         // --- 侧栏 / 导航 ---------------------------------------------
-        'sidebar.pages': '页面',
         'sidebar.views': '视图',
         'page.files': '文件管理',
         'page.volumes': '卷配置',
@@ -216,15 +220,15 @@ hand-written comments are lost. Credential fields left empty keep their stored v
         'table.pending': '待上传',
 
         // --- index（使用态仪表盘）---------------------------------------
+        'index.topbar_subtitle': '本实例各存储卷上的文件',
         'index.search_placeholder': '在 CyDrive 中搜索文件、文档、视频…',
         'index.upload_file': '上传文件',
         'index.refresh_drive': '刷新云盘',
         'index.total_files': '文件总数',
         'index.total_size': '云端总容量',
         'index.active': '运行中',
+        'webdav.running': '运行中',
         'index.webdav_service': 'WebDAV 服务',
-        'index.file_one': '个文件',
-        'index.file_many': '个文件',
         'index.drop_here': '拖拽文件到此处',
         'index.drop_sub': '即时同步至 Windows 磁盘与 Telegram 云端',
         'index.drop_sub_backend': '即时同步至 Windows 磁盘与 {backend}',
@@ -249,6 +253,12 @@ hand-written comments are lost. Credential fields left empty keep their stored v
         'index.delete_failed_alert': '无法从云端删除文件。',
         'status.synced': '已同步',
         'status.syncing': '同步中',
+
+        // --- 文件表的客户端分页 -------------------------------------------
+        'pagination.prev': '上一页',
+        'pagination.next': '下一页',
+        'pagination.page_x_of_y': '第 {x} / {y} 页',
+        'pagination.total': '共 {n} 条',
 
         // --- volumes（配置态管理页）--------------------------------------
         'volumes.title': '卷管理',

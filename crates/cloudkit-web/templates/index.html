@@ -36,12 +36,14 @@
             </nav>
 
             <!-- The page switcher, anchored at the sidebar's bottom
-                 (flex): the cross-page twin of the /volumes page's own
-                 switcher -->
+                 (flex): one horizontal two-segment pill (the sidebar
+                 twin of the topbar's language pill) — the active page's
+                 segment highlights. -->
             <nav class="sidebar-pages" aria-label="Pages">
-                <div class="nav-section-title" data-i18n="sidebar.pages">Pages</div>
-                <a href="/" class="nav-item active"><i class="fa-solid fa-hard-drive"></i> <span data-i18n="page.files">Files</span></a>
-                <a href="/volumes" class="nav-item"><i class="fa-solid fa-database"></i> <span data-i18n="page.volumes">Volumes</span></a>
+                <div class="page-switch" role="group" aria-label="Page switch">
+                    <a href="/" class="page-seg active"><i class="fa-solid fa-folder"></i> <span data-i18n="page.files">Files</span></a>
+                    <a href="/volumes" class="page-seg"><i class="fa-solid fa-database"></i> <span data-i18n="page.volumes">Volumes</span></a>
+                </div>
             </nav>
         </aside>
 
@@ -51,12 +53,15 @@
                  after the boot probe detects a volume registry) -->
             <div class="volume-tabs" id="volume-tabs" hidden></div>
 
-            <!-- Top Bar -->
+            <!-- Top Bar (the same shape as the /volumes page's: the
+                 page title + subtitle on the left, the language pill +
+                 the page's primary action + the round refresh button on
+                 the right; the file search lives in the files table's
+                 section-title row below) -->
             <header class="topbar">
-                <div class="search-box">
-                    <i class="fa-solid fa-magnifying-glass"></i>
-                    <input type="text" id="search-input" placeholder="Search files, documents, videos in CyDrive..."
-                           data-i18n-placeholder="index.search_placeholder">
+                <div class="topbar-title">
+                    <h2><i class="fa-solid fa-folder"></i> <span data-i18n="page.files">Files</span></h2>
+                    <p data-i18n="index.topbar_subtitle">Files on this instance's storage volumes</p>
                 </div>
 
                 <div class="topbar-actions">
@@ -102,32 +107,24 @@
                 <div class="stat-card">
                     <div class="stat-icon icon-cyan"><i class="fa-solid fa-network-wired"></i></div>
                     <div class="stat-info">
-                        <h3 id="webdav-endpoint">127.0.0.1:8080</h3>
+                        <h3 data-i18n="webdav.running">Running</h3>
                         <p data-i18n="index.webdav_service">WebDAV Service</p>
+                        <!-- The bound URL, demoted from the headline to a
+                             small muted mono line (the server fills it). -->
+                        <span id="webdav-endpoint" class="webdav-url">127.0.0.1:8080</span>
                     </div>
                 </div>
                 <!-- The storage card (moved out of the sidebar): the
                      quota percent is the headline, used/total the
                      detail, the drive badge the mount line. In
                      multi-volume mode the volume-scoped /api/stats
-                     makes it show the SELECTED volume, coexisting with
-                     the cross-volume summary card below. -->
+                     makes it show the SELECTED volume. -->
                 <div class="stat-card" id="storage-card">
                     <div class="stat-icon icon-cyan"><i class="fa-solid fa-hard-drive"></i></div>
                     <div class="stat-info">
                         <h3 id="storage-percent">0%</h3>
                         <p id="storage-detail">0 MB / Unlimited</p>
                         <span class="drive-badge"><i class="fa-brands fa-windows"></i> <span data-i18n="index.mounted_on">Mounted on</span> <strong id="drive-letter">Y:</strong></span>
-                    </div>
-                </div>
-                <!-- Cross-volume aggregate card (multi-volume mode only;
-                     app.js sums the /api/volumes rows — one request, no
-                     per-volume stats N+1) -->
-                <div class="stat-card" id="summary-card" hidden>
-                    <div class="stat-icon icon-green"><i class="fa-solid fa-layer-group"></i></div>
-                    <div class="stat-info">
-                        <h3 id="summary-size">0 B</h3>
-                        <p id="summary-detail" data-i18n="common.all_volumes">All volumes</p>
                     </div>
                 </div>
             </section>
@@ -143,7 +140,17 @@
             <section class="files-container">
                 <div class="section-title">
                     <h3><i class="fa-solid fa-folder-open"></i> <span data-i18n="index.cloud_files">Cloud Files & Directories</span></h3>
-                    <span id="file-count-label">0 items</span>
+                    <div class="section-tools">
+                        <!-- The file search (moved out of the topbar —
+                             it filters this table, so it lives on this
+                             row now; the wiring in app.js is unchanged) -->
+                        <div class="search-box">
+                            <i class="fa-solid fa-magnifying-glass"></i>
+                            <input type="text" id="search-input" placeholder="Search files, documents, videos in CyDrive..."
+                                   data-i18n-placeholder="index.search_placeholder">
+                        </div>
+                        <span id="file-count-label">0 items</span>
+                    </div>
                 </div>
 
                 <div class="table-responsive">
@@ -166,6 +173,11 @@
                         </tbody>
                     </table>
                 </div>
+
+                <!-- Client-side pagination (app.js slices the in-memory
+                     filtered list, 50 rows a page and fills this host;
+                     hidden until there is something to page through) -->
+                <nav class="pagination" id="pagination" hidden aria-label="Files pagination"></nav>
             </section>
         </main>
     </div>
