@@ -53,6 +53,13 @@ body {
 /* Sidebar */
 .sidebar {
     width: 280px;
+    /* Sticky: the long files table scrolls the page, the sidebar (and
+       the page switch at its bottom) stays in view; overflow-y keeps
+       the column reachable on short viewports. */
+    position: sticky;
+    top: 0;
+    height: 100vh;
+    overflow-y: auto;
     background: var(--bg-card);
     backdrop-filter: blur(20px);
     border-right: 1px solid var(--border-color);
@@ -138,7 +145,7 @@ body {
 }
 
 /* Small section labels inside the sidebar (the views filter on the
-   dashboard, the bottom page switcher's title). */
+   dashboard). */
 .nav-section-title {
     font-size: 0.65rem;
     font-weight: 600;
@@ -155,11 +162,50 @@ body {
    so both pages share the same anchor semantics. */
 .sidebar-pages {
     margin-top: auto;
-    display: flex;
-    flex-direction: column;
-    gap: 0.5rem;
     padding-top: 1.5rem;
     border-top: 1px solid var(--border-color);
+}
+
+/* The two-segment page switch pill (Files | Volumes): the sidebar
+   sibling of the topbar's language pill — one container, the active
+   page's segment highlights, compact icon + short label. */
+.page-switch {
+    display: inline-flex;
+    align-items: stretch;
+    border: 1px solid var(--border-color);
+    border-radius: 10px;
+    overflow: hidden;
+    background: var(--bg-card);
+}
+
+.page-seg {
+    display: inline-flex;
+    align-items: center;
+    gap: 0.45rem;
+    padding: 0.55rem 0.85rem;
+    color: var(--text-muted);
+    text-decoration: none;
+    font-size: 0.82rem;
+    font-weight: 600;
+    white-space: nowrap;
+    transition: all 0.2s ease;
+}
+
+.page-seg i {
+    font-size: 0.8rem;
+}
+
+.page-seg:hover {
+    color: var(--text-main);
+}
+
+.page-seg.active {
+    background: rgba(0, 243, 255, 0.12);
+    color: var(--accent-cyan);
+}
+
+.page-seg + .page-seg {
+    border-left: 1px solid var(--border-color);
 }
 
 .backend-badge {
@@ -279,12 +325,6 @@ body {
     box-shadow: 0 0 6px rgba(255, 51, 102, 0.7);
 }
 
-/* The cross-volume summary card (multi-volume mode): same stat-card
-   chassis; the [hidden] rule re-pins against .stat-card's flex. */
-#summary-card[hidden] {
-    display: none;
-}
-
 .drive-badge {
     background: rgba(0, 243, 255, 0.1);
     border: 1px solid rgba(0, 243, 255, 0.2);
@@ -295,12 +335,14 @@ body {
     text-align: center;
 }
 
-/* The drive badge's new home inside the storage stat card (the sidebar
+/* The drive badge's home inside the storage stat card (the sidebar
    chassis it grew up in is gone): a compact inline pill under the
-   used/total detail line. */
+   used/total detail line — tightened for the one-row stats grid. */
 .stat-info .drive-badge {
     display: inline-block;
     margin-top: 0.45rem;
+    padding: 0.2rem 0.45rem;
+    font-size: 0.68rem;
 }
 
 /* Main Content */
@@ -340,6 +382,26 @@ body {
     font-size: 0.95rem;
 }
 
+/* The search box lives on the files table's section-title row now
+   (title left, search right), compact next to the count label. */
+.section-tools {
+    display: flex;
+    align-items: center;
+    gap: 0.9rem;
+}
+
+.section-title .search-box {
+    flex-grow: 0;
+    width: 300px;
+    max-width: 40vw;
+    padding: 0.5rem 0.9rem;
+    border-radius: 10px;
+}
+
+.section-title .search-box input {
+    font-size: 0.85rem;
+}
+
 .topbar-actions {
     display: flex;
     gap: 0.8rem;
@@ -369,11 +431,18 @@ body {
     box-shadow: 0 0 25px rgba(0, 243, 255, 0.5);
 }
 
+/* The topbar's round refresh button (both pages — the shared
+   topbar-actions row's last slot). */
 .btn-icon {
     background: var(--bg-card);
     border: 1px solid var(--border-color);
     color: var(--text-main);
-    padding: 0.75rem 1rem;
+    width: 2.75rem;
+    height: 2.75rem;
+    padding: 0;
+    border-radius: 50%;
+    justify-content: center;
+    flex-shrink: 0;
 }
 
 .btn-icon:hover {
@@ -414,21 +483,24 @@ body {
     color: var(--accent-cyan);
 }
 
-/* Stats Grid */
+/* Stats Grid: both pages carry exactly five cards, sized to hold them
+   on ONE row from a 1280px viewport up (5 × 150px min + gaps fits the
+   column left of the sidebar); auto-fit lets them breathe evenly on
+   wide screens. */
 .stats-grid {
     display: grid;
-    grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
-    gap: 1.2rem;
+    grid-template-columns: repeat(auto-fit, minmax(150px, 1fr));
+    gap: 1rem;
 }
 
 .stat-card {
     background: var(--bg-card);
     border: 1px solid var(--border-color);
     border-radius: 14px;
-    padding: 1.2rem 1.5rem;
+    padding: 0.9rem 1rem;
     display: flex;
     align-items: center;
-    gap: 1.2rem;
+    gap: 0.8rem;
     transition: all 0.2s ease;
 }
 
@@ -438,13 +510,14 @@ body {
 }
 
 .stat-icon {
-    width: 50px;
-    height: 50px;
-    border-radius: 12px;
+    width: 40px;
+    height: 40px;
+    border-radius: 10px;
     display: flex;
     align-items: center;
     justify-content: center;
-    font-size: 1.3rem;
+    font-size: 1.05rem;
+    flex-shrink: 0;
 }
 
 .icon-blue { background: rgba(0, 243, 255, 0.15); color: var(--accent-cyan); }
@@ -452,8 +525,25 @@ body {
 .icon-green { background: rgba(0, 255, 136, 0.15); color: var(--accent-green); }
 .icon-cyan { background: rgba(255, 0, 127, 0.15); color: var(--accent-pink); }
 
-.stat-info h3 { font-size: 1.4rem; font-weight: 700; }
-.stat-info p { font-size: 0.8rem; color: var(--text-muted); }
+.stat-info {
+    min-width: 0;
+}
+
+.stat-info h3 { font-size: 1.15rem; font-weight: 700; }
+.stat-info p { font-size: 0.75rem; color: var(--text-muted); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+
+/* The WebDAV card's URL line: the bound address demoted from the
+   headline to a small muted mono footer (it can be long — let it
+   wrap rather than stretch the card). */
+.webdav-url {
+    display: block;
+    margin-top: 0.25rem;
+    font-family: var(--font-mono);
+    font-size: 0.65rem;
+    color: var(--text-muted);
+    word-break: break-all;
+    line-height: 1.4;
+}
 
 /* Drop Zone */
 .drop-zone {
@@ -578,6 +668,58 @@ body {
     background: rgba(255, 51, 102, 0.15);
 }
 
+/* Client-side pagination of the files table (app.js slices the
+   in-memory list): prev/next buttons, the page indicator, the total —
+   one quiet row under the table. */
+.pagination {
+    display: flex;
+    align-items: center;
+    justify-content: flex-end;
+    gap: 0.9rem;
+    padding-top: 1rem;
+}
+
+.pagination[hidden] {
+    display: none;
+}
+
+.page-btn {
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-radius: 8px;
+    color: var(--text-main);
+    font-size: 0.8rem;
+    font-weight: 600;
+    padding: 0.35rem 0.75rem;
+    cursor: pointer;
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    transition: all 0.2s ease;
+}
+
+.page-btn:hover:not(:disabled) {
+    color: var(--accent-cyan);
+    border-color: var(--accent-cyan);
+}
+
+.page-btn:disabled {
+    opacity: 0.4;
+    cursor: not-allowed;
+}
+
+.page-info {
+    font-size: 0.82rem;
+    color: var(--text-muted);
+    font-variant-numeric: tabular-nums;
+}
+
+.page-total {
+    font-size: 0.78rem;
+    color: var(--text-muted);
+    opacity: 0.85;
+}
+
 /* Modal */
 .modal {
     display: none;
@@ -615,8 +757,8 @@ body {
    The §1.4 configuration-state twin: additive glue over the existing
    tokens only — no new visual system. */
 
-/* The topbar title block (the slot the usage-state topbar's search
-   box occupies). */
+/* The topbar's title block — the SHARED left half of both pages'
+   topbars (page title + subtitle). */
 .topbar-title h2 {
     font-size: 1.25rem;
     font-weight: 700;

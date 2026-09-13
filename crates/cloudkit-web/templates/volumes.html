@@ -15,7 +15,9 @@
     <div class="app-container">
         <!-- Sidebar (the index skeleton minus the view filters): the
              page switcher is the ONLY nav now, anchored at the
-             sidebar's bottom via flex — Volumes is active here -->
+             sidebar's bottom via flex — one horizontal two-segment pill
+             (the sidebar twin of the topbar's language pill), Volumes
+             active here -->
         <aside class="sidebar">
             <div class="brand">
                 <div class="logo-box">
@@ -32,9 +34,10 @@
                  storage line that used to close this sidebar moved up
                  into the stats grid's Total Storage card -->
             <nav class="sidebar-pages" aria-label="Pages">
-                <div class="nav-section-title" data-i18n="sidebar.pages">Pages</div>
-                <a href="/" class="nav-item"><i class="fa-solid fa-hard-drive"></i> <span data-i18n="page.files">Files</span></a>
-                <a href="/volumes" class="nav-item active"><i class="fa-solid fa-database"></i> <span data-i18n="page.volumes">Volumes</span></a>
+                <div class="page-switch" role="group" aria-label="Page switch">
+                    <a href="/" class="page-seg"><i class="fa-solid fa-folder"></i> <span data-i18n="page.files">Files</span></a>
+                    <a href="/volumes" class="page-seg active"><i class="fa-solid fa-database"></i> <span data-i18n="page.volumes">Volumes</span></a>
+                </div>
             </nav>
         </aside>
 

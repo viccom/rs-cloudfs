@@ -1,6 +1,15 @@
 let allFiles = [];
 let currentFilter = 'all';
 
+// Client-side pagination of the files table: allFiles is fully in
+// memory, so a page is just a slice of the current filter result. The
+// page resets on user-driven filter changes (search box, view filters)
+// and only clamps on poll refreshes — so a delete that empties the
+// current page steps back instead of staring at a blank table.
+const PAGE_SIZE = 50;
+let currentPage = 1;
+let filteredFiles = [];
+
 // The active backend's identity, refreshed from every /api/stats poll
 // (server-reported — the UI never guesses which backend is running).
 let backendState = {
@@ -38,9 +47,17 @@ document.addEventListener("DOMContentLoaded", async () => {
     loadDriveData();
     setupDropZone();
     setupSearch();
+    setupPagination();
     // Auto-refresh drive files and stats every 4 seconds
     setInterval(loadDriveData, 4000);
 });
+
+// One delegated listener on the static pagination host serves every
+// bar the renderer mints.
+function setupPagination() {
+    const host = document.getElementById("pagination");
+    if (host) host.addEventListener("click", onPaginationClick);
+}
 
 // Boot probe: a parameterless /api/stats answers 200 on a single-volume
 // dashboard and 400 + the volume list on a registry dashboard (K23).
@@ -61,7 +78,6 @@ async function detectMultiVolumeMode() {
                 const first = volumeState.volumes.find(v => v.status === 'running');
                 volumeState.current = rememberedOk ? remembered : (first ? first.name : null);
                 renderVolumeTabs();
-                updateSummaryCard();
             }
         }
     } catch (err) {
@@ -69,8 +85,8 @@ async function detectMultiVolumeMode() {
     }
 }
 
-// One /api/volumes call carries everything the tabs and the summary
-// card need (server reads db metadata — no per-volume N+1 polling).
+// One /api/volumes call carries everything the volume tabs need
+// (server reads db metadata — no per-volume N+1 polling).
 async function refreshVolumes() {
     try {
         const res = await fetch("/api/volumes");
@@ -102,7 +118,6 @@ async function loadDriveData() {
             if (volumesRes.ok) {
                 volumeState.volumes = await volumesRes.json();
                 renderVolumeTabs();
-                updateSummaryCard();
             }
 
             if (statsRes.ok) {
@@ -199,37 +214,6 @@ function rememberVolume(name) {
 
 function recallVolume() {
     try { return localStorage.getItem('cydrive.volume'); } catch (err) { return null; }
-}
-
-// The cross-volume aggregate card: client-side sums over the ONE
-// /api/volumes response (files / bytes / quota where the volumes
-// report them).
-function updateSummaryCard() {
-    const card = document.getElementById("summary-card");
-    if (!card) return;
-    if (!volumeState.multi || !volumeState.volumes.length) {
-        card.hidden = true;
-        return;
-    }
-    card.hidden = false;
-    let files = 0, bytes = 0, quotaUsed = 0, quotaTotal = 0, hasTotal = false;
-    for (const v of volumeState.volumes) {
-        if (typeof v.total_files === "number") files += v.total_files;
-        if (typeof v.total_bytes === "number") bytes += v.total_bytes;
-        if (typeof v.quota_used === "number") quotaUsed += v.quota_used;
-        if (typeof v.quota_total === "number") {
-            quotaTotal += v.quota_total;
-            hasTotal = true;
-        }
-    }
-    const sizeEl = document.getElementById("summary-size");
-    if (sizeEl) sizeEl.innerText = formatBytes(bytes);
-    const detailEl = document.getElementById("summary-detail");
-    if (detailEl) {
-        let detail = `${t('common.all_volumes')}: ${files} ${files === 1 ? t('index.file_one') : t('index.file_many')}`;
-        if (hasTotal) detail += ` • ${formatBytes(quotaUsed)} / ${formatBytes(quotaTotal)}`;
-        detailEl.innerText = detail;
-    }
 }
 
 function updateStatsUI(stats) {
@@ -332,7 +316,7 @@ function updateBackendUI(stats) {
 
 function filterType(type) {
     currentFilter = type;
-    
+
     // Update active nav-item class
     document.querySelectorAll(".nav-menu .nav-item").forEach(item => {
         item.classList.remove("active");
@@ -343,10 +327,12 @@ function filterType(type) {
         eventTarget.classList.add("active");
     }
 
-    applyCurrentFilter();
+    applyCurrentFilter(true);
 }
 
-function applyCurrentFilter() {
+// The current view's file set: the type filter crossed with the search
+// box (both user-driven, so either resets the page).
+function filterFiles() {
     let filtered = allFiles;
 
     if (currentFilter === 'media') {
@@ -360,14 +346,74 @@ function applyCurrentFilter() {
         const q = searchInput.value.toLowerCase().trim();
         filtered = filtered.filter(f => f.name.toLowerCase().includes(q));
     }
+    return filtered;
+}
 
-    renderFilesTable(filtered);
+// The one slice entry point every refresh path goes through: the poll,
+// the search box, the view filters and the post-delete reload all end
+// here. resetPage=true on the user-driven paths (fresh filter, first
+// page); the poll path clamps only, so a live refresh never yanks the
+// reader off their page — and a delete that emptied the current page
+// steps back to the last page that has rows.
+function applyCurrentFilter(resetPage) {
+    if (resetPage) currentPage = 1;
+    filteredFiles = filterFiles();
+    const pages = Math.max(1, Math.ceil(filteredFiles.length / PAGE_SIZE));
+    if (currentPage > pages) currentPage = pages;
+
+    const start = (currentPage - 1) * PAGE_SIZE;
+    renderFilesTable(filteredFiles.slice(start, start + PAGE_SIZE));
+    renderPagination();
+}
+
+// The pagination bar under the table: prev/next (disabled at the
+// bounds), the x / y indicator and the total. Hidden while there is
+// nothing to page through (the empty-state row carries the table).
+function renderPagination() {
+    const host = document.getElementById("pagination");
+    if (!host) return;
+    const total = filteredFiles.length;
+    if (!total) {
+        host.hidden = true;
+        host.innerHTML = "";
+        return;
+    }
+    host.hidden = false;
+    const pages = Math.ceil(total / PAGE_SIZE);
+    host.innerHTML = `
+        <button class="page-btn" data-page="${currentPage - 1}"${currentPage <= 1 ? " disabled" : ""}>
+            <i class="fa-solid fa-chevron-left"></i> ${t('pagination.prev')}
+        </button>
+        <span class="page-info">${t('pagination.page_x_of_y', { x: currentPage, y: pages })}</span>
+        <button class="page-btn" data-page="${currentPage + 1}"${currentPage >= pages ? " disabled" : ""}>
+            ${t('pagination.next')} <i class="fa-solid fa-chevron-right"></i>
+        </button>
+        <span class="page-total">${t('pagination.total', { n: total })}</span>
+    `;
+}
+
+// The bar's click handler: one delegated listener moves by the data-page
+// the buttons carry (one behind/one ahead of the current page).
+function onPaginationClick(event) {
+    const button = event.target.closest("button[data-page]");
+    if (!button || button.disabled) return;
+    const pages = Math.max(1, Math.ceil(filteredFiles.length / PAGE_SIZE));
+    const page = Math.min(pages, Math.max(1, Number(button.dataset.page)));
+    if (page === currentPage) return;
+    currentPage = page;
+    const start = (currentPage - 1) * PAGE_SIZE;
+    renderFilesTable(filteredFiles.slice(start, start + PAGE_SIZE));
+    renderPagination();
+    const table = document.querySelector(".files-table");
+    if (table) table.scrollIntoView({ behavior: "smooth", block: "start" });
 }
 
 function renderFilesTable(files) {
     const tbody = document.getElementById("files-tbody");
     const countLabel = document.getElementById("file-count-label");
-    if (countLabel) countLabel.innerText = `${files.length} ${t('index.items')}`;
+    // The count label reports the whole filtered set (the pagination
+    // bar under the table breaks down the page math).
+    if (countLabel) countLabel.innerText = `${filteredFiles.length} ${t('index.items')}`;
 
     if (!files || files.length === 0) {
         const target = backendState.backend
@@ -515,7 +561,7 @@ function setupSearch() {
     const searchInput = document.getElementById("search-input");
     if (searchInput) {
         searchInput.addEventListener("input", () => {
-            applyCurrentFilter();
+            applyCurrentFilter(true);
         });
     }
 }
