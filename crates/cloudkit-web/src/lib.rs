@@ -87,7 +87,8 @@
 //!   management page's data source: the registry listing cannot see
 //!   disabled volumes): one `CONFIGS` through the seam, the row lines
 //!   parsed into `{name, backend, enabled, running}` / `{name,
-//!   invalid, reason}` JSON.
+//!   invalid, reason}` JSON, with the P2 sparse markers `rebuilding`/
+//!   `encrypted` riding as `true` when the row carries them.
 //! - `POST /api/volumes/{name}/remove|disable|enable` (P1) — the
 //!   management write family: one command through the same seam (the
 //!   SAME serialized execution the control channel funnels into), the
@@ -96,6 +97,12 @@
 //!   client's 120s (a REMOVE legitimately drains uploads first). No
 //!   registry gate: a disabled volume is by definition absent from the
 //!   registry — the command's own reply is the authority.
+//! - `POST /api/volumes/{name}/rebuild` (P6) — the Refresh button's
+//!   member of the same write family: one `REBUILD <name>` whose reply
+//!   is the instance's ACCEPTANCE (the walk is the instance's
+//!   background task, so the 120s budget covers the serialized queue,
+//!   never the walk); the volume's `rebuilding` marker (the configs
+//!   rows above) is the button's live state.
 //!
 //! The volume-management family (`/api/volumes`, the two config
 //! routes, and the write routes) runs behind a same-origin guard (§1.5
@@ -583,6 +590,10 @@ fn multi_router(
             "/api/volumes/{name}/enable",
             post(api_volume_enable).layer(axum::middleware::from_fn(same_origin_guard)),
         )
+        .route(
+            "/api/volumes/{name}/rebuild",
+            post(api_volume_rebuild).layer(axum::middleware::from_fn(same_origin_guard)),
+        )
         .route("/api/stats/summary", get(api_stats_summary))
         .with_state(state)
 }
@@ -972,8 +983,22 @@ async fn api_volume_enable(State(state): State<AppState>, Path(name): Path<Strin
     volume_write_route(state, name, "ENABLE").await
 }
 
+/// `POST /api/volumes/{name}/rebuild` (P6, the Refresh button): one
+/// `REBUILD <name>` through the seam — the reply is the instance's
+/// ACCEPTANCE (R3: the walk runs as its background task, so the write
+/// budget only ever covers the serialized queue, never the walk). The
+/// seam's `ERR:` refusals (already running, undrained queue, the K11/
+/// telegram gates) ride the family's 409 verbatim.
+async fn api_volume_rebuild(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    volume_write_route(state, name, "REBUILD").await
+}
+
 /// One CONFIGS reply row parsed into its JSON face: a loadable file as
-/// `{name, backend, enabled, running}`, a schema-broken one as
+/// `{name, backend, enabled, running}` plus the P2 sparse markers —
+/// `rebuilding: true` while a background REBUILD is in flight and
+/// `encrypted: true` while the file carries `enable_encryption` (the
+/// Refresh button's gating pair, P6; emitted only when true so a quiet
+/// row keeps its P1 shape) — and a schema-broken one as
 /// `{name, invalid: true, reason}` (the reason is display text — a
 /// re-parse failure keeps the row with the invalid marker rather than
 /// dropping it).
@@ -1000,12 +1025,32 @@ fn configs_row_json(line: &str) -> serde_json::Value {
                 .and_then(|flag| flag.strip_prefix("enabled="))
                 .and_then(|flag| flag.parse::<bool>().ok());
             let running = tokens.next() == Some("running");
-            serde_json::json!({
+            // The sparse markers (P2): whatever trailing tokens the row
+            // carries; unknown ones stay ignored for forward compat.
+            let (mut encrypted, mut rebuilding) = (false, false);
+            for marker in tokens {
+                match marker {
+                    "encrypted" => encrypted = true,
+                    "rebuilding" => rebuilding = true,
+                    _ => {}
+                }
+            }
+            let mut row = serde_json::json!({
                 "name": name,
                 "backend": backend,
                 "enabled": enabled,
                 "running": running,
-            })
+            });
+            // Inserted only when true — the object stays byte-equal to
+            // the P1 shape for quiet rows (the pins and the frontend's
+            // `=== true` reads both rely on the absence).
+            if encrypted {
+                row["encrypted"] = serde_json::json!(true);
+            }
+            if rebuilding {
+                row["rebuilding"] = serde_json::json!(true);
+            }
+            row
         }
         None => serde_json::json!({ "name": name, "invalid": true, "reason": "" }),
     }

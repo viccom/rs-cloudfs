@@ -8,7 +8,11 @@
 // disabled one — single-step confirm for the two reversible operations,
 // a loading state while the command runs, a toast with the backend's
 // reply text (ERR text is already actionable), and an immediate refresh
-// when it settles.
+// when it settles. P6 adds [Refresh] (rebuild the volume's index from
+// its remote backend, background): no confirm (idempotent, nothing is
+// deleted), its loading state driven by the row's `rebuilding` marker
+// (the poll data), and a muted tooltip note where a backend cannot be
+// rebuilt (telegram's shadow index, encrypted volumes → cydrive sync).
 
 const VOLUME_LABELS = {
     telegram: 'Telegram MTProto',
@@ -27,11 +31,12 @@ document.addEventListener("DOMContentLoaded", () => {
     if (tbody) tbody.addEventListener("click", onVolumeActionClick);
 });
 
-// The P1 write actions: which HTTP route each button posts to.
+// The write actions: which HTTP route each button posts to.
 const VOLUME_ACTIONS = {
     unmount: { route: 'remove', confirm: true },
     disable: { route: 'disable', confirm: true },
     enable: { route: 'enable', confirm: false },
+    refresh: { route: 'rebuild', confirm: false },
 };
 
 async function loadVolumesPage() {
@@ -123,9 +128,10 @@ function renderStorageCard(runtime) {
 }
 
 // One table row model: the configs row (name/backend/enabled/running or
-// invalid) joined with the runtime row of the same name (status detail,
-// drive, pending, size). Rows without a configs listing (a read-only
-// boot) fall back to the runtime row alone.
+// invalid, plus the sparse rebuilding/encrypted markers) joined with the
+// runtime row of the same name (status detail, drive, pending, size).
+// Rows without a configs listing (a read-only boot) fall back to the
+// runtime row alone.
 function volumeRows(configs, runtime) {
     const runtimeByName = new Map(runtime.map(v => [v.name, v]));
     if (!configs) {
@@ -138,6 +144,8 @@ function volumeRows(configs, runtime) {
         invalidReason: c.reason || '',
         enabled: c.enabled !== false,
         running: c.running === true,
+        rebuilding: c.rebuilding === true,
+        encrypted: c.encrypted === true,
         runtime: runtimeByName.get(c.name) || null,
     }));
 }
@@ -204,15 +212,18 @@ function renderVolumesTable(configs, runtime) {
     }).join("");
 }
 
-// The Actions cell (P1): a running volume offers [Unmount] (runtime
-// removal — the file stays) and [Disable] (file + unmount); a stopped
-// or disabled volume offers [Enable]. An invalid file offers nothing —
-// it needs a hand edit first. Refresh/Edit/Delete land in later batches.
+// The Actions cell (P1+P6): a running volume offers [Refresh] (rebuild
+// its index from the remote backend — or the muted note where the
+// backend cannot be rebuilt), [Unmount] (runtime removal — the file
+// stays) and [Disable] (file + unmount); a stopped or disabled volume
+// offers [Enable]. An invalid file offers nothing — it needs a hand
+// edit first. Edit/Delete land in later batches.
 function volumeActionButtons(v) {
     if (v.invalid) return '';
     const name = escapeHtml(v.name);
     if (v.running) {
         return `
+            ${refreshControl(v, name)}
             <button class="btn-mini" data-action="unmount" data-name="${name}"
                     title="Unmount and unregister now (the volume file stays on disk)">
                 <i class="fa-solid fa-eject"></i> Unmount
@@ -227,6 +238,31 @@ function volumeActionButtons(v) {
         <button class="btn-mini" data-action="enable" data-name="${name}"
                 title="Write enabled = true and assemble the volume now">
             <i class="fa-solid fa-play"></i> Enable
+        </button>
+    `;
+}
+
+// The Refresh control (P6): a button on every running volume whose
+// index the backend can rebuild (plaintext local/baidu), a muted note
+// where it cannot — telegram's db IS its index (the shadow index; the
+// guidance is `cydrive sync`) and an encrypted volume's backend only
+// sees ciphertext containers (K11; the guidance is `cydrive sync`, the
+// sync payload carries the encrypted row semantics). While the row's
+// `rebuilding` marker is up (the poll's live state), the button renders
+// in its busy shape — disabled, spinning — until the background pass
+// settles.
+function refreshControl(v, name) {
+    if (v.backend === 'telegram') {
+        return `<span class="volume-note" data-note="refresh-unsupported" title="Refresh is not supported for the telegram backend — its db IS the index (the shadow index); use \`cydrive sync\` to replicate it to another instance instead"><i class="fa-solid fa-rotate"></i></span>`;
+    }
+    if (v.encrypted) {
+        return `<span class="volume-note" data-note="refresh-unsupported" title="Refresh refuses encrypted instances — the backend only sees ciphertext containers; use \`cydrive sync\` instead (the sync payload carries the encrypted row semantics)"><i class="fa-solid fa-rotate"></i></span>`;
+    }
+    const busy = v.rebuilding === true;
+    return `
+        <button class="btn-mini" data-action="refresh" data-name="${name}"${busy ? ' disabled' : ''}
+                title="Rebuild this volume's index from its remote backend (idempotent, runs in the background)">
+            <i class="fa-solid ${busy ? 'fa-circle-notch fa-spin' : 'fa-rotate'}"></i> Refresh
         </button>
     `;
 }
@@ -280,6 +316,7 @@ function setButtonLoading(button, loading) {
             unmount: 'fa-solid fa-eject',
             disable: 'fa-solid fa-power-off',
             enable: 'fa-solid fa-play',
+            refresh: 'fa-solid fa-rotate',
         }[button.dataset.action] || 'fa-solid fa-circle');
 }
 

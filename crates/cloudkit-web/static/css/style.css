@@ -663,6 +663,19 @@ a.volume-tab.volume-add:hover {
     cursor: wait;
 }
 
+/* The P6 muted note: the Refresh slot of a volume whose index cannot
+   be rebuilt from its backend (telegram's shadow index, encrypted
+   volumes) — a receding icon whose tooltip carries the guidance. */
+.volume-note {
+    display: inline-flex;
+    align-items: center;
+    margin-right: 0.35rem;
+    color: var(--text-muted);
+    opacity: 0.45;
+    cursor: help;
+    font-size: 0.78rem;
+}
+
 /* A disabled volume's whole row recedes. */
 tr.volume-disabled td {
     opacity: 0.5;

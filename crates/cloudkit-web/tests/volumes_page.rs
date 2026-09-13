@@ -884,3 +884,179 @@ async fn configs_endpoint_serves_the_parsed_listing() {
     let resp = send(addr, &request("GET", "/api/volumes/configs", addr, &[])).await;
     assert_eq!(status_of(&resp), 503, "no seam: {resp}");
 }
+
+// ------------------- the P6 rebuild route + the sparse config markers (§3-P6) ---
+
+/// `POST /api/volumes/{name}/rebuild` (P6): the Refresh button's
+/// endpoint — one `REBUILD <name>` through the seam (the same
+/// serialized surface the control channel runs; the acceptance comes
+/// back immediately, the walk is the instance's background task), the
+/// pinned write-family success shape, and the seam's `ERR:` (an
+/// already-running rebuild, the drained-queue refusal, the K11/telegram
+/// gates) as a 409 with its actionable text verbatim.
+#[tokio::test]
+async fn rebuild_route_forwards_the_command_and_maps_replies() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let (seam, seen) = recording_seam(
+        "OK: rebuild of `a` started in background — `LIST` shows progress; the result \
+         logs when done\n"
+            .to_string(),
+    );
+    let server = multi_server_with_commands(vec![entry], seam).await;
+    let addr = server.local_addr();
+
+    let resp = send(addr, &request("POST", "/api/volumes/a/rebuild", addr, &[])).await;
+    assert_eq!(status_of(&resp), 200, "the rebuild route answers: {resp}");
+    assert!(resp.contains("application/json"), "json: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse body");
+    assert_eq!(
+        body,
+        serde_json::json!({
+            "ok": true,
+            "reply": "rebuild of `a` started in background — `LIST` shows progress; the \
+                      result logs when done"
+        }),
+        "the pinned write-family success shape: {body}"
+    );
+    assert_eq!(
+        *seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+        vec!["REBUILD a".to_string()],
+        "the route sends exactly the REBUILD command"
+    );
+    server.shutdown().await;
+
+    // An ERR reply (the gates' refusals) maps to 409 with the text
+    // verbatim — the dashboard toasts the actionable wording as-is.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let server = multi_server_with_commands(
+        vec![entry],
+        canned_seam(
+            "ERR: rebuild already running on `a` (started 14:23:07) — `LIST` shows its \
+             progress\n"
+                .to_string(),
+        ),
+    )
+    .await;
+    let addr = server.local_addr();
+    let resp = send(addr, &request("POST", "/api/volumes/a/rebuild", addr, &[])).await;
+    assert_eq!(status_of(&resp), 409, "ERR maps to 409: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("error json");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("already running")),
+        "the refusal text rides the error verbatim: {body}"
+    );
+    server.shutdown().await;
+}
+
+/// The rebuild route joins the write family's gates wholesale: a
+/// foreign Origin 403s BEFORE the seam, a non-loopback binding without
+/// `allow_remote_admin` 403s naming the key, and a seam-less dashboard
+/// 503s — the P1 middleware/budget family inherited untouched.
+#[tokio::test]
+async fn rebuild_route_inherits_origin_remote_and_seam_gates() {
+    // Origin: refused before the seam is reached.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let (seam, seen) = recording_seam("OK: rebuild of `a` started in background\n".to_string());
+    let server = multi_server_with_commands(vec![entry], seam).await;
+    let addr = server.local_addr();
+    let resp = send(
+        addr,
+        &request(
+            "POST",
+            "/api/volumes/a/rebuild",
+            addr,
+            &[("Origin", "http://evil.example")],
+        ),
+    )
+    .await;
+    assert_eq!(
+        status_of(&resp),
+        403,
+        "cross-origin rebuild refused: {resp}"
+    );
+    assert!(
+        seen.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty(),
+        "the guard refuses before the seam is reached"
+    );
+    server.shutdown().await;
+
+    // Remote degrade: a non-loopback binding withholds the write.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let (seam, _seen) = recording_seam("OK: rebuild of `a` started in background\n".to_string());
+    let server = WebUiServer::serve_multi_with_remote_admin(
+        RegistryHandle::new(vec![entry]),
+        "0.0.0.0:0".parse().expect("parse the bind address"),
+        Some(seam),
+        false,
+    )
+    .await
+    .expect("serve on a non-loopback binding");
+    let addr = SocketAddr::from(([127, 0, 0, 1], server.local_addr().port()));
+    let resp = send(addr, &request("POST", "/api/volumes/a/rebuild", addr, &[])).await;
+    assert_eq!(status_of(&resp), 403, "remote rebuild withheld: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("error json");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("allow_remote_admin")),
+        "the refusal names the opt-in key: {body}"
+    );
+    server.shutdown().await;
+
+    // No seam: the family's 503.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let server = multi_server(vec![entry]).await;
+    let addr = server.local_addr();
+    let resp = send(addr, &request("POST", "/api/volumes/a/rebuild", addr, &[])).await;
+    assert_eq!(status_of(&resp), 503, "no seam: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("error json");
+    assert!(
+        body["error"].as_str().is_some_and(|msg| !msg.is_empty()),
+        "actionable error: {body}"
+    );
+}
+
+/// The configs rows' P2 sparse markers parse into the JSON the Refresh
+/// button gates on: `rebuilding` and `encrypted` ride as `true`, and a
+/// quiet row carries NEITHER key (the P1 row shape stays
+/// byte-for-byte — the frontend's `=== true` reads absence as false).
+#[tokio::test]
+async fn configs_endpoint_parses_the_sparse_rebuild_markers() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let (seam, _seen) = recording_seam(
+        "OK: 3 volume file(s)\n\
+         a local enabled=true running rebuilding\n\
+         enc local enabled=true running encrypted\n\
+         busy baidu enabled=true running encrypted rebuilding\n"
+            .to_string(),
+    );
+    let server = multi_server_with_commands(vec![entry], seam).await;
+    let addr = server.local_addr();
+
+    let resp = send(addr, &request("GET", "/api/volumes/configs", addr, &[])).await;
+    assert_eq!(status_of(&resp), 200, "ok: {resp}");
+    let rows: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse rows");
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            { "name": "a", "backend": "local", "enabled": true, "running": true,
+              "rebuilding": true },
+            { "name": "enc", "backend": "local", "enabled": true, "running": true,
+              "encrypted": true },
+            { "name": "busy", "backend": "baidu", "enabled": true, "running": true,
+              "encrypted": true, "rebuilding": true },
+        ]),
+        "the sparse markers ride their rows: {rows}"
+    );
+    server.shutdown().await;
+}
