@@ -138,6 +138,11 @@
 //! mode tables — multi serves the management page, single-volume the
 //! explanation page, 裁决④) stays open like every page/read route.
 //!
+//! UI polish round 2 adds `GET /volumes/system` next to it — the
+//! read-only system-parameters page, the same state-picked pattern
+//! (multi serves `system.html`, single-volume the explanation page);
+//! it reads only the existing endpoints, no new API surface.
+//!
 //! Single-volume mode (the `serve` constructor) is untouched: the same
 //! nine-route table, the same bodies, and a stray `?volume=` parameter
 //! is simply ignored (there is exactly one volume — no registry to
@@ -544,6 +549,11 @@ fn contract_routes(router: axum::Router<AppState>) -> axum::Router<AppState> {
         // management skeleton, the single-volume mode the explanation
         // page (裁决④) — one handler, state-picked body.
         .route("/volumes", get(page_volumes))
+        // The read-only system-parameters page (UI polish round 2) is
+        // the same trick one page over: multi-volume serves the
+        // parameters skeleton, single-volume the explanation page (its
+        // parameters ARE its config.toml).
+        .route("/volumes/system", get(page_volume_system))
         .route("/api/files", get(api_files))
         .route("/api/stats", get(api_stats))
         .route("/api/upload", post(api_upload))
@@ -787,6 +797,23 @@ async fn page_volumes(State(state): State<AppState>) -> Response {
     let template = match &state {
         AppState::Multi { .. } => "volumes.html",
         AppState::Single { .. } => "volumes-single.html",
+    };
+    match Templates::get(template) {
+        Some(file) => content_response("text/html; charset=utf-8", file.data.into_owned()),
+        None => StatusCode::NOT_FOUND.into_response(),
+    }
+}
+
+/// `GET /volumes/system` (UI polish round 2): the read-only system
+/// parameters page, one handler for both modes — multi-volume serves
+/// the parameters skeleton (`system.html`, filled by `system.js` off
+/// the existing read endpoints); a single-volume instance gets the
+/// explanation page (its one volume's parameters are its `config.toml`,
+/// there is no registry to enumerate).
+async fn page_volume_system(State(state): State<AppState>) -> Response {
+    let template = match &state {
+        AppState::Multi { .. } => "system.html",
+        AppState::Single { .. } => "system-single.html",
     };
     match Templates::get(template) {
         Some(file) => content_response("text/html; charset=utf-8", file.data.into_owned()),

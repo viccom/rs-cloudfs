@@ -16,7 +16,13 @@ const LANG = {
         // --- sidebar / navigation -------------------------------------
         'sidebar.views': 'Views',
         'page.files': 'Files',
-        'page.volumes': 'Volumes',
+        // The page pill's second segment: the config SECTION (not the
+        // one management page — the section submenu below names its
+        // pages exactly).
+        'pages.config': 'Configuration',
+        'config.volumes': 'Volume Management',
+        'config.system': 'System Parameters',
+        'config.readonly': 'Read-only',
 
         // --- shared ---------------------------------------------------
         'common.cancel': 'Cancel',
@@ -80,6 +86,7 @@ const LANG = {
         'pagination.next': 'Next',
         'pagination.page_x_of_y': 'Page {x} / {y}',
         'pagination.total': '{n} total',
+        'pagination.per_page': '{n} / page',
 
         // --- volumes (configuration-state page) ------------------------
         'volumes.title': 'Volume Management',
@@ -189,13 +196,61 @@ hand-written comments are lost. Credential fields left empty keep their stored v
         'vsingle.p2_2': ' at a directory of ',
         'vsingle.p2_3': ' volume files and restart. The usage-state dashboard for the current volume is ',
         'vsingle.p2_4': 'on the home page',
+
+        // --- the system parameters page (read-only, UI polish round 2) ----
+        'system.title': 'System Parameters',
+        'system.subtitle': "Read-only · from the instance's current configuration",
+        'sys.instance': 'Instance',
+        'sys.dashboard_url': 'Dashboard address',
+        'sys.webdav_endpoints': 'WebDAV endpoints',
+        'sys.volume_files': 'Volume files',
+        'sys.running_volumes': 'Running volumes',
+        'sys.volume_params': 'Storage Volume Parameters',
+        'sys.loading': 'Loading configuration...',
+        'sys.config_unavailable': 'the volume\'s configuration is unavailable (the SHOW command did not answer)',
+        'sys.cred_set': 'Set',
+        'sys.cred_unset': 'Not set',
+        'sys.value.yes': 'yes',
+        'sys.value.no': 'no',
+
+        // Configuration-key display labels: the key → readable-label map
+        // (a key missing here renders under its raw toml name).
+        'syskey.enabled': 'Enabled',
+        'syskey.drive_letter': 'Drive letter',
+        'syskey.chunk_size_mb': 'Chunk size (MB)',
+        'syskey.enable_encryption': 'Enable encryption',
+        'syskey.encryption_scheme': 'Encryption scheme',
+        'syskey.baidu_root': 'Baidu app root',
+        'syskey.baidu_app_key': 'App key',
+        'syskey.local_root': 'Local root',
+        'syskey.storage_path': 'Storage path',
+        'syskey.cache_path': 'Cache path',
+        'syskey.db_path': 'Database path',
+        'syskey.sync_url': 'Sync URL',
+        'syskey.sync_interval_secs': 'Sync interval (s)',
+        'syskey.chat_id': 'Chat ID',
+        'syskey.bot_token': 'Bot token',
+        'syskey.encryption_password': 'Encryption password',
+        'syskey.sync_secret': 'Sync secret',
+        'syskey.baidu_app_secret': 'App secret',
+        'syskey.baidu_access_token': 'Access token',
+        'syskey.baidu_refresh_token': 'Refresh token',
+
+        // --- the system page's single-volume explanation ------------------
+        'syssingle.p1_1': 'Single-volume mode: this instance serves ',
+        'syssingle.p1_2': 'one volume defined by ',
+        'syssingle.p1_3': " — its parameters are that file's content, and this read-only page serves multi-volume instances.",
     },
 
     zh: {
         // --- 侧栏 / 导航 ---------------------------------------------
         'sidebar.views': '视图',
         'page.files': '文件管理',
-        'page.volumes': '卷配置',
+        // 页面 pill 第二段：配置「分区」（其下的子菜单精确点名各页）。
+        'pages.config': '配置管理',
+        'config.volumes': '卷管理',
+        'config.system': '系统参数',
+        'config.readonly': '只读',
 
         // --- 通用 ------------------------------------------------------
         'common.cancel': '取消',
@@ -259,6 +314,7 @@ hand-written comments are lost. Credential fields left empty keep their stored v
         'pagination.next': '下一页',
         'pagination.page_x_of_y': '第 {x} / {y} 页',
         'pagination.total': '共 {n} 条',
+        'pagination.per_page': '{n} / 页',
 
         // --- volumes（配置态管理页）--------------------------------------
         'volumes.title': '卷管理',
@@ -366,6 +422,49 @@ hand-written comments are lost. Credential fields left empty keep their stored v
         'vsingle.p2_2': '指向一个存放',
         'vsingle.p2_3': '卷文件的目录并重启。当前卷的使用态仪表盘在',
         'vsingle.p2_4': '首页',
+
+        // --- 系统参数页（只读，UI polish 第二轮）---------------------------
+        'system.title': '系统参数',
+        'system.subtitle': '只读 · 来自实例当前配置',
+        'sys.instance': '实例',
+        'sys.dashboard_url': '仪表盘地址',
+        'sys.webdav_endpoints': 'WebDAV 端点',
+        'sys.volume_files': '卷文件数',
+        'sys.running_volumes': '运行中卷数',
+        'sys.volume_params': '存储卷参数',
+        'sys.loading': '正在加载配置…',
+        'sys.config_unavailable': '该卷的配置不可用（SHOW 命令未应答）',
+        'sys.cred_set': '已设置',
+        'sys.cred_unset': '未设置',
+        'sys.value.yes': '是',
+        'sys.value.no': '否',
+
+        // 配置键展示标签：键 → 可读标签映射（未收录的键按原始 toml 键名显示）。
+        'syskey.enabled': '启用',
+        'syskey.drive_letter': '盘符',
+        'syskey.chunk_size_mb': '分块大小（MB）',
+        'syskey.enable_encryption': '启用加密',
+        'syskey.encryption_scheme': '加密方案',
+        'syskey.baidu_root': '百度应用根目录',
+        'syskey.baidu_app_key': 'App key',
+        'syskey.local_root': '本地根目录',
+        'syskey.storage_path': '存储路径',
+        'syskey.cache_path': '缓存路径',
+        'syskey.db_path': '数据库路径',
+        'syskey.sync_url': '同步 URL',
+        'syskey.sync_interval_secs': '同步间隔（秒）',
+        'syskey.chat_id': 'Chat ID',
+        'syskey.bot_token': 'Bot token',
+        'syskey.encryption_password': '加密密码',
+        'syskey.sync_secret': '同步密钥',
+        'syskey.baidu_app_secret': 'App secret',
+        'syskey.baidu_access_token': 'Access token',
+        'syskey.baidu_refresh_token': 'Refresh token',
+
+        // --- 系统参数页的单卷说明 -------------------------------------------
+        'syssingle.p1_1': '单卷模式：本实例仅服务',
+        'syssingle.p1_2': '由',
+        'syssingle.p1_3': '定义的那一个卷——其参数即该文件的内容；本只读页面服务多卷模式实例。',
     },
 };
 
