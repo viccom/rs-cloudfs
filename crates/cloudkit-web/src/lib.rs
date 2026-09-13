@@ -83,13 +83,30 @@
 //!   credential VALUE never reaches this layer). The registry gates the
 //!   lookup (a REMOVE'd volume 404s though its file stays), no seam
 //!   answers 503.
+//! - `GET /api/volumes/configs` (P1) — the configuration FULL set (the
+//!   management page's data source: the registry listing cannot see
+//!   disabled volumes): one `CONFIGS` through the seam, the row lines
+//!   parsed into `{name, backend, enabled, running}` / `{name,
+//!   invalid, reason}` JSON.
+//! - `POST /api/volumes/{name}/remove|disable|enable` (P1) — the
+//!   management write family: one command through the same seam (the
+//!   SAME serialized execution the control channel funnels into), the
+//!   reply mapped to `{"ok": true, "reply": "..."}` or a 409 carrying
+//!   the actionable `ERR:` text. The web-side budget is the control
+//!   client's 120s (a REMOVE legitimately drains uploads first). No
+//!   registry gate: a disabled volume is by definition absent from the
+//!   registry — the command's own reply is the authority.
 //!
-//! The volume-management family (`/api/volumes`, the config route, and
-//! the P1+ write routes) runs behind a same-origin guard (§1.5 裁决③):
-//! an Origin/Referer naming another site 403s; headerless requests
-//! (non-browser clients) pass. `GET /volumes` (both mode tables —
-//! multi serves the management page, single-volume the explanation
-//! page, 裁决④) stays open like every page/read route.
+//! The volume-management family (`/api/volumes`, the two config
+//! routes, and the write routes) runs behind a same-origin guard (§1.5
+//! 裁决③): an Origin/Referer naming another site 403s; headerless
+//! requests (non-browser clients) pass. The write family additionally
+//! carries the §1.5 non-loopback ruling: bound to a non-loopback
+//! address without the process key `allow_remote_admin = true`, the
+//! write routes 403 naming that key (the management plane degrades to
+//! read-only; the reads and pages stay open). `GET /volumes` (both
+//! mode tables — multi serves the management page, single-volume the
+//! explanation page, 裁决④) stays open like every page/read route.
 //!
 //! Single-volume mode (the `serve` constructor) is untouched: the same
 //! nine-route table, the same bodies, and a stray `?volume=` parameter
@@ -400,13 +417,44 @@ impl WebUiServer {
     /// handler the cli composition root installed on the control
     /// channel, so both trigger sources serialize behind one queue.
     /// `None` keeps the read-only dashboard (the seam routes answer
-    /// their actionable 503).
+    /// their actionable 503). Equivalent to
+    /// [`WebUiServer::serve_multi_with_remote_admin`] without the
+    /// opt-in: a non-loopback bind keeps the write family withheld.
     pub async fn serve_multi_with_commands(
         volumes: RegistryHandle,
         addr: SocketAddr,
         commands: Option<VolumeCommandClient>,
     ) -> Result<Self, WebUiError> {
-        let app = multi_router(volumes, commands);
+        Self::serve_multi_with_remote_admin(volumes, addr, commands, false).await
+    }
+
+    /// [`WebUiServer::serve_multi_with_commands`] plus the §1.5
+    /// remote-administration ruling: the management WRITE family
+    /// (`POST /api/volumes/{name}/{remove,enable,disable}`) serves only
+    /// when the bind address is loopback OR the operator passed
+    /// `allow_remote_admin = true` (the process key of the same name,
+    /// threaded in by the cli assembly). A non-loopback bind without the
+    /// opt-in degrades the management plane to read-only — the write
+    /// routes 403 naming the key, the reads (listing, configs, config)
+    /// stay open — with a startup warning.
+    pub async fn serve_multi_with_remote_admin(
+        volumes: RegistryHandle,
+        addr: SocketAddr,
+        commands: Option<VolumeCommandClient>,
+        allow_remote_admin: bool,
+    ) -> Result<Self, WebUiError> {
+        let writes_allowed = addr.ip().is_loopback() || allow_remote_admin;
+        if !writes_allowed {
+            // The crate's log face is eprintln (the accept-loop error
+            // precedent); the cli assembly's tracing carries the same
+            // fact on its own.
+            eprintln!(
+                "[web-ui] bound to a non-loopback address ({addr}): the \
+                 volume-management write routes are disabled (403) — set \
+                 allow_remote_admin = true in config.toml to manage volumes remotely"
+            );
+        }
+        let app = multi_router(volumes, commands, writes_allowed);
         serve_router(app, addr).await
     }
 
@@ -494,20 +542,46 @@ fn router(vfs: Arc<Vfs>, cfg: WebUiConfig) -> axum::Router {
 
 /// Assembles the multi-volume route table: the nine contract routes
 /// (K23 volume-parameter flavour) plus the two registry routes and the
-/// volume-management family — `/api/volumes` and the config endpoint
-/// share the same-origin guard (§1.5 裁决③; the P1+ write routes join
-/// this family), the family deliberately NOT spanning the read routes
-/// (downloads stay linkable from anywhere).
-fn multi_router(volumes: RegistryHandle, commands: Option<VolumeCommandClient>) -> axum::Router {
-    let state = AppState::Multi { volumes, commands };
+/// volume-management family — `/api/volumes`, the config endpoint, the
+/// configs listing and the P1 write routes share the same-origin guard
+/// (§1.5 裁决③), the family deliberately NOT spanning the read routes
+/// (downloads stay linkable from anywhere). `writes_allowed` is the
+/// §1.5 verdict (loopback bind or the `allow_remote_admin` opt-in);
+/// the write handlers 403 when it is `false`.
+fn multi_router(
+    volumes: RegistryHandle,
+    commands: Option<VolumeCommandClient>,
+    writes_allowed: bool,
+) -> axum::Router {
+    let state = AppState::Multi {
+        volumes,
+        commands,
+        writes_allowed,
+    };
     contract_routes(axum::Router::new())
         .route(
             "/api/volumes",
             get(api_volumes).layer(axum::middleware::from_fn(same_origin_guard)),
         )
         .route(
+            "/api/volumes/configs",
+            get(api_volume_configs).layer(axum::middleware::from_fn(same_origin_guard)),
+        )
+        .route(
             "/api/volumes/{name}/config",
             get(api_volume_config).layer(axum::middleware::from_fn(same_origin_guard)),
+        )
+        .route(
+            "/api/volumes/{name}/remove",
+            post(api_volume_remove).layer(axum::middleware::from_fn(same_origin_guard)),
+        )
+        .route(
+            "/api/volumes/{name}/disable",
+            post(api_volume_disable).layer(axum::middleware::from_fn(same_origin_guard)),
+        )
+        .route(
+            "/api/volumes/{name}/enable",
+            post(api_volume_enable).layer(axum::middleware::from_fn(same_origin_guard)),
         )
         .route("/api/stats/summary", get(api_stats_summary))
         .with_state(state)
@@ -528,10 +602,13 @@ enum AppState {
     /// re-read per request (RV1) to resolve the `?volume=<name>`
     /// parameter, plus the volume-command seam (web volume management
     /// §1.1) the management routes send through — `None` on a dashboard
-    /// booted without one (those routes answer 503).
+    /// booted without one (those routes answer 503) — and the §1.5
+    /// write verdict (loopback bind or the `allow_remote_admin`
+    /// opt-in; the write routes 403 when `false`).
     Multi {
         volumes: RegistryHandle,
         commands: Option<VolumeCommandClient>,
+        writes_allowed: bool,
     },
 }
 
@@ -749,7 +826,10 @@ const VOLUME_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// [`VOLUME_COMMAND_TIMEOUT`] 503s actionably, and the seam's `ERR:`
 /// replies carry their actionable text as 404s.
 async fn api_volume_config(State(state): State<AppState>, Path(name): Path<String>) -> Response {
-    let AppState::Multi { volumes, commands } = &state else {
+    let AppState::Multi {
+        volumes, commands, ..
+    } = &state
+    else {
         return error_json(
             StatusCode::NOT_FOUND,
             "no volume registry: this dashboard serves a single volume",
@@ -792,6 +872,180 @@ async fn api_volume_config(State(state): State<AppState>, Path(name): Path<Strin
                 "the SHOW reply was not valid JSON — the volume file may be mid-edit; retry",
             ),
         },
+        None => error_json(
+            StatusCode::NOT_FOUND,
+            reply.trim().trim_start_matches("ERR: "),
+        ),
+    }
+}
+
+// --------------------------- the P1 write family + configs (web volume §1.2/§1.5) ---
+
+/// The write-family seam budget: a REMOVE legitimately waits out its
+/// 60s drain + 10s unmount windows (K50), so the web call carries the
+/// control client's own 120s budget (M1 `EXCHANGE_BUDGET` semantics)
+/// instead of the read family's 5s — the dashboard parks behind a long
+/// command rather than giving up on it.
+const VOLUME_WRITE_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The shared body of the three write routes (P1, plan §1.2): the §1.5
+/// write verdict first (403 naming the opt-in key on a non-loopback
+/// bind), then one command through the seam with the write budget.
+/// Replies: the pinned success shape `{"ok": true, "reply": "..."}` (the
+/// `OK: ` prefix stripped — the dashboard toasts the text verbatim), a
+/// seam `ERR:` as 409 with its actionable text (a refused mutation is a
+/// conflict; the reply text is what the operator needs), a missing seam
+/// the family 503, a command that outlives the budget the busy 503.
+/// No registry gate on purpose: a DISABLED volume is by definition
+/// absent from the registry — the command's own reply is the authority
+/// on unknown names.
+async fn volume_write_route(state: AppState, name: String, verb: &str) -> Response {
+    let AppState::Multi {
+        commands,
+        writes_allowed,
+        ..
+    } = state
+    else {
+        return error_json(
+            StatusCode::NOT_FOUND,
+            "no volume registry: this dashboard serves a single volume",
+        );
+    };
+    if !writes_allowed {
+        return error_json(
+            StatusCode::FORBIDDEN,
+            "remote administration is disabled: the web UI is bound to a non-loopback \
+             address, so the volume-management write routes refuse requests — set \
+             `allow_remote_admin = true` in config.toml to manage volumes remotely",
+        );
+    }
+    let Some(client) = commands else {
+        return error_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "volume commands are not available: this dashboard runs without the \
+             volume-command seam (the multi-volume cli assembly installs it)",
+        );
+    };
+    let command = format!("{verb} {name}");
+    let reply = match tokio::time::timeout(VOLUME_WRITE_TIMEOUT, client(&command)).await {
+        Ok(reply) => reply,
+        Err(_elapsed) => {
+            return error_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                format!(
+                    "the {verb} command for '{name}' timed out — the instance is likely busy \
+                     with a long volume command (e.g. a REMOVE draining an upload); retry \
+                     once it settles"
+                ),
+            );
+        }
+    };
+    match reply.trim().strip_prefix("OK: ") {
+        Some(payload) => Json(serde_json::json!({
+            "ok": true,
+            "reply": payload.trim(),
+        }))
+        .into_response(),
+        None => error_json(
+            StatusCode::CONFLICT,
+            reply.trim().trim_start_matches("ERR: "),
+        ),
+    }
+}
+
+/// `POST /api/volumes/{name}/remove` (P1): an unmount through the same
+/// K50 sequence the control channel's REMOVE runs (the seam forwards to
+/// the identical handler).
+async fn api_volume_remove(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    volume_write_route(state, name, "REMOVE").await
+}
+
+/// `POST /api/volumes/{name}/disable` (P1): `enabled = false` written to
+/// the volume file first, then the same unmount as REMOVE.
+async fn api_volume_disable(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    volume_write_route(state, name, "DISABLE").await
+}
+
+/// `POST /api/volumes/{name}/enable` (P1): `enabled = true` written,
+/// then the volume re-assembles through the runtime ADD path.
+async fn api_volume_enable(State(state): State<AppState>, Path(name): Path<String>) -> Response {
+    volume_write_route(state, name, "ENABLE").await
+}
+
+/// One CONFIGS reply row parsed into its JSON face: a loadable file as
+/// `{name, backend, enabled, running}`, a schema-broken one as
+/// `{name, invalid: true, reason}` (the reason is display text — a
+/// re-parse failure keeps the row with the invalid marker rather than
+/// dropping it).
+fn configs_row_json(line: &str) -> serde_json::Value {
+    let mut tokens = line.split_whitespace();
+    let name = tokens.next().unwrap_or_default();
+    match tokens.next() {
+        Some("invalid") => {
+            // The row wraps its reason in parentheses; unwrap the pair.
+            let reason = tokens.collect::<Vec<_>>().join(" ");
+            let reason = reason
+                .strip_prefix('(')
+                .and_then(|inner| inner.strip_suffix(')'))
+                .unwrap_or(&reason);
+            serde_json::json!({
+                "name": name,
+                "invalid": true,
+                "reason": reason,
+            })
+        }
+        Some(backend) => {
+            let enabled = tokens
+                .next()
+                .and_then(|flag| flag.strip_prefix("enabled="))
+                .and_then(|flag| flag.parse::<bool>().ok());
+            let running = tokens.next() == Some("running");
+            serde_json::json!({
+                "name": name,
+                "backend": backend,
+                "enabled": enabled,
+                "running": running,
+            })
+        }
+        None => serde_json::json!({ "name": name, "invalid": true, "reason": "" }),
+    }
+}
+
+/// `GET /api/volumes/configs` (P1, the config page's data source): one
+/// `CONFIGS` through the seam (the configuration FULL set — `/api/volumes`
+/// reads the registry, which cannot see disabled volumes), the reply's
+/// row lines parsed into JSON. The read budget suffices: CONFIGS is a
+/// directory scan plus file parses. An `ERR:` reply carries its text as
+/// a 404 (the config endpoint's mapping), a missing seam the family 503.
+async fn api_volume_configs(State(state): State<AppState>) -> Response {
+    let AppState::Multi { commands, .. } = &state else {
+        return error_json(
+            StatusCode::NOT_FOUND,
+            "no volume registry: this dashboard serves a single volume",
+        );
+    };
+    let Some(client) = commands else {
+        return error_json(
+            StatusCode::SERVICE_UNAVAILABLE,
+            "volume configurations are not available: this dashboard runs without the \
+             volume-command seam (the multi-volume cli assembly installs it)",
+        );
+    };
+    let reply = match tokio::time::timeout(VOLUME_COMMAND_TIMEOUT, client("CONFIGS")).await {
+        Ok(reply) => reply,
+        Err(_elapsed) => {
+            return error_json(
+                StatusCode::SERVICE_UNAVAILABLE,
+                "the CONFIGS listing timed out — the instance is likely busy with a long \
+                 volume command (e.g. a REMOVE draining an upload); retry once it settles",
+            );
+        }
+    };
+    match reply.strip_prefix("OK: ") {
+        Some(rows) => Json(serde_json::Value::Array(
+            rows.lines().skip(1).map(configs_row_json).collect(),
+        ))
+        .into_response(),
         None => error_json(
             StatusCode::NOT_FOUND,
             reply.trim().trim_start_matches("ERR: "),

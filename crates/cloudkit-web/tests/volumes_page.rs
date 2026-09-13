@@ -609,3 +609,278 @@ async fn origin_guard_scoped_to_the_volume_management_family() {
         );
     }
 }
+
+// -------------------------- the P1 write routes + configs endpoint (§1.2/§1.5) ---
+
+/// A seam that records every command it received and answers the canned
+/// reply — the write routes' transport.
+fn recording_seam(reply: String) -> (VolumeCommandClient, Arc<std::sync::Mutex<Vec<String>>>) {
+    let seen: Arc<std::sync::Mutex<Vec<String>>> = Arc::default();
+    let seen_for_closure = Arc::clone(&seen);
+    let client: VolumeCommandClient = Arc::new(move |line: &str| {
+        seen_for_closure
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .push(line.to_string());
+        let reply = reply.clone();
+        Box::pin(async move { reply })
+    });
+    (client, seen)
+}
+
+/// The three write routes forward their commands through the seam and
+/// answer the pinned success shape: `{"ok": true, "reply": "..."}` with
+/// the `OK: ` prefix stripped (the dashboard toasts the reply verbatim).
+#[tokio::test]
+async fn write_routes_forward_their_commands_through_the_seam() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let (seam, seen) = recording_seam("OK: removed volume `a`\n".to_string());
+    let server = multi_server_with_commands(vec![entry], seam).await;
+    let addr = server.local_addr();
+
+    for target in [
+        "/api/volumes/a/remove",
+        "/api/volumes/a/disable",
+        "/api/volumes/a/enable",
+    ] {
+        let resp = send(addr, &request("POST", target, addr, &[])).await;
+        assert_eq!(status_of(&resp), 200, "{target} ok: {resp}");
+        assert!(resp.contains("application/json"), "json: {resp}");
+        let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse body");
+        assert_eq!(
+            body,
+            serde_json::json!({ "ok": true, "reply": "removed volume `a`" }),
+            "the pinned success shape ({target}): {body}"
+        );
+    }
+    assert_eq!(
+        *seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+        vec!["REMOVE a", "DISABLE a", "ENABLE a"],
+        "each route sends its own command line"
+    );
+}
+
+/// The write routes map the seam's `ERR:` replies to 409 with the
+/// actionable text verbatim (a refused mutation is a conflict, and the
+/// dashboard toasts the text as-is).
+#[tokio::test]
+async fn write_routes_map_err_replies_to_409_with_the_text() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let server = multi_server_with_commands(
+        vec![entry],
+        canned_seam(
+            "ERR: no volume registered under `ghost` — `LIST` shows the current set\n".to_string(),
+        ),
+    )
+    .await;
+    let addr = server.local_addr();
+
+    let resp = send(
+        addr,
+        &request("POST", "/api/volumes/ghost/remove", addr, &[]),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 409, "ERR maps to 409: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("error json");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("no volume registered")),
+        "the ERR text rides the error verbatim: {body}"
+    );
+}
+
+/// Without the command seam the write routes answer their actionable
+/// 503 (the read-only dashboard boot).
+#[tokio::test]
+async fn write_routes_require_the_seam() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let server = multi_server(vec![entry]).await;
+    let addr = server.local_addr();
+
+    for target in [
+        "/api/volumes/a/remove",
+        "/api/volumes/a/disable",
+        "/api/volumes/a/enable",
+    ] {
+        let resp = send(addr, &request("POST", target, addr, &[])).await;
+        assert_eq!(status_of(&resp), 503, "no seam ({target}): {resp}");
+        let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("error json");
+        assert!(
+            body["error"].as_str().is_some_and(|msg| !msg.is_empty()),
+            "actionable error: {body}"
+        );
+    }
+}
+
+/// The P0 Origin middleware covers the write routes (裁决③: the
+/// state-changing family is what it exists for): a foreign Origin 403s
+/// BEFORE the seam is reached.
+#[tokio::test]
+async fn write_routes_inherit_the_origin_guard() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let (seam, seen) = recording_seam("OK: removed volume `a`\n".to_string());
+    let server = multi_server_with_commands(vec![entry], seam).await;
+    let addr = server.local_addr();
+
+    let resp = send(
+        addr,
+        &request(
+            "POST",
+            "/api/volumes/a/remove",
+            addr,
+            &[("Origin", "http://evil.example")],
+        ),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 403, "cross-origin POST refused: {resp}");
+    assert!(
+        seen.lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .is_empty(),
+        "the guard refuses before the seam is reached"
+    );
+}
+
+/// §1.5's non-loopback degrade: binding a non-loopback address withholds
+/// the management WRITE family (403 naming `allow_remote_admin`) while
+/// the reads — including the configs listing — stay open; the explicit
+/// opt-in restores the writes.
+#[tokio::test]
+async fn non_loopback_binding_forbids_write_routes_without_the_opt_in() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let (seam, _seen) =
+        recording_seam("OK: 1 volume file(s)\na local enabled=true running\n".to_string());
+    let server = WebUiServer::serve_multi_with_remote_admin(
+        RegistryHandle::new(vec![entry]),
+        // 0.0.0.0 is the standard "listen everywhere" binding the guard
+        // exists for; the client reaches it over the loopback interface.
+        "0.0.0.0:0".parse().expect("parse the bind address"),
+        Some(seam),
+        false,
+    )
+    .await
+    .expect("serve on a non-loopback binding");
+    // Windows refuses to CONNECT to 0.0.0.0 (AddrNotAvailable): the
+    // client reaches the wildcard binding over the loopback interface.
+    let addr = SocketAddr::from(([127, 0, 0, 1], server.local_addr().port()));
+
+    for target in [
+        "/api/volumes/a/remove",
+        "/api/volumes/a/disable",
+        "/api/volumes/a/enable",
+    ] {
+        let resp = send(addr, &request("POST", target, addr, &[])).await;
+        assert_eq!(status_of(&resp), 403, "write withheld ({target}): {resp}");
+        let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("error json");
+        assert!(
+            body["error"]
+                .as_str()
+                .is_some_and(|msg| msg.contains("allow_remote_admin")),
+            "the refusal names the opt-in key: {body}"
+        );
+    }
+    let resp = send(addr, &request("GET", "/api/volumes", addr, &[])).await;
+    assert_eq!(
+        status_of(&resp),
+        200,
+        "the read listing stays open (read-only degrade): {resp}"
+    );
+    let resp = send(addr, &request("GET", "/api/volumes/configs", addr, &[])).await;
+    assert_eq!(
+        status_of(&resp),
+        200,
+        "the configs listing is a read: {resp}"
+    );
+    server.shutdown().await;
+
+    // The opt-in restores the writes.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let (seam, _seen) = recording_seam("OK: removed volume `a`\n".to_string());
+    let server = WebUiServer::serve_multi_with_remote_admin(
+        RegistryHandle::new(vec![entry]),
+        "0.0.0.0:0".parse().expect("parse the bind address"),
+        Some(seam),
+        true,
+    )
+    .await
+    .expect("serve with the opt-in");
+    let addr = SocketAddr::from(([127, 0, 0, 1], server.local_addr().port()));
+    let resp = send(addr, &request("POST", "/api/volumes/a/remove", addr, &[])).await;
+    assert_eq!(
+        status_of(&resp),
+        200,
+        "allow_remote_admin = true restores the write family: {resp}"
+    );
+    server.shutdown().await;
+}
+
+/// `GET /api/volumes/configs` (the config page's data source): one
+/// `CONFIGS` through the seam, the row lines parsed into JSON — good
+/// rows as `{name, backend, enabled, running}`, broken files as
+/// `{name, invalid, reason}`. An `ERR:` reply carries its text as a 404
+/// (the P0 config endpoint's mapping) and a missing seam the 503.
+#[tokio::test]
+async fn configs_endpoint_serves_the_parsed_listing() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let (seam, seen) = recording_seam(
+        "OK: 3 volume file(s)\n\
+         a telegram enabled=true running\n\
+         b local enabled=false absent\n\
+         broken invalid (unknown key `no_such_key`)\n"
+            .to_string(),
+    );
+    let server = multi_server_with_commands(vec![entry], seam).await;
+    let addr = server.local_addr();
+
+    let resp = send(addr, &request("GET", "/api/volumes/configs", addr, &[])).await;
+    assert_eq!(status_of(&resp), 200, "ok: {resp}");
+    assert!(
+        resp.contains("application/json"),
+        "json content type: {resp}"
+    );
+    let rows: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("parse rows");
+    assert_eq!(
+        rows,
+        serde_json::json!([
+            { "name": "a", "backend": "telegram", "enabled": true, "running": true },
+            { "name": "b", "backend": "local", "enabled": false, "running": false },
+            { "name": "broken", "invalid": true, "reason": "unknown key `no_such_key`" },
+        ]),
+        "the CONFIGS rows parsed into the pinned JSON shapes: {rows}"
+    );
+    assert_eq!(
+        *seen.lock().unwrap_or_else(|poisoned| poisoned.into_inner()),
+        vec!["CONFIGS".to_string()],
+        "the endpoint sends exactly the CONFIGS command"
+    );
+    server.shutdown().await;
+
+    // An ERR reply maps to 404 with its text.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let server = multi_server_with_commands(
+        vec![entry],
+        canned_seam("ERR: this instance runs single-volume mode\n".to_string()),
+    )
+    .await;
+    let addr = server.local_addr();
+    let resp = send(addr, &request("GET", "/api/volumes/configs", addr, &[])).await;
+    assert_eq!(status_of(&resp), 404, "ERR maps to 404: {resp}");
+    server.shutdown().await;
+
+    // No seam: the family's 503.
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let server = multi_server(vec![entry]).await;
+    let addr = server.local_addr();
+    let resp = send(addr, &request("GET", "/api/volumes/configs", addr, &[])).await;
+    assert_eq!(status_of(&resp), 503, "no seam: {resp}");
+}

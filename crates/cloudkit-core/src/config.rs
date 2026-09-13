@@ -76,6 +76,7 @@ pub const KNOWN_TOML_KEYS: &[&str] = &[
     "web_ui_host",
     "web_ui_port",
     "enable_web_ui",
+    "allow_remote_admin",
     "drive_letter",
     "auto_mount_drive",
     "mount_backend",
@@ -139,6 +140,7 @@ const LEGACY_REJECTED_KEYS: &[&str] = &[
     "local_root",
     "volumes_dir",
     "enabled",
+    "allow_remote_admin",
 ];
 
 /// Client-side encryption container scheme (Batch E / E-4, foundation D7).
@@ -276,6 +278,9 @@ pub const PROCESS_SCOPED_KEYS: &[&str] = &[
     // claim, so a per-volume spelling would leave sibling mounts under a
     // different backend with no single place to reason about them.
     "mount_backend",
+    // The dashboard's remote-administration opt-in (web volume
+    // management §1.5): one switch for the ONE process dashboard.
+    "allow_remote_admin",
 ];
 
 /// Volume-scoped keys (Phase 2.5 / K19): everything a single storage
@@ -645,6 +650,54 @@ fn toml_value_json(value: &toml::Value) -> serde_json::Value {
     }
 }
 
+/// Renders a volume file's EXPLICIT keys back as toml — the controlled
+/// rewrite primitive behind ENABLE/DISABLE (web volume management plan
+/// §1.2's narrow UPDATE form; CREATE/UPDATE in P3/P4 reuse it). The
+/// explicit keys render in the file's own order (one `key = value` per
+/// line, values through toml's own value serialization), an overrides
+/// key REPLACES its explicit twin in place or APPENDS when the file
+/// never set it, and **no default keys are paved** — the same philosophy
+/// as the setup hand-written template ([`CyDriveConfig::save_toml`]'s
+/// 29-key paving would drown a hand-maintained volume file). Comments
+/// are lost (裁决①: accepted, callers must surface it); the output
+/// re-parses through [`load_volume_config`] (pinned by tests).
+pub fn render_volume_toml(explicit: &toml::Table, overrides: &toml::Table) -> String {
+    let mut text = String::new();
+    for (key, value) in explicit {
+        let value = overrides.get(key).unwrap_or(value);
+        text.push_str(&format!("{key} = {value}\n"));
+    }
+    for (key, value) in overrides {
+        if !explicit.contains_key(key) {
+            text.push_str(&format!("{key} = {value}\n"));
+        }
+    }
+    text
+}
+
+/// The ENABLE/DISABLE file write (web volume management §1.2): rewrite
+/// one volume file with the `enabled` flag overlaid through
+/// [`render_volume_toml`]. The file is validated through the FULL
+/// [`load_volume_config`] funnel first — a half-validated file is never
+/// "repaired" by a rewrite that cannot know what it would destroy — and
+/// the raw table is then re-read for the render (the SHOW serializer's
+/// double-read precedent; a toggle is a rare, human-scale command).
+pub fn write_volume_enabled(path: &Path, enabled: bool) -> Result<(), ConfigError> {
+    load_volume_config(path)?;
+    let text = fs::read_to_string(path).map_err(|source| ConfigError::Read {
+        path: path_as_str(path),
+        source,
+    })?;
+    let explicit: toml::Table = toml::from_str(&text).map_err(|err| ConfigError::Parse {
+        path: path_as_str(path),
+        message: redact_credential_values(&err.to_string()),
+    })?;
+    let mut overrides = toml::Table::new();
+    overrides.insert("enabled".to_string(), toml::Value::Boolean(enabled));
+    fs::write(path, render_volume_toml(&explicit, &overrides))?;
+    Ok(())
+}
+
 /// Lists the `*.toml` volume files in `dir` (non-recursive), sorted
 /// stably by file name (K19). A missing directory and a directory with
 /// no volume files are both actionable errors — an empty multi-volume
@@ -807,6 +860,14 @@ fn is_enabled(value: &bool) -> bool {
     *value
 }
 
+/// `skip_serializing_if` predicate for `allow_remote_admin`: the default
+/// (`false`, the safe stance) is omitted — a `setup`-written process
+/// config stays byte-identical to the pre-key form; an explicit `true`
+/// (the remote-administration opt-in) survives the round-trip.
+fn is_default_allow_remote_admin(value: &bool) -> bool {
+    !*value
+}
+
 /// Default `baidu_root` (Phase 2 / K17): the Baidu app-dir root
 /// (ck-baidu `DEFAULT_ROOT` — the driver crate owns the value, this
 /// mirrors it for the config default; the composition root passes the
@@ -876,6 +937,20 @@ pub struct CyDriveConfig {
     pub web_ui_port: u16,
     /// Whether to start the web dashboard at all.
     pub enable_web_ui: bool,
+    /// Whether the dashboard's volume-management WRITE routes
+    /// (`POST /api/volumes/<name>/{remove,enable,disable}`) stay enabled
+    /// when the web UI binds a non-loopback `web_ui_host` (web volume
+    /// management plan §1.5). A **process-scoped** key (K19 partition:
+    /// one switch for the ONE process dashboard). The default — `false`
+    /// — is the safe stance: a remotely reachable dashboard refuses
+    /// volume mutations (403 naming this key) unless the operator
+    /// explicitly opts in, so binding `0.0.0.0` for read-only browsing
+    /// never silently opens volume administration to the network.
+    /// `validate` adds no rule — a bool has no invalid value.
+    /// Serialization emits the key only when `true` (a `setup`-written
+    /// process config stays byte-identical to the pre-key form).
+    #[serde(default, skip_serializing_if = "is_default_allow_remote_admin")]
+    pub allow_remote_admin: bool,
     /// Windows drive letter to mount, canonical form `"X:"`.
     pub drive_letter: String,
     /// Whether to auto-mount the drive on startup.
@@ -1029,6 +1104,7 @@ impl Default for CyDriveConfig {
             web_ui_host: "127.0.0.1".to_string(),
             web_ui_port: 8088,
             enable_web_ui: true,
+            allow_remote_admin: false,
             drive_letter: "Y:".to_string(),
             auto_mount_drive: true,
             mount_backend: MountBackend::default(),

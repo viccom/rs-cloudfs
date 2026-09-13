@@ -131,9 +131,14 @@ fn control_addr() -> SocketAddr {
 
 /// One raw HTTP/1.1 request (`Connection: close`), response read to EOF.
 async fn send_http(addr: SocketAddr, target: &str) -> String {
+    send_http_method("GET", addr, target).await
+}
+
+/// [`send_http`] with the method injectable (the P1 write routes POST).
+async fn send_http_method(method: &str, addr: SocketAddr, target: &str) -> String {
     let mut stream = TcpStream::connect(addr).await.expect("connect to server");
     let request = format!(
-        "GET {target} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\
+        "{method} {target} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\
          Content-Length: 0\r\n\r\n",
         addr.port()
     );
@@ -388,6 +393,167 @@ async fn web_seam_serves_config_and_follows_the_registry() {
     let resp = send_http(web, "/api/volumes").await;
     let rows: serde_json::Value = serde_json::from_str(body_of(&resp)).expect("parse rows");
     assert_eq!(rows.as_array().expect("array").len(), 1, "one row left");
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+// ------------------------------------------- the P1 write family e2e ---
+
+/// The P1 write routes drive the REAL command surface end to end (the
+/// seam's other side is the cli composition root's own handler): an
+/// unmount through the web endpoint changes the configs listing's
+/// runtime column, a disable writes the volume file and takes the
+/// volume down, an enable brings it back — the file, the registry and
+/// the configs row all agreeing at every step. Green-since-birth pin:
+/// the components were each red→green in their own suites; this test
+/// pins their composition.
+#[tokio::test]
+async fn web_write_routes_drive_the_real_command_surface() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("a.toml"),
+        &volume_toml("111:FAKE-TOKEN-WEB-WRITE", 111111),
+    );
+    write_file(
+        &dir.path().join("volumes").join("b.toml"),
+        &volume_toml("222:BBB", 222222),
+    );
+    let _guard = chdir(dir.path());
+
+    let cfg = web_process_config();
+    let specs =
+        cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load volume specs");
+    let injections = vec![
+        (
+            specs[0].clone(),
+            RunOptions::default(),
+            mock_transport().await as Arc<dyn CloudTransport>,
+        ),
+        (
+            specs[1].clone(),
+            RunOptions::default(),
+            mock_transport().await as Arc<dyn CloudTransport>,
+        ),
+    ];
+    let handle = cloudkit_cli::run_multi_with_transports_and_commands(
+        &cfg,
+        injections,
+        RuntimeVolumeCommands {
+            dispatch: Some(mock_dispatch()),
+            remove_tuning: RemoveTuning::fast(),
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await
+    .expect("boot with the command surface");
+    let web = handle
+        .web_ui_addr()
+        .expect("the dashboard bound (enable_web_ui = true)");
+    let addr = control_addr();
+
+    // The configs row lookup helper over the endpoint's JSON.
+    async fn configs_row(web: SocketAddr, name: &str) -> serde_json::Value {
+        let resp = send_http(web, "/api/volumes/configs").await;
+        assert_eq!(status_of(&resp), 200, "configs ok: {resp}");
+        let rows: serde_json::Value =
+            serde_json::from_str(body_of(&resp)).expect("parse the configs rows");
+        rows.as_array()
+            .expect("array body")
+            .iter()
+            .find(|row| row["name"] == name)
+            .unwrap_or_else(|| panic!("row {name}: {rows}"))
+            .clone()
+    }
+
+    // Boot state: both volumes running.
+    let row = configs_row(web, "a").await;
+    assert_eq!(
+        row,
+        serde_json::json!({ "name": "a", "backend": "telegram", "enabled": true, "running": true }),
+        "the boot row: {row}"
+    );
+
+    // Unmount `a` through the web endpoint: the reply rides the pinned
+    // shape and the configs row flips to absent (the FILE stays — K49).
+    let resp = send_http_method("POST", web, "/api/volumes/a/remove").await;
+    assert_eq!(status_of(&resp), 200, "remove ok: {resp}");
+    let body: serde_json::Value = serde_json::from_str(body_of(&resp)).expect("parse body");
+    assert_eq!(body["ok"], serde_json::json!(true), "the ok flag: {body}");
+    assert!(
+        body["reply"]
+            .as_str()
+            .is_some_and(|r| r.contains("removed")),
+        "the reply text rides: {body}"
+    );
+    let row = configs_row(web, "a").await;
+    assert_eq!(
+        row,
+        serde_json::json!({ "name": "a", "backend": "telegram", "enabled": true, "running": false }),
+        "the unmounted volume reads absent with its file intact: {row}"
+    );
+
+    // Disable `b`: the file flips, the volume comes down.
+    let resp = send_http_method("POST", web, "/api/volumes/b/disable").await;
+    assert_eq!(status_of(&resp), 200, "disable ok: {resp}");
+    let file = fs::read_to_string(dir.path().join("volumes").join("b.toml"))
+        .expect("read the volume file");
+    assert!(
+        file.contains("enabled = false"),
+        "the web disable wrote the file: {file}"
+    );
+    assert!(
+        !file.contains("FAKE-TOKEN-WEB-WRITE"),
+        "the other volume's credential never rides sibling files: {file}"
+    );
+    let reply = send_cmd(addr, "LIST").await;
+    assert!(
+        reply.starts_with("OK: 0 volume(s)"),
+        "both volumes down (a unmounted, b disabled): {reply}"
+    );
+    let row = configs_row(web, "b").await;
+    assert_eq!(
+        row,
+        serde_json::json!({ "name": "b", "backend": "telegram", "enabled": false, "running": false }),
+        "the disabled row: {row}"
+    );
+
+    // Enable `b`: the file flips back and the volume re-assembles.
+    let resp = send_http_method("POST", web, "/api/volumes/b/enable").await;
+    assert_eq!(status_of(&resp), 200, "enable ok: {resp}");
+    let file = fs::read_to_string(dir.path().join("volumes").join("b.toml"))
+        .expect("read the volume file");
+    assert!(
+        file.contains("enabled = true"),
+        "the web enable wrote the file: {file}"
+    );
+    let row = configs_row(web, "b").await;
+    assert_eq!(
+        row["running"],
+        serde_json::json!(true),
+        "the volume runs again: {row}"
+    );
+    let reply = send_cmd(addr, "LIST").await;
+    assert!(
+        reply.starts_with("OK: 1 volume(s)") && reply.contains("b running"),
+        "LIST agrees with the configs row: {reply}"
+    );
+
+    // An ERR reply keeps its actionable text on the 409 (remove a
+    // volume that is not registered).
+    let resp = send_http_method("POST", web, "/api/volumes/ghost/remove").await;
+    assert_eq!(status_of(&resp), 409, "ERR maps to 409: {resp}");
+    let body: serde_json::Value = serde_json::from_str(body_of(&resp)).expect("error json");
+    assert!(
+        body["error"].as_str().is_some_and(|m| m.contains("ghost")),
+        "the refusal names the volume: {body}"
+    );
 
     timeout(Duration::from_secs(30), handle.shutdown())
         .await

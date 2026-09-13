@@ -1934,7 +1934,10 @@ pub async fn run_multi_with_transports_and_commands(
 /// or bind failure logs an error and returns `None` — the volumes keep
 /// running, only the UI face is gone. `commands` is the volume-command
 /// seam (web volume management §1.1) injected into the dashboard's
-/// management routes — the same `Arc` the control channel runs.
+/// management routes — the same `Arc` the control channel runs. The
+/// §1.5 remote-administration ruling rides along: a non-loopback bind
+/// keeps the management write family withheld unless the process key
+/// `allow_remote_admin = true` opts in.
 async fn bind_multi_web_ui(
     process_cfg: &CyDriveConfig,
     volumes: cloudkit_web::RegistryHandle,
@@ -1955,7 +1958,14 @@ async fn bind_multi_web_ui(
             return None;
         }
     };
-    match WebUiServer::serve_multi_with_commands(volumes, bind, commands).await {
+    match WebUiServer::serve_multi_with_remote_admin(
+        volumes,
+        bind,
+        commands,
+        process_cfg.allow_remote_admin,
+    )
+    .await
+    {
         Ok(server) => {
             tracing::info!(addr = %server.local_addr(), "multi-volume web UI listening");
             Some(server)
@@ -2221,19 +2231,22 @@ impl RuntimeVolumeControl {
         let mut tokens = line.split_whitespace();
         match (tokens.next(), tokens.next(), tokens.next()) {
             (Some("LIST"), None, None) => self.list(),
-            // SHOW is read-only like LIST (web volume management §1.2):
-            // the shutdown gate refuses mutations, never reads — the
-            // registry and the volume files stay valid through it.
+            // SHOW and CONFIGS are read-only like LIST (web volume
+            // management §1.2): the shutdown gate refuses mutations,
+            // never reads — the registry and the volume files stay valid
+            // through it.
             (Some("SHOW"), Some(name), None) => self.show_volume(name),
-            (Some(cmd @ ("ADD" | "REMOVE")), Some(name), None) => {
+            (Some("CONFIGS"), None, None) => self.configs(),
+            (Some(cmd @ ("ADD" | "REMOVE" | "ENABLE" | "DISABLE")), Some(name), None) => {
                 // The gate's entry observation point (review H1): once
                 // the shutdown gate has fired, the mutating commands are
                 // refused — the stop task's idle barrier is waiting for
                 // in-flight commands to settle, and a fresh mutation
-                // would race its `take_all`. LIST is read-only and the
-                // registry stays valid through the shutdown, so it keeps
-                // answering. The refusal still goes back over the reply
-                // channel (the connection task parks on the one-shot).
+                // would race its `take_all`. LIST (and the other reads)
+                // is read-only and the registry stays valid through the
+                // shutdown, so it keeps answering. The refusal still
+                // goes back over the reply channel (the connection task
+                // parks on the one-shot).
                 if self.watch.fired() {
                     return format!(
                         "ERR: {cmd} refused — the instance is shutting down; volume changes \
@@ -2242,14 +2255,19 @@ impl RuntimeVolumeControl {
                 }
                 match cmd {
                     "ADD" => self.add_volume(name).await,
-                    _ => self.remove_volume(name).await,
+                    "REMOVE" => self.remove_volume(name).await,
+                    "DISABLE" => self.disable_volume(name).await,
+                    _ => self.enable_volume(name).await,
                 }
             }
-            (Some(cmd @ ("ADD" | "REMOVE" | "SHOW")), _, _) => format!(
+            (Some(cmd @ ("ADD" | "REMOVE" | "SHOW" | "ENABLE" | "DISABLE")), _, _) => format!(
                 "ERR: usage: {cmd} <name> — exactly one volume name (volume names match \
                  ^[a-z][a-z0-9_-]{{0,31}}$)\n"
             ),
-            _ => "ERR: usage: ADD <name> | REMOVE <name> | SHOW <name> | LIST\n".to_string(),
+            (Some("CONFIGS"), _, _) => "ERR: usage: CONFIGS — takes no argument\n".to_string(),
+            _ => "ERR: usage: ADD <name> | REMOVE <name> | ENABLE <name> | DISABLE <name> | \
+                  SHOW <name> | LIST | CONFIGS\n"
+                .to_string(),
         }
     }
 
@@ -2332,6 +2350,169 @@ impl RuntimeVolumeControl {
                 path.display()
             ),
         }
+    }
+
+    /// `CONFIGS` (web volume management P1): the configuration FULL set —
+    /// every `*.toml` under the volumes_dir, one row per file, joined
+    /// against the runtime registry. LIST cannot serve the dashboard's
+    /// configuration page: it reads the registry, and a disabled volume
+    /// is by definition absent from it. Row shapes (the web endpoint
+    /// parses them back):
+    ///
+    /// - loadable file: `<name> <backend> enabled=<bool> running|absent`
+    ///   (running = the registry has the name);
+    /// - schema-broken file: `<name> invalid (<reason>)` — one broken
+    ///   file must not take the whole listing down (the K22 spirit).
+    fn configs(&self) -> String {
+        let Some(dir) = self.process_cfg.volumes_dir.as_deref() else {
+            return "ERR: this instance runs single-volume mode (no volumes_dir) — \
+                    CONFIGS serves multi-volume instances\n"
+                .to_string();
+        };
+        let files = match cloudkit_core::config::discover_volumes(Path::new(dir)) {
+            Ok(files) => files,
+            Err(error) => return format!("ERR: {error}\n"),
+        };
+        let mut reply = format!("OK: {} volume file(s)\n", files.len());
+        for path in files {
+            let name = path
+                .file_stem()
+                .map(|stem| stem.to_string_lossy().into_owned())
+                .unwrap_or_default();
+            match cloudkit_core::config::load_volume_config(&path) {
+                Ok(spec) => {
+                    let running = if self.registry.volume(&spec.name).is_some() {
+                        "running"
+                    } else {
+                        "absent"
+                    };
+                    reply.push_str(&format!(
+                        "{} {} enabled={} {running}\n",
+                        spec.name,
+                        spec.settings.backend.as_str(),
+                        spec.settings.enabled
+                    ));
+                }
+                Err(error) => {
+                    // The reason is already credential-scrubbed (the
+                    // load funnel's M3 funnel); it may be multi-line
+                    // (toml embeds the offending source) — the row
+                    // protocol is line-oriented, so newlines fold.
+                    let reason = error.to_string().replace('\n', " ");
+                    reply.push_str(&format!("{name} invalid ({reason})\n"));
+                }
+            }
+        }
+        reply
+    }
+
+    /// The shared file-write segment of `ENABLE`/`DISABLE` (web volume
+    /// management P1): validate through the full funnel, rewrite with
+    /// the flag overlaid. `Err` carries the actionable refusal — the
+    /// caller must not touch the runtime when it fires (the persistent
+    /// file is the source of truth, K49).
+    fn persist_enabled_flag(&self, name: &str, path: &Path, enabled: bool) -> Result<(), String> {
+        match cloudkit_core::config::write_volume_enabled(path, enabled) {
+            Ok(()) => Ok(()),
+            Err(error) => Err(format!(
+                "ERR: {} `{name}` failed writing the volume file {}: {error} — \
+                 nothing was changed at runtime (the volume file is the persistent \
+                 source of truth); fix the file and retry\n",
+                if enabled { "ENABLE" } else { "DISABLE" },
+                path.display()
+            )),
+        }
+    }
+
+    /// `DISABLE <name>` (web volume management P1): the narrow UPDATE —
+    /// write `enabled = false` into the volume file FIRST, then, if the
+    /// volume is running, take it down through the SAME K50 sequence
+    /// `REMOVE` runs (直接调用 [`Self::remove_volume`] — the drain /
+    /// release / unregister steps and every H1 observation point are
+    /// reused, not duplicated). The write-first order is the K50
+    /// philosophy: the persistent file is the source of truth, so a
+    /// failed write leaves the runtime untouched; an unmount that fails
+    /// after a successful write leaves a disabled file under a still
+    /// running volume, which the idempotent retry (write is a no-op,
+    /// unmount re-runs) resolves.
+    async fn disable_volume(&self, name: &str) -> String {
+        if !Self::name_is_path_safe(name) {
+            return format!(
+                "ERR: `{name}` is not a volume name — DISABLE takes the file stem of a \
+                 volumes_dir entry (names match ^[a-z][a-z0-9_-]{{0,31}}$)\n"
+            );
+        }
+        let Some(dir) = self.process_cfg.volumes_dir.as_deref() else {
+            return "ERR: this instance runs single-volume mode (no volumes_dir) — \
+                    DISABLE serves multi-volume instances\n"
+                .to_string();
+        };
+        let path = Path::new(dir).join(format!("{name}.toml"));
+        if !path.is_file() {
+            return format!(
+                "ERR: no volume file for `{name}` at {} — DISABLE reads the volumes_dir \
+                 ({dir}); `CONFIGS` lists every volume file\n",
+                path.display()
+            );
+        }
+        if let Err(refusal) = self.persist_enabled_flag(name, &path, false) {
+            return refusal;
+        }
+        if self.registry.volume(name).is_none() {
+            return format!(
+                "OK: disabled volume `{name}` (enabled = false written to {}; the \
+                 volume was not running)\n",
+                path.display()
+            );
+        }
+        let removal = self.remove_volume(name).await;
+        if removal.starts_with("OK:") {
+            return format!(
+                "OK: disabled volume `{name}` (enabled = false written to {}; volume \
+                 unmounted and unregistered — the file keeps it disabled across \
+                 restarts)\n",
+                path.display()
+            );
+        }
+        let reason = removal.trim().trim_start_matches("ERR: ");
+        format!(
+            "ERR: disabling `{name}` wrote the file (enabled = false at {}) but the \
+             unmount failed: {reason} — retry `DISABLE {name}` once the cause is \
+             resolved (the file write is idempotent)\n",
+            path.display()
+        )
+    }
+
+    /// `ENABLE <name>` (web volume management P1): write `enabled = true`
+    /// into the volume file, then assemble through the SAME runtime ADD
+    /// path ([`Self::add_volume`] verbatim reply — its refusals are
+    /// already actionable: a duplicate registration, a missing file, a
+    /// bad name). The write-first order mirrors DISABLE's: a failed
+    /// write never reaches the runtime.
+    async fn enable_volume(&self, name: &str) -> String {
+        if !Self::name_is_path_safe(name) {
+            return format!(
+                "ERR: `{name}` is not a volume name — ENABLE takes the file stem of a \
+                 volumes_dir entry (names match ^[a-z][a-z0-9_-]{{0,31}}$)\n"
+            );
+        }
+        let Some(dir) = self.process_cfg.volumes_dir.as_deref() else {
+            return "ERR: this instance runs single-volume mode (no volumes_dir) — \
+                    ENABLE serves multi-volume instances\n"
+                .to_string();
+        };
+        let path = Path::new(dir).join(format!("{name}.toml"));
+        if !path.is_file() {
+            return format!(
+                "ERR: no volume file for `{name}` at {} — ENABLE reads the volumes_dir \
+                 ({dir}); `CONFIGS` lists every volume file\n",
+                path.display()
+            );
+        }
+        if let Err(refusal) = self.persist_enabled_flag(name, &path, true) {
+            return refusal;
+        }
+        self.add_volume(name).await
     }
 
     /// `ADD <name>` (K48's runtime assembly): read `volumes/<name>.toml`

@@ -628,3 +628,113 @@ a.volume-tab.volume-add:hover {
     transform: none;
     box-shadow: none;
 }
+
+/* ------------------------- P1: the volume table's live faces (web volume mgmt) --- */
+
+/* The mini action buttons of the volume table's Actions column. */
+.btn-mini {
+    padding: 0.35rem 0.7rem;
+    border-radius: 8px;
+    font-size: 0.78rem;
+    font-weight: 600;
+    cursor: pointer;
+    border: 1px solid var(--border-color);
+    background: var(--bg-card);
+    color: var(--text-main);
+    display: inline-flex;
+    align-items: center;
+    gap: 0.4rem;
+    transition: all 0.2s ease;
+    margin-right: 0.35rem;
+}
+
+.btn-mini:hover {
+    color: var(--accent-cyan);
+    border-color: var(--accent-cyan);
+}
+
+.btn-mini-danger:hover {
+    color: #ff6688;
+    border-color: #ff6688;
+}
+
+.btn-mini:disabled {
+    opacity: 0.5;
+    cursor: wait;
+}
+
+/* A disabled volume's whole row recedes. */
+tr.volume-disabled td {
+    opacity: 0.5;
+}
+
+/* The Stopped badge: configured, not currently served (unmounted at
+   runtime; one Enable away from running). */
+.badge-stopped {
+    background: rgba(139, 155, 180, 0.15);
+    color: var(--text-muted);
+}
+
+/* The Disabled badge: enabled = false in the volume file — no mount,
+   no route, skipped at boot. */
+.badge-disabled {
+    background: rgba(255, 255, 255, 0.06);
+    color: var(--text-muted);
+}
+
+/* The toast stack (top-right, slide-in, 4s self-destruct). */
+#toast-host {
+    position: fixed;
+    top: 1.2rem;
+    right: 1.2rem;
+    z-index: 1200;
+    display: flex;
+    flex-direction: column;
+    gap: 0.6rem;
+    max-width: 420px;
+}
+
+.toast {
+    display: flex;
+    gap: 0.6rem;
+    align-items: flex-start;
+    background: var(--bg-card);
+    border: 1px solid var(--border-color);
+    border-left: 3px solid var(--accent-cyan);
+    padding: 0.8rem 1rem;
+    border-radius: 10px;
+    box-shadow: 0 6px 24px rgba(0, 0, 0, 0.45);
+    font-size: 0.85rem;
+    color: var(--text-main);
+    animation: toast-in 0.25s ease;
+}
+
+.toast i {
+    color: var(--accent-cyan);
+    margin-top: 0.1rem;
+}
+
+.toast-err {
+    border-left-color: #ff3366;
+}
+
+.toast-err i {
+    color: #ff6688;
+}
+
+.toast-out {
+    opacity: 0;
+    transform: translateX(12px);
+    transition: all 0.35s ease;
+}
+
+@keyframes toast-in {
+    from {
+        opacity: 0;
+        transform: translateX(16px);
+    }
+    to {
+        opacity: 1;
+        transform: none;
+    }
+}

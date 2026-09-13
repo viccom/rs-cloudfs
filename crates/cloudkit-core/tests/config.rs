@@ -212,6 +212,7 @@ fn toml_roundtrip_preserves_full_config() {
         web_ui_host: "192.168.1.10".to_string(),
         web_ui_port: 9443,
         enable_web_ui: false,
+        allow_remote_admin: true,
         drive_letter: "Z:".to_string(),
         auto_mount_drive: false,
         // Phase 3 / K40: the mount backend round-trips too.

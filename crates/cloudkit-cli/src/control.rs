@@ -14,11 +14,13 @@
 //!   payload `cydrive status` shows on its instance row);
 //! - `ADD <name>` / `REMOVE <name>` / `LIST` / `SHOW <name>`
 //!   (runtime-volumes K48; `SHOW` since the web volume management plan
-//!   §1.2) are forwarded to the installed [`VolumeCommandHandler`]; its
-//!   reply is passed through verbatim — `OK: ...` or a multi-line
-//!   `OK:`/`ERR:` block whose text is the handler's actionable message.
-//!   The replies are documented where the handler lives ([`crate`]'s
-//!   multi-volume boot); the transport layer adds nothing to them;
+//!   §1.2) / `ENABLE <name>` / `DISABLE <name>` / `CONFIGS` (the same
+//!   plan's P1 batch) are forwarded to the installed
+//!   [`VolumeCommandHandler`]; its reply is passed through verbatim —
+//!   `OK: ...` or a multi-line `OK:`/`ERR:` block whose text is the
+//!   handler's actionable message. The replies are documented where the
+//!   handler lives ([`crate`]'s multi-volume boot); the transport layer
+//!   adds nothing to them;
 //! - anything else answers `ERR: unknown command`. An instance without a
 //!   handler answers the volume commands with the actionable
 //!   "not available" ERR instead of routing them.
@@ -100,11 +102,15 @@ fn first_token(line: &str) -> &str {
 }
 
 /// `true` for the lines the volume-command surface owns (K48; `SHOW`
-/// since the web volume management plan §1.2): the four keywords, with
-/// or without their argument — the handler answers malformed shapes
-/// with its own usage ERR.
+/// since the web volume management plan §1.2; `ENABLE`/`DISABLE`/
+/// `CONFIGS` since its P1 batch): the keywords, with or without their
+/// argument — the handler answers malformed shapes with its own usage
+/// ERR.
 fn is_volume_command(line: &str) -> bool {
-    matches!(first_token(line), "ADD" | "REMOVE" | "SHOW" | "LIST")
+    matches!(
+        first_token(line),
+        "ADD" | "REMOVE" | "SHOW" | "LIST" | "ENABLE" | "DISABLE" | "CONFIGS"
+    )
 }
 
 /// A running instance's loopback control listener (contract C1): the
