@@ -2,13 +2,13 @@
 
 > 计划：`docs/plans/2026-09-14-pan123-driver.md` ｜ 需求口径：自用（K59.1）+ 全量公民 + 编译开关 + 零侵入
 > 基线：main@c819ee8（workspace 1069/0/12；winfsp 腿 117/0/1）
-> 状态：**方案已落库，待负责人批准**（D1 路线裁决挂 123-0 spike；D2–D4 附带建议拍板）
+> 状态：**方案已批准（2026-09-14，K64：D1–D4 全拍板，D1 直裁 web API）——123-0（验证与采样 spike）解锁可开工**
 > 前置依赖：与 Phase 4/5 共享的 `compiled_drivers()` 可扩展化重构（谁先到谁做，只做一次）
 > worktree：待建（建议 `feat/pan123-driver`）
 
 | 任务 | 内容 | 状态 | 完成情况 | 证据 |
 |---|---|---|---|---|
-| 123-0 | 双腿 spike 与路线裁决 | ⏸ | web API 全链（QR 登录/动态域名/list/trash/download_info+Range+**流量限额实测**/upload 全链+分片状态保留）+ 开放平台侧（直链无 VIP 行为，若意愿）；产出 §1.3 裁决 + 采样表 | — |
+| 123-0 | web API 验证与采样 spike（路线已定 K64） | ⏳ 可开工 | 六项：① web API 形态有效性（pan123-rs ~3 月未动，首项确认）② QR 登录+动态域名 ③ list/info/trash 往返 ④ download_info+Range+**流量限额数字** ⑤ upload 全链（5060/秒传/**duplicate 覆盖行为**/分片/complete）+分片状态保留 ⑥ 密文空 etag；产出 errno/限额/覆盖采样表 | — |
 | 123-1 | 认证与驱动骨架 | ⏸ | QR 三端点 + TokenStore + 动态域名发现 + 四件套 + 配置键三处同步 | — |
 | 123-2 | 读路径 | ⏸ | list/stat/mkdir/trash/rename + download_info 缓存 + Range 流读 + traffic 预检 + 令牌桶限流 | — |
 | 123-3 | 写路径 | ⏸ | upload_request/分片 presign/PUT/complete + duplicate 语义 + MD5 预计算 + 超时自适应 | — |
@@ -25,6 +25,7 @@
 
 ## 批次日志
 
+- **2026-09-14 拍板收口（K64，方案获批）**：D1 = **web API（直裁，双腿门槛关闭**，路线 A 降为文字参照）；D2/D3 = 沿用 Phase 5 拍板形态（trash 回收站语义不引回收站接口 / 根目录可设置缺省网盘根）；D4 = duplicate 覆盖模式（对齐 writer 契约，rtype=3 先例；覆盖行为 123-0 实测钉表）。**123-0 解锁**，职责收窄为 web API 验证与采样（计划 §6 已改写：首项 = 形态有效性确认——pan123-rs ~3 月未动）。落档四处：decisions K64、计划 §1.3/§6/§8/头部、本表、AGENTS。
 - **2026-09-14 立项前置研究完成**（pan123-rs 为专门克隆实测：`E:\GitHub\pan123-rs`，MIT；主仓全程零改动）：
   - 三参照分工定调（计划 §0.1）：pan123-rs = 主路线 Rust 规格书（可移植源）；PCFS = 形态对照 + 签名备胎；alist 123_open = 备选路线参照。
   - **对前轮评估的更新**：web 路线从「直译 PCFS ~ck-baidu 量级」降为「**移植现成 Rust SDK**（主项 = blocking→async 转换）」；新增产品级约束发现——**每日下载流量限额**（非会员；会员 9 元/月解除）与 **MD5 etag 前置**。

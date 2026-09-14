@@ -1,7 +1,7 @@
 # rs-cloudfs — Agent 工作须知
 
 ## 项目信息
-- 项目：rs-cloudfs = rs-CyDrive × PrivateCloudFS 融合体——多云存储平台（统一存储抽象之上的 WebDAV 挂载/仪表盘/同步/CLI；后端：telegram / baidu / local，未来 sftp（Phase 4 方案已批，SF1 待开工）/ pan115（Phase 5 方案已批，115-0 spike 待开工）/ 123 / s3）
+- 项目：rs-cloudfs = rs-CyDrive × PrivateCloudFS 融合体——多云存储平台（统一存储抽象之上的 WebDAV 挂载/仪表盘/同步/CLI；后端：telegram / baidu / local，未来 sftp（Phase 4 方案已批，SF1 待开工）/ pan115（Phase 5 方案已批，115-0 spike 待开工）/ pan123（Phase 6 方案已批，123-0 spike 待开工）/ s3）
 - 技术栈：Rust（edition 2021）/ tokio / axum / dav-server / rusqlite(bundled) / grammers(telegram) / hyper-rustls
 - **血统**：fork 自 rs-CyDrive（全 git 历史；remote `upstream-cydrive` 只读参照，禁止 push）；PrivateCloudFS（`E:\Go_codes\PrivateCloudFS`，Go）是设计参照系与踩坑情报源（情报附录在 multicloud 计划）
 - **北极星**：「一个稳定好用的程序」——重组已验证资产，不重写
@@ -24,6 +24,7 @@
 **Web 体验批完成（2026-09-14）**：ArtPlayer 5.4.0 本地内置媒体播放器（错误回退 + 格式清单扩 mov/m4v/m4a/aac/opus）+ 文件行「复制链接」按钮；前端注入修复（`escapeHtml` 转义引号 + 事件委托替代内联 onclick——修复含 `'` 文件名的按钮失效）；volume-tab 委托修复（重绘竞态）；**默认加密方案改 `aead_v2`**（84939ab——新卷 Range 流式播放默认可用，gcm 保留显式可选；`EncryptionScheme::default()` = AeadV2，gcm 数学测试显式钉 Gcm 防漂移）。
 **Phase 4 立项（2026-09-14，K59+K60，方案已批）**：ssh/sftp 存储驱动——计划 `docs/plans/2026-09-14-sftp-driver.md` + 跟踪单 `docs/tracking/phase4-sftp.md`。选型 russh 0.63 + russh-sftp 3.0（**ring** 后端零新增 C 依赖；版本下限 0.63 = GHSA-47hw-gvq5-r2gm 客户端侧 High）；三轮外部研究（本仓探针 / termscp / aeroftp）+ 实测验证（依赖树编译 PASS；**Windows 进程内 SFTP 桩端到端 PASS**——list/stat/range 读逐字节/error 全绿，不依赖 Docker/HOME）。**SF0 已拍板（K60）**：D1 认证=密码+私钥（含 passphrase）、D2 host key=显式接受+指纹落盘（变更恒拒）、D3=起步单连接（多卷≠多连接澄清落档）——SF1 可开工。同批 `driver-onboarding.md` 升 **v1.1 增 §10 transport-only 驱动类**（telegram 先例，两班制只在契约面）。
 **Phase 5 立项（2026-09-14，K61+K62，方案已批）**：pan115 驱动——计划 `docs/plans/2026-09-14-pan115-driver.md` + 跟踪单 `docs/tracking/phase5-pan115.md`。**双路线**：主 = 官方开放平台（proapi.115.com，device-code/QR，115-plus-desktop Rust 实证 + `ali-oss-rs` 复用）；保底 = PCFS 私有 web API（sign.go 可直译）；**D1 路线裁决挂 115-0 spike**（凭证可得性 = 胜负手——2026-08-09 开放平台暂停事件后新申请通道存疑，K61.3 三选一规则防悬空）。**D2–D4 已拍板（K62）**：删除=进回收站（回收站接口不引入）、根目录可设置缺省网盘根、QPS 实现期合理定值（RebuildTuning 式注入 + CDN 429 自适应重生）。前置依赖 Phase 4 SF1 的 `compiled_drivers()` 可扩展化（顺序对调则所有权对调，只做一次）。
+**Phase 6 立项（2026-09-14，K63+K64，方案已批）**：pan123 驱动——计划 `docs/plans/2026-09-14-pan123-driver.md` + 跟踪单 `docs/tracking/phase6-pan123.md`。**主参照 = `E:\GitHub\pan123-rs`**（MIT，2862 行 Rust web API SDK：全端点/QR 双头认证/上传三段流 presigned PUT/Range 续传/令牌桶/动态域名；reqwest 0.12 同栈；**移植主项 = blocking→async 转换**）。**D1–D4 已全拍板（K64）**：路线 = **web API 直裁**（开放平台降为文字参照）；删除/根目录沿用 Phase 5 形态（trash 回收站语义 / 根可设置缺省网盘根）；duplicate = 覆盖模式（rtype=3 先例）。**两项产品级约束（123-0 实测钉数字）**：每日下载流量限额（会员消解）+ MD5 etag 前置（暂存件预计算解）。三阶段均待开工：Phase 4 SF1 / Phase 5 115-0 / Phase 6 123-0；`compiled_drivers()` 重构谁先到谁做（只做一次）。
 
 ## 常用命令（仓库根）
 ```

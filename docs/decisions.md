@@ -673,3 +673,11 @@
 - **K63.5 架构口径**：全量公民（照 ck-baidu 四件套）；能力位 range_read/multipart/server_side_move/rapid_upload/authoritative_index/remote_delete 计划为 true，resume 待分片状态保留验证后点亮；删除 = trash `intoRecycle`（**建议沿用 Phase 5 D2 拍板形态**：进回收站、回收站接口不引入）；根目录可设置缺省网盘根（建议沿用 Phase 5 D3）；上传 duplicate 语义待 D4 拍板（建议覆盖模式，百度 rtype=3 同课题）；conformance 桩 = 假 123 API + **假 presigned PUT 接收端**（presign URL 指向 loopback，与 Phase 5 假 OSS 同理）。OSS 上传零自研签名（presigned 是服务端签的，**不引 ali-oss-rs**）。
 - **K63.6 硬纪律**：blocking→async 转换主项；动态域名发现（/api/dydomain，失败回退 api.123278.com）；双认证头 + Origin/Referer 必带；5060→duplicate 二次请求；PUT 超时 `max(300s, mb×2s)`；traffic 前置检查给 RateLimited 人话错误；上传后 size 校验；IPv4 dial（pan123-rs 未处理，我们照 baidu 形态加）。
 - **状态**：方案与跟踪单落库（`docs/plans/2026-09-14-pan123-driver.md` + `docs/tracking/phase6-pan123.md`），**待负责人批准后开工 123-0**。本批只读（pan123-rs 克隆至仓外 `E:\GitHub\`），主仓零改动。
+
+## 2026-09-14 K64：Phase 6（pan123）拍板——方案获批，D1 直裁 web API，123-0 解锁
+
+- **K64.1 D1 路线 = web API（路线 B，负责人直裁）**：K63.4 的双腿并测门槛就此关闭；路线 A（开放平台）降为纯文字参照不再 spike。前置事实性条件有二，均由 123-0 首项验证/实测钉死：① web API 形态有效性（pan123-rs 最后提交 2026-06-26，~3 月未动）；② 每日下载流量限额额度数字（负责人接受该约束，会员可消解）。
+- **K64.2 D2 删除语义 = 沿用 Phase 5 D2 形态**：`trash` 的 `intoRecycle` 原生回收站语义直接采用，回收站端点族不引入，误删恢复走 123 官方端；`remote_delete = true`；表单/DESTROY 文案明示。
+- **K64.3 D3 根目录 = 沿用 Phase 5 D3 形态**：`pan123_root` 可设置（folder id）、缺省网盘根 `"0"`、validate 不强制专用子目录、doctor 提示根卷误删边界（与回收站构成双兜底）。
+- **K64.4 D4 上传 duplicate 语义 = 覆盖模式**：对齐 writer 契约覆盖语义（百度 rtype=3 同课题先例）——5060 已存在时以 duplicate 覆盖参数重发；「取消报错」「自动改名副本」形态不得漏出到挂载面；覆盖后旧文件/秒传交互行为 123-0 实测并钉进错误映射表。
+- **效果**：Phase 6 方案 待批准 → **已批准**；**123-0 解锁可开工**（职责收窄：路线已定，spike = web API 验证与采样，§6 已同步改写）。落档：计划头部/§1.3/§6/§8、跟踪单状态行+任务行+批次日志、AGENTS 项目信息行+当前阶段段。三阶段态势：Phase 4 SF1 / Phase 5 115-0 / Phase 6 123-0 均可开工，`compiled_drivers()` 重构谁先到谁做（只做一次）。
