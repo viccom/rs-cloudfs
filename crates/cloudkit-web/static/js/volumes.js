@@ -598,14 +598,16 @@ function vfPrefillEdit(config) {
         'vf-chat-id': config.chat_id,
         'vf-baidu-root': config.baidu_root,
         'vf-local-root': config.local_root,
-        'vf-sync-url': config.sync_url,
     };
     for (const [id, value] of Object.entries(plain)) {
         const el = vfEl(id);
         if (el && value !== undefined && value !== null) el.value = value;
     }
     // The write-only credential keys: SHOW answered {"set": bool}, never
-    // a value — the placeholder states whether one is stored.
+    // a value — the placeholder states whether one is stored. K58-M2:
+    // the sync URL is credential-valued (it may carry userinfo), so it
+    // rides the same write-only affordance — an empty input keeps the
+    // stored URL, a typed one overwrites (proxy_url has no form field).
     const writeOnly = {
         'vf-bot-token': config.bot_token,
         'vf-baidu-app-key': config.baidu_app_key,
@@ -613,6 +615,7 @@ function vfPrefillEdit(config) {
         'vf-baidu-access-token': config.baidu_access_token,
         'vf-baidu-refresh-token': config.baidu_refresh_token,
         'vf-enc-pass': config.encryption_password,
+        'vf-sync-url': config.sync_url,
         'vf-sync-secret': config.sync_secret,
     };
     for (const [id, marker] of Object.entries(writeOnly)) {

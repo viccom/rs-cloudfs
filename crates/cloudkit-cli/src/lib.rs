@@ -2350,6 +2350,24 @@ fn volume_payload_table(payload: &str) -> Result<toml::Table, String> {
     Ok(table)
 }
 
+/// Parses the volume-file text UPDATE already read as the raw explicit
+/// table (the overlay base). K58-M5: the parse error routes through the
+/// core redaction funnel ([`cloudkit_core::config::redact_credential_values`])
+/// — this was the one toml parse surface that bare-concatenated the raw
+/// error, whose embedded source line can carry a credential value (the
+/// loader accepted the text a moment earlier, so a failure here means a
+/// TOCTOU rewrite landed between the two reads — the fresher text's
+/// values must not ride the ERR reply or the log).
+fn parse_explicit_table_redacted(path: &Path, text: &str) -> Result<toml::Table, String> {
+    toml::from_str(text).map_err(|error| {
+        format!(
+            "re-reading the volume file {} failed: {}",
+            path.display(),
+            cloudkit_core::config::redact_credential_values(&error.to_string())
+        )
+    })
+}
+
 /// The state the control channel's `ADD`/`REMOVE`/`LIST` commands act
 /// through (RV2 / K48): the cli master registry (the truth), the two
 /// face tables (the WebDAV dispatch and dashboard projections), the live
@@ -2860,7 +2878,10 @@ impl RuntimeVolumeControl {
             fields = ?fields,
             "CREATE: writing a new volume file (field names only, by policy)"
         );
-        if let Err(error) = std::fs::write(&path, text) {
+        // K58-H3: the atomic write — a torn CREATE (crash mid-write)
+        // would leave a truncated file that boot refuses (or silently
+        // drops trailing keys).
+        if let Err(error) = cloudkit_core::config::write_config_atomically(&path, &text) {
             return format!(
                 "ERR: writing the volume file {} failed: {error} — nothing was changed at \
                  runtime\n",
@@ -2956,14 +2977,9 @@ impl RuntimeVolumeControl {
                 );
             }
         };
-        let explicit: toml::Table = match toml::from_str(&text) {
+        let explicit = match parse_explicit_table_redacted(&path, &text) {
             Ok(table) => table,
-            Err(error) => {
-                return format!(
-                    "ERR: re-reading the volume file {} failed: {error}\n",
-                    path.display()
-                );
-            }
+            Err(message) => return format!("ERR: {message}\n"),
         };
         let overlay = match volume_payload_table(payload) {
             Ok(table) => table,
@@ -2998,7 +3014,9 @@ impl RuntimeVolumeControl {
             fields = ?fields,
             "UPDATE: rewriting the volume file (field names only, by policy)"
         );
-        if let Err(error) = std::fs::write(&path, &merged) {
+        // K58-H3: the atomic write — UPDATE rewriting a LIVE volume file
+        // in place is exactly the torn window the primitive closes.
+        if let Err(error) = cloudkit_core::config::write_config_atomically(&path, &merged) {
             return format!(
                 "ERR: writing the volume file {} failed: {error} — the runtime was not \
                  touched (the volume keeps its current configuration)\n",
@@ -6503,6 +6521,40 @@ pub fn run_migrate(store: &dyn CredentialStore) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// K58-M5: the UPDATE re-read parse (the overlay base) routes its
+    /// error through the core redaction funnel — it was the one toml
+    /// parse surface that bypassed it, bare-concatenating the raw error
+    /// into the ERR reply. The refusal keeps the path and the key name,
+    /// never the value; the happy arm returns the parsed table.
+    #[test]
+    fn parse_explicit_table_redacted_masks_credential_values() {
+        let broken =
+            "backend = \"telegram\"\nproxy_url = \"socks5://user:secretpass@127.0.0.1:7897\n";
+        let error = parse_explicit_table_redacted(Path::new("volumes/media.toml"), broken)
+            .expect_err("the broken-quote line must fail to parse");
+        assert!(
+            error.starts_with("re-reading the volume file volumes/media.toml failed"),
+            "the refusal keeps the path wording: {error}"
+        );
+        assert!(
+            !error.contains("secretpass"),
+            "the URL credential value is masked: {error}"
+        );
+        assert!(
+            error.contains("proxy_url"),
+            "the key name stays for diagnosis: {error}"
+        );
+
+        let table =
+            parse_explicit_table_redacted(Path::new("volumes/media.toml"), "backend = \"local\"\n")
+                .expect("valid text parses");
+        assert_eq!(
+            table.get("backend").and_then(toml::Value::as_str),
+            Some("local"),
+            "the happy arm returns the explicit table"
+        );
+    }
 
     #[test]
     fn compiled_drivers_lists_the_feature_set_in_fixed_order() {

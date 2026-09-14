@@ -24,6 +24,7 @@
 //!   runtime concern elsewhere.
 
 use std::fs;
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
 
 use crate::credentials::{CredentialStore, BOT_TOKEN, ENCRYPTION_PASSWORD, SERVICE};
@@ -381,10 +382,17 @@ pub fn is_valid_volume_name(name: &str) -> bool {
 /// log — so the values are masked at the `ConfigError::Parse`
 /// construction points (the credential-values-never-enter-logs red
 /// line). Key names and positions always stay; only values go.
+///
+/// Review M2 (K58): the URL keys are credential-valued too — a proxy
+/// URL carries userinfo (`socks5://user:pass@host`) and a sync URL may
+/// — so `proxy_url`/`sync_url` join the list (both the SHOW folding and
+/// this redaction follow the one list).
 const SECRET_VALUED_KEYS: &[&str] = &[
     "bot_token",
     "encryption_password",
     "sync_secret",
+    "proxy_url",
+    "sync_url",
     "baidu_app_secret",
     "baidu_access_token",
     "baidu_refresh_token",
@@ -439,7 +447,13 @@ fn credential_assignment_value_offset(line: &str) -> Option<usize> {
 ///
 /// A message naming no credential key is returned verbatim — ordinary
 /// syntax errors keep their full diagnostic text.
-fn redact_credential_values(message: &str) -> String {
+///
+/// K58-M5: PUBLIC because it is the ONE scrubber — the single-funnel
+/// rule. A toml parse-error surface outside this module (the cli
+/// UPDATE re-read is the first) must route through this function
+/// rather than grow a second redaction implementation that can drift
+/// from this one.
+pub fn redact_credential_values(message: &str) -> String {
     if !SECRET_VALUED_KEYS.iter().any(|key| message.contains(key)) {
         return message.to_string();
     }
@@ -777,6 +791,60 @@ pub fn render_volume_toml(explicit: &toml::Table, overrides: &toml::Table) -> St
     text
 }
 
+/// Writes a config file (volume file or `config.toml`) with no torn
+/// intermediate state on disk (K58-H3): a plain `fs::write` truncates
+/// the target in place, so a crash or power loss mid-write leaves a
+/// truncated file — for a volume file that means either invalid TOML
+/// (every instance of the volume refuses to boot) or, worse, a tear at
+/// a line boundary that silently DROPS trailing keys (`enable_encryption`
+/// / `enabled` / a credential flipped away — the file re-parses but with
+/// different semantics). The atomic sequence instead writes the full
+/// content to a sibling temp file (the fixed `.<name>.tmp` pattern, a
+/// stale leftover from a crashed earlier attempt removed first),
+/// fsyncs it, then `std::fs::rename`s it over the target — on Windows
+/// (`MoveFileEx` with `MOVEFILE_REPLACE_EXISTING`) and POSIX alike the
+/// rename is an atomic replace, so a concurrent reader sees either the
+/// whole previous file or the whole new one, never a middle. A failure
+/// before or at the rename leaves the ORIGINAL untouched and removes
+/// the temp file this call created (a crash between write and rename
+/// leaves at most the temp file, which the next attempt's pre-delete
+/// clears).
+///
+/// The one atomic-write primitive every config write goes through:
+/// [`write_volume_enabled`], the cli's CREATE/UPDATE volume writes and
+/// [`CyDriveConfig::save_toml`]/[`CyDriveConfig::save_toml_scrubbed`]
+/// (the review's 顺带 convergence — a torn `config.toml` is the same
+/// boot-refusing failure).
+pub fn write_config_atomically(path: &Path, contents: &str) -> std::io::Result<()> {
+    let name = path.file_name().ok_or_else(|| {
+        std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!("config path {} has no file name", path.display()),
+        )
+    })?;
+    let temp_path = path.with_file_name(format!(".{}.tmp", name.to_string_lossy()));
+    // Best-effort pre-delete of a crashed attempt's leftover: a stubborn
+    // leftover resurfaces as the create error below (never silently
+    // ignored past that point).
+    let _ = fs::remove_file(&temp_path);
+    let mut file = fs::File::create(&temp_path)?;
+    let written = file
+        .write_all(contents.as_bytes())
+        .and_then(|()| file.sync_all());
+    drop(file);
+    if let Err(error) = written {
+        let _ = fs::remove_file(&temp_path);
+        return Err(error);
+    }
+    match fs::rename(&temp_path, path) {
+        Ok(()) => Ok(()),
+        Err(error) => {
+            let _ = fs::remove_file(&temp_path);
+            Err(error)
+        }
+    }
+}
+
 /// The ENABLE/DISABLE file write (web volume management §1.2): rewrite
 /// one volume file with the `enabled` flag overlaid through
 /// [`render_volume_toml`]. The file is validated through the FULL
@@ -796,7 +864,7 @@ pub fn write_volume_enabled(path: &Path, enabled: bool) -> Result<(), ConfigErro
     })?;
     let mut overrides = toml::Table::new();
     overrides.insert("enabled".to_string(), toml::Value::Boolean(enabled));
-    fs::write(path, render_volume_toml(&explicit, &overrides))?;
+    write_config_atomically(path, &render_volume_toml(&explicit, &overrides))?;
     Ok(())
 }
 
@@ -1305,7 +1373,7 @@ impl CyDriveConfig {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, text)?;
+        write_config_atomically(path, &text)?;
         Ok(())
     }
 
@@ -1344,7 +1412,7 @@ impl CyDriveConfig {
         if let Some(parent) = path.parent() {
             fs::create_dir_all(parent)?;
         }
-        fs::write(path, text)?;
+        write_config_atomically(path, &text)?;
         Ok(())
     }
 
