@@ -93,8 +93,10 @@ async function loadVolumesPage() {
         // catch swallowed into a silently stuck loading row.
         const configsStatus = configsRes.status === 'fulfilled'
             ? configsRes.value.status : 0;
+        const runtimeStatus = runtimeRes.status === 'fulfilled'
+            ? runtimeRes.value.status : 0;
         if (!configs && !runtime) {
-            renderVolumesError(configsStatus);
+            renderVolumesError(runtimeStatus || configsStatus);
             return;
         }
         renderVolumeCards(configs, runtime);

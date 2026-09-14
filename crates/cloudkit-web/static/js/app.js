@@ -64,6 +64,7 @@ document.addEventListener("DOMContentLoaded", async () => {
     setupDropZone();
     setupSearch();
     setupFileActions();
+    setupVolumeTabActions();
     setupPagination();
     // Auto-refresh drive files and stats every 4 seconds
     setInterval(loadDriveData, 4000);
@@ -92,6 +93,21 @@ function onFileActionClick(event) {
     if (button.dataset.action === "copy") copyLink(name);
     else if (button.dataset.action === "play") previewMedia(name);
     else if (button.dataset.action === "delete") deleteFile(name);
+}
+
+// The multi-volume chips follow the file-row fix: one delegated
+// listener on the static host, with the raw volume name carried in a
+// data attribute — never inside inline JavaScript.
+function setupVolumeTabActions() {
+    const bar = document.getElementById("volume-tabs");
+    if (!bar) return;
+    bar.addEventListener("click", onVolumeTabClick);
+}
+
+function onVolumeTabClick(event) {
+    const button = event.target.closest("button[data-volume-name]");
+    if (!button || button.disabled) return;
+    switchVolume(button.dataset.volumeName);
 }
 
 // One delegated listener pair on the static pagination host serves
@@ -217,7 +233,7 @@ function renderVolumeTabs() {
         const label = `${escapeHtml(v.name)} <span class="volume-backend">${escapeHtml(v.backend || "")}</span> ${dot}`;
         return failed
             ? `<button class="volume-tab failed" disabled${reason}>${label}</button>`
-            : `<button class="volume-tab${active}" onclick="switchVolume('${escapeHtml(v.name)}')"${reason}>${label}</button>`;
+            : `<button class="volume-tab${active}" data-volume-name="${escapeHtml(v.name)}"${reason}>${label}</button>`;
     }).join("");
     bar.innerHTML = `${chips}<a href="/volumes" class="volume-tab volume-add" title="${t('index.manage_volumes')}">＋</a>`;
     ensureCurrentVolume();

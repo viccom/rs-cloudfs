@@ -493,6 +493,53 @@ async fn static_asset_served() {
     );
 }
 
+/// 2b. The volume tabs must not inline raw volume names into JavaScript:
+///     a quote-bearing name would break `onclick="switchVolume('...')"`
+///     exactly like the file-row bug that was just fixed. The asset
+///     should carry the delegated listener path instead.
+#[tokio::test]
+async fn app_js_volume_tabs_use_delegated_click_handling() {
+    let env = test_env().await;
+    let addr = env.server.local_addr();
+
+    let resp = send(addr, &request("GET", "/static/js/app.js", addr, &[], "")).await;
+    assert_eq!(status_of(&resp), 200, "js asset: {resp}");
+    let body = body_of(&resp);
+    assert!(
+        !body.contains("onclick=\"switchVolume('"),
+        "volume switch must not use inline JS: {body}"
+    );
+    assert!(
+        body.contains("data-volume-name=\""),
+        "volume tabs should carry the raw name in a data attribute: {body}"
+    );
+    assert!(
+        body.contains("function setupVolumeTabActions()"),
+        "volume tabs should be wired through delegated click handling: {body}"
+    );
+}
+
+/// 2c. When both /volumes reads fail, the UI should prefer a real HTTP
+///     status from the runtime leg over a synthetic 0 from a rejected
+///     configs leg, so the operator sees the actionable failure code.
+#[tokio::test]
+async fn app_js_prefers_runtime_status_for_volumes_error_face() {
+    let env = test_env().await;
+    let addr = env.server.local_addr();
+
+    let resp = send(addr, &request("GET", "/static/js/volumes.js", addr, &[], "")).await;
+    assert_eq!(status_of(&resp), 200, "js asset: {resp}");
+    let body = body_of(&resp);
+    assert!(
+        body.contains("const runtimeStatus = runtimeRes.status === 'fulfilled'"),
+        "volumes error handling should read the runtime status too: {body}"
+    );
+    assert!(
+        body.contains("renderVolumesError(runtimeStatus || configsStatus);"),
+        "volumes error face should prefer the real runtime status: {body}"
+    );
+}
+
 /// 3. GET /api/files mirrors Python's `SELECT *` row shape key by key,
 ///    with the exact fields app.js consumes (name / is_dir / size /
 ///    mtime / is_uploaded) carrying sane values.
