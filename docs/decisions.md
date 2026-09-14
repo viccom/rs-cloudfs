@@ -663,3 +663,13 @@
 - **K62.3 D4 QPS = 实现期合理定值（负责人授权「参考其他项目，合理设置即可」）**：`RebuildTuning` 式结构注入（不加 config 键）；初始保守值——列目录簇 ~2 QPS 起步、downurl 结果缓存（TTL 115-0 实测定，参照 baidu dlink 60min 先例形态）；CDN 429 自适应分段重生（115-plus-desktop 先例）兜底；spike 校准后数字钉进跟踪单。
 - **K62.4 D1 路线 A/B 保持 spike 门槛**：K61.3 三选一规则不变，负责人可随时直裁。
 - **效果**：Phase 5 方案 待批准 → **已批准**；**115-0（路线 spike 与裁决）解锁可开工**。落档：计划 §8 改拍板记录 + 头部状态、跟踪单状态行 + 批次日志、AGENTS 项目信息行 + 当前阶段段。
+
+## 2026-09-14 K63：Phase 6（pan123）立项——方案落库待批，路线裁决挂 123-0
+
+- **K63.1 参照研究完成（2026-09-14）**：`E:\GitHub\pan123-rs`（buladuo，**MIT**，v0.1.0，最后提交 2026-06-26，本轮专门克隆实测——workspace = pan123-sdk **2862 行** + pan123-cli，**web API 路线 Rust 全套**：全端点/QR 三端点认证（双头 Bearer+sso-token）/上传三段流（upload_request→逐分片 presigned PUT→complete）/Range 续传/令牌桶限流/5060 处理）+ PCFS（Go，形态对照 + sign.go 备胎）+ alist 123_open（开放平台参照）。
+- **K63.2 对前轮评估的更新**：123 的 web 路线从「直译 PCFS」升为「**移植现成 Rust SDK**」——依赖栈与我们高度重合（reqwest 0.12 + rustls 同版本）；**移植主项 = blocking→async 全量转换**（pan123-sdk 是 `reqwest::blocking`）。签名形态实证分歧：pan123-rs 用随机 key（服务端校验放松）vs PCFS CRC32 替换表——按 pan123-rs 起步、PCFS 备胎。
+- **K63.3 新增产品级约束（两发现）**：① **每日下载流量限额**（`traffic/check` 端点显式存在；pan123-rs README 明示不破解、会员 9 元/月解除）——对挂载卷下载量是硬约束，额度数字 123-0 实测；② **MD5 etag 前置**（upload_request 必填）——队列暂存件预计算可解，密文空 etag 行为 spike 确认。
+- **K63.4 路线裁决门槛**：123-0 双腿并测（web API 全链 vs 开放平台直链行为）后三选一——web 过且限额可接受 → 路线 B（**初步倾向**：Rust 现成 + 无直链门槛 + 会员可消解限额）；web 不可行且开放平台直链可用 → 路线 A；皆不可行 → 挂起销账。负责人可随时直裁。
+- **K63.5 架构口径**：全量公民（照 ck-baidu 四件套）；能力位 range_read/multipart/server_side_move/rapid_upload/authoritative_index/remote_delete 计划为 true，resume 待分片状态保留验证后点亮；删除 = trash `intoRecycle`（**建议沿用 Phase 5 D2 拍板形态**：进回收站、回收站接口不引入）；根目录可设置缺省网盘根（建议沿用 Phase 5 D3）；上传 duplicate 语义待 D4 拍板（建议覆盖模式，百度 rtype=3 同课题）；conformance 桩 = 假 123 API + **假 presigned PUT 接收端**（presign URL 指向 loopback，与 Phase 5 假 OSS 同理）。OSS 上传零自研签名（presigned 是服务端签的，**不引 ali-oss-rs**）。
+- **K63.6 硬纪律**：blocking→async 转换主项；动态域名发现（/api/dydomain，失败回退 api.123278.com）；双认证头 + Origin/Referer 必带；5060→duplicate 二次请求；PUT 超时 `max(300s, mb×2s)`；traffic 前置检查给 RateLimited 人话错误；上传后 size 校验；IPv4 dial（pan123-rs 未处理，我们照 baidu 形态加）。
+- **状态**：方案与跟踪单落库（`docs/plans/2026-09-14-pan123-driver.md` + `docs/tracking/phase6-pan123.md`），**待负责人批准后开工 123-0**。本批只读（pan123-rs 克隆至仓外 `E:\GitHub\`），主仓零改动。
