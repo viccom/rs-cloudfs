@@ -1,10 +1,10 @@
 # 驱动接入手册（Driver Onboarding）
 
-> 状态：v1.0（2026-09-08，Phase 2 前置任务）｜ 强制级别：新驱动 PR 的验收依据
+> 状态：v1.1（2026-09-14 增补 §10 transport-only 驱动类；v1.0 = 2026-09-08 Phase 2 前置任务）｜ 强制级别：新驱动 PR 的验收依据
 > 来源：foundation §5 Phase 2 前置任务（红队 H4：无手册则「端到端硬验收」无判定依据）；PCFS 四驱动实证 + 其坑清单（decisions 2026-09-08 PCFS 研究）；spike 报告百度参数
 > 上游标准：[architecture.md](architecture.md)（红线/分层）、[interfaces.md](interfaces.md)（StorageDriver 契约/conformance 八断言）、[code-style.md](code-style.md)（门禁/TDD）
 
-**一句话**：新后端接入 = 实现一个 L2 驱动 crate + 过 conformance 套件 + 按本手册装配，上层全部能力（挂载/仪表盘/同步/CLI）自动可用。
+**一句话**：新后端接入 = 实现一个 L2 驱动 crate + 过 conformance 套件 + 按本手册装配，上层全部能力（挂载/仪表盘/同步/CLI）自动可用。**例外**：后端没有「按路径枚举」面的，走 §10 transport-only 类（telegram 先例）——那是设计事实不是欠债。
 
 ## 1. 驱动 crate 形态
 
@@ -74,3 +74,42 @@
 - 驱动删除失败**禁止**吞错仍清本地索引（云端孤儿）；
 - 禁止 ETag/短前缀构造 EntryId（用稳定后端句柄）；禁止以 Name 前缀嗅探驱动类型（用 Capabilities/类型）；
 - 驱动内部路径前缀（如 baidu 根）**不得泄漏到聚合层**（R1）。
+
+## 10. transport-only 驱动类（telegram 先例；2026-09-14 增补）
+
+不是所有后端都能诚实实现 §2 的九方法。**新驱动接入前先回答一个问题：后端有没有「按路径枚举/寻址」的面？**——即能否**只给定路径**（不借助任何本地索引）实现 `list(dir)` 与 `stat(path)`。
+
+- **有** → 走 §1–§9 的全量公民路线（local / baidu / 115 / 123 / sftp…）；
+- **没有** → 本节的 transport-only 类。
+
+这个二分是 foundation **D4（影子索引 vs 权威索引）**的驱动面投影：权威索引后端（list 即真相）对应 `StorageDriver` 宽面；影子索引后端（索引只存在于本地 db + sync 协议）对应 `CloudTransport` 窄面。**trait 家族长成两班制，正是为了让「没有文件系统面孔的后端」可以诚实存在**（R4「能力位必须诚实」的 trait 面版本）。
+
+### 判定标准与先例证据
+
+- **判定**：远端存储是否可在「只给定路径」时枚举/定位对象。文件系统型后端天然满足；**消息形后端不满足**——路径↔对象的映射只能靠本地索引维持。
+- **telegram 是先例**：远端是聊天消息，caption 是唯一的远端路径链接（`ck-telegram/src/caption.rs` 模块头自述）。按路径枚举需要遍历聊天历史——**2026-09-04 真机 spike 证伪**：bot 会话调 `messages.getHistory` / `messages.search` 均返回 400 `BOT_METHOD_INVALID`（Telegram 平台级限制，与文档一致；见 decisions.md 2026-09-04 条目与 `examples/history_spike.rs`）。rescan 出局，`list`/`stat` 在后端层面**不可实现**。
+
+### transport-only 驱动的义务（替代 §2 的九方法义务）
+
+1. **实现 `CloudTransport` 核心面**：connect / upload（±upload_stream）/ open / open_range / delete_remote / capabilities；可选 `InboundCap` / `ChatCap`（telegram 是唯一先例，两者都实现——这也是宽面驱动没有的能力）。
+2. **能力位照 R4 诚实**：telegram 声明 `range_read` / `multipart` / `inbound` / `chat` 四位（`ck-telegram/src/transport.rs` capabilities），不声明做不到的。
+3. **错误映射表照 R2**：`map_invocation_error` 先例（FloodWait→`RateLimited{retry_after}`）。
+4. **索引职责归 L3**：路径↔消息映射住在元数据库 + `Vfs`（`remote_handle_for` 从 chunks 行组装句柄）；**索引复制走 sync**——影子索引后端的 sync 是**必需基建**而非加速器（D4）。
+5. **编译开关照 §1 全套无差别**（K30 三件套：feature 门控 / 缺驱动文案 / `compiled_drivers()` 臂 / 无驱动孪生函数）——**两班制只在驱动契约面，不在裁剪面**。
+
+### 禁止清单（为什么不能「补齐成全量公民」）
+
+- **不实现 `StorageDriver`**：九方法中 `list`/`stat`/`mkdir`/`rename` 无后端语义；唯一绕路 = 驱动内自建影子索引，即复制 L3 元数据库职责 + 双索引一致性负担 + R6 兼容契约红线风险，纯负收益（2026-09-14 会话逐方法分析否决）。
+- **不接 conformance 套件**：断言③（stat/list 分页）④（mkdir 幂等）⑥（rename 文件+目录）无法诚实通过，而套件「可扩不可减」（§6）。
+- **不进统一 dispatch**：`build_backend_transport_with` 的 telegram 臂**带着 feature 也 bail 是刻意的**——连接由 run 流程自有路径持有；且 boot 臂与运行时 ADD 臂的失败语义差异是**功能性的**（boot = Ctrl+C 竞速 + 人话指引 + `exit(1)`；ADD = 可应答 Err，控制命令绝不杀实例），**勿为视觉对称合并两臂**。
+- **无 rebuild**：`TELEGRAM_REBUILD_REFUSAL` 文案先例（影子索引无后端可走，"this db IS the authoritative index"）；新机器 bootstrap 走 sync 或 import-meta，不走后端枚举。
+
+### transport-only 类验收清单（替代 §8）
+
+- [ ] crate 形态/依赖方向合规（check_layers 绿）
+- [ ] CloudTransport 面 + 错误映射表（mock/桩回放钉死）
+- [ ] Capabilities 逐位依据注码（R4）
+- [ ] 配置键三处同步 + validate 文案可行动（§4 照旧）
+- [ ] transport 面契约测试（`ck-telegram/tests/` 先例：contract / adapter / stream_reader）
+- [ ] 连接路径有 deadline 界 + 失败人话指引（`connect_with_deadline` 先例——网络阻塞的静默挂起是真机事故教训）
+- [ ] 文档联动：README 状态表 / AGENTS 计数 / 本节如需修订

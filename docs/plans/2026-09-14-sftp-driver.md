@@ -300,7 +300,7 @@ crates/drivers/ck-sftp/
 - 能力位：`crates/cloudkit-storage/src/capability.rs:13-49`
 - transport 家族：`crates/cloudkit-storage/src/transport/mod.rs:154-211`
 - 最贴近的实现参照：`crates/drivers/ck-local/src/driver.rs`、`crates/drivers/ck-local/src/transport_face.rs`
-- 接入手册：`docs/standards/driver-onboarding.md`（§1 crate 形态 / §2 九方法义务 / §3 能力位纪律 / §4 配置 schema / §5 工厂装配 / §6 conformance / §7 E2E 凭据 / §8 验收清单 / §9 勿抄清单）
+- 接入手册：`docs/standards/driver-onboarding.md`（§1 crate 形态 / §2 九方法义务 / §3 能力位纪律 / §4 配置 schema / §5 工厂装配 / §6 conformance / §7 E2E 凭据 / §8 验收清单 / §9 勿抄清单 / §10 transport-only 驱动类——telegram 先例；SFTP 走 §1–§9 全量公民路线）
 - 接入点：`lib.rs:122-137`（`compiled_drivers`）、`:101-112`（`*_DRIVER_REQUIRED`）、`:4900-4977`（`BackendTransport`）、`:5044-5056`（`build_local_transport`）、`:5066-5115`（dispatch）、`:5348-5388`（`build_driver`）
 - 配置键：`crates/cloudkit-core/src/config.rs:67-106`（`KNOWN_TOML_KEYS`）、`:203-222`（`Backend`）、`VOLUME_SCOPED_KEYS`
 - 零侵入依据：`crates/cloudkit-core/src/vfs.rs:333-339`、`:434-501`、`:508-512`、`:776-780`
