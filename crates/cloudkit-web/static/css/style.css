@@ -752,6 +752,48 @@ body {
     cursor: pointer;
 }
 
+/* The preview modal's always-present download way out (top-right, next
+   to the close button — the error fallback leans on it too). */
+.modal-download {
+    position: absolute;
+    top: 1.15rem; right: 3.6rem;
+    color: var(--text-muted);
+    font-size: 1rem;
+}
+
+.modal-download:hover {
+    color: var(--accent-cyan);
+}
+
+/* The ArtPlayer mount: explicit height via aspect-ratio (the player
+   sizes itself to its container). */
+.art-player-host {
+    width: 100%;
+    aspect-ratio: 16 / 9;
+    border-radius: 10px;
+    box-shadow: 0 0 25px rgba(0, 243, 255, 0.2);
+    overflow: hidden;
+}
+
+/* The preview's error fallback (a format the browser cannot decode):
+   the message plus the download way out. */
+.media-fallback {
+    text-align: center;
+    padding: 3rem 1rem;
+    color: var(--text-muted);
+}
+
+.media-fallback i {
+    display: block;
+    font-size: 2.2rem;
+    color: #ff6688;
+    margin-bottom: 0.8rem;
+}
+
+.media-fallback p {
+    margin-bottom: 1.2rem;
+}
+
 
 /* ---------- Volume management page (web volume management P0) ----------
    The §1.4 configuration-state twin: additive glue over the existing

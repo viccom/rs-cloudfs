@@ -500,6 +500,7 @@ function renderFilesTable(files) {
                 <td>${statusBadge}</td>
                 <td>${dateStr}</td>
                 <td>
+                    ${!isDir ? `<button class="action-btn" title="${t('index.copy_link')}" onclick="copyLink('${encName}')"><i class="fa-solid fa-link"></i></button>` : ''}
                     ${!isDir ? `<a href="${apiUrl(`/api/download/${encName}`)}" class="action-btn" title="${t('index.download')}"><i class="fa-solid fa-download"></i></a>` : ''}
                     ${!isDir && isMedia(file.name) ? `<button class="action-btn" title="${t('index.stream')}" onclick="previewMedia('${encName}')"><i class="fa-solid fa-play"></i></button>` : ''}
                     <button class="action-btn btn-delete" title="${deleteTitle}" onclick="deleteFile('${encName}')"><i class="fa-solid fa-trash-can"></i></button>
@@ -527,9 +528,25 @@ function getFileIcon(name, isDir) {
     return '<i class="fa-solid fa-file" style="color: #8b9bb4; font-size: 1.2rem;"></i>';
 }
 
+// The media extension lists — the one source shared by isMedia() (the
+// media filter + the play button) and previewMedia() (the modal's
+// branch dispatch), so the two can never drift apart. mov/m4v and
+// m4a/aac/opus ride the iPhone/web-media wave (false-negative fixes);
+// avi stays listed — ArtPlayer's in-modal error fallback owns its
+// failure path now (a message + the download way out) instead of a
+// black screen. The image branch keeps the native <img>.
+const VIDEO_EXTS = ['mp4', 'webm', 'mkv', 'avi', 'mov', 'm4v'];
+const AUDIO_EXTS = ['mp3', 'wav', 'flac', 'ogg', 'm4a', 'aac', 'opus'];
+const IMAGE_EXTS = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'];
+
+// The preview modal's open ArtPlayer instance, if any — destroyed on
+// the modal close (closeModal) and on the error fallback, so a closed
+// modal never keeps decoding or holding its media element.
+let currentArt = null;
+
 function isMedia(name) {
     const ext = name.split('.').pop().toLowerCase();
-    return ['mp4', 'webm', 'mkv', 'avi', 'mp3', 'wav', 'flac', 'ogg', 'jpg', 'jpeg', 'png', 'gif', 'webp', 'svg'].includes(ext);
+    return VIDEO_EXTS.includes(ext) || AUDIO_EXTS.includes(ext) || IMAGE_EXTS.includes(ext);
 }
 
 function isDocument(name) {
@@ -543,14 +560,56 @@ function previewMedia(fileName) {
     const modal = document.getElementById("media-modal");
     const modalTitle = document.getElementById("modal-title");
     const modalBody = document.getElementById("modal-body");
+    const modalDownload = document.getElementById("modal-download");
 
     modalTitle.innerText = decoded;
     const url = apiUrl(`/api/download/${fileName}`);
+    // The modal's always-present download way out (top-right, next to
+    // the close button) — the same anchor the error fallback leans on.
+    if (modalDownload) {
+        modalDownload.href = url;
+        modalDownload.hidden = false;
+    }
 
-    if (['mp4', 'webm', 'mkv', 'avi'].includes(ext)) {
-        modalBody.innerHTML = `<video controls autoplay style="width: 100%; border-radius: 10px; box-shadow: 0 0 25px rgba(0,243,255,0.2);"><source src="${url}"></video>`;
-    } else if (['mp3', 'wav', 'flac', 'ogg'].includes(ext)) {
+    if (VIDEO_EXTS.includes(ext)) {
+        // ArtPlayer 5.x (UMD, window.Artplayer — vendored at
+        // static/js/vendor/artplayer.js): the in-modal player with the
+        // full settings tray. hotkey stays off — its global arrow/space
+        // bindings would fight the page while the modal is open. The
+        // theme matches the accent-cyan. A decode failure (avi, mkv
+        // codecs the browser lacks) tears the player down and renders
+        // the fallback layer with the download link.
+        modalBody.innerHTML = '<div class="art-player-host"></div>';
+        const container = modalBody.querySelector('.art-player-host');
+        const art = new Artplayer({
+            container: container,
+            url: url,
+            autoplay: true,
+            theme: '#00f3ff',
+            setting: true,
+            playbackRate: true,
+            aspectRatio: true,
+            flip: true,
+            screenshot: true,
+            pip: true,
+            hotkey: false,
+            fullscreen: true,
+            fullscreenWeb: true,
+            miniProgressBar: true,
+            mutex: true,
+        });
+        currentArt = art;
+        art.on('error', () => {
+            destroyCurrentArt();
+            renderMediaFallback(modalBody, fileName);
+        });
+    } else if (AUDIO_EXTS.includes(ext)) {
         modalBody.innerHTML = `<audio controls autoplay style="width: 100%; margin-top: 1.5rem;"><source src="${url}"></audio>`;
+        // With <source> children the load error fires on the source
+        // element, not the audio element — the capture-phase listener
+        // sees both.
+        const audio = modalBody.querySelector('audio');
+        if (audio) audio.addEventListener('error', () => renderMediaFallback(modalBody, fileName), true);
     } else {
         modalBody.innerHTML = `<img src="${url}" style="max-width: 100%; max-height: 520px; border-radius: 10px; display: block; margin: 0 auto; box-shadow: 0 0 30px rgba(0,243,255,0.25);">`;
     }
@@ -558,9 +617,32 @@ function previewMedia(fileName) {
     modal.style.display = "flex";
 }
 
+// The preview's error fallback (a format the browser cannot decode):
+// the message plus the download way out — never a silent black modal.
+function renderMediaFallback(container, encodedName) {
+    const url = apiUrl(`/api/download/${encodedName}`);
+    container.innerHTML = `
+        <div class="media-fallback">
+            <i class="fa-solid fa-triangle-exclamation"></i>
+            <p>${t('index.play_failed')}</p>
+            <a class="btn btn-primary" href="${url}" download><i class="fa-solid fa-download"></i> ${t('index.download_instead')}</a>
+        </div>
+    `;
+}
+
+function destroyCurrentArt() {
+    if (currentArt) {
+        try { currentArt.destroy(); } catch (err) { /* already gone */ }
+        currentArt = null;
+    }
+}
+
 function closeModal() {
+    destroyCurrentArt();
     const modal = document.getElementById("media-modal");
     if (modal) {
+        const download = document.getElementById("modal-download");
+        if (download) download.hidden = true;
         document.getElementById("modal-body").innerHTML = "";
         modal.style.display = "none";
     }
@@ -661,6 +743,70 @@ async function uploadFiles(files) {
         }
     }
     loadDriveData();
+}
+
+// The file row's copy-link action: the absolute URL of the download
+// endpoint (volume-scoped via apiUrl — the clipboard carries exactly
+// the URL the download button would fetch). The Clipboard API first
+// (the dashboard runs on a secure context), the temporary-textarea
+// fallback second, an error toast last — the copy never dies silently.
+async function copyLink(encodedName) {
+    const url = location.origin + apiUrl(`/api/download/${encodedName}`);
+    if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
+        try {
+            await navigator.clipboard.writeText(url);
+            showToast('ok', t('index.link_copied'));
+            return;
+        } catch (err) { /* denied / busy — the legacy path takes over */ }
+    }
+    try {
+        legacyCopyText(url);
+        showToast('ok', t('index.link_copied'));
+    } catch (err) {
+        console.error("Copy failed:", err);
+        showToast('err', t('index.copy_failed'));
+    }
+}
+
+// The execCommand fallback (denied clipboard permission, missing API):
+// a temporary off-screen textarea, select, copy, remove.
+function legacyCopyText(text) {
+    const area = document.createElement('textarea');
+    area.value = text;
+    area.style.position = 'fixed';
+    area.style.opacity = '0';
+    document.body.appendChild(area);
+    area.select();
+    let ok = false;
+    try {
+        ok = document.execCommand('copy');
+    } finally {
+        area.remove();
+    }
+    if (!ok) throw new Error('execCommand copy returned false');
+}
+
+// The toast (the volumes.js twin — same markup and classes, the
+// style.css #toast-host rules are global): created on demand, one slot
+// per message, 4s self-destruct.
+function showToast(kind, text) {
+    let host = document.getElementById('toast-host');
+    if (!host) {
+        host = document.createElement('div');
+        host.id = 'toast-host';
+        document.body.appendChild(host);
+    }
+    const toast = document.createElement('div');
+    toast.className = `toast toast-${kind}`;
+    toast.innerHTML = `
+        <i class="fa-solid ${kind === 'ok' ? 'fa-circle-check' : 'fa-circle-exclamation'}"></i>
+        <span>${escapeHtml(text)}</span>
+    `;
+    host.appendChild(toast);
+    setTimeout(() => {
+        toast.classList.add('toast-out');
+        setTimeout(() => toast.remove(), 350);
+    }, 4000);
 }
 
 function formatBytes(bytes, decimals = 2) {
