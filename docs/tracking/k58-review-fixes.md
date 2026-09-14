@@ -18,7 +18,19 @@
 
 | 项 | 复核结论 |
 |---|---|
-| （收口时填） | — |
+| H1 web 超时/断连斩杀命令→楔死 | ✅ 已修并复核——红实证（hyper 实测 drop 在途 future→LIST 永列 stuck）→ 绿（abort 后命令跑完、卷消失、shutdown 干净）；机制=执行任务 spawn+oneshot，等待端可弃不影响执行（`an_abandoned_web_remove_runs_to_its_natural_end`） |
+| H2 web 缝绕过串行队列 | ✅ 已修并复核——红实证（并发 REMOVE×2 撞结构 ERR）→ 绿（一成一拒）；单 permit Mutex 全入口串行 + 死锁论证入注释；特征测试 `concurrent_rebuilds_across_both_faces_serialize...` 钉双入口串行；九处假注释重写 |
+| H3 卷文件非原子写 | ✅ 已修并复核——`write_config_atomically`（tmp+sync+rename）五写盘点收敛；五种真实 fs 态测试（含失败路径原文件逐字节不动、临时清理）；CONFIGS 契约链经 SHOW 面加验 |
+| H4 panic 日志泄凭据 | ✅（随 FB 重梳）——真正 panic 防护移入执行任务：tracing 只记 payload 摘要（`panic_summary` 截断）不记命令行；control.rs 旧 `command = %line` 日志随注释重写移除（commit 正文核对）；web 腿 panic e2e 钉通道存活 |
+| H5 Origin guard 防 rebinding 无效 | ✅ 已修并复核——红实证（rebinding 形态 destroy 409 漏过 / upload 200 直达）→ 绿（双 403）；Host 白名单绑定后推导（:0 端口先 bind）；四形态钉住不误伤（curl 无头/同源/localhost/大小写）；/api/upload 存量 CSRF 一并收口 |
+| M1 worker panic→幽灵 outstanding | ✅ 已修并复核——红（注入 panic transport→outstanding 恒 1 满窗口）→ 绿（degraded 终态+worker 存活第二文件成功+缓存保留）；workspace 1067/0/12 |
+| M2 proxy_url/sync_url 凭据分类缺口 | ✅ 已修并复核——红（SHOW 原样出 userinfo / parse 引文泄）→ 绿（`{"set":true}` 折叠）；前端 write-only 占位符同步；增补：baidu_app_key 亦入清单（与前端既有渲染对齐，968d492） |
+| M3 disabled 卷 Edit 必 404 | ✅ 已修并复核——红（registry 无→404）→ 绿（200 脱敏 JSON，FAKE-TOKEN 断言）；REMOVE 后修复回路恢复（cli e2e 语义翻转即本意） |
+| M4a rebuild 检查点身份判据 | ✅ 已修并复核——单元测（同实例稳定/re-ADD 必变/Failed 无身份，断言直取 Arc::as_ptr 非同义反复）+ 集成（旧代码负载无关确定红；绿后窗口内外两形态均中止）；「重建必变」论证入 doc（无同 Vfs 复用路径+钉活防 ABA） |
+| M4b rebuild 行走中排空复查 | ✅ 已修并复核——红全套两次稳定复现 → 绿（可恢复中断 UploadsResumed+标记回落+排空后重受理跑完） |
+| M5 UPDATE 重读脱敏旁路 | ✅ 已修并复核——`redact_credential_values` 提 pub（单一漏斗 doc）+ `parse_explicit_table_redacted` 直连测试；全批唯一漏斗声明恢复 |
+| M6 前端轮询重绘击穿防重入 | ✅ 已修并复核——jsdom 红 4 FAIL（双 POST/无 toast/禁用态蒸发）→ 绿 11/11（双击 no-op、重绘恢复整行禁用、confirm 取消不沾锁）；i18n 双语键 |
+| M7 回复文本前缀匹配判成败 | ✅ 已修并复核——`add_volume` 返回 (String,bool) 三态单元测（特征测试性质如实标注：文案不可注入，漂移免疫以类型系统+bool 三态代理）；CREATE/UPDATE 按 bool 分类、strip 降为展示糖 |
 
 ## 批次日志
 
