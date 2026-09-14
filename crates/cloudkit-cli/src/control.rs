@@ -43,7 +43,11 @@
 //! Concurrency (runtime-volumes §4): volume commands are serialized —
 //! the accept loop awaits the handler for at most one command at a time,
 //! so ADD and REMOVE can never interleave (a later command, STOP
-//! included, queues behind the one in flight).
+//! included, queues behind the one in flight). K58-FB: the production
+//! handler the boot installs ALSO serializes internally (a single-permit
+//! gate around its detached execution), because the same handler `Arc`
+//! serves the dashboard's command seam on concurrent axum tasks — this
+//! loop's serialization alone never covered those.
 
 use std::future::Future;
 use std::io;
@@ -84,9 +88,13 @@ pub fn control_file_path(cfg: &CyDriveConfig) -> PathBuf {
 /// The volume-command handler the multi-volume boot installs (K48): the
 /// raw command line (trimmed, e.g. `ADD b` / `REMOVE b` / `LIST`) in,
 /// the verbatim reply text out — `OK: ...` or `ERR: ...`, multi-line
-/// allowed, `\n`-terminated lines. At most one invocation runs at a time
-/// (the accept loop serializes), so the handler needs no internal
-/// locking of its own for command-vs-command races.
+/// allowed, `\n`-terminated lines. This accept loop awaits one
+/// invocation at a time, so a handler installed ONLY here needs no
+/// internal command-vs-command locking; the production multi-volume
+/// handler is additionally shared with the dashboard's seam (K58-FB),
+/// so it serializes INTERNALLY — one single-permit gate around the
+/// actual execution — and this loop's await is then a second, redundant
+/// serialization layer rather than the only one.
 pub type VolumeCommandHandler = Arc<
     dyn for<'a> Fn(&'a str) -> Pin<Box<dyn Future<Output = String> + Send + 'a>>
         + Send
@@ -101,8 +109,15 @@ const VOLUME_COMMANDS_UNAVAILABLE: &str =
 
 /// The reply a command whose handler panicked gets (review M1-1): the
 /// panic is contained, the channel keeps serving — the instance log
-/// carries the panic payload for diagnosis.
-const HANDLER_PANIC_REPLY: &str =
+/// carries the panic payload for diagnosis. K58-FB: the production
+/// handler moved its execution onto a detached task (see the boot
+/// wiring's `volume_command_handler`), which catches its own panics and
+/// answers with this SAME text through its reply channel — so both
+/// faces (this channel and the dashboard's seam) speak the identical
+/// wording. The panic-protection layering: the task-side catch (where
+/// the real execution runs) + the catch below (defense in depth for
+/// arbitrary handlers installed without their own containment).
+pub(crate) const HANDLER_PANIC_REPLY: &str =
     "ERR: internal error while executing the command — the control channel stays up; see the instance log\n";
 
 /// The first token of a control line (uppercased for the keyword match).
@@ -298,17 +313,25 @@ impl ControlServer {
                     if let Some((line, reply_tx)) = command {
                         // The serialized command execution: at most one
                         // handler invocation is awaited here at a time
-                        // (runtime-volumes §4's concurrency ruling). The
-                        // unwind guard (review M1-1) keeps a panicking
-                        // handler from taking this loop task down — the
-                        // listener lives on it, so an unguarded panic
-                        // would also kill STOP/PING and leave the
-                        // panicking command's client on a bare EOF;
-                        // instead the client gets the actionable
-                        // internal-error ERR and the next command runs
-                        // normally. The payload is our own command text
-                        // and panic message — nothing credential-shaped
-                        // reaches the log.
+                        // (runtime-volumes §4's concurrency ruling) —
+                        // the SEMANTIC guarantee for control-channel
+                        // commands even if the handler has no internal
+                        // locking of its own. The production handler
+                        // (K58-FB) runs each command on a detached task
+                        // behind its own single-permit gate, so the
+                        // future awaited here only parks on the reply
+                        // channel — commands from the dashboard's seam
+                        // serialize against these through the handler's
+                        // gate, not this loop. The unwind guard (review
+                        // M1-1) keeps a panicking handler from taking
+                        // this loop task down — the listener lives on
+                        // it, so an unguarded panic would also kill
+                        // STOP/PING and leave the panicking command's
+                        // client on a bare EOF; instead the client gets
+                        // the actionable internal-error ERR and the next
+                        // command runs normally. The payload is our own
+                        // command text and panic message — nothing
+                        // credential-shaped reaches the log.
                         let reply = match &commands {
                             Some(handler) => {
                                 match AssertUnwindSafe(handler(&line))
