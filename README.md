@@ -8,15 +8,15 @@
 
 ```
 L5 应用  cli │ webdav 网关 │ web 仪表盘 │ bot(telegram)
-L4 服务  上传队列 │ 同步引擎(+sync-server) │ LRU 缓存 │ 加密(v1 GCM/v2 分块 AEAD 流式)
+L4 服务  上传队列 │ 同步引擎(+sync-server) │ LRU 缓存 │ 加密(v1 GCM/v2 分块 AEAD 流式，新卷默认 v2)
 L3 领域  VFS │ 元数据索引(SQLite) │ MetadataEvent 总线
 L2 抽象  StorageDriver trait + 能力位 + 错误分类学 + conformance kit
-L1 驱动  telegram │ baidu │ local │ (未来: 115/123/s3…)
+L1 驱动  telegram │ baidu │ local │ (未来: sftp(Phase 4 立项) / 115/123/s3…)
 ```
 
-**新后端接入 = 实现一个驱动 + 过 conformance 套件，上层全部能力（挂载/仪表盘/同步/CLI）自动可用。**
+**新后端接入 = 实现一个驱动 + 过 conformance 套件，上层全部能力（挂载/仪表盘/同步/CLI）自动可用。**驱动分两类（[driver-onboarding §10](docs/standards/driver-onboarding.md)）：后端有「按路径枚举」面的走 `StorageDriver` 宽面 + conformance（baidu/local/sftp）；没有的走 `CloudTransport` 窄面（telegram 先例——远端是消息，bot 读历史被平台拒绝，索引只存在于本地 db + sync）。**两类在编译开关上完全平权**（见下文 feature 门控）。
 
-## 状态（2026-09-07）
+## 状态（2026-09-14）
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
@@ -26,7 +26,11 @@ L1 驱动  telegram │ baidu │ local │ (未来: 115/123/s3…)
 | Phase 1 | 百度 spike → StorageDriver 抽象落地 → 加密 v2 流式（0.8.0，617+ 测试绿，含真机冒烟两轮） | ✅ 完成 |
 | Phase 2 | ck-local + ck-baidu + 组合根接线 + 端到端硬验收（0.9.0，740 测试绿；baidu/local E2E 通过、telegram 腿待独立测试 chat） | ✅ 完成 |
 | Phase 2.5 | 多卷启用（Registry + 每实例配置 + 多盘挂载，方案一裁决） | ✅ 完成（0.10.0，810 测试绿；单进程三卷真机 E2E：local 加密 V: + tg Y: + baidu Z:，全过） |
-| Phase 3 | WinFsp 类本地盘挂载（WF0–WF5，K38–K46）+ 115/123/桌面端/自更新（择机） | 🟨 WinFsp 挂载完成（867 测试绿；三卷真机验收七项全过，764MB 视频 open 55.4s→7-11ms；其余项择机） |
+| Phase 3 | WinFsp 类本地盘挂载（WF0–WF5，K38–K46） | ✅ 完成（867 测试绿；三卷真机验收七项全过，764MB 视频 open 55.4s→7-11ms；115/123/桌面端/自更新仍择机） |
+| Phase 3.6 | 存储卷运行态装卸 + 卷级 enabled 键（RV0–RV3，K48–K51）+ 两轮审查修复（K55/K56、K58 5H+8M） | ✅ 完成 |
+| 卷管理面 | Web `/volumes` 页 + 卷全生命周期命令协议（K57：SHOW/ENABLE/DISABLE/REBUILD/CREATE/UPDATE/DESTROY，凭据 write-only）+ 运行时后台 rebuild | ✅ 完成 |
+| Web 体验 | ArtPlayer 内置播放器 + 复制链接 + 注入修复 + **默认加密方案 aead_v2**（新卷流式播放默认可用） | ✅ 完成（1069 测试绿） |
+| Phase 4 | ssh/sftp 存储驱动（russh 0.63 + russh-sftp 3.0，ring 后端；K59） | 🟨 方案立项待批（三轮外部研究 + Windows 进程内 SFTP 桩实测验证完成） |
 
 阶段计划与裁决：[docs/plans/2026-09-07-cloudfusion-foundation.md](docs/plans/2026-09-07-cloudfusion-foundation.md) ｜ 历史裁决：[docs/decisions.md](docs/decisions.md)
 
@@ -59,7 +63,7 @@ cargo build --release --no-default-features --features local,baidu # 本地+百�
 
 ### 流式读（视频直接播放）
 
-非加密文件 + 支持 Range 的后端（baidu/local/telegram）的读取走 **Range 直通**：请求哪段拉哪段（4MiB 窗口），不再整文件下载后才能播放——764MiB 视频首字节 <1ms、1MiB 片段 ~0.2s。生效面：WebDAV 盘符、仪表盘播放器、`/api/download` URL（可直接喂 PotPlayer/VLC）。`aead_v2` 加密文件同样支持 Range 流式读（按需拉密文窗口实时解密，逐 chunk AEAD 验签）；gcm v1 加密文件与不支持 Range 的后端仍自动回退整文件模式。
+非加密文件 + 支持 Range 的后端（baidu/local/telegram）的读取走 **Range 直通**：请求哪段拉哪段（4MiB 窗口），不再整文件下载后才能播放——764MiB 视频首字节 <1ms、1MiB 片段 ~0.2s。生效面：WebDAV 盘符、仪表盘播放器（**ArtPlayer**，本地内置无外联 CDN，支持常见音视频格式 + 播放失败自动回退原生素材）、`/api/download` URL（可直接喂 PotPlayer/VLC；文件管理页每行有「复制链接」按钮一键取直链）。**加密默认 `aead_v2`**（2026-09-14 起，新卷默认——分块 AEAD 按需拉密文窗口实时解密、逐 chunk 验签，同样支持 Range 流式读）；`gcm` v1 保留显式可选（整文件模式，Python 基线兼容形态），不支持 Range 的后端自动回退整文件模式。
 
 > **盘符路径播放大视频的固有限制**：Windows 的 WebDAV 重定向器对播放器打开的大文件会先整文件缓存（实测读 4MB 实际拉全文件），764MB 视频会以全速下载十几秒后可能触发客户端 RPC 故障。**大视频请用 URL 直喂播放器**（PotPlayer/VLC 打开 URL：`http://127.0.0.1:8485/vol/baidu/<文件名>`，真流式秒开）；盘符适合常规文件操作。
 
