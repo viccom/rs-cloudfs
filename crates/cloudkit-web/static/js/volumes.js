@@ -785,7 +785,9 @@ function vfCollectPayload() {
     const enc = vfEl('vf-enc');
     if (enc) payload.enable_encryption = enc.checked;
     const scheme = vfEl('vf-enc-scheme');
-    if (scheme && scheme.value !== 'gcm') payload.encryption_scheme = scheme.value;
+    // The key is written only when it differs from the config default
+    // (aead_v2) — an absent key reads as the default on the backend.
+    if (scheme && scheme.value !== 'aead_v2') payload.encryption_scheme = scheme.value;
     const backend = vfBackend();
     if (backend) payload.backend = backend;
     return payload;

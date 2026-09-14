@@ -59,6 +59,10 @@ fn test_cfg(chunk_size_bytes: u64) -> UploadQueueConfig {
 fn encrypted_cfg(chunk_size_bytes: u64, password: &str) -> UploadQueueConfig {
     let mut cfg = test_cfg(chunk_size_bytes);
     cfg.encryption_password = Some(password.to_string());
+    // The callers below assert the v1 whole-file ciphertext math (44 B
+    // GCM overhead, 16 B boundary chunks) — pin Gcm explicitly instead
+    // of riding the config default, which is now AeadV2.
+    cfg.encryption_scheme = cloudkit_core::config::EncryptionScheme::Gcm;
     cfg
 }
 

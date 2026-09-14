@@ -38,18 +38,18 @@ fn toml_parses_aead_v2_scheme() {
 }
 
 #[test]
-fn default_scheme_is_gcm() {
+fn default_scheme_is_aead_v2() {
     assert_eq!(
         CyDriveConfig::default().encryption_scheme,
-        EncryptionScheme::Gcm,
-        "dataclass default is gcm"
+        EncryptionScheme::AeadV2,
+        "dataclass default is aead_v2 (K58 ruling: streaming is the sane default)"
     );
     let (_dir, path) = config_file("config.toml", BASE);
     let cfg = CyDriveConfig::load_toml(&path).expect("base config loads");
     assert_eq!(
         cfg.encryption_scheme,
-        EncryptionScheme::Gcm,
-        "a file without the key keeps the gcm default (zero behavior change)"
+        EncryptionScheme::AeadV2,
+        "a file without the key keeps the aead_v2 default"
     );
 }
 

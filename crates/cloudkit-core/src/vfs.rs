@@ -41,10 +41,10 @@ pub struct VfsConfig {
     /// Password enabling client-side encryption; default `None`.
     pub encryption_password: Option<String>,
     /// Container scheme for newly encrypted rows (Batch E / E-4):
-    /// `Gcm` (default — v1 whole-file staging, byte-identical to the
-    /// pre-E-4 behavior) or `AeadV2` (streaming upload, zero `.enc.tmp`).
-    /// Recorded on the `files` row at `put` time; the read path dispatches
-    /// on the row's scheme, never on this field.
+    /// `AeadV2` (default — chunked streaming upload, zero `.enc.tmp`,
+    /// Range-streamable reads per K47) or `Gcm` (frozen v1 whole-file
+    /// staging). Recorded on the `files` row at `put` time; the read
+    /// path dispatches on the row's scheme, never on this field.
     pub encryption_scheme: crate::config::EncryptionScheme,
     /// Upper bound on the remote-dependent span of a hydration
     /// (transport open through the final cache copy); default 1800s.

@@ -160,10 +160,11 @@ const LEGACY_REJECTED_KEYS: &[&str] = &[
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum EncryptionScheme {
-    /// v1 whole-file GCM (Python compatible, frozen; the default).
-    #[default]
+    /// v1 whole-file GCM (frozen legacy format; reads stay supported).
     Gcm,
-    /// v2 chunked AEAD (streaming + random access).
+    /// v2 chunked AEAD (streaming + random access) — the default for
+    /// new encrypted volumes.
+    #[default]
     AeadV2,
 }
 
@@ -1164,11 +1165,12 @@ pub struct CyDriveConfig {
     /// Whether client-side encryption is enabled.
     pub enable_encryption: bool,
     /// Container scheme for NEW encrypted uploads (Batch E / E-4):
-    /// `"gcm"` (default, Python-compatible v1) or `"aead_v2"` (streaming
-    /// v2). Read paths dispatch on the per-row scheme in the metadata DB,
-    /// never on this key. Value validation is exhaustive at parse time
-    /// (the field is a typed enum — an unknown variant is a
-    /// [`ConfigError::Parse`] naming both accepted values and never
+    /// `"aead_v2"` (chunked streaming v2 — the default; supports Range
+    /// streaming reads, K47) or `"gcm"` (frozen v1 whole-file legacy,
+    /// reads only). Read paths dispatch on the per-row scheme in the
+    /// metadata DB, never on this key. Value validation is exhaustive
+    /// at parse time (the field is a typed enum — an unknown variant is
+    /// a [`ConfigError::Parse`] naming both accepted values and never
     /// reaches `validate`, which therefore adds no rule for this key).
     pub encryption_scheme: EncryptionScheme,
     /// Optional SOCKS5 proxy URL for the Telegram MTProto connection
