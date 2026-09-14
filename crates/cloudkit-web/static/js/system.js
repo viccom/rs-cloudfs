@@ -221,6 +221,11 @@ function setText(id, text) {
     if (el) el.innerText = text;
 }
 
+// K58 follow-up (external review): quotes are escaped too — the
+// invalid reason (sysStatusBadge's title) and SHOW values land inside
+// double-quoted attributes, where an unescaped quote would break out.
+// & stays first: no double-escaping.
 function escapeHtml(text) {
-    return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }

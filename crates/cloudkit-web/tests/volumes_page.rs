@@ -763,7 +763,8 @@ async fn index_page_is_bilingual_ready_and_storage_card_moved() {
         "the Cloud Drive filter item is gone: {body}"
     );
     assert!(
-        body.contains("filterType('media')") && body.contains("filterType('documents')"),
+        body.contains("filterType('media', event)")
+            && body.contains("filterType('documents', event)"),
         "the view filter items stay: {body}"
     );
     // This page's switcher pill: Files is the active segment.

@@ -63,10 +63,36 @@ document.addEventListener("DOMContentLoaded", async () => {
     loadDriveData();
     setupDropZone();
     setupSearch();
+    setupFileActions();
     setupPagination();
     // Auto-refresh drive files and stats every 4 seconds
     setInterval(loadDriveData, 4000);
 });
+
+// The file rows' action buttons: ONE delegated listener on the static
+// tbody serves every row the renderer mints (the render replaces the
+// rows every poll — the listener outlives them). K58 follow-up, external
+// review: the row template used to inline the encoded name into
+// onclick="fn('...')" — encodeURIComponent leaves `'` intact, so a plain
+// apostrophe file name (reachable: RelPath does not reject quotes)
+// produced broken inline JS, and a `"`-shaped name could break out of
+// the attribute itself. The buttons now carry data-action/data-name (the
+// RAW name — the HTML parser decodes the entity references), and no
+// file name is ever interpolated into a JavaScript context again.
+function setupFileActions() {
+    const tbody = document.getElementById("files-tbody");
+    if (!tbody) return;
+    tbody.addEventListener("click", onFileActionClick);
+}
+
+function onFileActionClick(event) {
+    const button = event.target.closest("button[data-action]");
+    if (!button) return;
+    const name = button.dataset.name;
+    if (button.dataset.action === "copy") copyLink(name);
+    else if (button.dataset.action === "play") previewMedia(name);
+    else if (button.dataset.action === "delete") deleteFile(name);
+}
 
 // One delegated listener pair on the static pagination host serves
 // every bar the renderer mints (clicks move pages, the select changes
@@ -333,7 +359,14 @@ function updateBackendUI(stats) {
     }
 }
 
-function filterType(type) {
+// The view filters (fix 4, external review): the anchors carry href="#"
+// only for pointer semantics, so the click must be preventDefault'ed —
+// otherwise the page jumps to the top. The handler takes the event
+// explicitly (the templates pass `event`) instead of leaning on the
+// legacy window.event global, and highlights the anchor the event
+// actually dispatched from (ev.currentTarget — target would be the
+// inner icon/span).
+function filterType(type, ev) {
     currentFilter = type;
 
     // Update active nav-item class
@@ -341,9 +374,9 @@ function filterType(type) {
         item.classList.remove("active");
     });
 
-    const eventTarget = window.event ? window.event.currentTarget : null;
-    if (eventTarget) {
-        eventTarget.classList.add("active");
+    if (ev) {
+        ev.preventDefault();
+        ev.currentTarget.classList.add("active");
     }
 
     applyCurrentFilter(true);
@@ -480,6 +513,9 @@ function renderFilesTable(files) {
             : `<span class="badge-status badge-uploading"><i class="fa-solid fa-rotate fa-spin"></i> ${t('status.syncing')}</span>`;
 
         const isDir = Boolean(file.is_dir);
+        // The only URL-context use of the encoded name: the download
+        // link's href (legal there). The action buttons carry the raw
+        // name in data attributes instead — see setupFileActions.
         const encName = encodeURIComponent(file.name);
         // The delete semantics are server-declared (K4): a remote-delete
         // backend really removes the cloud object, telegram only drops
@@ -500,10 +536,10 @@ function renderFilesTable(files) {
                 <td>${statusBadge}</td>
                 <td>${dateStr}</td>
                 <td>
-                    ${!isDir ? `<button class="action-btn" title="${t('index.copy_link')}" onclick="copyLink('${encName}')"><i class="fa-solid fa-link"></i></button>` : ''}
+                    ${!isDir ? `<button class="action-btn" title="${t('index.copy_link')}" data-action="copy" data-name="${escapeHtml(file.name)}"><i class="fa-solid fa-link"></i></button>` : ''}
                     ${!isDir ? `<a href="${apiUrl(`/api/download/${encName}`)}" class="action-btn" title="${t('index.download')}"><i class="fa-solid fa-download"></i></a>` : ''}
-                    ${!isDir && isMedia(file.name) ? `<button class="action-btn" title="${t('index.stream')}" onclick="previewMedia('${encName}')"><i class="fa-solid fa-play"></i></button>` : ''}
-                    <button class="action-btn btn-delete" title="${deleteTitle}" onclick="deleteFile('${encName}')"><i class="fa-solid fa-trash-can"></i></button>
+                    ${!isDir && isMedia(file.name) ? `<button class="action-btn" title="${t('index.stream')}" data-action="play" data-name="${escapeHtml(file.name)}"><i class="fa-solid fa-play"></i></button>` : ''}
+                    <button class="action-btn btn-delete" title="${deleteTitle}" data-action="delete" data-name="${escapeHtml(file.name)}"><i class="fa-solid fa-trash-can"></i></button>
                 </td>
             </tr>
         `;
@@ -554,16 +590,18 @@ function isDocument(name) {
     return ['pdf', 'doc', 'docx', 'txt', 'md', 'csv', 'xlsx', 'pptx', 'json', 'xml', 'py', 'js', 'html', 'css', 'sql', 'sh'].includes(ext);
 }
 
+// Opens the preview modal for the RAW file name (the caller passes the
+// data-name verbatim); the URL context is encoded here, not by callers.
 function previewMedia(fileName) {
-    const decoded = decodeURIComponent(fileName);
-    const ext = decoded.split('.').pop().toLowerCase();
+    const ext = fileName.split('.').pop().toLowerCase();
+    const encoded = encodeURIComponent(fileName);
+    const url = apiUrl(`/api/download/${encoded}`);
     const modal = document.getElementById("media-modal");
     const modalTitle = document.getElementById("modal-title");
     const modalBody = document.getElementById("modal-body");
     const modalDownload = document.getElementById("modal-download");
 
-    modalTitle.innerText = decoded;
-    const url = apiUrl(`/api/download/${fileName}`);
+    modalTitle.innerText = fileName;
     // The modal's always-present download way out (top-right, next to
     // the close button) — the same anchor the error fallback leans on.
     if (modalDownload) {
@@ -601,7 +639,7 @@ function previewMedia(fileName) {
         currentArt = art;
         art.on('error', () => {
             destroyCurrentArt();
-            renderMediaFallback(modalBody, fileName);
+            renderMediaFallback(modalBody, encoded);
         });
     } else if (AUDIO_EXTS.includes(ext)) {
         modalBody.innerHTML = `<audio controls autoplay style="width: 100%; margin-top: 1.5rem;"><source src="${url}"></audio>`;
@@ -609,7 +647,7 @@ function previewMedia(fileName) {
         // element, not the audio element — the capture-phase listener
         // sees both.
         const audio = modalBody.querySelector('audio');
-        if (audio) audio.addEventListener('error', () => renderMediaFallback(modalBody, fileName), true);
+        if (audio) audio.addEventListener('error', () => renderMediaFallback(modalBody, encoded), true);
     } else {
         modalBody.innerHTML = `<img src="${url}" style="max-width: 100%; max-height: 520px; border-radius: 10px; display: block; margin: 0 auto; box-shadow: 0 0 30px rgba(0,243,255,0.25);">`;
     }
@@ -648,12 +686,13 @@ function closeModal() {
     }
 }
 
-async function deleteFile(encodedName) {
-    const fileName = decodeURIComponent(encodedName);
-    // The confirm copy mirrors the server's real delete semantics
-    // (/api/stats `remote_delete`): remote-delete backends remove the
-    // cloud object, telegram keeps the remote copy (Python parity).
-    // In multi-volume mode the volume name scopes the action (K23).
+// Deletes the RAW-named file (data-name verbatim; the JSON body carries
+// the plain name — no URL context, nothing to encode). The confirm copy
+// mirrors the server's real delete semantics (/api/stats
+// `remote_delete`): remote-delete backends remove the cloud object,
+// telegram keeps the remote copy (Python parity). In multi-volume mode
+// the volume name scopes the action (K23).
+async function deleteFile(fileName) {
     const volumeNote = volumeState.multi && volumeState.current
         ? t('index.volume_note', { name: volumeState.current }) : "";
     const message = backendState.remoteDelete
@@ -747,11 +786,12 @@ async function uploadFiles(files) {
 
 // The file row's copy-link action: the absolute URL of the download
 // endpoint (volume-scoped via apiUrl — the clipboard carries exactly
-// the URL the download button would fetch). The Clipboard API first
-// (the dashboard runs on a secure context), the temporary-textarea
-// fallback second, an error toast last — the copy never dies silently.
-async function copyLink(encodedName) {
-    const url = location.origin + apiUrl(`/api/download/${encodedName}`);
+// the URL the download button would fetch). Takes the RAW name and
+// encodes the path here; the Clipboard API first (the dashboard runs on
+// a secure context), the temporary-textarea fallback second, an error
+// toast last — the copy never dies silently.
+async function copyLink(fileName) {
+    const url = location.origin + apiUrl(`/api/download/${encodeURIComponent(fileName)}`);
     if (typeof navigator !== 'undefined' && navigator.clipboard && navigator.clipboard.writeText) {
         try {
             await navigator.clipboard.writeText(url);
@@ -818,6 +858,12 @@ function formatBytes(bytes, decimals = 2) {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 }
 
+// K58 follow-up (external review): quotes are escaped too — file names
+// reachable through upload/remote sync may carry `"` or `'` (RelPath
+// does not reject them), and an unescaped quote breaks out of the
+// double-quoted title/data-name attributes this code interpolates into.
+// & must stay first so the entity ampersands are not double-escaped.
 function escapeHtml(text) {
-    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    return text.replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }

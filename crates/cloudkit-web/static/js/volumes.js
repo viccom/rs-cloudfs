@@ -86,9 +86,15 @@ async function loadVolumesPage() {
         const runtime = runtimeRes.status === 'fulfilled' && runtimeRes.value.ok
             ? await runtimeRes.value.json()
             : null;
+        // K58 follow-up (external review): read the configs leg's status
+        // BEFORE the branch — a rejected promise has no `.value`, and the
+        // ternary inside the branch used to touch it whenever the runtime
+        // leg was fulfilled-but-failed, throwing a TypeError that the
+        // catch swallowed into a silently stuck loading row.
+        const configsStatus = configsRes.status === 'fulfilled'
+            ? configsRes.value.status : 0;
         if (!configs && !runtime) {
-            renderVolumesError(runtimeRes.status === 'fulfilled'
-                ? configsRes.value.status : 0);
+            renderVolumesError(configsStatus);
             return;
         }
         renderVolumeCards(configs, runtime);
@@ -446,8 +452,13 @@ function formatBytes(bytes, decimals = 2) {
     return parseFloat((bytes / Math.pow(k, i)).toFixed(dm)) + ' ' + sizes[i];
 }
 
+// K58 follow-up (external review): quotes are escaped too — the
+// invalidReason/status_reason free text (and any interpolated value)
+// lands inside double-quoted title/data-name attributes, where an
+// unescaped quote would break out. & stays first: no double-escaping.
 function escapeHtml(text) {
-    return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+    return String(text).replace(/&/g, "&amp;").replace(/</g, "&lt;").replace(/>/g, "&gt;")
+        .replace(/"/g, "&quot;").replace(/'/g, "&#39;");
 }
 
 // ------------------------- the volume form card (web volume mgmt P3) -----
