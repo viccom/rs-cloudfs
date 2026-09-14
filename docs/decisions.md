@@ -681,3 +681,13 @@
 - **K64.3 D3 根目录 = 沿用 Phase 5 D3 形态**：`pan123_root` 可设置（folder id）、缺省网盘根 `"0"`、validate 不强制专用子目录、doctor 提示根卷误删边界（与回收站构成双兜底）。
 - **K64.4 D4 上传 duplicate 语义 = 覆盖模式**：对齐 writer 契约覆盖语义（百度 rtype=3 同课题先例）——5060 已存在时以 duplicate 覆盖参数重发；「取消报错」「自动改名副本」形态不得漏出到挂载面；覆盖后旧文件/秒传交互行为 123-0 实测并钉进错误映射表。
 - **效果**：Phase 6 方案 待批准 → **已批准**；**123-0 解锁可开工**（职责收窄：路线已定，spike = web API 验证与采样，§6 已同步改写）。落档：计划头部/§1.3/§6/§8、跟踪单状态行+任务行+批次日志、AGENTS 项目信息行+当前阶段段。三阶段态势：Phase 4 SF1 / Phase 5 115-0 / Phase 6 123-0 均可开工，`compiled_drivers()` 重构谁先到谁做（只做一次）。
+
+## 2026-09-14 K65：Phase 5 补充研究——115 凭证门槛消失（OpenList 生态实证），AppKey 表述修正
+
+- **触发**：负责人问询 OpenList-APIPages 在线站「使用 OpenList 提供的参数」选项是否意味着官方源码内置 115 app_id/app_key。专门克隆三仓核实（`E:\GitHub\OpenList`、`E:\GitHub\OpenList-APIPages`、`E:\GitHub\115-sdk-go`，均仓外）。
+- **K65.1 答案：源码不含明文凭据**。APIPages `wrangler.jsonc` 的 `cloud115_uid/key` 为打码占位，部署时 env 注入（`OPLIST_CLOUD115_UID/KEY`）；`server_use=true` = 服务端密钥代换码 + 主动清空凭据 cookie 防泄漏。OpenList 主仓 115_open 驱动配置面仅 access/refresh 双 token（`meta.go`），自身零 client 凭据。
+- **K65.2 决定性技术事实（115-sdk-go `auth.go` 逐行核实）**：device-code PKCE 流全程无 secret——`AuthDeviceCode`（client_id + code_challenge）→ `CodeToToken`（uid + code_verifier）→ **`RefreshToken` 载荷仅 `refresh_token` 一字段**；常规 API 仅 Bearer（`request.go:40-42`）。app_key 只在浏览器 OAuth 重定向流（APIPages 的 `authorize→authCodeToToken`）被服务端使用。
+- **K65.3 凭证路径丙（新，推荐起步）**：公共 client_id（非机密，PKCE 设计使然）自铸 token 对 → refresh_token 自持无限续期——运行期零 app_key、零外部依赖、无需自注册。原 K61.3 的「凭证可得性 = 胜负手」**降级为「选哪个 app 身份起步」**；三选一规则不变，预期结论倾向路线 A。
+- **K65.4 残余风险（入计划 §7 + 115-0）**：① app 身份连坐——token 绑定他人 app（OpenList/115-plus-desktop），115 封该 app 则同身份 token 全灭（换身份重扫即恢复，无人值守卷断一次；缓解 = `pan115_client_id` 可配置 + doctor 探活指引）；② 共享限额池——若限额按 app 计则公共身份全用户共享（115-0 实测定级：按 token 还是按 app）；③ upload `sign_key/sign_val` 二次认证是否涉 app 级签名未决（115-0 ④）。
+- **K65.5 表述修正（对本计划 v1 与会话记录）**：§1.1 原「AppID/AppKey + device-code 流」不准确——app_key 非扫码路线所需；配置键 `pan115_app_id/app_key` 相应调整为 `pan115_client_id`（非机密、驱动可带缺省值）+ 路径甲专用 `pan115_app_key`（可选）。已同步计划 §1.1/§1.3/§4.3/§6/§7/附录 A.5/B。
+- **K65.6 附带情报**：OpenList 主仓 = 40+ 网盘驱动 Go 活参照（123/115/quark/189/139/aliyun 全有），对 Phase 6（pan123 路线 A 侧写）与未来驱动均有情报价值；115-sdk-go 的 `const.go` 端点常量表（proapi/passportapi/qrcodeapi 三域 14 端点）可直接对照写 api.rs。本批只读，主仓零改动。

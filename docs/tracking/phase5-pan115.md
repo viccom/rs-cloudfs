@@ -8,7 +8,7 @@
 
 | 任务 | 内容 | 状态 | 完成情况 | 证据 |
 |---|---|---|---|---|
-| 115-0 | 路线 spike 与裁决 | ⏸ | 五项：凭证可得性（胜负手）/downurl UA+Range/QPS/upload 全链+resume/秒传哈希可否省略；`examples/pan115_spike`（workspace exclude 照 baidu_spike 先例）；产出路线裁决（计划 §1.3 三选一）+ errno 采样表 | — |
+| 115-0 | 路线 spike 与裁决 | ⏳ 可开工（**K65 后范围更新**） | 五项：① **路径丙全链自铸**（公共 client_id → PKCE 扫码 → deviceCodeToToken → Bearer user/info → refreshToken 自续——验证零 app_key 运行期自持；顺带记录限额按 token 还是按 app）② downurl UA 矩阵 + Range/206 ③ QPS 限额实测 ④ upload 全链 + resume + **sign_key/sign_val 是否涉 app 签名** ⑤ 秒传哈希可否省略；产出路线裁决 + 采样表 | — |
 | 115-1 | 认证与驱动骨架 | ⏸ | oauth.rs（device-code/QR/refresh+TokenStore；路线 B 则 cookie）+ 四件套骨架 + 配置键三处同步 + SECRET_VALUED_KEYS 增补 + ali-oss-rs 版本树核对 | — |
 | 115-2 | 读路径 | ⏸ | list/stat/mkdir/delete/rename + downurl 流读（HEAD 探测/Range/429 分段重生） | — |
 | 115-3 | 写路径 | ⏸ | upload init/get_token/ali-oss-rs 分片/complete/resume/秒传 + 硬纪律 3/4/5 | — |
@@ -25,6 +25,7 @@
 
 ## 批次日志
 
+- **2026-09-14 K65 补充研究（凭证门槛消失）**：负责人问询 OpenList-APIPages「使用 OpenList 提供的参数」触发，专门克隆三仓核实（OpenList / OpenList-APIPages / 115-sdk-go）。**结论**：源码不含明文凭据（打码占位 + 部署时 env 注入）；但 **device-code PKCE 流全程无 secret**（`RefreshToken` 载荷仅 refresh_token 一字段）→ **凭证路径丙**成立：公共 client_id 自铸 + refresh 自持，运行期零 app_key/零外部依赖——「凭证可得性 = 胜负手」降级为「选 app 身份」。残余风险三项（app 身份连坐/共享限额池/upload 二次认证未决）入计划 §7 与 115-0 ①③④。配置键调整 `pan115_app_id/app_key` → `pan115_client_id`（非机密带缺省）+ `pan115_app_key`（路径甲专用可选）。计划同步六处（§1.1/§1.3/§4.3/§6/§7/附录 A.5/B）；decisions K65 入档。
 - **2026-09-14 拍板收口（K62，方案获批）**：D2 = 删除进回收站、回收站接口不引入（误删恢复走官方端）；D3 = `pan115_root` 可设置、缺省网盘根 `"0"`；D4 = QPS 实现期合理定值（RebuildTuning 式注入 + 列目录 ~2 QPS 起步 + downurl 缓存 TTL 待 spike + CDN 429 自适应重生）；D1 路线保持 spike 门槛（§1.3 规则）。**115-0 解锁可开工**。落档四处：decisions K62、计划 §8/头部、本表、AGENTS。
 - **2026-09-14 立项前置研究完成**（只读勘察，仓库 git status 干净）：
   - 双仓库分工定调（计划 §0.1）：115-plus-desktop = 主路线规格书 + Rust 传输参照；PCFS = 驱动形态对照 + 路线 B 保底；ck-baidu = 结构模板（api/oauth/errno mock/假服务端/TokenStore）。
