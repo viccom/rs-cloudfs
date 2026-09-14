@@ -527,7 +527,11 @@ async fn app_js_prefers_runtime_status_for_volumes_error_face() {
     let env = test_env().await;
     let addr = env.server.local_addr();
 
-    let resp = send(addr, &request("GET", "/static/js/volumes.js", addr, &[], "")).await;
+    let resp = send(
+        addr,
+        &request("GET", "/static/js/volumes.js", addr, &[], ""),
+    )
+    .await;
     assert_eq!(status_of(&resp), 200, "js asset: {resp}");
     let body = body_of(&resp);
     assert!(
