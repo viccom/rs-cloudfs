@@ -337,6 +337,20 @@ impl UploadQueueHandle {
 /// receiver and runs each to a terminal state (retries included) before
 /// claiming the next. `recv()` under the shared-receiver lock serializes
 /// claiming, so a `workers = 1` queue is strictly FIFO.
+///
+/// Panic isolation (K58-M1): every `process_job` call runs inside
+/// `catch_unwind`. A panic inside one job — the realistic shape is a bug
+/// in a driver's `upload` — must not kill this worker task: a dead worker
+/// leaves the job with no terminal counter, `outstanding()`
+/// (enqueued − succeeded − degraded) never returns to zero, and K57's
+/// drain gates (REMOVE/REBUILD/DESTROY) refuse the volume until restart.
+/// A caught panic lands the job in `degraded` — this queue's established
+/// "give up on this job" terminal state (same family as H2's skip
+/// accounting): the local cache copy is kept, the row stays pending — and
+/// the loop continues with the next job. The panic payload is summarized
+/// in the `error!` line from `&str`/`String` payloads only, truncated
+/// (see [`panic_summary`]): the payload originates in driver code and
+/// must not flow into logs unfiltered.
 async fn worker_loop(
     db: Arc<MetaDatabase>,
     transport: Arc<dyn CloudTransport>,
@@ -352,9 +366,47 @@ async fn worker_loop(
             rx.recv().await
         };
         match job {
-            Some(job) => process_job(db.as_ref(), transport.as_ref(), &cfg, &stats, job).await,
+            Some(job) => {
+                // The rel_path must outlive the move into `process_job`:
+                // on the panic branch the job itself is gone (unwound and
+                // dropped), but the log line still needs to name the file
+                // the queue gave up on.
+                let rel_path = job.rel_path.clone();
+                let outcome = futures_util::FutureExt::catch_unwind(std::panic::AssertUnwindSafe(
+                    process_job(db.as_ref(), transport.as_ref(), &cfg, &stats, job),
+                ))
+                .await;
+                if let Err(payload) = outcome {
+                    tracing::error!(
+                        rel_path = %rel_path,
+                        panic = %panic_summary(payload.as_ref()),
+                        "upload job panicked; counting degraded and keeping the worker alive"
+                    );
+                    bump(&stats.degraded);
+                }
+            }
             None => return, // channel closed and drained: shut down
         }
+    }
+}
+
+/// Panic payload → bounded, credential-free log excerpt: only `&str` /
+/// `String` payloads are rendered (truncated at 200 chars); any other
+/// payload type is described, never formatted. The payload originates in
+/// driver code, so downcasting just the two string shapes keeps whatever
+/// a buggy driver panicked with out of the logs beyond a bounded excerpt
+/// (K58-M1: no credential form may ride a panic message into storage).
+fn panic_summary(payload: &(dyn std::any::Any + Send)) -> String {
+    let text = if let Some(s) = payload.downcast_ref::<&str>() {
+        (*s).to_string()
+    } else if let Some(s) = payload.downcast_ref::<String>() {
+        s.clone()
+    } else {
+        return "non-string panic payload".to_string();
+    };
+    match text.char_indices().nth(200) {
+        Some((cut, _)) => format!("{}…", &text[..cut]),
+        None => text,
     }
 }
 
@@ -1000,6 +1052,10 @@ fn delete_local_copy(local_path: &Path) {
 /// 5. Persistence errors on the success path → no re-upload (a retry
 ///    cannot fix the DB and would duplicate remote data): count
 ///    degraded, `warn`.
+/// 6. A panic anywhere in one job's processing (K58-M1; the realistic
+///    shape is a driver `upload` bug) → count degraded, `error!` with
+///    the rel_path and a truncated payload excerpt, keep the local copy,
+///    row stays pending, worker stays alive (see [`worker_loop`]).
 pub fn spawn_queue(
     db: Arc<MetaDatabase>,
     transport: Arc<dyn CloudTransport>,
