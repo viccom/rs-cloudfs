@@ -18,7 +18,10 @@ cloudkit-storage = { path = "../cloudkit-storage" }
 # 消费不算违规（architecture §1.5 注）；core/src/crypto.rs 为兼容 shim。
 cloudkit-crypto = { path = "../cloudkit-crypto" }
 futures-core = "0.3"
-futures-util = { version = "0.3", default-features = false }
+# "std" unlocks FutureExt::catch_unwind (std-gated in futures-util) — the
+# upload worker's panic-isolation seam (K58-M1); the stream::unfold call
+# in upload_v2_stream needs no features on its own.
+futures-util = { version = "0.3", default-features = false, features = ["std"] }
 rand = "0.10.2"
 # "hooks": Connection::update_hook — the files-table change doorbell
 # (wake chokepoint batch); not a rusqlite default feature.

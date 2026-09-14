@@ -1288,3 +1288,174 @@ async fn stale_empty_put_artifact_reaches_terminal_queue_state() {
     );
     assert!(local.exists(), "cache copy kept for the superseding job");
 }
+
+// ---------------------------------------------------------------------------
+// 25. K58-M1（worker panic 隔离）：`process_job` 内任一 panic（最现实形
+//     态 = 驱动 `transport.upload` 的 bug）一旦把 worker task 带死，该
+//     job 便永无终态计数——入队时已计 enqueued、succeeded/degraded 永不
+//     落，`outstanding()` 恒 ≥ 1：K57 把它用作 REMOVE/REBUILD/DESTROY
+//     的排空硬门禁，卷从此卸不掉、rebuild 拒收，直至重启。worker_loop
+//     必须把 panic 转成该 job 的 degraded 终态（与 H2 的 skip 补
+//     degraded 同族——本队列「放弃该 job」的既有语义：本地副本保留、
+//     行保持 pending）并继续下一个 job：worker 不死。
+//     Harness：委派包装 transport——upload 对指定 rel_path 首行 panic
+//     （驱动 bug 注入缝，attempts 计数证明 job 确已抵达传输层），其余
+//     调用原样透传：第二个文件走同一条 worker，钉「存活」。
+//     注：mock 的 panic 消息经默认 hook 打到 stderr（libtest 只捕获测试
+//     线程自身，tokio worker 线程上的 panic 不在捕获内）——接受该输出，
+//     不静音全局 panic hook（跨测试进程级状态，静音会掩盖真实失败）。
+// ---------------------------------------------------------------------------
+
+struct ExplodingUploadTransport {
+    inner: Arc<MockTransport>,
+    attempts: Arc<std::sync::atomic::AtomicUsize>,
+}
+
+#[async_trait::async_trait]
+impl CloudTransport for ExplodingUploadTransport {
+    async fn upload(&self, job: &UploadJob) -> Result<UploadReceipt, StorageError> {
+        if job.rel_path.as_str() == "/boom.bin" {
+            self.attempts
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            panic!("worker exploded: K58_M1_MARKER");
+        }
+        self.inner.upload(job).await
+    }
+
+    async fn connect(&self) -> Result<(), StorageError> {
+        self.inner.connect().await
+    }
+
+    async fn open(
+        &self,
+        file: &cloudkit_core::transport::RemoteHandle,
+    ) -> Result<cloudkit_core::transport::ByteStream, StorageError> {
+        self.inner.open(file).await
+    }
+
+    async fn open_range(
+        &self,
+        file: &cloudkit_core::transport::RemoteHandle,
+        off: u64,
+        len: u64,
+    ) -> Result<cloudkit_core::transport::ByteStream, StorageError> {
+        self.inner.open_range(file, off, len).await
+    }
+
+    async fn delete_remote(
+        &self,
+        handle: &cloudkit_core::transport::RemoteHandle,
+    ) -> Result<(), StorageError> {
+        self.inner.delete_remote(handle).await
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    fn as_inbound(&self) -> Option<&dyn InboundCap> {
+        self.inner.as_inbound()
+    }
+
+    fn as_chat(&self) -> Option<&dyn ChatCap> {
+        self.inner.as_chat()
+    }
+}
+
+#[tokio::test]
+async fn panicking_upload_degrades_and_keeps_the_worker_alive() {
+    let (_dir, db, cache, mock) = test_env().await;
+    let attempts = Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let transport: Arc<dyn CloudTransport> = Arc::new(ExplodingUploadTransport {
+        inner: mock.clone(),
+        attempts: Arc::clone(&attempts),
+    });
+    let handle = spawn_queue(db.clone(), transport, test_cfg(64));
+
+    // 文件 A：transport.upload panic——该 job 仍必须到达终态。
+    let boom_local = seed_pending(&db, &cache, "/boom.bin", b"boom", 1);
+    handle
+        .enqueue(job_for(&cache, "/boom.bin", 4, 1, 64))
+        .await
+        .expect("enqueue boom");
+
+    // 轮询窗口（≤2s）：panic 确已抵达传输层且 outstanding 归零。现状
+    // （红）：worker 死、终态永不落、outstanding 恒 1。
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        let stats = handle.stats();
+        if stats.outstanding() == 0
+            && stats.degraded == 1
+            && attempts.load(std::sync::atomic::Ordering::SeqCst) >= 1
+        {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "panic never reached a terminal counter (ghost outstanding): \
+             stats={:?} attempts={}",
+            handle.stats(),
+            attempts.load(std::sync::atomic::Ordering::SeqCst)
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+    assert_eq!(
+        attempts.load(std::sync::atomic::Ordering::SeqCst),
+        1,
+        "the panicked job degrades on its first attempt: no retry ladder for panics"
+    );
+
+    // worker 不死：第二个文件经同一 worker 正常上传成功。
+    seed_pending(&db, &cache, "/after.bin", b"after", 1);
+    handle
+        .enqueue(job_for(&cache, "/after.bin", 5, 1, 64))
+        .await
+        .expect("enqueue after");
+    let deadline = std::time::Instant::now() + Duration::from_secs(2);
+    loop {
+        if handle.stats().succeeded == 1 {
+            break;
+        }
+        assert!(
+            std::time::Instant::now() < deadline,
+            "the worker died with the panicking job: the second file never \
+             uploaded (stats={:?})",
+            handle.stats()
+        );
+        tokio::time::sleep(Duration::from_millis(10)).await;
+    }
+
+    // panic 的 job = degraded 语义：本地副本保留、行保持 pending。
+    assert!(
+        boom_local.exists(),
+        "panicked job keeps its local copy (degraded semantics)"
+    );
+    let boom_row = db
+        .get_file("/boom.bin")
+        .expect("db read")
+        .expect("row exists");
+    assert!(
+        !boom_row.is_uploaded,
+        "panicked job stays pending (degraded semantics)"
+    );
+    let after_row = db
+        .get_file("/after.bin")
+        .expect("db read")
+        .expect("row exists");
+    assert!(
+        after_row.is_uploaded,
+        "the surviving worker uploaded the second file"
+    );
+
+    handle.shutdown().await;
+    assert_eq!(
+        handle.stats(),
+        QueueStats {
+            enqueued: 2,
+            succeeded: 1,
+            degraded: 1,
+            retries: 0,
+        },
+        "panic lands in exactly one terminal counter; the queue fully drains"
+    );
+}

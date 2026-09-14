@@ -55,6 +55,10 @@ use cloudkit_core::inbound::spawn_inbound_worker;
 use cloudkit_core::rebuild;
 use cloudkit_core::rel_path::RelPath;
 use cloudkit_core::sync::{namespace_key, sync_once, SyncOutcome};
+use futures_util::FutureExt as _;
+// The command-execution task's unwind guard (K58-FB) — the same
+// containment pattern control.rs applies around its handler await.
+use std::panic::AssertUnwindSafe;
 // Local-arm-only sync vocab (FT3): the K12 local namespace derivation
 // exists only with the `local` feature.
 #[cfg(feature = "local")]
@@ -1534,10 +1538,11 @@ impl RemoveTuning {
 /// [`RuntimeVolumeCommands`]): the whole background rebuild runs under
 /// `timeout` — an interrupted pass keeps its upserted rows (the rel_path
 /// conflict key makes the merge idempotent, a rerun continues where it
-/// stopped) — and the R5 checkpoint (registry presence + shutdown gate)
-/// is audited every `checkpoint_interval`. Deliberately NOT config
-/// keys (可配性挂账): a struct injection keeps the surface at zero while
-/// the tests reach millisecond scale through [`RebuildTuning::fast`].
+/// stopped) — and the R5 checkpoint (instance identity + the shutdown
+/// gate + the drained queue) is audited every `checkpoint_interval`.
+/// Deliberately NOT config keys (可配性挂账): a struct injection keeps
+/// the surface at zero while the tests reach millisecond scale through
+/// [`RebuildTuning::fast`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RebuildTuning {
     /// The whole background rebuild's budget (default 15 minutes).
@@ -1695,7 +1700,9 @@ pub async fn run_multi_with_transports(
 /// faces at once (master registry, WebDAV dispatch, dashboard — the cli
 /// master table is the truth, the faces are projections), REMOVE runs
 /// the K50 safe sequence, LIST reports the live set. Commands are
-/// serialized on the control loop, so they never interleave.
+/// serialized behind the boot wiring's command gate (K58-FB — every
+/// entrypoint's execution takes the same single permit), so they never
+/// interleave, whichever face dispatched them.
 ///
 /// Boot itself is unchanged: one volume core per spec (db + cache + VFS
 /// with requeue and inbound worker, K21-resolved paths), one periodic sync
@@ -1720,7 +1727,9 @@ pub async fn run_multi_with_transports(
 /// receives the SAME volume-command handler the control channel runs
 /// (web volume management §1.1): its management routes send commands
 /// through the shared seam, so both trigger sources serialize behind
-/// one queue.
+/// one queue — the handler's own single-permit gate (K58-FB), with
+/// each execution detached from its caller's wait (a route budget that
+/// elapses abandons the REPLY, never the command).
 pub async fn run_multi_with_transports_and_commands(
     process_cfg: &CyDriveConfig,
     volumes: Vec<(VolumeConfig, RunOptions, Arc<dyn CloudTransport>)>,
@@ -1825,12 +1834,30 @@ pub async fn run_multi_with_transports_and_commands(
 
     // The ONE volume-command handler (web volume management plan §1.1):
     // the same closure serves the control channel AND the dashboard's
-    // command seam — web-sent commands and control-channel commands
-    // funnel into the same serialized execution behind the in-flight
-    // counter (review H1). Built before the dashboard bind so the bind
-    // can inject its `Arc` clone (the web alias is structurally the
-    // same type; cloning shares, it does not re-wrap).
+    // command seam. K58-FB re-wired it so that BOTH claims about it are
+    // now actually true:
+    //
+    // - SERIALIZATION (review H2): every invocation spawns a detached
+    //   execution task that must first take `command_gate` — a
+    //   single-permit mutex — so control-channel commands, web-route
+    //   commands and web×web commands all queue behind the one
+    //   execution (the K48 semantics the web seam used to bypass by
+    //   running the handler inline on its own axum task).
+    // - CANCELLATION SAFETY (review H1): the execution task owns the
+    //   command; the future this closure returns only WAITS for the
+    //   reply over a oneshot. A caller that stops waiting (the
+    //   dashboard route's budget elapsing, a dropped web connection)
+    //   abandons the WAIT, never the command — the same
+    //   client-abandonment semantics the control channel's serialized
+    //   loop always had. Pre-fix, the route budgets dropped the
+    //   `surface.handle` future mid-K50, taking the volume's live
+    //   entry with it and wedging the registry.
+    //
+    // Built before the dashboard bind so the bind can inject its `Arc`
+    // clone (the web alias is structurally the same type; cloning
+    // shares, it does not re-wrap).
     let in_flight = Arc::new(InFlightCommands::default());
+    let command_gate = Arc::new(tokio::sync::Mutex::new(()));
     // The P2 rebuild executor resolution: the injected seam or the
     // production `run_rebuild_command` closure (the same body the
     // offline `cydrive rebuild` runs — K11 gate + db open + walk).
@@ -1858,12 +1885,81 @@ pub async fn run_multi_with_transports_and_commands(
     let volume_command_handler: control::VolumeCommandHandler = {
         let surface = Arc::clone(&command_surface);
         let in_flight = Arc::clone(&in_flight);
+        let command_gate = Arc::clone(&command_gate);
         Arc::new(move |line: &str| {
             let surface = Arc::clone(&surface);
+            let gate = Arc::clone(&command_gate);
+            // The idle barrier spans the TRUE execution: the guard
+            // enters the moment the command is accepted from ANY face
+            // and drops only when the execution task below reaches its
+            // natural end — a caller abandoning its waiting future
+            // cannot shorten it (the stop task's `wait_idle` therefore
+            // still covers every mid-K50 entry hold, review H1's
+            // original invariant).
             let guard = in_flight.enter();
-            Box::pin(async move {
+            let line = line.to_owned();
+            let (reply_tx, reply_rx) = tokio::sync::oneshot::channel::<String>();
+            // The detached execution (K58-FB H1+H2). Deadlock audit —
+            // why a plain single-permit Mutex is safe here:
+            //
+            // - the task acquires the gate FIRST and then awaits only
+            //   inside `surface.handle` (dispatch, drain polls, mount);
+            //   nothing on those paths routes back into this closure,
+            //   so no execution ever re-acquires the gate it holds.
+            //   The nested command callers (DISABLE/UPDATE/DESTROY)
+            //   call the remove_volume/add_volume METHODS directly,
+            //   never the command closure;
+            // - the waiting side (the control accept loop, a web route
+            //   task) holds NO lock while parked on `reply_rx`, so
+            //   waiter → holder edges do not exist — the wait-for graph
+            //   is a flat star around one mutex and cannot cycle;
+            // - the stop task's idle barrier waits on the guard (not
+            //   the gate), and a task queued behind a long command
+            //   still finishes promptly once its turn comes: the gate
+            //   refusal is the FIRST thing `handle` checks, so a
+            //   post-shutdown command answers within one poll tick and
+            //   releases its guard — `wait_idle` stays bounded.
+            tokio::spawn(async move {
                 let _in_flight = guard;
-                surface.handle(line).await
+                let _serialized = gate.lock().await;
+                // Panic isolation (M1's layering, relocated to where
+                // the command actually runs): the task boundary
+                // contains the unwind, the catch logs the payload and
+                // converts it into the actionable reply — both faces
+                // (control connection, web route) get an answer and
+                // the serialization survives the panic. The payload is
+                // our own command text and panic message — nothing
+                // credential-shaped reaches the log.
+                let reply = match AssertUnwindSafe(surface.handle(&line)).catch_unwind().await {
+                    Ok(reply) => reply,
+                    Err(panic) => {
+                        let reason = panic
+                            .downcast_ref::<&str>()
+                            .map(|str| (*str).to_string())
+                            .or_else(|| panic.downcast_ref::<String>().cloned())
+                            .unwrap_or_else(|| "<non-string panic payload>".to_string());
+                        tracing::error!(
+                            command = %line,
+                            %reason,
+                            "a volume command execution panicked; the command surface stays up"
+                        );
+                        control::HANDLER_PANIC_REPLY.to_string()
+                    }
+                };
+                // A caller that already gave up dropped the receiver:
+                // the reply is simply discarded, the execution was
+                // never affected (H1's whole point).
+                let _ = reply_tx.send(reply);
+            });
+            Box::pin(async move {
+                match reply_rx.await {
+                    Ok(reply) => reply,
+                    // The execution task ended without answering — only
+                    // reachable when its very task was torn down (a
+                    // runtime shutdown); answer the shared actionable
+                    // text instead of parking the caller forever.
+                    Err(_dropped_without_reply) => control::HANDLER_PANIC_REPLY.to_string(),
+                }
             })
         })
     };
@@ -1965,13 +2061,14 @@ pub async fn run_multi_with_transports_and_commands(
             web_ui.shutdown().await;
         }
         // The idle barrier (review H1): a volume command in flight when
-        // the gate fired (Ctrl+C / SIGTERM race the control loop's
-        // serialized handler) may be holding an entry out of the live
-        // table mid-K50 — draining NOW would orphan it. The in-flight
-        // command observes the gate at its checkpoints and hands the
-        // entry back; only then does this pass take everything (see
+        // the gate fired (Ctrl+C / SIGTERM race the serialized command
+        // execution) may be holding an entry out of the live table
+        // mid-K50 — draining NOW would orphan it. The in-flight command
+        // observes the gate at its checkpoints and hands the entry back;
+        // only then does this pass take everything (see
         // [`InFlightCommands`] for the invariant and the bounded-wait
-        // argument).
+        // argument — the guard spans the detached execution, so a web
+        // caller that abandoned its wait cannot strand the entry).
         stop_in_flight.wait_idle().await;
         for (name, entry) in stop_live.take_all() {
             if let Some(mut release) = entry.release {
@@ -2350,13 +2447,33 @@ fn volume_payload_table(payload: &str) -> Result<toml::Table, String> {
     Ok(table)
 }
 
+/// Parses the volume-file text UPDATE already read as the raw explicit
+/// table (the overlay base). K58-M5: the parse error routes through the
+/// core redaction funnel ([`cloudkit_core::config::redact_credential_values`])
+/// — this was the one toml parse surface that bare-concatenated the raw
+/// error, whose embedded source line can carry a credential value (the
+/// loader accepted the text a moment earlier, so a failure here means a
+/// TOCTOU rewrite landed between the two reads — the fresher text's
+/// values must not ride the ERR reply or the log).
+fn parse_explicit_table_redacted(path: &Path, text: &str) -> Result<toml::Table, String> {
+    toml::from_str(text).map_err(|error| {
+        format!(
+            "re-reading the volume file {} failed: {}",
+            path.display(),
+            cloudkit_core::config::redact_credential_values(&error.to_string())
+        )
+    })
+}
+
 /// The state the control channel's `ADD`/`REMOVE`/`LIST` commands act
 /// through (RV2 / K48): the cli master registry (the truth), the two
 /// face tables (the WebDAV dispatch and dashboard projections), the live
 /// volumes and the pieces runtime ADD needs to assemble one. Commands
-/// run serialized on the control loop (runtime-volumes §4), so a
-/// plain-`&self` pass over these interior-mutable tables cannot
-/// interleave.
+/// run serialized behind the command gate — the single-permit mutex the
+/// boot wiring wraps every entrypoint's execution in (K58-FB: control
+/// channel AND the dashboard's seam), so a plain-`&self` pass over
+/// these interior-mutable tables cannot interleave no matter which face
+/// dispatched the command.
 struct RuntimeVolumeControl {
     process_cfg: CyDriveConfig,
     registry: RegistryHandle,
@@ -2496,7 +2613,10 @@ impl RuntimeVolumeControl {
                     );
                 }
                 match cmd {
-                    "ADD" => self.add_volume(name).await,
+                    // K58-M7: the ADD arm passes the reply through
+                    // verbatim — the structured bool is CREATE/UPDATE's
+                    // (and the unit tests') to consume.
+                    "ADD" => self.add_volume(name).await.0,
                     "REMOVE" => self.remove_volume(name).await,
                     "DISABLE" => self.disable_volume(name).await,
                     "REBUILD" => self.rebuild_volume(name).await,
@@ -2759,8 +2879,9 @@ impl RuntimeVolumeControl {
     /// into the volume file, then assemble through the SAME runtime ADD
     /// path ([`Self::add_volume`] verbatim reply — its refusals are
     /// already actionable: a duplicate registration, a missing file, a
-    /// bad name). The write-first order mirrors DISABLE's: a failed
-    /// write never reaches the runtime.
+    /// bad name; the structured bool is ENABLE's own verdict-free face,
+    /// the reply text carries everything). The write-first order
+    /// mirrors DISABLE's: a failed write never reaches the runtime.
     async fn enable_volume(&self, name: &str) -> String {
         if !Self::name_is_path_safe(name) {
             return format!(
@@ -2784,7 +2905,7 @@ impl RuntimeVolumeControl {
         if let Err(refusal) = self.persist_enabled_flag(name, &path, true) {
             return refusal;
         }
-        self.add_volume(name).await
+        self.add_volume(name).await.0
     }
 
     /// `CREATE <name> <json>` (web volume management P3, plan §1.2):
@@ -2860,7 +2981,10 @@ impl RuntimeVolumeControl {
             fields = ?fields,
             "CREATE: writing a new volume file (field names only, by policy)"
         );
-        if let Err(error) = std::fs::write(&path, text) {
+        // K58-H3: the atomic write — a torn CREATE (crash mid-write)
+        // would leave a truncated file that boot refuses (or silently
+        // drops trailing keys).
+        if let Err(error) = cloudkit_core::config::write_config_atomically(&path, &text) {
             return format!(
                 "ERR: writing the volume file {} failed: {error} — nothing was changed at \
                  runtime\n",
@@ -2882,24 +3006,30 @@ impl RuntimeVolumeControl {
             );
         }
         // The runtime leg: the SAME add_volume the control channel's ADD
-        // runs (assembly, mount claim, H3 semantics included).
-        let addition = self.add_volume(name).await;
-        let state = addition
-            .trim()
-            .strip_prefix(&format!("OK: added volume `{name}` "));
-        match state {
-            Some(state) => format!(
+        // runs (assembly, mount claim, H3 semantics included). K58-M7:
+        // the verdict is the structured bool — the reply text below is
+        // display sugar only, so a future wording tweak can never flip
+        // a real assembly into the failure branch.
+        let (addition, added) = self.add_volume(name).await;
+        if added {
+            let state = addition
+                .trim()
+                .strip_prefix(&format!("OK: added volume `{name}` "))
+                .map(|state| state.trim().to_owned())
+                .unwrap_or_else(|| addition.trim().to_owned());
+            format!(
                 "OK: created volume `{name}` (file at {}; {})\n",
                 path.display(),
-                state.trim()
-            ),
-            None => format!(
+                state
+            )
+        } else {
+            format!(
                 "ERR: the volume file was saved at {}, but assembling the volume failed: \
                  {} — fix the file (or send `UPDATE {name} <json>` with corrected fields) \
                  and retry with `ENABLE {name}` (or `ADD {name}`)\n",
                 path.display(),
                 addition.trim().trim_start_matches("ERR: ")
-            ),
+            )
         }
     }
 
@@ -2956,14 +3086,9 @@ impl RuntimeVolumeControl {
                 );
             }
         };
-        let explicit: toml::Table = match toml::from_str(&text) {
+        let explicit = match parse_explicit_table_redacted(&path, &text) {
             Ok(table) => table,
-            Err(error) => {
-                return format!(
-                    "ERR: re-reading the volume file {} failed: {error}\n",
-                    path.display()
-                );
-            }
+            Err(message) => return format!("ERR: {message}\n"),
         };
         let overlay = match volume_payload_table(payload) {
             Ok(table) => table,
@@ -2998,7 +3123,9 @@ impl RuntimeVolumeControl {
             fields = ?fields,
             "UPDATE: rewriting the volume file (field names only, by policy)"
         );
-        if let Err(error) = std::fs::write(&path, &merged) {
+        // K58-H3: the atomic write — UPDATE rewriting a LIVE volume file
+        // in place is exactly the torn window the primitive closes.
+        if let Err(error) = cloudkit_core::config::write_config_atomically(&path, &merged) {
             return format!(
                 "ERR: writing the volume file {} failed: {error} — the runtime was not \
                  touched (the volume keeps its current configuration)\n",
@@ -3058,21 +3185,26 @@ impl RuntimeVolumeControl {
                 path.display()
             );
         }
-        let addition = self.add_volume(name).await;
-        let state = addition
-            .trim()
-            .strip_prefix(&format!("OK: added volume `{name}` "));
-        match state {
-            Some(state) => format!(
+        let (addition, added) = self.add_volume(name).await;
+        // K58-M7: the structured verdict classifies the re-assembly;
+        // the strip is display sugar only (see CREATE's twin comment).
+        if added {
+            let state = addition
+                .trim()
+                .strip_prefix(&format!("OK: added volume `{name}` "))
+                .map(|state| state.trim().to_owned())
+                .unwrap_or_else(|| addition.trim().to_owned());
+            format!(
                 "OK: updated volume `{name}` (re-assembled: {}); {comments}\n",
-                state.trim()
-            ),
-            None => format!(
+                state
+            )
+        } else {
+            format!(
                 "ERR: the volume file was updated ({}) and the volume is now UNMOUNTED: \
                  {} — fix the file and `ENABLE {name}`; {comments}\n",
                 path.display(),
                 addition.trim().trim_start_matches("ERR: ")
-            ),
+            )
         }
     }
 
@@ -3310,62 +3442,89 @@ impl RuntimeVolumeControl {
     /// a claim that cannot be honored fails the ADD with nothing
     /// registered (the assembled volume is quietly torn down — its
     /// workers never served a request).
-    async fn add_volume(&self, name: &str) -> String {
+    ///
+    /// K58-M7: the outcome is STRUCTURED — the reply is the operator
+    /// text, the bool is the assembly+mount verdict (true only when the
+    /// volume ended up registered and serving). CREATE/UPDATE classify
+    /// on the bool, never on re-parsing the reply's `OK:` prefix.
+    async fn add_volume(&self, name: &str) -> (String, bool) {
         // Path-safety precheck (shared with SHOW): the full name rules
         // live in `load_volume_config`.
         if !Self::name_is_path_safe(name) {
-            return format!(
-                "ERR: `{name}` is not a volume name — ADD takes the file stem of a \
-                 volumes_dir entry (names match ^[a-z][a-z0-9_-]{{0,31}}$)\n"
+            return (
+                format!(
+                    "ERR: `{name}` is not a volume name — ADD takes the file stem of a \
+                     volumes_dir entry (names match ^[a-z][a-z0-9_-]{{0,31}}$)\n"
+                ),
+                false,
             );
         }
         if let Some(registered) = self.registry.volume(name) {
-            return format!(
-                "ERR: volume `{name}` is already registered (status: {}) — remove it \
-                 first (`REMOVE {name}`) if you want to re-assemble it\n",
-                registered.status().as_str()
+            return (
+                format!(
+                    "ERR: volume `{name}` is already registered (status: {}) — remove it \
+                     first (`REMOVE {name}`) if you want to re-assemble it\n",
+                    registered.status().as_str()
+                ),
+                false,
             );
         }
         let Some(dir) = self.process_cfg.volumes_dir.as_deref() else {
-            return "ERR: this instance runs single-volume mode (no volumes_dir) — \
+            return (
+                "ERR: this instance runs single-volume mode (no volumes_dir) — \
                     runtime ADD serves multi-volume instances\n"
-                .to_string();
+                    .to_string(),
+                false,
+            );
         };
         let path = Path::new(dir).join(format!("{name}.toml"));
         let spec = match cloudkit_core::config::load_volume_config(&path) {
             Ok(spec) => spec,
             Err(error) => {
-                return format!(
-                    "ERR: reading the volume file {} failed: {error} — fix the file \
-                     and retry\n",
-                    path.display()
+                return (
+                    format!(
+                        "ERR: reading the volume file {} failed: {error} — fix the file \
+                         and retry\n",
+                        path.display()
+                    ),
+                    false,
                 );
             }
         };
         if !spec.settings.enabled {
-            return format!(
-                "ERR: volume `{name}` is disabled (enabled = false in {}) — the volume \
-                 file is the persistent source of truth (K49); flip the key to true \
-                 and retry\n",
-                spec.file_path.display()
+            return (
+                format!(
+                    "ERR: volume `{name}` is disabled (enabled = false in {}) — the volume \
+                     file is the persistent source of truth (K49); flip the key to true \
+                     and retry\n",
+                    spec.file_path.display()
+                ),
+                false,
             );
         }
         let Some(dispatch) = &self.dispatch else {
-            return "ERR: this instance booted without a runtime transport dispatch — \
+            return (
+                "ERR: this instance booted without a runtime transport dispatch — \
                     ADD cannot assemble new volumes here\n"
-                .to_string();
+                    .to_string(),
+                false,
+            );
         };
         let (options, transport) = match dispatch(&spec).await {
             Ok(Some(pair)) => pair,
             Ok(None) => {
-                return format!(
-                    "ERR: connecting volume `{name}` was interrupted; nothing changed\n"
+                return (
+                    format!("ERR: connecting volume `{name}` was interrupted; nothing changed\n"),
+                    false,
                 );
             }
             Err(error) => {
-                return format!(
-                    "ERR: connecting volume `{name}` failed: {error:#} — nothing was \
-                     changed; fix the volume file and retry\n"
+                return (
+                    format!(
+                        "ERR: connecting volume `{name}` failed: {error:#} — nothing was \
+                         changed; fix the volume file and retry\n"
+                    ),
+                    false,
                 );
             }
         };
@@ -3374,9 +3533,12 @@ impl RuntimeVolumeControl {
             {
                 Ok(assembled) => assembled,
                 Err((_, error)) => {
-                    return format!(
-                        "ERR: assembling volume `{name}` failed: {error:#} — nothing was \
-                         changed; fix the volume file and retry\n"
+                    return (
+                        format!(
+                            "ERR: assembling volume `{name}` failed: {error:#} — nothing was \
+                             changed; fix the volume file and retry\n"
+                        ),
+                        false,
                     );
                 }
             };
@@ -3391,9 +3553,12 @@ impl RuntimeVolumeControl {
         // cannot wedge the stop task's idle barrier.
         if self.watch.fired() {
             tear_down_unpublished(assembled).await;
-            return format!(
-                "ERR: volume `{name}` not added — the instance is shutting down; the \
-                 assembled volume was torn down and nothing was registered\n"
+            return (
+                format!(
+                    "ERR: volume `{name}` not added — the instance is shutting down; the \
+                     assembled volume was torn down and nothing was registered\n"
+                ),
+                false,
             );
         }
 
@@ -3402,7 +3567,10 @@ impl RuntimeVolumeControl {
         // semantics — there is no mount window to hide behind (H3).
         if !spec.explicit_drive_letter {
             self.publish_added_volume(name, assembled, None, None);
-            return format!("OK: added volume `{name}` (running; no drive letter claimed)\n");
+            return (
+                format!("OK: added volume `{name}` (running; no drive letter claimed)\n"),
+                true,
+            );
         }
         if !self.process_cfg.auto_mount_drive {
             tracing::info!(
@@ -3411,7 +3579,10 @@ impl RuntimeVolumeControl {
                  without its drive (the same gate the boot mount pass applies)"
             );
             self.publish_added_volume(name, assembled, None, None);
-            return format!("OK: added volume `{name}` (running; no drive letter claimed)\n");
+            return (
+                format!("OK: added volume `{name}` (running; no drive letter claimed)\n"),
+                true,
+            );
         }
 
         // The mount-first window (review H3): the ADD's drive mount runs
@@ -3419,8 +3590,9 @@ impl RuntimeVolumeControl {
         // into the three faces first, so `/vol/<name>` routed and the
         // dashboard tab appeared while the mount was still seconds away
         // — and a mount failure rolled the faces back under in-flight
-        // requests (axum request tasks run concurrently with the control
-        // loop; "same task, serialized" only holds between commands).
+        // requests (axum request tasks run concurrently with the
+        // serialized command execution — even with every command behind
+        // the gate, the DATA-plane requests the faces serve are not).
         // Publishing after the mount settles makes the window
         // unobservable: a volume is either not registered at all or
         // registered AND mounted. Accepted edge: the LIST/banner face
@@ -3464,10 +3636,13 @@ impl RuntimeVolumeControl {
                 volume = name,
                 "runtime ADD rolled back: the drive mount failed"
             );
-            return format!(
-                "ERR: volume `{name}` assembled but its drive mount failed — the \
-                 addition was rolled back; free the drive letter (see the hints \
-                 above) and retry\n"
+            return (
+                format!(
+                    "ERR: volume `{name}` assembled but its drive mount failed — the \
+                     addition was rolled back; free the drive letter (see the hints \
+                     above) and retry\n"
+                ),
+                false,
             );
         };
         let release = mount_release(&mount, &mut handles);
@@ -3495,10 +3670,13 @@ impl RuntimeVolumeControl {
                 }
             }
             tear_down_unpublished(assembled).await;
-            return format!(
-                "ERR: volume `{name}` not added — the instance is shutting down; the \
-                 freshly mounted drive was released, the assembled volume torn down, \
-                 and nothing was registered\n"
+            return (
+                format!(
+                    "ERR: volume `{name}` not added — the instance is shutting down; the \
+                     freshly mounted drive was released, the assembled volume torn down, \
+                     and nothing was registered\n"
+                ),
+                false,
             );
         }
 
@@ -3509,7 +3687,10 @@ impl RuntimeVolumeControl {
         self.publish_added_volume(name, assembled, Some(mount), release);
         println!("Volume {name} mounted at {letter} ({backend}).");
         tracing::info!(volume = name, letter = %letter, backend = %backend, "runtime ADD mounted the volume's drive");
-        format!("OK: added volume `{name}` (running; mounted {letter} via {short})\n")
+        (
+            format!("OK: added volume `{name}` (running; mounted {letter} via {short})\n"),
+            true,
+        )
     }
 
     /// The ADD publication point (review H3): all three faces and the
@@ -3692,7 +3873,11 @@ impl RuntimeVolumeControl {
     /// background task spawns (R3), and the reply is immediate — the
     /// command queue is never parked behind a walk. The background
     /// task owns the R4 budget and the R5 checkpoints; its result
-    /// arrives as a log line, never on this reply.
+    /// arrives as a log line, never on this reply. K58-FD: the task
+    /// carries the ACCEPTED instance's identity (M4a — a re-assembled
+    /// same-name volume is a different generation and aborts the walk)
+    /// and re-audits the drained queue every checkpoint (M4b — uploads
+    /// resuming mid-walk interrupt the pass recoverably).
     async fn rebuild_volume(&self, name: &str) -> String {
         if !Self::name_is_path_safe(name) {
             return format!(
@@ -3755,10 +3940,22 @@ impl RuntimeVolumeControl {
                 );
             }
         };
-        // R1 + R3: the marker goes up and the task detaches. The
-        // command loop is serialized, so a second REBUILD cannot race
-        // this insert; the background task's exit path is the only
-        // other writer, and it removes only its own name.
+        // R1 + R3: the marker goes up and the task detaches. Commands
+        // serialize behind the command gate (K58-FB), so a second
+        // REBUILD cannot race this insert; the background task's exit
+        // path is the only other writer, and it removes only its own
+        // name.
+        //
+        // K58-FD/M4a: the instance identity, captured at acceptance —
+        // the accepted Vfs's heap allocation address (see
+        // [`volume_identity`]). The task also keeps the Vfs clone
+        // itself: the M4b checkpoint re-reads its queue, and the clone
+        // PINNED here makes the identity exact for the task's whole
+        // run (the accepted allocation can never be freed and its
+        // address reused while the task holds it, so a fresh assembly
+        // can never alias the identity).
+        let identity = volume_identity(&runtime)
+            .expect("the running gate above guaranteed a Vfs-backed entry");
         self.rebuilds
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3772,6 +3969,8 @@ impl RuntimeVolumeControl {
                 rebuilds: Arc::clone(&self.rebuilds),
                 tuning: self.rebuild_tuning,
                 run: Arc::clone(&self.rebuild),
+                vfs,
+                identity,
             }
             .run(),
         );
@@ -3789,6 +3988,27 @@ fn format_start_clock(started: std::time::SystemTime) -> String {
     local.format("%H:%M:%S").to_string()
 }
 
+/// The instance identity behind a registry entry (K58-FD/M4a): the
+/// entry's Vfs allocation address, read through the RUNNING variant's
+/// `Arc<Vfs>` (`None` for a Failed entry — a broken assembly has no
+/// identity, and a walk accepted on a running instance must not treat
+/// it as its own).
+///
+/// Why the address is an EXACT identity for the rebuild task's run:
+/// every registration path (boot discovery, runtime ADD, ENABLE —
+/// which routes through `add_volume` verbatim — and UPDATE's internal
+/// REMOVE+ADD) assembles a FRESH `Arc<Vfs>` through `assemble_volume`
+/// (there is no same-Vfs reuse path anywhere: even DISABLE→ENABLE
+/// re-assembles from scratch, so an in-flight walk from the
+/// pre-DISABLE instance aborts — correct, its settings snapshot is the
+/// old assembly's); and the RebuildTask holds its own clone of the
+/// accepted Vfs for the whole run, so the accepted allocation stays
+/// live (pinned) — a freed-and-reused address cannot alias the
+/// identity. Same address therefore MEANS same instance.
+fn volume_identity(runtime: &VolumeRuntime) -> Option<usize> {
+    runtime.vfs().map(|vfs| Arc::as_ptr(vfs) as usize)
+}
+
 /// How one background rebuild ended (P2/R3–R5) — each exit has its own
 /// one-line report; every one of them resets the R1 marker.
 enum RebuildExit {
@@ -3796,10 +4016,17 @@ enum RebuildExit {
     Done(Result<rebuild::RebuildOutcome>),
     /// The R4 budget ran out (the idempotent-merge world: rows stay).
     TimedOut(Duration),
-    /// The R5 checkpoint found the volume REMOVEd.
+    /// The R5 checkpoint found the accepted instance gone from the
+    /// registry — removed, or (K58-FD/M4a) replaced by a DIFFERENT
+    /// generation under the same name (a re-assembly's fresh Vfs never
+    /// matches the accepted identity).
     VolumeGone,
     /// The R5 checkpoint found the shutdown gate fired.
     ShuttingDown,
+    /// The FD checkpoint (M4b) found uploads back in flight mid-walk:
+    /// a recoverable interrupt — the rows stay, a rerun continues the
+    /// merge once the queue drains.
+    UploadsResumed,
     /// The executor's task panicked (contained, like a command panic).
     Panicked(String),
 }
@@ -3812,6 +4039,14 @@ enum RebuildExit {
 /// the volume re-acceptable — including the abort exits, because the
 /// rebuild's upserts are idempotent (the rel_path conflict key: a
 /// rerun re-merges exactly what the interrupted pass had written).
+///
+/// K58-FD: the checkpoints bind to the ACCEPTED instance, not the
+/// name — `identity` is the accepted Vfs's address ([`volume_identity`])
+/// and a same-name re-assembly (a new generation) aborts the walk
+/// (M4a); `vfs` (the accepted instance's own queue) is re-audited
+/// every checkpoint so uploads resuming mid-walk interrupt the pass
+/// recoverably instead of letting stale list pages overwrite fresh
+/// fs_ids (M4b).
 struct RebuildTask {
     name: String,
     settings: CyDriveConfig,
@@ -3820,14 +4055,20 @@ struct RebuildTask {
     rebuilds: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::SystemTime>>>,
     tuning: RebuildTuning,
     run: RuntimeRebuild,
+    /// The accepted instance's Vfs (M4b's queue read; also the pin
+    /// that keeps the identity exact — see [`volume_identity`]).
+    vfs: Arc<Vfs>,
+    /// The accepted instance's identity (M4a's checkpoint verdict).
+    identity: usize,
 }
 
 impl RebuildTask {
     /// The supervision loop: the executor runs on its own spawned task
     /// (so an abort can DROP it mid-await — the R5 semantics), with
-    /// the checkpoint ticking between the registry presence and the
-    /// shutdown gate, and the R4 deadline over the whole pass. The
-    /// checkpoint cadence is the plan's "periodic checkpoint" stand-in
+    /// the checkpoint ticking between the shutdown gate, the accepted
+    /// instance's identity and the drained queue, and the R4 deadline
+    /// over the whole pass. The checkpoint cadence is the plan's
+    /// "periodic checkpoint" stand-in
     /// for the per-page hook: `rebuild_from_backend` has no
     /// page-granularity seam, and a sub-second cadence bounds the
     /// abort latency as tightly without touching core's walk (the
@@ -3863,16 +4104,37 @@ impl RebuildTask {
                 }
                 _ = checkpoints.tick() => {
                     // R5's two observables, the H1 gate's own reading
-                    // points: the shutdown gate and the registry entry.
+                    // points: the shutdown gate and the registry entry
+                    // — the latter as the ACCEPTED INSTANCE's identity
+                    // (K58-FD/M4a): a same-name re-assembly (UPDATE's
+                    // internal REMOVE+ADD, DISABLE→ENABLE) is a new
+                    // generation and must not inherit the walk.
                     if self.watch.fired() {
                         work.abort();
                         let _ = work.await;
                         break RebuildExit::ShuttingDown;
                     }
-                    if self.registry.volume(&self.name).is_none() {
+                    let same_generation = self
+                        .registry
+                        .volume(&self.name)
+                        .as_ref()
+                        .and_then(volume_identity)
+                        .is_some_and(|identity| identity == self.identity);
+                    if !same_generation {
                         work.abort();
                         let _ = work.await;
                         break RebuildExit::VolumeGone;
+                    }
+                    // K58-FD/M4b: R2 re-audited mid-walk — uploads that
+                    // resumed after acceptance would let an earlier
+                    // list page overwrite a re-uploaded row's fs_id
+                    // with the stale one (old bytes served until the
+                    // next pass), so a non-empty queue interrupts the
+                    // pass recoverably instead.
+                    if self.vfs.queue_stats().outstanding() > 0 {
+                        work.abort();
+                        let _ = work.await;
+                        break RebuildExit::UploadsResumed;
                     }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
@@ -3884,7 +4146,7 @@ impl RebuildTask {
         };
         // R1's reset on every exit path — the marker's whole lifetime
         // is this task's run (the handler only inserts what this
-        // removes; the serialized command loop cannot interleave).
+        // removes; the gate-serialized commands cannot interleave).
         self.rebuilds
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3921,12 +4183,26 @@ impl RebuildTask {
             }
             RebuildExit::VolumeGone => {
                 println!(
-                    "Volume {name} rebuild aborted — the volume was removed at runtime \
-                     (nothing to resume; re-add the volume and REBUILD again)."
+                    "Volume {name} rebuild aborted — the volume this rebuild started on is no \
+                     longer registered under that name: it was removed, or re-assembled into a \
+                     different generation, at runtime (nothing to resume; re-REBUILD the \
+                     volume now registered if it should be rebuilt)."
                 );
                 tracing::info!(
                     volume = name,
-                    "background rebuild aborted: the volume was removed at runtime"
+                    "background rebuild aborted: the volume left the registry or its \
+                     registered instance is a different generation (identity mismatch)"
+                );
+            }
+            RebuildExit::UploadsResumed => {
+                println!(
+                    "Volume {name} rebuild interrupted — uploads resumed mid-walk; rerun \
+                     REBUILD when the queue drains (the rows already rebuilt are kept, the \
+                     merge is idempotent)."
+                );
+                tracing::warn!(
+                    volume = name,
+                    "background rebuild interrupted by resumed uploads; the pass is resumable"
                 );
             }
             RebuildExit::ShuttingDown => {
@@ -6504,6 +6780,40 @@ pub fn run_migrate(store: &dyn CredentialStore) -> Result<String> {
 mod tests {
     use super::*;
 
+    /// K58-M5: the UPDATE re-read parse (the overlay base) routes its
+    /// error through the core redaction funnel — it was the one toml
+    /// parse surface that bypassed it, bare-concatenating the raw error
+    /// into the ERR reply. The refusal keeps the path and the key name,
+    /// never the value; the happy arm returns the parsed table.
+    #[test]
+    fn parse_explicit_table_redacted_masks_credential_values() {
+        let broken =
+            "backend = \"telegram\"\nproxy_url = \"socks5://user:secretpass@127.0.0.1:7897\n";
+        let error = parse_explicit_table_redacted(Path::new("volumes/media.toml"), broken)
+            .expect_err("the broken-quote line must fail to parse");
+        assert!(
+            error.starts_with("re-reading the volume file volumes/media.toml failed"),
+            "the refusal keeps the path wording: {error}"
+        );
+        assert!(
+            !error.contains("secretpass"),
+            "the URL credential value is masked: {error}"
+        );
+        assert!(
+            error.contains("proxy_url"),
+            "the key name stays for diagnosis: {error}"
+        );
+
+        let table =
+            parse_explicit_table_redacted(Path::new("volumes/media.toml"), "backend = \"local\"\n")
+                .expect("valid text parses");
+        assert_eq!(
+            table.get("backend").and_then(toml::Value::as_str),
+            Some("local"),
+            "the happy arm returns the explicit table"
+        );
+    }
+
     #[test]
     fn compiled_drivers_lists_the_feature_set_in_fixed_order() {
         // K32: the `--version` banner's `(drivers: ...)` segment. Every
@@ -6643,6 +6953,122 @@ mod tests {
         );
     }
 
+    /// K58-M7: `add_volume` reports its outcome STRUCTURALLY — the
+    /// reply stays the operator text, the bool is the assembly+mount
+    /// verdict. The pre-fix CREATE/UPDATE classification re-parsed the
+    /// reply's `OK:` prefix, so any wording drift would misreport a
+    /// real assembly as a failure (with the wrong recovery guidance).
+    /// Characterization-style unit test — the review's sanctioned
+    /// fallback form (the reply wording is not injectable, so the
+    /// drift-immunity itself cannot be pinned by rewriting it in a
+    /// test): the three enumerated endings each pin the bool directly
+    /// against a minimal surface.
+    #[tokio::test]
+    async fn add_volume_reports_structured_success_for_its_three_endings() {
+        // The minimal surface under test: empty faces, fast tuning, no
+        // webdav listener, and the dispatch/mount seams injectable per
+        // ending. The volumes_dir is ABSOLUTE (no chdir dance).
+        fn unit_surface(
+            cfg: CyDriveConfig,
+            dispatch: VolumeTransportDispatch,
+            mount: Option<RuntimeMount>,
+        ) -> RuntimeVolumeControl {
+            RuntimeVolumeControl {
+                process_cfg: cfg,
+                registry: RegistryHandle::new(Vec::new()),
+                webdav: cloudkit_webdav::RegistryHandle::new(Vec::new()),
+                web: cloudkit_web::RegistryHandle::new(Vec::new()),
+                live: Arc::new(VolumeLiveTable::default()),
+                watch: Arc::new(ShutdownWatch::new()),
+                webdav_available: false,
+                dispatch: Some(dispatch),
+                mount,
+                tuning: RemoveTuning::fast(),
+                rebuilds: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
+                rebuild_tuning: RebuildTuning::fast(),
+                rebuild: Arc::new(|_name: &str, _settings: &CyDriveConfig| {
+                    Box::pin(async { Ok(rebuild::RebuildOutcome { files: 0, dirs: 0 }) })
+                }),
+            }
+        }
+        fn unit_volume_toml() -> String {
+            "backend = \"telegram\"\nbot_token = \"1:UNIT\"\nchat_id = 1\n".to_string()
+        }
+        let mock_dispatch: VolumeTransportDispatch = Arc::new(move |_spec: &VolumeConfig| {
+            Box::pin(async {
+                let mock = Arc::new(cloudkit_core::transport::mock::MockTransport::new());
+                mock.connect().await.expect("unit mock connects");
+                Ok(Some((
+                    RunOptions::default(),
+                    mock as Arc<dyn CloudTransport>,
+                )))
+            })
+        });
+
+        let dir = tempfile::tempdir().expect("tempdir");
+        let volumes = dir.path().join("volumes");
+        std::fs::create_dir_all(&volumes).expect("create volumes dir");
+        let plain_cfg = CyDriveConfig {
+            volumes_dir: Some(volumes.to_string_lossy().into_owned()),
+            ..CyDriveConfig::default()
+        };
+
+        // Ending 1 — success: the file assembles and publishes (no
+        // drive letter claimed — the no-mount publication arm).
+        std::fs::write(volumes.join("ok.toml"), unit_volume_toml()).expect("write ok.toml");
+        let (reply, added) = unit_surface(plain_cfg.clone(), mock_dispatch.clone(), None)
+            .add_volume("ok")
+            .await;
+        assert!(added, "a clean assembly reports success: {reply}");
+        assert!(
+            reply.starts_with("OK: added volume `ok`"),
+            "the success reply keeps its operator text: {reply}"
+        );
+
+        // Ending 2 — dispatch (connect/credential) failure: nothing
+        // changes, the verdict is failure.
+        std::fs::write(volumes.join("bad.toml"), unit_volume_toml()).expect("write bad.toml");
+        let failing_dispatch: VolumeTransportDispatch = Arc::new(move |_spec: &VolumeConfig| {
+            Box::pin(async { anyhow::bail!("connect refused (unit test)") })
+        });
+        let (reply, added) = unit_surface(plain_cfg.clone(), failing_dispatch, None)
+            .add_volume("bad")
+            .await;
+        assert!(!added, "a dispatch failure reports failure: {reply}");
+        assert!(
+            reply.starts_with("ERR:") && reply.contains("connecting volume `bad` failed"),
+            "the refusal keeps its actionable text: {reply}"
+        );
+
+        // Ending 3 — mount-failure rollback: the assembled volume is
+        // torn down unpublished, the verdict is failure.
+        std::fs::write(
+            volumes.join("mnt.toml"),
+            format!("{}drive_letter = \"Q\"\n", unit_volume_toml()),
+        )
+        .expect("write mnt.toml");
+        let empty_mount_stub: RuntimeMount = Arc::new(move |_name: &str, _letter: &str| {
+            Box::pin(async {
+                VolumeMounts {
+                    mounted: Vec::new(),
+                    winfsp: Default::default(),
+                }
+            })
+        });
+        let mount_cfg = CyDriveConfig {
+            auto_mount_drive: true,
+            ..plain_cfg.clone()
+        };
+        let (reply, added) = unit_surface(mount_cfg, mock_dispatch, Some(empty_mount_stub))
+            .add_volume("mnt")
+            .await;
+        assert!(!added, "a mount-failure rollback reports failure: {reply}");
+        assert!(
+            reply.starts_with("ERR:") && reply.contains("rolled back"),
+            "the rollback refusal keeps its actionable text: {reply}"
+        );
+    }
+
     /// M1-3 (review fix): the net-use release's error path through the
     /// spawn_blocking + budget wrapper — deleting a mapping that does
     /// not exist must come back Err (the verbatim net-use failure, with
@@ -6672,6 +7098,91 @@ mod tests {
         assert!(
             error.contains("failed"),
             "the failure reads as a failure: {error}"
+        );
+    }
+
+    /// K58-FD/M4a: the checkpoint's identity observable — the registry
+    /// entry's Vfs allocation address. The unit pins the extraction's
+    /// three semantics directly (the integration test
+    /// `a_reassembled_volume_is_a_new_generation_...` pins the walk's
+    /// abort): the identity is STABLE while the same instance stays
+    /// registered, a REMOVE→re-ADD swap (UPDATE's internals, ENABLE's
+    /// path — every registration goes through a fresh assembly) reads
+    /// a DIFFERENT identity, and a Failed entry carries none.
+    #[tokio::test]
+    async fn volume_identity_is_stable_per_instance_and_changes_across_reassembly() {
+        fn unit_spec(name: &str, dir: &Path) -> VolumeConfig {
+            VolumeConfig {
+                name: name.to_string(),
+                file_path: dir.join(format!("{name}.toml")),
+                base_dir: dir.to_path_buf(),
+                settings: CyDriveConfig::default(),
+                explicit_drive_letter: false,
+            }
+        }
+        // Two independent assemblies (fresh db + cache + Vfs each —
+        // `assemble_volume`'s shape in miniature); the tempdirs stay
+        // alive for the entries' lifetime.
+        let assemble = |stem: &str| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db = Arc::new(MetaDatabase::open(&dir.path().join("meta.db")).expect("open db"));
+            let cache = CacheManager::new(dir.path().join("cache"), u64::MAX);
+            let transport: Arc<dyn CloudTransport> =
+                Arc::new(cloudkit_core::transport::mock::MockTransport::new());
+            let vfs = Arc::new(Vfs::new(
+                db,
+                cache,
+                Arc::clone(&transport),
+                Default::default(),
+            ));
+            let runtime = VolumeRuntime::Running {
+                spec: unit_spec(stem, dir.path()),
+                transport,
+                vfs,
+            };
+            (runtime, dir)
+        };
+
+        let (first, _keep_first) = assemble("a");
+        let accepted = volume_identity(&first).expect("a Running entry carries its Vfs identity");
+
+        // Stable for the live instance: the registry clone reads the
+        // same identity the acceptance captured.
+        let registry = RegistryHandle::new(vec![first]);
+        let live = registry.volume("a").expect("registered");
+        assert_eq!(
+            volume_identity(&live),
+            Some(accepted),
+            "the same registered instance keeps its identity"
+        );
+
+        // The REMOVE→re-ADD swap: the fresh assembly is a new
+        // generation — the identity the checkpoint compares against
+        // MUST change, or a re-assembled volume would inherit the old
+        // walk.
+        let (second, _keep_second) = assemble("a");
+        assert!(registry.remove("a"), "the REMOVE leg drops the entry");
+        registry.insert(second);
+        let swapped = registry
+            .volume("a")
+            .expect("the re-ADD registers the new generation");
+        let swapped_vfs = swapped.vfs().expect("the re-assembled entry runs");
+        assert_ne!(
+            Arc::as_ptr(swapped_vfs) as usize,
+            accepted,
+            "a re-assembled volume is a different generation (identity changed)"
+        );
+
+        // A Failed entry (a broken re-assembly) has no identity at all
+        // — never the accepted one.
+        let failed = VolumeRuntime::Failed {
+            spec: unit_spec("a", Path::new(".")),
+            reason: "assembly failed".to_string(),
+        };
+        assert_eq!(
+            volume_identity(&failed),
+            None,
+            "a Failed entry carries no identity"
         );
     }
 }

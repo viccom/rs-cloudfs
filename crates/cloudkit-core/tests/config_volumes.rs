@@ -16,9 +16,9 @@ use std::path::Path;
 
 use cloudkit_core::config::{
     discover_volumes, ensure_no_volume_keys_in_process, is_valid_volume_name, json_value_to_toml,
-    load_volume_config, load_volumes, parse_volume_toml, render_volume_toml, volume_show_json,
-    write_volume_enabled, Backend, ConfigError, CyDriveConfig, KNOWN_TOML_KEYS,
-    PROCESS_SCOPED_KEYS, VOLUME_SCOPED_KEYS,
+    load_volume_config, load_volumes, parse_volume_toml, redact_credential_values,
+    render_volume_toml, volume_show_json, write_config_atomically, write_volume_enabled, Backend,
+    ConfigError, CyDriveConfig, KNOWN_TOML_KEYS, PROCESS_SCOPED_KEYS, VOLUME_SCOPED_KEYS,
 };
 
 // ------------------------------------------------------------- helpers ---
@@ -358,6 +358,84 @@ fn load_volume_config_parse_error_without_credentials_stays_verbatim() {
         message.contains("local_root = \"plain-offending-value"),
         "a message without credential keys is not redacted: {message}"
     );
+}
+
+/// Review M2 (K58): the URL keys are credential-valued — a proxy URL
+/// carries userinfo (`socks5://user:pass@host`) and a sync URL may too —
+/// so their SHOW answers must collapse to the set marker like every
+/// other credential key (write-only: the value never leaves the
+/// backend, and the dashboard's edit form prefills from this reply).
+#[test]
+fn volume_show_json_masks_url_credentials() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("media.toml");
+    write_file(
+        &file,
+        "backend = \"telegram\"\n\
+         bot_token = \"111:FAKE-TOKEN-MARKER\"\n\
+         proxy_url = \"socks5://user:secretpass@127.0.0.1:7897\"\n\
+         sync_url = \"https://sync.example.org:8290\"\n",
+    );
+
+    let line = volume_show_json(&file).expect("serialize the volume file");
+    let value: serde_json::Value = serde_json::from_str(&line).expect("valid json");
+    assert_eq!(
+        value["proxy_url"],
+        serde_json::json!({"set": true}),
+        "the proxy URL collapses to the set marker: {line}"
+    );
+    assert_eq!(
+        value["sync_url"],
+        serde_json::json!({"set": true}),
+        "the sync URL collapses to the set marker: {line}"
+    );
+    assert!(
+        !line.contains("secretpass") && !line.contains("sync.example.org"),
+        "URL credential values must not ride the SHOW reply: {line}"
+    );
+}
+
+/// Review M2 (K58), the redaction twin: a broken-quote `proxy_url`
+/// line's value (the userinfo-carrying URL) must be masked in the parse
+/// error like every other credential value — the key name stays for
+/// diagnosis.
+#[test]
+fn load_volume_config_parse_error_redacts_url_credentials() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("leak.toml");
+    write_file(
+        &path,
+        "backend = \"telegram\"\nproxy_url = \"socks5://user:secretpass@127.0.0.1:7897\n",
+    );
+
+    let err = load_volume_config(&path).expect_err("the broken-quote line must fail to parse");
+    let message = err.to_string();
+    assert!(
+        !message.contains("secretpass"),
+        "the proxy URL value must be redacted from the parse error: {message}"
+    );
+    assert!(
+        message.contains("proxy_url"),
+        "the key name stays for diagnosis: {message}"
+    );
+}
+
+/// K58-M5: the redaction funnel is PUBLIC — the one scrubber every
+/// toml parse-error surface outside the config module routes through
+/// (the cli UPDATE re-read is the first direct caller; the
+/// no-second-implementation rule). Direct contract pin on a crafted
+/// message: a backtick-quoted URL credential is masked, the key name
+/// survives.
+#[test]
+fn redact_credential_values_masks_url_credentials_directly() {
+    let message = "invalid type: string `socks5://user:secretpass@127.0.0.1:7897`, \
+                   expected a string for key `proxy_url`";
+    let masked = redact_credential_values(message);
+    assert!(
+        !masked.contains("secretpass"),
+        "the URL credential value is masked: {masked}"
+    );
+    assert!(masked.contains("proxy_url"), "the key name stays: {masked}");
 }
 
 // ------------------------------------------------------- discovery -------
@@ -996,6 +1074,128 @@ fn write_volume_enabled_refuses_files_the_funnel_rejects() {
     assert!(
         write_volume_enabled(&missing, true).is_err(),
         "a missing file is a Read error, not a fresh write"
+    );
+}
+
+// --------------------- atomic config writes (K58-H3 review fix) ----------
+
+/// The primitive's happy path: the content lands byte-exact and NO
+/// temp file stays behind (the `.<name>.tmp` sibling must not leak into
+/// discovery listings or user view of the volumes directory).
+#[test]
+fn write_config_atomically_writes_content_and_leaves_no_temp_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("media.toml");
+
+    write_config_atomically(&file, "backend = \"local\"\nenabled = false\n")
+        .expect("the write lands");
+
+    assert_eq!(
+        fs::read_to_string(&file).expect("read the file back"),
+        "backend = \"local\"\nenabled = false\n",
+        "the content is byte-exact"
+    );
+    assert!(
+        !dir.path().join(".media.toml.tmp").exists(),
+        "no temp file stays behind on the success path"
+    );
+}
+
+/// Overwrite-in-place: an existing target is replaced whole (the
+/// rename leg — readers see either the entire old file or the entire
+/// new one, never a torn middle).
+#[test]
+fn write_config_atomically_replaces_an_existing_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("media.toml");
+    write_file(&file, "backend = \"local\"\n");
+
+    write_config_atomically(&file, "backend = \"telegram\"\n").expect("the overwrite lands");
+
+    assert_eq!(
+        fs::read_to_string(&file).expect("read the file back"),
+        "backend = \"telegram\"\n",
+        "the new content replaces the old whole"
+    );
+    assert!(
+        !dir.path().join(".media.toml.tmp").exists(),
+        "no temp file stays behind on the success path"
+    );
+}
+
+/// A stale temp file left by a crashed earlier attempt must not block
+/// the next write (the pre-rename delete): the write lands and the
+/// stale file is gone.
+#[test]
+fn write_config_atomically_removes_a_stale_temp_file_first() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("media.toml");
+    write_file(
+        &dir.path().join(".media.toml.tmp"),
+        "stale garbage from a crashed write\n",
+    );
+
+    write_config_atomically(&file, "backend = \"local\"\n")
+        .expect("the write over the stale temp lands");
+
+    assert_eq!(
+        fs::read_to_string(&file).expect("read the file back"),
+        "backend = \"local\"\n",
+        "the content landed despite the stale temp"
+    );
+    assert!(
+        !dir.path().join(".media.toml.tmp").exists(),
+        "the stale temp is gone"
+    );
+}
+
+/// Write-stage failure: the error propagates and the ORIGINAL file
+/// stays byte-identical (the temp file is created beside the target —
+/// the target itself is never opened for writing). The reliable
+/// cross-platform construction for a write-stage failure is occupying
+/// the temp path with a directory (a read-only directory bit does NOT
+/// block file creation on Windows and ACLs are out of std's reach —
+/// K58-H3 取舍, see the primitive's tests note in the tracker).
+#[test]
+fn write_config_atomically_write_failure_keeps_the_original() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("media.toml");
+    write_file(&file, "backend = \"local\"\nlocal_root = \"root\"\n");
+    fs::create_dir(dir.path().join(".media.toml.tmp")).expect("block the temp path");
+
+    let error = write_config_atomically(&file, "backend = \"telegram\"\n")
+        .expect_err("the blocked temp path must fail the write");
+
+    assert!(
+        !error.to_string().is_empty(),
+        "the write-stage error propagates"
+    );
+    assert_eq!(
+        fs::read_to_string(&file).expect("read the original back"),
+        "backend = \"local\"\nlocal_root = \"root\"\n",
+        "the original is untouched on the failure path"
+    );
+}
+
+/// Rename-stage failure: the temp file is cleaned up and the error
+/// propagates (the target occupied by a directory makes the replace
+/// rename fail on both Windows and POSIX).
+#[test]
+fn write_config_atomically_rename_failure_cleans_the_temp_file() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let file = dir.path().join("media.toml");
+    fs::create_dir(&file).expect("the target is a directory");
+
+    let error = write_config_atomically(&file, "backend = \"local\"\n")
+        .expect_err("renaming a file over a directory must fail");
+
+    assert!(
+        !error.to_string().is_empty(),
+        "the rename-stage error propagates"
+    );
+    assert!(
+        !dir.path().join(".media.toml.tmp").exists(),
+        "the temp file is removed after the failed rename"
     );
 }
 

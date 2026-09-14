@@ -427,8 +427,12 @@ impl WebUiServer {
         cfg: WebUiConfig,
         addr: SocketAddr,
     ) -> Result<Self, WebUiError> {
-        let app = router(vfs, cfg);
-        serve_router(app, addr).await
+        let listener = bind(addr).await?;
+        let bound = listener
+            .local_addr()
+            .map_err(|source| WebUiError::Bind { addr, source })?;
+        let app = router(vfs, cfg, Arc::new(HostAllowlist::derive(&bound)));
+        serve_listener(listener, bound, app).await
     }
 
     /// Binds `addr` and serves the multi-volume dashboard (Phase 2.5 /
@@ -489,8 +493,20 @@ impl WebUiServer {
                  allow_remote_admin = true in config.toml to manage volumes remotely"
             );
         }
-        let app = multi_router(volumes, commands, writes_allowed);
-        serve_router(app, addr).await
+        // Bind BEFORE the router is assembled: the Host allowlist (H5)
+        // derives from the BOUND address — a `:0` port is not real until
+        // the listener answers for it.
+        let listener = bind(addr).await?;
+        let bound = listener
+            .local_addr()
+            .map_err(|source| WebUiError::Bind { addr, source })?;
+        let app = multi_router(
+            volumes,
+            commands,
+            writes_allowed,
+            Arc::new(HostAllowlist::derive(&bound)),
+        );
+        serve_listener(listener, bound, app).await
     }
 
     /// The actually bound address (`:0` resolves to the real port).
@@ -509,15 +525,23 @@ impl WebUiServer {
     }
 }
 
-/// The shared bind + accept-loop segment behind both constructors.
-async fn serve_router(app: axum::Router, addr: SocketAddr) -> Result<WebUiServer, WebUiError> {
-    let listener = TcpListener::bind(addr)
+/// Binds `addr` — the shared bind segment of both constructors (the
+/// `:0` port resolves off the returned listener).
+async fn bind(addr: SocketAddr) -> Result<TcpListener, WebUiError> {
+    TcpListener::bind(addr)
         .await
-        .map_err(|source| WebUiError::Bind { addr, source })?;
-    let addr = listener
-        .local_addr()
-        .map_err(|source| WebUiError::Bind { addr, source })?;
+        .map_err(|source| WebUiError::Bind { addr, source })
+}
 
+/// The accept-loop segment behind both constructors: the listener is
+/// already bound and its address resolved (`addr`), because the Host
+/// allowlist (H5) is derived from the BOUND address — the router cannot
+/// be assembled before the port is real.
+async fn serve_listener(
+    listener: TcpListener,
+    addr: SocketAddr,
+    app: axum::Router,
+) -> Result<WebUiServer, WebUiError> {
     let (shutdown, rx) = watch::channel(false);
     let task = tokio::task::spawn(async move {
         let server = axum::serve(listener, app).with_graceful_shutdown(async move {
@@ -540,8 +564,15 @@ async fn serve_router(app: axum::Router, addr: SocketAddr) -> Result<WebUiServer
 }
 
 /// The nine contract routes (shared by both modes); the caller appends
-/// any mode-specific routes and applies `.with_state` last.
-fn contract_routes(router: axum::Router<AppState>) -> axum::Router<AppState> {
+/// any mode-specific routes and applies `.with_state` last. `/api/upload`
+/// carries the same-origin guard (H5's stock-closing: it had no Origin
+/// protection at all, and a multipart POST is a simple request — no
+/// preflight, cross-site reachable); `allowed_hosts` is the guard's
+/// allowlist state (derived from the bound address).
+fn contract_routes(
+    router: axum::Router<AppState>,
+    allowed_hosts: &Arc<HostAllowlist>,
+) -> axum::Router<AppState> {
     router
         .route("/", get(index))
         // The volume-management page (web volume management §1.4) is on
@@ -556,7 +587,13 @@ fn contract_routes(router: axum::Router<AppState>) -> axum::Router<AppState> {
         .route("/volumes/system", get(page_volume_system))
         .route("/api/files", get(api_files))
         .route("/api/stats", get(api_stats))
-        .route("/api/upload", post(api_upload))
+        .route(
+            "/api/upload",
+            post(api_upload).layer(axum::middleware::from_fn_with_state(
+                Arc::clone(allowed_hosts),
+                same_origin_guard,
+            )),
+        )
         .route("/api/delete", post(api_delete))
         // `{*filename}` spans slashes: a sub-path download resolves as
         // its virtual RelPath (the Python `{filename}` route only ever
@@ -571,13 +608,14 @@ fn contract_routes(router: axum::Router<AppState>) -> axum::Router<AppState> {
 }
 
 /// Assembles the single-volume route table over the shared state — the
-/// frozen nine routes, byte-identical to the pre-MV3 table.
-fn router(vfs: Arc<Vfs>, cfg: WebUiConfig) -> axum::Router {
+/// frozen nine routes, byte-identical to the pre-MV3 table (plus H5's
+/// upload guard, whose allowlist comes from the bound address).
+fn router(vfs: Arc<Vfs>, cfg: WebUiConfig, allowed_hosts: Arc<HostAllowlist>) -> axum::Router {
     let state = AppState::Single {
         vfs,
         cfg: Arc::new(cfg),
     };
-    contract_routes(axum::Router::new()).with_state(state)
+    contract_routes(axum::Router::new(), &allowed_hosts).with_state(state)
 }
 
 /// Assembles the multi-volume route table: the nine contract routes
@@ -587,55 +625,85 @@ fn router(vfs: Arc<Vfs>, cfg: WebUiConfig) -> axum::Router {
 /// (§1.5 裁决③), the family deliberately NOT spanning the read routes
 /// (downloads stay linkable from anywhere). `writes_allowed` is the
 /// §1.5 verdict (loopback bind or the `allow_remote_admin` opt-in);
-/// the write handlers 403 when it is `false`.
+/// the write handlers 403 when it is `false`. `allowed_hosts` is H5's
+/// Host-allowlist state (the guard's second verdict — derived from the
+/// bound address, so the router is assembled after the bind).
 fn multi_router(
     volumes: RegistryHandle,
     commands: Option<VolumeCommandClient>,
     writes_allowed: bool,
+    allowed_hosts: Arc<HostAllowlist>,
 ) -> axum::Router {
     let state = AppState::Multi {
         volumes,
         commands,
         writes_allowed,
     };
-    contract_routes(axum::Router::new())
+    contract_routes(axum::Router::new(), &allowed_hosts)
         .route(
             "/api/volumes",
             get(api_volumes)
                 .post(api_volume_create)
-                .layer(axum::middleware::from_fn(same_origin_guard)),
+                .layer(axum::middleware::from_fn_with_state(
+                    Arc::clone(&allowed_hosts),
+                    same_origin_guard,
+                )),
         )
         .route(
             "/api/volumes/configs",
-            get(api_volume_configs).layer(axum::middleware::from_fn(same_origin_guard)),
+            get(api_volume_configs).layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&allowed_hosts),
+                same_origin_guard,
+            )),
         )
         .route(
             "/api/volumes/{name}/config",
-            get(api_volume_config).layer(axum::middleware::from_fn(same_origin_guard)),
+            get(api_volume_config).layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&allowed_hosts),
+                same_origin_guard,
+            )),
         )
         .route(
             "/api/volumes/{name}/remove",
-            post(api_volume_remove).layer(axum::middleware::from_fn(same_origin_guard)),
+            post(api_volume_remove).layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&allowed_hosts),
+                same_origin_guard,
+            )),
         )
         .route(
             "/api/volumes/{name}/disable",
-            post(api_volume_disable).layer(axum::middleware::from_fn(same_origin_guard)),
+            post(api_volume_disable).layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&allowed_hosts),
+                same_origin_guard,
+            )),
         )
         .route(
             "/api/volumes/{name}/enable",
-            post(api_volume_enable).layer(axum::middleware::from_fn(same_origin_guard)),
+            post(api_volume_enable).layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&allowed_hosts),
+                same_origin_guard,
+            )),
         )
         .route(
             "/api/volumes/{name}/rebuild",
-            post(api_volume_rebuild).layer(axum::middleware::from_fn(same_origin_guard)),
+            post(api_volume_rebuild).layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&allowed_hosts),
+                same_origin_guard,
+            )),
         )
         .route(
             "/api/volumes/{name}/destroy",
-            post(api_volume_destroy).layer(axum::middleware::from_fn(same_origin_guard)),
+            post(api_volume_destroy).layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&allowed_hosts),
+                same_origin_guard,
+            )),
         )
         .route(
             "/api/volumes/{name}",
-            post(api_volume_update).layer(axum::middleware::from_fn(same_origin_guard)),
+            post(api_volume_update).layer(axum::middleware::from_fn_with_state(
+                Arc::clone(&allowed_hosts),
+                same_origin_guard,
+            )),
         )
         .route("/api/stats/summary", get(api_stats_summary))
         .with_state(state)
@@ -823,20 +891,101 @@ async fn page_volume_system(State(state): State<AppState>) -> Response {
 
 // ------------------------------- the same-origin guard (web volume §1.5) ---
 
+/// The Host-header authorities one bound address legitimately answers
+/// (H5): the same-origin guard's second verdict. Comparing Origin
+/// against Host alone cannot catch DNS rebinding — the attacker's page
+/// is served from a domain that later resolves to the dashboard's own
+/// address, so Host and Origin AGREE on the attacker's authority and
+/// the first verdict waves the forged request through. The allowlist
+/// names what the listener actually answers FOR, derived from the BOUND
+/// address (after `:0` resolves — never a hardcoded port):
+///
+/// - a specific address contributes its own `host:port` spelling, plus
+///   `localhost:{port}` when it is loopback (that name reaches the same
+///   listener);
+/// - a wildcard bind (`0.0.0.0` / `::`) contributes the loopback
+///   spellings — `127.0.0.1`, `[::1]`, `localhost` — every one a
+///   literal an attacker's domain can never take. Consequence (the
+///   review's adjudicated trade): a wildcard bind serves its guarded
+///   family only under the loopback spellings — an operator managing a
+///   machine by its LAN hostname must bind that concrete address.
+///
+/// Comparison is case-insensitive (the Host grammar allows case
+/// variation; browsers send lowercase).
+#[derive(Clone)]
+struct HostAllowlist {
+    /// The legal `host:port` authorities.
+    authorities: Vec<String>,
+}
+
+impl HostAllowlist {
+    /// Derives the allowlist for one bound address.
+    fn derive(bound: &SocketAddr) -> Self {
+        let port = bound.port();
+        let ip = bound.ip();
+        let mut authorities = Vec::new();
+        let mut push = |spelling: &str| authorities.push(format!("{spelling}:{port}"));
+        if ip.is_unspecified() {
+            push("127.0.0.1");
+            push("[::1]");
+            push("localhost");
+        } else {
+            match ip {
+                std::net::IpAddr::V4(v4) => push(&v4.to_string()),
+                std::net::IpAddr::V6(v6) => push(&format!("[{v6}]")),
+            }
+            if ip.is_loopback() {
+                push("localhost");
+            }
+        }
+        Self { authorities }
+    }
+
+    /// Case-insensitive membership.
+    fn allows(&self, host: &str) -> bool {
+        self.authorities
+            .iter()
+            .any(|authority| authority.eq_ignore_ascii_case(host))
+    }
+}
+
 /// The volume-management family's CSRF-shaped defense (裁决③: Origin
-/// checking, not tokens): a state-changing browser request always
-/// carries an Origin (or a Referer) naming the site that issued it, so
-/// a management API call whose Origin/Referer names another site is a
-/// cross-site forgery and answers 403. Requests carrying neither header
-/// (non-browser clients, address-bar navigation) pass — the dashboard
-/// has no session for them to forge. Deliberately scoped to the
-/// `/api/volumes*` family only: the read routes (downloads, stats) and
-/// the pages stay open to foreign links.
-async fn same_origin_guard(request: Request, next: Next) -> Response {
-    match cross_origin_refusal(&request) {
+/// checking, not tokens), plus H5's Host-allowlist verdict. A
+/// state-changing browser request always carries an Origin (or a
+/// Referer) naming the site that issued it, so a management API call
+/// whose Origin/Referer names another site is a cross-site forgery and
+/// answers 403 — and a Host naming no bound authority is the DNS
+/// rebinding shape (Origin and Host agree on the attacker's domain),
+/// refused the same way. Requests carrying neither header (non-browser
+/// clients, address-bar navigation) pass — the dashboard has no session
+/// for them to forge. Deliberately scoped to the guarded family (the
+/// `/api/volumes*` routes and, since H5, `/api/upload`): the read
+/// routes (downloads, stats) and the pages stay open to foreign links.
+async fn same_origin_guard(
+    State(allowed_hosts): State<Arc<HostAllowlist>>,
+    request: Request,
+    next: Next,
+) -> Response {
+    match host_refusal(&allowed_hosts, &request).or_else(|| cross_origin_refusal(&request)) {
         Some(message) => error_json(StatusCode::FORBIDDEN, message),
         None => next.run(request).await,
     }
+}
+
+/// The allowlist verdict (H5): a present, parseable Host naming no bound
+/// authority is the rebinding shape (or a misdirected request) — either
+/// way the guarded family refuses it, naming the suspicion in the body.
+/// A MISSING Host keeps the pass-through verdict: browsers always send
+/// one, so a headerless request is a non-browser client, and 裁决③'s
+/// "no headers = not a browser" semantics stay intact.
+fn host_refusal(allowed_hosts: &HostAllowlist, request: &Request) -> Option<String> {
+    let host = request.headers().get(header::HOST)?.to_str().ok()?;
+    (!allowed_hosts.allows(host)).then(|| {
+        format!(
+            "request refused: Host '{host}' names no address this dashboard is bound to \
+             (suspected DNS rebinding)"
+        )
+    })
 }
 
 /// The refusal verdict for one request: `Some(message)` when an Origin
@@ -890,30 +1039,21 @@ const VOLUME_COMMAND_TIMEOUT: Duration = Duration::from_secs(5);
 /// through the command seam — a `SHOW <name>` whose reply JSON passes
 /// through verbatim (core's serializer already collapsed every
 /// credential key to its `{"set": bool}` marker; the value never
-/// reaches this layer, let alone the browser). The registry gates the
-/// lookup — a REMOVE'd volume 404s even though its file stays (K49:
-/// removal is runtime-only). A missing seam answers 503 (a dashboard
-/// booted without volume management), a command that outlives
+/// reaches this layer, let alone the browser). No registry gate
+/// (K58-M3): SHOW answers by FILE — a disabled or REMOVE'd volume
+/// (K49: removal is runtime-only) keeps its Edit repair loop, and the
+/// command's own `ERR:` text is the authority on unknown names. A
+/// missing seam answers 503 (a dashboard booted without volume
+/// management), a command that outlives
 /// [`VOLUME_COMMAND_TIMEOUT`] 503s actionably, and the seam's `ERR:`
 /// replies carry their actionable text as 404s.
 async fn api_volume_config(State(state): State<AppState>, Path(name): Path<String>) -> Response {
-    let AppState::Multi {
-        volumes, commands, ..
-    } = &state
-    else {
+    let AppState::Multi { commands, .. } = &state else {
         return error_json(
             StatusCode::NOT_FOUND,
             "no volume registry: this dashboard serves a single volume",
         );
     };
-    let names = volumes.names();
-    if volumes.find(&name).is_none() {
-        return volume_routing_error(
-            StatusCode::NOT_FOUND,
-            format!("unknown volume '{name}'"),
-            &names,
-        );
-    }
     let Some(client) = commands else {
         return error_json(
             StatusCode::SERVICE_UNAVAILABLE,

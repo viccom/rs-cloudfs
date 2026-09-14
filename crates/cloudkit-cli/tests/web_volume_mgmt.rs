@@ -303,9 +303,9 @@ async fn show_refusals_are_actionable() {
 
 /// The cli assembly injects the SAME handler the control channel runs
 /// into the dashboard: the web config endpoint answers the masked SHOW
-/// JSON, follows the dynamic registry (a REMOVEd volume 404s — the
-/// file stays, the registry governs), and the `/volumes` page serves
-/// its skeleton on the dashboard port.
+/// JSON by FILE (K58-M3: a REMOVEd volume keeps answering while its
+/// toml stays — K49; only the listing follows the dynamic registry),
+/// and the `/volumes` page serves its skeleton on the dashboard port.
 #[tokio::test]
 async fn web_seam_serves_config_and_follows_the_registry() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -385,17 +385,29 @@ async fn web_seam_serves_config_and_follows_the_registry() {
         "the management skeleton: {resp}"
     );
 
-    // A volume outside the registry 404s even with a file on disk.
+    // A name with no volume file 404s through the seam's own ERR
+    // (K58-M3: the registry pre-gate is gone — SHOW's refusal, naming
+    // the volumes_dir, is the authority on unknown names).
     let resp = send_http(web, "/api/volumes/ghost/config").await;
-    assert_eq!(status_of(&resp), 404, "unknown volume: {resp}");
+    assert_eq!(status_of(&resp), 404, "no file, no config: {resp}");
 
-    // REMOVE a over the control channel: the seam follows the dynamic
-    // registry — the endpoint 404s (the toml stays, the registry governs)
-    // and the listing shrinks.
+    // REMOVE a over the control channel: the listing follows the
+    // dynamic registry (K49: removal is runtime-only, the toml stays)
+    // while the config endpoint keeps answering the FILE (K58-M3: SHOW
+    // is file-backed — the Edit repair loop stays open on a removed
+    // volume) with the masking intact.
     let reply = send_cmd(addr, "REMOVE a").await;
     assert!(reply.starts_with("OK:"), "remove ok: {reply}");
     let resp = send_http(web, "/api/volumes/a/config").await;
-    assert_eq!(status_of(&resp), 404, "removed volume 404s: {resp}");
+    assert_eq!(
+        status_of(&resp),
+        200,
+        "removed-but-file-kept volume still SHOWs: {resp}"
+    );
+    assert!(
+        !resp.contains("FAKE-TOKEN-WEB-SEAM"),
+        "the credential value never rides the HTTP response: {resp}"
+    );
     let resp = send_http(web, "/api/volumes").await;
     let rows: serde_json::Value = serde_json::from_str(body_of(&resp)).expect("parse rows");
     assert_eq!(rows.as_array().expect("array").len(), 1, "one row left");

@@ -614,3 +614,14 @@
 - **双页布局（负责人裁决：使用态与配置态独立页面）**：`/volumes` 配置页（同 CSS token 体系：实例概览四卡 + 卷表 Name|Backend|Status|Drive|Pending|Size|Actions + 展开式表单卡 + 两步删除 modal）与 `/` 使用态整页跳转互链；单卷模式 `/volumes` 给说明页；顺路修复使用态选中卷被 REMOVE 后 current 悬空 UI 冻结缺陷。
 - **批次与验证**：P0-P6 七批全绿（6972651/72bdfe7/4e07ff2+bf338c2/00c522b/63daf3b/782d63d），workspace 955→1039（+84 测试），winfsp 腿 117/0/1 持平，clippy×3/fmt/裁剪构建/check_layers/scan_secrets 全绿；前端以 jsdom DOM harness 钉住（P0 22 项、P1 16、P5 31 等），真浏览器视觉面待真机窗口复核（挂账）。**执行事故如实记录**：P3/P4 派发两次撞账号 5 小时限额——一次实为异步完成（commit 落盘但报告未达，主会话按未审查处理：亲跑门禁 1026/0/12 + 安全点抽查后放行）；一次中断留半成品（重置丢弃重派）。
 - **挂账**：周期 rebuild、pruning 策略、rebuild_timeout 可配键、管理面鉴权（Origin 之上）、真浏览器视觉复核、写路由超时分支真机验证。
+
+## 2026-09-14 K58 审查修复批落地：5 High + 8 Medium 清偿（fix/k58-review）
+
+- **审查范围**：6fbd90a..7e1b2be（K55/K56 修复批 + K57 卷管理面 + UI 批 Rust 触点）四分域深度审查 + 主会话亲验；子代理矛盾裁决一处（卷管理 POST 实为 axum 默认 2MB 上限——1900MiB DoS 报告项剔除）。
+- **H1+H2（命令执行模型重构，FB/85ff4be）**：`volume_command_handler` 闭包改 **spawn 执行任务 + oneshot 回复 + 单 permit Mutex**——web 超时/断连只弃等待（hyper 实测会 drop 在途 future 的斩杀面消除，红实证=abort 后卷楔死）；全入口（control/web×web）恢复 K48 串行（红实证=并发双 REMOVE 撞结构 ERR）；死锁论证（扁平星形等待图/等待侧零锁/停机 idle 屏障等 guard 有界）入代码注释；九处「serialized」假注释重写。
+- **H3（FA/b5a1120）**：core `write_config_atomically`（tmp+sync+rename）收敛五写盘点（write_volume_enabled/save_toml×2/CREATE/UPDATE）——撕裂窗口（全实例拒启/行边界静默丢键翻转加密语义）闭合。
+- **H4（随 FB）**：panic 防护移入执行任务，tracing 只记 payload 摘要——control.rs 原 `command=%line` 日志（CREATE/UPDATE 凭据明文落盘点）移除。
+- **H5（FC/1b7f8ae）**：same_origin_guard 加 **Host 白名单**（绑定后 SocketAddr 推导，wildcard 收窄为回环拼写——LAN 主机名管理须改绑具体地址，已入 doc）；rebinding 形态红实证（destroy 409 漏过/upload 200 直达）→ 双 403；/api/upload 存量 CSRF 一并收口。
+- **Medium 清偿**：M1 worker panic catch_unwind+degraded 终态（幽灵 outstanding 消除，FE/c19db0a）；M2 proxy_url/sync_url（+增补 baidu_app_key）入 SECRET_VALUED_KEYS；M3 Edit 门撤除（disabled/REMOVE 后修复回路恢复）；M4a rebuild 检查点身份判据（Vfs 堆地址+钉活防 ABA）；M4b 行走中 outstanding 复查（可恢复中断）；M5 UPDATE 重读经脱敏漏斗；M6 前端 action-in-flight 锁；M7 add_volume 结构化 (String,bool) 成败。
+- **验证**：FA-FE 五批串行、逐批 diff 审查；逐项复核表（13 项×钉住测试）入 docs/tracking/k58-review-fixes.md；workspace 1045→1067（+22 测试）、winfsp 腿 117/0/1 持平、clippy×3/fmt/裁剪构建/check_layers/scan_secrets 全绿。
+- **执行事故如实记录**：两次账号限速中断（FA/FD 首派）——FD 半成品重置重派；FA 顺带裁决 baidu_app_key 入脱敏清单（前端既有 write-only 渲染与后端 SHOW 不一致，主会话一行增补 968d492）。
