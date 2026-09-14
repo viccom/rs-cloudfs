@@ -645,3 +645,13 @@
 - **K60.3 D3 起步多连接 = 否 + 概念澄清**：负责人答复中「不同认证各起一个实例」指**多卷模式**（不同服务器/账号各一卷——Phase 2.5 既有能力，SFTP 作为普通卷自动继承，零额外工作）；D3 本意是**同一卷内为吞吐开 N 条并行 SSH 连接做文件内分段**（aeroftp `download_intra_file_pooled` 路线）。拍板：起步单连接（russh-sftp 3.0 `max_concurrent_reads: 16` 流水线读），SF4 实测吞吐不足再立项 SF5。
 - **效果**：计划状态 待批准 → **已批准**；SF0 验收达成（选型 K59.2–K59.7 + 本条 D1/D2/D3）；SF1（驱动骨架 + 配置接入 + `compiled_drivers()` 可扩展化）解锁可开工。落档同步：计划 §8 改拍板记录、跟踪单 SF0 行 ✅、AGENTS 待人工清单第 6 项销账。
 
+
+## 2026-09-14 K61：Phase 5（pan115）立项——方案落库待批，路线裁决门槛挂 115-0
+
+- **K61.1 双仓库研究完成（2026-09-14，只读）**：① `E:\Go_codes\PrivateCloudFS`（Go，私有 web API 路线，`SheltonZhu/115driver v1.2.3`）；② `E:\GitHub\115-plus-desktop`（Rust+Tauri，MIT，v1.1.0-alpha 活跃至 2026-08-19，**官方开放平台路线**，`ali-oss-rs` + sha1 + reqwest）。
+- **K61.2 对前轮评估的修正**：115 从「只有猫鼠一条腿」改判**两条腿**——官方开放平台（proapi.115.com，device-code/QR 认证，115-plus-desktop 实证 Rust 可行）+ 私有 web API（PCFS，sign.go 可直译保底）；Rust 生态从「零现成物」改判「`ali-oss-rs`（MIT，crates.io）可直接依赖 + 传输实战参照齐备」。
+- **K61.3 路线裁决门槛（写死防悬空）**：115-0 spike 按三选一裁决——① 凭证可得 + downurl/Range/QPS 实测过 → 路线 A（开放平台）；② 凭证不可得 → 呈负责人风控取舍，批准则路线 B（web API）；③ 不可得且不接受 → 挂起销账。**依据**：2026-08-09「115 API 开放平台暂停服务」报道 + 115-plus-desktop README「没有开放平台的可加 QQ 群获取」暗示新申请通道收紧，而存量应用持续可用。
+- **K61.4 选型**：主路线 = 开放平台（官方文档、无签名逆向、与 ck-baidu oauth.rs 同形态的 token 设施复用）；OSS 分片上传用 `ali-oss-rs` 不自研（**核对 reqwest 版本树防双大版本**）；秒传 SHA1+pre_sha1+preid（密文永不命中，位按原语声明）；加密零参与（core 层继承）。crate/feature/backend/配置前缀统一 **`pan115`**（crate 名不可数字开头）。
+- **K61.5 架构口径**：全量公民（StorageDriver + conformance，照 ck-baidu 四件套结构）；能力位 range_read/multipart/server_side_move/rapid_upload/authoritative_index/remote_delete 计划为 true，**resume 待断言⑦验证后点亮**；conformance 桩 = 假开放平台 HTTP 服务端 + **假 OSS 端点**（get_token 返回的 OSS 端点指向 loopback——端点可控是关键设计）。装配 12 处与 SFTP 同清单；**前置依赖 Phase 4 SF1 的 `compiled_drivers()` 可扩展化**（顺序对调则所有权对调，只做一次）。
+- **K61.6 硬纪律（两仓库实战坑）**：downurl UA 绑定（开放平台要浏览器形态 UA；web 路线要完整头回传；SheltonZhu #80 空 UA 场景）；CDN 429 分段级重试+respawn；OSS 续传双坑（PartAlreadyExist 循环 #29 / UploadId 重置 #30，修法 2026-08-19 最新）；上传后 size 校验；IPv4 dial。
+- **状态**：方案与跟踪单落库（`docs/plans/2026-09-14-pan115-driver.md` + `docs/tracking/phase5-pan115.md`），**待负责人批准后开工 115-0**；D1-D4 待拍板（路线/删除语义/根目录/限速参数形态，计划 §8）。本批只读勘察，无源码改动。
