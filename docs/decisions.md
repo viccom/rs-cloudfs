@@ -655,3 +655,11 @@
 - **K61.5 架构口径**：全量公民（StorageDriver + conformance，照 ck-baidu 四件套结构）；能力位 range_read/multipart/server_side_move/rapid_upload/authoritative_index/remote_delete 计划为 true，**resume 待断言⑦验证后点亮**；conformance 桩 = 假开放平台 HTTP 服务端 + **假 OSS 端点**（get_token 返回的 OSS 端点指向 loopback——端点可控是关键设计）。装配 12 处与 SFTP 同清单；**前置依赖 Phase 4 SF1 的 `compiled_drivers()` 可扩展化**（顺序对调则所有权对调，只做一次）。
 - **K61.6 硬纪律（两仓库实战坑）**：downurl UA 绑定（开放平台要浏览器形态 UA；web 路线要完整头回传；SheltonZhu #80 空 UA 场景）；CDN 429 分段级重试+respawn；OSS 续传双坑（PartAlreadyExist 循环 #29 / UploadId 重置 #30，修法 2026-08-19 最新）；上传后 size 校验；IPv4 dial。
 - **状态**：方案与跟踪单落库（`docs/plans/2026-09-14-pan115-driver.md` + `docs/tracking/phase5-pan115.md`），**待负责人批准后开工 115-0**；D1-D4 待拍板（路线/删除语义/根目录/限速参数形态，计划 §8）。本批只读勘察，无源码改动。
+
+## 2026-09-14 K62：Phase 5（pan115）拍板——方案获批，115-0 解锁
+
+- **K62.1 D2 删除语义 = 进回收站，回收站接口不引入**：`/open/ufile/delete` 原生语义即进回收站，直接采用；回收站端点族（list/restore/清空）v1 不引入，误删恢复走 115 官方客户端/网页。`remote_delete = true` 照旧（远端状态真实变更，回收站形态是自用安全垫）；web 表单与 DESTROY 文案明示。
+- **K62.2 D3 根目录 = 可设置、缺省网盘根**：`pan115_root` 接受 folder id、缺省 `"0"`；validate 不强制专用子目录（自用裁量），doctor 对根卷提示误删边界。
+- **K62.3 D4 QPS = 实现期合理定值（负责人授权「参考其他项目，合理设置即可」）**：`RebuildTuning` 式结构注入（不加 config 键）；初始保守值——列目录簇 ~2 QPS 起步、downurl 结果缓存（TTL 115-0 实测定，参照 baidu dlink 60min 先例形态）；CDN 429 自适应分段重生（115-plus-desktop 先例）兜底；spike 校准后数字钉进跟踪单。
+- **K62.4 D1 路线 A/B 保持 spike 门槛**：K61.3 三选一规则不变，负责人可随时直裁。
+- **效果**：Phase 5 方案 待批准 → **已批准**；**115-0（路线 spike 与裁决）解锁可开工**。落档：计划 §8 改拍板记录 + 头部状态、跟踪单状态行 + 批次日志、AGENTS 项目信息行 + 当前阶段段。
