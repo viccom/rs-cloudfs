@@ -24,9 +24,10 @@ use std::time::Duration;
 use cloudkit_cli::control::read_control_addr;
 use cloudkit_cli::{
     rebuild_forward_live, run_multi_with_transports_and_commands, MultiVolumeHandle, RebuildTuning,
-    RunOptions, RuntimeRebuild, RuntimeVolumeCommands,
+    RunOptions, RuntimeRebuild, RuntimeVolumeCommands, VolumeTransportDispatch,
 };
 use cloudkit_core::config::{CyDriveConfig, VolumeConfig};
+use cloudkit_core::rel_path::RelPath;
 use cloudkit_core::transport::mock::{MockTransport, UploadAction};
 use cloudkit_core::transport::{CloudTransport, StorageError};
 use tokio::io::{AsyncReadExt as _, AsyncWriteExt as _};
@@ -82,6 +83,18 @@ fn process_config() -> CyDriveConfig {
         web_ui_port: 0,
         auto_mount_drive: false,
         ..CyDriveConfig::default()
+    }
+}
+
+/// The same config with the dashboard ON (an ephemeral web port): the
+/// dual-face tests (K58-FD characterization) need both command faces —
+/// the control channel and the web seam — in one instance. The control
+/// file's path keys on `db_path` only, so [`control_addr`] resolves the
+/// same file either way.
+fn web_process_config() -> CyDriveConfig {
+    CyDriveConfig {
+        enable_web_ui: true,
+        ..process_config()
     }
 }
 
@@ -147,6 +160,40 @@ async fn send_cmd(addr: SocketAddr, line: &str) -> String {
 /// The running instance's control address (the port file in the cwd).
 fn control_addr() -> SocketAddr {
     read_control_addr(&process_config()).expect("the control file parses into an address")
+}
+
+/// The RV2 dispatch seam (the `runtime_volumes.rs` shape): every
+/// dispatched connect answers a fresh pre-connected mock — the runtime
+/// ADD the M4a test re-assembles through.
+fn mock_dispatch() -> VolumeTransportDispatch {
+    Arc::new(move |_spec: &VolumeConfig| {
+        Box::pin(async {
+            let mock = mock_transport().await;
+            Ok(Some((
+                RunOptions::default(),
+                mock as Arc<dyn CloudTransport>,
+            )))
+        })
+    })
+}
+
+/// One raw HTTP/1.1 request against the dashboard (`Connection:
+/// close`), response read to EOF (the `command_serialization.rs`
+/// device — a loopback Host rides the allowlist, no Origin header).
+async fn send_http_method(method: &str, addr: SocketAddr, target: &str) -> String {
+    let mut stream = TcpStream::connect(addr).await.expect("connect to server");
+    let request = format!(
+        "{method} {target} HTTP/1.1\r\nHost: 127.0.0.1:{}\r\nConnection: close\r\n\
+         Content-Length: 0\r\n\r\n",
+        addr.port()
+    );
+    stream
+        .write_all(request.as_bytes())
+        .await
+        .expect("send request");
+    let mut raw = Vec::new();
+    stream.read_to_end(&mut raw).await.expect("read to EOF");
+    String::from_utf8_lossy(&raw).into_owned()
 }
 
 /// The LIST reply's data rows (everything after the `OK: N volume(s)`
@@ -802,6 +849,333 @@ async fn rebuild_forward_reports_per_volume_replies() {
     assert!(
         until(&probe, |probe| probe.calls() == 1).await,
         "the instance's background rebuild actually ran"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+// ------------------------------------- 7. K58-FD/M4a: instance identity ---
+
+/// REMOVE→same-name re-ADD (UPDATE's internal shape) inside a running
+/// rebuild's walk must abort the OLD task: the checkpoint binds to the
+/// accepted instance's IDENTITY (its Vfs allocation), so a
+/// re-registered name — a NEW assembly with new settings semantics —
+/// reads as a different generation and the walk stops instead of
+/// silently upserting stale rows against the new instance. Pre-FD the
+/// checkpoint judged by NAME alone: the name was back, so the old task
+/// walked on. The differential is the MARKER, not the cancellation
+/// witness: the probe is never released in the deciding window, so
+/// pre-FD the parked task holds its marker up forever — only the fixed
+/// checkpoint (identity mismatch → abort) can take it down unprompted.
+/// The wide cadence (5s) keeps the deciding tick away from the
+/// transient name-absent gap mid-REMOVE (that arm is test 4's): REMOVE
+/// and re-ADD settle in well under a second on the mock dispatch,
+/// orders of magnitude inside one interval, so the next tick judges the
+/// finished re-assembly.
+#[tokio::test]
+async fn a_reassembled_volume_is_a_new_generation_and_the_running_rebuild_aborts() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(&dir.path().join("volumes").join("a.toml"), &local_toml());
+    let _guard = chdir(dir.path());
+
+    let (seam, probe, mut entered) = rebuild_probe();
+    let (handle, _specs) = boot(
+        process_config(),
+        RuntimeVolumeCommands {
+            dispatch: Some(mock_dispatch()),
+            rebuild: Some(seam),
+            rebuild_tuning: RebuildTuning {
+                timeout: Duration::from_secs(30),
+                checkpoint_interval: Duration::from_secs(5),
+            },
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await;
+    let addr = control_addr();
+
+    let reply = send_cmd(addr, "REBUILD a").await;
+    assert!(reply.starts_with("OK:"), "accepted: {reply}");
+    timeout(Duration::from_secs(5), entered.recv())
+        .await
+        .expect("the background body started");
+
+    // The re-assembly: REMOVE, then ADD back under the same name —
+    // both complete inside one checkpoint interval.
+    let reply = send_cmd(addr, "REMOVE a").await;
+    assert!(reply.starts_with("OK:"), "REMOVE is not blocked: {reply}");
+    let reply = send_cmd(addr, "ADD a").await;
+    assert!(reply.starts_with("OK:"), "the volume re-assembles: {reply}");
+    assert!(
+        handle.volume("a").is_some(),
+        "the NEW assembly is registered"
+    );
+
+    // The differential: the probe is NEVER released, so pre-FD the old
+    // task stays parked and its marker stays up; post-FD the next
+    // checkpoint reads the new generation and aborts unprompted (the
+    // marker falls, the cancellation witness flips, the new assembly
+    // keeps running).
+    let mut marker_fell = false;
+    for _ in 0..320 {
+        let reply = send_cmd(addr, "LIST").await;
+        if !reply.contains("rebuilding") {
+            marker_fell = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(25)).await;
+    }
+    assert!(
+        marker_fell,
+        "a re-assembled volume is a different generation — the rebuild that started on the \
+         old instance must abort (its marker must fall without the probe being released), \
+         not keep walking against the new one"
+    );
+    assert!(
+        probe.cancelled(),
+        "the aborted executor is dropped (the cancellation witness)"
+    );
+    assert!(
+        handle.volume("a").is_some(),
+        "the abort touches only the walk — the new assembly keeps running"
+    );
+    assert_eq!(probe.calls(), 1, "no re-invocation after the abort");
+
+    // The new generation is re-acceptable (its own queue is idle) and
+    // its rebuild runs.
+    probe.release();
+    let reply = send_cmd(addr, "REBUILD a").await;
+    assert!(
+        reply.starts_with("OK:"),
+        "the new instance accepts a rebuild: {reply}"
+    );
+    assert!(
+        until(&probe, |probe| probe.calls() == 2).await,
+        "the new instance's rebuild ran"
+    );
+    assert!(
+        list_shows_rebuilding(addr, "a", false).await,
+        "the second pass settles (the probe stays released)"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+// ------------------------------- 8. K58-FD/M4b: mid-walk queue re-audit ---
+
+/// R2's drained-queue gate only speaks at ACCEPTANCE: uploads that
+/// resume DURING the walk used to go unnoticed — the walk's earlier
+/// list pages would overwrite a re-uploaded row's fs_id with the stale
+/// one (old bytes served until the next pass). The FD fix re-audits
+/// `outstanding()` at every checkpoint: a resumed upload interrupts the
+/// pass RECOVERABLY — rows kept (the merge is idempotent), marker down,
+/// re-REBUILD once the queue drains.
+#[tokio::test]
+async fn uploads_resuming_mid_walk_interrupt_the_rebuild_recoverably() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(
+        &dir.path().join("volumes").join("stuck.toml"),
+        &local_toml(),
+    );
+    let _guard = chdir(dir.path());
+
+    // The held-upload transport: the ONE upload fails with an
+    // authoritative 3s RateLimited, then the exhausted script serves
+    // the retry as Ok (test 2's device, shortened — the hold is a
+    // window, not a wall; 3s keeps ~60 checkpoint ticks inside the
+    // window even under a loaded suite).
+    let hold = Arc::new(
+        MockTransport::builder()
+            .upload_action(UploadAction::Fail {
+                error: StorageError::RateLimited {
+                    retry_after: Some(Duration::from_secs(3)),
+                },
+            })
+            .build(),
+    );
+    hold.connect().await.expect("connect the hold mock");
+    let specs =
+        cloudkit_core::config::load_volumes(Path::new("volumes")).expect("load volume specs");
+    let spec = specs.into_iter().next().expect("the stuck volume spec");
+    let (seam, probe, mut entered) = rebuild_probe();
+    let handle = run_multi_with_transports_and_commands(
+        &process_config(),
+        vec![(spec, RunOptions::default(), hold as Arc<dyn CloudTransport>)],
+        RuntimeVolumeCommands {
+            rebuild: Some(seam),
+            rebuild_tuning: RebuildTuning {
+                timeout: Duration::from_secs(30),
+                checkpoint_interval: Duration::from_millis(50),
+            },
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await
+    .expect("boot with the held volume");
+    let addr = control_addr();
+
+    // Acceptance passes: the queue is idle at the gate (R2).
+    let reply = send_cmd(addr, "REBUILD stuck").await;
+    assert!(
+        reply.starts_with("OK:"),
+        "accepted on the drained queue: {reply}"
+    );
+    timeout(Duration::from_secs(5), entered.recv())
+        .await
+        .expect("the background body started");
+
+    // The resumed upload: ingested AFTER acceptance, the worker parks
+    // on the 3s authoritative wait (outstanding = 1 for that window).
+    let source = dir.path().join("hold.txt");
+    fs::write(&source, b"resume me mid-walk").expect("write source");
+    handle
+        .volume("stuck")
+        .expect("volume stuck")
+        .vfs()
+        .expect("vfs stuck")
+        .ingest_file(
+            &RelPath::new("/hold.txt").expect("valid rel path"),
+            &source,
+            1.0,
+        )
+        .await
+        .expect("ingest into stuck");
+    tokio::time::sleep(Duration::from_millis(300)).await;
+
+    // The differential: pre-FD the walk keeps going (the checkpoint
+    // never re-read the queue); post-FD the next checkpoint interrupts
+    // the pass recoverably.
+    assert!(
+        until(&probe, |probe| probe.cancelled()).await,
+        "uploads resumed mid-walk must interrupt the running rebuild"
+    );
+    assert!(
+        list_shows_rebuilding(addr, "stuck", false).await,
+        "the interrupted pass takes its marker down"
+    );
+    assert_eq!(probe.calls(), 1, "no re-invocation after the interrupt");
+
+    // The interruption is recoverable: once the held upload retries to
+    // Ok and the queue drains (R2 answers honestly in between), a
+    // fresh REBUILD is accepted and runs.
+    probe.release();
+    let mut reaccepted = false;
+    for _ in 0..40 {
+        let reply = send_cmd(addr, "REBUILD stuck").await;
+        if reply.starts_with("OK:") {
+            reaccepted = true;
+            break;
+        }
+        tokio::time::sleep(Duration::from_millis(250)).await;
+    }
+    assert!(
+        reaccepted,
+        "the volume is re-acceptable once the queue drains"
+    );
+    assert!(
+        until(&probe, |probe| probe.calls() == 2).await,
+        "the re-accepted rebuild ran"
+    );
+    assert!(
+        list_shows_rebuilding(addr, "stuck", false).await,
+        "the second pass settles (the probe stays released)"
+    );
+
+    timeout(Duration::from_secs(30), handle.shutdown())
+        .await
+        .expect("shutdown completes")
+        .expect("shutdown joins cleanly");
+}
+
+// -------------------- 9. K58-FD characterization: dual-face serialization ---
+
+/// Characterization (expected green as written — FB's single permit
+/// already serializes every command entrypoint): a REBUILD fired from
+/// the control channel and one fired from the dashboard CONCURRENTLY
+/// serialize — exactly one acceptance, exactly one `already running`
+/// refusal, exactly one executor call. The R1 marker's
+/// check-then-insert is safe BECAUSE both faces funnel into the one
+/// serialized execution (K58-FB); this pins that contract for the
+/// rebuild path specifically (the FD batch's accompanying check).
+#[tokio::test]
+async fn concurrent_rebuilds_across_both_faces_serialize_one_accepts_one_refuses() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.toml"),
+        "volumes_dir = \"volumes\"\n",
+    );
+    write_file(&dir.path().join("volumes").join("a.toml"), &local_toml());
+    let _guard = chdir(dir.path());
+
+    let (seam, probe, _entered) = rebuild_probe();
+    let (handle, _specs) = boot(
+        web_process_config(),
+        RuntimeVolumeCommands {
+            rebuild: Some(seam),
+            rebuild_tuning: RebuildTuning {
+                timeout: Duration::from_secs(30),
+                checkpoint_interval: Duration::from_millis(50),
+            },
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await;
+    let web = handle
+        .web_ui_addr()
+        .expect("the dashboard bound (enable_web_ui = true)");
+    let addr = control_addr();
+
+    // Both faces fire the SAME command concurrently; the serialized
+    // gate orders them — whoever lands first accepts and raises the R1
+    // marker, the second meets the `already running` refusal.
+    let (control_reply, web_raw) = tokio::join!(
+        send_cmd(addr, "REBUILD a"),
+        send_http_method("POST", web, "/api/volumes/a/rebuild"),
+    );
+    let mut acceptances = 0;
+    let mut refusals = 0;
+    if control_reply.contains("rebuild of `a` started in background") {
+        acceptances += 1;
+    }
+    if control_reply.contains("already running") {
+        refusals += 1;
+    }
+    if web_raw.contains("\"ok\":true") && web_raw.contains("started in background") {
+        acceptances += 1;
+    }
+    if web_raw.contains("HTTP/1.1 409") && web_raw.contains("already running") {
+        refusals += 1;
+    }
+    assert_eq!(
+        acceptances, 1,
+        "exactly one acceptance across the two faces: control={control_reply} web={web_raw}"
+    );
+    assert_eq!(
+        refusals, 1,
+        "exactly one already-running refusal across the two faces: control={control_reply} \
+         web={web_raw}"
+    );
+    assert_eq!(probe.calls(), 1, "exactly one executor call");
+
+    // The winner's pass settles and the state resets.
+    probe.release();
+    assert!(
+        list_shows_rebuilding(addr, "a", false).await,
+        "the marker falls once the accepted pass settles"
     );
 
     timeout(Duration::from_secs(30), handle.shutdown())

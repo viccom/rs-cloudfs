@@ -1538,10 +1538,11 @@ impl RemoveTuning {
 /// [`RuntimeVolumeCommands`]): the whole background rebuild runs under
 /// `timeout` — an interrupted pass keeps its upserted rows (the rel_path
 /// conflict key makes the merge idempotent, a rerun continues where it
-/// stopped) — and the R5 checkpoint (registry presence + shutdown gate)
-/// is audited every `checkpoint_interval`. Deliberately NOT config
-/// keys (可配性挂账): a struct injection keeps the surface at zero while
-/// the tests reach millisecond scale through [`RebuildTuning::fast`].
+/// stopped) — and the R5 checkpoint (instance identity + the shutdown
+/// gate + the drained queue) is audited every `checkpoint_interval`.
+/// Deliberately NOT config keys (可配性挂账): a struct injection keeps
+/// the surface at zero while the tests reach millisecond scale through
+/// [`RebuildTuning::fast`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RebuildTuning {
     /// The whole background rebuild's budget (default 15 minutes).
@@ -3872,7 +3873,11 @@ impl RuntimeVolumeControl {
     /// background task spawns (R3), and the reply is immediate — the
     /// command queue is never parked behind a walk. The background
     /// task owns the R4 budget and the R5 checkpoints; its result
-    /// arrives as a log line, never on this reply.
+    /// arrives as a log line, never on this reply. K58-FD: the task
+    /// carries the ACCEPTED instance's identity (M4a — a re-assembled
+    /// same-name volume is a different generation and aborts the walk)
+    /// and re-audits the drained queue every checkpoint (M4b — uploads
+    /// resuming mid-walk interrupt the pass recoverably).
     async fn rebuild_volume(&self, name: &str) -> String {
         if !Self::name_is_path_safe(name) {
             return format!(
@@ -3940,6 +3945,17 @@ impl RuntimeVolumeControl {
         // REBUILD cannot race this insert; the background task's exit
         // path is the only other writer, and it removes only its own
         // name.
+        //
+        // K58-FD/M4a: the instance identity, captured at acceptance —
+        // the accepted Vfs's heap allocation address (see
+        // [`volume_identity`]). The task also keeps the Vfs clone
+        // itself: the M4b checkpoint re-reads its queue, and the clone
+        // PINNED here makes the identity exact for the task's whole
+        // run (the accepted allocation can never be freed and its
+        // address reused while the task holds it, so a fresh assembly
+        // can never alias the identity).
+        let identity = volume_identity(&runtime)
+            .expect("the running gate above guaranteed a Vfs-backed entry");
         self.rebuilds
             .lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
@@ -3953,6 +3969,8 @@ impl RuntimeVolumeControl {
                 rebuilds: Arc::clone(&self.rebuilds),
                 tuning: self.rebuild_tuning,
                 run: Arc::clone(&self.rebuild),
+                vfs,
+                identity,
             }
             .run(),
         );
@@ -3970,6 +3988,27 @@ fn format_start_clock(started: std::time::SystemTime) -> String {
     local.format("%H:%M:%S").to_string()
 }
 
+/// The instance identity behind a registry entry (K58-FD/M4a): the
+/// entry's Vfs allocation address, read through the RUNNING variant's
+/// `Arc<Vfs>` (`None` for a Failed entry — a broken assembly has no
+/// identity, and a walk accepted on a running instance must not treat
+/// it as its own).
+///
+/// Why the address is an EXACT identity for the rebuild task's run:
+/// every registration path (boot discovery, runtime ADD, ENABLE —
+/// which routes through `add_volume` verbatim — and UPDATE's internal
+/// REMOVE+ADD) assembles a FRESH `Arc<Vfs>` through `assemble_volume`
+/// (there is no same-Vfs reuse path anywhere: even DISABLE→ENABLE
+/// re-assembles from scratch, so an in-flight walk from the
+/// pre-DISABLE instance aborts — correct, its settings snapshot is the
+/// old assembly's); and the RebuildTask holds its own clone of the
+/// accepted Vfs for the whole run, so the accepted allocation stays
+/// live (pinned) — a freed-and-reused address cannot alias the
+/// identity. Same address therefore MEANS same instance.
+fn volume_identity(runtime: &VolumeRuntime) -> Option<usize> {
+    runtime.vfs().map(|vfs| Arc::as_ptr(vfs) as usize)
+}
+
 /// How one background rebuild ended (P2/R3–R5) — each exit has its own
 /// one-line report; every one of them resets the R1 marker.
 enum RebuildExit {
@@ -3977,10 +4016,17 @@ enum RebuildExit {
     Done(Result<rebuild::RebuildOutcome>),
     /// The R4 budget ran out (the idempotent-merge world: rows stay).
     TimedOut(Duration),
-    /// The R5 checkpoint found the volume REMOVEd.
+    /// The R5 checkpoint found the accepted instance gone from the
+    /// registry — removed, or (K58-FD/M4a) replaced by a DIFFERENT
+    /// generation under the same name (a re-assembly's fresh Vfs never
+    /// matches the accepted identity).
     VolumeGone,
     /// The R5 checkpoint found the shutdown gate fired.
     ShuttingDown,
+    /// The FD checkpoint (M4b) found uploads back in flight mid-walk:
+    /// a recoverable interrupt — the rows stay, a rerun continues the
+    /// merge once the queue drains.
+    UploadsResumed,
     /// The executor's task panicked (contained, like a command panic).
     Panicked(String),
 }
@@ -3993,6 +4039,14 @@ enum RebuildExit {
 /// the volume re-acceptable — including the abort exits, because the
 /// rebuild's upserts are idempotent (the rel_path conflict key: a
 /// rerun re-merges exactly what the interrupted pass had written).
+///
+/// K58-FD: the checkpoints bind to the ACCEPTED instance, not the
+/// name — `identity` is the accepted Vfs's address ([`volume_identity`])
+/// and a same-name re-assembly (a new generation) aborts the walk
+/// (M4a); `vfs` (the accepted instance's own queue) is re-audited
+/// every checkpoint so uploads resuming mid-walk interrupt the pass
+/// recoverably instead of letting stale list pages overwrite fresh
+/// fs_ids (M4b).
 struct RebuildTask {
     name: String,
     settings: CyDriveConfig,
@@ -4001,14 +4055,20 @@ struct RebuildTask {
     rebuilds: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::SystemTime>>>,
     tuning: RebuildTuning,
     run: RuntimeRebuild,
+    /// The accepted instance's Vfs (M4b's queue read; also the pin
+    /// that keeps the identity exact — see [`volume_identity`]).
+    vfs: Arc<Vfs>,
+    /// The accepted instance's identity (M4a's checkpoint verdict).
+    identity: usize,
 }
 
 impl RebuildTask {
     /// The supervision loop: the executor runs on its own spawned task
     /// (so an abort can DROP it mid-await — the R5 semantics), with
-    /// the checkpoint ticking between the registry presence and the
-    /// shutdown gate, and the R4 deadline over the whole pass. The
-    /// checkpoint cadence is the plan's "periodic checkpoint" stand-in
+    /// the checkpoint ticking between the shutdown gate, the accepted
+    /// instance's identity and the drained queue, and the R4 deadline
+    /// over the whole pass. The checkpoint cadence is the plan's
+    /// "periodic checkpoint" stand-in
     /// for the per-page hook: `rebuild_from_backend` has no
     /// page-granularity seam, and a sub-second cadence bounds the
     /// abort latency as tightly without touching core's walk (the
@@ -4044,16 +4104,37 @@ impl RebuildTask {
                 }
                 _ = checkpoints.tick() => {
                     // R5's two observables, the H1 gate's own reading
-                    // points: the shutdown gate and the registry entry.
+                    // points: the shutdown gate and the registry entry
+                    // — the latter as the ACCEPTED INSTANCE's identity
+                    // (K58-FD/M4a): a same-name re-assembly (UPDATE's
+                    // internal REMOVE+ADD, DISABLE→ENABLE) is a new
+                    // generation and must not inherit the walk.
                     if self.watch.fired() {
                         work.abort();
                         let _ = work.await;
                         break RebuildExit::ShuttingDown;
                     }
-                    if self.registry.volume(&self.name).is_none() {
+                    let same_generation = self
+                        .registry
+                        .volume(&self.name)
+                        .as_ref()
+                        .and_then(volume_identity)
+                        .is_some_and(|identity| identity == self.identity);
+                    if !same_generation {
                         work.abort();
                         let _ = work.await;
                         break RebuildExit::VolumeGone;
+                    }
+                    // K58-FD/M4b: R2 re-audited mid-walk — uploads that
+                    // resumed after acceptance would let an earlier
+                    // list page overwrite a re-uploaded row's fs_id
+                    // with the stale one (old bytes served until the
+                    // next pass), so a non-empty queue interrupts the
+                    // pass recoverably instead.
+                    if self.vfs.queue_stats().outstanding() > 0 {
+                        work.abort();
+                        let _ = work.await;
+                        break RebuildExit::UploadsResumed;
                     }
                 }
                 _ = tokio::time::sleep_until(deadline) => {
@@ -4102,12 +4183,26 @@ impl RebuildTask {
             }
             RebuildExit::VolumeGone => {
                 println!(
-                    "Volume {name} rebuild aborted — the volume was removed at runtime \
-                     (nothing to resume; re-add the volume and REBUILD again)."
+                    "Volume {name} rebuild aborted — the volume this rebuild started on is no \
+                     longer registered under that name: it was removed, or re-assembled into a \
+                     different generation, at runtime (nothing to resume; re-REBUILD the \
+                     volume now registered if it should be rebuilt)."
                 );
                 tracing::info!(
                     volume = name,
-                    "background rebuild aborted: the volume was removed at runtime"
+                    "background rebuild aborted: the volume left the registry or its \
+                     registered instance is a different generation (identity mismatch)"
+                );
+            }
+            RebuildExit::UploadsResumed => {
+                println!(
+                    "Volume {name} rebuild interrupted — uploads resumed mid-walk; rerun \
+                     REBUILD when the queue drains (the rows already rebuilt are kept, the \
+                     merge is idempotent)."
+                );
+                tracing::warn!(
+                    volume = name,
+                    "background rebuild interrupted by resumed uploads; the pass is resumable"
                 );
             }
             RebuildExit::ShuttingDown => {
@@ -7003,6 +7098,91 @@ mod tests {
         assert!(
             error.contains("failed"),
             "the failure reads as a failure: {error}"
+        );
+    }
+
+    /// K58-FD/M4a: the checkpoint's identity observable — the registry
+    /// entry's Vfs allocation address. The unit pins the extraction's
+    /// three semantics directly (the integration test
+    /// `a_reassembled_volume_is_a_new_generation_...` pins the walk's
+    /// abort): the identity is STABLE while the same instance stays
+    /// registered, a REMOVE→re-ADD swap (UPDATE's internals, ENABLE's
+    /// path — every registration goes through a fresh assembly) reads
+    /// a DIFFERENT identity, and a Failed entry carries none.
+    #[tokio::test]
+    async fn volume_identity_is_stable_per_instance_and_changes_across_reassembly() {
+        fn unit_spec(name: &str, dir: &Path) -> VolumeConfig {
+            VolumeConfig {
+                name: name.to_string(),
+                file_path: dir.join(format!("{name}.toml")),
+                base_dir: dir.to_path_buf(),
+                settings: CyDriveConfig::default(),
+                explicit_drive_letter: false,
+            }
+        }
+        // Two independent assemblies (fresh db + cache + Vfs each —
+        // `assemble_volume`'s shape in miniature); the tempdirs stay
+        // alive for the entries' lifetime.
+        let assemble = |stem: &str| {
+            let dir = tempfile::tempdir().expect("tempdir");
+            let db = Arc::new(MetaDatabase::open(&dir.path().join("meta.db")).expect("open db"));
+            let cache = CacheManager::new(dir.path().join("cache"), u64::MAX);
+            let transport: Arc<dyn CloudTransport> =
+                Arc::new(cloudkit_core::transport::mock::MockTransport::new());
+            let vfs = Arc::new(Vfs::new(
+                db,
+                cache,
+                Arc::clone(&transport),
+                Default::default(),
+            ));
+            let runtime = VolumeRuntime::Running {
+                spec: unit_spec(stem, dir.path()),
+                transport,
+                vfs,
+            };
+            (runtime, dir)
+        };
+
+        let (first, _keep_first) = assemble("a");
+        let accepted = volume_identity(&first).expect("a Running entry carries its Vfs identity");
+
+        // Stable for the live instance: the registry clone reads the
+        // same identity the acceptance captured.
+        let registry = RegistryHandle::new(vec![first]);
+        let live = registry.volume("a").expect("registered");
+        assert_eq!(
+            volume_identity(&live),
+            Some(accepted),
+            "the same registered instance keeps its identity"
+        );
+
+        // The REMOVE→re-ADD swap: the fresh assembly is a new
+        // generation — the identity the checkpoint compares against
+        // MUST change, or a re-assembled volume would inherit the old
+        // walk.
+        let (second, _keep_second) = assemble("a");
+        assert!(registry.remove("a"), "the REMOVE leg drops the entry");
+        registry.insert(second);
+        let swapped = registry
+            .volume("a")
+            .expect("the re-ADD registers the new generation");
+        let swapped_vfs = swapped.vfs().expect("the re-assembled entry runs");
+        assert_ne!(
+            Arc::as_ptr(swapped_vfs) as usize,
+            accepted,
+            "a re-assembled volume is a different generation (identity changed)"
+        );
+
+        // A Failed entry (a broken re-assembly) has no identity at all
+        // — never the accepted one.
+        let failed = VolumeRuntime::Failed {
+            spec: unit_spec("a", Path::new(".")),
+            reason: "assembly failed".to_string(),
+        };
+        assert_eq!(
+            volume_identity(&failed),
+            None,
+            "a Failed entry carries no identity"
         );
     }
 }
