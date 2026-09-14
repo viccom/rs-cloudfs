@@ -63,6 +63,15 @@ const VOLUME_ACTIONS = {
     refresh: { route: 'rebuild', confirm: false },
 };
 
+// The per-volume re-entry lock (K58-M6): while one command runs for a
+// volume, a second click on ANY of its buttons is a no-op toast — the
+// serialized backend queue answers the second command anyway, but the
+// UI must not pile them up (and the poll's 4s re-render must not
+// evaporate the disabled state: renderVolumeButtons restores it from
+// this set). Keyed by volume name; the poll itself stays untouched
+// (configs/runtime are read-only).
+const inFlight = new Set();
+
 async function loadVolumesPage() {
     try {
         // allSettled: a read-only boot without the command seam still
@@ -241,40 +250,43 @@ function renderVolumesTable(configs, runtime) {
 // file stays) and [Disable] (file + unmount); a stopped or disabled
 // volume offers [Edit] + [Enable]. Every valid row (invalid included,
 // though its [Delete] is disabled until the file parses) carries
-// [Delete] — the P5 two-step modal.
+// [Delete] — the P5 two-step modal. K58-M6: a volume with a command
+// in flight renders its WHOLE row disabled (the 4s poll re-renders the
+// table — the lock state is restored from the inFlight set, not lost).
 function volumeActionButtons(v) {
+    const lock = inFlight.has(v.name) ? ' disabled' : '';
     if (v.invalid) {
-        return deleteControl(v);
+        return deleteControl(v, lock);
     }
     const name = escapeHtml(v.name);
     if (v.running) {
         return `
-            ${refreshControl(v, name)}
-            <button class="btn-mini" data-action="edit" data-name="${name}"
+            ${refreshControl(v, name, lock)}
+            <button class="btn-mini" data-action="edit" data-name="${name}"${lock}
                     title="${t('volumes.tip.edit_running')}">
                 <i class="fa-solid fa-pen"></i> ${t('volumes.actions.edit')}
             </button>
-            <button class="btn-mini" data-action="unmount" data-name="${name}"
+            <button class="btn-mini" data-action="unmount" data-name="${name}"${lock}
                     title="${t('volumes.tip.unmount')}">
                 <i class="fa-solid fa-eject"></i> ${t('volumes.actions.unmount')}
             </button>
-            <button class="btn-mini btn-mini-danger" data-action="disable" data-name="${name}"
+            <button class="btn-mini btn-mini-danger" data-action="disable" data-name="${name}"${lock}
                     title="${t('volumes.tip.disable')}">
                 <i class="fa-solid fa-power-off"></i> ${t('volumes.actions.disable')}
             </button>
-            ${deleteControl(v)}
+            ${deleteControl(v, lock)}
         `;
     }
     return `
-        <button class="btn-mini" data-action="edit" data-name="${name}"
+        <button class="btn-mini" data-action="edit" data-name="${name}"${lock}
                 title="${t('volumes.tip.edit')}">
             <i class="fa-solid fa-pen"></i> ${t('volumes.actions.edit')}
         </button>
-        <button class="btn-mini" data-action="enable" data-name="${name}"
+        <button class="btn-mini" data-action="enable" data-name="${name}"${lock}
                 title="${t('volumes.tip.enable')}">
             <i class="fa-solid fa-play"></i> ${t('volumes.actions.enable')}
         </button>
-        ${deleteControl(v)}
+        ${deleteControl(v, lock)}
     `;
 }
 
@@ -282,8 +294,8 @@ function volumeActionButtons(v) {
 // disabled — the DESTROY command needs no running volume, only the
 // file); an invalid row keeps it disabled with the parse tooltip —
 // the file must be fixed (or removed by hand) first, exactly like
-// Edit's prefill gate.
-function deleteControl(v) {
+// Edit's prefill gate. K58-M6: an in-flight row locks it too.
+function deleteControl(v, lock) {
     const name = escapeHtml(v.name);
     if (v.invalid) {
         return `
@@ -294,7 +306,7 @@ function deleteControl(v) {
         `;
     }
     return `
-        <button class="btn-mini btn-mini-danger" data-action="delete" data-name="${name}"
+        <button class="btn-mini btn-mini-danger" data-action="delete" data-name="${name}"${lock}
                 title="${t('volumes.tip.delete')}">
             <i class="fa-solid fa-trash"></i> ${t('volumes.actions.delete')}
         </button>
@@ -310,14 +322,14 @@ function deleteControl(v) {
 // `rebuilding` marker is up (the poll's live state), the button renders
 // in its busy shape — disabled, spinning — until the background pass
 // settles.
-function refreshControl(v, name) {
+function refreshControl(v, name, lock) {
     if (v.backend === 'telegram') {
         return `<span class="volume-note" data-note="refresh-unsupported" title="${t('volumes.note.refresh_telegram')}"><i class="fa-solid fa-rotate"></i></span>`;
     }
     if (v.encrypted) {
         return `<span class="volume-note" data-note="refresh-unsupported" title="${t('volumes.note.refresh_encrypted')}"><i class="fa-solid fa-rotate"></i></span>`;
     }
-    const busy = v.rebuilding === true;
+    const busy = v.rebuilding === true || lock !== '';
     return `
         <button class="btn-mini" data-action="refresh" data-name="${name}"${busy ? ' disabled' : ''}
                 title="${t('volumes.tip.refresh')}">
@@ -347,12 +359,20 @@ function onVolumeActionClick(event) {
 async function runVolumeAction(action, name, button) {
     const spec = VOLUME_ACTIONS[action];
     if (!spec) return;
+    // K58-M6: one command per volume at a time — a second click while
+    // one is running is a no-op with a toast (the backend queue would
+    // serialize it anyway, but the operator should not stack commands).
+    if (inFlight.has(name)) {
+        showToast('err', t('volumes.action_in_flight', { name }));
+        return;
+    }
     if (spec.confirm) {
         const message = action === 'unmount'
             ? t('volumes.confirm.unmount', { name })
             : t('volumes.confirm.disable', { name });
         if (!confirm(message)) return;
     }
+    inFlight.add(name);
     setButtonLoading(button, true);
     try {
         const res = await fetch(`/api/volumes/${encodeURIComponent(name)}/${spec.route}`, {
@@ -369,8 +389,9 @@ async function runVolumeAction(action, name, button) {
     } catch (err) {
         showToast('err', t('common.request_failed', { error: err }));
     } finally {
-        // The refresh rebuilds the table (and the button with it); the
-        // loading state only needs to span the request itself.
+        // Release the lock BEFORE the refresh re-render so the fresh row
+        // comes back enabled (the command has settled by definition).
+        inFlight.delete(name);
         setButtonLoading(button, false);
         await loadVolumesPage();
     }

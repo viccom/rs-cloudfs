@@ -198,6 +198,39 @@ fn request(method: &str, target: &str, addr: SocketAddr, extra: &[(&str, &str)])
     req
 }
 
+/// Builds an HTTP/1.1 request with an arbitrary Host header and an exact
+/// Content-Length for `body` (the DNS-rebinding shape puts the attacker's
+/// authority in the Host itself — the shared helper pins the legal
+/// loopback spelling).
+fn request_with_host(
+    method: &str,
+    target: &str,
+    host: &str,
+    extra: &[(&str, &str)],
+    body: &str,
+) -> String {
+    let mut req = format!("{method} {target} HTTP/1.1\r\nHost: {host}\r\nConnection: close\r\n");
+    for (name, value) in extra {
+        req.push_str(&format!("{name}: {value}\r\n"));
+    }
+    req.push_str(&format!("Content-Length: {}\r\n\r\n", body.len()));
+    req.push_str(body);
+    req
+}
+
+/// Hand-rolled `multipart/form-data` body with exactly one field named
+/// `file` (the `web_e2e.rs` shape — the only form the frontend's
+/// `FormData.append("file", ...)` produces).
+fn multipart_body(boundary: &str, filename: &str, content: &str) -> String {
+    format!(
+        "--{boundary}\r\n\
+         Content-Disposition: form-data; name=\"file\"; filename=\"{filename}\"\r\n\
+         Content-Type: application/octet-stream\r\n\r\n\
+         {content}\r\n\
+         --{boundary}--\r\n"
+    )
+}
+
 /// Parses the numeric status code off the status line.
 fn status_of(resp: &str) -> u16 {
     let line = resp.lines().next().expect("status line");
@@ -896,10 +929,45 @@ async fn volume_config_endpoint_serves_the_masked_show_reply() {
     assert_eq!(value["bot_token"], serde_json::json!({"set": true}));
 }
 
+/// M3: the config endpoint answers by FILE, not registry membership — a
+/// volume file with no registry entry (disabled at boot, or REMOVE'd
+/// with the file kept, K49) still serves its masked SHOW reply; that is
+/// what keeps the Edit repair loop open for stopped/disabled volumes.
+/// The seam's own ERR text stays the authority on names with no file.
+#[tokio::test]
+async fn volume_config_endpoint_serves_unregistered_volume_files() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let volumes_dir = dir.path().join("volumes");
+    write_volume_file(&volumes_dir, "shelved");
+    // The registry is EMPTY: the file exists, the runtime does not.
+    let server = multi_server_with_commands(vec![], show_seam(volumes_dir)).await;
+    let addr = server.local_addr();
+
+    let resp = send(
+        addr,
+        &request("GET", "/api/volumes/shelved/config", addr, &[]),
+    )
+    .await;
+    assert_eq!(
+        status_of(&resp),
+        200,
+        "a file-backed volume answers SHOW regardless of registry membership: {resp}"
+    );
+    let raw = body_of(&resp);
+    assert!(
+        !raw.contains("FAKE-TOKEN-MARKER"),
+        "the production masking still rides the reply: {raw}"
+    );
+    let value: serde_json::Value = serde_json::from_str(&raw).expect("parse the config json");
+    assert_eq!(value["name"], "shelved");
+    assert_eq!(value["bot_token"], serde_json::json!({"set": true}));
+}
+
 /// The endpoint maps the seam's answers: an `ERR:` reply carries its
-/// actionable text as a 404, and a name outside the registry 404s with
-/// the addressable volume list (the registry link the runtime table
-/// gives REMOVE).
+/// actionable text as a 404, and a name the seam refuses (K58-M3: the
+/// registry pre-gate is gone — the seam's own ERR text is the authority
+/// on unknown names, the cli's SHOW naming the volumes_dir) 404s the
+/// same way.
 #[tokio::test]
 async fn volume_config_endpoint_maps_err_and_unknown_names() {
     let dir = tempfile::tempdir().expect("temp dir");
@@ -928,10 +996,11 @@ async fn volume_config_endpoint_maps_err_and_unknown_names() {
     .await;
     assert_eq!(status_of(&resp), 404, "unknown volume: {resp}");
     let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("error json");
-    assert_eq!(
-        body["volumes"],
-        serde_json::json!(["a"]),
-        "the addressable list names the registry: {body}"
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("no volume file")),
+        "the seam's ERR text is the unknown-name answer (K58-M3: no registry list): {body}"
     );
 }
 
@@ -1021,6 +1090,154 @@ async fn origin_guard_scoped_to_the_volume_management_family() {
             "the read/page route {target} stays open to foreign origins: {resp}"
         );
     }
+}
+
+// ------------------------------------------- the Host allowlist (K58-H5) ---
+
+/// H5: the guard's second verdict. Comparing Origin against Host alone
+/// cannot catch DNS rebinding — the attacker's page is served from a
+/// domain that later resolves to the dashboard's own address, so Host
+/// and Origin AGREE on the attacker's authority and the §1.5 verdict
+/// waves the forged request through into the handler. The Host
+/// allowlist (derived from the bound address) refuses that shape: an
+/// authority naming no bound spelling answers 403 naming the rebinding
+/// suspicion — BEFORE the seam is reached.
+#[tokio::test]
+async fn guard_refuses_the_dns_rebinding_shape_on_the_management_family() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let server = multi_server_with_commands(
+        vec![entry],
+        canned_seam("ERR: no volume registered under `a`\n".to_string()),
+    )
+    .await;
+    let addr = server.local_addr();
+
+    let evil = format!("evil.example:{}", addr.port());
+    let origin = format!("http://{evil}");
+    let resp = send(
+        addr,
+        &request_with_host(
+            "POST",
+            "/api/volumes/a/destroy",
+            &evil,
+            &[("Origin", origin.as_str())],
+            "",
+        ),
+    )
+    .await;
+    assert_eq!(
+        status_of(&resp),
+        403,
+        "Host == Origin == the attacker's authority must be refused before the seam: {resp}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("error json");
+    assert!(
+        body["error"]
+            .as_str()
+            .is_some_and(|msg| msg.contains("rebinding")),
+        "the refusal names the suspicion: {body}"
+    );
+}
+
+/// H5 stock-closing: `/api/upload` joins the guard — it had NO Origin
+/// protection at all, and a multipart POST is a simple request (no
+/// preflight), so a cross-site page can drive it. The same rebinding
+/// shape 403s BEFORE any multipart parsing or volume routing.
+#[tokio::test]
+async fn upload_route_refuses_the_dns_rebinding_shape() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let server = multi_server(vec![entry]).await;
+    let addr = server.local_addr();
+
+    let evil = format!("evil.example:{}", addr.port());
+    let origin = format!("http://{evil}");
+    let body = multipart_body("k58rebind", "forged.txt", "forged");
+    let content_type = "multipart/form-data; boundary=k58rebind";
+    let resp = send(
+        addr,
+        &request_with_host(
+            "POST",
+            "/api/upload?volume=a",
+            &evil,
+            &[("Origin", origin.as_str()), ("Content-Type", content_type)],
+            &body,
+        ),
+    )
+    .await;
+    assert_eq!(
+        status_of(&resp),
+        403,
+        "the forged-Host upload must be refused before the multipart parse: {resp}"
+    );
+}
+
+/// H5 no-false-positive pin: the upload guard keeps the contract route
+/// working exactly as before — a non-browser client (curl's shape: legal
+/// Host, no Origin/Referer) and the dashboard's own same-origin uploads
+/// both pass, and the Host comparison is case-insensitive (`LOCALHOST`
+/// is the same authority as `localhost`).
+#[tokio::test]
+async fn upload_guard_keeps_legitimate_uploads_working() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let server = multi_server(vec![entry]).await;
+    let addr = server.local_addr();
+
+    // One upload per shape, asserted inline (the label rides the failure
+    // messages).
+    async fn upload(label: &str, addr: SocketAddr, host: &str, extra: &[(&str, &str)]) {
+        let content_type = "multipart/form-data; boundary=k58legit";
+        let mut headers = vec![("Content-Type", content_type)];
+        headers.extend(extra);
+        let body = multipart_body("k58legit", "legit.txt", "legitimate");
+        let resp = send(
+            addr,
+            &request_with_host("POST", "/api/upload?volume=a", host, &headers, &body),
+        )
+        .await;
+        assert_eq!(status_of(&resp), 200, "{label} must keep uploading: {resp}");
+        assert!(
+            body_of(&resp).contains("\"success\":true"),
+            "{label} — the handler itself must have run: {resp}"
+        );
+    }
+
+    let same_origin = format!("http://127.0.0.1:{}", addr.port());
+    let local_referer = format!("http://localhost:{}/volumes", addr.port());
+    let ip_host = format!("127.0.0.1:{}", addr.port());
+    let name_host = format!("localhost:{}", addr.port());
+
+    // The curl shape: legal Host, no Origin/Referer (the "no headers =
+    // not a browser" verdict stays).
+    upload("curl shape", addr, &ip_host, &[]).await;
+    // The dashboard's own same-origin uploads.
+    upload(
+        "same-origin Origin",
+        addr,
+        &ip_host,
+        &[("Origin", same_origin.as_str())],
+    )
+    .await;
+    // The localhost spelling reaches the same loopback listener.
+    upload(
+        "localhost Host + matching Referer",
+        addr,
+        &name_host,
+        &[("Referer", local_referer.as_str())],
+    )
+    .await;
+    // Host comparison is case-insensitive (LOCALHOST == localhost).
+    let upper_host = name_host.to_uppercase();
+    let upper_origin = format!("http://{name_host}");
+    upload(
+        "case-insensitive Host spelling",
+        addr,
+        &upper_host,
+        &[("Origin", upper_origin.as_str())],
+    )
+    .await;
 }
 
 // -------------------------- the P1 write routes + configs endpoint (§1.2/§1.5) ---

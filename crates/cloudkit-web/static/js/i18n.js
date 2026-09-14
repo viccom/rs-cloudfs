@@ -133,6 +133,7 @@ const LANG = {
         'volumes.note.refresh_encrypted': "Refresh refuses encrypted instances — the backend only sees ciphertext containers; use `cydrive sync` instead (the sync payload carries the encrypted row semantics)",
         'volumes.confirm.unmount': 'Unmount volume "{name}"?\nIts drive disappears immediately; the volume file stays on disk (re-enable anytime).',
         'volumes.confirm.disable': 'Disable volume "{name}"?\nThis writes enabled = false to its file (it stays disabled across restarts) and unmounts it.',
+        'volumes.action_in_flight': 'A command for volume "{name}" is already running — wait for it to settle first.',
 
         // --- the volume form card (P3/P4) -------------------------------
         'volumes.form.name': 'Volume name',
@@ -364,6 +365,7 @@ hand-written comments are lost. Credential fields left empty keep their stored v
         'volumes.note.refresh_encrypted': '加密实例拒绝刷新——后端只见密文容器；请改用 `cydrive sync`（同步载荷携带加密行语义）',
         'volumes.confirm.unmount': '卸载卷「{name}」？\n其盘符立即消失；卷文件保留在磁盘上（可随时重新启用）。',
         'volumes.confirm.disable': '停用卷「{name}」？\n这会向其文件写入 enabled = false（重启后保持停用）并卸载该卷。',
+        'volumes.action_in_flight': '卷「{name}」已有操作进行中——请等待其完成。',
 
         // --- 卷表单卡（P3/P4）---------------------------------------------
         'volumes.form.name': '卷名称',
