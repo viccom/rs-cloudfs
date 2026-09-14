@@ -189,6 +189,8 @@
     <!-- Preview Modal -->
     <div id="media-modal" class="modal">
         <div class="modal-content">
+            <a id="modal-download" class="modal-download" href="#" download
+               title="Download" data-i18n-title="index.download" hidden><i class="fa-solid fa-download"></i></a>
             <button class="modal-close" onclick="closeModal()">&times;</button>
             <h3 id="modal-title" data-i18n="index.file_preview">File Preview</h3>
             <div id="modal-body"></div>
@@ -196,6 +198,10 @@
     </div>
 
     <script src="/static/js/i18n.js"></script>
+    <!-- ArtPlayer 5.4.0 (UMD, MIT — window.Artplayer), the preview
+         modal's video player; loaded before the app.js wiring that
+         instantiates it. -->
+    <script src="/static/js/vendor/artplayer.js"></script>
     <script src="/static/js/app.js"></script>
 </body>
 </html>
