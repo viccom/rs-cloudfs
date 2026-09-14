@@ -393,6 +393,7 @@ const SECRET_VALUED_KEYS: &[&str] = &[
     "sync_secret",
     "proxy_url",
     "sync_url",
+    "baidu_app_key",
     "baidu_app_secret",
     "baidu_access_token",
     "baidu_refresh_token",
