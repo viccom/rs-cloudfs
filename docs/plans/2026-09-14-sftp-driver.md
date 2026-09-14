@@ -1,6 +1,6 @@
 # Phase 4 计划：ssh/sftp 存储驱动
 
-> 状态：**方案待负责人批准**（2026-09-14 立）｜ 批次编号建议 SF0–SF5
+> 状态：**已批准（2026-09-14，SF0 三项拍板，见 §8）**（2026-09-14 立）｜ 批次编号建议 SF0–SF5
 > 前置研究：三轮外部项目勘察（2026-09-14，均为只读，情报见本文附录 A）
 > 上游标准：`docs/standards/architecture.md`（六层 + R1–R7）、`docs/standards/driver-onboarding.md`（新驱动验收依据）、`docs/standards/interfaces.md`（StorageDriver 契约/conformance 八断言）、`docs/plans/2026-09-07-cloudfusion-foundation.md`（D4 权威索引）
 > 需求口径（负责人 2026-09-14）：**自用项目，不对外分发**——借鉴外部项目实现时不受许可证传染约束；但"能跑起来、坑最少"是唯一标准，且不得因此降低本仓既有的门禁纪律。
@@ -168,7 +168,7 @@ crates/drivers/ck-sftp/
 2. **上传 `close` 后校验远端大小**（比对本地 size，短/零即判失败）。这是 aeroftp 从 0 字节上传 bug 中活下来的唯一持久修复（`:1050-1085`）。
 3. **续传/覆盖写绝不用 `APPEND`**；用 `OpenFlags::WRITE | CREATE`（无 TRUNCATE）+ 显式 seek，且**offset 用重新 stat 的真实远端大小钳制**（`:2282-2295`、`:1139-1148`）。理由："部分服务器设置 APPEND 时忽略 seek 而在 EOF 写"。
 
-### 4.5 host key 策略（**需负责人拍板**，见 §8-D2）
+### 4.5 host key 策略（已拍板 2026-09-14：显式接受 + 指纹落盘，见 §8-D2）
 
 技术底座已明确：`russh::keys::known_hosts::{check_known_hosts, learn_known_hosts}` 提供现成解析/写入（aeroftp 的 `host_key_check.rs` 即基于它，含 566 行实现与 11 个单测——**仅作设计参照，代码不抄**）。三态语义 `known | unknown | changed`、`changed` 带 1-based 行号、原子写（temp+rename）。
 
@@ -235,11 +235,11 @@ crates/drivers/ck-sftp/
 - 分块上传/秒传/变更推送（SFTP 无此原语）
 - SCp 协议（只做 SFTP subsystem）
 
-## 8. 待拍板（SF0 必须解决）
+## 8. 拍板记录（SF0，2026-09-14 负责人已决）
 
-- **D1 认证方式**：支持哪几种？参考 aeroftp（私钥含 passphrase / 密码 / keyboard-interactive；**无 agent/证书**）与 termcp（agent → key → password；空密码时优先密钥）。建议：**密码 + 私钥（含 passphrase）+ keyboard-interactive 回退**，agent 暂不做（自用场景可由配置文件路径直接引用密钥）。凭据按 R3 走 env > config > keyring，纳入 `SECRET_VALUED_KEYS` 脱敏。
-- **D2 host key 形态**：§4.5 的甲（显式接受，推荐）或乙（静默 TOFU）。
-- **D3 是否起步即多连接**：建议否——先用 3.0 的流水线读实测，不足再上 SF5。
+- **D1 认证方式 = 密码 + 私钥**（负责人原话「便于实现自动化」）。私钥支持含解锁 passphrase（`sftp_private_key_passphrase` 凭据键，加密私钥不支持等于半个私钥支持）。**keyboard-interactive 与 ssh-agent 不做**（v1 范围外挂账——aeroftp 教训：个别服务器（SourceForge 类）只收 keyboard-interactive，遇到再议）。凭据按 R3 走 env > config > keyring，`sftp_password` / `sftp_private_key_passphrase` 入 `SECRET_VALUED_KEYS` 脱敏。
+- **D2 host key 形态 = 显式接受 + 指纹落盘**（§4.5 甲案）：未记录指纹的 host key → **拒连**并返回可行动错误（指明接受途径）；接受动作 = 显式用户行为，指纹持久化后静默校验；**指纹变更 → 恒拒**（MITM 信号），救济 = 显式移除旧指纹重新接受。绝不无条件接受（termcp 教训）。
+- **D3 起步多连接 = 否**。**概念澄清（落档防复混）**：负责人答复中的「不同认证各起一个实例」指的是**多卷模式**（不同服务器/账号各一卷，Phase 2.5 既有能力，SFTP 作为普通卷自动继承——无需任何额外工作）；D3 问的是**同一卷内为吞吐开 N 条并行 SSH 连接做文件内分段**（aeroftp 的 `download_intra_file_pooled`，其 300MiB 实测 144.75s→25.46s）。拍板：**起步单连接**（russh-sftp 3.0 会话内 `max_concurrent_reads: 16` 流水线读），SF4 真机实测吞吐，不足再立项 SF5。
 
 ## 9. 验收总纲（driver-onboarding §8 清单对照）
 

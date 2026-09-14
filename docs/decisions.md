@@ -638,3 +638,10 @@
 - **状态**：方案与跟踪单落库（`docs/plans/2026-09-14-sftp-driver.md` + `docs/tracking/phase4-sftp.md`），**待负责人批准后开工 SF1**；SF0 三项待拍板（D1 认证方式 / D2 host key 形态 / D3 是否起步即多连接）。
 - **本批性质**：只读勘察 + 仓外探针（`E:\tmp\sftp-probe`、`E:\tmp\sftp-harness`），仓库 git status 全程干净，无源码改动。
 
+## 2026-09-14 K60：SF0 三项拍板——Phase 4 方案获批，SF1 解锁
+
+- **K60.1 D1 认证方式 = 密码 + 私钥**（负责人：「便于实现自动化」）。私钥含解锁 passphrase（`sftp_private_key_passphrase` 凭据键——不支持加密私钥等于半个私钥支持）；**keyboard-interactive 与 ssh-agent 不做**（v1 挂账：aeroftp 教训，个别服务器只收 k-i，遇到再议）。`sftp_password`/`sftp_private_key_passphrase` 入 `SECRET_VALUED_KEYS`；凭据链 env > config > keyring 照 R3。
+- **K60.2 D2 host key = 显式接受 + 指纹落盘**（方案 §4.5 甲案）：未记录指纹 → 拒连 + 可行动错误（指明接受途径）；接受 = 显式用户行为后指纹持久化、后续静默校验；**指纹变更恒拒**（MITM 信号），救济 = 显式移除旧指纹重新接受。禁止无条件接受（termcp `NoCheckServerKey` 反例，2026-09-14 会话核实其全仓无 known_hosts）。
+- **K60.3 D3 起步多连接 = 否 + 概念澄清**：负责人答复中「不同认证各起一个实例」指**多卷模式**（不同服务器/账号各一卷——Phase 2.5 既有能力，SFTP 作为普通卷自动继承，零额外工作）；D3 本意是**同一卷内为吞吐开 N 条并行 SSH 连接做文件内分段**（aeroftp `download_intra_file_pooled` 路线）。拍板：起步单连接（russh-sftp 3.0 `max_concurrent_reads: 16` 流水线读），SF4 实测吞吐不足再立项 SF5。
+- **效果**：计划状态 待批准 → **已批准**；SF0 验收达成（选型 K59.2–K59.7 + 本条 D1/D2/D3）；SF1（驱动骨架 + 配置接入 + `compiled_drivers()` 可扩展化）解锁可开工。落档同步：计划 §8 改拍板记录、跟踪单 SF0 行 ✅、AGENTS 待人工清单第 6 项销账。
+
