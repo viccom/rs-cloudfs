@@ -25,7 +25,7 @@
 mod client;
 mod config;
 mod driver;
-mod error;
+pub(crate) mod error;
 mod transport_face;
 
 use std::sync::Arc;
@@ -37,12 +37,63 @@ pub use driver::{SftpDriver, SftpStager};
 pub use transport_face::SftpTransport;
 
 /// 装配工厂：构造驱动（**不连接**——惰性建立是 D3 的既定形态；连接
-/// 时机 = 首次操作或 transport 面 `connect` 探活）。装配接线（backend
-/// dispatch）在 SF3 落地。
+/// 时机 = 首次操作或 transport 面 `connect` 探活）。
 ///
 /// 阻塞面：无（`SftpDriver::new` 纯构造）。
 pub async fn factory(cfg: &SftpParams) -> Result<Arc<SftpDriver>, StorageError> {
     Ok(Arc::new(SftpDriver::new(cfg.clone())?))
+}
+
+/// 探连接的结构化结果（doctor 腿；baidu `BackendProbe` 同款形态）。
+///
+/// D2 的**非交互接受途径**就落在这里：未设指纹时的 `HostKeyUnpinned`
+/// 携带服务器实际指纹——doctor 把它渲染成可行动检查项（「把该指纹
+/// 复制进卷配置的 sftp_host_fingerprint 键」），用户不需要交互式弹窗。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SftpProbe {
+    /// 连接 + 认证 + 指纹校验全过（指纹已 pin 且匹配）。
+    Alive,
+    /// D2-甲：配置未记录指纹——拒连，`actual` 是服务器实际指纹
+    /// （复制进 `sftp_host_fingerprint` 即完成显式接受）。
+    HostKeyUnpinned(String),
+    /// D2：指纹不匹配（MITM 信号）——恒拒；救济 = 显式移除旧指纹。
+    HostKeyChanged {
+        /// 配置里 pin 的指纹。
+        expected: String,
+        /// 服务器本次presented的指纹。
+        actual: String,
+    },
+    /// D1 认证失败（密码/私钥均拒或材料不可读）；载荷是不含凭据值的
+    /// 诊断文案（R3）。
+    AuthFailed(String),
+    /// 网络/协议层不可达（超时、拒绝、KEX 失败等）。
+    Unreachable(String),
+}
+
+/// 探连接（doctor 腿的直连探针）：建立一次完整连接（TCP/KEX/指纹/
+/// 认证/SFTP 握手）后立即断开，把 [`crate::client::SessionError`] 的
+/// 细节归一为 [`SftpProbe`]——`Availability` 之外的关键信息（实际
+/// 指纹）在这里以结构化形态浮到 doctor，而不是只进日志。
+pub async fn probe(params: &SftpParams) -> SftpProbe {
+    match client::probe_connect(params).await {
+        Ok(()) => SftpProbe::Alive,
+        Err(error) => match error {
+            crate::error::SessionError::HostKeyUnpinned { actual } => {
+                SftpProbe::HostKeyUnpinned(actual)
+            }
+            crate::error::SessionError::HostKeyMismatch { expected, actual } => {
+                SftpProbe::HostKeyChanged { expected, actual }
+            }
+            crate::error::SessionError::AuthFailed { detail, .. } => SftpProbe::AuthFailed(detail),
+            crate::error::SessionError::Ssh(transport) => SftpProbe::Unreachable(format!(
+                "ssh transport to {}:{} failed: {transport}",
+                params.host, params.port
+            )),
+            crate::error::SessionError::Sftp(sftp) => {
+                SftpProbe::Unreachable(format!("sftp subsystem failed: {sftp}"))
+            }
+        },
+    }
 }
 
 #[cfg(test)]

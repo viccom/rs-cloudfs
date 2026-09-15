@@ -24,14 +24,28 @@
 //!      时忽略 seek 而在 EOF 写」）。驱动不声明 `resume` 能力位，续传
 //!      语义由上层缓存承担。
 //!
-//! ## commit-on-close 的边界（与 local 的差异，诚实声明）
+//! ## commit-on-close：暂存件 + rename + stash（与 ck-local 同构）
 //!
-//! 计划 §7 明确不做「远程临时文件 + rename 的原子上传」——SFTP 写
-//! 直接落在最终路径上，staging 窗口内目标路径以部分内容可见。close
-//! 前 `stat` 目标可能看到短文件（而非 `NotFound`）。abort 尽力删除
-//! 目标；覆盖旧版本的场景 abort 后目标缺失（无 stash 能力）。这些
-//! 行为由 SF2 桩测试钉死后再对 conformance 断言①（close 前不可见）
-//! 做出豁免说明或补强。
+//! 计划 §7 的「远程临时文件 + rename」由 conformance 断言①（close 前
+//! 目标不可见，interfaces §6）钉死为**必须实现**——本次裁决：以
+//! SFTP 原生 rename 实现与 ck-local 同构的提交协议：
+//!
+//! - 数据落 `<final>.cksftp-<pid>-<seq>.part`（同目录——SFTP rename
+//!   的原子性仅在**同一服务器文件系统内**成立，跨设备 rename 会失败，
+//!   同目录命名保证同设备）；
+//! - 覆盖场景：旧对象先 `rename(final → <final>.cksftp-<pid>-<seq>.old)`
+//!   stash——staging 窗口内目标路径不可见（stat → NotFound），断言①
+//!   的覆盖腿亦满足；
+//! - `close` = part→final rename（目标已空，POSIX rename 语义直接
+//!   落位）→ 远端 size 校验（硬仗②）→ 删 stash；
+//! - `abort` = 删 part + stash→final rename 恢复旧版（abort = 回到
+//!   writer 打开前状态，local 同款）；
+//! - `.cksftp-` 命名的暂存件对 `list` 恒过滤（驱动实现细节，不是卷
+//!   内容——断言③集合完整性依赖；local 的 `.cklocal-staging/` 同源）。
+//!
+//! **真机（OpenSSH）的形态差**：rename 语义与 POSIX 一致，stash 腿在
+//! 真机上等价成立；SF4 真机矩阵复验该协议（含 crash 残留的 `.cksftp-`
+//! 件清理——断言③过滤同时覆盖残留不可见）。
 //!
 //! ## 并发与一致性
 //!
@@ -236,6 +250,12 @@ impl StorageDriver for SftpDriver {
                 if name == "." || name == ".." {
                     return None;
                 }
+                // 暂存件/孤儿残件（`.cksftp-<pid>-<seq>.part|.old`）是
+                // 驱动实现细节，不是卷内容（断言③集合完整性；local 的
+                // `.cklocal-staging/` 过滤同源）
+                if is_staging_artifact(&name) {
+                    return None;
+                }
                 // 词汇层不可表示的名字（驱动侧再硬化：join 拒绝的
                 // 组件）不可见即不可寻址
                 let child = dir.join(&name).ok()?;
@@ -400,8 +420,9 @@ impl StorageDriver for SftpDriver {
         Ok(Box::pin(frames))
     }
 
-    /// 打开上传暂存器（硬仗③：WRITE|CREATE|TRUNCATE——绝不用 APPEND；
-    /// commit-on-close 边界见模块文档）。
+    /// 打开上传暂存器（硬仗③：WRITE|CREATE（无 TRUNCATE 需求——part
+    /// 是新文件）——绝不用 APPEND；commit-on-close 协议见模块文档：
+    /// 数据落 `.part` 暂存件，覆盖场景旧对象先 stash 成 `.old`）。
     async fn writer(
         &self,
         path: &RelPath,
@@ -410,23 +431,47 @@ impl StorageDriver for SftpDriver {
         if path.is_root() {
             return Err(StorageError::Invalid); // 根是目录，不可作为上传目标
         }
-        if let Ok(attrs) = self.stat_path(path).await {
-            if attrs.is_dir() {
-                return Err(StorageError::Invalid); // 目标是已存在目录（trait 契约）
-            }
-        }
+        // 目标形态预检：已存在目录 → Invalid（trait 契约）；文件 → 待
+        // stash（下）；缺失 → 直建 part
+        let existing = match self.stat_path(path).await {
+            Ok(attrs) if attrs.is_dir() => return Err(StorageError::Invalid),
+            Ok(_) => true,
+            Err(StorageError::NotFound) => false,
+            Err(other) => return Err(other),
+        };
         if let Some(parent) = path.parent() {
             if !parent.is_root() {
                 self.ensure_parents(&parent).await?;
             }
         }
-        let remote = self.path(path);
-        let file = self.client.open_write_truncate(&remote).await?;
+        // 暂存名：final 同目录 + `.cksftp-<pid>-<seq>.part`（同目录保证
+        // rename 同设备——SFTP rename 跨设备失败；list 侧按前缀过滤）
+        let final_remote = self.path(path);
+        let (part_remote, old_remote) = staging_names(&final_remote);
+        let file = self.client.open_write_truncate(&part_remote).await?;
+        // 覆盖场景：旧对象 stash（staging 窗口内最终路径不可见——断言①
+        // 覆盖腿；rename 到 .old 后 final 为空，close 的 rename 直接落位）
+        let stash = if existing {
+            match self.client.rename(&final_remote, &old_remote).await {
+                Ok(()) => Some(old_remote),
+                // 竞态窗内旧对象消失：按「原本不存在」继续
+                Err(StorageError::NotFound) => None,
+                Err(other) => {
+                    // 收拾刚建的 part 再报错（不留孤儿）
+                    let _ = self.client.remove_file(&part_remote).await;
+                    return Err(other);
+                }
+            }
+        } else {
+            None
+        };
         Ok(Box::new(SftpStager {
             volume: self.volume.clone(),
             final_rel: path.clone(),
             client: self.client.clone(),
             file: Some(file),
+            part_remote,
+            stash_remote: stash,
             written: 0,
             hinted_size: hint.size,
             finished: false,
@@ -456,22 +501,28 @@ impl StorageDriver for SftpDriver {
     }
 }
 
-/// SFTP 上传暂存器（commit-on-close；三硬仗纪律见 driver.rs 模块文档）。
+/// SFTP 上传暂存器（commit-on-close：`.part` 暂存 + rename 固化 +
+/// `.old` stash；协议见 driver.rs 模块文档）。
 ///
-/// - 语义：写入直接落最终路径（计划 §7 裁决不做临时文件+rename——
-///   staging 窗口内目标以部分内容可见，边界声明见模块文档）；
+/// - 语义：数据落同目录 `.cksftp-<pid>-<seq>.part`；覆盖场景旧对象在
+///   writer 打开时已 stash 成 `.old`（staging 窗口目标不可见，断言①）；
 /// - 错误：io/协议失败按 error.rs 映射；close 时 size 承诺不符 →
 ///   `Invalid`（WriteHint 契约）；close 后远端大小 != written → `Io`
 ///   （硬仗②）；
 /// - 并发：单 stager 串行使用（trait 契约）；
-/// - 生命周期：close（flush + awaited close + 大小校验）/ abort
-///   （awaited close + 尽力删除目标）/ Drop（russh-sftp close_nowait
-///   兜底——库行为，不等待确认）三选一收尾。
+/// - 生命周期：close（flush + awaited close + rename + 大小校验 + 删
+///   stash）/ abort（awaited close + 删 part + stash→final 恢复）/
+///   Drop（awaited close 无路——russh-sftp close_nowait 兜底 + 同步
+///   part 清理不保证；残件靠 list 过滤不可见，模块文档边界）三选一。
 pub struct SftpStager {
     volume: VolumeId,
     final_rel: RelPath,
     client: Arc<SftpClient>,
     file: Option<russh_sftp::client::fs::File>,
+    /// 暂存件远端路径（`.cksftp-<pid>-<seq>.part`）。
+    part_remote: String,
+    /// 被 stash 的旧版本远端路径（`.old`）；None = 目标原本不存在。
+    stash_remote: Option<String>,
     written: u64,
     hinted_size: Option<u64>,
     finished: bool,
@@ -488,35 +539,53 @@ impl UploadStager for SftpStager {
         Ok(())
     }
 
-    /// 提交：flush → awaited close（硬仗①）→ 远端大小校验（硬仗②）→
-    /// Entry。
+    /// 提交：flush → awaited close（硬仗①）→ part→final rename（原子
+    /// 固化）→ 远端大小校验（硬仗②）→ 删 stash → Entry。
+    ///
+    /// 失败路径尽力恢复现场（async 面可做真正的 stash→final 恢复——
+    /// 与 LocalStager 的 Drop 同步恢复同语义）：提交失败时 target 不得
+    /// 停在被 stash 丢空的状态。恢复失败只留不可见残件（list 过滤），
+    /// 不吞原错误。
     async fn close(mut self: Box<Self>) -> Result<Entry, StorageError> {
         let Some(mut file) = self.file.take() else {
             return Err(StorageError::Invalid); // 未打开/已收尾
         };
         if let Some(hinted) = self.hinted_size {
             if hinted != self.written {
-                // WriteHint 契约：承诺与实际不符；file 由 russh-sftp Drop
-                // 收尾（close_nowait），远端残留是 truncate 语义的既定
-                // 边界（模块文档）
+                // WriteHint 契约：承诺与实际不符——恢复现场（删 part /
+                // 复位旧版）后报 Invalid
+                let _ = file.close().await;
                 self.finished = true;
+                self.restore_scene().await;
                 return Err(StorageError::Invalid);
             }
         }
-        file.flush()
-            .await
-            .map_err(|e| StorageError::Io(format!("sftp flush: {e}")))?;
+        if let Err(e) = file.flush().await {
+            let _ = file.close().await;
+            self.finished = true;
+            self.restore_scene().await;
+            return Err(StorageError::Io(format!("sftp flush: {e}")));
+        }
         let _ = file.sync_all().await; // fsync@openssh.com 可选扩展，尽力
                                        // 硬仗①：awaited close——等待在途写与 close 确认，之后远端
                                        // 状态才可信
-        file.close()
-            .await
-            .map_err(|e| StorageError::Io(format!("sftp close after upload: {e}")))?;
+        if let Err(e) = file.close().await {
+            self.finished = true;
+            self.restore_scene().await;
+            return Err(StorageError::Io(format!("sftp close after upload: {e}")));
+        }
+        // 原子固化：final 此刻为空（旧版已 stash）——POSIX rename 语义
+        // 直接落位；这是断言①「close 后立即可见」的兑现点
+        let final_remote = remote_path(&self.client.params().root, &self.final_rel);
+        if let Err(e) = self.client.rename(&self.part_remote, &final_remote).await {
+            self.finished = true;
+            self.restore_scene().await;
+            return Err(e);
+        }
         self.finished = true;
         // 硬仗②：close 后校验远端大小（短/零判失败——0 字节上传 bug
         // 的唯一持久修复）
-        let remote = remote_path(&self.client.params().root, &self.final_rel);
-        let attrs = self.client.metadata(&remote).await?;
+        let attrs = self.client.metadata(&final_remote).await?;
         let remote_size = attrs.len();
         if remote_size != self.written {
             return Err(StorageError::Io(format!(
@@ -524,29 +593,75 @@ impl UploadStager for SftpStager {
                 self.written
             )));
         }
+        // 新版本已就位，stash 作废（best-effort——失败只留不可见残件）
+        if let Some(old) = &self.stash_remote {
+            let _ = self.client.remove_file(old).await;
+        }
         Ok(entry_from_attrs(&self.volume, &self.final_rel, &attrs))
     }
 
-    /// 放弃：awaited close + 尽力删除目标（我们创建/截断的对象；覆盖
-    /// 场景旧版本不可恢复——模块文档边界声明）。
+    /// 放弃：awaited close → 删 part → stash→final 恢复（abort = 回到
+    /// writer 打开前状态，local stager 同款恢复语义）。
     async fn abort(mut self: Box<Self>) -> Result<(), StorageError> {
         if let Some(file) = self.file.take() {
             let _ = file.close().await; // 硬仗①：失败分支也 awaited close
         }
         self.finished = true;
-        let remote = remote_path(&self.client.params().root, &self.final_rel);
-        match self.client.remove_file(&remote).await {
-            Ok(()) => Ok(()),
-            Err(StorageError::NotFound) => Ok(()), // 已消失视为已清理
-            Err(other) => Err(other),
+        self.restore_scene().await;
+        Ok(())
+    }
+}
+
+impl SftpStager {
+    /// 现场恢复（close 失败 / abort 的共用收尾）：删 part 暂存件 +
+    /// stash→final 复位。order 有讲究——先复位 stash 再删 part 会与
+    /// 「part 是孤儿」的判定互不影响，这里按「删自己的、还别人的」
+    /// 顺序：part 是我们创建的（删除安全），stash 是别人的（归还）。
+    /// 每步 best-effort：远端残件不可见（list 过滤），调用方错误优先。
+    async fn restore_scene(&self) {
+        match self.client.remove_file(&self.part_remote).await {
+            Ok(()) | Err(StorageError::NotFound) => {}
+            Err(_) => {} // 残件不可见（list 过滤）
+        }
+        if let Some(old) = &self.stash_remote {
+            let final_remote = remote_path(&self.client.params().root, &self.final_rel);
+            if self.client.rename(old, &final_remote).await.is_err() {
+                let _ = self.client.remove_file(old).await;
+            }
         }
     }
 }
 
+/// 暂存件命名（`final` 同目录）：`.cksftp-<pid>-<seq>.part` / `.old`。
+///
+/// 同目录是硬要求——SFTP rename 的原子性只在同一服务器文件系统内成立
+/// （跨设备 rename 直接失败）；这一形态让 close 的固化对真机 OpenSSH
+/// 同样成立（SF4 复验）。进程级单调序号防同进程多 stager 撞名。
+fn staging_names(final_remote: &str) -> (String, String) {
+    static STAGING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    let seq = STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    let pid = std::process::id();
+    let suffix = format!(".cksftp-{pid}-{seq}");
+    (
+        format!("{final_remote}{suffix}.part"),
+        format!("{final_remote}{suffix}.old"),
+    )
+}
+
+/// 暂存件前缀过滤（list 不可见——断言③集合完整性的驱动侧保障；同时
+/// 覆盖 crash/close 失败残留的孤儿件）。判定 = 文件名含 `.cksftp-`
+/// 且以 `.part`/`.old` 结尾（双重条件防误伤用户合法文件名——两者
+/// 同时命中才算驱动残件）。
+pub(crate) fn is_staging_artifact(name: &str) -> bool {
+    name.contains(".cksftp-") && (name.ends_with(".part") || name.ends_with(".old"))
+}
+
 impl Drop for SftpStager {
-    /// 未 close/abort 即丢弃 → russh-sftp File 的 Drop 兜底（排入
-    /// close_nowait，不等待确认——库行为；三硬仗①的异常路径边界，
-    /// SF2 桩的服务端句柄计数测试钉住）。
+    /// 未 close/abort 即丢弃（消费者异常路径）→ russh-sftp File 的 Drop
+    /// 兜底（排入 close_nowait，不等待确认——库行为；三硬仗①的异常
+    /// 路径边界，SF2 桩的服务端句柄计数测试钉住）。暂存件与 stash 的
+    /// 远端残件不可见（list 过滤），不阻塞后续同名路径的上传（part
+    /// 名带进程级序号，不撞旧件）。
     fn drop(&mut self) {
         let _ = self.file.take();
     }

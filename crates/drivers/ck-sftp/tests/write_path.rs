@@ -358,6 +358,103 @@ async fn writer_abort_deletes_target() {
     assert_eq!(stub.open_handle_count(), 0);
 }
 
+// -------------------------------------------- commit-on-close staging ---
+
+/// 断言①的驱动面（conformance 断言的离线红→绿所对应）：staging 窗口内
+/// 目标路径必须不可见——写入数据落在暂存件上，close 才固化。
+#[tokio::test]
+async fn mid_staging_target_is_invisible_and_close_commits() {
+    let (_stub, driver) = setup().await;
+    let data = pattern(4096);
+    let hint = WriteHint {
+        size: Some(data.len() as u64),
+        ..Default::default()
+    };
+    let mut stager = driver
+        .writer(&rel("staged.bin"), &hint)
+        .await
+        .expect("writer");
+    stager.write(&data).await.expect("write");
+    assert_eq!(
+        driver.stat(&rel("staged.bin")).await.err(),
+        Some(StorageError::NotFound),
+        "mid-staging stat must be NotFound (commit-on-close invisibility)"
+    );
+    let entry = stager.close().await.expect("close");
+    assert_eq!(entry.size, data.len() as u64);
+    assert_eq!(
+        driver
+            .stat(&rel("staged.bin"))
+            .await
+            .expect("visible after close")
+            .size,
+        data.len() as u64
+    );
+}
+
+/// 覆盖写 + abort = 回到 writer 打开前状态（旧版本恢复，不是丢失）——
+/// stash 方案的恢复语义（ck-local stager 同款）。
+#[tokio::test]
+async fn abort_restores_the_stashed_old_version() {
+    let (stub, driver) = setup().await;
+    let old = pattern(3000);
+    stub.add_file("/keep.bin", &old);
+    let mut stager = driver
+        .writer(&rel("keep.bin"), &WriteHint::default())
+        .await
+        .expect("writer");
+    stager.write(&pattern(100)).await.expect("write");
+    // staging 窗口：旧版本已 stash → 目标不可见
+    assert_eq!(
+        driver.stat(&rel("keep.bin")).await.err(),
+        Some(StorageError::NotFound),
+        "overwrite staging must hide the old version too"
+    );
+    stager.abort().await.expect("abort");
+    let got = read_all(
+        driver
+            .reader(&entry_id(&driver, "keep.bin"), None)
+            .await
+            .expect("reader after abort restores old"),
+    )
+    .await
+    .expect("read");
+    assert_eq!(got, old, "abort must restore the pre-writer version");
+}
+
+/// 暂存件对 list 不可见（驱动实现细节，不是卷内容——conformance 断言③
+/// 的集合完整性依赖它；local 的 `.cklocal-staging/` 过滤同源）。
+#[tokio::test]
+async fn staging_artifacts_are_invisible_in_list() {
+    let (_stub, driver) = setup().await;
+    driver.mkdir(&rel("dir")).await.expect("mkdir");
+    // 打开一个 stager 不关闭：暂存件此刻在远端存在（同一目录下）
+    let mut stager = driver
+        .writer(&rel("dir/live.bin"), &WriteHint::default())
+        .await
+        .expect("writer");
+    stager.write(&pattern(64)).await.expect("write");
+    let listing = driver
+        .list(&rel("dir"), cloudkit_storage::Page::all())
+        .await
+        .expect("list");
+    assert!(
+        listing.entries.is_empty(),
+        "staging artifacts must not surface: {:?}",
+        listing
+            .entries
+            .iter()
+            .map(|e| e.path.as_str())
+            .collect::<Vec<_>>()
+    );
+    stager.abort().await.expect("abort");
+    let listing = driver
+        .list(&rel("dir"), cloudkit_storage::Page::all())
+        .await
+        .expect("list after abort");
+    assert!(listing.entries.is_empty(), "abort leaves no artifacts");
+}
+
 /// 目标是已存在目录 → Invalid；卷根 → Invalid（trait 契约）。
 #[tokio::test]
 async fn writer_rejects_dir_target_and_root() {

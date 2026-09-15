@@ -716,6 +716,7 @@ dependencies = [
  "chrono",
  "ck-baidu",
  "ck-local",
+ "ck-sftp",
  "ck-telegram",
  "clap",
  "cloudkit-core",

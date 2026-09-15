@@ -122,6 +122,7 @@
                             <label><input type="radio" name="vf-backend" value="telegram" checked> <span data-i18n="backend.telegram">Telegram MTProto</span></label>
                             <label><input type="radio" name="vf-backend" value="baidu"> <span data-i18n="backend.baidu">Baidu Netdisk</span></label>
                             <label><input type="radio" name="vf-backend" value="local"> <span data-i18n="backend.local">Local Disk</span></label>
+                            <label><input type="radio" name="vf-backend" value="sftp"> <span data-i18n="backend.sftp">SFTP (SSH)</span></label>
                         </div>
                     </fieldset>
 
@@ -173,6 +174,49 @@
                                 <span><span data-i18n="volumes.form.local_root">Local root</span> <em>*</em></span>
                                 <input type="text" id="vf-local-root" autocomplete="off"
                                        placeholder="absolute path, e.g. C:\data\cloudfs">
+                            </label>
+                        </div>
+                    </fieldset>
+
+                    <fieldset class="volume-fieldset vf-cred-group" id="vf-group-sftp" hidden>
+                        <legend data-i18n="volumes.form.cred_sftp">SFTP backend</legend>
+                        <div class="volume-form-grid">
+                            <label class="volume-field">
+                                <span><span data-i18n="volumes.form.sftp_host">Host</span> <em>*</em></span>
+                                <input type="text" id="vf-sftp-host" autocomplete="off"
+                                       placeholder="hostname or IP, e.g. nas.lan">
+                            </label>
+                            <label class="volume-field">
+                                <span data-i18n="volumes.form.sftp_port">Port</span>
+                                <input type="text" id="vf-sftp-port" inputmode="numeric" autocomplete="off" placeholder="22 (default)">
+                            </label>
+                            <label class="volume-field">
+                                <span><span data-i18n="volumes.form.sftp_username">Username</span> <em>*</em></span>
+                                <input type="text" id="vf-sftp-username" autocomplete="off">
+                            </label>
+                            <label class="volume-field">
+                                <span data-i18n="volumes.form.sftp_password">Password</span>
+                                <input type="password" id="vf-sftp-password" autocomplete="new-password"
+                                       placeholder="password or private key — at least one">
+                            </label>
+                            <label class="volume-field">
+                                <span data-i18n="volumes.form.sftp_private_key_path">Private key path</span>
+                                <input type="text" id="vf-sftp-private-key-path" autocomplete="off"
+                                       placeholder="C:\keys\id_ed25519 (optional)">
+                            </label>
+                            <label class="volume-field">
+                                <span data-i18n="volumes.form.sftp_private_key_passphrase">Key passphrase</span>
+                                <input type="password" id="vf-sftp-private-key-passphrase" autocomplete="new-password"
+                                       placeholder="only for an encrypted key">
+                            </label>
+                            <label class="volume-field">
+                                <span data-i18n="volumes.form.sftp_host_fingerprint">Host key fingerprint</span>
+                                <input type="text" id="vf-sftp-host-fingerprint" autocomplete="off"
+                                       placeholder="SHA256:... — run `cydrive doctor` to obtain it">
+                            </label>
+                            <label class="volume-field">
+                                <span data-i18n="volumes.form.sftp_root">Remote root</span>
+                                <input type="text" id="vf-sftp-root" autocomplete="off" placeholder="/ (default)">
                             </label>
                         </div>
                     </fieldset>

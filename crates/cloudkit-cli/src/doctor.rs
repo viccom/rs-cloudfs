@@ -439,7 +439,13 @@ pub fn evaluate_winfsp_install(install: Option<&cloudkit_platform::WinFspInstall
 /// - **local**: the root exists-and-is-writable probe (create + write +
 ///   remove, mirroring the cache check) and the K12 sync-unsupported
 ///   warning when `sync_url` is set (the task never starts), plus the
-///   K18 proxy notice.
+///   K18 proxy notice;
+/// - **sftp** (Phase 4 / SF3): the sync-unsupported warning (the remote
+///   filesystem is the source of truth, same ruling as local) plus the
+///   K18 proxy notice. The connectivity leg — including the D2 host-key
+///   fingerprint gate — is [`sftp_connectivity_check`] over
+///   [`crate::sftp_backend_probe`], assembled separately because it
+///   dials out.
 pub fn backend_checks(cfg: &cloudkit_core::config::CyDriveConfig) -> Vec<CheckResult> {
     use cloudkit_core::config::Backend;
     let mut results = Vec::new();
@@ -463,13 +469,76 @@ pub fn backend_checks(cfg: &cloudkit_core::config::CyDriveConfig) -> Vec<CheckRe
             }
             results.push(check_local_root(cfg.local_root.as_deref()));
         }
-        // Phase 4 / SF1 placeholder: the sftp-specific checks (host-key
-        // fingerprint present, auth form present, connectivity) are an
-        // SF3 doctor item; the sftp keys' cross-field rules already run
-        // in the config validate pass doctor shares.
-        Backend::Sftp => {}
+        Backend::Sftp => {
+            // The K12 warning covers both non-sync backends; the text
+            // follows the backend (SFTP_SYNC_UNSUPPORTED for sftp).
+            if let Some(warning) = crate::local_sync_unsupported_warning(cfg) {
+                results.push(CheckResult {
+                    name: "sync".to_string(),
+                    status: CheckStatus::Warn,
+                    detail: warning.to_string(),
+                });
+            }
+        }
     }
     results
+}
+
+/// The sftp connectivity leg (Phase 4 / SF3): renders
+/// [`crate::sftp_backend_probe`]'s verdict into one check result.
+///
+/// The D2 distinction is the load-bearing part: an unpinned host key is
+/// **not** a failure of this machine — it is the explicit-accept step
+/// every new server requires, so it surfaces as a Warn carrying the
+/// server's actual fingerprint and the exact key to paste it into
+/// (the non-interactive acceptance path — no popup, per D2's ruling).
+/// A **changed** fingerprint is a Fail (the MITM signal, refused by
+/// design); auth failures and unreachable servers Fail with their
+/// actionable detail. Feature-gated with the driver (K30 pattern): a
+/// binary without `sftp` has no probe value to render.
+#[cfg(feature = "sftp")]
+pub fn sftp_connectivity_check(probe: &ck_sftp::SftpProbe) -> CheckResult {
+    use ck_sftp::SftpProbe;
+    match probe {
+        SftpProbe::Alive => CheckResult {
+            name: "sftp connectivity".to_string(),
+            status: CheckStatus::Ok,
+            detail: "connected, authenticated, and the host-key fingerprint matches".to_string(),
+        },
+        SftpProbe::HostKeyUnpinned(actual) => CheckResult {
+            name: "sftp host key".to_string(),
+            status: CheckStatus::Warn,
+            detail: format!(
+                "the server's host key is not accepted yet; it presented {actual} — copy \
+                 that value into this volume's sftp_host_fingerprint key to accept it \
+                 (the driver refuses to connect until then: no silent trust-on-first-use)"
+            ),
+        },
+        SftpProbe::HostKeyChanged { expected, actual } => CheckResult {
+            name: "sftp host key".to_string(),
+            status: CheckStatus::Fail,
+            detail: format!(
+                "the server's host key CHANGED: expected {expected}, got {actual} — a \
+                 man-in-the-middle is one possible cause; the connection is refused. If \
+                 the server was legitimately reinstalled, remove the old \
+                 sftp_host_fingerprint value and accept the new one only after verifying \
+                 it out-of-band"
+            ),
+        },
+        SftpProbe::AuthFailed(detail) => CheckResult {
+            name: "sftp authentication".to_string(),
+            status: CheckStatus::Fail,
+            detail: format!(
+                "authentication failed: {detail} — check sftp_username, sftp_password / \
+                 sftp_private_key_path and the passphrase"
+            ),
+        },
+        SftpProbe::Unreachable(detail) => CheckResult {
+            name: "sftp connectivity".to_string(),
+            status: CheckStatus::Fail,
+            detail: format!("cannot reach the server: {detail}"),
+        },
+    }
 }
 
 /// The local backend's root probe: `None` (no config to read a root

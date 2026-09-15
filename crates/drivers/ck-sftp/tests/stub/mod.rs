@@ -34,6 +34,9 @@
 //! - **host key**：服务端起好后经 [`Stub::fingerprint`] 暴露
 //!   `SHA256:...`（`ssh_key::PublicKey::fingerprint(HashAlg::Sha256)` 的
 //!   Display 形态，与 client.rs `check_server_key` 逐字同源）。
+//! - **stat 故障注入**（SF3 增补，conformance 断言⑤）：
+//!   [`Stub::fail_next_stat`] 让下一次 stat 以给定状态码失败——错误
+//!   映射经真实协议面回放（服务器 Status 码 → 客户端映射函数）。
 //!
 //! SF3 的 conformance 复用本桩（`mod stub;` 从任意集成测试引入）。
 
@@ -102,6 +105,10 @@ struct VfsState {
     dir_handles: HashMap<String, DirHandle>,
     next_handle: u64,
     mtime_tick: u32,
+    /// 一次性 stat 故障注入（conformance 断言⑤的注入面）：下一次
+    /// `stat` 请求直接以该状态码失败——驱动的错误映射经真实协议
+    /// 回放（服务器回 Status 码 → 客户端 map_status）。消费即清空。
+    fail_next_stat: Option<StatusCode>,
 }
 
 impl VfsState {
@@ -113,6 +120,7 @@ impl VfsState {
             dir_handles: HashMap::new(),
             next_handle: 0,
             mtime_tick: 0,
+            fail_next_stat: None,
         }
     }
 
@@ -414,9 +422,13 @@ impl russh_sftp::server::Handler for SftpHandler {
     }
 
     async fn stat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
-        let attrs = lock_vfs!(self)
-            .attr_of(&path)
-            .ok_or(StatusCode::NoSuchFile)?;
+        let mut vfs = lock_vfs!(self);
+        // 断言⑤注入优先于真实查找（注入的码恰好是 NoSuchFile 时也不
+        // 能被真实查找路径"顺便"满足——回放的是驱动映射，不是 VFS 态）
+        if let Some(code) = vfs.fail_next_stat.take() {
+            return Err(code);
+        }
+        let attrs = vfs.attr_of(&path).ok_or(StatusCode::NoSuchFile)?;
         Ok(Attrs { id, attrs })
     }
 
@@ -856,6 +868,12 @@ impl Stub {
     /// 认证成功次数。
     pub fn auth_success_count(&self) -> usize {
         self.counters.auth_successes.load(Ordering::SeqCst)
+    }
+
+    /// 注入一次 stat 故障（conformance 断言⑤）：下一次到达服务端的
+    /// `stat`/`lstat` 直接以 `code` 失败，消费后恢复。
+    pub fn fail_next_stat(&self, code: StatusCode) {
+        self.lock_vfs().fail_next_stat = Some(code);
     }
 
     /// 杀掉当前所有连接（协议级 SSH_MSG_DISCONNECT → 客户端传输层死）

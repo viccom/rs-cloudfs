@@ -277,6 +277,23 @@ impl SftpClient {
     }
 }
 
+/// 探连接（doctor 腿）：完整建连一次（TCP/KEX/指纹/认证/SFTP 握手）
+/// 后丢弃句柄（Drop 拆除），把 [`SessionError`] 原样交给调用方做结构
+/// 化归类（[`crate::probe`]）。指纹这三态的细节只有这里能拿到——
+/// 驱动面的 `Unauthorized` 无载荷（L2 冻结契约），doctor 需要实际
+/// 指纹来做「复制进配置」的指引。
+pub(crate) async fn probe_connect(params: &SftpParams) -> Result<(), SessionError> {
+    let connection = tokio::time::timeout(CONNECT_BUDGET, connect_once(params))
+        .await
+        .map_err(|_| SessionError::Ssh(russh::Error::ConnectionTimeout))??;
+    // 探针不保留会话：显式断开（await 确认），SF2 桩的句柄计数据此归零
+    let handle = connection.handle;
+    let _ = handle
+        .disconnect(russh::Disconnect::ByApplication, "", "")
+        .await;
+    Ok(())
+}
+
 /// 建立一条完整连接：TCP + KEX（含 D2 host key 校验）→ 认证（D1）→
 /// sftp 子系统 → SftpSession。行为测试在 SF2 桩批。
 async fn connect_once(params: &SftpParams) -> Result<SshConnection, SessionError> {

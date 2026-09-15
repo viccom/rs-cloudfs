@@ -789,11 +789,16 @@ async fn doctor_cmd() -> Result<()> {
         cloudkit_core::config::Backend::Local => {
             results.extend(cloudkit_cli::doctor::backend_checks(&cfg));
         }
-        // Phase 4 / SF1 placeholder: the sftp doctor leg (connectivity,
-        // host-key fingerprint) is an SF3 item; the backend_checks match
-        // inside already carries the sftp arm.
+        // Phase 4 / SF3: the sftp leg — the offline checks plus the live
+        // connectivity probe (host-key fingerprint gate, auth, network).
+        // A binary without the driver skips the dial-out leg (K31 shape,
+        // the baidu rule): no fake Unreachable.
         cloudkit_core::config::Backend::Sftp => {
             results.extend(cloudkit_cli::doctor::backend_checks(&cfg));
+            #[cfg(feature = "sftp")]
+            results.push(cloudkit_cli::doctor::sftp_connectivity_check(
+                &cloudkit_cli::sftp_backend_probe(&cfg).await,
+            ));
         }
     }
     print!("{}", cloudkit_cli::doctor::render_report(&results));
