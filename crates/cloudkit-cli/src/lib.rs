@@ -111,28 +111,47 @@ pub const LOCAL_DRIVER_REQUIRED: &str = "this binary was built without the local
      rebuild with `cargo build --features local`, or set `backend = \"telegram\"` / \
      `backend = \"baidu\"` in config.toml";
 
+/// The actionable message every sftp surface carries when the binary was
+/// built without the sftp driver (K31 shape, Phase 4 / SF3 — same form as
+/// [`TELEGRAM_DRIVER_REQUIRED`] / [`BAIDU_DRIVER_REQUIRED`] /
+/// [`LOCAL_DRIVER_REQUIRED`]): name the rebuild command, then name the
+/// backend switch. Pinned by the off-feature test in `tests/dispatch.rs`.
+pub const SFTP_DRIVER_REQUIRED: &str = "this binary was built without the sftp driver; \
+     rebuild with `cargo build --features sftp`, or set `backend = \"telegram\"` / \
+     `backend = \"baidu\"` / `backend = \"local\"` in config.toml";
+
 /// The driver list the binary was compiled with (K32,
 /// docs/plans/2026-09-09-driver-feature-gates.md) — the `(drivers: ...)`
-/// segment of the `--version` banner. A compile-time constant in
-/// substance: every arm is a literal selected by the feature set at
-/// compile time, in the fixed order telegram, baidu, local; a build
-/// with every driver feature off reports `none`. Pinned by
+/// segment of the `--version` banner.
+///
+/// Extensible form (Phase 4 / SF1, `docs/plans/2026-09-14-sftp-driver.md`
+/// §3): the fixed-order table maps one `cfg!` probe per driver, the list
+/// is the filter-join of the enabled rows and the empty set reports
+/// `none` — adding a driver is one appended row (the SF0-era 3-tuple
+/// match would grow 2^n arms instead). Each row is still selected by the
+/// feature set at compile time (`cfg!` expands to a literal), in the
+/// fixed order telegram, baidu, local, sftp; onboarding the next driver
+/// (driver-onboarding §1) appends its row here. Pinned by
 /// `tests::compiled_drivers_lists_the_feature_set_in_fixed_order`
-/// (cfg-gated arms — one assertion per build).
-pub const fn compiled_drivers() -> &'static str {
-    match (
-        cfg!(feature = "telegram"),
-        cfg!(feature = "baidu"),
-        cfg!(feature = "local"),
-    ) {
-        (true, true, true) => "telegram, baidu, local",
-        (true, true, false) => "telegram, baidu",
-        (true, false, true) => "telegram, local",
-        (false, true, true) => "baidu, local",
-        (true, false, false) => "telegram",
-        (false, true, false) => "baidu",
-        (false, false, true) => "local",
-        (false, false, false) => "none",
+/// (cfg-gated arms — one assertion per build; the 3-driver combinations'
+/// output is byte-identical to the pre-SF1 refactor, and the sftp row
+/// simply appends to the fixed order).
+pub fn compiled_drivers() -> String {
+    const DRIVER_ROWS: &[(bool, &str)] = &[
+        (cfg!(feature = "telegram"), "telegram"),
+        (cfg!(feature = "baidu"), "baidu"),
+        (cfg!(feature = "local"), "local"),
+        (cfg!(feature = "sftp"), "sftp"),
+    ];
+    let enabled: Vec<&str> = DRIVER_ROWS
+        .iter()
+        .filter(|(compiled, _)| *compiled)
+        .map(|(_, name)| *name)
+        .collect();
+    if enabled.is_empty() {
+        "none".to_string()
+    } else {
+        enabled.join(", ")
     }
 }
 
@@ -4662,6 +4681,12 @@ pub async fn run_sync_command(cfg: &CyDriveConfig, secret: Option<&str>) -> Resu
             .context("connecting the baidu backend to derive the sync namespace")?
             .sync_namespace_key(),
         Backend::Local => anyhow::bail!("{LOCAL_SYNC_UNSUPPORTED}"),
+        // Phase 4 / SF3: the sftp volume is authoritative-index (the
+        // remote filesystem IS the truth — SF1 capability ruling); like
+        // local, its sync participation is off — the remote side is the
+        // source of truth, not a mirror target. `is_sync_supported`
+        // reports the same and doctor shares the warning.
+        Backend::Sftp => anyhow::bail!("{SFTP_SYNC_UNSUPPORTED}"),
     };
 
     let db = MetaDatabase::open(Path::new(&cfg.db_path))
@@ -4912,21 +4937,29 @@ pub enum BackendTransport {
     /// [`LOCAL_DRIVER_REQUIRED`] instead).
     #[cfg(feature = "local")]
     Local(Arc<ck_local::LocalTransport>),
+    /// The sftp transport face over the factory-constructed driver
+    /// (Phase 4 / SF3): requires the `sftp` feature — a binary without
+    /// the driver refuses with [`SFTP_DRIVER_REQUIRED`] instead.
+    #[cfg(feature = "sftp")]
+    Sftp(Arc<ck_sftp::SftpTransport>),
 }
 
 impl BackendTransport {
-    /// The assembled volume identity (`baidu:<uid>` / `local:<root>`).
+    /// The assembled volume identity (`baidu:<uid>` / `local:<root>` /
+    /// `sftp:<user>@<host>:<port>`).
     pub fn volume(&self) -> &str {
         match self {
             #[cfg(feature = "baidu")]
             BackendTransport::Baidu(t) => StorageDriver::volume(t.driver()).as_str(),
             #[cfg(feature = "local")]
             BackendTransport::Local(t) => StorageDriver::volume(t.driver()).as_str(),
+            #[cfg(feature = "sftp")]
+            BackendTransport::Sftp(t) => StorageDriver::volume(t.driver()).as_str(),
             // Every driver gated out: the enum is uninhabited — no
             // value can exist. The empty match over the dereferenced
             // place is the never-taken arm a reference scrutinee needs
             // (a reference alone counts as inhabited, E0004).
-            #[cfg(not(any(feature = "baidu", feature = "local")))]
+            #[cfg(not(any(feature = "baidu", feature = "local", feature = "sftp")))]
             _ => match *self {},
         }
     }
@@ -4939,7 +4972,9 @@ impl BackendTransport {
             BackendTransport::Baidu(t) => CloudTransport::capabilities(t.as_ref()),
             #[cfg(feature = "local")]
             BackendTransport::Local(t) => CloudTransport::capabilities(t.as_ref()),
-            #[cfg(not(any(feature = "baidu", feature = "local")))]
+            #[cfg(feature = "sftp")]
+            BackendTransport::Sftp(t) => CloudTransport::capabilities(t.as_ref()),
+            #[cfg(not(any(feature = "baidu", feature = "local", feature = "sftp")))]
             _ => match *self {},
         }
     }
@@ -4948,7 +4983,9 @@ impl BackendTransport {
     /// raw volume identity `baidu:<uid>` (a stable, non-secret account
     /// id); local — `local:<digest>` over the driver-normalized root
     /// (the raw path never ships to the server; local never starts the
-    /// sync task anyway — [`is_sync_supported`]).
+    /// sync task anyway — [`is_sync_supported`]); sftp — the volume
+    /// identity `sftp:<user>@<host>:<port>` (no path/credential parts;
+    /// like local, sftp never starts the sync task today).
     pub fn sync_namespace_key(&self) -> String {
         match self {
             #[cfg(feature = "baidu")]
@@ -4957,7 +4994,9 @@ impl BackendTransport {
             BackendTransport::Local(t) => namespace_key_for(&NamespaceIdentity::Local {
                 root: &t.driver().root_path().to_string_lossy(),
             }),
-            #[cfg(not(any(feature = "baidu", feature = "local")))]
+            #[cfg(feature = "sftp")]
+            BackendTransport::Sftp(_) => self.volume().to_string(),
+            #[cfg(not(any(feature = "baidu", feature = "local", feature = "sftp")))]
             _ => match *self {},
         }
     }
@@ -4971,7 +5010,9 @@ impl BackendTransport {
             BackendTransport::Baidu(t) => t.clone() as Arc<dyn CloudTransport>,
             #[cfg(feature = "local")]
             BackendTransport::Local(t) => t.clone() as Arc<dyn CloudTransport>,
-            #[cfg(not(any(feature = "baidu", feature = "local")))]
+            #[cfg(feature = "sftp")]
+            BackendTransport::Sftp(t) => t.clone() as Arc<dyn CloudTransport>,
+            #[cfg(not(any(feature = "baidu", feature = "local", feature = "sftp")))]
             _ => match *self {},
         }
     }
@@ -5002,7 +5043,22 @@ impl BackendTransport {
             },
             #[cfg(feature = "local")]
             BackendTransport::Local(_) => None,
-            #[cfg(not(any(feature = "baidu", feature = "local")))]
+            #[cfg(feature = "sftp")]
+            BackendTransport::Sftp(t) => match StorageDriver::quota(t.driver()).await {
+                Ok(quota) => Some(cloudkit_web::QuotaSnapshot {
+                    used: quota.used,
+                    total: quota.total,
+                }),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "sftp quota read failed; the dashboard storage card degrades to \
+                         unlimited"
+                    );
+                    None
+                }
+            },
+            #[cfg(not(any(feature = "baidu", feature = "local", feature = "sftp")))]
             _ => match *self {},
         }
     }
@@ -5052,6 +5108,76 @@ async fn build_local_transport(cfg: &CyDriveConfig) -> Result<BackendTransport> 
     .map_err(|error| anyhow::anyhow!("initialising the local backend: {error}"))?;
     Ok(BackendTransport::Local(Arc::new(
         ck_local::LocalTransport::new(driver),
+    )))
+}
+
+/// The sftp dispatch arm, shared by both [`build_backend_transport_with`]
+/// twins and [`build_driver`] (Phase 4 / SF3): flatten the `sftp_*`
+/// config keys into [`ck_sftp::SftpParams`] and hand them to the factory.
+///
+/// Credential resolution follows the R3 chain the other drivers use —
+/// env var over file value, per key (`CYDRIVE_SFTP_PASSWORD` /
+/// `CYDRIVE_SFTP_PRIVATE_KEY_PASSPHRASE` are the credential-valued
+/// keys; the non-secret keys stay file-only, matching the baidu
+/// pattern where only the credential keys have env routes). The
+/// factory itself only constructs — D3 lazy connect means this returns
+/// without touching the network; the first operation (or the transport
+/// `connect` probe) establishes the session.
+#[cfg(feature = "sftp")]
+fn sftp_params(cfg: &CyDriveConfig) -> Result<ck_sftp::SftpParams> {
+    // 展平为 (key, value) 对——非空值才入列（空串 = 未设置，与驱动侧
+    // empty-means-unset 语义对齐）。
+    fn push(pairs: &mut Vec<(String, String)>, key: &str, value: Option<&str>) {
+        if let Some(v) = value.filter(|v| !v.is_empty()) {
+            pairs.push((key.to_string(), v.to_string()));
+        }
+    }
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    push(&mut pairs, "sftp_host", cfg.sftp_host.as_deref());
+    if let Some(port) = cfg.sftp_port {
+        pairs.push(("sftp_port".to_string(), port.to_string()));
+    }
+    push(&mut pairs, "sftp_username", cfg.sftp_username.as_deref());
+    // Credential keys resolve env-over-file (R3 chain, per key).
+    let password = std::env::var("CYDRIVE_SFTP_PASSWORD")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| cfg.sftp_password.clone());
+    push(&mut pairs, "sftp_password", password.as_deref());
+    push(
+        &mut pairs,
+        "sftp_private_key_path",
+        cfg.sftp_private_key_path.as_deref(),
+    );
+    let passphrase = std::env::var("CYDRIVE_SFTP_PRIVATE_KEY_PASSPHRASE")
+        .ok()
+        .filter(|v| !v.is_empty())
+        .or_else(|| cfg.sftp_private_key_passphrase.clone());
+    push(
+        &mut pairs,
+        "sftp_private_key_passphrase",
+        passphrase.as_deref(),
+    );
+    push(
+        &mut pairs,
+        "sftp_host_fingerprint",
+        cfg.sftp_host_fingerprint.as_deref(),
+    );
+    push(&mut pairs, "sftp_root", cfg.sftp_root.as_deref());
+    ck_sftp::SftpParams::from_pairs(&pairs)
+        .map_err(|error| anyhow::anyhow!("reading the sftp config keys: {error}"))
+}
+
+/// The sftp factory assembly shared by the dispatch and the rebuild
+/// driver builder (composition-root R1 exemption: it may name drivers).
+#[cfg(feature = "sftp")]
+async fn build_sftp_transport(cfg: &CyDriveConfig) -> Result<BackendTransport> {
+    let params = sftp_params(cfg)?;
+    let driver = ck_sftp::factory(&params)
+        .await
+        .map_err(|error| anyhow::anyhow!("initialising the sftp backend: {error}"))?;
+    Ok(BackendTransport::Sftp(Arc::new(
+        ck_sftp::SftpTransport::new(driver),
     )))
 }
 
@@ -5111,6 +5237,19 @@ pub async fn build_backend_transport_with(
                 anyhow::bail!("{LOCAL_DRIVER_REQUIRED}")
             }
         }
+        // Phase 4 / SF3: the sftp dispatch arm — with the driver the
+        // factory assembly ([`build_sftp_transport`]); without it the
+        // actionable rebuild message (K31).
+        Backend::Sftp => {
+            #[cfg(feature = "sftp")]
+            {
+                build_sftp_transport(cfg).await
+            }
+            #[cfg(not(feature = "sftp"))]
+            {
+                anyhow::bail!("{SFTP_DRIVER_REQUIRED}")
+            }
+        }
     }
 }
 
@@ -5145,6 +5284,18 @@ pub async fn build_backend_transport_with(cfg: &CyDriveConfig) -> Result<Backend
             #[cfg(not(feature = "local"))]
             {
                 anyhow::bail!("{LOCAL_DRIVER_REQUIRED}")
+            }
+        }
+        // Phase 4 / SF3 — the sftp arm follows its feature like the
+        // local arm above.
+        Backend::Sftp => {
+            #[cfg(feature = "sftp")]
+            {
+                build_sftp_transport(cfg).await
+            }
+            #[cfg(not(feature = "sftp"))]
+            {
+                anyhow::bail!("{SFTP_DRIVER_REQUIRED}")
             }
         }
     }
@@ -5244,15 +5395,28 @@ pub const PROXY_DIRECT_BACKEND_NOTICE: &str =
 /// root IS the source of truth); a `sync_url` on such an instance is a
 /// misconfiguration surfaced as this warning (the sync task's start
 /// gate and doctor share the text). `None` for every other shape.
+/// Phase 4 / SF3: the sftp backend got the same ruling (the remote
+/// filesystem is the source of truth) — the warning text follows the
+/// backend ([`SFTP_SYNC_UNSUPPORTED`] for sftp).
 pub fn local_sync_unsupported_warning(cfg: &CyDriveConfig) -> Option<&'static str> {
-    (cfg.sync_url.is_some() && !cloudkit_core::sync::is_sync_supported(&cfg.backend))
-        .then_some(LOCAL_SYNC_UNSUPPORTED)
+    (cfg.sync_url.is_some() && !cloudkit_core::sync::is_sync_supported(&cfg.backend)).then_some({
+        match cfg.backend {
+            Backend::Sftp => SFTP_SYNC_UNSUPPORTED,
+            _ => LOCAL_SYNC_UNSUPPORTED,
+        }
+    })
 }
 
 /// The K12 warning text shared by the sync-start gate and doctor.
 pub const LOCAL_SYNC_UNSUPPORTED: &str =
     "sync is not supported for the local backend: the periodic sync task stays off and \
      the sync_url key has no effect";
+
+/// The K12 warning text for the sftp backend (Phase 4 / SF3): the remote
+/// filesystem is the source of truth — same ruling as local.
+pub const SFTP_SYNC_UNSUPPORTED: &str =
+    "sync is not supported for the sftp backend: the remote filesystem is the source of \
+     truth, so the periodic sync task stays off and the sync_url key has no effect";
 
 // -------------------------------------------- doctor: baidu probe (B3b) ---
 
@@ -5285,6 +5449,28 @@ pub enum BackendProbe {
 #[cfg(feature = "baidu")]
 pub async fn baidu_backend_probe(cfg: &CyDriveConfig) -> BackendProbe {
     baidu_backend_probe_with(cfg, &BaiduEndpoints::default()).await
+}
+
+/// The sftp backend probe (Phase 4 / SF3 doctor leg): connects once
+/// (TCP/KEX/host-key/auth/subsystem) and returns the driver's structured
+/// verdict — including the D2 host-key three-state detail the driver's
+/// `Unauthorized` cannot carry (L2's frozen no-payload contract). The
+/// driver gate mirrors the baidu probe's K31 rule: a binary without the
+/// `sftp` feature cannot dial, so the CLI skips this leg entirely.
+#[cfg(feature = "sftp")]
+pub async fn sftp_backend_probe(cfg: &CyDriveConfig) -> ck_sftp::SftpProbe {
+    // Incomplete config never reaches the network: the validate pass
+    // gives the actionable verdict first (the sftp arm of validate()).
+    let params = match sftp_params(cfg) {
+        Ok(params) => params,
+        Err(error) => {
+            return ck_sftp::SftpProbe::Unreachable(format!(
+                "the sftp configuration is incomplete ({error}); set the sftp_* keys in \
+                 config.toml and retry"
+            ));
+        }
+    };
+    ck_sftp::probe(&params).await
 }
 
 /// [`baidu_backend_probe`] with the endpoint set injected (tests point
@@ -5384,6 +5570,20 @@ async fn build_driver(cfg: &CyDriveConfig) -> Result<Arc<dyn StorageDriver>> {
         }
         #[cfg(not(feature = "local"))]
         Backend::Local => anyhow::bail!("{LOCAL_DRIVER_REQUIRED}"),
+        // With the driver: the factory assembly ([`sftp_params`] +
+        // ck-sftp factory, D3 lazy connect). Without it: the actionable
+        // rebuild message (K31) — `rebuild` cannot walk a volume the
+        // binary cannot index.
+        #[cfg(feature = "sftp")]
+        Backend::Sftp => {
+            let params = sftp_params(cfg)?;
+            let driver = ck_sftp::factory(&params)
+                .await
+                .map_err(|error| anyhow::anyhow!("initialising the sftp backend: {error}"))?;
+            Ok(driver)
+        }
+        #[cfg(not(feature = "sftp"))]
+        Backend::Sftp => anyhow::bail!("{SFTP_DRIVER_REQUIRED}"),
     }
 }
 
@@ -6820,25 +7020,63 @@ mod tests {
         // arm is a cfg-gated literal — no runtime feature probing — so
         // exactly one assertion is compiled per build and it pins the
         // expected list for that feature combination: fixed order
-        // telegram, baidu, local; the all-off build reports `none`.
+        // telegram, baidu, local, sftp; the all-off build reports
+        // `none`.
+        //
+        // SF3 structure: the sftp row (appended after local, never
+        // interleaved) is factored out of the literal pins — the
+        // 3-driver expectations below stay byte-identical, and the two
+        // sftp assertions pin the suffix rule and the 4-driver list.
         let drivers = compiled_drivers();
+        let base: String = if cfg!(feature = "sftp") {
+            match drivers.strip_suffix(", sftp") {
+                Some(base) => base.to_string(),
+                None => "none".to_string(), // sftp is the only driver enabled
+            }
+        } else {
+            drivers.clone()
+        };
 
         #[cfg(all(feature = "telegram", feature = "baidu", feature = "local"))]
-        assert_eq!(drivers, "telegram, baidu, local");
+        assert_eq!(base, "telegram, baidu, local");
         #[cfg(all(feature = "telegram", feature = "baidu", not(feature = "local")))]
-        assert_eq!(drivers, "telegram, baidu");
+        assert_eq!(base, "telegram, baidu");
         #[cfg(all(feature = "telegram", not(feature = "baidu"), feature = "local"))]
-        assert_eq!(drivers, "telegram, local");
+        assert_eq!(base, "telegram, local");
         #[cfg(all(not(feature = "telegram"), feature = "baidu", feature = "local"))]
-        assert_eq!(drivers, "baidu, local");
+        assert_eq!(base, "baidu, local");
         #[cfg(all(feature = "telegram", not(feature = "baidu"), not(feature = "local")))]
-        assert_eq!(drivers, "telegram");
+        assert_eq!(base, "telegram");
         #[cfg(all(not(feature = "telegram"), feature = "baidu", not(feature = "local")))]
-        assert_eq!(drivers, "baidu");
+        assert_eq!(base, "baidu");
         #[cfg(all(not(feature = "telegram"), not(feature = "baidu"), feature = "local"))]
-        assert_eq!(drivers, "local");
+        assert_eq!(base, "local");
         #[cfg(not(any(feature = "telegram", feature = "baidu", feature = "local")))]
-        assert_eq!(drivers, "none");
+        assert_eq!(base, "none");
+
+        // SF3: the sftp row is a pure append in the fixed order — the
+        // list ends with it whenever the feature is on, the all-four
+        // build reads in the documented order, and the sftp-only build
+        // reports just the row.
+        #[cfg(feature = "sftp")]
+        assert!(
+            drivers.ends_with("sftp"),
+            "sftp must be the last row: {drivers}"
+        );
+        #[cfg(all(
+            feature = "telegram",
+            feature = "baidu",
+            feature = "local",
+            feature = "sftp"
+        ))]
+        assert_eq!(drivers, "telegram, baidu, local, sftp");
+        #[cfg(all(
+            not(feature = "telegram"),
+            not(feature = "baidu"),
+            not(feature = "local"),
+            feature = "sftp"
+        ))]
+        assert_eq!(drivers, "sftp");
     }
 
     /// H1 (review fix): `take` used to find the position under one lock

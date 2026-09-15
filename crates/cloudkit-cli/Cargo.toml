@@ -23,10 +23,11 @@ path = "src/main.rs"
 # that refuses that driver's surfaces at runtime with the actionable
 # rebuild message (K31).
 [features]
-default = ["telegram", "baidu", "local"]
+default = ["telegram", "baidu", "local", "sftp"]
 telegram = ["dep:ck-telegram"]
 baidu = ["dep:ck-baidu"]
 local = ["dep:ck-local"]
+sftp = ["dep:ck-sftp"]
 # WinFsp mount backend (Phase 3, K38/K40): OFF by default and it must
 # stay out of `default` — enabling it pulls the GPL-3.0 winfsp-rs
 # bindings into the graph, and the release artifacts must stay GPL-free.
@@ -65,6 +66,12 @@ ck-baidu = { path = "../drivers/ck-baidu", optional = true }
 # a binary that refuses local surfaces at runtime with the actionable
 # rebuild message (K31, `cloudkit_cli::LOCAL_DRIVER_REQUIRED`).
 ck-local = { path = "../drivers/ck-local", optional = true }
+# The sftp driver is feature-gated (K30 pattern, Phase 4 SF3): `default`
+# keeps it on; a build without `sftp` produces a binary that refuses
+# sftp surfaces at runtime with the actionable rebuild message (K31,
+# `cloudkit_cli::SFTP_DRIVER_REQUIRED`). The whole russh protocol stack
+# rides this gate — a build without it resolves none of it.
+ck-sftp = { path = "../drivers/ck-sftp", optional = true }
 cloudkit-web = { path = "../cloudkit-web" }
 cloudkit-webdav = { path = "../cloudkit-webdav" }
 # WinFsp native mount adapter (Phase 3, L5). Optional and feature-gated

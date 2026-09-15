@@ -261,11 +261,17 @@ fn local_root_digest(root: &str) -> String {
 /// keys). A **local** drive never starts the sync task — the local root
 /// IS the source of truth, and a `sync_url` set on a local instance is
 /// a misconfiguration surfaced as a doctor warning, never a running
-/// task. This is the判定 function for the doctor warning and the
-/// task-start gate; the run-flow wiring lands with the backend dispatch
-/// (Batch B3b 段二b).
+/// task. An **sftp** drive follows the same ruling (Phase 4 / SF3): the
+/// remote filesystem is the source of truth (its authoritative-index
+/// capability mirrors local's), so the task stays off and a `sync_url`
+/// is the same warning. This is the判定 function for the doctor warning
+/// and the task-start gate; the run-flow wiring lands with the backend
+/// dispatch (Batch B3b 段二b).
 pub fn is_sync_supported(backend: &crate::config::Backend) -> bool {
-    !matches!(backend, crate::config::Backend::Local)
+    !matches!(
+        backend,
+        crate::config::Backend::Local | crate::config::Backend::Sftp
+    )
 }
 
 /// Lowercase hex of a digest (mirror of the `chunker` helper).

@@ -1,7 +1,7 @@
 # rs-cloudfs — Agent 工作须知
 
 ## 项目信息
-- 项目：rs-cloudfs = rs-CyDrive × PrivateCloudFS 融合体——多云存储平台（统一存储抽象之上的 WebDAV 挂载/仪表盘/同步/CLI；后端：telegram / baidu / local，未来 sftp（Phase 4 方案已批，SF1 待开工）/ pan115（Phase 5 方案已批，115-0 spike 待开工）/ pan123（Phase 6 方案已批，123-0 spike 待开工）/ s3）
+- 项目：rs-cloudfs = rs-CyDrive × PrivateCloudFS 融合体——多云存储平台（统一存储抽象之上的 WebDAV 挂载/仪表盘/同步/CLI；后端：telegram / baidu / local / **sftp（Phase 4 完成）**，未来 pan115（Phase 5 方案已批，115-0 spike 待开工）/ pan123（Phase 6 方案已批，123-0 spike 待开工）/ s3）
 - 技术栈：Rust（edition 2021）/ tokio / axum / dav-server / rusqlite(bundled) / grammers(telegram) / hyper-rustls
 - **血统**：fork 自 rs-CyDrive（全 git 历史；remote `upstream-cydrive` 只读参照，禁止 push）；PrivateCloudFS（`E:\Go_codes\PrivateCloudFS`，Go）是设计参照系与踩坑情报源（情报附录在 multicloud 计划）
 - **北极星**：「一个稳定好用的程序」——重组已验证资产，不重写
@@ -23,19 +23,25 @@
 **K58 审查修复批完成（2026-09-14，fix/k58-review，5 High + 8 Medium 清偿）**：H1+H2 命令执行模型重构（web 缝闭包改 spawn 执行任务 + oneshot 回复 + 单 permit Mutex——hyper 斩杀面消除，全入口恢复 K48 串行）；H3 `write_config_atomically`（tmp+sync+rename 收敛五处配置写盘点）；H4 panic 防护入执行任务 + 控制通道日志 payload 摘要化（凭据明文落盘点消除）；H5 Host 白名单防 DNS rebinding（绑定后 SocketAddr 推导，`/api/upload` 存量 CSRF 一并收口）；M1–M7（worker panic degraded 终态/SECRET_VALUED_KEYS 增补 proxy_url·sync_url·baidu_app_key/Edit 门撤除/rebuild 检查点身份判据/行走中 outstanding 复查/UPDATE 脱敏漏斗/前端 action-in-flight 锁/add_volume 结构化成败）。逐项复核表（13 项×钉住测试）入 `docs/tracking/k58-review-fixes.md`。
 **Web 体验批完成（2026-09-14）**：ArtPlayer 5.4.0 本地内置媒体播放器（错误回退 + 格式清单扩 mov/m4v/m4a/aac/opus）+ 文件行「复制链接」按钮；前端注入修复（`escapeHtml` 转义引号 + 事件委托替代内联 onclick——修复含 `'` 文件名的按钮失效）；volume-tab 委托修复（重绘竞态）；**默认加密方案改 `aead_v2`**（84939ab——新卷 Range 流式播放默认可用，gcm 保留显式可选；`EncryptionScheme::default()` = AeadV2，gcm 数学测试显式钉 Gcm 防漂移）。
 **Phase 4 立项（2026-09-14，K59+K60，方案已批）**：ssh/sftp 存储驱动——计划 `docs/plans/2026-09-14-sftp-driver.md` + 跟踪单 `docs/tracking/phase4-sftp.md`。选型 russh 0.63 + russh-sftp 3.0（**ring** 后端零新增 C 依赖；版本下限 0.63 = GHSA-47hw-gvq5-r2gm 客户端侧 High）；三轮外部研究（本仓探针 / termscp / aeroftp）+ 实测验证（依赖树编译 PASS；**Windows 进程内 SFTP 桩端到端 PASS**——list/stat/range 读逐字节/error 全绿，不依赖 Docker/HOME）。**SF0 已拍板（K60）**：D1 认证=密码+私钥（含 passphrase）、D2 host key=显式接受+指纹落盘（变更恒拒）、D3=起步单连接（多卷≠多连接澄清落档）——SF1 可开工。同批 `driver-onboarding.md` 升 **v1.1 增 §10 transport-only 驱动类**（telegram 先例，两班制只在契约面）。
+**Phase 4 完成（2026-09-15，K66，worktree `feat/sftp-driver`，SF1–SF4 全落地）**：`ck-sftp` 驱动（六模块）——**SF1** 骨架 + 配置接入（八键四处清单 + `Backend::Sftp` + validate 分支；`compiled_drivers()` 重构为 DRIVER_ROWS 可扩展表，3 驱动输出逐字不变）；**SF2** Windows 进程内桩（russh::server + 内存 VFS + 活句柄/认证计数器）+ 41 行为测试，暴露并修复断连分类缺陷（`sender dropped`/`channel closed` 入连接死信清单——否则 with_retry 重连名存实亡）；**SF3** conformance 八断言绿 + 12 处接入点（feature 门控/装配/doctor/rebuild/web 表单/i18n）+ 6 组合裁剪构建全过；断言①红（直写语义在覆盖写时旧对象可见）→ 实现 **`.part` 暂存 + rename 固化 + `.old` stash** 协议（与 ck-local 同构）。**SF4** WSL2 OpenSSH 真机矩阵 11/11（上传回读逐字/Range 跨帧/吞吐 140.5↑67.7↓ MiB/s/会话复用/覆盖写+staging 不可见/symlink 两腿/D1·D2 拒绝腿），**真机揭出并修复数据破坏级缺陷**——`stat`/`list`/递归删除原用 SSH_FXP_STAT（跟随链接），link-to-dir 会被当目录下潜（实测 `list(link)` 列出 `/etc` 207 条目），修复 = 改走 **lstat**（报本体形态、`list(link-to-dir)` → `Invalid`、递归只删链；`reader` 保持跟随）；桩同步补齐 lstat/symlink 以离线回放该缺陷。**SF5 明确销账**（单连接流水线读实测达标，不做文件内分段多连接）。
 **Phase 5 立项（2026-09-14，K61+K62+K65，方案已批）**：pan115 驱动——计划 `docs/plans/2026-09-14-pan115-driver.md` + 跟踪单 `docs/tracking/phase5-pan115.md`。**双路线**：主 = 官方开放平台（proapi.115.com，device-code/QR，115-plus-desktop Rust 实证 + `ali-oss-rs` 复用 + 115-sdk-go 端点常量对照）；保底 = PCFS 私有 web API（sign.go 可直译）；**D1 路线裁决挂 115-0 spike**（~~凭证可得性=胜负手~~ **K65 降级为选 app 身份**：OpenList 生态实证 device-code PKCE 流全程无 secret、refresh 仅凭 refresh_token 自持 → 公共 client_id 自铸即可，零 app_key）。**D2–D4 已拍板（K62）**：删除=进回收站（回收站接口不引入）、根目录可设置缺省网盘根、QPS 实现期合理定值（RebuildTuning 式注入 + CDN 429 自适应重生）。前置依赖 Phase 4 SF1 的 `compiled_drivers()` 可扩展化（顺序对调则所有权对调，只做一次）。
 **Phase 6 立项（2026-09-14，K63+K64，方案已批）**：pan123 驱动——计划 `docs/plans/2026-09-14-pan123-driver.md` + 跟踪单 `docs/tracking/phase6-pan123.md`。**主参照 = `E:\GitHub\pan123-rs`**（MIT，2862 行 Rust web API SDK：全端点/QR 双头认证/上传三段流 presigned PUT/Range 续传/令牌桶/动态域名；reqwest 0.12 同栈；**移植主项 = blocking→async 转换**）。**D1–D4 已全拍板（K64）**：路线 = **web API 直裁**（开放平台降为文字参照）；删除/根目录沿用 Phase 5 形态（trash 回收站语义 / 根可设置缺省网盘根）；duplicate = 覆盖模式（rtype=3 先例）。**两项产品级约束（123-0 实测钉数字）**：每日下载流量限额（会员消解）+ MD5 etag 前置（暂存件预计算解）。三阶段均待开工：Phase 4 SF1 / Phase 5 115-0 / Phase 6 123-0；`compiled_drivers()` 重构谁先到谁做（只做一次）。
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 1069 测试（2026-09-14：K58 修复批 + aead_v2 默认 + 资产回归；ignored 12 = 真机/平台/真网类）
+cargo test --workspace --no-fail-fast            # 1141 测试（2026-09-15：Phase 4 SF1–SF4 全批；ignored 23 = 真机/平台/真网类，其中 sftp 真机矩阵 11）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
-cargo build -p cloudkit-cli --no-default-features --features local,baidu   # 驱动裁剪构建（K30 三 feature）；缺驱动构建运行期报可行动错误（K31 rebuild 指引），cydrive --version 显示驱动清单（K32）
+cargo build -p cloudkit-cli --no-default-features --features local,baidu   # 驱动裁剪构建（K30 四 feature）；缺驱动构建运行期报可行动错误（K31 rebuild 指引），cydrive --version 显示驱动清单（K32）
 LIBCLANG_PATH=D:/Python312/Lib/site-packages/clang/native cargo test -p cloudkit-winfsp --features winfsp   # winfsp 腿（117 测试，ignored 1 = 真机挂载；需 libclang+MSVC，见已知陷阱）
 scripts/check_layers                             # R1 层依赖门禁（CI 同款；动 Cargo.toml 依赖后必跑）
 scripts/scan_secrets                             # R3 秘密扫描门禁（CI 同款；本地模式=全树扫描）
 ```
+# sftp 真机矩阵（WSL2 OpenSSH fixture；凭据只经 env，步骤见 docs/tracking/phase4-sftp-fixture.md）
+MSYS_NO_PATHCONV=1 CYDRIVE_SFTP_TEST_HOST=127.0.0.1 CYDRIVE_SFTP_TEST_PORT=2222 \
+  CYDRIVE_SFTP_TEST_USER=... CYDRIVE_SFTP_TEST_PASSWORD=... \
+  CYDRIVE_SFTP_TEST_FINGERPRINT='SHA256:...' CYDRIVE_SFTP_TEST_ROOT='/srv/sftp-test' \
+  cargo test -p ck-sftp --test live_matrix -- --ignored --test-threads=1 --nocapture
 
 ## 硬性规则（摘要，全文见 standards/）
 - 七条架构红线（architecture.md §2）——违反即返工
@@ -67,4 +73,4 @@ scripts/scan_secrets                             # R3 秘密扫描门禁（CI �
 3. ~~新仓远端 origin 待建~~ **已建**：origin = github.com/viccom/rs-cloudfs（**私有**，2026-09-09 建，main + feat/phase0-1 + feat/phase2 已推）。~~公开化前建议做一次全历史秘密审查~~ **已做（2026-09-11，gitleaks 8.30.1 全历史 388 提交）**：8 命中全部为公开 Cynet Android `api_hash` 常量（与 config.rs 默认值同源），**零真实凭据**——公开化前的历史审查此项销账。
 4. 自 rs-CyDrive 继承的挂账——**2026-09-08 修复批后仅剩验证类**：P3 hydrate 快照回写竞态已修（47c4fc2，目标列写 set_cached_flag）；Low×5 已清（sync_url host 校验 f8040aa/模拟器排序 e93433a/SyncClient trait 文档 09fff2c/--help 实证漂移 bc34d43/64MB 并发闸 08fee1d；凭据门槛核实本已统一于 resolve_sync_secret）；gen_compat_fixtures.py 已修（5a3a319，重生成需同步改 database.rs 钉死的 created_at 断言）；deny advisories 已过（`advisories ok`，经 7897 代理拉库——github.com 直连不通的既有限制自此有绕行方案）。**剩余：#[ignore] 真机测试 ×3、litmus 套件（均验证类，随真机窗口跑）**
 5. **工程债清单（权威记录 = docs/tracking/review-fixes.md 挂账节 + docs/decisions.md K53）**：原审查 H3（rename 进 staged 路径 chimera，探针留证）、header RTT+PBKDF2 LRU、fs.rs 拆分、窗口数学 AeadV2Window 下沉、delete_pending 半死代码维持现状（生产写/测试读，激活需语义设计）。2026-09-11 已清一批（K53）：VOLUME_SERIAL 按卷名派生、宽限表 size+mtime 双见证（RB1 窄缝闭环）、unix_to_filetime 整数域、M2 反解歧义注释留证、LetterInUse 文案达标。
-6. ~~**Phase 4 SFTP 待拍板（SF0）**~~ **已拍板（2026-09-14，K60 入档 decisions）：方案获批，SF1 解锁可开工**——① D1 = 密码 + 私钥（含 passphrase；keyboard-interactive/agent 不做，挂账遇需再议）；② D2 = 显式接受 + 指纹落盘（未记录拒连给可行动错误、指纹变更恒拒）；③ D3 = 起步单连接（**多卷≠多连接**：多服务器各一卷=Phase 2.5 既有能力自动继承；同卷吞吐多连接留 SF4 实测后议）。详见 `docs/plans/2026-09-14-sftp-driver.md` §8 + `docs/tracking/phase4-sftp.md`。
+6. ~~**Phase 4 SFTP 待拍板（SF0）**~~ **已拍板（2026-09-14，K60 入档 decisions）：方案获批，SF1 解锁可开工**——① D1 = 密码 + 私钥（含 passphrase；keyboard-interactive/agent 不做，挂账遇需再议）；② D2 = 显式接受 + 指纹落盘（未记录拒连给可行动错误、指纹变更恒拒）；③ D3 = 起步单连接（**多卷≠多连接**：多服务器各一卷=Phase 2.5 既有能力自动继承；同卷吞吐多连接留 SF4 实测后议）。详见 `docs/plans/2026-09-14-sftp-driver.md` §8 + `docs/tracking/phase4-sftp.md`。~~**执行完成（2026-09-15，K66）：SF1–SF4 全批次落地，SF5 销账**~~——conformance 八断言绿 + WSL2 OpenSSH 真机矩阵 11/11 + 数据破坏级 symlink 下潜缺陷修复；**setup 交互式向导挂账（自用项目：D2 指纹接受经 doctor 显示 + toml/web 表单编辑即可完成，SF4 真机确认可操作性）**。**SF4 未覆盖项（如实挂账）**：真实公网链路的断线重连形态与符号链接的「链接链」形态（本机 fixture 只做了单层链）；`k-i`/`ssh-agent` 认证延续 SF0 挂账。

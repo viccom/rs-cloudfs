@@ -13,6 +13,7 @@ members = [
     "crates/drivers/ck-telegram",
     "crates/drivers/ck-local",
     "crates/drivers/ck-baidu",
+    "crates/drivers/ck-sftp",
 ]
 # Not a member on purpose: an external path dependency keeps rustc's
 # cap-lints=allow for upstream code (fmt/clippy gates stay ours), while

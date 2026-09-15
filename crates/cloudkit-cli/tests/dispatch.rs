@@ -25,9 +25,9 @@ use cloudkit_cli::{
     build_backend_transport, local_sync_unsupported_warning, proxy_ineffective_warning,
     BackendProbe,
 };
-// Driver-gated enum pins (FT2 / FT3): the `Baidu` / `Local` arm
-// type-assertion tests are the only users of the enum name.
-#[cfg(any(feature = "baidu", feature = "local"))]
+// Driver-gated enum pins (FT2 / FT3 / SF3): the `Baidu` / `Local` /
+// `Sftp` arm type-assertion tests are the only users of the enum name.
+#[cfg(any(feature = "baidu", feature = "local", feature = "sftp"))]
 use cloudkit_cli::BackendTransport;
 // Baidu-gated surface (FT2): the mock backend, the injected dispatch
 // seam and the driver trait only exist with the `baidu` feature.
@@ -133,6 +133,23 @@ fn local_config(root: &std::path::Path) -> CyDriveConfig {
     CyDriveConfig {
         backend: Backend::Local,
         local_root: Some(root.to_string_lossy().into_owned()),
+        ..CyDriveConfig::default()
+    }
+}
+
+/// A validate-clean sftp config (loopback host; the dispatch's factory
+/// only constructs — D3 lazy connect — so no server is needed here).
+fn sftp_config() -> CyDriveConfig {
+    CyDriveConfig {
+        backend: Backend::Sftp,
+        sftp_host: Some("127.0.0.1".to_string()),
+        sftp_port: Some(2222),
+        sftp_username: Some("tester".to_string()),
+        sftp_password: Some("stub-only-password".to_string()),
+        sftp_host_fingerprint: Some(
+            "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+        ),
+        sftp_root: Some("/srv/cloudfs".to_string()),
         ..CyDriveConfig::default()
     }
 }
@@ -289,6 +306,64 @@ async fn missing_local_driver_refuses_with_the_rebuild_message() {
     assert!(
         message.contains(cloudkit_cli::LOCAL_DRIVER_REQUIRED),
         "the off-feature refusal is the K31 rebuild message: {message}"
+    );
+}
+
+/// Off-feature pin (Phase 4 / SF3, K31 shape): in a binary built
+/// without the sftp driver, the dispatch's sftp arm carries the
+/// actionable rebuild message — not an assembly attempt (there is no
+/// driver to construct).
+#[cfg(not(feature = "sftp"))]
+#[tokio::test]
+async fn missing_sftp_driver_refuses_with_the_rebuild_message() {
+    let err = match build_backend_transport(&sftp_config()).await {
+        Ok(_) => panic!("a driver-less binary cannot assemble the sftp arm"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains(cloudkit_cli::SFTP_DRIVER_REQUIRED),
+        "the off-feature refusal is the K31 rebuild message: {message}"
+    );
+}
+
+/// With the driver: `backend = "sftp"` assembles a SftpTransport over
+/// the configured identity — the factory only constructs (D3 lazy
+/// connect), so the volume identity and the capability face are
+/// available without a server. This pins the dispatch's sftp arm end
+/// to end (the §4.2 capability bits ride the transport face).
+#[cfg(feature = "sftp")]
+#[tokio::test]
+async fn sftp_key_builds_sftp_transport() {
+    let cfg = sftp_config();
+    cfg.validate().expect("the test config validates");
+    let dispatched = build_backend_transport(&cfg)
+        .await
+        .expect("the sftp arm assembles without connecting (D3)");
+    assert!(matches!(dispatched, BackendTransport::Sftp(_)));
+    assert_eq!(
+        dispatched.volume(),
+        "sftp:tester@127.0.0.1:2222",
+        "volume identity is <user>@<host>:<port>"
+    );
+    let caps = dispatched.caps();
+    assert!(caps.range_read, "sftp declares range_read (§4.2)");
+    assert!(caps.server_side_move, "sftp declares server_side_move");
+    assert!(
+        caps.authoritative_index,
+        "sftp declares authoritative_index"
+    );
+    assert!(
+        caps.remote_delete,
+        "the transport face declares remote_delete"
+    );
+    assert!(!caps.resume, "sftp does not declare resume");
+    assert!(!caps.multipart, "sftp does not declare multipart");
+    // The K12 sync ruling: sftp never runs the sync task (the remote
+    // filesystem is the source of truth — same as local).
+    assert!(
+        !cloudkit_core::sync::is_sync_supported(&Backend::Sftp),
+        "sftp is not a sync backend"
     );
 }
 

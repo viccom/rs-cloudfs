@@ -39,6 +39,7 @@ const VOLUME_LABELS = {
     telegram: 'backend.telegram',
     baidu: 'backend.baidu',
     local: 'backend.local',
+    sftp: 'backend.sftp',
 };
 
 function backendDisplayName(backend) {
@@ -470,14 +471,18 @@ const VF_CRED_GROUPS = {
     telegram: 'vf-group-telegram',
     baidu: 'vf-group-baidu',
     local: 'vf-group-local',
+    sftp: 'vf-group-sftp',
 };
 
 // The starred requireds per backend (UX-level only — the CREATE command
-// is the authority and its ERR text renders in the red box).
+// is the authority and its ERR text renders in the red box). sftp: host +
+// username are required; password/private-key-path is at least-one (the
+// CREATE ERR text carries that rule).
 const VF_REQUIRED = {
     telegram: ['vf-bot-token', 'vf-chat-id'],
     baidu: ['vf-baidu-app-key', 'vf-baidu-app-secret', 'vf-baidu-access-token', 'vf-baidu-refresh-token'],
     local: ['vf-local-root'],
+    sftp: ['vf-sftp-host', 'vf-sftp-username'],
 };
 
 // String fields: input id → payload key (collected only when non-empty —
@@ -491,6 +496,13 @@ const VF_STRINGS = {
     'vf-baidu-refresh-token': 'baidu_refresh_token',
     'vf-baidu-root': 'baidu_root',
     'vf-local-root': 'local_root',
+    'vf-sftp-host': 'sftp_host',
+    'vf-sftp-username': 'sftp_username',
+    'vf-sftp-password': 'sftp_password',
+    'vf-sftp-private-key-path': 'sftp_private_key_path',
+    'vf-sftp-private-key-passphrase': 'sftp_private_key_passphrase',
+    'vf-sftp-host-fingerprint': 'sftp_host_fingerprint',
+    'vf-sftp-root': 'sftp_root',
     'vf-enc-pass': 'encryption_password',
     'vf-sync-url': 'sync_url',
     'vf-sync-secret': 'sync_secret',
@@ -502,6 +514,7 @@ const VF_NUMBERS = {
     'vf-chat-id': 'chat_id',
     'vf-chunk': 'chunk_size_mb',
     'vf-sync-interval': 'sync_interval_secs',
+    'vf-sftp-port': 'sftp_port',
 };
 
 // The form card's current mode: null (closed), 'create' or 'edit'.
@@ -632,6 +645,11 @@ function vfPrefillEdit(config) {
         'vf-chat-id': config.chat_id,
         'vf-baidu-root': config.baidu_root,
         'vf-local-root': config.local_root,
+        'vf-sftp-host': config.sftp_host,
+        'vf-sftp-username': config.sftp_username,
+        'vf-sftp-private-key-path': config.sftp_private_key_path,
+        'vf-sftp-host-fingerprint': config.sftp_host_fingerprint,
+        'vf-sftp-root': config.sftp_root,
     };
     for (const [id, value] of Object.entries(plain)) {
         const el = vfEl(id);
@@ -648,6 +666,8 @@ function vfPrefillEdit(config) {
         'vf-baidu-app-secret': config.baidu_app_secret,
         'vf-baidu-access-token': config.baidu_access_token,
         'vf-baidu-refresh-token': config.baidu_refresh_token,
+        'vf-sftp-password': config.sftp_password,
+        'vf-sftp-private-key-passphrase': config.sftp_private_key_passphrase,
         'vf-enc-pass': config.encryption_password,
         'vf-sync-url': config.sync_url,
         'vf-sync-secret': config.sync_secret,

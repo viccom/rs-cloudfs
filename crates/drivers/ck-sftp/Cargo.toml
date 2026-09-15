@@ -1,0 +1,53 @@
+[package]
+name = "ck-sftp"
+description = "SSH/SFTP StorageDriver - driver skeleton + config integration (Phase 4 SF1; behavioral tests land with the SF2 in-process stub)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# StorageDriver/UploadStager 均为 #[async_trait] trait，实现侧必须使用
+# 同一宏（ck-local / ck-baidu 同款）。
+async-trait = "0.1"
+# reader 帧构造（Bytes 零拷贝形态，ByteStream 的项类型）。
+bytes = "1"
+# L2 契约层是唯一 workspace 依赖——驱动 crate 禁依赖 cloudkit-core 与
+# 任何 L3+ crate（driver-onboarding §1 / R1，scripts/check_layers 拦截）。
+cloudkit-storage = { path = "../../cloudkit-storage" }
+# reader/upload 流的 Stream 组合子（ck-local 同款最小特性面）。
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false }
+# SSH/SFTP 协议栈（Phase 4 / K59 选型，计划 §1）：russh 0.63（下限 =
+# GHSA-47hw-gvq5-r2gm 客户端侧 High 修复所在线）+ russh-sftp 3.0
+#（max_concurrent_reads=16 流水线读，2.x 串行读缺陷已修）。ring 后端
+# 零新增 C 依赖（ring 0.17.14 已在 lock，经 rustls）；禁默认特性里的
+# aws-lc-rs（需 C/CMake 工具链）。
+russh = { version = "0.63", default-features = false, features = [
+    "ring",
+    "rsa",
+    "async-trait",
+] }
+russh-sftp = "3.0"
+# thiserror：client.rs 会话错误枚举（russh Handler::Error 关联类型）。
+thiserror = "2"
+# 会话失败的可行动文案落日志（D2：指纹与接受途径经 warn 通道到达
+# 用户——StorageError::Unauthorized 无载荷，分类学边界见 error.rs）。
+tracing = "0.1"
+# 文件 IO（AsyncReadExt/AsyncWriteExt/AsyncSeekExt）+ 会话锁
+#（tokio::sync::Mutex，单连接串行化）+ spawn_blocking（私钥文件读取）
+# + 重连退避 sleep。
+tokio = { version = "1", features = ["rt", "io-util", "sync", "time", "fs"] }
+
+[dev-dependencies]
+# 纯函数层单测（config 解析/错误映射/能力位/路径规范化）+ SF2 桩测试
+# 的 #[tokio::test]（rt/macros）。
+tokio = { version = "1", features = ["rt", "macros", "net", "time"] }
+# SF2 桩：服务端 Ed25519 随机密钥生成（russh 同一 rand 0.10 线，lock
+# 既有版本——非新增依赖项）。`rand::rng()` 在 std 默认特性面内。
+rand = "0.10"
+# SF2 桩：私钥形态认证测试的临时密钥文件（lock 既有，ck-local dev-dep
+# 同版本先例）。
+tempfile = "3"

@@ -11,7 +11,7 @@ L5 应用  cli │ webdav 网关 │ web 仪表盘 │ bot(telegram)
 L4 服务  上传队列 │ 同步引擎(+sync-server) │ LRU 缓存 │ 加密(v1 GCM/v2 分块 AEAD 流式，新卷默认 v2)
 L3 领域  VFS │ 元数据索引(SQLite) │ MetadataEvent 总线
 L2 抽象  StorageDriver trait + 能力位 + 错误分类学 + conformance kit
-L1 驱动  telegram │ baidu │ local │ (未来: sftp(Phase 4 立项) / 115/123/s3…)
+L1 驱动  telegram │ baidu │ local │ sftp │ (未来: 115/123/s3…)
 ```
 
 **新后端接入 = 实现一个驱动 + 过 conformance 套件，上层全部能力（挂载/仪表盘/同步/CLI）自动可用。**驱动分两类（[driver-onboarding §10](docs/standards/driver-onboarding.md)）：后端有「按路径枚举」面的走 `StorageDriver` 宽面 + conformance（baidu/local/sftp）；没有的走 `CloudTransport` 窄面（telegram 先例——远端是消息，bot 读历史被平台拒绝，索引只存在于本地 db + sync）。**两类在编译开关上完全平权**（见下文 feature 门控）。
@@ -30,36 +30,37 @@ L1 驱动  telegram │ baidu │ local │ (未来: sftp(Phase 4 立项) / 115/
 | Phase 3.6 | 存储卷运行态装卸 + 卷级 enabled 键（RV0–RV3，K48–K51）+ 两轮审查修复（K55/K56、K58 5H+8M） | ✅ 完成 |
 | 卷管理面 | Web `/volumes` 页 + 卷全生命周期命令协议（K57：SHOW/ENABLE/DISABLE/REBUILD/CREATE/UPDATE/DESTROY，凭据 write-only）+ 运行时后台 rebuild | ✅ 完成 |
 | Web 体验 | ArtPlayer 内置播放器 + 复制链接 + 注入修复 + **默认加密方案 aead_v2**（新卷流式播放默认可用） | ✅ 完成（1069 测试绿） |
-| Phase 4 | ssh/sftp 存储驱动（russh 0.63 + russh-sftp 3.0，ring 后端；K59） | 🟨 方案立项待批（三轮外部研究 + Windows 进程内 SFTP 桩实测验证完成） |
+| Phase 4 | ssh/sftp 存储驱动（russh 0.63 + russh-sftp 3.0，ring 后端；K59/K60） | ✅ 完成（SF1–SF4：conformance 八断言绿；WSL2 OpenSSH 真机矩阵 11/11，吞吐上行 140.5 / 下行 67.7 MiB/s；SF5 多连接增强明确销账） |
 
 阶段计划与裁决：[docs/plans/2026-09-07-cloudfusion-foundation.md](docs/plans/2026-09-07-cloudfusion-foundation.md) ｜ 历史裁决：[docs/decisions.md](docs/decisions.md)
 
-## 快速开始（三后端：telegram / baidu / local，`backend` 配置键分发）
+## 快速开始（四后端：telegram / baidu / local / sftp，`backend` 配置键分发）
 
 ```powershell
 cargo build --release
 ./cydrive.exe setup     # 选后端：telegram(bot token/chat_id) / baidu(appkey+refresh_token) / local(根目录)
-./cydrive.exe doctor    # 体检（baidu：token 探活/直连声明；local：root 可写）
+./cydrive.exe doctor    # 体检（baidu：token 探活/直连声明；local：root 可写；sftp：连接探活+主机密钥指纹）
 ./cydrive.exe run       # WebDAV :8080 → 自动挂载（默认 Y:；config drive_letter 可改）｜ 仪表盘 :8088 ｜ ctrl+c 或 cydrive stop
 ```
 
 baidu 实例最小配置（config.toml）：`backend = "baidu"` + `baidu_app_key/baidu_app_secret/baidu_refresh_token`（或 env `CYDRIVE_BAIDU_*`，access_token 缺省由 refresh 换取）；`baidu_root` 默认 `/apps/cloudfs`。
 local 实例：`backend = "local"` + `local_root = "<绝对路径>"`。
+sftp 实例：`backend = "sftp"` + `sftp_host` / `sftp_username` + 认证（`sftp_password` **或** `sftp_private_key_path`，可选 `sftp_private_key_passphrase`）；`sftp_port` 默认 22、`sftp_root` 默认 `/`。**首次连接必须先接受服务器主机密钥**：`cydrive doctor` 会打印服务器实际指纹（D2：未接受前驱动拒连，绝无静默 TOFU），把该值填进 `sftp_host_fingerprint` 即完成接受；指纹此后变更会被恒拒（MITM 信号）。凭据可经 env `CYDRIVE_SFTP_PASSWORD` / `CYDRIVE_SFTP_PRIVATE_KEY_PASSPHRASE` 覆盖文件值。
 **全参数示例配置**（凭据已脱敏占位，可用 `cydrive status` 验证解析）：单卷 [`examples/single-volume.example.toml`](examples/single-volume.example.toml)（36 键全览，注释分组）；多卷 [`examples/multi-volume/`](examples/multi-volume/)（进程级 `config.example.toml` + 4 卷矩阵 `volumes/`：baidu-enc / baidu-plain / local-enc / local-plain——同后端多卷×加密开关，层次在文件布局：进程级键与卷级键分文件，见下节）。
 权威后端（baidu/local）冷启动可 `cydrive rebuild` 从后端重建索引（明文集；加密实例走 sync）。多卷模式下若实例在运行，rebuild 自动经控制通道转发为各卷的后台 `REBUILD <名>`（受理即回，进度看 `LIST` 的 `rebuilding` 标记；实例不在线则照旧离线重建）。
 新后端接入指南：[docs/standards/driver-onboarding.md](docs/standards/driver-onboarding.md)（conformance 套件 + 装配点 + E2E 拓扑）。
 
 ### 按需裁剪驱动（feature 门控）
 
-三个驱动都是可选依赖（feature：`telegram` / `baidu` / `local`，默认全开 = 默认构建行为不变）：
+四个驱动都是可选依赖（feature：`telegram` / `baidu` / `local` / `sftp`，默认全开 = 默认构建行为不变）：
 
 ```powershell
-cargo build --release                                              # 全量（默认三驱动）
+cargo build --release                                              # 全量（默认四驱动）
 cargo build --release --no-default-features --features local       # 纯本地
 cargo build --release --no-default-features --features local,baidu # 本地+百度
 ```
 
-缺驱动的二进制运行到对应表面时得到可行动报错（给出 rebuild 命令与 backend 改法，而非隐藏命令）；`cydrive --version` 显示本构建的驱动清单，如 `cydrive 0.10.0 (drivers: telegram, baidu, local)`，全关构建显示 `(drivers: none)`。
+缺驱动的二进制运行到对应表面时得到可行动报错（给出 rebuild 命令与 backend 改法，而非隐藏命令）；`cydrive --version` 显示本构建的驱动清单，如 `cydrive 0.10.0 (drivers: telegram, baidu, local, sftp)`，全关构建显示 `(drivers: none)`。裁剪掉 `sftp` 时整个 russh 协议栈都不进依赖图。
 
 ### 流式读（视频直接播放）
 
