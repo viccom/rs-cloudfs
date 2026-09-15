@@ -62,6 +62,8 @@ cargo build --release --no-default-features --features local,baidu # 本地+百�
 
 缺驱动的二进制运行到对应表面时得到可行动报错（给出 rebuild 命令与 backend 改法，而非隐藏命令）；`cydrive --version` 显示本构建的驱动清单，如 `cydrive 0.10.0 (drivers: telegram, baidu, local, sftp)`，全关构建显示 `(drivers: none)`。裁剪掉 `sftp` 时整个 russh 协议栈都不进依赖图。
 
+**三平台构建**：Windows（原生，主力）/ Linux（原生，WSL2 实测含 sftp 真机连通）均可直接编译运行；macOS 编译面已验证（交叉工具链可出 Mach-O 二进制，挂载功能未实现、运行未实机验证，SDK 许可有灰色地带）——完整指南见 [docs/platform-builds.md](docs/platform-builds.md)（命令、实测数字、四个 macOS 交叉坑的解、坑速查表）。
+
 ### 流式读（视频直接播放）
 
 非加密文件 + 支持 Range 的后端（baidu/local/telegram）的读取走 **Range 直通**：请求哪段拉哪段（4MiB 窗口），不再整文件下载后才能播放——764MiB 视频首字节 <1ms、1MiB 片段 ~0.2s。生效面：WebDAV 盘符、仪表盘播放器（**ArtPlayer**，本地内置无外联 CDN，支持常见音视频格式 + 播放失败自动回退原生素材）、`/api/download` URL（可直接喂 PotPlayer/VLC；文件管理页每行有「复制链接」按钮一键取直链）。**加密默认 `aead_v2`**（2026-09-14 起，新卷默认——分块 AEAD 按需拉密文窗口实时解密、逐 chunk 验签，同样支持 Range 流式读）；`gcm` v1 保留显式可选（整文件模式，Python 基线兼容形态），不支持 Range 的后端自动回退整文件模式。

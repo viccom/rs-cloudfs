@@ -14,6 +14,7 @@
 4. `docs/plans/2026-09-06-multicloud.md` —— 百度情报附录 A（端点/参数/errno/dlink/Range 实证）
 5. `docs/decisions.md` —— 历史裁决（自 rs-CyDrive 继承，继续追加）
 6. `docs/tracking/<phase>.md` —— 当前阶段任务跟踪单（当前活跃：`phase4-sftp.md`——SF0 已拍板，SF1 待开工；**开工先读、每批收口更新**）
+7. `docs/platform-builds.md` —— 三平台构建指南（Windows/Linux 原生 + macOS 交叉；实测数字与坑速查——**做平台相关构建/交叉编译前先读**）
 
 ## 当前阶段
 **Phase 3.6 完成（2026-09-12）**：存储卷运行态动态加载/卸载 + 卷级 enabled 键（RV0–RV3 四批，K48–K51 入档 decisions）——RV0 卷级 `enabled` 键（缺省 true=语义自然缺省，发现期跳过+`info!` 声明，禁用卷不占盘符不装配）；RV1 注册表动态化（三面 `RegistryHandle`：cli 主表=真源、webdav/web=投影，变更统一经 cli mutator 汇流；dav per-request 读锁查表分发，端口不变无重绑，锁不跨 await）；RV2 控制通道 `ADD/REMOVE/LIST`（K50 安全序=排空上传→盘符释放→faces 先 workers 后提交，任一步超时/失败中止且卷保持注册——绝不半卸；命令串行处理；REMOVE 只动运行态不碰卷文件，K49；`cydrive status` 多卷面带 LIST 转发）；RV3 真机矩阵六项全过（运行态 ADD baidu 卷 Q: 三面即时可见可读写、REMOVE 排空后三面消失数据跨往返完好、enabled=false 重启跳过、坏凭据 ADD 不伤兄弟卷；执行期发现：winfsp 卸载不受用户态句柄阻挡——占用中止路径在 webdav 腿+注入探针单测；执行期修复：logging::init 上移到配置发现前，发现期 info! 不再被吞）。前置 Phase 3（winfsp 挂载，K38–K46+K52）与 Phase 2.5（0.10.0 多卷/仪表盘）完成；过渡测试包：E:\Rs_Codes\cydrive-0.8.0-testkit（telegram+加密 U:/V:，仓外不入库）。
