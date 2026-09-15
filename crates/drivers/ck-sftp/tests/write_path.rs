@@ -672,3 +672,70 @@ async fn next_operation_reconnects_after_connection_kill() {
     );
     assert_eq!(stub.connection_count(), 2, "exactly one rebuild");
 }
+
+// --------------------------------------------- 审查修复批（提交/竞态面）---
+
+/// close 的 rename 重放窗（审查修复）：rename 已在服务端执行但回复
+/// 丢失（连接死亡 → with_retry 重连 → 重放 rename → part 已不在 →
+/// NotFound）时，close 必须探测 final 是否已就位——已就位且尺寸恰为
+/// written = 提交已落地，清 stash 返回成功；**不得**走 restore_scene
+/// 把 stash 复位回去（那会把已提交的新版本覆盖回旧版——数据丢失）。
+#[tokio::test]
+async fn close_treats_replayed_rename_as_committed() {
+    let (stub, driver) = setup().await;
+    stub.add_file("/f.bin", b"old-old!");
+
+    let hint = WriteHint {
+        size: Some(7),
+        ..Default::default()
+    };
+    let mut stager = driver.writer(&rel("f.bin"), &hint).await.expect("writer");
+    stager.write(b"newdata").await.expect("write");
+
+    // 模拟「rename 已在服务端执行、ACK 丢失」：服务端面把 part 直接
+    // 搬到 final（此时 final 已是新内容、stash 仍在、part 已不在）
+    assert!(
+        stub.simulate_lost_ack_rename("/f.bin").await,
+        "the staging part must exist before the simulated lost-ack rename"
+    );
+    assert_eq!(
+        stub.file_bytes("/f.bin").as_deref(),
+        Some(b"newdata".as_slice()),
+        "sanity: the server-side rename landed the new content"
+    );
+
+    let entry = stager
+        .close()
+        .await
+        .expect("close must treat the replayed rename as already committed");
+    assert_eq!(entry.size, 7);
+    assert_eq!(
+        stub.file_bytes("/f.bin").as_deref(),
+        Some(b"newdata".as_slice()),
+        "the committed new version must survive close"
+    );
+    assert!(
+        stub.staging_artifacts().is_empty(),
+        "the stash must be cleaned after the detected commit: {:?}",
+        stub.staging_artifacts()
+    );
+}
+
+/// rename 执行点撞已存在 → `Exists`（审查修复，镜像 mkdir 竞态臂）：
+/// 预检后、执行前目标被抢占创建——reject 形态服务器（OpenSSH 经典
+/// rename 对已存在目标回 Failure）在驱动面必须归一为契约的 Exists
+/// 而不是 Io。桩注入：目标对 stat 隐身、在下一个 rename 请求到达时
+/// 现形并撞车。
+#[tokio::test]
+async fn rename_race_into_existing_target_reports_exists() {
+    let (stub, driver) = setup().await;
+    stub.add_file("/from.txt", b"moving");
+    stub.add_file("/to.txt", b"occupied");
+    stub.hide_until_next_rename("/to.txt");
+
+    assert_eq!(
+        driver.rename(&rel("from.txt"), &rel("to.txt")).await.err(),
+        Some(StorageError::Exists),
+        "a rename racing into a freshly created target must surface Exists, not Io"
+    );
+}

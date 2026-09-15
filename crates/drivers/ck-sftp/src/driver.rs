@@ -247,8 +247,18 @@ impl StorageDriver for SftpDriver {
     /// 拒以 `Invalid`（walkable 判定拒绝下潜，aeroftp 教训 8）。
     /// 条目 kind 取 readdir attrs（OpenSSH 报链接本体形态：link-to-dir
     /// 在 list 中呈现为 File/link 长度——与 POSIX lstat 观感一致）。
+    ///
+    /// **根例外（审查修复）**：`dir` 为卷根时预检用**跟随** stat——根是
+    /// 操作者经 `sftp_root` 声明的挂载点，不是走查发现的条目，symlink
+    /// 根（如 `/var/www → /srv/www`）必须可列（修复前 symlink 根让整卷
+    /// 列表面报 Invalid）。跟随的只是挂载点解析，卷内条目仍走 lstat
+    /// ——GAP-A02 的防线下潜不重开。
     async fn list(&self, dir: &RelPath, page: Page) -> Result<Listing, StorageError> {
-        let attrs = self.client.symlink_metadata(&self.path(dir)).await?;
+        let attrs = if dir.is_root() {
+            self.stat_path(dir).await?
+        } else {
+            self.client.symlink_metadata(&self.path(dir)).await?
+        };
         if !attrs.is_dir() {
             return Err(StorageError::Invalid);
         }
@@ -268,9 +278,17 @@ impl StorageDriver for SftpDriver {
                 if is_staging_artifact(&name) {
                     return None;
                 }
-                // 词汇层不可表示的名字（驱动侧再硬化：join 拒绝的
-                // 组件）不可见即不可寻址
-                let child = dir.join(&name).ok()?;
+                // 词汇层不可表示的名字（join 拒绝的组件）不可见即不可
+                // 寻址；**不可寻址名同样不可见（审查修复）**——句柄往返
+                // `RelPath::new` 拒 `\`/`\0`，非 UTF-8 名被 russh-sftp
+                // 协议层 lossy 成 U+FFFD 替换串（替换名在服务器上并非
+                // 真实路径）——ck-local `join_validated` / 非 UTF-8 跳过
+                // 的同源硬化：list 产出的每条 Entry 都必须能被本驱动
+                // 的 delete/reader 寻址。
+                let child = match dir.join(&name) {
+                    Ok(child) if name_is_addressable(&name) => child,
+                    _ => return None,
+                };
                 Some(entry_from_attrs(&self.volume, &child, &entry.metadata()))
             })
             .collect();
@@ -304,8 +322,15 @@ impl StorageDriver for SftpDriver {
     /// 的消费方（递归走查/rebuild/列表渲染）不会把链接误当目录下潜。
     /// 需要跟随语义的读取（reader/下载）仍走 `metadata`（SSH_FXP_STAT
     /// 跟随，能读到链接指向的内容——这是用户预期）。
+    ///
+    /// **根例外（审查修复）**：卷根与 `list` 的根预检同裁决——跟随
+    /// 解析（symlink 根报目标目录的 `Dir`，而非链接本体的 `File`）。
     async fn stat(&self, path: &RelPath) -> Result<Entry, StorageError> {
-        let attrs = self.client.symlink_metadata(&self.path(path)).await?;
+        let attrs = if path.is_root() {
+            self.stat_path(path).await?
+        } else {
+            self.client.symlink_metadata(&self.path(path)).await?
+        };
         Ok(entry_from_attrs(&self.volume, path, &attrs))
     }
 
@@ -373,7 +398,14 @@ impl StorageDriver for SftpDriver {
                 self.ensure_parents(&parent).await?;
             }
         }
-        self.client.rename(&self.path(from), &self.path(to)).await
+        match self.client.rename(&self.path(from), &self.path(to)).await {
+            Ok(()) => Ok(()),
+            // 竞态窗内目标被抢占创建（reject 形态服务器对已存在目标回
+            // Failure→Io）：按 trait 契约归一 Exists——镜像 mkdir 的
+            // 竞态臂（审查修复：修复前该交错 surfaced 为 Io）
+            Err(_) if self.stat_path(to).await.is_ok() => Err(StorageError::Exists),
+            Err(other) => Err(other),
+        }
     }
 
     /// 流式读（Range 半开 + 越界钳制；offset 读 = SFTP 原生 seek）。
@@ -594,12 +626,26 @@ impl UploadStager for SftpStager {
             return Err(StorageError::Io(format!("sftp close after upload: {e}")));
         }
         // 原子固化：final 此刻为空（旧版已 stash）——POSIX rename 语义
-        // 直接落位；这是断言①「close 后立即可见」的兑现点
+        // 直接落位；这是断言①「close 后立即可见」的兑现点。
+        //
+        // **重放窗（审查修复）**：rename 可能在服务端已执行而回复丢失
+        //（连接死亡 → with_retry 重连 → 重放 rename → part 已不在 →
+        // NotFound）——探测 final 是否已就位且尺寸恰为 written：是 =
+        // 提交已落地，按已提交继续（下方校验/清 stash 照常）；否 = 真
+        // 失败，恢复现场后报原错误。不探测直接 restore_scene 会把 stash
+        // 复位回去——**把已提交的新版本覆盖回旧版（数据丢失）**。
         let final_remote = remote_path(&self.client.params().root, &self.final_rel);
         if let Err(e) = self.client.rename(&self.part_remote, &final_remote).await {
-            self.finished = true;
-            self.restore_scene().await;
-            return Err(e);
+            let already_committed = matches!(e, StorageError::NotFound)
+                && matches!(
+                    self.client.metadata(&final_remote).await,
+                    Ok(attrs) if attrs.len() == self.written
+                );
+            if !already_committed {
+                self.finished = true;
+                self.restore_scene().await;
+                return Err(e);
+            }
         }
         self.finished = true;
         // 硬仗②：close 后校验远端大小（短/零判失败——0 字节上传 bug
@@ -673,6 +719,16 @@ fn staging_names(final_remote: &str) -> (String, String) {
 /// 同时命中才算驱动残件）。
 pub(crate) fn is_staging_artifact(name: &str) -> bool {
     name.contains(".cksftp-") && (name.ends_with(".part") || name.ends_with(".old"))
+}
+
+/// 组件名可寻址性（审查修复，ck-local `join_validated` 同源硬化）：
+/// list 产出的每条 Entry 必须能被本驱动的 delete/reader 寻址——句柄
+/// 字符串 → `RelPath::new` 的往返拒绝 `\` 与 `\0`；russh-sftp 协议层
+/// 对非 UTF-8 名做 **lossy 替换**（U+FFFD 替换串在服务器上并非真实
+/// 路径，对它的任何寻址都是 NotFound）。三类名字不可见（不可寻址即
+/// 不可见；local 对非 UTF-8 名 `to_str()` 失败即跳过的同款立场）。
+pub(crate) fn name_is_addressable(name: &str) -> bool {
+    !name.contains('\\') && !name.contains('\0') && !name.contains('\u{FFFD}')
 }
 
 impl Drop for SftpStager {

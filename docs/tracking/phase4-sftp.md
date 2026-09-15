@@ -27,6 +27,22 @@
 
 ## 批次日志
 
+- **2026-09-15 深度审查修复批（K67，worktree `fix/phase4-review`）**：负责人指令对 Phase 4 全部代码改动做合入后深度审查（端到端测试已完成，修复须不破坏既有功能）。**三路审查**：主会话精读 ck-sftp src 六文件 + 两子代理分域审计（A=测试/桩面：无 High、6 Medium、7 Low；B=集成面：无 High、4 Medium、5 Low）。
+  - **修复（全部 TDD 红→绿留证，5+4 项）**：
+    - **H1 symlink 卷根不可用（驱动，功能级）**：`list`/`stat` 的 lstat 预检把 symlink 根（如 `/var/www → /srv/www`）也拒了——整卷列表面对 symlink 根报 Invalid。修复 = 根例外：卷根预检走跟随 stat（根是操作者经 `sftp_root` 声明的挂载点，非走查条目），卷内条目仍走 lstat（GAP-A02 防线不重开）。离线 `symlinked_volume_root_is_listable_and_stats_as_dir` + 真机新增 ⑥c 腿 `live_symlinked_volume_root_is_listable` 双验证。
+    - **M-a 不可寻址名可见（驱动，正确性）**：含 `\`/`\0` 名（句柄往返 `RelPath::new` 拒绝 → delete/reader 必败）与非 UTF-8 名（russh-sftp 协议层 **lossy 成 U+FFFD**——替换名在服务器上并非真实路径）此前会在 list 产出——产出即承诺可寻址。修复 = `name_is_addressable` 过滤（ck-local `join_validated`/非 UTF-8 跳过同源硬化）。
+    - **M-b rename 竞态臂报 Io（驱动，分类学）**：预检后执行前目标被抢占创建——reject 形态服务器回 Failure→Io 上抛，而契约要求 Exists。修复 = 镜像 mkdir 竞态臂（失败后复查 stat→Exists）；桩补 `hide_until_next_rename` 注入面回放该交错。
+    - **H2 close 重放窗数据丢失（驱动，数据保护）**：rename 已在服务端执行但 ACK 丢失（连接死→重连→重放 rename→part 已不在→NotFound）时，close 原路走 restore_scene——**把已提交的新版本覆盖回旧版**。修复 = 重放窗探测（NotFound + final 已就位且 size==written → 按已提交继续，清 stash 返回成功）；桩补 `simulate_lost_ack_rename`/`staging_artifacts` 注入观测面。
+    - **M-c SSH IO 死形态分类（驱动，error.rs）**：TCP 拒连/重置/超时经 `russh::Error::IO` 兜底归 Io——「服务器没起来」与重连骨架的触发形态（Unavailable）对不上。修复 = 按 `io::ErrorKind` 判定五种死形态归 Unavailable（本地资源类维持 Io）。
+    - **B-M1 env 路由违背 K28（集成，多卷运维级）**：`CYDRIVE_SFTP_PASSWORD`/`CYDRIVE_SFTP_PRIVATE_KEY_PASSPHRASE` 在装配点直读——多卷模式下绕过 K28 跳过，两个 sftp 卷 + 一条 export = 兄弟卷凭据全坏。修复 = 两键挪进 `with_env_overrides`（单卷装载链；baidu 空串=清除规则一并对齐），cli `sftp_params` 撤 env 直读——多卷免疫由构造保证；core 新测试 `sftp_credential_env_overrides_apply_and_empty_clears`。
+    - **B-M2 私钥相对路径不 rebase（集成）**：卷文件相对 `sftp_private_key_path` 锚定进程 CWD 而非卷 home（K21）。修复 = `resolve_volume_settings` 补该键 rebase（sftp_root 仍豁免——后端命名空间路径）；multivolume_ops 新测试（相对锚 home/绝对直通两臂）。
+    - **B-M3/B-M4 web 面（集成）**：编辑回填漏 `sftp_port`（数字段补）；`app.js`/`system.js` 两孪生 backend 标签表漏 sftp 行（各一行）。
+    - **小修**：live_matrix port 坏值 panic 而非静默回退 22、指纹空串视同未设置（防误导性 mismatch）、link_guard 消费后 panic 文案带重建指引；K18 proxy 文案补 sftp；注释漂移三处（web backend 文档、main.rs 两处 dispatch 注释）。
+  - **桩保真度增强（审查副产品）**：opendir 改跟随链接（OpenSSH 语义；早期拒链比真机更严且挡了 symlink 根场景）+ hidden 竞态注入 + lost-ack/staging_artifacts 管理面 + read 句柄可读性不变（挂账）。
+  - **未修复挂账（见 decisions K67.5）**：桩 read 不校验句柄可读性（A-M1）、early-EOF 分支桩不可达（A-M2）、quota 真值分支零覆盖（A-M3）、symlink×rename 组合桩不支持（A-M4）、真机断线重连腿（A-M5）、非 UTF-8 名 lossy 的根因在 russh-sftp（上游形态，驱动侧已不可见化处理）。
+  - **既有功能零破坏验证**：workspace **1149/0**（基线 1141 + 新增 8：4 行为 + 2 lib 纯函数 + 1 core env + 1 K21 rebase）；conformance 八断言/既有 63 离线测试零漂移全绿；裁剪构建（local,baidu）+ dispatch 12 绿；clippy/fmt/layers/secrets 全绿；**u18 真机 12/12**（11 旧腿全过 + 新增 ⑥c；吞吐 130.3↑/63.2↓ MiB/s 同档）。
+  - **未询问的决定（自主裁决，最可逆方向）**：①H1 根跟随只对卷根开（卷内 lstat 契约不动——GAP-A02 修复语义零漂移）；②M-a 选择「不可见」而非「报错」（list 是流式集合面，单条坏名不该炸整卷——local 同款立场）；③H2 重放窗探测限定 rename NotFound 形态（不扩大到 Io——重放窗的确定性信号只有 part 消失）；④B-M1 env 走 with_env_overrides 而非卷模式感知（前者是既有 K28 机制，零新逻辑面）；⑤B-M2 rebase 仅相对路径（绝对直通，幂等）。
+
 - **2026-09-15 第二轮真机：u18（负责人指名服务器，Phase 4 合入后）**：
   - **范围**：负责人提供 u18（172.27.199.30，Ubuntu 24.04 OpenSSH，root + 本机 RSA 私钥）要求验证 sftp 功能。live_matrix 原只喂密码认证（SF4 fixture 形态），本批补 `CYDRIVE_SFTP_TEST_KEY_PATH`（未加密私钥路径，`password`/`key_path` 二者至少其一；模块文档同步）——**私钥认证腿首次对真实 OpenSSH 验证**（SF4 仅密码；D1 私钥形态此前只有进程内桩覆盖）。
   - **服务器侧 fixture**：`/root/cydrive-sf4`（link_test 三件套 + link_guard/victim + protector，步骤同 fixture 文档）；指纹经 `ssh-keygen -F` 取自 known_hosts（**不入仓库**—— reinstall 即换）；递归删除腿消费 link_guard 后已重建，测试残留（`sf4/*` 工作目录）已清理。

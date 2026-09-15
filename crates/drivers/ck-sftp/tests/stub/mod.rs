@@ -116,6 +116,10 @@ struct VfsState {
     /// `stat` 请求直接以该状态码失败——驱动的错误映射经真实协议
     /// 回放（服务器回 Status 码 → 客户端 map_status）。消费即清空。
     fail_next_stat: Option<StatusCode>,
+    /// 竞态注入（rename 撞车测试的注入面）：集合内的路径对 stat/
+    /// lstat 请求隐身（NoSuchFile），在下一个 rename 请求到达时
+    /// 现形——回放「驱动预检放行、执行撞已存在目标」的交错。
+    hidden: BTreeSet<String>,
 }
 
 impl VfsState {
@@ -129,6 +133,7 @@ impl VfsState {
             next_handle: 0,
             mtime_tick: 0,
             fail_next_stat: None,
+            hidden: BTreeSet::new(),
         }
     }
 
@@ -488,6 +493,10 @@ impl russh_sftp::server::Handler for SftpHandler {
         if let Some(code) = vfs.fail_next_stat.take() {
             return Err(code);
         }
+        // 竞态注入：hidden 路径对 stat 隐身（NoSuchFile）
+        if vfs.hidden.contains(&path) {
+            return Err(StatusCode::NoSuchFile);
+        }
         // SSH_FXP_STAT：**跟随**链接（OpenSSH 语义）
         let attrs = vfs.stat_following(&path).ok_or(StatusCode::NoSuchFile)?;
         Ok(Attrs { id, attrs })
@@ -499,6 +508,9 @@ impl russh_sftp::server::Handler for SftpHandler {
         let mut vfs = lock_vfs!(self);
         if let Some(code) = vfs.fail_next_stat.take() {
             return Err(code);
+        }
+        if vfs.hidden.contains(&path) {
+            return Err(StatusCode::NoSuchFile);
         }
         let attrs = vfs.lstat_of(&path).ok_or(StatusCode::NoSuchFile)?;
         Ok(Attrs { id, attrs })
@@ -624,12 +636,12 @@ impl russh_sftp::server::Handler for SftpHandler {
 
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
         let mut vfs = lock_vfs!(self);
-        // 链接本体不是目录：link-to-dir 不可 opendir（OpenSSH 对链接
-        // 目标为目录的 opendir 会跟随成功，但**驱动不应发出该请求**
-        // ——桩按 lstat 形态拒绝，使「驱动是否下潜」在桩侧可观测）
-        if vfs.symlinks.contains_key(&path) {
-            return Err(StatusCode::Failure);
-        }
+        // OpenSSH 语义：opendir 的路径解析**跟随**链接（symlink 根、
+        // 或任何直指目录的链接都能打开）——「不下潜卷内链接」由驱动
+        // 侧 lstat 预检保证（list(link) 在预检处 Invalid，桩对齐真机
+        // 后该契约不弱化）。桩早期在这里拒链是比真机更严的第二道
+        // 墙，但把 symlink 根也挡了——审查修复批放通。
+        let path = vfs.resolve_link(&path).unwrap_or(path);
         if !vfs.dirs.contains(&path) {
             return Err(StatusCode::NoSuchFile);
         }
@@ -725,6 +737,9 @@ impl russh_sftp::server::Handler for SftpHandler {
         newpath: String,
     ) -> Result<Status, Self::Error> {
         let mut vfs = lock_vfs!(self);
+        // 竞态注入解除：hidden 路径在 rename 请求到达时现形（此后
+        // 正常处理——已存在目标按 OpenSSH 形态回 Failure）
+        vfs.hidden.clear();
         let source_is_dir = vfs.dirs.contains(&oldpath);
         if !source_is_dir && !vfs.files.contains_key(&oldpath) {
             return Err(StatusCode::NoSuchFile);
@@ -978,6 +993,64 @@ impl Stub {
     /// `stat`/`lstat` 直接以 `code` 失败，消费后恢复。
     pub fn fail_next_stat(&self, code: StatusCode) {
         self.lock_vfs().fail_next_stat = Some(code);
+    }
+
+    /// 竞态注入（rename 撞车测试）：路径对 stat/lstat 隐身
+    /// （NoSuchFile），在下一个 rename 请求到达时现形——回放「驱动
+    /// 预检放行、执行撞已存在目标」的交错。
+    pub fn hide_until_next_rename(&self, path: &str) {
+        self.lock_vfs().hidden.insert(path.to_string());
+    }
+
+    /// 模拟「rename 已在服务端执行但 ACK 丢失」（close 重放窗测试）：
+    /// 把 final 同目录的 `.cksftp-*….part` 暂存件直接搬到 final
+    /// （服务端面动作，不经客户端协议）。桩是 commit-on-close 模型，
+    /// 在写的 part 句柄尚不在 `files` 里——模拟 = 把句柄缓冲以新名
+    /// 落盘并把句柄改指 final（POSIX：rename 打开中的文件句柄保持
+    /// 有效；客户端随后的 awaited close 落在同一处，无害）。russh-sftp
+    /// 的写是 nowait 入队（服务端异步消费），故先等在途写落服（≤1s
+    /// 预算）。返回是否找到了已收到数据的暂存句柄。
+    pub async fn simulate_lost_ack_rename(&self, final_path: &str) -> bool {
+        let prefix = format!("{final_path}.cksftp-");
+        for _ in 0..500 {
+            let found = {
+                let vfs = self.lock_vfs();
+                vfs.file_handles
+                    .iter()
+                    .find(|(_h, fh)| {
+                        fh.path.starts_with(&prefix)
+                            && fh.path.ends_with(".part")
+                            && !fh.buf.is_empty()
+                    })
+                    .map(|(h, _)| h.clone())
+            };
+            if let Some(handle_key) = found {
+                let mut vfs = self.lock_vfs();
+                let (data,) = {
+                    let fh = vfs.file_handles.get_mut(&handle_key).expect("just found");
+                    let data = fh.buf.clone();
+                    fh.path = final_path.to_string();
+                    (data,)
+                };
+                let mtime = vfs.next_mtime();
+                vfs.files
+                    .insert(final_path.to_string(), FileNode { data, mtime });
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(2)).await;
+        }
+        false
+    }
+
+    /// 当前 VFS 里的驱动暂存残件清单（`.cksftp-` 前缀 + `.part`/`.old`
+    /// 结尾——与驱动 `is_staging_artifact` 同判定）。
+    pub fn staging_artifacts(&self) -> Vec<String> {
+        self.lock_vfs()
+            .files
+            .keys()
+            .filter(|p| p.contains(".cksftp-") && (p.ends_with(".part") || p.ends_with(".old")))
+            .cloned()
+            .collect()
     }
 
     /// 杀掉当前所有连接（协议级 SSH_MSG_DISCONNECT → 客户端传输层死）

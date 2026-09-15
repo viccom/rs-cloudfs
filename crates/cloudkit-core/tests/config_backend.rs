@@ -35,12 +35,17 @@ use cloudkit_core::config::{Backend, ConfigError, CyDriveConfig};
 
 // ------------------------------------------------------------- helpers ---
 
-/// The four CYDRIVE_BAIDU_* override keys (isolated against ambient env).
+/// Every credential env key these tests touch (isolated against ambient env):
+/// the four CYDRIVE_BAIDU_* overrides and the two CYDRIVE_SFTP_* ones
+/// (review fix: the sftp keys ride the same `with_env_overrides` chain, so
+/// the K28 multi-volume skip covers them — volumes never see env values).
 const BAIDU_ENV_KEYS: &[&str] = &[
     "CYDRIVE_BAIDU_APP_KEY",
     "CYDRIVE_BAIDU_APP_SECRET",
     "CYDRIVE_BAIDU_ACCESS_TOKEN",
     "CYDRIVE_BAIDU_REFRESH_TOKEN",
+    "CYDRIVE_SFTP_PASSWORD",
+    "CYDRIVE_SFTP_PRIVATE_KEY_PASSPHRASE",
 ];
 
 /// Serialises env-touching tests (same precedent as `tests/config.rs`).
@@ -297,6 +302,31 @@ fn env_overrides_apply_env_over_file_and_empty_clears() {
     std::env::set_var("CYDRIVE_BAIDU_APP_KEY", "");
     let cfg = baidu_config().with_env_overrides();
     assert_eq!(cfg.baidu_app_key, None, "empty env clears to None");
+}
+
+/// The two sftp credential keys ride the same `with_env_overrides` chain
+/// as the baidu ones (review fix, K28 alignment): env > file on the
+/// single-volume load path, empty clears, and — because the multi-volume
+/// discovery path never calls `with_env_overrides` — volume files are
+/// immune to cross-volume env bleed by construction.
+#[test]
+fn sftp_credential_env_overrides_apply_and_empty_clears() {
+    let _env = env_guard();
+
+    std::env::set_var("CYDRIVE_SFTP_PASSWORD", "env-password");
+    std::env::set_var("CYDRIVE_SFTP_PRIVATE_KEY_PASSPHRASE", "env-phrase");
+    let cfg = sftp_config().with_env_overrides();
+    assert_eq!(cfg.sftp_password.as_deref(), Some("env-password"));
+    assert_eq!(
+        cfg.sftp_private_key_passphrase.as_deref(),
+        Some("env-phrase")
+    );
+
+    // Empty clears to None (baidu/sync_url precedent); a key-path-only
+    // config stays valid without the password.
+    std::env::set_var("CYDRIVE_SFTP_PASSWORD", "");
+    let cfg = sftp_config().with_env_overrides();
+    assert_eq!(cfg.sftp_password, None, "empty env clears to None");
 }
 
 #[test]

@@ -1581,6 +1581,8 @@ impl CyDriveConfig {
     /// | `CYDRIVE_BAIDU_APP_SECRET` | `baidu_app_secret` | same empty-clears rule |
     /// | `CYDRIVE_BAIDU_ACCESS_TOKEN` | `baidu_access_token` | same empty-clears rule |
     /// | `CYDRIVE_BAIDU_REFRESH_TOKEN` | `baidu_refresh_token` | same empty-clears rule |
+    /// | `CYDRIVE_SFTP_PASSWORD` | `sftp_password` | same empty-clears rule (review fix: rides this chain so the K28 multi-volume skip applies — volumes never see env credentials) |
+    /// | `CYDRIVE_SFTP_PRIVATE_KEY_PASSPHRASE` | `sftp_private_key_passphrase` | same empty-clears rule |
     pub fn with_env_overrides(self) -> Self {
         let mut config = self;
         if let Some(value) = env_string("CYDRIVE_BOT_TOKEN") {
@@ -1626,6 +1628,16 @@ impl CyDriveConfig {
         }
         if let Some(value) = env_string("CYDRIVE_BAIDU_REFRESH_TOKEN") {
             config.baidu_refresh_token = (!value.is_empty()).then_some(value);
+        }
+        // Review fix (K28 alignment): the two sftp credential keys ride the
+        // same env > file chain as the baidu ones — the multi-volume
+        // discovery path never calls this method, so volume files are
+        // immune to cross-volume env bleed by construction.
+        if let Some(value) = env_string("CYDRIVE_SFTP_PASSWORD") {
+            config.sftp_password = (!value.is_empty()).then_some(value);
+        }
+        if let Some(value) = env_string("CYDRIVE_SFTP_PRIVATE_KEY_PASSPHRASE") {
+            config.sftp_private_key_passphrase = (!value.is_empty()).then_some(value);
         }
         config
     }

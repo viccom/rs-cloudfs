@@ -53,6 +53,7 @@ const VOLUME_LABELS = {
     telegram: 'backend.telegram',
     baidu: 'backend.baidu',
     local: 'backend.local',
+    sftp: 'backend.sftp',
 };
 
 function backendDisplayName(backend) {

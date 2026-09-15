@@ -211,8 +211,8 @@ pub struct WebUiConfig {
     /// Python: `bool(bot_token and bot_token != "NOT_CONFIGURED")`).
     pub is_configured: bool,
     /// The active backend's stable config spelling (`"telegram" |
-    /// "baidu" | "local"` — `Backend::as_str`); the dashboard derives
-    /// its labels and copy from this. Sourced from the config at
+    /// "baidu" | "local" | "sftp"` — `Backend::as_str`); the dashboard
+    /// derives its labels and copy from this. Sourced from the config at
     /// assembly, so it names the backend that actually booted.
     pub backend: String,
     /// The dispatched volume identity (`baidu:<uid>` / `local:<hash>`);

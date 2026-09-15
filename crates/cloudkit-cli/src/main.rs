@@ -956,7 +956,8 @@ async fn run_single_volume(cfg: CyDriveConfig, cwd: std::path::PathBuf) -> Resul
 
 /// The multi-volume run flow (Phase 2.5 / MV1): per-volume transport
 /// dispatch (the same two arms as the single-volume flow — telegram's
-/// deadline-bounded connect and the unified baidu/local dispatch — keyed
+/// deadline-bounded connect and the unified non-telegram dispatch
+/// (baidu/local/sftp) — keyed
 /// on each volume's settings with K21 volume-home state directories),
 /// then the Volume Registry assembly and ONE process-level stop gate.
 async fn run_multi_volume(
@@ -1103,7 +1104,8 @@ async fn run_multi_volume(
 /// The single-volume transport dispatch shared by `run` and the in-process
 /// winfsp `mount` path (Phase 3 / WF4 extraction; the body is the
 /// pre-WF4 `run_single_volume` arm verbatim): telegram's deadline-bounded
-/// connect raced against Ctrl+C, or the unified baidu/local dispatch which
+/// connect raced against Ctrl+C, or the unified non-telegram dispatch
+/// (baidu/local/sftp) which
 /// also fills the dashboard identity into `options`. `Ok(None)` means
 /// Ctrl+C won the connect race (the caller exits cleanly).
 async fn connect_single_volume_transport(

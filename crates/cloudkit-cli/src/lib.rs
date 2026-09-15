@@ -1067,6 +1067,18 @@ pub fn resolve_volume_settings(spec: &VolumeConfig) -> Result<CyDriveConfig> {
                 .into_owned(),
         );
     }
+    // sftp_private_key_path is a filesystem path like the three above
+    // (review fix): a relative value in a volume file would otherwise be
+    // read against the process CWD — wrong key file (or none) depending on
+    // where cydrive was launched from. sftp_root stays a backend namespace
+    // path (leading '/', same exemption as baidu_root).
+    if let Some(key_path) = settings.sftp_private_key_path.as_deref() {
+        settings.sftp_private_key_path = Some(
+            resolve_volume_path(&home, key_path)
+                .to_string_lossy()
+                .into_owned(),
+        );
+    }
     Ok(settings)
 }
 
@@ -5138,25 +5150,21 @@ fn sftp_params(cfg: &CyDriveConfig) -> Result<ck_sftp::SftpParams> {
         pairs.push(("sftp_port".to_string(), port.to_string()));
     }
     push(&mut pairs, "sftp_username", cfg.sftp_username.as_deref());
-    // Credential keys resolve env-over-file (R3 chain, per key).
-    let password = std::env::var("CYDRIVE_SFTP_PASSWORD")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| cfg.sftp_password.clone());
-    push(&mut pairs, "sftp_password", password.as_deref());
+    // Credential keys arrive already env-resolved: CYDRIVE_SFTP_PASSWORD /
+    // CYDRIVE_SFTP_PRIVATE_KEY_PASSPHRASE ride `with_env_overrides` on the
+    // single-volume load path (review fix, K28 — the multi-volume path
+    // never applies env overrides, so volume files can't bleed credentials
+    // across volumes; reading env here would bypass that guarantee).
+    push(&mut pairs, "sftp_password", cfg.sftp_password.as_deref());
     push(
         &mut pairs,
         "sftp_private_key_path",
         cfg.sftp_private_key_path.as_deref(),
     );
-    let passphrase = std::env::var("CYDRIVE_SFTP_PRIVATE_KEY_PASSPHRASE")
-        .ok()
-        .filter(|v| !v.is_empty())
-        .or_else(|| cfg.sftp_private_key_passphrase.clone());
     push(
         &mut pairs,
         "sftp_private_key_passphrase",
-        passphrase.as_deref(),
+        cfg.sftp_private_key_passphrase.as_deref(),
     );
     push(
         &mut pairs,
@@ -5375,8 +5383,9 @@ impl ck_baidu::TokenStore for ConfigTokenStore {
 
 // -------------------------------------------- K12 / K18 warning helpers ---
 
-/// K18: `proxy_url` has no effect on the baidu/local backends (their
-/// drivers always connect directly — no_proxy + forced IPv4); the
+/// K18: `proxy_url` has no effect on the baidu/local/sftp backends (their
+/// drivers always connect directly — no_proxy + forced IPv4; the sftp
+/// transport has no proxy support); the
 /// assembly logs this warning and doctor repeats it. `None` on
 /// telegram (the proxy is a live setting there) or when no proxy is
 /// configured.
@@ -5388,8 +5397,9 @@ pub fn proxy_ineffective_warning(cfg: &CyDriveConfig) -> Option<&'static str> {
 
 /// The K18 declaration text shared by the assembly log and doctor.
 pub const PROXY_DIRECT_BACKEND_NOTICE: &str =
-    "proxy_url is set but has no effect on this backend: baidu/local always connect \
-     directly (no_proxy + forced IPv4); the proxy only serves the telegram transport";
+    "proxy_url is set but has no effect on this backend: baidu/local/sftp always connect \
+     directly (no_proxy + forced IPv4; the sftp transport has no proxy support); the proxy \
+     only serves the telegram transport";
 
 /// K12: a local instance cannot run the metadata-sync task (the local
 /// root IS the source of truth); a `sync_url` on such an instance is a

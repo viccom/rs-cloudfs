@@ -162,6 +162,20 @@ pub(crate) fn map_ssh_error(error: russh::Error) -> StorageError {
         | Error::InactivityTimeout
         | Error::SendError
         | Error::WrongChannel => StorageError::Unavailable(format!("ssh transport: {error}")),
+        // TCP 层死形态（拒连/重置/中断/超时/对端早闭）同属「服务器不可
+        // 达/连接已死」——归 Unavailable 而非 Io（审查修复：修复前
+        // 「服务器没起来」在驱动面 surfaced 为 Io；按 io::ErrorKind
+        // 判定，不做字符串匹配）。其余 IO（本地资源类）维持 Io。
+        Error::IO(io) => match io.kind() {
+            std::io::ErrorKind::ConnectionRefused
+            | std::io::ErrorKind::ConnectionReset
+            | std::io::ErrorKind::ConnectionAborted
+            | std::io::ErrorKind::TimedOut
+            | std::io::ErrorKind::UnexpectedEof => {
+                StorageError::Unavailable(format!("ssh transport io: {io}"))
+            }
+            _ => StorageError::Io(format!("ssh io: {io}")),
+        },
         // 其他（KEX/算法/协议/包形态）→ Io 保留原始消息
         other => StorageError::Io(format!("ssh: {other}")),
     }

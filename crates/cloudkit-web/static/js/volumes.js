@@ -692,6 +692,11 @@ function vfPrefillEdit(config) {
     if (scheme) scheme.value = config.encryption_scheme === 'aead_v2' ? 'aead_v2' : 'gcm';
     const chunk = vfEl('vf-chunk');
     if (chunk && typeof config.chunk_size_mb === 'number') chunk.value = config.chunk_size_mb;
+    // sftp_port is a number-typed plain key (review fix): SHOW returns the
+    // stored value, and leaving it out of the numeric prefill made an edit
+    // form show the "22 (default)" placeholder over a stored 2222.
+    const sftpPort = vfEl('vf-sftp-port');
+    if (sftpPort && typeof config.sftp_port === 'number') sftpPort.value = config.sftp_port;
     const interval = vfEl('vf-sync-interval');
     if (interval && typeof config.sync_interval_secs === 'number') {
         interval.value = config.sync_interval_secs;

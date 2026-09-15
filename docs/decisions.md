@@ -702,3 +702,14 @@
 - **K66.6 未询问的决定（自主模式，最可逆方向）**：①`stat`/`list` 采 lstat 观察（一致性优先：`kind == Dir` 的消费方绝不能把链接当目录；读目标有 `reader` 通道）；②setup 交互向导不做（doctor 显示指纹 + toml/表单编辑已足够，SF4 确认可操作）；③env 链只开两个凭据键（对齐 baidu「仅凭据键有 env」）；④真机套件 `#[ignore]` + env 凭据（R3），不做 CI 接入；⑤符号链接 fixture 用「服务器侧预置 + 缺则 panic」形态（不静默跳过）。
 - **K66.7 回滚点**：整批在分支 `feat/sftp-driver`（4 commits：37360ba / 4d3e539+71abc2e / 3f007f7 / 49de14e），merge 前可整支丢弃；merge 后回滚 = revert 那一个 merge commit（合并 commit 版本）；单驱动禁用 = `--no-default-features` 去掉 `sftp`（其余功能零影响——接线全在追加臂）。
 - **K66.8 未覆盖项（挂账）**：真实公网链路（延迟/丢包下的断线重连形态、吞吐）、符号链接链（多层链）与 symlink 的 rebuild 走查形态、`k-i`/ssh-agent 认证（沿 SF0 挂账）、SFTP 服务器的非 OpenSSH 实现（如嵌入式服务器 attrs 不可信形态——aeroftp 教训 7 的 STAT 回退未实现，遇服务器再议）。
+
+## 2026-09-15 K67：Phase 4 合入后深度审查——9 项修复（5 驱动 + 4 集成），既有功能零破坏
+
+负责人指令：对 Phase 4 全部代码改动做深度代码审查（E2E 已完成，修复须不破坏既有功能与逻辑）。三路审查（主会话精读 ck-sftp src 六文件 + 子代理 A 测试/桩面 + 子代理 B 集成面），两子代理均无 High。
+
+- **K67.1 驱动修复五项（全部红→绿留证）**：①**symlink 卷根不可用**（H 级——`list`/`stat` 的 lstat 预检拒绝 symlink 根，整卷 Invalid；修复 = 卷根走跟随 stat，卷内条目维持 lstat，GAP-A02 防线不重开）；②**不可寻址名可见**（`\`/`\0` 名句柄往返必败 + 非 UTF-8 名被 russh-sftp 协议层 lossy 成 U+FFFD——修复 = `name_is_addressable` 过滤，「list 产出即可寻址」，ck-local 同源硬化）；③**rename 竞态臂报 Io**（修复 = 镜像 mkdir 竞态臂复查归一 Exists）；④**close 重放窗数据丢失**（H 级——rename ACK 丢失重放后 restore_scene 会把已提交新版本覆盖回旧版；修复 = NotFound + final 已就位且 size 吻合 → 按已提交继续）；⑤**SSH IO 死形态分类**（TCP 拒连/重置/超时按 `io::ErrorKind` 归 Unavailable——重连骨架触发形态对齐）。
+- **K67.2 集成修复四项**：①**`CYDRIVE_SFTP_*` env 违背 K28**（装配点直读绕过多卷跳过——跨卷凭据串味；修复 = 两键挪进 `with_env_overrides`（单卷链、空串=清除对齐 baidu），cli 撤 env 直读，多卷免疫由构造保证）；②`sftp_private_key_path` 相对路径 K21 rebase（原锚进程 CWD）；③web 编辑回填漏 `sftp_port`；④`app.js`/`system.js` 标签表漏 sftp 行。
+- **K67.3 真机复验**：u18（172.27.199.30）**12/12**——11 旧腿零回归 + 新增 ⑥c symlink 根腿（H1 的 E2E 证明）；吞吐 130.3↑/63.2↓ MiB/s 与修复前同档。
+- **K67.4 既有功能零破坏的证据**：workspace 1149/0（基线 1141 + 8 新测试，既有断言零漂移）；conformance 八断言绿；裁剪构建（local,baidu）绿；clippy/fmt/layers/secrets 全绿。
+- **K67.5 挂账（审查发现、本批不修——桩加固/覆盖缺口，非当前掩盖）**：桩 read 不校验句柄可读性（A-M1）、reader early-EOF 分支桩不可达（A-M2，快照 buf 模型）、quota 真值分支零覆盖（A-M3，桩不声明 statvfs 且无开关）、symlink×rename 组合桩不支持含 writer stash 对 symlink 目标的双侧空白（A-M4）、真机断线重连腿仅有桩覆盖（A-M5——重连行为对真实 OpenSSH TCP 形态的验证仍空）、`is_staging_artifact` 对用户合法文件 `report.cksftp-0-0.part` 的隐藏边界（已在 lib 单测文档化钉死）、非 UTF-8 名 lossy 的根因在 russh-sftp buf.rs（上游形态，驱动侧不可见化已是本仓能做的全部）。
+- **K67.6 回滚点**：分支 `fix/phase4-review`（单 commit），merge 前可整支丢弃；merge 后 `git revert -m 1 <merge>`；env 路由单独回退 = 撤 with_env_overrides 两键 + sftp_params 恢复直读（改动各 ≤10 行）。

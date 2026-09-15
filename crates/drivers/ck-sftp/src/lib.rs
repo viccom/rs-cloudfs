@@ -289,7 +289,7 @@ mod tests {
     // ----------------------------------------------------- error.rs ---
 
     use crate::error::{
-        looks_like_connection_loss, map_session_error, map_sftp_error, map_status,
+        looks_like_connection_loss, map_session_error, map_sftp_error, map_ssh_error, map_status,
         normalize_fingerprint, SessionError,
     };
     use russh_sftp::client::error::Error as SftpClientError;
@@ -440,5 +440,54 @@ mod tests {
             mapped,
             StorageError::Unauthorized { recoverable: false }
         ));
+    }
+
+    /// SSH 传输层的 TCP 死形态（拒连/重置/中断/超时/对端早闭）→
+    /// `Unavailable`（审查修复：修复前「服务器没起来」surfaced 为 Io
+    /// ——重连骨架与上层退避的触发形态对不上）；本地资源类 IO 维持 Io。
+    #[test]
+    fn ssh_io_dead_kinds_map_to_unavailable() {
+        use std::io::ErrorKind;
+        let io_err = |kind: ErrorKind| russh::Error::IO(std::io::Error::from(kind));
+        for kind in [
+            ErrorKind::ConnectionRefused,
+            ErrorKind::ConnectionReset,
+            ErrorKind::ConnectionAborted,
+            ErrorKind::TimedOut,
+            ErrorKind::UnexpectedEof,
+        ] {
+            assert!(
+                matches!(map_ssh_error(io_err(kind)), StorageError::Unavailable(_)),
+                "{kind:?} must map to Unavailable (server-down form)"
+            );
+        }
+        let local_io = russh::Error::IO(std::io::Error::other("local resource trouble"));
+        assert!(
+            matches!(map_ssh_error(local_io), StorageError::Io(_)),
+            "non-connection io must stay Io"
+        );
+    }
+
+    /// 暂存件过滤与名字可寻址性谓词的边界钉死（list 过滤面的纯函数层）。
+    #[test]
+    fn staging_artifact_and_addressable_name_predicates() {
+        use crate::driver::{is_staging_artifact, name_is_addressable};
+        // 驱动自产名（真实前缀 + pid/seq + 后缀）
+        assert!(is_staging_artifact("f.bin.cksftp-4242-7.part"));
+        assert!(is_staging_artifact("f.bin.cksftp-4242-7.old"));
+        // 单条件不命中：有前缀无后缀 / 有后缀无前缀
+        assert!(!is_staging_artifact("f.bin.cksftp-4242-7.tmp"));
+        assert!(!is_staging_artifact("report.part"));
+        // 已文档化的边界：恰含前缀且恰以后缀结尾的用户文件会被隐藏
+        //（双重条件已把误伤面收窄到此形态——代价声明在模块文档）
+        assert!(is_staging_artifact("report.cksftp-0-0.part"));
+
+        // 可寻址性：`\`/`\0`（句柄往返 RelPath::new 拒绝）与 U+FFFD
+        //（russh-sftp 对非 UTF-8 名的 lossy 替换串）不可见
+        assert!(name_is_addressable("normal.txt"));
+        assert!(name_is_addressable("中文文件.bin"));
+        assert!(!name_is_addressable("back\\slash.txt"));
+        assert!(!name_is_addressable("nul\0byte"));
+        assert!(!name_is_addressable("mojibake\u{FFFD}.txt"));
     }
 }
