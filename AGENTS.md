@@ -28,7 +28,7 @@
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 1069 测试（2026-09-14：K58 修复批 + aead_v2 默认 + 资产回归；ignored 12 = 真机/平台/真网类）
+cargo test --workspace --no-fail-fast            # 1133 测试（2026-09-15：SF1 驱动骨架 + SF2 进程内桩行为测试 41 个；ignored 12 = 真机/平台/真网类）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo build -p cloudkit-cli --no-default-features --features local,baidu   # 驱动裁剪构建（K30 三 feature）；缺驱动构建运行期报可行动错误（K31 rebuild 指引），cydrive --version 显示驱动清单（K32）

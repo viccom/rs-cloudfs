@@ -2,14 +2,14 @@
 
 > 计划：`docs/plans/2026-09-14-sftp-driver.md` ｜ 需求口径：负责人 2026-09-14「自用项目，不对外销售」+ 三条硬要求（编译开关 / 零侵入 / 保持松耦合）
 > 基线：main@c9cd4e3（workspace 1067/0/12；winfsp 腿 117/0/1）
-> 状态：**方案已批准（2026-09-14 SF0 拍板，K60）——SF1 可开工**
-> worktree：待建（建议 `feat/sftp-driver`，跨 ≥3 commit → 按仓库纪律必须 worktree 隔离）
+> 状态：**SF2 完成（2026-09-15）——SF3 conformance + 装配接线可开工**
+> worktree：`feat/sftp-driver`（已建，独立 target `E:\Rs_Codes\rs-cloudfs-sftp-target`；跨 ≥3 commit → 按仓库纪律 worktree 隔离）
 
 | 任务 | 内容 | 状态 | 完成情况 | 证据 |
 |---|---|---|---|---|
 | SF0 | 决策与门禁前置（无代码） | ✅ 2026-09-14 | 三项全拍板（K60）：**D1 = 密码 + 私钥（含 passphrase；k-i/agent 不做挂账）**；**D2 = 显式接受 + 指纹落盘**（未记录拒连、变更恒拒）；**D3 = 起步单连接**（多卷≠多连接概念澄清落档——多卷为 Phase 2.5 既有能力自动继承；同卷 N 连接分段留 SF4 实测后再议）。选型已于 K59.2–K59.7 入档。计划状态 → 已批准。 | decisions K60；计划 §8 拍板记录 |
 | SF1 | 驱动骨架 + 配置接入（无真实网络） | ✅ 2026-09-15 | `ck-sftp` crate 落地（六模块 1945 行：client 连接/认证 D1/host key D2 三态/with_retry 重连骨架、driver 九方法+能力位逐位注码、stager 三硬仗、transport 薄壳、config/error 纯函数）；配置键**四处**清单同步（KNOWN/VOLUME_SCOPED/SECRET_VALUED + LEGACY_REJECTED——后者为派发单遗漏、按既有模式补齐）+ `Backend::Sftp` + `validate()` Sftp 分支；`compiled_drivers()` 重构为 DRIVER_ROWS 表 filter-join 形态（签名 `const fn ->&str` 改 `fn ->String`，既有测试**零改动**通过=零漂移）；4 个编译必需占位 arm（sync/dispatch×2/build_driver，bail 文案指明 SF3 接线）；纯函数层 TDD（ck-sftp 14 测试 + core config_backend 9 新测试）。**执行注记**：子代理中途撞平台限额，半成品（TDD 红相位：`remote_path` todo! + `StorageError::Invalid` 误作载荷变体 7 处编译红）由主会话续作转绿——`Invalid` 是 L2 冻结单元变体，可行动文案改经 `tracing::warn!` 双通道（map_session_error 同款先例）。**风险挂账（SF3 验证）**：stager 按计划 §7 裁决直接写最终路径（无 tmp+rename/stash），staging 窗口目标以部分内容可见——conformance 断言①（close 前不可见）届时红则补 tmp+rename 或豁免声明。 | workspace 1092/0/12（基线 1069+23）；clippy/fmt/check_layers(13 manifests)/scan_secrets 全绿；既有 `compiled_drivers_lists_the_feature_set_in_fixed_order` 零改动通过 |
-| SF2 | 测试桩：进程内 SFTP 服务端 | ⏳ 未开工（**骨架已验证**） | 搭建方式与 Windows 可行性已实测跑通（附录 C.2），从"高风险批"降级为"照骨架落地" | `E:\tmp\sftp-harness` 端到端 PASS |
+| SF2 | 测试桩：进程内 SFTP 服务端 | ✅ 2026-09-15 | `tests/stub/mod.rs` 进程内桩（russh::server Ed25519 随机 host key + 密码/公钥可配置校验 + sftp subsystem + 内存 VFS：opendir/readdir **EOF 二轮语义**（每轮 ≤2 条多轮翻页）/open 全 OpenFlags/read 越界 Eof/write offset splice/close commit-on-close/rename 目标存在 Failure（OpenSSH 形态，目录子树整迁）/mkdir 父存在性/rmdir 空目录；**活句柄/连接/认证三计数器**测试可读；`fingerprint()` 与 client.rs check_server_key Display 形态逐字同源；bind 127.0.0.1:0，不依赖 HOME/Docker/known_hosts；kill_connections = 协议级 SSH_MSG_DISCONNECT——run_stream 内部自起 runtime 任务，**abort 外层任务杀不掉连接**（实测））。行为测试 41 个全绿：connect_auth 9（D2 三态/D1 密码+私钥 passphrase+用户名校验/D3 单连接计数）+ read_path 13（list depth-1 字典序 off:N 翻页/stat size·mtime·kind/reader 跨 64KiB 帧边界逐字节/越界钳制/start>=size 空流不开句柄/错误往返分类）+ write_path 19（mkdir 新建·Exists·隐式父/delete 递归·NotFound·根 Invalid/rename 四错误面+子树迁移/writer 往返·hint 不符 Invalid·abort 删目标·覆盖 TRUNCATE/quota None 降级/三硬仗①句柄归零×3/with_retry 断连重连）。**暴露并修复 SF1 缺陷 1 个（红→绿留证）**：russh-sftp 会话死信号 `UnexpectedBehavior("sender dropped")`（在途请求回复通道随连接死亡消失）与 russh 死通道写 `io "channel closed"` 未在 CONNECTION_LOSS_MARKERS → 断连归 Io 而非 Unavailable → with_retry 永不触发；修复 = 两信标入表（单一来源清单）+ UnexpectedBehavior 腿接 looks_like_connection_loss 分派（error.rs），lib.rs 单测同步钉死。 | workspace 1133/0/12（基线 1092+41）；clippy/fmt/check_layers(13 manifests)/scan_secrets 全绿；红→绿原件：`next_operation_reconnects_after_connection_kill` 修前 `Io("sftp unexpected server behavior: sender dropped")` / 修后 PASS |
 | SF3 | conformance + 装配接线 | ⏳ 未开工 | 离线八断言 + 12 处接入点 + doctor/setup/web 表单/i18n | — |
 | SF4 | 真机矩阵 | ⏳ 未开工 | WSL2 localhost:22 作测试服务器；上下行吞吐/Range 播放/断线重连/符号链接/rebuild 收敛 | — |
 | SF5 | 吞吐增强（可选） | ⏳ 视 SF4 | 若单连接流水线读不足 → 文件内分段多连接；否则明确销账 | — |
@@ -26,6 +26,13 @@
 | 本仓桩探针 `E:\tmp\sftp-harness` | 计划 §5 SF2、附录 C.2 | **决定性**：Windows 进程内 SFTP 桩端到端 PASS（list/stat/range/error），不依赖 Docker/HOME |
 
 ## 批次日志
+
+- **2026-09-15 SF2 完成**（worktree `feat/sftp-driver`，独立 target）：
+  - **桩形态**：`tests/stub/mod.rs`（dev-only，SF3 conformance 可 `mod stub;` 复用）——russh::server + russh_sftp::server::run 之上的内存路径树 VFS；**执行期实证两条**：①`russh::server::run_stream` 内部自起 runtime 任务持有 TcpStream——abort 外层包装任务**杀不掉连接**（第一版 kill 实测连接存活），改协议级 `RunningSession::handle().disconnect()`（SSH_MSG_DISCONNECT）才是真杀；②目录 rename 在路径键模型下必须显式搬文件（第一版只搬 dirs 子树，`rename_moves_directory_subtree` 红暴露后修桩——桩 bug 修桩，不动测试断言）。
+  - **SF1 缺陷修复（红→绿）**：断连后 `driver.stat` 归 `Io("sftp unexpected server behavior: sender dropped")` 而非 `Unavailable` → `with_retry` 重连骨架永不触发（D3 重连腿名存实亡）。溯源：russh-sftp `Request::poll` 在回复 oneshot sender 被 drop（rawsession 内部任务随连接死亡终止）时返回 `UnexpectedBehavior("sender dropped")`。修复：`sender dropped` / `channel closed` 两信标入 `CONNECTION_LOSS_MARKERS`（维持单一来源纪律，aeroftp A.2-5）+ `map_sftp_error` 的 `UnexpectedBehavior` 腿接 `looks_like_connection_loss` 分派（命中 → Unavailable 带 `sftp session lost:` 前缀，否则维持 Io）。lib.rs 既有两单测同步扩展断言（marker 清单 + UnexpectedBehavior 双路）。
+  - **dev-deps**：rand 0.10（russh 同线，lock 既有版本）/ tempfile 3（lock 既有）/ tokio 补 net+time——lock 仅登记依赖关系，零新包版本。
+  - 验证：workspace `cargo test --no-fail-fast` **1133/0/12**（基线 1092 + 41：connect_auth 9 + read_path 13 + write_path 19）；clippy `-D warnings` 绿；fmt 绿；check_layers 绿（13 manifests）；scan_secrets 绿。全部新测试默认跑（无 #[ignore]），仅依赖进程内回环 127.0.0.1:0。
+  - **未询问的决定（自主裁决，最可逆方向）**：①kill 注入形态从 abort 改协议级 disconnect（abort 无效是库结构事实，非语义取舍）；②`writer_size_hint_mismatch_is_invalid` 只断言 Invalid 错误不断言远端残留态（close_nowait 排队时序非确定——驱动文档已声明 truncate 残留边界）；③桩 `read` 对 offset>=len 回 `Err(Eof)`（SFTP v3 规范形态；客户端 check_read_result 归一为优雅 EOF——比回空 Data 更贴真实服务器）。
 
 - **2026-09-15 SF1 完成**（worktree `feat/sftp-driver`，独立 target `E:\Rs_Codes\rs-cloudfs-sftp-target`）：
   - **执行模式偏离记录**：原计划 hub-and-spoke 委派子代理；子代理启动后中途撞平台 5 小时使用限额（2026-09-15 10:00 重置）被掐断，留下未 commit 的 TDD 红相位半成品（改动形态与派发单吻合：config 键四处清单、compiled_drivers DRIVER_ROWS 表、ck-sftp 六模块、`remote_path` todo! 红测试在位）。主会话按「未审查 PR」处置：逐文件审查（重点测试断言零漂移——`tests/config.rs` 仅 struct 字面量补字段、既有断言未动）、完成红→绿（`remote_path` 实现、`invalid_config` 归一 7 处 `StorageError::Invalid(format!)` 编译错——`Invalid` 为 L2 冻结单元变体无载荷，文案经 `tracing::warn!` 双通道）、clippy 4 错修复（field_reassign/doc_lazy×2/question_mark）、fmt 归一。

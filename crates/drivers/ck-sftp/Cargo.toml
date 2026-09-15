@@ -42,5 +42,12 @@ tracing = "0.1"
 tokio = { version = "1", features = ["rt", "io-util", "sync", "time", "fs"] }
 
 [dev-dependencies]
-# 纯函数层单测（config 解析/错误映射/能力位/路径规范化）。
-tokio = { version = "1", features = ["rt", "macros"] }
+# 纯函数层单测（config 解析/错误映射/能力位/路径规范化）+ SF2 桩测试
+# 的 #[tokio::test]（rt/macros）。
+tokio = { version = "1", features = ["rt", "macros", "net", "time"] }
+# SF2 桩：服务端 Ed25519 随机密钥生成（russh 同一 rand 0.10 线，lock
+# 既有版本——非新增依赖项）。`rand::rng()` 在 std 默认特性面内。
+rand = "0.10"
+# SF2 桩：私钥形态认证测试的临时密钥文件（lock 既有，ck-local dev-dep
+# 同版本先例）。
+tempfile = "3"
