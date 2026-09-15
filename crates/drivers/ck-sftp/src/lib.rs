@@ -308,7 +308,9 @@ mod tests {
             map_sftp_error(SftpClientError::Limited("handle limit reached".to_string())),
             StorageError::RateLimited { retry_after: None }
         ));
-        // UnexpectedPacket / UnexpectedBehavior → Io
+        // UnexpectedPacket / UnexpectedBehavior → Io；会话死信号例外
+        //（"sender dropped" = 在途请求的回复通道随连接死亡消失 →
+        // Unavailable——SF2 桩断连测试的修复面）
         assert!(matches!(
             map_sftp_error(SftpClientError::UnexpectedPacket),
             StorageError::Io(_)
@@ -318,6 +320,12 @@ mod tests {
                 "odd server".to_string()
             )),
             StorageError::Io(_)
+        ));
+        assert!(matches!(
+            map_sftp_error(SftpClientError::UnexpectedBehavior(
+                "sender dropped".to_string()
+            )),
+            StorageError::Unavailable(_)
         ));
         // Status 透传 map_status
         assert!(matches!(
@@ -333,6 +341,9 @@ mod tests {
     fn connection_loss_marker_list_is_the_single_source() {
         assert!(looks_like_connection_loss("write failed: broken pipe"));
         assert!(looks_like_connection_loss("Connection Closed"));
+        // 栈内实测的会话死信号（SF2 桩断连钉死）
+        assert!(looks_like_connection_loss("sender dropped"));
+        assert!(looks_like_connection_loss("channel closed"));
         assert!(!looks_like_connection_loss("disk full"));
         assert!(!looks_like_connection_loss(""));
     }

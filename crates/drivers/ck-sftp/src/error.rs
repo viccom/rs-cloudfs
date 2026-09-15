@@ -40,6 +40,13 @@ use russh_sftp::protocol::{Status, StatusCode};
 /// russh-sftp 字符串化 IO 错误里「连接已死」的信标（**单一来源**，
 /// aeroftp 教训 A.2-5：它曾有四份互相不一致的拷贝，一份把 broken
 /// pipe 当磁盘错误而拒绝重试）。命中任一子串 → [`StorageError::Unavailable`]。
+///
+/// 栈内实测形态（SF2 桩断连测试钉死）：
+/// - `sender dropped`——russh-sftp `Request::poll` 在回复通道 sender 被
+///   drop 时返回 `UnexpectedBehavior("sender dropped")`（rawsession 内部
+///   任务随连接死亡而终止 = 在途请求的传输层死信号）；
+/// - `channel closed`——russh ChannelStream 对已死会话写入时的
+///   `io::Error(BrokenPipe, "channel closed")`。
 const CONNECTION_LOSS_MARKERS: &[&str] = &[
     "broken pipe",
     "connection reset",
@@ -51,6 +58,8 @@ const CONNECTION_LOSS_MARKERS: &[&str] = &[
     "unexpected end of file",
     "os error 10054", // WSAECONNRESET
     "os error 10053", // WSAECONNABORTED
+    "sender dropped", // russh-sftp 在途请求的会话死信号
+    "channel closed", // russh 死会话上的通道写入
 ];
 
 /// `true` 当消息文本呈现连接死形态（供 [`map_sftp_error`] 的 IO 腿）。
@@ -129,7 +138,14 @@ pub(crate) fn map_sftp_error(error: SftpClientError) -> StorageError {
             StorageError::Io("sftp protocol error: unexpected packet from the server".to_string())
         }
         SftpClientError::UnexpectedBehavior(detail) => {
-            StorageError::Io(format!("sftp unexpected server behavior: {detail}"))
+            // 会话死信号（"sender dropped"——在途请求的回复通道消失）
+            // 归 Unavailable：with_retry 的重连触发形态；其余保持 Io
+            //（保留原始消息，R2）。
+            if looks_like_connection_loss(&detail) {
+                StorageError::Unavailable(format!("sftp session lost: {detail}"))
+            } else {
+                StorageError::Io(format!("sftp unexpected server behavior: {detail}"))
+            }
         }
     }
 }
