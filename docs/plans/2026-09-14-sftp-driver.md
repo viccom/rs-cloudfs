@@ -1,6 +1,6 @@
 # Phase 4 计划：ssh/sftp 存储驱动
 
-> 状态：**已批准（2026-09-14，SF0 三项拍板，见 §8）**（2026-09-14 立）｜ 批次编号建议 SF0–SF5
+> 状态：**已批准（2026-09-14，SF0 三项拍板，见 §8）｜ 执行完成（2026-09-15，K66）——SF1–SF4 全批次落地，SF5 明确销账**（2026-09-14 立）｜ 批次编号建议 SF0–SF5
 > 前置研究：三轮外部项目勘察（2026-09-14，均为只读，情报见本文附录 A）
 > 上游标准：`docs/standards/architecture.md`（六层 + R1–R7）、`docs/standards/driver-onboarding.md`（新驱动验收依据）、`docs/standards/interfaces.md`（StorageDriver 契约/conformance 八断言）、`docs/plans/2026-09-07-cloudfusion-foundation.md`（D4 权威索引）
 > 需求口径（负责人 2026-09-14）：**自用项目，不对外分发**——借鉴外部项目实现时不受许可证传染约束；但"能跑起来、坑最少"是唯一标准，且不得因此降低本仓既有的门禁纪律。
@@ -230,7 +230,7 @@ crates/drivers/ck-sftp/
 ## 7. 明确不做（本阶段范围外）
 
 - ssh-agent / SSH 证书认证（aeroftp 的 SFTP provider 同样不支持；agent 只在它 rsync 通道有）——除非 SF0 拍板要
-- 远程临时文件 + rename 的原子上传（aeroftp 也不做：直接写目标路径）
+- ~~远程临时文件 + rename 的原子上传（aeroftp 也不做：直接写目标路径）~~ **本条已按 SF3 执行裁决修订（2026-09-15，K66.2）**：conformance 断言①（close 前目标不可见，interfaces §6）无豁免旋钮且离线红 → **实现 `.part` 暂存 + rename 固化 + `.old` stash**（与 ck-local 同构；SFTP rename 原子性只在同设备成立 → 暂存件与目标同目录）。SF4 真机（WSL2 OpenSSH）复验该协议成立。原「直写」判断依据（aeroftp 直接写目标路径）在**我们自己的 conformance 契约**面前不成立——契约优先于外部项目形态。
 - 面向播放器的 HTTP-Range 服务端（aeroftp **没做到**——其 CLI `serve http` 是整文件读入内存再切片。**我们的 `range_read` 是驱动级真流式，恰好超过它**）
 - 分块上传/秒传/变更推送（SFTP 无此原语）
 - SCp 协议（只做 SFTP subsystem）

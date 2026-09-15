@@ -2,7 +2,7 @@
 
 > 计划：`docs/plans/2026-09-14-sftp-driver.md` ｜ 需求口径：负责人 2026-09-14「自用项目，不对外销售」+ 三条硬要求（编译开关 / 零侵入 / 保持松耦合）
 > 基线：main@c9cd4e3（workspace 1067/0/12；winfsp 腿 117/0/1）
-> 状态：**SF2 完成（2026-09-15）——SF3 conformance + 装配接线可开工**
+> 状态：**SF1–SF4 全部完成（2026-09-15）——SF5 明确销账；Phase 4 收口，待 merge 回 main**
 > worktree：`feat/sftp-driver`（已建，独立 target `E:\Rs_Codes\rs-cloudfs-sftp-target`；跨 ≥3 commit → 按仓库纪律 worktree 隔离）
 
 | 任务 | 内容 | 状态 | 完成情况 | 证据 |
