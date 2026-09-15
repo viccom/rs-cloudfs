@@ -16,7 +16,9 @@
 mod stub;
 
 use ck_sftp::{SftpDriver, SftpParams};
-use cloudkit_storage::{BackendHandle, EntryId, RelPath, StorageDriver, StorageError, WriteHint};
+use cloudkit_storage::{
+    BackendHandle, EntryId, Page, RelPath, StorageDriver, StorageError, WriteHint,
+};
 use futures_util::StreamExt;
 use stub::{Stub, StubAuth};
 
@@ -165,6 +167,96 @@ async fn delete_foreign_handle_and_volume_root() {
         driver.delete(&entry_id(&driver, "")).await.err(),
         Some(StorageError::Invalid),
         "volume root is not deletable"
+    );
+}
+
+// ---------------------------------------------------------- symlinks ---
+
+/// 符号链接契约（SF4 真机矩阵揭出的 GAP-A02 缺陷的**离线回放**——防
+/// 回归）：link-to-dir 的本体是链接，不是目录。
+///
+/// 修复前（真机红）：`stat`/`list` 用 SSH_FXP_STAT（跟随）→ link-to-dir
+/// 报 `Dir`；`list(link)` 枚举链接目标（真机列出 /etc 的 207 个条目）；
+/// 递归删除会下潜。修复 = 目录性判定与递归删除走 lstat（不跟随）。
+#[tokio::test]
+async fn symlink_to_dir_is_not_traversed() {
+    let (stub, driver) = setup().await;
+    stub.add_dir("/guard");
+    stub.add_file("/guard/x.bin", &pattern(10));
+    // 受保护的目标目录 + 指向它的链接
+    stub.add_dir("/protector");
+    stub.add_file("/protector/keep.bin", &pattern(3));
+    stub.add_symlink("/guard/dirlink", "/protector");
+
+    // ①list(link-to-dir) 必须 Invalid（不可下潜），绝不是链接目标的条目
+    assert_eq!(
+        driver.list(&rel("guard/dirlink"), Page::all()).await.err(),
+        Some(StorageError::Invalid),
+        "a symlink to a directory must not be traversable"
+    );
+    // ②stat(link-to-dir) 报本体形态（File——链接自身），不是 Dir
+    let st = driver.stat(&rel("guard/dirlink")).await.expect("stat link");
+    assert_eq!(
+        st.kind,
+        cloudkit_storage::EntryKind::File,
+        "lstat semantics: the link reports itself, not the target's kind"
+    );
+    // ③递归删除 guard：链接被删、**目标内容完好**（绝不下潜）
+    driver
+        .delete(&entry_id(&driver, "guard"))
+        .await
+        .expect("recursive delete");
+    assert_eq!(
+        driver.stat(&rel("guard")).await.err(),
+        Some(StorageError::NotFound),
+        "guard is gone"
+    );
+    let kept = driver
+        .list(&rel("protector"), Page::all())
+        .await
+        .expect("the link target survives");
+    assert!(
+        kept.entries
+            .iter()
+            .any(|e| e.path.as_str().ends_with("keep.bin")),
+        "the link target's content must survive the recursive delete: {:?}",
+        kept.entries
+            .iter()
+            .map(|e| e.path.as_str())
+            .collect::<Vec<_>>()
+    );
+    // ④list 中链接按本体形态呈现（File，不是 Dir——aeroftp 教训 7）
+    stub.add_symlink("/guard2_link", "/protector");
+    let listing = driver
+        .list(&RelPath::root(), Page::all())
+        .await
+        .expect("list root");
+    let link_entry = listing
+        .entries
+        .iter()
+        .find(|e| e.path.as_str() == "guard2_link")
+        .expect("the link appears in its parent listing");
+    assert_eq!(
+        link_entry.kind,
+        cloudkit_storage::EntryKind::File,
+        "the listing reports the link itself, not a directory"
+    );
+    // ⑤链接**指向文件**时 reader 仍跟随（用户预期：读链即读目标）
+    stub.add_dir("/fdir");
+    stub.add_file("/fdir/real.bin", &pattern(64));
+    stub.add_symlink("/fdir/link.bin", "real.bin");
+    let got = read_all(
+        driver
+            .reader(&entry_id(&driver, "fdir/link.bin"), None)
+            .await
+            .expect("reader follows a file link"),
+    )
+    .await
+    .expect("read");
+    assert_eq!(
+        got,
+        pattern(64),
+        "reading through a link yields the target's bytes"
     );
 }
 

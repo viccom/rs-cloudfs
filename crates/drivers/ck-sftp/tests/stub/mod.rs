@@ -67,6 +67,9 @@ const PERM_FILE: u32 = 0o100_644;
 /// 目录权限位（0o040755：type=DIR + rwxr-xr-x）。
 const PERM_DIR: u32 = 0o040_755;
 
+/// 符号链接的权限位（S_IFLNK——POSIX lstat 的 type 面）。
+const PERM_LINK: u32 = 0o120_777;
+
 /// VFS 内部锁的统一入口（毒锁恢复比卡死正确——桩不区分毒化场景）。
 macro_rules! lock_vfs {
     ($self:ident) => {
@@ -101,6 +104,10 @@ struct DirHandle {
 struct VfsState {
     dirs: BTreeSet<String>,
     files: BTreeMap<String, FileNode>,
+    /// 符号链接（aeroftp 教训 8 的语句面；SF4 真机矩阵揭出的缺陷——
+    /// 驱动对 link-to-dir 不得下潜——在桩侧可离线回放）：link path →
+    /// 目标路径（绝对或相对，解析同 POSIX：相对目标相对链接的父目录）。
+    symlinks: BTreeMap<String, String>,
     file_handles: HashMap<String, FileHandle>,
     dir_handles: HashMap<String, DirHandle>,
     next_handle: u64,
@@ -116,12 +123,57 @@ impl VfsState {
         VfsState {
             dirs: BTreeSet::from(["/".to_string()]),
             files: BTreeMap::new(),
+            symlinks: BTreeMap::new(),
             file_handles: HashMap::new(),
             dir_handles: HashMap::new(),
             next_handle: 0,
             mtime_tick: 0,
             fail_next_stat: None,
         }
+    }
+
+    /// 链接目标解析（POSIX 语义：绝对目标原样、相对目标相对链接父目录；
+    /// 只解析一层——测试夹具不需要链接链）。
+    fn resolve_link(&self, link: &str) -> Option<String> {
+        let target = self.symlinks.get(link)?;
+        if target.starts_with('/') {
+            Some(target.clone())
+        } else {
+            let parent = Self::parent_of(link);
+            let joined = if parent == "/" {
+                format!("/{target}")
+            } else {
+                format!("{parent}/{target}")
+            };
+            Some(joined)
+        }
+    }
+
+    /// 链接本体的 attrs（POSIX lstat：file type = link，size = 目标串长；
+    /// OpenSSH 的 readdir/stat 对链接报的也是本体形态）。
+    fn link_attrs(&self, link: &str) -> FileAttributes {
+        FileAttributes {
+            size: Some(self.symlinks.get(link).map(|t| t.len()).unwrap_or(0) as u64),
+            permissions: Some(PERM_LINK),
+            mtime: Some(MTIME_BASE),
+            ..FileAttributes::default()
+        }
+    }
+
+    /// lstat 语义查找（**不跟随**链接）。
+    fn lstat_of(&self, path: &str) -> Option<FileAttributes> {
+        if self.symlinks.contains_key(path) {
+            return Some(self.link_attrs(path));
+        }
+        self.attr_of(path)
+    }
+
+    /// stat 语义查找（**跟随**链接；一层解析后走真实查找）。
+    fn stat_following(&self, path: &str) -> Option<FileAttributes> {
+        if let Some(resolved) = self.resolve_link(path) {
+            return self.lstat_of(&resolved);
+        }
+        self.attr_of(path)
     }
 
     fn next_mtime(&mut self) -> u32 {
@@ -194,6 +246,14 @@ impl VfsState {
         for path in &self.dirs {
             if path != "/" && path.starts_with(&prefix) && !path[prefix.len()..].contains('/') {
                 out.push((Self::name_of(path).to_string(), self.dir_attrs()));
+            }
+        }
+        // 链接条目按**本体**形态列出（OpenSSH 的 readdir 报 lstat 观感：
+        // link-to-dir 呈现为链接自身，不是目录——aeroftp 教训 7/8 的
+        // 服务端侧对齐）
+        for path in self.symlinks.keys() {
+            if path.starts_with(&prefix) && !path[prefix.len()..].contains('/') {
+                out.push((Self::name_of(path).to_string(), self.link_attrs(path)));
             }
         }
         out
@@ -428,7 +488,19 @@ impl russh_sftp::server::Handler for SftpHandler {
         if let Some(code) = vfs.fail_next_stat.take() {
             return Err(code);
         }
-        let attrs = vfs.attr_of(&path).ok_or(StatusCode::NoSuchFile)?;
+        // SSH_FXP_STAT：**跟随**链接（OpenSSH 语义）
+        let attrs = vfs.stat_following(&path).ok_or(StatusCode::NoSuchFile)?;
+        Ok(Attrs { id, attrs })
+    }
+
+    /// SSH_FXP_LSTAT：**不跟随**链接（驱动的递归删除/目录性预检面；
+    /// SF4 真机矩阵揭出的 GAP-A02 缺陷在桩侧的可回放形态）。
+    async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
+        let mut vfs = lock_vfs!(self);
+        if let Some(code) = vfs.fail_next_stat.take() {
+            return Err(code);
+        }
+        let attrs = vfs.lstat_of(&path).ok_or(StatusCode::NoSuchFile)?;
         Ok(Attrs { id, attrs })
     }
 
@@ -440,6 +512,9 @@ impl russh_sftp::server::Handler for SftpHandler {
         _attrs: FileAttributes,
     ) -> Result<Handle, Self::Error> {
         let mut vfs = lock_vfs!(self);
+        // SSH_FXP_OPEN 跟随链接（OpenSSH 语义：读链即读目标）——
+        // 写入也必须落到**目标**而非替换链接本体。
+        let filename = vfs.resolve_link(&filename).unwrap_or(filename);
         if vfs.dirs.contains(&filename) {
             // 打开目录当文件 → Failure（OpenSSH 形态）
             return Err(StatusCode::Failure);
@@ -549,6 +624,12 @@ impl russh_sftp::server::Handler for SftpHandler {
 
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
         let mut vfs = lock_vfs!(self);
+        // 链接本体不是目录：link-to-dir 不可 opendir（OpenSSH 对链接
+        // 目标为目录的 opendir 会跟随成功，但**驱动不应发出该请求**
+        // ——桩按 lstat 形态拒绝，使「驱动是否下潜」在桩侧可观测）
+        if vfs.symlinks.contains_key(&path) {
+            return Err(StatusCode::Failure);
+        }
         if !vfs.dirs.contains(&path) {
             return Err(StatusCode::NoSuchFile);
         }
@@ -582,6 +663,11 @@ impl russh_sftp::server::Handler for SftpHandler {
     async fn remove(&mut self, id: u32, filename: String) -> Result<Status, Self::Error> {
         let mut vfs = lock_vfs!(self);
         if vfs.files.remove(&filename).is_some() {
+            return Ok(ok_status(id));
+        }
+        // 链接本体：remove/unlink 删链**本身**，绝不动目标
+        // （OpenSSH 语义；递归删除的「只删链不下潜」依赖这一条）
+        if vfs.symlinks.remove(&filename).is_some() {
             return Ok(ok_status(id));
         }
         if vfs.dirs.contains(&filename) {
@@ -838,6 +924,24 @@ impl Stub {
             current.push_str(comp);
             vfs.dirs.insert(current.clone());
         }
+    }
+
+    /// 预置一个符号链接（link → target；target 绝对或相对链接父目录）——
+    /// 符号链接契约的离线回放面（SF4 真机矩阵揭出的缺陷形态）。
+    pub fn add_symlink(&self, link: &str, target: &str) {
+        let mut vfs = self.lock_vfs();
+        let parent = VfsState::parent_of(link).to_string();
+        assert!(
+            vfs.dirs.contains(&parent),
+            "stub: add_symlink parent must exist ({link})"
+        );
+        let mut current = String::new();
+        for comp in target.split('/').filter(|c| !c.is_empty()) {
+            current.push('/');
+            current.push_str(comp);
+            vfs.dirs.insert(current.clone());
+        }
+        vfs.symlinks.insert(link.to_string(), target.to_string());
     }
 
     /// 读回文件字节（上传往返断言）。

@@ -174,10 +174,15 @@ impl SftpDriver {
     }
 
     /// 递归删除（trait 契约：目录删除为递归；SFTP rmdir 只删空目录，
-    /// 深度优先清空再删自身。条目类型以 readdir attrs 为准——链接
-    /// 本体按其自身类型处理，绝不跟随）。
+    /// 深度优先清空再删自身）。
+    ///
+    /// **符号链接契约（aeroftp 教训 8 / 其 GAP-A02，真机矩阵揭出的
+    /// 缺陷修复）**：条目类型以 **lstat**（不跟随）判定——link-to-dir
+    /// 的本体是链接而非目录：递归**绝不下潜**进链接目标（跟随形态会
+    /// 把 `/etc` 之类的链接目标当子目录枚举并删除）。链接条目按文件
+    /// 语义删（`remove_file` 在 OpenSSH 上删链接本体、不动目标）。
     async fn recursive_remove(&self, rel: &RelPath) -> Result<(), StorageError> {
-        let attrs = self.stat_path(rel).await?;
+        let attrs = self.client.symlink_metadata(&self.path(rel)).await?;
         if attrs.is_dir() {
             let dir_path = self.path(rel);
             let names = self
@@ -235,8 +240,15 @@ impl StorageDriver for SftpDriver {
 
     /// depth-1 列目录（字典序稳定排序 + `off:N` 不透明分页令牌，
     /// local 同款形态）。行为测试在 SF2 桩批（readdir EOF 语义）。
+    ///
+    /// **目录性预检用 lstat（不跟随）**：link-to-dir 的本体是链接——
+    /// 把它当目录会枚举链接目标（真机矩阵揭出：指向 `/etc` 的链会列出
+    /// 207 个宿主条目，且为递归删除/rebuild 走查打开下潜通道）→
+    /// 拒以 `Invalid`（walkable 判定拒绝下潜，aeroftp 教训 8）。
+    /// 条目 kind 取 readdir attrs（OpenSSH 报链接本体形态：link-to-dir
+    /// 在 list 中呈现为 File/link 长度——与 POSIX lstat 观感一致）。
     async fn list(&self, dir: &RelPath, page: Page) -> Result<Listing, StorageError> {
-        let attrs = self.stat_path(dir).await?;
+        let attrs = self.client.symlink_metadata(&self.path(dir)).await?;
         if !attrs.is_dir() {
             return Err(StorageError::Invalid);
         }
@@ -285,8 +297,15 @@ impl StorageDriver for SftpDriver {
 
     /// stat（missing → NoSuchFile → NotFound；PermissionDenied /
     /// 连接错误绝不折叠为 NotFound——error.rs 分层映射钉死）。
+    ///
+    /// 链接语义（与 `list` 保持一致）：**用 lstat 报本体形态**——
+    /// link-to-dir 报 `File`（链接自身），而不是跟随后的 `Dir`。这样
+    /// `stat`/`list` 对同一条目给出一致的 kind，`entry.kind == Dir`
+    /// 的消费方（递归走查/rebuild/列表渲染）不会把链接误当目录下潜。
+    /// 需要跟随语义的读取（reader/下载）仍走 `metadata`（SSH_FXP_STAT
+    /// 跟随，能读到链接指向的内容——这是用户预期）。
     async fn stat(&self, path: &RelPath) -> Result<Entry, StorageError> {
-        let attrs = self.stat_path(path).await?;
+        let attrs = self.client.symlink_metadata(&self.path(path)).await?;
         Ok(entry_from_attrs(&self.volume, path, &attrs))
     }
 

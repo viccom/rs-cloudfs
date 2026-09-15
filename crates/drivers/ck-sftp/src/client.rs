@@ -171,6 +171,7 @@ impl SftpClient {
 
     /// stat 一个远端路径（missing → `SSH_FX_NO_SUCH_FILE` → NotFound；
     /// PermissionDenied / 连接错误绝不折叠为 NotFound——error.rs 钉死）。
+    /// **跟随符号链接**（SSH_FXP_STAT 语义）——面向用户可见的 path 面。
     pub(crate) async fn metadata(&self, path: &str) -> Result<FileAttributes, StorageError> {
         with_retry!(self, metadata_once(path))
     }
@@ -179,6 +180,25 @@ impl SftpClient {
         let guard = self.connected().await?;
         let conn = guard.as_ref().expect("connected() just ensured");
         conn.session.metadata(path).await.map_err(map_sftp_error)
+    }
+
+    /// **不跟随**符号链接的 stat（SSH_FXP_LSTAT 语义）——递归删除与
+    /// 「本体是什么」判定的正确面（aeroftp 教训 8 / 其 GAP-A02：跟随
+    /// 形态会把 symlink-to-dir 当目录下潜，递归删除将走进链接目标）。
+    pub(crate) async fn symlink_metadata(
+        &self,
+        path: &str,
+    ) -> Result<FileAttributes, StorageError> {
+        with_retry!(self, symlink_metadata_once(path))
+    }
+
+    async fn symlink_metadata_once(&self, path: &str) -> Result<FileAttributes, StorageError> {
+        let guard = self.connected().await?;
+        let conn = guard.as_ref().expect("connected() just ensured");
+        conn.session
+            .symlink_metadata(path)
+            .await
+            .map_err(map_sftp_error)
     }
 
     /// depth-1 列目录（readdir 到 EOF——SF2 桩批钉死协议语义）。
