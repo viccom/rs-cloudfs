@@ -21,7 +21,11 @@ members = [
 # examples/baidu_spike: Batch S verification spike (live Baidu network
 # calls) — must never enter CI gates; run manually via
 # `cargo run --manifest-path examples/baidu_spike/Cargo.toml --release --`.
-exclude = ["crates/vendor/grammers-session", "examples/baidu_spike"]
+exclude = [
+    "crates/vendor/grammers-session",
+    "examples/baidu_spike",
+    "examples/pan115_spike",
+]
 
 [workspace.package]
 version = "0.10.0"
