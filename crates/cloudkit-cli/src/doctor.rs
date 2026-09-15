@@ -414,15 +414,24 @@ pub fn evaluate_winfsp_install(install: Option<&cloudkit_platform::WinFspInstall
         Some(install) => CheckResult {
             name,
             status: CheckStatus::Ok,
+            // The trailing note is feature-aware: a build without the
+            // winfsp feature tells the operator what to rebuild; a build
+            // that carries it says so (the static "needs a --features
+            // winfsp build" text used to print even on winfsp builds).
             detail: format!(
-                "WinFsp installed at {} ({}) — `mount_backend = \"winfsp\"` additionally needs \
-                 a `--features winfsp` build",
+                "WinFsp installed at {} ({}) — {}",
                 install.install_dir.display(),
                 install
                     .dll
                     .as_ref()
                     .map(|dll| dll.display().to_string())
                     .unwrap_or_default(),
+                if cfg!(feature = "winfsp") {
+                    "this build carries the winfsp mount backend: `mount_backend = \"winfsp\"` \
+                     is ready"
+                } else {
+                    "`mount_backend = \"winfsp\"` additionally needs a `--features winfsp` build"
+                },
             ),
         },
     }

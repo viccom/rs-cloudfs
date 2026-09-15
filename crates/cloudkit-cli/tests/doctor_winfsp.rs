@@ -35,7 +35,9 @@ fn a_missing_install_is_a_warning_with_the_way_out() {
 }
 
 /// An installed runtime → Ok, naming the directory and the build flag the
-/// winfsp backend additionally needs.
+/// winfsp backend additionally needs — or, on a build that carries the
+/// winfsp feature, that the mount backend is ready (the note is
+/// feature-aware; both branches are pinned).
 #[cfg(windows)]
 #[test]
 fn an_installed_runtime_is_ok_and_names_the_build_flag() {
@@ -54,11 +56,19 @@ fn an_installed_runtime_is_ok_and_names_the_build_flag() {
         "the detail names the install, got: {}",
         check.detail
     );
-    assert!(
-        check.detail.contains("--features winfsp"),
-        "the detail names what a winfsp mount additionally needs, got: {}",
-        check.detail
-    );
+    if cfg!(feature = "winfsp") {
+        assert!(
+            check.detail.contains("carries the winfsp mount backend"),
+            "a winfsp build states the mount backend is ready, got: {}",
+            check.detail
+        );
+    } else {
+        assert!(
+            check.detail.contains("--features winfsp"),
+            "the detail names what a winfsp mount additionally needs, got: {}",
+            check.detail
+        );
+    }
 }
 
 /// A half install (directory present, runtime DLL missing) → Warn: a
