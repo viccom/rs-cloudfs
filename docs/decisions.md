@@ -713,3 +713,13 @@
 - **K67.4 既有功能零破坏的证据**：workspace 1149/0（基线 1141 + 8 新测试，既有断言零漂移）；conformance 八断言绿；裁剪构建（local,baidu）绿；clippy/fmt/layers/secrets 全绿。
 - **K67.5 挂账（审查发现、本批不修——桩加固/覆盖缺口，非当前掩盖）**：桩 read 不校验句柄可读性（A-M1）、reader early-EOF 分支桩不可达（A-M2，快照 buf 模型）、quota 真值分支零覆盖（A-M3，桩不声明 statvfs 且无开关）、symlink×rename 组合桩不支持含 writer stash 对 symlink 目标的双侧空白（A-M4）、真机断线重连腿仅有桩覆盖（A-M5——重连行为对真实 OpenSSH TCP 形态的验证仍空）、`is_staging_artifact` 对用户合法文件 `report.cksftp-0-0.part` 的隐藏边界（已在 lib 单测文档化钉死）、非 UTF-8 名 lossy 的根因在 russh-sftp buf.rs（上游形态，驱动侧不可见化已是本仓能做的全部）。
 - **K67.6 回滚点**：分支 `fix/phase4-review`（单 commit），merge 前可整支丢弃；merge 后 `git revert -m 1 <merge>`；env 路由单独回退 = 撤 with_env_overrides 两键 + sftp_params 恢复直读（改动各 ≤10 行）。
+
+## 2026-09-15 K68：尺寸优化编译档 release-min（性能/稳定性零妥协）
+
+负责人要求在不影响性能与稳定性的前提下做优化编译。裁决 = 只加链接期优化，不碰任何运行时语义：
+
+- **K68.1 profile 形态**：`[profile.release-min]`（独立命名档，默认 release 零变化）：`lto="fat"` + `codegen-units=1` + `strip="symbols"`，显式继承 `release` 的 `opt-level=3`。
+- **K68.2 两项刻意不做**：①`panic="abort"` 禁用——控制通道 handler 与 web 执行任务的 panic 防护依赖 `catch_unwind`（K55-H1/K58-H4），abort 会废掉该防线；②`opt-level="z"/"s"` 不做——性能零妥协是本次前提。
+- **K68.3 实测数据（sftp,winfsp 组合）**：18 MB → **15 MB**（-17%）；winfsp 真机挂载冒烟全绿（X: 挂载→rebuild→穿透盘符读 real.bin 字节正确→`cydrive stop` 干净卸载无残留）；吞吐取证 u18 128 MiB **300.8↑/317.8↓ MiB/s**（release-min，`cargo test --profile release-min`）——同机既有矩阵数字 130/63 系 **debug 测试档**，release 族全面更快（LTO 无性能损耗，符合预期）。
+- **K68.4 可诊断性**：MSVC 链接器仍生成独立 PDB，`strip="symbols"` 只去 exe 内符号表——线上崩溃仍可回溯符号。
+- **K68.5 回滚**：删 Cargo.toml 的 `[profile.release-min]` 节即回退（零代码面影响；release 档从未改动）。

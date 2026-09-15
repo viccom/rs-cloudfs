@@ -35,6 +35,7 @@ cargo test --workspace --no-fail-fast            # 1149 测试（2026-09-15：Ph
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo build -p cloudkit-cli --no-default-features --features local,baidu   # 驱动裁剪构建（K30 四 feature）；缺驱动构建运行期报可行动错误（K31 rebuild 指引），cydrive --version 显示驱动清单（K32）
+LIBCLANG_PATH=D:/Python312/Lib/site-packages/clang/native cargo build -p cloudkit-cli --no-default-features --features sftp,winfsp --profile release-min   # 尺寸优化档（K68）：strip+fat LTO+单编译单元；opt-level=3 与 panic=unwind 不动（catch_unwind 防护依赖）；18M→15M，PDB 仍生成可回溯
 LIBCLANG_PATH=D:/Python312/Lib/site-packages/clang/native cargo test -p cloudkit-winfsp --features winfsp   # winfsp 腿（117 测试，ignored 1 = 真机挂载；需 libclang+MSVC，见已知陷阱）
 scripts/check_layers                             # R1 层依赖门禁（CI 同款；动 Cargo.toml 依赖后必跑）
 scripts/scan_secrets                             # R3 秘密扫描门禁（CI 同款；本地模式=全树扫描）

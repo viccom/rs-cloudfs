@@ -60,3 +60,17 @@ targets = [
     "x86_64-unknown-linux-gnu",
     "x86_64-pc-windows-msvc",
 ]
+
+# Size-optimized release variant (K68): identical runtime semantics to
+# `release` — same opt-level=3, panic stays unwind (the control-channel
+# handler and web execution task rely on catch_unwind; K55-H1/K58-H4).
+# Only link-time work is added: fat LTO + one codegen unit + symbol
+# strip. Diagnosability is preserved: the MSVC linker still writes the
+# PDB next to the artifact, so backtraces stay symbolizable.
+#   cargo build -p cloudkit-cli --no-default-features \
+#       --features sftp,winfsp --profile release-min
+[profile.release-min]
+inherits = "release"
+lto = "fat"
+codegen-units = 1
+strip = "symbols"
