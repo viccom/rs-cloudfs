@@ -8,7 +8,7 @@
 | 任务 | 内容 | 状态 | 完成情况 | 证据 |
 |---|---|---|---|---|
 | SF0 | 决策与门禁前置（无代码） | ✅ 2026-09-14 | 三项全拍板（K60）：**D1 = 密码 + 私钥（含 passphrase；k-i/agent 不做挂账）**；**D2 = 显式接受 + 指纹落盘**（未记录拒连、变更恒拒）；**D3 = 起步单连接**（多卷≠多连接概念澄清落档——多卷为 Phase 2.5 既有能力自动继承；同卷 N 连接分段留 SF4 实测后再议）。选型已于 K59.2–K59.7 入档。计划状态 → 已批准。 | decisions K60；计划 §8 拍板记录 |
-| SF1 | 驱动骨架 + 配置接入（无真实网络） | ⏳ 未开工 | `ck-sftp` crate 落地 + 配置键三处同步 + `compiled_drivers()` 可扩展化改写（3 驱动输出逐字不变） | — |
+| SF1 | 驱动骨架 + 配置接入（无真实网络） | ✅ 2026-09-15 | `ck-sftp` crate 落地（六模块 1945 行：client 连接/认证 D1/host key D2 三态/with_retry 重连骨架、driver 九方法+能力位逐位注码、stager 三硬仗、transport 薄壳、config/error 纯函数）；配置键**四处**清单同步（KNOWN/VOLUME_SCOPED/SECRET_VALUED + LEGACY_REJECTED——后者为派发单遗漏、按既有模式补齐）+ `Backend::Sftp` + `validate()` Sftp 分支；`compiled_drivers()` 重构为 DRIVER_ROWS 表 filter-join 形态（签名 `const fn ->&str` 改 `fn ->String`，既有测试**零改动**通过=零漂移）；4 个编译必需占位 arm（sync/dispatch×2/build_driver，bail 文案指明 SF3 接线）；纯函数层 TDD（ck-sftp 14 测试 + core config_backend 9 新测试）。**执行注记**：子代理中途撞平台限额，半成品（TDD 红相位：`remote_path` todo! + `StorageError::Invalid` 误作载荷变体 7 处编译红）由主会话续作转绿——`Invalid` 是 L2 冻结单元变体，可行动文案改经 `tracing::warn!` 双通道（map_session_error 同款先例）。**风险挂账（SF3 验证）**：stager 按计划 §7 裁决直接写最终路径（无 tmp+rename/stash），staging 窗口目标以部分内容可见——conformance 断言①（close 前不可见）届时红则补 tmp+rename 或豁免声明。 | workspace 1092/0/12（基线 1069+23）；clippy/fmt/check_layers(13 manifests)/scan_secrets 全绿；既有 `compiled_drivers_lists_the_feature_set_in_fixed_order` 零改动通过 |
 | SF2 | 测试桩：进程内 SFTP 服务端 | ⏳ 未开工（**骨架已验证**） | 搭建方式与 Windows 可行性已实测跑通（附录 C.2），从"高风险批"降级为"照骨架落地" | `E:\tmp\sftp-harness` 端到端 PASS |
 | SF3 | conformance + 装配接线 | ⏳ 未开工 | 离线八断言 + 12 处接入点 + doctor/setup/web 表单/i18n | — |
 | SF4 | 真机矩阵 | ⏳ 未开工 | WSL2 localhost:22 作测试服务器；上下行吞吐/Range 播放/断线重连/符号链接/rebuild 收敛 | — |
@@ -26,6 +26,11 @@
 | 本仓桩探针 `E:\tmp\sftp-harness` | 计划 §5 SF2、附录 C.2 | **决定性**：Windows 进程内 SFTP 桩端到端 PASS（list/stat/range/error），不依赖 Docker/HOME |
 
 ## 批次日志
+
+- **2026-09-15 SF1 完成**（worktree `feat/sftp-driver`，独立 target `E:\Rs_Codes\rs-cloudfs-sftp-target`）：
+  - **执行模式偏离记录**：原计划 hub-and-spoke 委派子代理；子代理启动后中途撞平台 5 小时使用限额（2026-09-15 10:00 重置）被掐断，留下未 commit 的 TDD 红相位半成品（改动形态与派发单吻合：config 键四处清单、compiled_drivers DRIVER_ROWS 表、ck-sftp 六模块、`remote_path` todo! 红测试在位）。主会话按「未审查 PR」处置：逐文件审查（重点测试断言零漂移——`tests/config.rs` 仅 struct 字面量补字段、既有断言未动）、完成红→绿（`remote_path` 实现、`invalid_config` 归一 7 处 `StorageError::Invalid(format!)` 编译错——`Invalid` 为 L2 冻结单元变体无载荷，文案经 `tracing::warn!` 双通道）、clippy 4 错修复（field_reassign/doc_lazy×2/question_mark）、fmt 归一。
+  - **未询问的决定（自主裁决，最可逆方向）**：①`StorageError::Invalid` 无载荷的文案通道选 warn 日志（对齐 crate 内 map_session_error 已有先例，不改 L2 类型）；②stager 维持计划 §7 字面裁决直写最终路径（未擅自升级 tmp+rename），断言①风险显式挂 SF3；③TDD 红相位中断导致「红输出留证」缺失，以「测试对实现的约束力审读 + 全量绿」替代，如实记录；④doctor/main.rs 的 `Backend::Sftp` 占位 arm 属枚举扩展的编译必需连带（非越界），真检查留 SF3。
+  - 验证：workspace `cargo test --no-fail-fast` **1092/0/12**（基线 1069 + ck-sftp 14 + core 9）；clippy `-D warnings` 绿；fmt 绿；check_layers 绿（13 manifests / 4 driver crate）；scan_secrets 绿；依赖树 russh 0.63.3 + russh-sftp 3.0.0（版本下限合规，ring 复用）。
 
 - **2026-09-14 SF0 完成**（负责人拍板，K60 入档）：D1 = 密码 + 私钥（便于自动化；含 passphrase，k-i/agent 挂账）；D2 = 显式接受 + 指纹落盘（未记录拒连、变更恒拒、禁止无条件接受）；D3 = 起步单连接——**概念澄清**：负责人所述「不同认证各起一个实例」= 多卷模式（Phase 2.5 既有，SFTP 自动继承），非 D3 所问的同卷吞吐多连接；后者拍板不做，SF4 实测后再议 SF5。落档四处：decisions K60、计划 §8（待拍板→拍板记录）、本表 SF0 行、AGENTS 待人工清单销账。
 - **2026-09-14 立项前置研究完成**（本批不开工实现；只读勘察 + 仓外探针，仓库 `git status` 全程干净）：

@@ -239,6 +239,16 @@ fn toml_roundtrip_preserves_full_config() {
         baidu_access_token: None,
         baidu_refresh_token: None,
         local_root: None,
+        // Phase 4 / SF1: the sftp key group round-trips too (all unset —
+        // the exhaustive-field shape of this test).
+        sftp_host: None,
+        sftp_port: None,
+        sftp_username: None,
+        sftp_password: None,
+        sftp_private_key_path: None,
+        sftp_private_key_passphrase: None,
+        sftp_host_fingerprint: None,
+        sftp_root: None,
         volumes_dir: None,
         // Phase 3.6 / RV0: the volume enable switch round-trips too.
         enabled: true,

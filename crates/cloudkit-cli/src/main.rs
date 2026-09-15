@@ -789,6 +789,12 @@ async fn doctor_cmd() -> Result<()> {
         cloudkit_core::config::Backend::Local => {
             results.extend(cloudkit_cli::doctor::backend_checks(&cfg));
         }
+        // Phase 4 / SF1 placeholder: the sftp doctor leg (connectivity,
+        // host-key fingerprint) is an SF3 item; the backend_checks match
+        // inside already carries the sftp arm.
+        cloudkit_core::config::Backend::Sftp => {
+            results.extend(cloudkit_cli::doctor::backend_checks(&cfg));
+        }
     }
     print!("{}", cloudkit_cli::doctor::render_report(&results));
     Ok(())

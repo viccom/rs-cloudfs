@@ -463,6 +463,11 @@ pub fn backend_checks(cfg: &cloudkit_core::config::CyDriveConfig) -> Vec<CheckRe
             }
             results.push(check_local_root(cfg.local_root.as_deref()));
         }
+        // Phase 4 / SF1 placeholder: the sftp-specific checks (host-key
+        // fingerprint present, auth form present, connectivity) are an
+        // SF3 doctor item; the sftp keys' cross-field rules already run
+        // in the config validate pass doctor shares.
+        Backend::Sftp => {}
     }
     results
 }

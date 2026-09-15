@@ -101,6 +101,14 @@ pub const KNOWN_TOML_KEYS: &[&str] = &[
     "baidu_access_token",
     "baidu_refresh_token",
     "local_root",
+    "sftp_host",
+    "sftp_port",
+    "sftp_username",
+    "sftp_password",
+    "sftp_private_key_path",
+    "sftp_private_key_passphrase",
+    "sftp_host_fingerprint",
+    "sftp_root",
     "volumes_dir",
     "enabled",
 ];
@@ -139,6 +147,14 @@ const LEGACY_REJECTED_KEYS: &[&str] = &[
     "baidu_access_token",
     "baidu_refresh_token",
     "local_root",
+    "sftp_host",
+    "sftp_port",
+    "sftp_username",
+    "sftp_password",
+    "sftp_private_key_path",
+    "sftp_private_key_passphrase",
+    "sftp_host_fingerprint",
+    "sftp_root",
     "volumes_dir",
     "enabled",
     "allow_remote_admin",
@@ -208,6 +224,9 @@ pub enum Backend {
     Baidu,
     /// Local filesystem drive (ck-local, one root directory).
     Local,
+    /// SSH/SFTP drive (ck-sftp, Phase 4 / SF1 — one server account per
+    /// volume; driver wiring lands in SF3).
+    Sftp,
 }
 
 impl Backend {
@@ -217,6 +236,7 @@ impl Backend {
             Backend::Telegram => "telegram",
             Backend::Baidu => "baidu",
             Backend::Local => "local",
+            Backend::Sftp => "sftp",
         }
     }
 }
@@ -321,6 +341,14 @@ pub const VOLUME_SCOPED_KEYS: &[&str] = &[
     "baidu_access_token",
     "baidu_refresh_token",
     "local_root",
+    "sftp_host",
+    "sftp_port",
+    "sftp_username",
+    "sftp_password",
+    "sftp_private_key_path",
+    "sftp_private_key_passphrase",
+    "sftp_host_fingerprint",
+    "sftp_root",
     "enabled",
 ];
 
@@ -398,6 +426,12 @@ const SECRET_VALUED_KEYS: &[&str] = &[
     "baidu_app_secret",
     "baidu_access_token",
     "baidu_refresh_token",
+    // Phase 4 / SF1 (D1): both sftp credential keys — the password and
+    // the private-key passphrase — ride the same masking funnel as the
+    // baidu secrets (parse-error redaction + the SHOW `{"set": bool}`
+    // write-only folding).
+    "sftp_password",
+    "sftp_private_key_passphrase",
 ];
 
 /// Masks a credential value span: length-preserving, first and last two
@@ -1232,6 +1266,40 @@ pub struct CyDriveConfig {
     /// inert otherwise. No env route (K17 names env overrides for the
     /// four baidu keys only).
     pub local_root: Option<String>,
+    /// SSH server hostname / address (ck-sftp, Phase 4 / SF1). Required
+    /// when `backend = "sftp"`; inert otherwise.
+    pub sftp_host: Option<String>,
+    /// SSH server TCP port; `None` = the SSH default 22 (the driver's
+    /// `DEFAULT_PORT`). `validate` rejects an explicit `0` (the
+    /// 1..=65535 rule — values above 65535 cannot parse into `u16` and
+    /// fail earlier, at the typed parse).
+    pub sftp_port: Option<u16>,
+    /// SSH login user name. Required when `backend = "sftp"`; inert
+    /// otherwise.
+    pub sftp_username: Option<String>,
+    /// SSH password credential (D1: password OR private key — at least
+    /// one). A [`SECRET_VALUED_KEYS`] member (R3): masked in parse
+    /// errors, folded to `{"set": bool}` in SHOW replies.
+    pub sftp_password: Option<String>,
+    /// Filesystem path of the SSH private key (D1's second auth form;
+    /// the path itself is not a credential, only the key file's content
+    /// is).
+    pub sftp_private_key_path: Option<String>,
+    /// Passphrase unlocking an encrypted [`Self::sftp_private_key_path`]
+    /// (D1: an encrypted key without its passphrase is half support).
+    /// A [`SECRET_VALUED_KEYS`] member (R3).
+    pub sftp_private_key_passphrase: Option<String>,
+    /// Server host-key fingerprint (D2: explicit accept + pinned
+    /// fingerprint). `SHA256:...` OpenSSH form (the connecting error
+    /// message spells the server's actual fingerprint to copy here);
+    /// `None` = not yet accepted — the driver REFUSES to connect and
+    /// the error names the acceptance path (never a silent TOFU, never
+    /// an unconditional accept).
+    pub sftp_host_fingerprint: Option<String>,
+    /// SFTP drive root as a backend-absolute path (must start with `'/'`
+    /// when the backend is `sftp`; `None` = the server filesystem root
+    /// `/`). Mirrors the `baidu_root`/`local_root` naming convention.
+    pub sftp_root: Option<String>,
     /// Volumes directory (Phase 2.5 / K19), relative to the process
     /// working directory: one `<name>.toml` file per storage volume
     /// (see [`load_volume_config`]). `None` — the default — means
@@ -1301,6 +1369,14 @@ impl Default for CyDriveConfig {
             baidu_access_token: None,
             baidu_refresh_token: None,
             local_root: None,
+            sftp_host: None,
+            sftp_port: None,
+            sftp_username: None,
+            sftp_password: None,
+            sftp_private_key_path: None,
+            sftp_private_key_passphrase: None,
+            sftp_host_fingerprint: None,
+            sftp_root: None,
             volumes_dir: None,
             enabled: default_enabled(),
         }
@@ -1639,8 +1715,15 @@ impl CyDriveConfig {
     ///   `baidu_access_token` / `baidu_refresh_token`) set and non-empty
     ///   (each naming its `CYDRIVE_BAIDU_*` env route in the error), and
     ///   a `baidu_root` starting with `'/'`; `backend = "local"`
-    ///   requires `local_root` set and absolute. The telegram default
-    ///   triggers neither rule — pre-Phase-2 configs validate unchanged.
+    ///   requires `local_root` set and absolute; `backend = "sftp"`
+    ///   requires `sftp_host` and `sftp_username` non-empty, at least
+    ///   one of `sftp_password` / `sftp_private_key_path` (D1), an
+    ///   explicit `sftp_port` in `1..=65535` and — when present — an
+    ///   `sftp_root` starting with `'/'` (`sftp_host_fingerprint` is
+    ///   deliberately optional: refusing to connect until the operator
+    ///   pins a fingerprint is the driver's D2 job, not a config rule).
+    ///   The telegram default triggers none of these rules —
+    ///   pre-Phase-2 configs validate unchanged.
     ///
     /// Returns `Ok(())` when every rule holds.
     pub fn validate(&self) -> Result<(), ConfigError> {
@@ -1790,6 +1873,49 @@ impl CyDriveConfig {
                          directory as an absolute path in config.toml"
                             .to_string(),
                     ));
+                }
+            }
+        }
+        // Phase 4 / SF1 cross-field rules (gated on the backend like the
+        // baidu/local blocks above — the telegram default never fires).
+        if self.backend == Backend::Sftp {
+            for (name, value) in [
+                ("sftp_host", &self.sftp_host),
+                ("sftp_username", &self.sftp_username),
+            ] {
+                if value.as_deref().is_none_or(str::is_empty) {
+                    return Err(ConfigError::Invalid(format!(
+                        "backend = \"sftp\" requires {name}: set it in config.toml \
+                         (the SSH server address and the login user)"
+                    )));
+                }
+            }
+            let has_password = self.sftp_password.as_deref().is_some_and(|v| !v.is_empty());
+            let has_key = self
+                .sftp_private_key_path
+                .as_deref()
+                .is_some_and(|v| !v.is_empty());
+            if !has_password && !has_key {
+                return Err(ConfigError::Invalid(
+                    "backend = \"sftp\" requires an auth credential: set sftp_password or \
+                     sftp_private_key_path in config.toml (password or private key — at least \
+                     one; the optional sftp_private_key_passphrase unlocks an encrypted key)"
+                        .to_string(),
+                ));
+            }
+            if let Some(port) = self.sftp_port {
+                if !(1..=65535).contains(&port) {
+                    return Err(ConfigError::Invalid(format!(
+                        "sftp_port must be in 1..=65535, got {port}"
+                    )));
+                }
+            }
+            if let Some(root) = &self.sftp_root {
+                if !root.starts_with('/') {
+                    return Err(ConfigError::Invalid(format!(
+                        "sftp_root must be a backend-absolute path starting with '/', e.g. \
+                         \"/srv/cloudfs\", got {root:?}"
+                    )));
                 }
             }
         }

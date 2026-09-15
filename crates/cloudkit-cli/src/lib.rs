@@ -113,26 +113,34 @@ pub const LOCAL_DRIVER_REQUIRED: &str = "this binary was built without the local
 
 /// The driver list the binary was compiled with (K32,
 /// docs/plans/2026-09-09-driver-feature-gates.md) — the `(drivers: ...)`
-/// segment of the `--version` banner. A compile-time constant in
-/// substance: every arm is a literal selected by the feature set at
-/// compile time, in the fixed order telegram, baidu, local; a build
-/// with every driver feature off reports `none`. Pinned by
+/// segment of the `--version` banner.
+///
+/// Extensible form (Phase 4 / SF1, `docs/plans/2026-09-14-sftp-driver.md`
+/// §3): the fixed-order table maps one `cfg!` probe per driver, the list
+/// is the filter-join of the enabled rows and the empty set reports
+/// `none` — adding a driver is one appended row (the SF0-era 3-tuple
+/// match would grow 2^n arms instead). Each row is still selected by the
+/// feature set at compile time (`cfg!` expands to a literal), in the
+/// fixed order telegram, baidu, local; onboarding the next driver
+/// (driver-onboarding §1) appends its row here. Pinned by
 /// `tests::compiled_drivers_lists_the_feature_set_in_fixed_order`
-/// (cfg-gated arms — one assertion per build).
-pub const fn compiled_drivers() -> &'static str {
-    match (
-        cfg!(feature = "telegram"),
-        cfg!(feature = "baidu"),
-        cfg!(feature = "local"),
-    ) {
-        (true, true, true) => "telegram, baidu, local",
-        (true, true, false) => "telegram, baidu",
-        (true, false, true) => "telegram, local",
-        (false, true, true) => "baidu, local",
-        (true, false, false) => "telegram",
-        (false, true, false) => "baidu",
-        (false, false, true) => "local",
-        (false, false, false) => "none",
+/// (cfg-gated arms — one assertion per build, unchanged by this
+/// refactor: the 3-driver combinations' output is byte-identical).
+pub fn compiled_drivers() -> String {
+    const DRIVER_ROWS: &[(bool, &str)] = &[
+        (cfg!(feature = "telegram"), "telegram"),
+        (cfg!(feature = "baidu"), "baidu"),
+        (cfg!(feature = "local"), "local"),
+    ];
+    let enabled: Vec<&str> = DRIVER_ROWS
+        .iter()
+        .filter(|(compiled, _)| *compiled)
+        .map(|(_, name)| *name)
+        .collect();
+    if enabled.is_empty() {
+        "none".to_string()
+    } else {
+        enabled.join(", ")
     }
 }
 
@@ -4662,6 +4670,13 @@ pub async fn run_sync_command(cfg: &CyDriveConfig, secret: Option<&str>) -> Resu
             .context("connecting the baidu backend to derive the sync namespace")?
             .sync_namespace_key(),
         Backend::Local => anyhow::bail!("{LOCAL_SYNC_UNSUPPORTED}"),
+        // Phase 4 / SF1 placeholder: the sftp volume is authoritative-index
+        // (like local) and its sync participation is undecided until SF3
+        // wires the backend; refuse loudly rather than guess a namespace.
+        Backend::Sftp => anyhow::bail!(
+            "cydrive sync does not support the sftp backend yet (Phase 4 SF3 \
+             wires the backend)"
+        ),
     };
 
     let db = MetaDatabase::open(Path::new(&cfg.db_path))
@@ -5111,6 +5126,14 @@ pub async fn build_backend_transport_with(
                 anyhow::bail!("{LOCAL_DRIVER_REQUIRED}")
             }
         }
+        // Phase 4 / SF1 placeholder: the sftp dispatch arm (the `sftp`
+        // feature gate, SFTP_DRIVER_REQUIRED and the transport assembly)
+        // lands in SF3 — SF1 ships the driver crate and the config keys
+        // only, so the only honest arm today is the refusal.
+        Backend::Sftp => anyhow::bail!(
+            "the sftp backend is not wired into this build yet (Phase 4 SF1 \
+             ships the driver crate and config keys; SF3 wires the dispatch)"
+        ),
     }
 }
 
@@ -5147,6 +5170,11 @@ pub async fn build_backend_transport_with(cfg: &CyDriveConfig) -> Result<Backend
                 anyhow::bail!("{LOCAL_DRIVER_REQUIRED}")
             }
         }
+        // Phase 4 / SF1 placeholder — see the baidu-feature twin above.
+        Backend::Sftp => anyhow::bail!(
+            "the sftp backend is not wired into this build yet (Phase 4 SF1 \
+             ships the driver crate and config keys; SF3 wires the dispatch)"
+        ),
     }
 }
 
@@ -5384,6 +5412,12 @@ async fn build_driver(cfg: &CyDriveConfig) -> Result<Arc<dyn StorageDriver>> {
         }
         #[cfg(not(feature = "local"))]
         Backend::Local => anyhow::bail!("{LOCAL_DRIVER_REQUIRED}"),
+        // Phase 4 / SF1 placeholder: the sftp rebuild arm lands with the
+        // SF3 dispatch wiring (until then no build can reach the driver).
+        Backend::Sftp => anyhow::bail!(
+            "the sftp backend is not wired into this build yet (Phase 4 SF1 \
+             ships the driver crate and config keys; SF3 wires the rebuild arm)"
+        ),
     }
 }
 
