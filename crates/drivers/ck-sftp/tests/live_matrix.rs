@@ -11,6 +11,10 @@
 //! CYDRIVE_SFTP_TEST_PASSWORD=... \
 //! CYDRIVE_SFTP_TEST_FINGERPRINT=SHA256:... \
 //! cargo test -p ck-sftp --test live_matrix -- --ignored --nocapture
+//!
+//! D1 两形态任选其一：密码（`CYDRIVE_SFTP_TEST_PASSWORD`）或本机
+//! 未加密私钥（`CYDRIVE_SFTP_TEST_KEY_PATH`）——驱动的「私钥优先、
+//! 密码兜底」认证序不变。
 //! ```
 //!
 //! **凭据红线（R3）**：测试凭据只从环境变量读（`CYDRIVE_SFTP_TEST_*`），
@@ -39,7 +43,8 @@ struct LiveEnv {
     host: String,
     port: u16,
     username: String,
-    password: String,
+    password: Option<String>,
+    key_path: Option<String>,
     fingerprint: Option<String>,
     root: String,
 }
@@ -53,6 +58,9 @@ fn live_env() -> LiveEnv {
             )
         })
     };
+    // 空串视同未设置——shell 里留空占位不该被当成凭据。
+    let optional =
+        |name: &str| -> Option<String> { std::env::var(name).ok().filter(|v| !v.is_empty()) };
     LiveEnv {
         host: required("CYDRIVE_SFTP_TEST_HOST"),
         port: std::env::var("CYDRIVE_SFTP_TEST_PORT")
@@ -60,7 +68,8 @@ fn live_env() -> LiveEnv {
             .and_then(|p| p.parse().ok())
             .unwrap_or(22),
         username: required("CYDRIVE_SFTP_TEST_USER"),
-        password: required("CYDRIVE_SFTP_TEST_PASSWORD"),
+        password: optional("CYDRIVE_SFTP_TEST_PASSWORD"),
+        key_path: optional("CYDRIVE_SFTP_TEST_KEY_PATH"),
         // D2: the live suite needs a pinned fingerprint unless a
         // dedicated acceptance test is the one running.
         fingerprint: std::env::var("CYDRIVE_SFTP_TEST_FINGERPRINT").ok(),
@@ -72,6 +81,11 @@ fn live_env() -> LiveEnv {
 /// fingerprint (the D2 rejection legs); everything else pins it.
 fn live_driver(require_pin: bool) -> SftpDriver {
     let env = live_env();
+    assert!(
+        env.password.is_some() || env.key_path.is_some(),
+        "no credential in the environment: set CYDRIVE_SFTP_TEST_PASSWORD or \
+         CYDRIVE_SFTP_TEST_KEY_PATH (D1 needs one of the two forms)"
+    );
     let fingerprint = if require_pin {
         Some(env.fingerprint.clone().unwrap_or_else(|| {
             panic!("CYDRIVE_SFTP_TEST_FINGERPRINT is not set (D2: the live suite pins the key)")
@@ -83,8 +97,8 @@ fn live_driver(require_pin: bool) -> SftpDriver {
         host: env.host,
         port: env.port,
         username: env.username,
-        password: Some(env.password),
-        private_key_path: None,
+        password: env.password.clone(),
+        private_key_path: env.key_path.map(std::path::PathBuf::from),
         private_key_passphrase: None,
         host_fingerprint: fingerprint,
         root: env.root,
@@ -619,8 +633,8 @@ async fn live_mismatched_fingerprint_is_rejected() {
         host: env.host,
         port: env.port,
         username: env.username,
-        password: Some(env.password),
-        private_key_path: None,
+        password: env.password.clone(),
+        private_key_path: env.key_path.map(std::path::PathBuf::from),
         private_key_passphrase: None,
         // A syntactically valid but wrong SHA256 fingerprint.
         host_fingerprint: Some("SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string()),

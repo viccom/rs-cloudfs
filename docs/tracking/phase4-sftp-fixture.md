@@ -65,6 +65,29 @@ CYDRIVE_SFTP_TEST_ROOT='/srv/sftp-test' \
 cargo test -p ck-sftp --test live_matrix -- --ignored --test-threads=1 --nocapture
 ```
 
+**凭据两形态（D1）二选一**：密码用 `CYDRIVE_SFTP_TEST_PASSWORD`；私钥用
+`CYDRIVE_SFTP_TEST_KEY_PATH='<本机未加密私钥路径>'`（如
+`C:\Users\<you>\.ssh\id_rsa`）替代 PASSWORD 行。指纹取法：
+`ssh-keygen -F <host> -l`（known_hosts 已有记录时）或
+`ssh-keyscan <host> | ssh-keygen -lf -`。
+
+## 第二轮：u18 真机（2026-09-15，Phase 4 合入后）
+
+负责人指名的第二台真机：**u18**（`172.27.199.30`，Ubuntu 24.04 OpenSSH，
+**root + 本机 RSA 私钥**——`CYDRIVE_SFTP_TEST_KEY_PATH` 腿首次真机验证）。
+fixture 建在 `/root/cydrive-sf4`（link_test/link_guard/protector 同上节）；
+指纹经 `ssh-keygen -F 172.27.199.30 -l` 取自 known_hosts（ED25519，
+**不入仓库**）。递归删除腿消费 link_guard 后需重建（同上节脚本）。
+
+| 项 | 结果 |
+|---|---|
+| 结果 | **11/11 通过（6.87s）** |
+| 上传 128 MiB | 0.96s（133.5 MiB/s） |
+| 下载 128 MiB | 2.09s（61.3 MiB/s） |
+
+与 WSL2 回环同档——u18 链路无可见带宽税；D2 三态与符号链接双腿在第二台
+服务器复验通过。
+
 ## 实测数字（2026-09-15，WSL2 本机回环）
 
 | 项 | 结果 |
