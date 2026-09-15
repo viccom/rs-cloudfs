@@ -238,6 +238,82 @@ function renderVolumeTabs() {
     }).join("");
     bar.innerHTML = `${chips}<a href="/volumes" class="volume-tab volume-add" title="${t('index.manage_volumes')}">＋</a>`;
     ensureCurrentVolume();
+    updateRebuildButton();
+}
+
+// The file page's rebuild entry (the P6 route surfaced here): reflects
+// the CURRENT volume's row from /api/volumes — hidden in single-volume
+// mode (the same gating the tabs use), disabled with guidance where the
+// backend cannot be walked (telegram's db IS its index; an encrypted
+// volume's backend only sees ciphertext — both go through `cydrive
+// sync`), and busy (spinning) while the row's rebuilding marker is up.
+function updateRebuildButton() {
+    const btn = document.getElementById("btn-rebuild-index");
+    if (!btn) return;
+    if (!volumeState.multi || !volumeState.current) {
+        btn.hidden = true;
+        return;
+    }
+    const row = volumeState.volumes.find(v => v.name === volumeState.current);
+    if (!row) {
+        btn.hidden = true;
+        return;
+    }
+    btn.hidden = false;
+    const icon = document.getElementById("btn-rebuild-index-icon");
+    const setTitle = (key) => {
+        btn.setAttribute('data-i18n-title', key);
+        btn.title = t(key);
+    };
+    if (row.backend === 'telegram' || row.encrypted) {
+        btn.disabled = true;
+        if (icon) icon.classList.remove('fa-spin');
+        setTitle('index.rebuild_unsupported');
+        return;
+    }
+    if (row.rebuilding) {
+        btn.disabled = true;
+        if (icon) icon.classList.add('fa-spin');
+        setTitle('index.rebuild_index');
+        return;
+    }
+    btn.disabled = false;
+    if (icon) icon.classList.remove('fa-spin');
+    setTitle('index.rebuild_index');
+}
+
+// POST the current volume's rebuild (the same route the /volumes row's
+// [Refresh] uses); the pass runs in the background, so the toast carries
+// the backend's reply verbatim and a short poll keeps the button's busy
+// state and the file list following the rebuild marker until it settles.
+async function rebuildCurrentVolume() {
+    const btn = document.getElementById("btn-rebuild-index");
+    if (!btn || btn.disabled) return;
+    const name = volumeState.current;
+    if (!name) return;
+    btn.disabled = true;
+    try {
+        const res = await fetch(`/api/volumes/${encodeURIComponent(name)}/rebuild`, {
+            method: "POST",
+        });
+        const body = await res.json().catch(() => ({}));
+        if (res.ok && body.ok) {
+            showToast('ok', body.reply || t('common.done'));
+        } else {
+            showToast('err', body.error || `HTTP ${res.status}`);
+        }
+    } catch (err) {
+        showToast('err', t('common.request_failed', { error: err }));
+    }
+    // Follow the background pass: refresh until the marker settles
+    // (bounded — a huge volume's walk outlives any sane poll window,
+    // the /volumes page stays the live view for those).
+    for (let i = 0; i < 15; i++) {
+        await new Promise(r => setTimeout(r, 2000));
+        await loadDriveData();
+        const row = volumeState.volumes.find(v => v.name === name);
+        if (!row || !row.rebuilding) break;
+    }
 }
 
 // The current-selection fallback (plan §1.4 顺带修复): a volume that
@@ -298,9 +374,17 @@ function updateStatsUI(stats) {
     updateStorageCard(stats, sizeStr);
     updateBackendUI(stats);
 
+    // The mount badge: only shown when this volume actually mounts a
+    // letter (webdav/winfsp mapping). Without one the badge hides — the
+    // template's static "Y:" default must not ghost as a mount that
+    // does not exist (a volume with no drive_letter mounted nothing).
+    const badge = document.getElementById("drive-mount-badge");
+    const letterEl = document.getElementById("drive-letter");
     if (stats.drive_letter) {
-        const letterEl = document.getElementById("drive-letter");
         if (letterEl) letterEl.innerText = stats.drive_letter;
+        if (badge) badge.hidden = false;
+    } else if (badge) {
+        badge.hidden = true;
     }
 }
 

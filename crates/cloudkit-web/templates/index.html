@@ -75,6 +75,11 @@
                     </button>
                     <input type="file" id="file-upload" style="display: none;" onchange="handleFileUpload(this)">
                     <button class="btn btn-icon" title="Refresh Drive" data-i18n-title="index.refresh_drive" onclick="loadDriveData()"><i class="fa-solid fa-rotate"></i></button>
+                    <!-- Rebuild the current volume's index from its backend
+                         (P6's POST /api/volumes/{name}/rebuild surfaced on
+                         the file page; revealed by app.js in multi-volume
+                         mode — the same gating the volume tabs use) -->
+                    <button class="btn btn-icon" id="btn-rebuild-index" title="Rebuild Index" data-i18n-title="index.rebuild_index" onclick="rebuildCurrentVolume()" hidden><i class="fa-solid fa-cloud-arrow-down" id="btn-rebuild-index-icon"></i></button>
                 </div>
             </header>
 
@@ -126,7 +131,11 @@
                     <div class="stat-info">
                         <h3 id="storage-percent">0%</h3>
                         <p id="storage-detail">0 MB / Unlimited</p>
-                        <span class="drive-badge"><i class="fa-brands fa-windows"></i> <span data-i18n="index.mounted_on">Mounted on</span> <strong id="drive-letter">Y:</strong></span>
+                        <!-- The mount badge: shown only when the stats
+                             actually carry a drive letter — the template's
+                             Y: default must not ghost on volumes that
+                             mount nothing (the app.js toggle owns it) -->
+                        <span class="drive-badge" id="drive-mount-badge" hidden><i class="fa-brands fa-windows"></i> <span data-i18n="index.mounted_on">Mounted on</span> <strong id="drive-letter">Y:</strong></span>
                     </div>
                 </div>
             </section>
