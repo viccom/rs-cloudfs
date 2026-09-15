@@ -45,7 +45,7 @@ cargo build --release
 
 baidu 实例最小配置（config.toml）：`backend = "baidu"` + `baidu_app_key/baidu_app_secret/baidu_refresh_token`（或 env `CYDRIVE_BAIDU_*`，access_token 缺省由 refresh 换取）；`baidu_root` 默认 `/apps/cloudfs`。
 local 实例：`backend = "local"` + `local_root = "<绝对路径>"`。
-sftp 实例：`backend = "sftp"` + `sftp_host` / `sftp_username` + 认证（`sftp_password` **或** `sftp_private_key_path`，可选 `sftp_private_key_passphrase`）；`sftp_port` 默认 22、`sftp_root` 默认 `/`。**首次连接必须先接受服务器主机密钥**：`cydrive doctor` 会打印服务器实际指纹（D2：未接受前驱动拒连，绝无静默 TOFU），把该值填进 `sftp_host_fingerprint` 即完成接受；指纹此后变更会被恒拒（MITM 信号）。凭据可经 env `CYDRIVE_SFTP_PASSWORD` / `CYDRIVE_SFTP_PRIVATE_KEY_PASSPHRASE` 覆盖文件值。
+sftp 实例：`backend = "sftp"` + `sftp_host` / `sftp_username` + 认证（`sftp_password` **或** `sftp_private_key_path`，可选 `sftp_private_key_passphrase`）；`sftp_port` 默认 22、`sftp_root` 默认 `/`。**首次连接必须先接受服务器主机密钥**：`cydrive doctor` 会打印服务器实际指纹（D2：未接受前驱动拒连，绝无静默 TOFU），把该值填进 `sftp_host_fingerprint` 即完成接受；指纹此后变更会被恒拒（MITM 信号）。凭据可经 env `CYDRIVE_SFTP_PASSWORD` / `CYDRIVE_SFTP_PRIVATE_KEY_PASSPHRASE` 覆盖文件值（单卷模式；多卷模式下与其他 `CYDRIVE_*` 一样被忽略——K28，见下文注意事项）。卷文件里的 `sftp_private_key_path` 相对路径锚定该卷 home 目录（K21，同 db/cache）。
 **全参数示例配置**（凭据已脱敏占位，可用 `cydrive status` 验证解析）：单卷 [`examples/single-volume.example.toml`](examples/single-volume.example.toml)（36 键全览，注释分组）；多卷 [`examples/multi-volume/`](examples/multi-volume/)（进程级 `config.example.toml` + 4 卷矩阵 `volumes/`：baidu-enc / baidu-plain / local-enc / local-plain——同后端多卷×加密开关，层次在文件布局：进程级键与卷级键分文件，见下节）。
 权威后端（baidu/local）冷启动可 `cydrive rebuild` 从后端重建索引（明文集；加密实例走 sync）。多卷模式下若实例在运行，rebuild 自动经控制通道转发为各卷的后台 `REBUILD <名>`（受理即回，进度看 `LIST` 的 `rebuilding` 标记；实例不在线则照旧离线重建）。
 新后端接入指南：[docs/standards/driver-onboarding.md](docs/standards/driver-onboarding.md)（conformance 套件 + 装配点 + E2E 拓扑）。

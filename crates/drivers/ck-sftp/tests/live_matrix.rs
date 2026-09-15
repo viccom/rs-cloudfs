@@ -23,8 +23,9 @@
 //!
 //! 矩阵（计划 §5 SF4）：①上传→回读逐字；②Range 跨窗口读（K47 流式
 //! 播放前置）；③大文件吞吐实测（数字记录）；④断线重连；⑤覆盖写；
-//! ⑥符号链接契约；⑦rebuild 由核心 `rebuild` 走驱动（本文件覆盖驱动
-//! 面：list 递归 + stat 收敛的等价物）。
+//! ⑥符号链接契约（⑥c = symlink 卷根跟随——审查修复腿）；⑦rebuild 由
+//! 核心 `rebuild` 走驱动（本文件覆盖驱动面：list 递归 + stat 收敛的
+//! 等价物）。
 //!
 //! 指纹来源：`ssh-keyscan`/`ssh-keygen -lf` 形态。故意不硬编码——
 //! 服务器重建即换 key，硬编码会让真机套件在下一次重装后静默失败。
@@ -63,16 +64,23 @@ fn live_env() -> LiveEnv {
         |name: &str| -> Option<String> { std::env::var(name).ok().filter(|v| !v.is_empty()) };
     LiveEnv {
         host: required("CYDRIVE_SFTP_TEST_HOST"),
-        port: std::env::var("CYDRIVE_SFTP_TEST_PORT")
-            .ok()
-            .and_then(|p| p.parse().ok())
-            .unwrap_or(22),
+        // 坏值（非数字）panic 而非静默回退 22——回退会连到错误的服务器
+        // 上跑凭据（审查修复）。
+        port: std::env::var("CYDRIVE_SFTP_TEST_PORT").map_or_else(
+            |_| 22,
+            |raw| {
+                raw.trim()
+                    .parse()
+                    .unwrap_or_else(|_| panic!("CYDRIVE_SFTP_TEST_PORT is not a number: {raw:?}"))
+            },
+        ),
         username: required("CYDRIVE_SFTP_TEST_USER"),
         password: optional("CYDRIVE_SFTP_TEST_PASSWORD"),
         key_path: optional("CYDRIVE_SFTP_TEST_KEY_PATH"),
         // D2: the live suite needs a pinned fingerprint unless a
-        // dedicated acceptance test is the one running.
-        fingerprint: std::env::var("CYDRIVE_SFTP_TEST_FINGERPRINT").ok(),
+        // dedicated acceptance test is the one running. 空串视同未设置
+        // （否则会以 mismatch 形态失败，文案误导成 MITM——审查修复）。
+        fingerprint: optional("CYDRIVE_SFTP_TEST_FINGERPRINT"),
         root: std::env::var("CYDRIVE_SFTP_TEST_ROOT").unwrap_or_else(|_| "/".to_string()),
     }
 }
@@ -491,6 +499,44 @@ async fn live_symlink_to_dir_is_never_followed_by_delete() {
     }
 }
 
+/// ⑥c（审查修复腿）：**symlink 卷根**可列、stat 报 Dir——根是操作者经
+/// `sftp_root` 声明的挂载点（跟随解析），不是走查发现的条目。复用
+/// `link_test/dirlink → /etc` fixture：以它为根的第二个驱动必须能列出
+/// 链接目标的真实内容（只读断言，不写 /etc）。修复前 list(root) 对
+/// symlink 根报 Invalid——整卷不可用。
+#[tokio::test]
+#[ignore = "live SFTP server (SF4 matrix); set CYDRIVE_SFTP_TEST_* env vars"]
+async fn live_symlinked_volume_root_is_listable() {
+    let env = live_env();
+    let symlink_root = format!("{}/link_test/dirlink", env.root.trim_end_matches('/'));
+    let params = SftpParams {
+        host: env.host,
+        port: env.port,
+        username: env.username,
+        password: env.password.clone(),
+        private_key_path: env.key_path.map(std::path::PathBuf::from),
+        private_key_passphrase: None,
+        host_fingerprint: env.fingerprint.clone(),
+        root: symlink_root,
+    };
+    let driver = SftpDriver::new(params).expect("driver with a symlinked root");
+
+    let root_stat = driver
+        .stat(&RelPath::root())
+        .await
+        .expect("a symlinked volume root must stat as its target dir");
+    assert_eq!(root_stat.kind, EntryKind::Dir);
+
+    let listing = driver
+        .list(&RelPath::root(), Page::all())
+        .await
+        .expect("a symlinked volume root must be listable");
+    assert!(
+        !listing.entries.is_empty(),
+        "the link target (/etc on the fixtures) is not empty"
+    );
+}
+
 /// ⑥b：递归删除 **目录**时对内部链接的处理（不跟随、只删链）——
 /// 在驱动器 fixture 里造一个含 link-to-dir 的目录，删该目录后：
 /// 链接本体消失、链接目标（服务器侧新建的受保护目录）内容原封不动。
@@ -500,10 +546,13 @@ async fn live_recursive_delete_does_not_follow_links() {
     let driver = live_driver(true);
     // 该目录由 fixture 提供（含 victim/ + protector/ + dirlink → protector）
     let guard = rel("link_guard");
-    let listing = driver
-        .list(&guard, Page::all())
-        .await
-        .expect("link_guard fixture must exist on the live server (see the SF4 docs)");
+    let listing = driver.list(&guard, Page::all()).await.unwrap_or_else(|e| {
+        panic!(
+            "link_guard fixture must exist on the live server — this test CONSUMES it; \
+                 rebuild it before the next run (see docs/tracking/phase4-sftp-fixture.md \
+                 §符号链接 fixture): {e:?}"
+        )
+    });
     let names: Vec<String> = listing
         .entries
         .iter()

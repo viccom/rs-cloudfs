@@ -340,3 +340,63 @@ async fn reader_foreign_volume_handle_yields_not_found() {
         Some(StorageError::NotFound)
     );
 }
+
+// ------------------------------------------- 审查修复批（root/名字面）---
+
+/// symlink 卷根可列（审查修复）：根是操作者经 `sftp_root` 声明的挂载
+/// 点，不是走查发现的条目——list/stat 对根采用**跟随**语义（symlink
+/// 根如 /var/www → /srv/www 必须可用）；卷内条目仍走 lstat（K66 契约
+/// 不变——修复前 list(root) 对 symlink 根报 Invalid，整个卷不可列）。
+#[tokio::test]
+async fn symlinked_volume_root_is_listable_and_stats_as_dir() {
+    let (stub, _default_root_driver) = setup().await;
+    stub.add_dir("/srv/real");
+    stub.add_file("/srv/real/x.bin", b"X");
+    stub.add_symlink("/srv/alias", "/srv/real");
+
+    let mut pairs = stub.param_pairs();
+    pairs.push((
+        "sftp_host_fingerprint".to_string(),
+        stub.fingerprint().to_string(),
+    ));
+    pairs.push(("sftp_root".to_string(), "/srv/alias".to_string()));
+    let params = SftpParams::from_pairs(&pairs).expect("params");
+    let driver = SftpDriver::new(params).expect("driver");
+
+    let listing = driver
+        .list(&RelPath::root(), Page::all())
+        .await
+        .expect("a symlinked volume root must be listable (operator-declared mount point)");
+    let names: Vec<&str> = listing.entries.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(names, vec!["x.bin"]);
+
+    let root = driver
+        .stat(&RelPath::root())
+        .await
+        .expect("stat on a symlinked root must resolve to the target dir");
+    assert_eq!(root.kind, EntryKind::Dir);
+}
+
+/// 不可寻址名不可见（审查修复）：`\` 名无法经句柄往返（`RelPath::new`
+/// 拒绝——delete/reader 寻址必败）；非 UTF-8 名被 russh-sftp 协议层
+/// lossy 成 U+FFFD 替换串（替换名在服务器上并非真实路径）。两类名字
+/// list 不得产出（不可寻址即不可见；ck-local `join_validated`/非 UTF-8
+//  跳过的同源硬化）。
+#[tokio::test]
+async fn list_hides_names_that_cannot_round_trip() {
+    let (stub, driver) = setup().await;
+    stub.add_file("/ok.txt", b"fine");
+    stub.add_file("/back\\slash.txt", b"hidden");
+    stub.add_file("/mojibake\u{FFFD}.txt", b"hidden");
+
+    let listing = driver
+        .list(&RelPath::root(), Page::all())
+        .await
+        .expect("list");
+    let names: Vec<&str> = listing.entries.iter().map(|e| e.path.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["ok.txt"],
+        "unaddressable names (backslash / lossy-replaced) must be invisible"
+    );
+}

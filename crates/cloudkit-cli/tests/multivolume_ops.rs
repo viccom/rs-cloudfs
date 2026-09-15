@@ -614,6 +614,74 @@ fn resolve_volume_settings_keeps_baidu_root_verbatim() {
     );
 }
 
+/// `sftp_private_key_path` is a **filesystem** path (unlike `sftp_root`,
+/// the backend namespace path): a relative value in a volume file must
+/// rebase onto the volume home like db_path/local_root (review fix —
+/// before, it resolved against the process CWD, reading the wrong key
+/// file or none depending on the launch directory), while an absolute
+/// path passes through untouched. `sftp_root` itself never rebases
+/// (the baidu_root exemption, same leading-`/` rule).
+#[test]
+fn resolve_volume_settings_rebases_relative_sftp_private_key_path() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let toml = if cfg!(windows) {
+        "backend = \"sftp\"\nsftp_host = \"nas\"\nsftp_username = \"u\"\n\
+         sftp_private_key_path = \"keys\\\\id_ed25519\"\n\
+         sftp_host_fingerprint = \"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n\
+         sftp_root = \"/srv/data\"\n"
+    } else {
+        "backend = \"sftp\"\nsftp_host = \"nas\"\nsftp_username = \"u\"\n\
+         sftp_private_key_path = \"keys/id_ed25519\"\n\
+         sftp_host_fingerprint = \"SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA\"\n\
+         sftp_root = \"/srv/data\"\n"
+    };
+    write_file(&dir.path().join("s.toml"), toml);
+    let volumes = cloudkit_core::config::load_volumes(dir.path()).expect("load volumes");
+    let home = dir.path().join("s");
+    let resolved = resolve_volume_settings(&volumes[0]).expect("K21 resolution");
+    let expected = home
+        .join(if cfg!(windows) {
+            "keys\\id_ed25519"
+        } else {
+            "keys/id_ed25519"
+        })
+        .to_string_lossy()
+        .into_owned();
+    assert_eq!(
+        resolved.sftp_private_key_path.as_deref(),
+        Some(expected.as_str()),
+        "a relative private key path anchors in the volume home"
+    );
+    assert_eq!(
+        resolved.sftp_root.as_deref(),
+        Some("/srv/data"),
+        "sftp_root is a backend path and never rebases"
+    );
+
+    // An absolute key path passes through untouched (idempotence).
+    // (Forward-slash spelling on Windows: `C:/…` is absolute for
+    // `Path::is_absolute` and keeps the TOML string escape-free.)
+    let abs = if cfg!(windows) {
+        "C:/keys/id_ed25519"
+    } else {
+        "/etc/ssh/keys/id_ed25519"
+    };
+    write_file(
+        &dir.path().join("s.toml"),
+        &format!(
+            "backend = \"sftp\"\nsftp_host = \"nas\"\nsftp_username = \"u\"\n\
+             sftp_private_key_path = \"{abs}\"\n"
+        ),
+    );
+    let volumes = cloudkit_core::config::load_volumes(dir.path()).expect("reload volumes");
+    let resolved = resolve_volume_settings(&volumes[0]).expect("K21 resolution (absolute)");
+    assert_eq!(
+        resolved.sftp_private_key_path.as_deref(),
+        Some(abs),
+        "an absolute key path passes through verbatim"
+    );
+}
+
 /// Multi-volume rebuild (the fresh-instance bootstrap): each rebuildable
 /// volume's index is rebuilt from its OWN backend into its OWN volume
 /// home db (K21), and telegram volumes are skipped (shadow index — the
