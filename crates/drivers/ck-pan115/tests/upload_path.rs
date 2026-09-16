@@ -529,18 +529,15 @@ fn path(s: &str) -> RelPath {
     RelPath::new(s.trim_start_matches('/')).expect("valid path")
 }
 
-/// 每个用例独立的 spool 目录（临时）。
+/// 每个用例独立的 spool 目录（临时）。tempfile 的 OS 级唯一命名（审查
+/// H-T1：自拼 pid+纳秒在 Windows ~1ms 时钟粒度下并行初始化会撞名——
+/// A 的尾部 remove_dir_all 删掉 B 正在用的目录，`spool create` os error 3
+/// 的 flaky 根因）。`into_path` 放弃自动删除，保持调用方尾部手动清理的
+/// 原语义。
 fn tmpdir() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "ck-pan115-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&dir).expect("tmpdir");
-    dir
+    tempfile::tempdir()
+        .expect("tmpdir")
+        .into_path()
 }
 
 /// 把桩 base 注入 get_token 的 thread-local（每个测试起点调用）。
