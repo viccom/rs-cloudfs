@@ -12,7 +12,7 @@
 | 115-1 | 认证与驱动骨架 | ✅ 完成（2026-09-16，commit 65efd51） | ck-pan115 五模块（api/oauth/oss/limiter/lib，~2.4k 行）：envelope 双形态 + K69.7 错误分类（401*/99 一次刷+重放、770004 硬退避、911 fail-fast）；PKCE 三端点 + 单飞 refresh + ConfigTokenStore 回写；OSS V1 签名层 port（K69.5 不引 ali-oss-rs）；D4 限速器落值（1rps+300s 起退避）；九方法占位。配置四清单 + Backend::Pan115 + validate；编译面 feature 三件套 + DRIVER_ROWS + 占位臂（SF1 深度）| workspace **1189/0/24**（基线 1149+40）；clippy/fmt/layers/secrets 全绿；双裁剪腿构建过（local,baidu 无 pan115 / pan115-only）|
 | 115-2 | 读路径 | ✅ 完成（2026-09-16，commit 12ecddd） | pathcache（路径↔cid 解析 + 单层目录索引缓存，热路径零 API 已断言）+ download（dlink TTL 缓存 30min 保守值 + 4MiB 有界窗口流；UA 绑定/HEAD 探测/206+Content-Range 校验/403→RateLimited 退避/空窗口形态）+ 九方法除 writer 全接线（list 全分页+稳定排序+offset 游标；mkdir 隐式父+Exists 预检；delete/rename 复合句柄 fid:pc:parent；rename 同父 update/跨父 move；reader 钳制+目录拒；quota rt_space_info；connect 取 uid）| tests/read_path.rs **14/14**（内存 VFS+loopback axum 桩回放）；workspace **1203/0/24**；五门禁全绿 |
 | 115-3 | 写路径 | ✅ 完成（2026-09-16，commit cfbf907） | upload.rs：commit-on-close stager（本地 spool 两遍读形态）——hash→init→**K69.2 二次认证循环**（sign_check 区间 SHA1，上限 3 轮）→get_token→PutObject/Initiate?sequential+分片→Complete(callback 头)→**远端 size 复核**；resume 会话表（path\|size\|sha1 三元键 + 磁盘层）：逐片落盘、ListParts 对账、只补缺片、NoSuchUpload 重建（K69.8 #30）；Drop 保会话/abort 清除；oss.rs 加 scheme 缝（桩面；签名零影响）| tests/upload_path.rs **12/12**（假开放平台+假 OSS 端点）；workspace **1215/0/24**；五门禁全绿 |
-| 115-4 | conformance + 装配 | ⏸ | 假开放平台 + 假 OSS 桩（get_token 端点指向 loopback）八断言全绿 + 12 装配点 + web 表单/扫码引导 | — |
+| 115-4 | conformance + 装配 | ✅ 完成（2026-09-16，26bc85d + 05a7c7d） | **4a**：conformance 八断言绿（假开放平台+假 OSS 桩，get_token 端点 loopback）+ 115 特化分片级差集用例；执行期修复两个真实缺陷（stat 新鲜度查询——缓存吞后端错误使断言⑤不可满足；中断路径不落会话使差集失效）+ 实现「到齐即传」。**4b**：transport_face（Pan115Transport）+ factory 改 connect（真 uid 身份，占位 `pan115:pending` 杜绝进生产）+ Pan115Probe 四变体；CLI 全装配（BackendTransport 臂+五方法、pan115_params、build_pan115_transport(+_with/_with_endpoints 缝)、ConfigTokenStore 双 impl、dispatch 双臂、build_driver、sync=baidu 式、doctor 探测+通断检查、PROXY 文案）；main.rs per-backend dispatch + state_dir 放宽；web 表单/i18n（含 D2 回收站提示）| workspace **1221/0/24**；clippy/fmt/layers/secrets 全绿；local,baidu / pan115-only / sftp,pan115 三裁剪腿全过 |
 | 115-5 | 真机矩阵 | ⏸ | 上传往返/Range 播放/秒传命中/断点续传（杀进程恢复）/rebuild 收敛（QPS 限速）/加密卷/E2E 三面 | — |
 
 ## 立项前研究（2026-09-14，已完成）
@@ -32,6 +32,10 @@
   - 双仓库分工定调（计划 §0.1）：115-plus-desktop = 主路线规格书 + Rust 传输参照；PCFS = 驱动形态对照 + 路线 B 保底；ck-baidu = 结构模板（api/oauth/errno mock/假服务端/TokenStore）。
   - **对上轮评估的修正入档**：115 从"一条腿"改判"两条腿"（开放平台 + web API）；Rust 生态从"零现成物"改判"`ali-oss-rs`（MIT）+ 传输参照齐备"——量级估计比 ck-baidu 省约三分之一（走路线 A 前提下）。
   - 计划落库三件：本跟踪单 + `docs/plans/2026-09-14-pan115-driver.md` + decisions K61。
+
+## 批次日志（续）
+
+- **2026-09-16 115-4 完成（4a 26bc85d + 4b 05a7c7d）**：conformance 八断言 + 全装配接线。**执行期两个真实缺陷修复**（4a 暴露）：①`stat` 原经路径缓存整层服务——后端错误永远浮不出来（断言⑤不可满足），改为末级新鲜查询（前缀仍缓存）；②分片传输中途失败不落会话——差集续传资产丢失（断言⑦失效），改为每片落地即持久化 + 失败路径同样落盘，并按 115 的 init 会话锁定语义实现「到齐即传」（`write` 到齐承诺量即推传输链，`close` 仍是提交点）。**装配批**：驱动面新增 transport_face/probe；`factory` 由 `new` 改 `connect`（VolumeId 真 uid）；CLI 13 处接线；web 4 处；测试 +4（dispatch 三 + crate transport/probe）。**裁决**：sync = baidu 式接入（计划 §4.3 明文；零 core 改动最可逆）；error_table 只留 430004（770004 是硬退避状态而非一次性失败，与断言⑤「恰好一次」契约冲突——映射由 errno_mapping.rs 钉）。子代理通道两次失败改主会话直做（记录在案）。
 
 ## 风险与未覆盖（如实记录）
 
