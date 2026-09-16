@@ -245,7 +245,7 @@ impl Pan115Stager {
                     let sts = self.client.get_token().await?;
                     let http = self.client.http();
                     let ctx = OssCtx {
-                        endpoint: sts.endpoint.clone(),
+                        endpoint: normalize_endpoint(&sts.endpoint),
                         bucket: resp.bucket.clone(),
                         object: resp.object.clone(),
                         access_key_id: sts.access_key_id.clone(),
@@ -393,7 +393,7 @@ impl Pan115Stager {
         let upload_id = if multipart {
             let http = self.client.http();
             let ctx = OssCtx {
-                endpoint: sts.endpoint.clone(),
+                endpoint: normalize_endpoint(&sts.endpoint),
                 bucket: bucket.clone(),
                 object: object.clone(),
                 access_key_id: sts.access_key_id.clone(),
@@ -431,7 +431,7 @@ impl Pan115Stager {
     async fn oss_ctx_for(&self, t: &TransferState) -> Result<OssCtx, StorageError> {
         let sts = self.client.get_token().await?;
         Ok(OssCtx {
-            endpoint: sts.endpoint.clone(),
+            endpoint: normalize_endpoint(&sts.endpoint),
             bucket: t.bucket.clone(),
             object: t.object.clone(),
             access_key_id: sts.access_key_id.clone(),
@@ -446,7 +446,7 @@ impl Pan115Stager {
         let sts = self.client.get_token().await?;
         let t = self.transfer.as_ref().expect("transfer state");
         Ok(OssCtx {
-            endpoint: sts.endpoint.clone(),
+            endpoint: normalize_endpoint(&sts.endpoint),
             bucket: t.bucket.clone(),
             object: t.object.clone(),
             access_key_id: sts.access_key_id.clone(),
@@ -760,6 +760,29 @@ impl Pan115Stager {
             mtime: 0.0,
         })
     }
+}
+
+/// OSS endpoint 规范化（spike probes.rs:611 同款）：115 的 `get_token`
+/// 下发**带 scheme** 的端点（如 `https://oss-cn-shenzhen.aliyuncs.com`），
+/// 而 [`OssCtx`] 的 host 构造要求裸 host——不剥离会拼出
+/// `bucket.https://...` 形态并触发 OSS 的 SecondLevelDomainForbidden
+/// （115-5 真机首跑实证）。
+///
+/// 保留 scheme 的形态只出现在 loopback 测试缝（`http://127.0.0.1:port`
+/// ——`oss_execute` 按 loopback 判定走 path-style）；生产端点一律剥离
+/// scheme 并强制 https。
+fn normalize_endpoint(raw: &str) -> String {
+    let stripped = raw
+        .trim_start_matches("https://")
+        .trim_start_matches("http://")
+        .trim_end_matches('/');
+    // loopback 缝：还原带 scheme 形态（仅测试端点会命中）。
+    if stripped.starts_with("127.0.0.1") || stripped.starts_with("localhost") {
+        if let Some(rest) = raw.strip_prefix("http://") {
+            return format!("http://{}", rest.trim_end_matches('/'));
+        }
+    }
+    stripped.to_string()
 }
 
 /// 二次认证触发判定（两仓库形态并集：status∈{6,7,8} 或 sign_key+

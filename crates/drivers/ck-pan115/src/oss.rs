@@ -270,7 +270,13 @@ async fn oss_execute(
     // 走 path-style `{endpoint}/{bucket}/{object}` 且保留该 scheme——
     // **签名不依赖二者**（CanonicalizedResource 恒为 `/bucket/object`，
     // V1 签名与 host 形态无关），因此该缝不改变任何被签名输入。
-    let base = if ctx.endpoint.contains("://") {
+    // 缝的判据是 **loopback host**（测试专用），不是「是否带 scheme」：
+    // 115 的生产端点本身就带 scheme（见 upload.rs `normalize_endpoint`），
+    // 用 scheme 判定会把真机流量误导向 path-style（115-5 真机首跑实证
+    // 的 SecondLevelDomainForbidden）。
+    let loopback = ctx.endpoint.starts_with("http://127.0.0.1")
+        || ctx.endpoint.starts_with("http://localhost");
+    let base = if loopback {
         format!(
             "{}/{}/{}",
             ctx.endpoint.trim_end_matches('/'),
