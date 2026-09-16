@@ -11,12 +11,12 @@ L5 应用  cli │ webdav 网关 │ web 仪表盘 │ bot(telegram)
 L4 服务  上传队列 │ 同步引擎(+sync-server) │ LRU 缓存 │ 加密(v1 GCM/v2 分块 AEAD 流式，新卷默认 v2)
 L3 领域  VFS │ 元数据索引(SQLite) │ MetadataEvent 总线
 L2 抽象  StorageDriver trait + 能力位 + 错误分类学 + conformance kit
-L1 驱动  telegram │ baidu │ local │ sftp │ (未来: 115/123/s3…)
+L1 驱动  telegram │ baidu │ local │ sftp │ pan115 │ (未来: 123/s3…)
 ```
 
 **新后端接入 = 实现一个驱动 + 过 conformance 套件，上层全部能力（挂载/仪表盘/同步/CLI）自动可用。**驱动分两类（[driver-onboarding §10](docs/standards/driver-onboarding.md)）：后端有「按路径枚举」面的走 `StorageDriver` 宽面 + conformance（baidu/local/sftp）；没有的走 `CloudTransport` 窄面（telegram 先例——远端是消息，bot 读历史被平台拒绝，索引只存在于本地 db + sync）。**两类在编译开关上完全平权**（见下文 feature 门控）。
 
-## 状态（2026-09-14）
+## 状态（2026-09-16）
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
@@ -31,10 +31,11 @@ L1 驱动  telegram │ baidu │ local │ sftp │ (未来: 115/123/s3…)
 | 卷管理面 | Web `/volumes` 页 + 卷全生命周期命令协议（K57：SHOW/ENABLE/DISABLE/REBUILD/CREATE/UPDATE/DESTROY，凭据 write-only）+ 运行时后台 rebuild | ✅ 完成 |
 | Web 体验 | ArtPlayer 内置播放器 + 复制链接 + 注入修复 + **默认加密方案 aead_v2**（新卷流式播放默认可用） | ✅ 完成（1069 测试绿） |
 | Phase 4 | ssh/sftp 存储驱动（russh 0.63 + russh-sftp 3.0，ring 后端；K59/K60） | ✅ 完成（SF1–SF4：conformance 八断言绿；WSL2 OpenSSH 真机矩阵 11/11，吞吐上行 140.5 / 下行 67.7 MiB/s；SF5 多连接增强明确销账） |
+| Phase 5 | 115 网盘存储驱动（ck-pan115：官方开放平台 device-code PKCE，K61/K62/K65/K69） | ✅ 完成（115-0…115-5：conformance 八断言绿 + 全装配接线；真机最小冒烟 3/3——上传回读逐字节 / Range 窗口逐字节 / 秒传同 fid 命中；完整矩阵列 `#[ignore]` 留证） |
 
 阶段计划与裁决：[docs/plans/2026-09-07-cloudfusion-foundation.md](docs/plans/2026-09-07-cloudfusion-foundation.md) ｜ 历史裁决：[docs/decisions.md](docs/decisions.md)
 
-## 快速开始（四后端：telegram / baidu / local / sftp，`backend` 配置键分发）
+## 快速开始（五后端：telegram / baidu / local / sftp / pan115，`backend` 配置键分发）
 
 ```powershell
 cargo build --release

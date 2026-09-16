@@ -27,10 +27,12 @@ use anyhow::{Context, Result};
 use ck_telegram::transport::GrammersTransport;
 use clap::{Parser, Subcommand};
 use cloudkit_cli::{discover_config, discover_config_with_volumes, DiscoveredConfig, VolumeStatus};
-// Baidu-only run-flow glue (FT2): the endpoint set and the K13
-// write-back store exist only with the driver.
+// Driver-only run-flow glue (FT2 / 115-4): the baidu endpoint set ships
+// with its driver; the K13 write-back store is shared by baidu/pan115.
 #[cfg(feature = "baidu")]
-use cloudkit_cli::{BaiduEndpoints, ConfigTokenStore};
+use cloudkit_cli::BaiduEndpoints;
+#[cfg(any(feature = "baidu", feature = "pan115"))]
+use cloudkit_cli::ConfigTokenStore;
 use cloudkit_core::config::{Backend, CyDriveConfig, MountBackend, VolumeConfig};
 use cloudkit_core::logging::LogConfig;
 #[cfg(feature = "telegram")]
@@ -800,6 +802,18 @@ async fn doctor_cmd() -> Result<()> {
                 &cloudkit_cli::sftp_backend_probe(&cfg).await,
             ));
         }
+        // Phase 5 / 115-4: the pan115 leg — the offline checks plus the
+        // live probe (user/info token liveness + quota, with the
+        // re-scan / manual-token guidance on auth failures). A binary
+        // without the driver skips the dial-out leg (K31 shape, the
+        // baidu rule): no fake Unreachable.
+        cloudkit_core::config::Backend::Pan115 => {
+            results.extend(cloudkit_cli::doctor::backend_checks(&cfg));
+            #[cfg(feature = "pan115")]
+            results.push(cloudkit_cli::doctor::pan115_connectivity_check(
+                &cloudkit_cli::pan115_backend_probe(&cfg).await,
+            ));
+        }
     }
     print!("{}", cloudkit_cli::doctor::render_report(&results));
     Ok(())
@@ -1262,22 +1276,48 @@ async fn dispatch_unified_backend_volume(
     home: &std::path::Path,
     run_options: &mut cloudkit_cli::RunOptions,
 ) -> Result<Arc<dyn cloudkit_core::transport::CloudTransport>> {
-    // With the driver: K13/K21 — token rotations write back into the
-    // volume's own file; upload sessions live in the volume home.
-    // Without it: the reduced twin (K31 — a baidu volume refuses with
-    // the rebuild message; a local volume assembles unchanged).
+    // Per-backend assembly (K13/K21: token rotations write back into the
+    // volume's own file; upload sessions live in the volume home).
+    //
+    // The baidu arm routes through its endpoint-injecting twin; pan115
+    // has its own assembly (the driver connects to read the uid and
+    // takes the same write-back store plus the volume home as its
+    // session base); the no-driver twins keep the K31 refusals.
     #[cfg(feature = "baidu")]
+    let dispatched = match settings.backend {
+        cloudkit_core::config::Backend::Baidu => {
+            let token_store = ConfigTokenStore::new(spec.file_path.clone());
+            cloudkit_cli::build_backend_transport_with(
+                settings,
+                &BaiduEndpoints::default(),
+                Some(Arc::new(token_store)),
+                home,
+            )
+            .await?
+        }
+        #[cfg(feature = "pan115")]
+        cloudkit_core::config::Backend::Pan115 => {
+            let token_store = ConfigTokenStore::new(spec.file_path.clone());
+            cloudkit_cli::build_pan115_transport_with(
+                settings,
+                Some(std::sync::Arc::new(token_store)),
+                Some(home),
+            )
+            .await?
+        }
+        _ => cloudkit_cli::build_backend_transport(settings).await?,
+    };
+    #[cfg(all(not(feature = "baidu"), feature = "pan115"))]
     let dispatched = {
         let token_store = ConfigTokenStore::new(spec.file_path.clone());
-        cloudkit_cli::build_backend_transport_with(
+        cloudkit_cli::build_pan115_transport_with(
             settings,
-            &BaiduEndpoints::default(),
-            Some(Arc::new(token_store)),
-            home,
+            Some(std::sync::Arc::new(token_store)),
+            Some(home),
         )
         .await?
     };
-    #[cfg(not(feature = "baidu"))]
+    #[cfg(not(any(feature = "baidu", feature = "pan115")))]
     let dispatched = cloudkit_cli::build_backend_transport_with(settings).await?;
     run_options.sync_namespace = Some(dispatched.sync_namespace_key());
     run_options.web_volume = Some(dispatched.volume().to_string());

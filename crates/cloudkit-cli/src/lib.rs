@@ -120,6 +120,15 @@ pub const SFTP_DRIVER_REQUIRED: &str = "this binary was built without the sftp d
      rebuild with `cargo build --features sftp`, or set `backend = \"telegram\"` / \
      `backend = \"baidu\"` / `backend = \"local\"` in config.toml";
 
+/// The actionable message every pan115 surface carries when the binary was
+/// built without the pan115 driver (K31 shape, Phase 5 / 115-1 — same form
+/// as the four driver constants above): name the rebuild command, then
+/// name the backend switch. Consumed by the 115-4 dispatch arms; pinned by
+/// the off-feature test when that wiring lands.
+pub const PAN115_DRIVER_REQUIRED: &str = "this binary was built without the pan115 driver; \
+     rebuild with `cargo build --features pan115`, or set `backend = \"telegram\"` / \
+     `backend = \"baidu\"` / `backend = \"local\"` / `backend = \"sftp\"` in config.toml";
+
 /// The driver list the binary was compiled with (K32,
 /// docs/plans/2026-09-09-driver-feature-gates.md) — the `(drivers: ...)`
 /// segment of the `--version` banner.
@@ -130,18 +139,19 @@ pub const SFTP_DRIVER_REQUIRED: &str = "this binary was built without the sftp d
 /// `none` — adding a driver is one appended row (the SF0-era 3-tuple
 /// match would grow 2^n arms instead). Each row is still selected by the
 /// feature set at compile time (`cfg!` expands to a literal), in the
-/// fixed order telegram, baidu, local, sftp; onboarding the next driver
-/// (driver-onboarding §1) appends its row here. Pinned by
+/// fixed order telegram, baidu, local, sftp, pan115; onboarding the next
+/// driver (driver-onboarding §1) appends its row here. Pinned by
 /// `tests::compiled_drivers_lists_the_feature_set_in_fixed_order`
 /// (cfg-gated arms — one assertion per build; the 3-driver combinations'
-/// output is byte-identical to the pre-SF1 refactor, and the sftp row
-/// simply appends to the fixed order).
+/// output is byte-identical to the pre-SF1 refactor, and the sftp/pan115
+/// rows simply append to the fixed order).
 pub fn compiled_drivers() -> String {
     const DRIVER_ROWS: &[(bool, &str)] = &[
         (cfg!(feature = "telegram"), "telegram"),
         (cfg!(feature = "baidu"), "baidu"),
         (cfg!(feature = "local"), "local"),
         (cfg!(feature = "sftp"), "sftp"),
+        (cfg!(feature = "pan115"), "pan115"),
     ];
     let enabled: Vec<&str> = DRIVER_ROWS
         .iter()
@@ -4699,6 +4709,14 @@ pub async fn run_sync_command(cfg: &CyDriveConfig, secret: Option<&str>) -> Resu
         // source of truth, not a mirror target. `is_sync_supported`
         // reports the same and doctor shares the warning.
         Backend::Sftp => anyhow::bail!("{SFTP_SYNC_UNSUPPORTED}"),
+        // Phase 5 / 115-4 ruling: pan115 joins the sync world like
+        // baidu — its namespace key is the raw volume identity
+        // (`pan115:<uid>`), and the driver self-refreshes tokens (the
+        // K13 store rides the dispatch assembly).
+        Backend::Pan115 => build_backend_transport(cfg)
+            .await
+            .context("connecting the pan115 backend to derive the sync namespace")?
+            .sync_namespace_key(),
     };
 
     let db = MetaDatabase::open(Path::new(&cfg.db_path))
@@ -4954,6 +4972,12 @@ pub enum BackendTransport {
     /// the driver refuses with [`SFTP_DRIVER_REQUIRED`] instead.
     #[cfg(feature = "sftp")]
     Sftp(Arc<ck_sftp::SftpTransport>),
+    /// The pan115 transport face over the factory-connected driver
+    /// (Phase 5 / 115-4): requires the `pan115` feature — a binary
+    /// without the driver refuses with [`PAN115_DRIVER_REQUIRED`]
+    /// instead.
+    #[cfg(feature = "pan115")]
+    Pan115(Arc<ck_pan115::Pan115Transport>),
 }
 
 impl BackendTransport {
@@ -4967,11 +4991,18 @@ impl BackendTransport {
             BackendTransport::Local(t) => StorageDriver::volume(t.driver()).as_str(),
             #[cfg(feature = "sftp")]
             BackendTransport::Sftp(t) => StorageDriver::volume(t.driver()).as_str(),
+            #[cfg(feature = "pan115")]
+            BackendTransport::Pan115(t) => StorageDriver::volume(t.driver()).as_str(),
             // Every driver gated out: the enum is uninhabited — no
             // value can exist. The empty match over the dereferenced
             // place is the never-taken arm a reference scrutinee needs
             // (a reference alone counts as inhabited, E0004).
-            #[cfg(not(any(feature = "baidu", feature = "local", feature = "sftp")))]
+            #[cfg(not(any(
+                feature = "baidu",
+                feature = "local",
+                feature = "sftp",
+                feature = "pan115"
+            )))]
             _ => match *self {},
         }
     }
@@ -4986,7 +5017,14 @@ impl BackendTransport {
             BackendTransport::Local(t) => CloudTransport::capabilities(t.as_ref()),
             #[cfg(feature = "sftp")]
             BackendTransport::Sftp(t) => CloudTransport::capabilities(t.as_ref()),
-            #[cfg(not(any(feature = "baidu", feature = "local", feature = "sftp")))]
+            #[cfg(feature = "pan115")]
+            BackendTransport::Pan115(t) => CloudTransport::capabilities(t.as_ref()),
+            #[cfg(not(any(
+                feature = "baidu",
+                feature = "local",
+                feature = "sftp",
+                feature = "pan115"
+            )))]
             _ => match *self {},
         }
     }
@@ -5008,7 +5046,16 @@ impl BackendTransport {
             }),
             #[cfg(feature = "sftp")]
             BackendTransport::Sftp(_) => self.volume().to_string(),
-            #[cfg(not(any(feature = "baidu", feature = "local", feature = "sftp")))]
+            // 115-4: baidu-style raw volume identity (`pan115:<uid>` —
+            // the factory connects with the account uid).
+            #[cfg(feature = "pan115")]
+            BackendTransport::Pan115(_) => self.volume().to_string(),
+            #[cfg(not(any(
+                feature = "baidu",
+                feature = "local",
+                feature = "sftp",
+                feature = "pan115"
+            )))]
             _ => match *self {},
         }
     }
@@ -5024,7 +5071,14 @@ impl BackendTransport {
             BackendTransport::Local(t) => t.clone() as Arc<dyn CloudTransport>,
             #[cfg(feature = "sftp")]
             BackendTransport::Sftp(t) => t.clone() as Arc<dyn CloudTransport>,
-            #[cfg(not(any(feature = "baidu", feature = "local", feature = "sftp")))]
+            #[cfg(feature = "pan115")]
+            BackendTransport::Pan115(t) => t.clone() as Arc<dyn CloudTransport>,
+            #[cfg(not(any(
+                feature = "baidu",
+                feature = "local",
+                feature = "sftp",
+                feature = "pan115"
+            )))]
             _ => match *self {},
         }
     }
@@ -5070,7 +5124,27 @@ impl BackendTransport {
                     None
                 }
             },
-            #[cfg(not(any(feature = "baidu", feature = "local", feature = "sftp")))]
+            #[cfg(feature = "pan115")]
+            BackendTransport::Pan115(t) => match StorageDriver::quota(t.driver()).await {
+                Ok(quota) => Some(cloudkit_web::QuotaSnapshot {
+                    used: quota.used,
+                    total: quota.total,
+                }),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "pan115 quota read failed; the dashboard storage card degrades to \
+                         unlimited"
+                    );
+                    None
+                }
+            },
+            #[cfg(not(any(
+                feature = "baidu",
+                feature = "local",
+                feature = "sftp",
+                feature = "pan115"
+            )))]
             _ => match *self {},
         }
     }
@@ -5176,6 +5250,124 @@ fn sftp_params(cfg: &CyDriveConfig) -> Result<ck_sftp::SftpParams> {
         .map_err(|error| anyhow::anyhow!("reading the sftp config keys: {error}"))
 }
 
+/// Test seam (the baidu `build_backend_transport_with` precedent): the
+/// same pan115 assembly with the endpoint pair overridable, so the
+/// dispatch tests can point the driver at a loopback mock instead of
+/// proapi.115.com. Not used by production paths.
+#[cfg(feature = "pan115")]
+#[doc(hidden)]
+pub async fn build_pan115_transport_with_endpoints(
+    cfg: &CyDriveConfig,
+    api_base: &str,
+    passport_base: &str,
+    token_store: Option<Arc<ConfigTokenStore>>,
+    state_dir: Option<&Path>,
+) -> Result<BackendTransport> {
+    let mut params = pan115_params(cfg)?;
+    params.api_base = api_base.to_string();
+    params.passport_base = passport_base.to_string();
+    params.token_store = token_store.map(|store| store as Arc<dyn ck_pan115::TokenStore>);
+    if let Some(dir) = state_dir {
+        params.sessions_dir = Some(dir.to_path_buf());
+    }
+    let driver = ck_pan115::factory(&params)
+        .await
+        .map_err(|error| anyhow::anyhow!("initialising the pan115 backend: {error}"))?;
+    Ok(BackendTransport::Pan115(Arc::new(
+        ck_pan115::Pan115Transport::new(driver),
+    )))
+}
+
+/// Test seam for [`pan115_backend_probe`] (loopback mock endpoints).
+#[cfg(feature = "pan115")]
+#[doc(hidden)]
+pub async fn pan115_backend_probe_with_endpoints(
+    cfg: &CyDriveConfig,
+    api_base: &str,
+    passport_base: &str,
+) -> ck_pan115::Pan115Probe {
+    match pan115_params(cfg) {
+        Ok(mut params) => {
+            params.api_base = api_base.to_string();
+            params.passport_base = passport_base.to_string();
+            ck_pan115::probe(&params).await
+        }
+        Err(_) => ck_pan115::Pan115Probe::Unreachable {
+            detail: "the pan115 config keys could not be read".to_string(),
+        },
+    }
+}
+
+/// Public seam for the multi-volume dispatcher (main.rs): same assembly
+/// as the internal [`build_pan115_transport`] with the K13 store and the
+/// volume home injected.
+#[cfg(feature = "pan115")]
+pub async fn build_pan115_transport_with(
+    cfg: &CyDriveConfig,
+    token_store: Option<Arc<ConfigTokenStore>>,
+    state_dir: Option<&Path>,
+) -> Result<BackendTransport> {
+    build_pan115_transport(cfg, token_store, state_dir).await
+}
+
+/// The `pan115_*` config-key flattening shared by the dispatch twins and
+/// [`build_driver`] (Phase 5 / 115-4). Credential resolution follows the
+/// same R3 chain as the other drivers — the credential keys ride
+/// `with_env_overrides` on the single-volume load path (K28); reading
+/// env here would bypass the multi-volume isolation guarantee.
+#[cfg(feature = "pan115")]
+fn pan115_params(cfg: &CyDriveConfig) -> Result<ck_pan115::Pan115Params> {
+    fn push(pairs: &mut Vec<(String, String)>, key: &str, value: Option<&str>) {
+        if let Some(v) = value.filter(|v| !v.is_empty()) {
+            pairs.push((key.to_string(), v.to_string()));
+        }
+    }
+    let mut pairs: Vec<(String, String)> = Vec::new();
+    push(
+        &mut pairs,
+        "pan115_client_id",
+        cfg.pan115_client_id.as_deref(),
+    );
+    push(
+        &mut pairs,
+        "pan115_access_token",
+        cfg.pan115_access_token.as_deref(),
+    );
+    push(
+        &mut pairs,
+        "pan115_refresh_token",
+        cfg.pan115_refresh_token.as_deref(),
+    );
+    push(&mut pairs, "pan115_root", cfg.pan115_root.as_deref());
+    ck_pan115::Pan115Params::from_pairs(&pairs)
+        .map_err(|error| anyhow::anyhow!("reading the pan115 config keys: {error}"))
+}
+
+/// The pan115 factory assembly (composition-root R1 exemption: it may
+/// name drivers). `factory` connects to read the account uid — the real
+/// `pan115:<uid>` volume identity lands there (the placeholder
+/// `pan115:pending` must never reach production). `state_dir` carries
+/// the volume home when the dispatcher has one (K21: upload sessions
+/// and the spool live with the volume).
+#[cfg(feature = "pan115")]
+async fn build_pan115_transport(
+    cfg: &CyDriveConfig,
+    token_store: Option<Arc<ConfigTokenStore>>,
+    state_dir: Option<&Path>,
+) -> Result<BackendTransport> {
+    let mut params = pan115_params(cfg)?;
+    params.token_store = token_store.map(|store| store as Arc<dyn ck_pan115::TokenStore>);
+    if let Some(dir) = state_dir {
+        params.sessions_dir = Some(dir.to_path_buf());
+    }
+    let driver = ck_pan115::factory(&params)
+        .await
+        .map_err(|error| anyhow::anyhow!("initialising the pan115 backend: {error}"))?;
+    Ok(BackendTransport::Pan115(Arc::new(
+        ck_pan115::Pan115Transport::new(driver),
+    )))
+}
+
 /// The sftp factory assembly shared by the dispatch and the rebuild
 /// driver builder (composition-root R1 exemption: it may name drivers).
 #[cfg(feature = "sftp")]
@@ -5258,6 +5450,24 @@ pub async fn build_backend_transport_with(
                 anyhow::bail!("{SFTP_DRIVER_REQUIRED}")
             }
         }
+        // Phase 5 / 115-4: the pan115 factory assembly — connect with
+        // the K13 write-back store and the volume home as the session
+        // base (K21; the single-volume caller below passes the cwd).
+        Backend::Pan115 => {
+            #[cfg(feature = "pan115")]
+            {
+                build_pan115_transport(
+                    cfg,
+                    Some(Arc::new(ConfigTokenStore::default())),
+                    Some(Path::new(".")),
+                )
+                .await
+            }
+            #[cfg(not(feature = "pan115"))]
+            {
+                anyhow::bail!("{PAN115_DRIVER_REQUIRED}")
+            }
+        }
     }
 }
 
@@ -5306,6 +5516,19 @@ pub async fn build_backend_transport_with(cfg: &CyDriveConfig) -> Result<Backend
                 anyhow::bail!("{SFTP_DRIVER_REQUIRED}")
             }
         }
+        // Phase 5 / 115-4: same assembly as the baidu-feature twin above
+        // (this no-baidu twin still carries the pan115 arm when the
+        // `pan115` feature is on).
+        Backend::Pan115 => {
+            #[cfg(feature = "pan115")]
+            {
+                build_pan115_transport(cfg, None, None).await
+            }
+            #[cfg(not(feature = "pan115"))]
+            {
+                anyhow::bail!("{PAN115_DRIVER_REQUIRED}")
+            }
+        }
     }
 }
 
@@ -5326,12 +5549,12 @@ pub async fn build_backend_transport_with(cfg: &CyDriveConfig) -> Result<Backend
 /// Exists only with the `baidu` feature (FT2): its behavior IS the
 /// driver's [`ck_baidu::TokenStore`] seam — a binary without the driver
 /// has no token rotation to persist.
-#[cfg(feature = "baidu")]
+#[cfg(any(feature = "baidu", feature = "pan115"))]
 pub struct ConfigTokenStore {
     path: PathBuf,
 }
 
-#[cfg(feature = "baidu")]
+#[cfg(any(feature = "baidu", feature = "pan115"))]
 impl ConfigTokenStore {
     /// Targets `path` (production: `config.toml` in the cwd —
     /// [`ConfigTokenStore::default`]; tests inject a temp file).
@@ -5340,7 +5563,7 @@ impl ConfigTokenStore {
     }
 }
 
-#[cfg(feature = "baidu")]
+#[cfg(any(feature = "baidu", feature = "pan115"))]
 impl Default for ConfigTokenStore {
     fn default() -> Self {
         ConfigTokenStore {
@@ -5381,6 +5604,38 @@ impl ck_baidu::TokenStore for ConfigTokenStore {
     }
 }
 
+/// The pan115 write-back leg of the same store (Phase 5 / 115-4): a
+/// refresh rotation mid-operation must persist, or the next boot reads a
+/// dead refresh_token — 115 rotates the pair on every refresh (K69.1).
+#[cfg(feature = "pan115")]
+impl ck_pan115::TokenStore for ConfigTokenStore {
+    fn save_tokens(&self, access_token: &str, refresh_token: &str) {
+        let report = |message: String| {
+            tracing::warn!(
+                path = %self.path.display(),
+                "{message}"
+            );
+        };
+        let Ok(mut cfg) = CyDriveConfig::load_toml(&self.path) else {
+            report(
+                "rotated pan115 tokens were NOT persisted: no readable config.toml — the \
+                 credentials likely came from CYDRIVE_PAN115_* env (update them there); \
+                 the new refresh_token is now the only live value"
+                    .to_string(),
+            );
+            return;
+        };
+        cfg.pan115_access_token = Some(access_token.to_string());
+        cfg.pan115_refresh_token = Some(refresh_token.to_string());
+        if let Err(error) = cfg.save_toml(&self.path) {
+            report(format!(
+                "rotated pan115 tokens were NOT persisted (write failed: {error}); the \
+                 new refresh_token is now the only live value"
+            ));
+        }
+    }
+}
+
 // -------------------------------------------- K12 / K18 warning helpers ---
 
 /// K18: `proxy_url` has no effect on the baidu/local/sftp backends (their
@@ -5397,7 +5652,7 @@ pub fn proxy_ineffective_warning(cfg: &CyDriveConfig) -> Option<&'static str> {
 
 /// The K18 declaration text shared by the assembly log and doctor.
 pub const PROXY_DIRECT_BACKEND_NOTICE: &str =
-    "proxy_url is set but has no effect on this backend: baidu/local/sftp always connect \
+    "proxy_url is set but has no effect on this backend: baidu/local/sftp/pan115 always connect \
      directly (no_proxy + forced IPv4; the sftp transport has no proxy support); the proxy \
      only serves the telegram transport";
 
@@ -5421,6 +5676,24 @@ pub fn local_sync_unsupported_warning(cfg: &CyDriveConfig) -> Option<&'static st
 pub const LOCAL_SYNC_UNSUPPORTED: &str =
     "sync is not supported for the local backend: the periodic sync task stays off and \
      the sync_url key has no effect";
+
+/// The K12 warning text for the sftp backend (Phase 4 / SF3): the remote
+/// filesystem is the source of truth — same ruling as local.
+/// The pan115 doctor probe leg (Phase 5 / 115-4): assembles the driver
+/// params from config and runs [`ck_pan115::probe`] — `user/info` for
+/// token liveness plus a quota read. Requires the `pan115` feature (the
+/// probe types live in the driver); a binary without it skips the
+/// dial-out leg (K31 shape, the baidu rule): no fake Unreachable.
+#[cfg(feature = "pan115")]
+pub async fn pan115_backend_probe(cfg: &CyDriveConfig) -> ck_pan115::Pan115Probe {
+    match pan115_params(cfg) {
+        Ok(params) => ck_pan115::probe(&params).await,
+        Err(_) => ck_pan115::Pan115Probe::Unreachable {
+            detail: "the pan115 config keys could not be read (see doctor's validate pass)"
+                .to_string(),
+        },
+    }
+}
 
 /// The K12 warning text for the sftp backend (Phase 4 / SF3): the remote
 /// filesystem is the source of truth — same ruling as local.
@@ -5594,6 +5867,25 @@ async fn build_driver(cfg: &CyDriveConfig) -> Result<Arc<dyn StorageDriver>> {
         }
         #[cfg(not(feature = "sftp"))]
         Backend::Sftp => anyhow::bail!("{SFTP_DRIVER_REQUIRED}"),
+        // Phase 5 / 115-1 placeholder: the pan115 factory assembly (the
+        // `pan115_params` mapping + ConfigTokenStore bridge) is a 115-4
+        // item; the driver itself compiles with placeholder methods until
+        // 115-2/3. Both arms refuse loudly until then.
+        // With the driver: the factory assembly (connect reads the uid)
+        // plus the K13 write-back store — a rebuild walk must persist a
+        // rotation or the next boot reads a dead refresh_token (the
+        // sftp arm has no rotation; baidu's is the shape mirrored here).
+        #[cfg(feature = "pan115")]
+        Backend::Pan115 => {
+            let mut params = pan115_params(cfg)?;
+            params.token_store = Some(Arc::new(ConfigTokenStore::default()));
+            let driver = ck_pan115::factory(&params)
+                .await
+                .map_err(|error| anyhow::anyhow!("initialising the pan115 backend: {error}"))?;
+            Ok(driver)
+        }
+        #[cfg(not(feature = "pan115"))]
+        Backend::Pan115 => anyhow::bail!("{PAN115_DRIVER_REQUIRED}"),
     }
 }
 
@@ -7030,21 +7322,31 @@ mod tests {
         // arm is a cfg-gated literal — no runtime feature probing — so
         // exactly one assertion is compiled per build and it pins the
         // expected list for that feature combination: fixed order
-        // telegram, baidu, local, sftp; the all-off build reports
-        // `none`.
+        // telegram, baidu, local, sftp, pan115; the all-off build
+        // reports `none`.
         //
         // SF3 structure: the sftp row (appended after local, never
         // interleaved) is factored out of the literal pins — the
         // 3-driver expectations below stay byte-identical, and the two
         // sftp assertions pin the suffix rule and the 4-driver list.
+        // 115-1 mirror: the pan115 row strips the same way before the
+        // sftp strip — every pre-existing assertion is untouched.
         let drivers = compiled_drivers();
+        let without_pan115: String = if cfg!(feature = "pan115") {
+            match drivers.strip_suffix(", pan115") {
+                Some(base) => base.to_string(),
+                None => "none".to_string(), // pan115 is the only driver enabled
+            }
+        } else {
+            drivers.clone()
+        };
         let base: String = if cfg!(feature = "sftp") {
-            match drivers.strip_suffix(", sftp") {
+            match without_pan115.strip_suffix(", sftp") {
                 Some(base) => base.to_string(),
                 None => "none".to_string(), // sftp is the only driver enabled
             }
         } else {
-            drivers.clone()
+            without_pan115.clone()
         };
 
         #[cfg(all(feature = "telegram", feature = "baidu", feature = "local"))]
@@ -7070,23 +7372,50 @@ mod tests {
         // reports just the row.
         #[cfg(feature = "sftp")]
         assert!(
-            drivers.ends_with("sftp"),
-            "sftp must be the last row: {drivers}"
+            without_pan115.ends_with("sftp"),
+            "sftp must precede pan115 when both are on: {drivers}"
         );
         #[cfg(all(
             feature = "telegram",
             feature = "baidu",
             feature = "local",
-            feature = "sftp"
+            feature = "sftp",
+            not(feature = "pan115")
         ))]
         assert_eq!(drivers, "telegram, baidu, local, sftp");
         #[cfg(all(
             not(feature = "telegram"),
             not(feature = "baidu"),
             not(feature = "local"),
-            feature = "sftp"
+            feature = "sftp",
+            not(feature = "pan115")
         ))]
         assert_eq!(drivers, "sftp");
+
+        // 115-1: the pan115 row is the same pure-append rule — last
+        // whenever on, the all-five build reads in the documented order,
+        // and the pan115-only build reports just the row.
+        #[cfg(feature = "pan115")]
+        assert!(
+            drivers.ends_with("pan115"),
+            "pan115 must be the last row: {drivers}"
+        );
+        #[cfg(all(
+            feature = "telegram",
+            feature = "baidu",
+            feature = "local",
+            feature = "sftp",
+            feature = "pan115"
+        ))]
+        assert_eq!(drivers, "telegram, baidu, local, sftp, pan115");
+        #[cfg(all(
+            not(feature = "telegram"),
+            not(feature = "baidu"),
+            not(feature = "local"),
+            not(feature = "sftp"),
+            feature = "pan115"
+        ))]
+        assert_eq!(drivers, "pan115");
     }
 
     /// H1 (review fix): `take` used to find the position under one lock

@@ -40,6 +40,7 @@ const VOLUME_LABELS = {
     baidu: 'backend.baidu',
     local: 'backend.local',
     sftp: 'backend.sftp',
+    pan115: 'backend.pan115',
 };
 
 function backendDisplayName(backend) {
@@ -472,6 +473,7 @@ const VF_CRED_GROUPS = {
     baidu: 'vf-group-baidu',
     local: 'vf-group-local',
     sftp: 'vf-group-sftp',
+    pan115: 'vf-group-pan115',
 };
 
 // The starred requireds per backend (UX-level only — the CREATE command
@@ -483,6 +485,7 @@ const VF_REQUIRED = {
     baidu: ['vf-baidu-app-key', 'vf-baidu-app-secret', 'vf-baidu-access-token', 'vf-baidu-refresh-token'],
     local: ['vf-local-root'],
     sftp: ['vf-sftp-host', 'vf-sftp-username'],
+    pan115: ['vf-pan115-access-token', 'vf-pan115-refresh-token'],
 };
 
 // String fields: input id → payload key (collected only when non-empty —
@@ -503,6 +506,10 @@ const VF_STRINGS = {
     'vf-sftp-private-key-passphrase': 'sftp_private_key_passphrase',
     'vf-sftp-host-fingerprint': 'sftp_host_fingerprint',
     'vf-sftp-root': 'sftp_root',
+    'vf-pan115-client-id': 'pan115_client_id',
+    'vf-pan115-access-token': 'pan115_access_token',
+    'vf-pan115-refresh-token': 'pan115_refresh_token',
+    'vf-pan115-root': 'pan115_root',
     'vf-enc-pass': 'encryption_password',
     'vf-sync-url': 'sync_url',
     'vf-sync-secret': 'sync_secret',
@@ -650,6 +657,8 @@ function vfPrefillEdit(config) {
         'vf-sftp-private-key-path': config.sftp_private_key_path,
         'vf-sftp-host-fingerprint': config.sftp_host_fingerprint,
         'vf-sftp-root': config.sftp_root,
+        'vf-pan115-client-id': config.pan115_client_id,
+        'vf-pan115-root': config.pan115_root,
     };
     for (const [id, value] of Object.entries(plain)) {
         const el = vfEl(id);
@@ -668,6 +677,8 @@ function vfPrefillEdit(config) {
         'vf-baidu-refresh-token': config.baidu_refresh_token,
         'vf-sftp-password': config.sftp_password,
         'vf-sftp-private-key-passphrase': config.sftp_private_key_passphrase,
+        'vf-pan115-access-token': config.pan115_access_token,
+        'vf-pan115-refresh-token': config.pan115_refresh_token,
         'vf-enc-pass': config.encryption_password,
         'vf-sync-url': config.sync_url,
         'vf-sync-secret': config.sync_secret,

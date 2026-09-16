@@ -723,3 +723,31 @@
 - **K68.3 实测数据（sftp,winfsp 组合）**：18 MB → **15 MB**（-17%）；winfsp 真机挂载冒烟全绿（X: 挂载→rebuild→穿透盘符读 real.bin 字节正确→`cydrive stop` 干净卸载无残留）；吞吐取证 u18 128 MiB **300.8↑/317.8↓ MiB/s**（release-min，`cargo test --profile release-min`）——同机既有矩阵数字 130/63 系 **debug 测试档**，release 族全面更快（LTO 无性能损耗，符合预期）。
 - **K68.4 可诊断性**：MSVC 链接器仍生成独立 PDB，`strip="symbols"` 只去 exe 内符号表——线上崩溃仍可回溯符号。
 - **K68.5 回滚**：删 Cargo.toml 的 `[profile.release-min]` 节即回退（零代码面影响；release 档从未改动）。
+
+## 2026-09-16 K69：Phase 5 115-0 spike 收口——路线 A go（路径丙自铸成立），QPS 770004 账号级限流实测，OSS 层采用 spike 自研签名
+
+按计划 §1.3 裁决规则①执行（自主授权会话）：凭证取得 + downurl/Range/QPS/upload 实测全过 → **路线 A（官方开放平台）go**；路线 B（私有 web API）不启用，其情报保留为设计保底。
+
+- **K69.1 凭证路径丙全链成立**：公共 client_id **`100197303`**（OpenList 官方托管 app——取自 api.oplist.org `server_use=true` 登录端点返回的 authorize 跳转 URL，公开非机密值；115-plus-desktop 源码不含 AppID（.env 空占位），APIPages 源码打码）→ device-code PKCE 扫码 → token 对 → Bearer user/info ✅ → refreshToken 自续一次 ✅（轮换落盘复验）。运行期零 app_key、零外部服务。**token 有效期 7200s**；refresh 严禁频繁（官方频控）。备选身份恢复路径：`pan115_client_id` 可配置，换身份重扫即恢复。
+- **K69.2 K65 未决项销账——`sign_key/sign_val` 是用户级挑战而非 app 级签名**：init 响应携带 `sign_key`+`sign_check`("start-end" 闭区间)，`sign_val` = 该区间文件字节 SHA1 大写hex，回带重发 init 即过（真机：秒传验证链首轮即触发，**常态路径而非罕见**，驱动必须实现循环）。app_key 与上传二次认证无关 → 路径丙不受限。
+- **K69.3 QPS 限流实测（D4 定数依据）**：持续 ~4 rps 可行；**5 rps 下 10 秒内 22% 请求被拒**；触发后整账号（**跨端点族**，user/info 同封）返回 `770004 "已达到当前访问上限"`，封锁窗口 **≥10 分钟**（实测 10 分钟未解除即停止探测，保守按 ≥10min 设计）。OpenList 官方驱动默认自限 **1 rps**（burst 1）。**D4 落值：全局 limiter 缺省 1 rps（列目录族），770004 → 硬退避（初值 5 分钟，指数，无风暴重试）**。真实限流码是 770004（20130827/911 形态来自桌面版代码未真机复现，一并入错误表）。
+- **K69.4 downurl/CDN 约束钉死**：直链与取链 UA **逐字节绑定**（错配恒 403，双向实测），但 **UA 形态本身不约束**（browser/spike/空 UA 三态全通）——驱动选固定 UA 常量即可，无需伪造浏览器。HEAD 探测 accept-ranges/etag 可用；Range 206 + Content-Range 起始吻合校验；**CDN etag = 文件 MD5**（完整性旁证）；CDN 403=限流（退避+降并发）≠ 401/410=URL 过期（重取直链）。downurl 缓存 TTL 未测（115-5 冒烟顺带），缺省 30min 保守值。
+- **K69.5 OSS 层决策：用 spike 自研签名层，不引入 ali-oss-rs**：版本树核对通过（ali-oss-rs 0.2.5 → reqwest ^0.12.12 同大版本，无冲突——回退条款的触发条件并未成立），但 115-0 spike 已产出**真机验证过**的 OSS V1 手写签名（5 操作：Put/Initiate?sequential/UploadPart/ListParts/Complete+callback，534 行，含 115 特有行为与两个签名陷阱——URL 尾斜杠归一、子资源排序），零新依赖。采用自研层的依据 = 计划 §2 回退形态 + 零依赖 + 已实证；回滚 = 换 ali-oss-rs（版本树已验兼容）。ListParts 分页（>1000 片）在驱动实现时补全。
+- **K69.6 秒传/哈希面**：秒传命中真机验证（同 SHA1 重 init → status==2，需过二次认证）；**伪造哈希 init 不被拒**（服务端在 complete/callback 侧校验）——「省略哈希直传」优化不做（风险不对称，明文/密文卷都照算真实哈希，密文永不秒传无害）。preid = 前 128KiB SHA1；全大写 hex。
+- **K69.7 错误码采样表（真机）**：`40199002`=QR 过期/key invalid（qrcodeapi，快拒）；`40101017`=未确认换 token；`40140123`=access_token 格式错；`401*`/`99`=token 过期（刷+重放一次）；`770004`=账号级访问上限；`911`=需人工验证（未真机复现）；`430004`=文件不存在（SDK 侧）；错误包 **HTTP 200 + envelope 双形态**（proapi `state:false` 布尔 / passportapi `state:0` 数字）——HTTP 状态码不可作判据。
+- **K69.8 上传链实证**：PutObject（3MiB）1.8s / 三片 multipart（12MiB）2.3s（OSS 直传，callback JSON 回应）；complete 后 size 复核纪律有效；resume 差集补片（1 复用 2 补）过。分片 min 5MiB、10000 片上限、sequential 子资源、callback 挂 Complete/Put（`x-oss-callback(-var)` base64 头）。
+- **K69.9 扫码停点协议记录（自主会话专用）**：QR 有效期 **~5 分钟**（签发→40199002 快拒），等待循环按 <5min 周期自动换码（同路径 PNG 恒新鲜），长轮询 30s/次。两轮窗口共 ~6.5h 无扫码、第三轮 13:05 捕获（80+1 周期、authDeviceCode 81 次无频控）。
+- **K69.10 回滚**：整批在 worktree 分支 `feat/pan115-driver`（merge 前 `git checkout main && git worktree remove` 即弃）；spike 为 workspace-excluded 不入 CI。账号侧残留：`/_e2e_pan115/` 空目录保留 + 回收站 4 个测试文件（D2 语义可恢复）。
+
+## 2026-09-16 K70：Phase 5 完成（115-0…115-5）——pan115 驱动上线，装配批两处真实缺陷修复
+
+Phase 5 五批次全落地（worktree `feat/pan115-driver`，`0b53c14`→`32060be`）。115-0 的路线裁决见 K69（路线 A go）。
+
+- **K70.1 批次链**：115-0 spike（auth 腿 `0b53c14` + 探针腿 `acebe05`）→ 115-1 骨架/认证/配置（`65efd51`）→ 115-2 读路径（`12ecddd`）→ 115-3 写路径（`cfbf907`）→ 115-4a conformance（`26bc85d`）+ 4b 全装配（`05a7c7d`）→ 115-5 真机冒烟（`32060be`）。
+- **K70.2 装配批揭出的两个真实设计缺陷（非桩面瑕疵）**：①**`stat` 曾被路径缓存整层服务**——后端错误永远浮不出来（conformance ⑤ 不可满足）；修复 = 末级新鲜查询（前缀仍缓存，list 的零网络缓存保护不破）。②**分片传输中途失败不落会话**——差集续传资产丢失（断言⑦ 失效）；修复 = 每片落地即持久化、失败路径同样落盘，并按 115「init 锁定 block_list」语义实现**到齐即传**（`write` 到齐承诺量即推传输链，`close` 仍是提交点）。
+- **K70.3 真机揭出的生产级缺陷**：**OSS endpoint 带 scheme 未剥离**——115 `get_token` 下发 `https://oss-….aliyuncs.com`，port 时丢了 spike 的剥离步骤（`probes.rs:611`），`host()` 拼出 `bucket.https://…` → OSS `SecondLevelDomainForbidden`（真机首跑即中）。修复 = `normalize_endpoint`；同时**测试缝判据改按 loopback host**（原按「含 `://`」会把生产流量误导向 path-style——同一缺陷的另一半）。教训：**桩测不出的形态只有真机揭**，115-5 的最小冒烟价值即在此。
+- **K70.4 sync 裁决**：pan115 支持 sync（baidu 式接入，`sync_namespace_key = pan115:<uid>`），依据 = 计划 §4.3 明文「sync_namespace 同 baidu 形态」+ 零 core 改动最可逆（回滚 = 单臂改回 bail）。
+- **K70.5 conformance ⑤ 表形态裁决**：`error_table` 只放可被「注入恰好一次后恢复」契约验证的码（`430004 → NotFound`）；**刻意不放 `770004`**——账号级上限触发的是 D4 硬退避窗（驱动主动进入封锁态），与断言⑤的一次性语义天然冲突，强塞只能靠削弱断言通过；映射由 `tests/errno_mapping.rs` 单测钉。
+- **K70.6 真机数字（115-5 最小冒烟）**：上传 200KiB → 回读逐字节 + close 内 size 复核；Range `[100000,150000)` 逐字节；秒传第二轮**同 fid**（status==2 实证）。作业纪律全守（只 /_e2e_pan115/、清理后核空、1rps 限速、未碰分享/离线/视频族）。
+- **K70.7 未覆盖（如实挂账）**：完整矩阵的断点续传杀进程恢复、rebuild 收敛耗时、加密卷 aead_v2 往返、E2E 三面（WebDAV/web/winfsp）、>5MiB 多分片真机上传（本次三项走 PutObject 与秒传路径）、目录 rename 真机形态（驱动按 move+update 实现未验）；setup 扫码向导未做（oauth.rs 三端点已备，无 GUI 向导——挂账待裁）。真机测试入口 = `crates/drivers/ck-pan115/tests/live_matrix.rs`（`#[ignore]`，凭据只经 env）。
+- **K70.8 回滚**：整批在 worktree 分支 `feat/pan115-driver`（单批 merge，merge 前 `git worktree remove` 即弃；merge 后 `git revert -m 1 <merge>`）；spike `examples/pan115_spike` workspace-excluded 不入 CI。账号侧残留：`/_e2e_pan115/` 空目录保留 + 回收站若干测试文件（D2 语义可恢复）。

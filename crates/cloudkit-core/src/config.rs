@@ -109,6 +109,10 @@ pub const KNOWN_TOML_KEYS: &[&str] = &[
     "sftp_private_key_passphrase",
     "sftp_host_fingerprint",
     "sftp_root",
+    "pan115_client_id",
+    "pan115_access_token",
+    "pan115_refresh_token",
+    "pan115_root",
     "volumes_dir",
     "enabled",
 ];
@@ -155,6 +159,10 @@ const LEGACY_REJECTED_KEYS: &[&str] = &[
     "sftp_private_key_passphrase",
     "sftp_host_fingerprint",
     "sftp_root",
+    "pan115_client_id",
+    "pan115_access_token",
+    "pan115_refresh_token",
+    "pan115_root",
     "volumes_dir",
     "enabled",
     "allow_remote_admin",
@@ -227,6 +235,9 @@ pub enum Backend {
     /// SSH/SFTP drive (ck-sftp, Phase 4 / SF1 — one server account per
     /// volume; driver wiring lands in SF3).
     Sftp,
+    /// 115 open-platform drive (ck-pan115, Phase 5 / 115-1 — one 115
+    /// account per volume; driver wiring lands in 115-4).
+    Pan115,
 }
 
 impl Backend {
@@ -237,6 +248,7 @@ impl Backend {
             Backend::Baidu => "baidu",
             Backend::Local => "local",
             Backend::Sftp => "sftp",
+            Backend::Pan115 => "pan115",
         }
     }
 }
@@ -349,6 +361,10 @@ pub const VOLUME_SCOPED_KEYS: &[&str] = &[
     "sftp_private_key_passphrase",
     "sftp_host_fingerprint",
     "sftp_root",
+    "pan115_client_id",
+    "pan115_access_token",
+    "pan115_refresh_token",
+    "pan115_root",
     "enabled",
 ];
 
@@ -432,6 +448,11 @@ const SECRET_VALUED_KEYS: &[&str] = &[
     // write-only folding).
     "sftp_password",
     "sftp_private_key_passphrase",
+    // Phase 5 / 115-1: both 115 token keys (the driver self-refreshes
+    // the pair and persists rotations back into these keys — the K13
+    // ConfigTokenStore precedent rides the baidu keys the same way).
+    "pan115_access_token",
+    "pan115_refresh_token",
 ];
 
 /// Masks a credential value span: length-preserving, first and last two
@@ -1300,6 +1321,30 @@ pub struct CyDriveConfig {
     /// when the backend is `sftp`; `None` = the server filesystem root
     /// `/`). Mirrors the `baidu_root`/`local_root` naming convention.
     pub sftp_root: Option<String>,
+    /// 115 open-platform app identity for the QR scan (ck-pan115,
+    /// Phase 5 / 115-1). **Non-secret** (K65 route C / K69.1: the
+    /// device-code PKCE flow needs no app secret; the default is the
+    /// public OpenList-managed client_id `100197303`, injected by the
+    /// driver when this key is absent — hence NOT in
+    /// [`SECRET_VALUED_KEYS`]). Overriding it is the recovery path when
+    /// the bound app identity gets banned (re-scan under a new identity).
+    pub pan115_client_id: Option<String>,
+    /// 115 access token (ck-pan115, Phase 5 / 115-1). Required when
+    /// `backend = "pan115"`; inert otherwise. A [`SECRET_VALUED_KEYS`]
+    /// member (R3). The driver refreshes and rotates the pair at
+    /// runtime, persisting rotations back into this key and
+    /// [`Self::pan115_refresh_token`] (the K13 ConfigTokenStore
+    /// precedent).
+    pub pan115_access_token: Option<String>,
+    /// 115 refresh token — the self-sustaining half of the pair (a
+    /// refresh response returns a NEW pair and the old refresh token
+    /// dies immediately; K69.1). A [`SECRET_VALUED_KEYS`] member (R3).
+    pub pan115_refresh_token: Option<String>,
+    /// 115 drive root as a numeric folder id (ck-pan115, Phase 5 /
+    /// 115-1; D3: settable, `None` = the netdisk root `"0"`, the
+    /// driver's own default). Must be all digits when present —
+    /// `validate` rejects anything else.
+    pub pan115_root: Option<String>,
     /// Volumes directory (Phase 2.5 / K19), relative to the process
     /// working directory: one `<name>.toml` file per storage volume
     /// (see [`load_volume_config`]). `None` — the default — means
@@ -1377,6 +1422,10 @@ impl Default for CyDriveConfig {
             sftp_private_key_passphrase: None,
             sftp_host_fingerprint: None,
             sftp_root: None,
+            pan115_client_id: None,
+            pan115_access_token: None,
+            pan115_refresh_token: None,
+            pan115_root: None,
             volumes_dir: None,
             enabled: default_enabled(),
         }
@@ -1583,6 +1632,8 @@ impl CyDriveConfig {
     /// | `CYDRIVE_BAIDU_REFRESH_TOKEN` | `baidu_refresh_token` | same empty-clears rule |
     /// | `CYDRIVE_SFTP_PASSWORD` | `sftp_password` | same empty-clears rule (review fix: rides this chain so the K28 multi-volume skip applies — volumes never see env credentials) |
     /// | `CYDRIVE_SFTP_PRIVATE_KEY_PASSPHRASE` | `sftp_private_key_passphrase` | same empty-clears rule |
+    /// | `CYDRIVE_PAN115_ACCESS_TOKEN` | `pan115_access_token` | same empty-clears rule (Phase 5 / 115-1: the K28 multi-volume skip applies the same way) |
+    /// | `CYDRIVE_PAN115_REFRESH_TOKEN` | `pan115_refresh_token` | same empty-clears rule |
     pub fn with_env_overrides(self) -> Self {
         let mut config = self;
         if let Some(value) = env_string("CYDRIVE_BOT_TOKEN") {
@@ -1638,6 +1689,16 @@ impl CyDriveConfig {
         }
         if let Some(value) = env_string("CYDRIVE_SFTP_PRIVATE_KEY_PASSPHRASE") {
             config.sftp_private_key_passphrase = (!value.is_empty()).then_some(value);
+        }
+        // Phase 5 / 115-1: the two 115 token keys ride the same env >
+        // file chain as the baidu/sftp ones — the multi-volume
+        // discovery path never calls this method, so volume files are
+        // immune to cross-volume env bleed by construction (K28).
+        if let Some(value) = env_string("CYDRIVE_PAN115_ACCESS_TOKEN") {
+            config.pan115_access_token = (!value.is_empty()).then_some(value);
+        }
+        if let Some(value) = env_string("CYDRIVE_PAN115_REFRESH_TOKEN") {
+            config.pan115_refresh_token = (!value.is_empty()).then_some(value);
         }
         config
     }
@@ -1926,7 +1987,40 @@ impl CyDriveConfig {
                 if !root.starts_with('/') {
                     return Err(ConfigError::Invalid(format!(
                         "sftp_root must be a backend-absolute path starting with '/', e.g. \
-                         \"/srv/cloudfs\", got {root:?}"
+                         \"/srv/sftp\", got {root:?}"
+                    )));
+                }
+            }
+        }
+        // Phase 5 / 115-1 cross-field rules (gated on the backend like
+        // the baidu/local/sftp blocks above — the telegram default
+        // never fires them).
+        if self.backend == Backend::Pan115 {
+            for (name, value, env) in [
+                (
+                    "pan115_access_token",
+                    &self.pan115_access_token,
+                    "CYDRIVE_PAN115_ACCESS_TOKEN",
+                ),
+                (
+                    "pan115_refresh_token",
+                    &self.pan115_refresh_token,
+                    "CYDRIVE_PAN115_REFRESH_TOKEN",
+                ),
+            ] {
+                if value.as_deref().is_none_or(str::is_empty) {
+                    return Err(ConfigError::Invalid(format!(
+                        "backend = \"pan115\" requires {name}: obtain the initial pair via the \
+                         setup QR scan (or a hand-filled token pair), then set it in config.toml \
+                         or export {env}"
+                    )));
+                }
+            }
+            if let Some(root) = &self.pan115_root {
+                if root.is_empty() || !root.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "pan115_root must be a numeric 115 folder id (\"0\" is the netdisk \
+                         root), got {root:?}"
                     )));
                 }
             }

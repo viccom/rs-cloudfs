@@ -489,6 +489,32 @@ pub fn backend_checks(cfg: &cloudkit_core::config::CyDriveConfig) -> Vec<CheckRe
                 });
             }
         }
+        Backend::Pan115 => {
+            // The K12 warning covers the non-sync backends only (pan115
+            // participates in sync, so this is a no-op today — kept for
+            // symmetry with baidu).
+            if let Some(warning) = crate::local_sync_unsupported_warning(cfg) {
+                results.push(CheckResult {
+                    name: "sync".to_string(),
+                    status: CheckStatus::Warn,
+                    detail: warning.to_string(),
+                });
+            }
+            // D3 note: an unset pan115_root means the volume maps the
+            // whole account — deletions land in the 115 recycle bin
+            // (recoverable via the official client), but every path the
+            // account holds becomes visible through this volume.
+            if cfg.pan115_root.as_deref().unwrap_or("0") == "0" {
+                results.push(CheckResult {
+                    name: "pan115_root".to_string(),
+                    status: CheckStatus::Warn,
+                    detail: "pan115_root is unset: this volume maps the whole account \
+                             (set a folder id to scope it; deletes go to the 115 \
+                             recycle bin and recover via the official client)"
+                        .to_string(),
+                });
+            }
+        }
     }
     results
 }
@@ -861,4 +887,50 @@ pub fn volume_checks(spec: &cloudkit_core::config::VolumeConfig) -> Vec<CheckRes
         }
     }
     results
+}
+/// The pan115 connectivity leg (Phase 5 / 115-4): renders
+/// [`crate::pan115_backend_probe`]'s verdict into one check result.
+///
+/// The auth distinction is the load-bearing part: a dead token pair is
+/// **not** a transient failure — it needs a re-scan (or hand-filled
+/// tokens), so `NeedsReauth` Fails with that actionable detail;
+/// `RateLimited` warns because the driver already entered its hard
+/// backoff window (D4/K69.3) and the retry is self-scheduled. Feature-
+/// gated with the driver (K30 pattern): a binary without `pan115` has
+/// no probe value to render.
+#[cfg(feature = "pan115")]
+pub fn pan115_connectivity_check(probe: &ck_pan115::Pan115Probe) -> CheckResult {
+    use ck_pan115::Pan115Probe;
+    match probe {
+        Pan115Probe::Alive { uid, free, total } => CheckResult {
+            name: "pan115_connectivity".to_string(),
+            status: CheckStatus::Ok,
+            detail: match total {
+                Some(total) => format!(
+                    "token alive for account {uid}; {} / {} bytes free",
+                    free, total
+                ),
+                None => format!("token alive for account {uid} (quota unknown)"),
+            },
+        },
+        Pan115Probe::NeedsReauth => CheckResult {
+            name: "pan115_connectivity".to_string(),
+            status: CheckStatus::Fail,
+            detail: "the pan115 token pair is no longer accepted — re-scan the QR in                      `cydrive setup`, or write fresh pan115_access_token /                      pan115_refresh_token values into the volume config"
+                .to_string(),
+        },
+        Pan115Probe::RateLimited { window } => CheckResult {
+            name: "pan115_connectivity".to_string(),
+            status: CheckStatus::Warn,
+            detail: format!(
+                "the 115 account hit its access cap (770004); the driver backs off for                  {}s before retrying — lower the request rate if this repeats",
+                window.as_secs()
+            ),
+        },
+        Pan115Probe::Unreachable { detail } => CheckResult {
+            name: "pan115_connectivity".to_string(),
+            status: CheckStatus::Fail,
+            detail: format!("could not reach 115: {detail}"),
+        },
+    }
 }

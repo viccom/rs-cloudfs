@@ -1,0 +1,36 @@
+[package]
+name = "pan115-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Phase 5 (pan115) 115-0 route spike — live 115 open-platform probes. This
+# crate is EXCLUDED from the workspace on purpose (same as examples/baidu_spike):
+# it performs live network calls and must never enter CI gates.
+#
+# Credential discipline (R3): nothing sensitive is committed. At RUNTIME the
+# spike reads/writes only under the gitignored test dir
+# (default E:\GitHub\rs-CyDrive\test, override PAN115_SPIKE_TEST_DIR):
+#   - pan115-auth-state.json  (in-flight device-code PKCE state)
+#   - pan115-tokens.json      (access/refresh token pair)
+#   - pan115-qr.png           (QR code for the user to scan)
+# client_id is a non-secret app identity (K65 path C), overridable via
+# PAN115_CLIENT_ID. Tokens are masked in all printed output.
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+hmac = "0.12"
+httpdate = "1"
+image = "0.24"
+qrcode = "0.13"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+sha2 = "0.10"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

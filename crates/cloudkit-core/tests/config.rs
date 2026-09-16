@@ -249,6 +249,12 @@ fn toml_roundtrip_preserves_full_config() {
         sftp_private_key_passphrase: None,
         sftp_host_fingerprint: None,
         sftp_root: None,
+        // Phase 5 / 115-1: the pan115 key group round-trips too (all
+        // unset — the exhaustive-field shape of this test).
+        pan115_client_id: None,
+        pan115_access_token: None,
+        pan115_refresh_token: None,
+        pan115_root: None,
         volumes_dir: None,
         // Phase 3.6 / RV0: the volume enable switch round-trips too.
         enabled: true,
