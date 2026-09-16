@@ -723,3 +723,18 @@
 - **K68.3 实测数据（sftp,winfsp 组合）**：18 MB → **15 MB**（-17%）；winfsp 真机挂载冒烟全绿（X: 挂载→rebuild→穿透盘符读 real.bin 字节正确→`cydrive stop` 干净卸载无残留）；吞吐取证 u18 128 MiB **300.8↑/317.8↓ MiB/s**（release-min，`cargo test --profile release-min`）——同机既有矩阵数字 130/63 系 **debug 测试档**，release 族全面更快（LTO 无性能损耗，符合预期）。
 - **K68.4 可诊断性**：MSVC 链接器仍生成独立 PDB，`strip="symbols"` 只去 exe 内符号表——线上崩溃仍可回溯符号。
 - **K68.5 回滚**：删 Cargo.toml 的 `[profile.release-min]` 节即回退（零代码面影响；release 档从未改动）。
+
+## 2026-09-16 K69：Phase 5 115-0 spike 收口——路线 A go（路径丙自铸成立），QPS 770004 账号级限流实测，OSS 层采用 spike 自研签名
+
+按计划 §1.3 裁决规则①执行（自主授权会话）：凭证取得 + downurl/Range/QPS/upload 实测全过 → **路线 A（官方开放平台）go**；路线 B（私有 web API）不启用，其情报保留为设计保底。
+
+- **K69.1 凭证路径丙全链成立**：公共 client_id **`100197303`**（OpenList 官方托管 app——取自 api.oplist.org `server_use=true` 登录端点返回的 authorize 跳转 URL，公开非机密值；115-plus-desktop 源码不含 AppID（.env 空占位），APIPages 源码打码）→ device-code PKCE 扫码 → token 对 → Bearer user/info ✅ → refreshToken 自续一次 ✅（轮换落盘复验）。运行期零 app_key、零外部服务。**token 有效期 7200s**；refresh 严禁频繁（官方频控）。备选身份恢复路径：`pan115_client_id` 可配置，换身份重扫即恢复。
+- **K69.2 K65 未决项销账——`sign_key/sign_val` 是用户级挑战而非 app 级签名**：init 响应携带 `sign_key`+`sign_check`("start-end" 闭区间)，`sign_val` = 该区间文件字节 SHA1 大写hex，回带重发 init 即过（真机：秒传验证链首轮即触发，**常态路径而非罕见**，驱动必须实现循环）。app_key 与上传二次认证无关 → 路径丙不受限。
+- **K69.3 QPS 限流实测（D4 定数依据）**：持续 ~4 rps 可行；**5 rps 下 10 秒内 22% 请求被拒**；触发后整账号（**跨端点族**，user/info 同封）返回 `770004 "已达到当前访问上限"`，封锁窗口 **≥10 分钟**（实测 10 分钟未解除即停止探测，保守按 ≥10min 设计）。OpenList 官方驱动默认自限 **1 rps**（burst 1）。**D4 落值：全局 limiter 缺省 1 rps（列目录族），770004 → 硬退避（初值 5 分钟，指数，无风暴重试）**。真实限流码是 770004（20130827/911 形态来自桌面版代码未真机复现，一并入错误表）。
+- **K69.4 downurl/CDN 约束钉死**：直链与取链 UA **逐字节绑定**（错配恒 403，双向实测），但 **UA 形态本身不约束**（browser/spike/空 UA 三态全通）——驱动选固定 UA 常量即可，无需伪造浏览器。HEAD 探测 accept-ranges/etag 可用；Range 206 + Content-Range 起始吻合校验；**CDN etag = 文件 MD5**（完整性旁证）；CDN 403=限流（退避+降并发）≠ 401/410=URL 过期（重取直链）。downurl 缓存 TTL 未测（115-5 冒烟顺带），缺省 30min 保守值。
+- **K69.5 OSS 层决策：用 spike 自研签名层，不引入 ali-oss-rs**：版本树核对通过（ali-oss-rs 0.2.5 → reqwest ^0.12.12 同大版本，无冲突——回退条款的触发条件并未成立），但 115-0 spike 已产出**真机验证过**的 OSS V1 手写签名（5 操作：Put/Initiate?sequential/UploadPart/ListParts/Complete+callback，534 行，含 115 特有行为与两个签名陷阱——URL 尾斜杠归一、子资源排序），零新依赖。采用自研层的依据 = 计划 §2 回退形态 + 零依赖 + 已实证；回滚 = 换 ali-oss-rs（版本树已验兼容）。ListParts 分页（>1000 片）在驱动实现时补全。
+- **K69.6 秒传/哈希面**：秒传命中真机验证（同 SHA1 重 init → status==2，需过二次认证）；**伪造哈希 init 不被拒**（服务端在 complete/callback 侧校验）——「省略哈希直传」优化不做（风险不对称，明文/密文卷都照算真实哈希，密文永不秒传无害）。preid = 前 128KiB SHA1；全大写 hex。
+- **K69.7 错误码采样表（真机）**：`40199002`=QR 过期/key invalid（qrcodeapi，快拒）；`40101017`=未确认换 token；`40140123`=access_token 格式错；`401*`/`99`=token 过期（刷+重放一次）；`770004`=账号级访问上限；`911`=需人工验证（未真机复现）；`430004`=文件不存在（SDK 侧）；错误包 **HTTP 200 + envelope 双形态**（proapi `state:false` 布尔 / passportapi `state:0` 数字）——HTTP 状态码不可作判据。
+- **K69.8 上传链实证**：PutObject（3MiB）1.8s / 三片 multipart（12MiB）2.3s（OSS 直传，callback JSON 回应）；complete 后 size 复核纪律有效；resume 差集补片（1 复用 2 补）过。分片 min 5MiB、10000 片上限、sequential 子资源、callback 挂 Complete/Put（`x-oss-callback(-var)` base64 头）。
+- **K69.9 扫码停点协议记录（自主会话专用）**：QR 有效期 **~5 分钟**（签发→40199002 快拒），等待循环按 <5min 周期自动换码（同路径 PNG 恒新鲜），长轮询 30s/次。两轮窗口共 ~6.5h 无扫码、第三轮 13:05 捕获（80+1 周期、authDeviceCode 81 次无频控）。
+- **K69.10 回滚**：整批在 worktree 分支 `feat/pan115-driver`（merge 前 `git checkout main && git worktree remove` 即弃）；spike 为 workspace-excluded 不入 CI。账号侧残留：`/_e2e_pan115/` 空目录保留 + 回收站 4 个测试文件（D2 语义可恢复）。

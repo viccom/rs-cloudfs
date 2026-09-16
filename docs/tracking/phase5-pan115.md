@@ -2,13 +2,13 @@
 
 > 计划：`docs/plans/2026-09-14-pan115-driver.md` ｜ 需求口径：自用（K59.1）+ 全量公民 + 编译开关 + 零侵入
 > 基线：main@52c3e41（workspace 1069/0/12；winfsp 腿 117/0/1）
-> 状态：**方案已批准（2026-09-14，K62：D2–D4 拍板）——115-0（路线 spike）解锁可开工；D1 路线裁决按计划 §1.3 由 spike 产出**
-> 前置依赖：Phase 4（SFTP）SF1 的 `compiled_drivers()` 可扩展化——若 Phase 5 先行，该重构所有权移至本阶段（只做一次）
-> worktree：待建（建议 `feat/pan115-driver`）
+> 状态：**115-0 完成（2026-09-16，K69：路线 A go）——115-1 可开工**
+> 前置依赖：Phase 4（SFTP）已落地（main@f843cd9 含 K66/K67）——`compiled_drivers()` 可扩展化已就位，115-1 仅加臂
+> worktree：`feat/pan115-driver`（E:/Rs_Codes/rs-cloudfs-pan115，独立 target）
 
 | 任务 | 内容 | 状态 | 完成情况 | 证据 |
 |---|---|---|---|---|
-| 115-0 | 路线 spike 与裁决 | ⏳ 可开工（**K65 后范围更新**） | 五项：① **路径丙全链自铸**（公共 client_id → PKCE 扫码 → deviceCodeToToken → Bearer user/info → refreshToken 自续——验证零 app_key 运行期自持；顺带记录限额按 token 还是按 app）② downurl UA 矩阵 + Range/206 ③ QPS 限额实测 ④ upload 全链 + resume + **sign_key/sign_val 是否涉 app 签名** ⑤ 秒传哈希可否省略；产出路线裁决 + 采样表 | — |
+| 115-0 | 路线 spike 与裁决 | ✅ 完成（2026-09-16，K69） | 五项全过，**裁决路线 A go**：① 路径丙全链成立（client_id **100197303** OpenList 托管 app → PKCE 扫码 → Bearer user/info → refresh 自续轮换落盘）② UA **逐字节绑定**（错配恒 403）但形态不约束（空 UA 通）；HEAD/Range/206、etag=MD5 全过 ③ **770004 账号级限流**（~4rps 可持续、5rps 10s 内 22% 拒、封 ≥10min、跨端点族）→ D4 落值 1rps+硬退避 ④ 上传双路+callback+size 复核+resume 差集全过；**sign_key=用户级挑战非 app 签名**（K65 未决销账）⑤ 秒传命中过；伪造哈希 init 不拒（complete 侧校验）→ 省哈希优化不做 | spike 真机全输出（`examples/pan115_spike`，workspace-excluded）；上传 3MiB 1.8s/12MiB 2.3s；扫码停点协议见 K69.9；错误码表 K69.7 |
 | 115-1 | 认证与驱动骨架 | ⏸ | oauth.rs（device-code/QR/refresh+TokenStore；路线 B 则 cookie）+ 四件套骨架 + 配置键三处同步 + SECRET_VALUED_KEYS 增补 + ali-oss-rs 版本树核对 | — |
 | 115-2 | 读路径 | ⏸ | list/stat/mkdir/delete/rename + downurl 流读（HEAD 探测/Range/429 分段重生） | — |
 | 115-3 | 写路径 | ⏸ | upload init/get_token/ali-oss-rs 分片/complete/resume/秒传 + 硬纪律 3/4/5 | — |
@@ -25,6 +25,7 @@
 
 ## 批次日志
 
+- **2026-09-16 115-0 完成（K69，路线 A go）**：自主会话执行。client_id 来源修正（115-plus-desktop `.env` 空占位 → 改取 api.oplist.org 托管站 authorize 跳转公开值 100197303）；spike 两批落地（auth 腿 `0b53c14` + 探针腿 `acebe05`，真机矩阵：上传双路/秒传/UA 矩阵/resume 差集/伪造哈希/QPS 升压）。**执行期钉死的关键事实**：QR 窗口 ~5min（40199002 快拒）、get.status 长轮询 30s/次、错误包 HTTP 200 + envelope 双形态（state:true 布尔 / state:1 数字）、真实限流码 770004（非 20130827）且**账号级**、OSS V1 签名两陷阱（URL 尾斜杠、子资源排序）、CDN etag=MD5、sign_key 用户级挑战。**决策**：OSS 层用 spike 自研签名（ali-oss-rs 版本树核对通过但零依赖自研已真机验证——K69.5）；D4 定值 1rps+770004 硬退避 5min 起步（K69.3）。未测：downurl 直链 TTL（115-5 顺带）、限流按 token 还是按 app（单身份无法测——挂账，缓解=client_id 可换）。测试目录 /_e2e_pan115/ 已清空保留；回收站 4 个测试文件（D2 语义）。
 - **2026-09-14 K65 补充研究（凭证门槛消失）**：负责人问询 OpenList-APIPages「使用 OpenList 提供的参数」触发，专门克隆三仓核实（OpenList / OpenList-APIPages / 115-sdk-go）。**结论**：源码不含明文凭据（打码占位 + 部署时 env 注入）；但 **device-code PKCE 流全程无 secret**（`RefreshToken` 载荷仅 refresh_token 一字段）→ **凭证路径丙**成立：公共 client_id 自铸 + refresh 自持，运行期零 app_key/零外部依赖——「凭证可得性 = 胜负手」降级为「选 app 身份」。残余风险三项（app 身份连坐/共享限额池/upload 二次认证未决）入计划 §7 与 115-0 ①③④。配置键调整 `pan115_app_id/app_key` → `pan115_client_id`（非机密带缺省）+ `pan115_app_key`（路径甲专用可选）。计划同步六处（§1.1/§1.3/§4.3/§6/§7/附录 A.5/B）；decisions K65 入档。
 - **2026-09-14 拍板收口（K62，方案获批）**：D2 = 删除进回收站、回收站接口不引入（误删恢复走官方端）；D3 = `pan115_root` 可设置、缺省网盘根 `"0"`；D4 = QPS 实现期合理定值（RebuildTuning 式注入 + 列目录 ~2 QPS 起步 + downurl 缓存 TTL 待 spike + CDN 429 自适应重生）；D1 路线保持 spike 门槛（§1.3 规则）。**115-0 解锁可开工**。落档四处：decisions K62、计划 §8/头部、本表、AGENTS。
 - **2026-09-14 立项前置研究完成**（只读勘察，仓库 git status 干净）：
