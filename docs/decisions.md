@@ -759,3 +759,9 @@ Phase 5 五批次全落地（worktree `feat/pan115-driver`，`0b53c14`→`32060b
 - **K71.3 执行期注意点（后续 E2E 复用）**：①RFC 4918——PUT 到父集合不存在的路径 409，先 MKCOL；②`cfg.validate()` 生产口径拒 `webdav_port=0`，而 run 流程支持 :0 临时端口——测试 boot 不调 validate（run_e2e 先例同）；③Windows 上写完主动 `shutdown()` 会把连接整断，靠 `Connection: close` 服务端收尾。
 - **K71.4 flaky 观察项（未定位，如实记录）**：cargo clean 后首轮全量中 `ck-pan115::upload_path::size_mismatch_after_complete_is_refused` 失败一次（首建高争用窗口）；单跑 5/5、全量复跑 2/2 绿。疑点在 `resolve_new_row` 的 5s 轮询窗，未证实——不动代码，留观察。
 - **K71.5 回滚**：本批仅新增 `crates/cloudkit-cli/tests/pan115_e2e.rs`（#[ignore] 真机测试，不入 CI）+ 三处文档；`git revert <commit>` 即整批回退。
+
+## 2026-09-16 K72：115 live 用例的 SHA1 去重短路教训（K70.7 收口批执行期实证；补档 2026-09-17，深度审查 M-T5 销账）
+
+- **K72.1 去重与名字无关**：115 的秒传按**内容 SHA1 全局去重**（K69.6 语义延伸）——live 用例若用固定名 + 固定内容，历史轮次残留（或跨用例同内容，含离线桩跑过的同 pattern）会让 init 直接命中秒传，**绕过待测路径且真机无桩计数不可见**。纪律：真机用例一律 stamp 唯一名 + 按轮随机内容（live_matrix ⑤⑥ 形态；④ 原漏此纪律，2026-09-17 审查 M-T3 对齐）。
+- **K72.2 会话/秒传的判定面**：固定形态下「零分片零会话」是命中秒传的可观测信号（⑥ 的会话文件断言即以此兜底——resume 路径被短路时 `session_files.len() == 1` 断言先红）。
+- **K72.3 关联**：同批删除 `debug_rename_landing` 排查探针（无断言、不清理，`--ignored` 会连带执行——审查 M-T2）；其调查目的（跨父 move 后落点/索引延迟）已由 ⑤ 的断言化用例覆盖。回滚随 `fix/phase5-review` 分支。

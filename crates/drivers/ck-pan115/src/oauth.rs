@@ -89,6 +89,38 @@ pub enum PollStatus {
     Cancelled,
 }
 
+// ---------------------------------------------------------------------------
+// setup 向导装配面（115-4b 挂账项收口，2026-09-16）
+// ---------------------------------------------------------------------------
+
+/// setup 向导的直连 http client（spike auth.rs `http_client` 同形态：
+/// no_proxy + 恒定 UA + 60s 超时——oauth 三端点与 user/info 验证共用）。
+pub fn setup_http_client() -> reqwest::Client {
+    reqwest::Client::builder()
+        .no_proxy()
+        .user_agent(crate::UA)
+        .timeout(REQUEST_TIMEOUT)
+        .build()
+        .expect("setup http client builds")
+}
+
+/// 终端二维码渲染（Dense1x2 半块字符，两列一字符——横向补偿终端
+/// 字符的高宽比）。扫码 URL 即 115 App 的登录确认页。
+///
+/// 错误只来自编码容量（URL 远低于 V1-L 容量上限，实践不可达）——
+/// 归一 `Invalid` 而非 panic（向导循环里可上抛）。
+pub fn render_qr_terminal(url: &str) -> Result<String, StorageError> {
+    use qrcode::render::unicode::Dense1x2;
+    use qrcode::QrCode;
+    let code = QrCode::with_error_correction_level(url, qrcode::EcLevel::L)
+        .map_err(|_e| StorageError::Invalid)?;
+    Ok(code
+        .render::<Dense1x2>()
+        .quiet_zone(true)
+        .module_dimensions(2, 1)
+        .build())
+}
+
 /// RFC 7636 unreserved + marks——spike 验证过被接受的字符集。
 pub(crate) const VERIFIER_CHARSET: &[u8] =
     b"ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-._~";
@@ -271,4 +303,45 @@ fn now_unix() -> i64 {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_secs() as i64)
         .unwrap_or(0)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// QR 渲染面（纯函数）：非空、多行、含半块字符（▀▄█ 族——终端
+    /// 可显示形态），且静区存在（quiet_zone 边缘行是全空格行）。
+    #[test]
+    fn render_qr_terminal_produces_a_scannable_block_matrix() {
+        let url = "https://115.com/scan/dg-0123456789abcdef0123456789abcdef";
+        let art = render_qr_terminal(url).expect("render");
+        assert!(art.lines().count() > 10, "a QR matrix has many rows");
+        assert!(
+            art.contains('█') || art.contains('▀') || art.contains('▄'),
+            "dense half-block glyphs present: {art}"
+        );
+        let first = art.lines().next().expect("row");
+        assert!(
+            first.trim().is_empty(),
+            "the quiet zone renders as blank margins: {first:?}"
+        );
+    }
+
+    /// PKCE 形态钉死（spike 实测被接受的形态）：64 字符合法字符集 +
+    /// challenge = STANDARD base64 的 SHA-256。
+    #[test]
+    fn pkce_shapes_hold() {
+        let verifier = gen_code_verifier();
+        assert_eq!(verifier.len(), 64);
+        assert!(
+            verifier.bytes().all(|b| VERIFIER_CHARSET.contains(&b)),
+            "charset"
+        );
+        let challenge = pkce_challenge(&verifier);
+        assert_eq!(challenge.len(), 44, "SHA-256 → base64 with padding");
+        assert!(
+            !challenge.contains('-') && !challenge.contains('_'),
+            "STANDARD base64, not urlsafe"
+        );
+    }
 }

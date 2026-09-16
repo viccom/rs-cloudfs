@@ -635,12 +635,14 @@ dependencies = [
  "futures-util",
  "hmac 0.12.1",
  "httpdate",
+ "qrcode",
  "rand 0.10.2",
  "reqwest",
  "serde",
  "serde_json",
  "sha1 0.10.7",
  "sha2 0.10.9",
+ "tempfile",
  "tokio",
  "tracing",
 ]
@@ -3441,6 +3443,12 @@ checksum = "985e7ec9bb745e6ce6535b544d84d6cd6f7ad8bd711c398938ae983b91a766d9"
 dependencies = [
  "unicode-ident",
 ]
+
+[[package]]
+name = "qrcode"
+version = "0.13.0"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "166f136dfdb199f98186f3649cf7a0536534a61417a1a30221b492b4fb60ce3f"
 
 [[package]]
 name = "quinn"

@@ -477,3 +477,134 @@ async fn pan115_webdav_roundtrip_plain_and_encrypted() {
     cleanup_remote(&driver, &enc_rel).await;
     eprintln!("PASS: pan115 webdav roundtrip (plain + encrypted, remote cleaned)");
 }
+
+// --------------------------------------- 3. rebuild 收敛（挂账收口腿） --
+
+/// rebuild 真机收敛：远端种 2 文件 + 1 子目录 → `run_rebuild_with_driver`
+/// 走全树 → outcome 计数与远端一致 → 实例 db 行对账（名/大小）→
+/// **1 rps 限速下的耗时记录**（D4 的实测数字）。卷根指到 `/_e2e_pan115/`
+/// 的 folder id（D3 scoping——rebuild 只走作业目录，不动全账号）。
+#[tokio::test]
+#[ignore = "real network: needs the live 115 token pair from env; run with --ignored --test-threads=1"]
+async fn pan115_rebuild_converges_under_the_rate_limit() {
+    let driver = live_driver().await;
+    let e2e = RelPath::new("_e2e_pan115").expect("e2e path");
+
+    // 作业目录的 cid（rebuild 的卷根锚点）。
+    let e2e_stat = driver.stat(&e2e).await.expect("e2e dir stat");
+    let e2e_cid = e2e_stat.id.handle.as_str().split(':').next().expect("fid");
+
+    // 种子：子目录 + 两个文件（不同大小）。
+    let stamp = unix_stamp();
+    let sub = e2e.join("rb").expect("sub");
+    driver.mkdir(&sub).await.expect("mkdir sub");
+    let mut seeded: Vec<(String, Vec<u8>)> = Vec::new();
+    for (name, size) in [("alpha.bin", 1024usize), ("beta.bin", 4096)] {
+        let rel = e2e.join(name).expect("file");
+        let data = pseudo_random(size, 0x5EED);
+        let hint = cloudkit_storage::WriteHint {
+            size: Some(data.len() as u64),
+            ..Default::default()
+        };
+        let mut stager = driver.writer(&rel, &hint).await.expect("writer");
+        stager.write(&data).await.expect("write");
+        stager.close().await.expect("close");
+        seeded.push((format!("{name}@{stamp}"), data));
+    }
+
+    // rebuild 配置：卷根 = 作业目录 cid；实例 db 在临时目录。
+    let dir = tempfile::tempdir().expect("tempdir");
+    let (access, refresh) = env_pair();
+    let cfg = CyDriveConfig {
+        backend: Backend::Pan115,
+        pan115_access_token: Some(access),
+        pan115_refresh_token: Some(refresh),
+        pan115_root: Some(e2e_cid.to_string()),
+        db_path: dir.path().join("meta.db").to_string_lossy().into_owned(),
+        cache_path: dir.path().join("cache").to_string_lossy().into_owned(),
+        ..CyDriveConfig::default()
+    };
+
+    let started = std::time::Instant::now();
+    let outcome = cloudkit_cli::run_rebuild_with_driver(&cfg, driver.as_ref())
+        .await
+        .expect("rebuild over the live backend");
+    let elapsed = started.elapsed();
+
+    // 对账：alpha/beta 两行 + rb 目录行（到齐即传的临时对象已 complete，
+    // 计数恰为 2 files + 1 dir；历次残留已由各用例自清）。
+    assert_eq!(outcome.files, 2, "two seeded files rebuilt: {outcome:?}");
+    assert_eq!(outcome.dirs, 1, "one seeded dir rebuilt: {outcome:?}");
+
+    let db = MetaDatabase::open(&dir.path().join("meta.db")).expect("reopen db");
+    for (name, data) in &seeded {
+        let bare = name.split('@').next().expect("bare name");
+        let row = db
+            .get_file(&format!("/{bare}"))
+            .expect("db read")
+            .unwrap_or_else(|| panic!("row for {bare} missing"));
+        assert_eq!(row.size, data.len() as i64, "{bare} size");
+    }
+    println!(
+        "[SUMMARY] rebuild_converge|files={}|dirs={}|elapsed_s={:.1}|rate=1rps",
+        outcome.files,
+        outcome.dirs,
+        elapsed.as_secs_f32()
+    );
+
+    // 清理（D2 回收站）。
+    for (name, _) in &seeded {
+        let bare = name.split('@').next().expect("bare");
+        cleanup_remote(driver.as_ref(), &format!("_e2e_pan115/{bare}")).await;
+    }
+    let sub_stat = driver.stat(&sub).await.expect("sub stat");
+    driver.delete(&sub_stat.id).await.expect("delete sub");
+    println!("PASS: pan115 rebuild convergence (remote cleaned)");
+}
+
+// ------------------------------------- 4. setup 向导流真机探测（挂账腿） --
+
+/// 向导的三个 oauth 端点从 cli 侧可达（非交互探测：起一个码 → 一次
+/// 长轮询应答 Waiting → 弃码）。换 token 腿不做（需要真人扫码——
+/// 向导交互流由 `cydrive setup` 的人工运行覆盖）。
+#[tokio::test]
+#[ignore = "real network: hits the live 115 auth endpoints (no scan needed); run with --ignored --test-threads=1"]
+async fn pan115_setup_flow_endpoints_reach_the_live_service() {
+    use ck_pan115::oauth::{self, PollStatus};
+
+    let http = oauth::setup_http_client();
+    let verifier = oauth::gen_code_verifier();
+    let device = oauth::auth_device_code(
+        &http,
+        ck_pan115::DEFAULT_PASSPORT_BASE,
+        ck_pan115::DEFAULT_CLIENT_ID,
+        &verifier,
+    )
+    .await
+    .expect("authDeviceCode against the live service");
+    assert!(!device.uid.is_empty());
+    assert!(
+        device.qrcode.starts_with("https://115.com/scan/"),
+        "{}",
+        "QR URL shape"
+    );
+    let art = oauth::render_qr_terminal(&device.qrcode).expect("terminal QR renders");
+    assert!(art.lines().count() > 10, "the wizard's QR has substance");
+
+    // 一次长轮询（~30s 服务端保持）：无人扫码 → Waiting。
+    let verdict = oauth::poll_status(
+        &http,
+        ck_pan115::DEFAULT_QRCODE_BASE,
+        &device.uid,
+        device.time,
+        &device.sign,
+    )
+    .await
+    .expect("get.status against the live service");
+    assert!(
+        matches!(verdict, PollStatus::Waiting),
+        "a fresh unscanned code polls Waiting, got {verdict:?}"
+    );
+    // 弃码（不换 token——无人扫码也无需清理：窗口 ~5min 自然失效）。
+    println!("[SUMMARY] setup_flow_probe|device_code=ok|qr_render=ok|poll=waiting");
+}

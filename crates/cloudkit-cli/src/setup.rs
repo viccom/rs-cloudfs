@@ -265,6 +265,8 @@ pub async fn run_setup_interactive(store: Option<&dyn CredentialStore>) -> Resul
         WizardBackend::Baidu => run_setup_baidu(store).await,
         #[cfg(feature = "local")]
         WizardBackend::Local => run_setup_local(),
+        #[cfg(feature = "pan115")]
+        WizardBackend::Pan115 => run_setup_pan115(store).await,
     }
 }
 
@@ -278,6 +280,8 @@ enum WizardBackend {
     Baidu,
     #[cfg(feature = "local")]
     Local,
+    #[cfg(feature = "pan115")]
+    Pan115,
 }
 
 /// The backend menu entries: one per compiled-in driver, in boot order.
@@ -294,6 +298,8 @@ fn backend_menu() -> Vec<(WizardBackend, &'static str)> {
     choices.push((WizardBackend::Baidu, "baidu"));
     #[cfg(feature = "local")]
     choices.push((WizardBackend::Local, "local (a directory on this machine)"));
+    #[cfg(feature = "pan115")]
+    choices.push((WizardBackend::Pan115, "pan115 (QR scan via the 115 app)"));
     choices
 }
 
@@ -432,6 +438,166 @@ async fn run_setup_baidu(store: Option<&dyn CredentialStore>) -> Result<()> {
     Ok(())
 }
 
+/// Applies the pan115 wizard's outcome onto `cfg` (pure): flips
+/// `backend = "pan115"` LAST with the verified token pair in hand (the
+/// baidu strict-validate ruling, B3b 段二b — a half-configured instance
+/// must fail in validate with a naming-what's-missing message).
+///
+/// `client_id` 写显式值（= 缺省 100197303 时也写——自文档化配置，
+/// 且「app 身份被连坐封禁后换身份」的恢复路径一眼可见）。
+pub fn apply_pan115_wizard(
+    mut cfg: CyDriveConfig,
+    client_id: &str,
+    access_token: &str,
+    refresh_token: &str,
+) -> CyDriveConfig {
+    cfg.backend = cloudkit_core::config::Backend::Pan115;
+    cfg.pan115_client_id = Some(client_id.trim().to_string());
+    cfg.pan115_access_token = Some(access_token.trim().to_string());
+    cfg.pan115_refresh_token = Some(refresh_token.trim().to_string());
+    cfg
+}
+
+/// The pan115 branch of the wizard (Phase 5 ledger closeout):
+/// device-code PKCE QR scan — the three oauth endpoints over a direct
+/// client (K69 route A), the pair verified once against `user/info`
+/// before anything is written. The QR lives ~5 minutes (K69.9): expiry
+/// regenerates it in place instead of failing the wizard.
+#[cfg(feature = "pan115")]
+async fn run_setup_pan115(store: Option<&dyn CredentialStore>) -> Result<()> {
+    use ck_pan115::oauth::{self, PollStatus};
+    use dialoguer::Input;
+
+    println!("115 netdisk backend: scan the QR code with the 115 app.");
+    println!("  (Device-code PKCE — no app secret; the pair rotates on every refresh,");
+    println!("   the wizard verifies it once and stores it.)");
+
+    let client_id: String = Input::new()
+        .with_prompt("App identity (client_id)")
+        .default(ck_pan115::DEFAULT_CLIENT_ID.to_string())
+        .interact_text()
+        .context("reading the client id")?;
+
+    let http = oauth::setup_http_client();
+    let (access, refresh) = loop {
+        // --- begin scan: device code + QR
+        let verifier = oauth::gen_code_verifier();
+        let device = oauth::auth_device_code(
+            &http,
+            ck_pan115::DEFAULT_PASSPORT_BASE,
+            client_id.trim(),
+            &verifier,
+        )
+        .await
+        .context("requesting the device code (direct connection, no proxy)")?;
+        let art = oauth::render_qr_terminal(&device.qrcode).context("rendering the QR code")?;
+        println!();
+        println!("{art}");
+        println!("Scan with the 115 app — or open: {}", device.qrcode);
+        println!("(the code lives ~5 minutes; it regenerates on expiry)");
+
+        // --- poll until confirmed / expired / cancelled (the server holds
+        //     each call ~30s; transport hiccups retry a bounded number —
+        //     10 consecutive failures abort with nothing written)
+        let mut hiccups = 0u32;
+        let confirmed = loop {
+            let verdict = oauth::poll_status(
+                &http,
+                ck_pan115::DEFAULT_QRCODE_BASE,
+                &device.uid,
+                device.time,
+                &device.sign,
+            )
+            .await;
+            match verdict {
+                Ok(PollStatus::Waiting) => hiccups = 0, // silent: ~30s per call
+                Ok(PollStatus::Scanned) => {
+                    hiccups = 0;
+                    println!("Scanned — confirm in the app...");
+                }
+                Ok(PollStatus::Confirmed) => break true,
+                Ok(PollStatus::Expired) => {
+                    println!("The QR window lapsed — regenerating...");
+                    break false;
+                }
+                Ok(PollStatus::Cancelled) => anyhow::bail!(
+                    "cancelled in the 115 app — nothing was written; re-run \
+                     `cydrive setup` to try again"
+                ),
+                Err(error) => {
+                    hiccups += 1;
+                    if hiccups >= 10 {
+                        anyhow::bail!(
+                            "poll transport failed {hiccups} times in a row ({error}) — \
+                             check the network and re-run `cydrive setup`; nothing was \
+                             written"
+                        );
+                    }
+                    println!("poll hiccup ({error}); retrying...");
+                    tokio::time::sleep(std::time::Duration::from_secs(3)).await;
+                }
+            }
+        };
+        if !confirmed {
+            continue; // expired → new QR, new verifier budget
+        }
+
+        // --- exchange + verify (user/info once; refresh is rate-limited
+        //     and must NOT be touched here, K69.1)
+        let (access, refresh) = oauth::device_code_to_token(
+            &http,
+            ck_pan115::DEFAULT_PASSPORT_BASE,
+            &device.uid,
+            &verifier,
+        )
+        .await
+        .context("exchanging the confirmation for the token pair")?;
+        println!("Verifying the token pair against 115 (user/info)...");
+        let verify = async {
+            let client = ck_pan115::Pan115Client::new(
+                access.clone(),
+                refresh.clone(),
+                ck_pan115::DEFAULT_PASSPORT_BASE.to_string(),
+                ck_pan115::DEFAULT_API_BASE.to_string(),
+                None,
+                std::sync::Arc::new(ck_pan115::limiter::RateLimiter::new(
+                    ck_pan115::limiter::LimiterConfig::default(),
+                )),
+            )?;
+            client.user_info().await
+        };
+        match verify.await {
+            Ok(info) => {
+                let name = info
+                    .get("user_name")
+                    .and_then(|v| v.as_str())
+                    .unwrap_or("<account>");
+                println!("Token pair verified — account: {name}");
+                break (access, refresh);
+            }
+            Err(error) => {
+                println!(
+                    "the freshly exchanged pair failed verification ({error}) — restarting \
+                     the scan; nothing was written"
+                );
+                continue;
+            }
+        }
+    };
+
+    let cfg = apply_pan115_wizard(CyDriveConfig::default(), &client_id, &access, &refresh);
+    persist_setup(&cfg, store)?;
+    println!(
+        "Configuration saved to ./config.toml (backend = pan115; the three pan115_* keys are \
+         in the file — K14 allows plaintext token keys there, keep it private)."
+    );
+    println!(
+        "Optionally set pan115_root to a folder id to scope the volume (0 = the whole account)."
+    );
+    println!("Run `cydrive doctor` to probe the token, or `cydrive run` to start.");
+    Ok(())
+}
+
 /// The local branch of the wizard (Phase 2 / B3b): one absolute-path
 /// prompt (validated; the directory is created on first run by the
 /// driver factory — doctor probes writability on demand). No secrets.
@@ -551,4 +717,23 @@ pub fn run_setup_multi() -> Result<String> {
          and `cydrive run` boots them all behind one WebDAV port at /vol/<name>."
     );
     Ok(report)
+}
+
+#[cfg(all(test, feature = "pan115"))]
+mod pan115_wizard_tests {
+    use super::apply_pan115_wizard;
+    use cloudkit_core::config::{Backend, CyDriveConfig};
+
+    /// The strict-validate shape: the three keys land and the backend
+    /// flips LAST (the baidu ruling) — a pan115 config from the wizard
+    /// always validates.
+    #[test]
+    fn apply_pan115_wizard_lands_a_validating_config() {
+        let cfg = apply_pan115_wizard(CyDriveConfig::default(), "100197303", "  acc  ", " ref ");
+        assert_eq!(cfg.backend, Backend::Pan115);
+        assert_eq!(cfg.pan115_client_id.as_deref(), Some("100197303"));
+        assert_eq!(cfg.pan115_access_token.as_deref(), Some("acc"), "trimmed");
+        assert_eq!(cfg.pan115_refresh_token.as_deref(), Some("ref"), "trimmed");
+        cfg.validate().expect("the wizard outcome validates");
+    }
 }
