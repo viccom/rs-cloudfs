@@ -765,3 +765,12 @@ Phase 5 五批次全落地（worktree `feat/pan115-driver`，`0b53c14`→`32060b
 - **K72.1 去重与名字无关**：115 的秒传按**内容 SHA1 全局去重**（K69.6 语义延伸）——live 用例若用固定名 + 固定内容，历史轮次残留（或跨用例同内容，含离线桩跑过的同 pattern）会让 init 直接命中秒传，**绕过待测路径且真机无桩计数不可见**。纪律：真机用例一律 stamp 唯一名 + 按轮随机内容（live_matrix ⑤⑥ 形态；④ 原漏此纪律，2026-09-17 审查 M-T3 对齐）。
 - **K72.2 会话/秒传的判定面**：固定形态下「零分片零会话」是命中秒传的可观测信号（⑥ 的会话文件断言即以此兜底——resume 路径被短路时 `session_files.len() == 1` 断言先红）。
 - **K72.3 关联**：同批删除 `debug_rename_landing` 排查探针（无断言、不清理，`--ignored` 会连带执行——审查 M-T2）；其调查目的（跨父 move 后落点/索引延迟）已由 ⑤ 的断言化用例覆盖。回滚随 `fix/phase5-review` 分支。
+
+## 2026-09-17 K73：Phase 5 合入后深度审查修复批——2 High + 12 Medium 全清偿（fix/phase5-review）
+
+- **K73.1 审查形态**：三路并行（主会话精读 ck-pan115 九模块 + 子代理测试/桩面 + 子代理集成/装配面，关键发现主会话亲验）；在制未提交改动纳入审查范围。产出 2 High + 12 Medium + Low 若干，逐项销账表 = `docs/tracking/phase5-review-fixes.md`。
+- **K73.2 实质修复五处驱动缺陷**：①delete 句柄 parent 段恒空（ghost 缓存 + API 形态未验，M-S1）；②STS 每分片重取（N+2 次 1rps 限流调用，M-S2）；③直链 401/410 不自愈（长流硬死，M-S3）；④rename 冷目录预检穿透（Exists 契约丢失，M-S4）；⑤pathcache 无 TTL/无上界（外部删改永久陈旧 + rebuild 内存无界，M-S5）。全部 TDD 红→绿留证。
+- **K73.3 裁剪组合双缺口**（M-I1/M-I2）：`not(baidu)+pan115` 曾丢 TokenStore 回写（一次一换下 = 重启失授权）+ 多卷 dispatch 把非 pan115 卷误装配——修复 = dispatch_unified_backend_volume 移入 lib 成可测缝 + 单一 match 全组合通用 + twin 对齐主 twin；组合构建下红→绿钉死（pan115_combo_dispatch.rs）。
+- **K73.4 测试面可信度**：H-T1 flaky 根因（自拼 tmpdir 撞名）tempfile 化（压测 2/26 失败 → 0/30）；H-T2 probe 假覆盖（名实不符 + 注入空转）重写为四变体真实触发；M-T1 sign_val 数值常量钉；M-T4 normalize_endpoint 生产分支正面钉。dev-dep sha1 触发 E0464 双 rlib → 预计算常量替代（同性质零依赖面）。
+- **K73.5 自主模式裁决记录**：工作区在制改动（setup 向导 + live ④⑤⑥ + e2e 腿）是多项 Medium 的修复载体，先修其自身问题（探针/④随机化/K72 补档/门禁红/poll 上限）commit 为 15195ce 再叠修复批——不动 main、不 push，`git branch -D fix/phase5-review` 即整批回退。`examples/sftp-config/`（Phase 4 运行遗留，含内网 IP/root 名）判定不入库，留负责人处置。
+- **K73.6 挂账**：Low 项与真机待验项见跟踪单「Low 挂账」「真机待验项」两节（rename 宽映射 / OSS status=0 重试分类 / setup IPv4 对齐 / 真机 parent_id 与直链 TTL 等）。
