@@ -28,16 +28,18 @@
 //! （driver-onboarding §1）；禁依赖 cloudkit-core 及任何 L3+ crate（R1）。
 
 pub mod api;
+pub mod download;
 pub mod limiter;
 pub mod oauth;
 pub mod oss;
+pub mod pathcache;
 
 use std::sync::Arc;
 
 use async_trait::async_trait;
 use cloudkit_storage::{
-    ByteStream, Capabilities, Entry, EntryId, Listing, Page, Quota, Range, RelPath, StorageDriver,
-    StorageError, UploadStager, VolumeId, WriteHint,
+    BackendHandle, ByteStream, Capabilities, Entry, EntryId, EntryKind, Listing, Page, PageCursor,
+    Quota, Range, RelPath, StorageDriver, StorageError, UploadStager, VolumeId, WriteHint,
 };
 
 pub use api::{Pan115Client, UA};
@@ -162,8 +164,14 @@ impl Pan115Params {
 ///   于 [`Pan115Client`]。
 pub struct Pan115Driver {
     volume: VolumeId,
-    client: Pan115Client,
+    /// 共享 HTTP 面（CDN 流任务经 Arc 持有——ByteStream 生命周期独立于
+    /// `&self`，baidu 同款）。
+    client: Arc<Pan115Client>,
     params: Pan115Params,
+    /// 路径 → folder id 解析缓存（115-2；list/stat 顺带喂）。
+    paths: pathcache::PathCache,
+    /// pick_code → CDN 直链 TTL 缓存（115-2；与流任务经 Arc 共享）。
+    dlinks: Arc<download::DlinkCache>,
 }
 
 impl Pan115Driver {
@@ -183,19 +191,59 @@ impl Pan115Driver {
             return Err(StorageError::Invalid);
         };
         let limiter_cfg = params.limiter.unwrap_or_default();
-        let client = Pan115Client::new(
+        let client = Arc::new(Pan115Client::new(
             access.clone(),
             refresh.clone(),
             params.passport_base.clone(),
             params.api_base.clone(),
             params.token_store.clone(),
             Arc::new(limiter::RateLimiter::new(limiter_cfg)),
-        )?;
+        )?);
         Ok(Pan115Driver {
             volume: VolumeId::new("pan115", "pending")?,
             client,
             params,
+            paths: pathcache::PathCache::new(),
+            dlinks: Arc::new(download::DlinkCache::new()),
         })
+    }
+
+    /// 连接构造（115-2）：`user/info` 取 uid → VolumeId `pan115:<uid>`
+    /// （K5；baidu `connect` 同形——uid 是账号级身份，ID 从第一天带卷）。
+    ///
+    /// 115-4 装配批的工厂走本入口；[`Pan115Driver::new`] 保持离线形态
+    /// （占位 VolumeId `pan115:pending`）供纯本地测试与 conformance 桩
+    /// 复用。
+    pub async fn connect(params: Pan115Params) -> Result<Self, StorageError> {
+        let mut driver = Pan115Driver::new(params)?;
+        let info = driver.client.user_info().await?;
+        let uid = info
+            .get("user_id")
+            .map(|v| match v {
+                serde_json::Value::Number(n) => n.to_string(),
+                serde_json::Value::String(s) => s.clone(),
+                other => other.to_string(),
+            })
+            .filter(|s| !s.is_empty() && s != "null")
+            .ok_or_else(|| StorageError::Unavailable("user/info: user_id missing".to_string()))?;
+        driver.volume = VolumeId::new("pan115", &uid)?;
+        Ok(driver)
+    }
+
+    /// 卷根的 folder id（`pan115_root`；D3）。
+    fn root_cid(&self) -> &str {
+        &self.params.root
+    }
+
+    /// 路径 → 解析层（list/stat/mkdir/rename 共用）。
+    async fn resolve(
+        &self,
+        path: &RelPath,
+        want_dir: bool,
+    ) -> Result<pathcache::Resolved, StorageError> {
+        self.paths
+            .resolve(&self.client, self.root_cid(), path, want_dir)
+            .await
     }
 
     /// api client 的公开访问面（115-2 起驱动方法经它调用端点；115-4
@@ -260,32 +308,196 @@ impl StorageDriver for Pan115Driver {
         }
     }
 
-    async fn list(&self, _dir: &RelPath, _page: Page) -> Result<Listing, StorageError> {
-        Err(not_wired("list", "115-2"))
+    /// 列目录（depth-1）：解析目录 cid → 全量翻页 → 字典序稳定排序 →
+    /// 内部 offset 游标切 [`Page`]（baidu 同款形态——后端分页参数在
+    /// 驱动内消化，游标是对外不透明令牌）。
+    async fn list(&self, dir: &RelPath, page: Page) -> Result<Listing, StorageError> {
+        let resolved = self.resolve(dir, true).await?;
+        let rows = pathcache::list_all(&self.client, &resolved.cid).await?;
+        // 解析层缓存顺带更新（list 产出即喂——同目录下一次零网络）。
+        self.paths.put_dir(&resolved.cid, &rows).await;
+        let mut entries: Vec<Entry> = rows
+            .iter()
+            .filter_map(|row| self.entry_from_row(dir, row))
+            .collect();
+        entries.sort_by(|a, b| a.path.cmp(&b.path));
+        let total = entries.len();
+        let offset = match page.cursor {
+            PageCursor::Start => 0usize,
+            PageCursor::Next(tok) => tok
+                .strip_prefix("off:")
+                .and_then(|n| n.parse().ok())
+                .unwrap_or(0),
+        };
+        let offset = offset.min(total); // 伪超大 offset 钳制
+        let end = offset.saturating_add(page.limit).min(total);
+        let next = (end < total).then(|| PageCursor::Next(format!("off:{end}")));
+        Ok(Listing {
+            entries: entries.drain(offset..end).collect(),
+            next,
+        })
     }
 
-    async fn stat(&self, _path: &RelPath) -> Result<Entry, StorageError> {
-        Err(not_wired("stat", "115-2"))
+    /// 取条目元数据：解析层精确匹配（未命中走 list 下行）；根 → 卷根本身。
+    async fn stat(&self, path: &RelPath) -> Result<Entry, StorageError> {
+        if path.is_root() {
+            return Ok(Entry {
+                id: EntryId::new(self.volume.clone(), BackendHandle::new(self.root_cid())),
+                path: RelPath::root(),
+                kind: EntryKind::Dir,
+                size: 0,
+                mtime: 0.0,
+            });
+        }
+        let resolved = self.resolve(path, false).await?;
+        let row = resolved.row.as_ref().ok_or(StorageError::NotFound)?;
+        let parent = path.parent().unwrap_or_else(RelPath::root);
+        self.entry_from_row(&parent, row)
+            .ok_or(StorageError::NotFound)
     }
 
-    async fn mkdir(&self, _path: &RelPath) -> Result<(), StorageError> {
-        Err(not_wired("mkdir", "115-2"))
+    /// 建目录（逐级隐式建父；末段已存在 → `Exists`——baidu 真网教训
+    /// 同源纪律：**先 list 预检再 create**，不产重名副本垃圾）。
+    async fn mkdir(&self, path: &RelPath) -> Result<(), StorageError> {
+        if path.is_root() {
+            return Err(StorageError::Exists); // 卷根本就存在（ck-local/baidu 同款）
+        }
+        let comps: Vec<String> = path.components().map(str::to_string).collect();
+        let last = comps.len() - 1;
+        let mut cid = self.root_cid().to_string();
+        for (i, comp) in comps.iter().enumerate() {
+            let existing = match self.paths.get_child(&cid, comp).await {
+                Some(row) => Some(row),
+                None => {
+                    let rows = pathcache::list_all(&self.client, &cid).await?;
+                    self.paths.put_dir(&cid, &rows).await;
+                    self.paths.get_child(&cid, comp).await
+                }
+            };
+            if let Some(row) = existing {
+                if i == last {
+                    return Err(StorageError::Exists);
+                }
+                if row.fc != "0" {
+                    return Err(StorageError::NotFound); // 中途遇文件
+                }
+                cid = row.fid;
+                continue;
+            }
+            // 不存在 → create；I/O 类失败走一次复查（mkdir 竞态臂归一，
+            // K67.3 ck-sftp 同源纪律）。
+            let fid = match self.client.mkdir(&cid, comp).await {
+                Ok(fid) => fid,
+                Err(StorageError::Io(msg)) => {
+                    let rows = pathcache::list_all(&self.client, &cid).await?;
+                    self.paths.put_dir(&cid, &rows).await;
+                    match self.paths.get_child(&cid, comp).await {
+                        Some(_) if i == last => return Err(StorageError::Exists),
+                        Some(row) => row.fid,
+                        None => return Err(StorageError::Io(msg)),
+                    }
+                }
+                Err(e) => return Err(e),
+            };
+            self.paths.invalidate(&cid).await; // 结构变更：父级缓存失效
+            cid = fid;
+        }
+        Ok(())
     }
 
-    async fn delete(&self, _id: &EntryId) -> Result<(), StorageError> {
-        Err(not_wired("delete", "115-2"))
+    /// 删除（`ufile/delete`，D2：进回收站语义）。幂等声明 = 删除不
+    /// 存在句柄 → `NotFound`（trait 二选一；本驱动选查询式，baidu 同款）。
+    async fn delete(&self, id: &EntryId) -> Result<(), StorageError> {
+        if id.volume != self.volume {
+            return Err(StorageError::NotFound); // 他卷句柄（trait 契约）
+        }
+        let (fid, _pc, parent) = parse_handle(id.handle.as_str())?;
+        self.client.delete(&fid, &parent).await?;
+        self.paths.invalidate(&parent).await; // 结构变更：父级缓存失效
+        Ok(())
     }
 
-    async fn rename(&self, _from: &RelPath, _to: &RelPath) -> Result<(), StorageError> {
-        Err(not_wired("rename", "115-2"))
+    /// 移动/重命名（`server_side_move`）。
+    ///
+    /// - 同父改名：文件走 `ufile/update`、目录走 `move` + `update`
+    ///   两步（`update` 端点对目录的行为 115-0 spike 未覆盖，115-5 真机
+    ///   复核；远端拒绝原样上抛不编造）；
+    /// - 跨父移动：`ufile/move`（源/目标 cid 都解析）；
+    /// - 预检目标存在 → `Exists`；目标在源之下 → `Invalid`（契约）。
+    async fn rename(&self, from: &RelPath, to: &RelPath) -> Result<(), StorageError> {
+        if from.is_root() || to.is_root() {
+            return Err(StorageError::Invalid);
+        }
+        // 后代检查（纯字符串面：`to` 以 `from/` 起头即源之后代）。
+        if to.as_str().starts_with(&format!("{}/", from.as_str())) {
+            return Err(StorageError::Invalid);
+        }
+        let src = self.resolve(from, false).await?;
+        let src_row = src.row.clone().ok_or(StorageError::NotFound)?;
+        let to_name = to
+            .components()
+            .last()
+            .ok_or(StorageError::Invalid)?
+            .to_string();
+        let dst_parent = to.parent().unwrap_or_else(RelPath::root);
+        let dst = self.resolve(&dst_parent, true).await?;
+        // 目标已存在 → Exists（占位检查先于任何变更）。
+        if self.paths.get_child(&dst.cid, &to_name).await.is_some() {
+            return Err(StorageError::Exists);
+        }
+        let same_parent = src.parent_cid == dst.cid;
+        if !same_parent {
+            // 跨父：move 到目标父，再按需改名（move 被拒 = 竞态占位）。
+            self.client
+                .move_entries(&src_row.fid, &dst.cid)
+                .await
+                .map_err(|e| match e {
+                    StorageError::Io(_) | StorageError::Unavailable(_) | StorageError::Invalid => {
+                        StorageError::Exists
+                    }
+                    other => other,
+                })?;
+        }
+        // 改名腿（同父改名或跨父后改名；名字已同则跳过）。
+        if src_row.fname != to_name {
+            self.client.update(&src_row.fid, &to_name).await?;
+        }
+        // 结构变更：两个父级都失效（同父时同一个）。
+        self.paths.invalidate(&src.parent_cid).await;
+        if !same_parent {
+            self.paths.invalidate(&dst.cid).await;
+        }
+        Ok(())
     }
 
-    async fn reader(
-        &self,
-        _id: &EntryId,
-        _range: Option<Range>,
-    ) -> Result<ByteStream, StorageError> {
-        Err(not_wired("reader", "115-2"))
+    /// 打开读取流。句柄编码 `fid:pick_code:parent_cid`（[`parse_handle`]）。
+    /// range 钳制在这里（end 越界 → EOF；start≥size → 空流——baidu
+    /// 同款 conformance ② 形态）。
+    async fn reader(&self, id: &EntryId, range: Option<Range>) -> Result<ByteStream, StorageError> {
+        if id.volume != self.volume {
+            return Err(StorageError::NotFound); // 他卷句柄
+        }
+        let (fid, pc, _parent) = parse_handle(id.handle.as_str())?;
+        // 形态判定：句柄不含 kind——get_info 复核（目录 → Invalid）。
+        let info = self.client.get_info(&fid).await?;
+        if info.file_category != "1" {
+            return Err(StorageError::Invalid); // 目录不可读（trait 契约）
+        }
+        let size = info.size_byte.max(0) as u64;
+        let pick_code = if !pc.is_empty() {
+            pc
+        } else if !info.pick_code.is_empty() {
+            info.pick_code
+        } else {
+            return Err(StorageError::Unavailable(
+                "reader: pick_code unavailable for this entry".to_string(),
+            ));
+        };
+        let (start, end) = match range {
+            None => (0u64, size),
+            Some(r) => (r.start, r.end.unwrap_or(size).min(size)),
+        };
+        download::open_range(&self.client, &self.dlinks, &pick_code, size, start, end).await
     }
 
     async fn writer(
@@ -296,9 +508,82 @@ impl StorageDriver for Pan115Driver {
         Err(not_wired("writer", "115-3"))
     }
 
+    /// 配额：`user/info` 的 `rt_space_info`（K69 采样：`all_total.size`
+    /// 总空间 / `all_use.size` 已用；`size` 数值/字符串两形态容错）。
     async fn quota(&self) -> Result<Quota, StorageError> {
-        Err(not_wired("quota", "115-2"))
+        let info = self.client.user_info().await?;
+        let space = info.get("rt_space_info");
+        let num = |v: Option<&serde_json::Value>| -> Option<u64> {
+            v.and_then(|v| match v {
+                serde_json::Value::Number(n) => n.as_u64(),
+                serde_json::Value::String(s) => s.parse().ok(),
+                _ => None,
+            })
+        };
+        let total = num(space
+            .and_then(|s| s.get("all_total"))
+            .and_then(|t| t.get("size")));
+        let used = num(space
+            .and_then(|s| s.get("all_use"))
+            .and_then(|t| t.get("size")))
+        .unwrap_or(0);
+        Ok(Quota { total, used })
     }
+}
+
+impl Pan115Driver {
+    /// 后端行 → [`Entry`]（list/stat 共用换算面）。不可寻址名（空名 /
+    /// 含反斜杠 / 含 NUL）过滤 → None（「list 产出即可寻址」纪律，
+    /// K67.2 ck-local/ck-sftp 同源硬化）。
+    fn entry_from_row(&self, dir: &RelPath, row: &api::ListRow) -> Option<Entry> {
+        if !name_is_addressable(&row.fname) {
+            tracing::debug!(
+                target: "ck_pan115::list",
+                fid = %row.fid,
+                "skipping unaddressable name (empty/backslash/NUL)"
+            );
+            return None;
+        }
+        let path = dir.join(&row.fname).ok()?;
+        let kind = if row.fc == "0" {
+            EntryKind::Dir
+        } else {
+            EntryKind::File
+        };
+        Some(Entry {
+            id: EntryId::new(
+                self.volume.clone(),
+                BackendHandle::new(encode_handle(&row.fid, &row.pc, "")),
+            ),
+            path,
+            kind,
+            size: row.fs.max(0) as u64,
+            mtime: row.upt as f64,
+        })
+    }
+}
+
+/// 句柄编码 `fid:pc:parent`（三段；pc/parent 允许空——空段保留位置）。
+fn encode_handle(fid: &str, pc: &str, parent: &str) -> String {
+    format!("{fid}:{pc}:{parent}")
+}
+
+/// 句柄解码（[`encode_handle`] 的逆；fid 非空校验）。
+fn parse_handle(handle: &str) -> Result<(String, String, String), StorageError> {
+    let mut parts = handle.splitn(3, ':');
+    let fid = parts.next().unwrap_or_default();
+    let pc = parts.next().unwrap_or_default();
+    let parent = parts.next().unwrap_or_default();
+    if fid.is_empty() {
+        return Err(StorageError::Invalid);
+    }
+    Ok((fid.to_string(), pc.to_string(), parent.to_string()))
+}
+
+/// 「list 产出即可寻址」：空名 / 含反斜杠 / 含 NUL 的名字不进 [`Entry`]
+/// （跨平台卷的可寻址性纪律，K67.2 同源）。
+fn name_is_addressable(name: &str) -> bool {
+    !name.is_empty() && !name.contains('\\') && !name.contains('\u{0}')
 }
 
 /// 装配工厂：构造驱动（**不连网**——首请求惰性建立；token 对齐备性
@@ -310,7 +595,7 @@ pub async fn factory(params: &Pan115Params) -> Result<Arc<Pan115Driver>, Storage
 #[cfg(test)]
 mod tests {
     use super::*;
-    use cloudkit_storage::{Page, RelPath, StorageDriver, WriteHint};
+    use cloudkit_storage::{RelPath, StorageDriver, WriteHint};
 
     fn pair(key: &str, value: &str) -> (String, String) {
         (key.to_string(), value.to_string())
@@ -416,61 +701,22 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nine_methods_hold_the_not_wired_shape() {
-        // 占位形态稳定性：全部九方法拒绝且载荷指明落地批次（115-2 读
-        // 面 / 115-3 写面）——115-4 装配前的任何触达都得到可行动错误。
+    async fn writer_holds_the_not_wired_shape_until_115_3() {
+        // 115-2 后仅 writer 仍是占位（读面已接线——协议面拒绝由
+        // read_path.rs 桩回放矩阵覆盖）。占位载荷指明落地批次。
         let driver = Pan115Driver::new(skeleton_params()).expect("driver");
-        let root = RelPath::root();
-        let check = |face: &'static str, err: StorageError, batch: &str| match &err {
+        let err = driver
+            .writer(&RelPath::root(), &WriteHint::default())
+            .await
+            .err()
+            .expect("writer still refuses");
+        match &err {
             StorageError::Unavailable(detail) => {
-                assert!(detail.contains(face), "{face} names itself: {detail}");
-                assert!(detail.contains(batch), "{face} names {batch}: {detail}");
+                assert!(detail.contains("writer"), "names itself: {detail}");
+                assert!(detail.contains("115-3"), "names the batch: {detail}");
             }
-            other => panic!("{face} must hold the Unavailable shape, got {other:?}"),
-        };
-        check(
-            "list",
-            driver.list(&root, Page::all()).await.expect_err("list"),
-            "115-2",
-        );
-        check("stat", driver.stat(&root).await.expect_err("stat"), "115-2");
-        check(
-            "mkdir",
-            driver.mkdir(&root).await.expect_err("mkdir"),
-            "115-2",
-        );
-        let id = cloudkit_storage::EntryId::new(
-            driver.volume().clone(),
-            cloudkit_storage::BackendHandle::new("f.txt"),
-        );
-        check(
-            "delete",
-            driver.delete(&id).await.expect_err("delete"),
-            "115-2",
-        );
-        check(
-            "rename",
-            driver
-                .rename(&root, &RelPath::new("x").expect("rel"))
-                .await
-                .expect_err("rename"),
-            "115-2",
-        );
-        check(
-            "reader",
-            driver.reader(&id, None).await.err().expect("reader"),
-            "115-2",
-        );
-        check("quota", driver.quota().await.expect_err("quota"), "115-2");
-        check(
-            "writer",
-            driver
-                .writer(&root, &WriteHint::default())
-                .await
-                .err()
-                .expect("writer"),
-            "115-3",
-        );
+            other => panic!("writer must hold the Unavailable shape, got {other:?}"),
+        }
     }
 
     // ------------------------------------------------------ oauth 面 ---

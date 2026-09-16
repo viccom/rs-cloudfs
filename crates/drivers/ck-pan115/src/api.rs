@@ -572,6 +572,12 @@ impl Pan115Client {
         Ok(())
     }
 
+    /// HTTP 客户端访问面（download.rs 的 CDN HEAD/GET 直连面——UA 恒定
+    /// 绑定与 IPv4 直连策略经同一 client 保证，K69.4）。
+    pub(crate) fn http(&self) -> &reqwest::Client {
+        &self.http
+    }
+
     // ------------------------------------------------------- 端点面 ---
 
     /// `GET /open/user/info` → `data`（uid/配额字段；VolumeId 的 uid 与
