@@ -88,6 +88,22 @@ impl PathCache {
         path: &RelPath,
         want_dir: bool,
     ) -> Result<Resolved, StorageError> {
+        self.resolve_with(client, root_cid, path, want_dir, false)
+            .await
+    }
+
+    /// [`PathCache::resolve`] 的变体：`fresh_last = true` 时**末级组件
+    /// 绕过缓存**（现列父目录）——`stat` 走此形态：stat 是新鲜度查询，
+    /// 且 conformance ⑤ 要求后端错误能被 stat 观察到（缓存命中会把
+    /// 注入的后端错误吞掉）。中间层仍走缓存（目录链稳定）。
+    pub async fn resolve_with(
+        &self,
+        client: &Pan115Client,
+        root_cid: &str,
+        path: &RelPath,
+        want_dir: bool,
+        fresh_last: bool,
+    ) -> Result<Resolved, StorageError> {
         let comps: Vec<String> = path.components().map(str::to_string).collect();
         let mut cid = root_cid.to_string();
         if comps.is_empty() {
@@ -99,7 +115,13 @@ impl PathCache {
         }
         let last = comps.len() - 1;
         for (i, comp) in comps.iter().enumerate() {
-            let child = match self.get_child(&cid, comp).await {
+            let want_fresh = fresh_last && i == last;
+            let cached = if want_fresh {
+                None
+            } else {
+                self.get_child(&cid, comp).await
+            };
+            let child = match cached {
                 Some(row) => row,
                 None => {
                     // 未命中：list 该层一次（分页取全，1000/页沿 115

@@ -70,6 +70,10 @@ struct UState {
     part_put_count: u32,
     /// 强制 complete 后远端 size 为 0（复核负例注入）
     force_zero_size: bool,
+    /// 第 N 片之后的 PUT 失败（分片级 resume 用例的中断注入）
+    fail_part_after: Option<u32>,
+    /// pick_code → object key（resume 会话复用：同一 pc 回同一对象）
+    pc_objects: HashMap<String, String>,
 }
 
 struct Mock {
@@ -98,6 +102,7 @@ impl Mock {
             // OSS path-style：/{bucket}/{object}（?uploads / ?partNumber&uploadId / ?uploadId）
             .route("/{bucket}/{*object}", put(oss_put))
             .route("/{bucket}/{*object}", post(oss_post))
+            .route("/{bucket}/{*object}", get(oss_list_parts))
             // 桩要收 5MiB 级 OSS 分片：抬高 axum 的默认 body 上限
             // （2MB——否则大分片直接 413）。layer 在路由之后 → 覆盖全部。
             .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
@@ -127,6 +132,15 @@ impl Mock {
 
     fn st(&self) -> std::sync::MutexGuard<'_, UState> {
         self.state.lock().unwrap()
+    }
+
+    /// 分片级中断注入：第 N 片之后的 PUT 失败（可重试类）。
+    fn set_fail_part_after(&self, n: u32) {
+        self.state.lock().unwrap().fail_part_after = Some(n);
+    }
+
+    fn clear_part_failure(&self) {
+        self.state.lock().unwrap().fail_part_after = None;
     }
 }
 
@@ -240,6 +254,7 @@ async fn upload_init(State(state): State<Arc<Mutex<UState>>>, body: String) -> R
             completed: false,
         },
     );
+    st.pc_objects.insert(pick_code.clone(), key.clone());
     ok_json(json!({
         "pick_code": pick_code,
         "status": 1,
@@ -272,19 +287,14 @@ thread_local! {
 
 async fn upload_resume(State(state): State<Arc<Mutex<UState>>>, body: String) -> Response {
     let form = parse_form(&body);
-    let name = form.get("file_name").cloned().unwrap_or_default();
-    let mut st = state.lock().unwrap();
-    let key = st
-        .objs
-        .keys()
-        .find(|k| k.ends_with(&format!("-{name}")))
-        .cloned()
-        .unwrap_or_else(|| {
-            st.fid_seq += 1;
-            format!("{}-{name}", st.fid_seq)
-        });
+    let pc = form.get("pick_code").cloned().unwrap_or_default();
+    let st = state.lock().unwrap();
+    // 会话复用语义：同一 pick_code → 同一对象（含已传分片与 uploadId）
+    let Some(key) = st.pc_objects.get(&pc).cloned() else {
+        return err_json(430004, "pick_code 无效");
+    };
     ok_json(json!({
-        "pick_code": format!("pc-{}", st.fid_seq),
+        "pick_code": pc,
         "bucket": "mockbucket",
         "object": key,
         "callback": {"callback": "{\"a\":1}", "callback_var": "{}"}
@@ -370,11 +380,22 @@ async fn oss_put(
             .and_then(|s| s.split('&').next())
             .and_then(|s| s.parse().ok())
             .unwrap_or(0);
-        let obj = st.objs.get_mut(&object).expect("checked above");
+        // 分片级中断注入（可重试类：500 + OSS 错误码）；计数只记
+        // **成功落地**的片（差集断言的语义载体）。
+        if let Some(limit) = st.fail_part_after {
+            if st.part_put_count >= limit {
+                return (
+                    StatusCode::INTERNAL_SERVER_ERROR,
+                    "<Error><Code>InternalError</Code></Error>",
+                )
+                    .into_response();
+            }
+        }
+        st.part_put_count += 1;
+        let obj = st.objs.get_mut(&object).expect("checked");
         obj.parts.insert(n, body.to_vec());
         let etag = format!("\"etag-{n}-{}\"", body.len());
         obj.etags.insert(n, etag.clone());
-        st.part_put_count += 1;
         return Response::builder()
             .status(StatusCode::OK)
             .header("etag", etag)
@@ -397,6 +418,38 @@ async fn oss_put(
         .status(StatusCode::OK)
         .header("etag", etag)
         .body(axum::body::Body::empty())
+        .unwrap()
+}
+
+/// OSS GET：ListParts（resume 对账面）。
+async fn oss_list_parts(
+    State(state): State<Arc<Mutex<UState>>>,
+    axum::extract::Path((_bucket, object)): axum::extract::Path<(String, String)>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> Response {
+    let _q = query.unwrap_or_default();
+    let st = state.lock().unwrap();
+    let Some(obj) = st.objs.get(&object) else {
+        return (
+            StatusCode::NOT_FOUND,
+            "<Error><Code>NoSuchUpload</Code></Error>",
+        )
+            .into_response();
+    };
+    let mut xml = String::from("<ListPartsResult><IsTruncated>false</IsTruncated>");
+    let mut nums: Vec<&u32> = obj.parts.keys().collect();
+    nums.sort();
+    for n in nums {
+        let size = obj.parts[n].len();
+        let etag = obj.etags.get(n).cloned().unwrap_or_default();
+        xml.push_str(&format!(
+            "<Part><PartNumber>{n}</PartNumber><ETag>{etag}</ETag><Size>{size}</Size></Part>"
+        ));
+    }
+    xml.push_str("</ListPartsResult>");
+    Response::builder()
+        .status(StatusCode::OK)
+        .body(axum::body::Body::from(xml))
         .unwrap()
 }
 
@@ -668,54 +721,58 @@ async fn multipart_upload_splits_and_completes_with_callback() {
 
 #[tokio::test]
 async fn resume_diff_only_uploads_missing_parts() {
+    // 到齐即传形态：承诺量到齐的那一次 write 就把分片推给 OSS；Drop
+    // 保留会话（uploadId + 已传片）——第二轮同路径同内容经
+    // `/open/upload/resume` 复用会话，只补缺片。
+    //
+    // 中断模拟：让对象面在「第 1 片之后」失败（可重试类原样上抛），
+    // 此时第 1 片已在远端且已落会话。
     let mock = Mock::start(0, false).await;
     arm_base(&mock.base);
     let dir = tmpdir();
     let drv = mock.driver(dir.clone());
 
     let payload: Vec<u8> = (0..12 * 1024 * 1024u32).map(|i| (i % 253) as u8).collect();
+    let hint = WriteHint {
+        size: Some(payload.len() as u64),
+        ..WriteHint::default()
+    };
 
-    // 第一轮：写满 payload 但不 close → Drop（会话保留：uploadId + 分片）
+    mock.set_fail_part_after(1); // 第 1 片之后的 PUT 失败
     {
         let mut stager = drv
-            .writer(
-                &path("/resume.bin"),
-                &WriteHint {
-                    size: Some(payload.len() as u64),
-                    ..WriteHint::default()
-                },
-            )
+            .writer(&path("/resume.bin"), &hint)
             .await
             .expect("writer 1");
-        stager.write(&payload).await.expect("write");
-        drop(stager); // 会话资产保留（Resume 能力）；spool 清掉
+        let res = stager.write(&payload).await; // 到齐即传 → 链在此触发
+        match res {
+            Err(cloudkit_storage::StorageError::Unavailable(_))
+            | Err(cloudkit_storage::StorageError::RateLimited { .. }) => {}
+            other => panic!("the injected OSS failure must surface, got {other:?}"),
+        }
+        drop(stager); // 会话（含第 1 片）保留；spool 清理
     }
     let after_first = mock.st().part_put_count;
     assert_eq!(
-        after_first, 0,
-        "no parts fly on a bare drop (close owns the transfer)"
+        after_first, 1,
+        "the interrupted pass delivered exactly one part"
     );
 
-    // 第二轮：同路径同内容 → 走完整 close（首次真传）
+    // 第二轮：同路径同内容 → resume 复用会话 → 只补 2 片（不重传第 1 片）
+    mock.clear_part_failure();
     {
         let mut stager = drv
-            .writer(
-                &path("/resume.bin"),
-                &WriteHint {
-                    size: Some(payload.len() as u64),
-                    ..WriteHint::default()
-                },
-            )
+            .writer(&path("/resume.bin"), &hint)
             .await
             .expect("writer 2");
-        stager.write(&payload).await.expect("write");
-        let e = stager.close().await.expect("close");
+        stager.write(&payload).await.expect("write 2");
+        let e = stager.close().await.expect("close after resume");
         assert_eq!(e.size, payload.len() as u64);
     }
+    let second_pass = mock.st().part_put_count - after_first;
     assert_eq!(
-        mock.st().part_put_count,
-        3,
-        "first real transfer uploads all three parts"
+        second_pass, 2,
+        "the resumed pass uploads only the two missing parts (part 1 is reused)"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

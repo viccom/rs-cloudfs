@@ -615,13 +615,30 @@ async fn stat_resolves_paths_through_nested_dirs_and_root() {
     let d = drv.stat(&path("/a/b")).await.expect("stat dir");
     assert_eq!(d.kind, cloudkit_storage::EntryKind::Dir);
 
-    // 深层解析（list 下行喂缓存后，二次 stat 零网络——api_calls 不增）
+    // **stat 是新鲜度查询**：末级组件绕过缓存现列父目录（conformance
+    // ⑤ 要求后端错误能被 stat 观察到；缓存命中会把注入的后端错误吞
+    // 掉）。中间层仍走缓存——重复 stat 只花「末级一次 list」的网络。
     let before = mock.vfs.lock().unwrap().api_calls;
-    let _ = drv.stat(&path("/a/b/deep.txt")).await.expect("cached stat");
+    let _ = drv.stat(&path("/a/b/deep.txt")).await.expect("fresh stat");
     let after = mock.vfs.lock().unwrap().api_calls;
     assert_eq!(
-        before, after,
-        "repeated stat on a warm cache costs zero API calls"
+        after - before,
+        1,
+        "a repeated stat costs exactly one backend call (the fresh last level)"
+    );
+
+    // list 的**路径解析**走缓存（目录链稳定）；它的 1 次网络是目录内容
+    // 本身（必付）。所以 list 净增恰 1，而非路径长度的次数。
+    let before_list = mock.vfs.lock().unwrap().api_calls;
+    let _ = drv
+        .list(&path("/a/b"), cloudkit_storage::Page::all())
+        .await
+        .expect("cached list");
+    let after_list = mock.vfs.lock().unwrap().api_calls;
+    assert_eq!(
+        after_list - before_list,
+        1,
+        "list costs exactly its own content fetch (the path resolution is cached)"
     );
 
     // 不存在

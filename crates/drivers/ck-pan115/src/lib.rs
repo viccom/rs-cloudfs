@@ -375,7 +375,12 @@ impl StorageDriver for Pan115Driver {
                 mtime: 0.0,
             });
         }
-        let resolved = self.resolve(path, false).await?;
+        // stat = 新鲜度查询：末级现列（绕过缓存——后端错误必须能被
+        // stat 观察到，conformance ⑤ 的硬要求）。
+        let resolved = self
+            .paths
+            .resolve_with(&self.client, self.root_cid(), path, false, true)
+            .await?;
         let row = resolved.row.as_ref().ok_or(StorageError::NotFound)?;
         let parent = path.parent().unwrap_or_else(RelPath::root);
         self.entry_from_row(&parent, row)

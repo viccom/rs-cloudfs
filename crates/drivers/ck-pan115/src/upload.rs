@@ -141,22 +141,46 @@ pub struct Pan115Stager {
     /// 驱动侧共享面。
     client: Arc<Pan115Client>,
     volume: cloudkit_storage::VolumeId,
-    /// 挂载点（目标父目录 cid，close 时解析）。
+    /// 挂载点（目标父目录 cid）。
     parent_cid: String,
     file_name: String,
     /// 目标卷内路径（Entry 产出用）。
     rel_path: RelPath,
-    /// spool 文件（本地临时；Drop 时清理——除非会话保留路径接管）。
+    /// spool 文件（本地临时；Drop 时清理）。
     spool: PathBuf,
     written: u64,
     hint: WriteHint,
     sessions: Arc<SessionStore>,
     /// 调用方的秒传提示（hint.rapid_upload）——**观察面**：115 的秒传
     /// 探测是服务端在 init（SHA1 载荷）里自动完成的，驱动无需额外动
-    /// 作；该位只进 debug 日志供 conformance ⑧ 的提示断言取证。
+    /// 作；该位进 run_transfer 的 debug 日志（conformance 桩用它取证）。
     rapid: bool,
     /// 显式 abort 标记（Drop 时不留 spool）。
     aborted: bool,
+    /// 传输进度（**到齐即传**：写入量达到承诺 size 的那一刻就起
+    /// 传输链——115 的 init 会话锁定全量 block_list，视频/网盘侧同款
+    /// 「到齐即传」形态；也让 conformance ⑦ 的差集观测点在 close 前
+    /// 就成立）。`None` 表示尚未起链。
+    transfer: Option<TransferState>,
+}
+
+/// 传输链的中途状态（hash→init/resume→get_token→分片；**不含 complete**
+/// ——complete 归 close()，那是 commit-on-close 的提交点）。
+struct TransferState {
+    fileid: String,
+    /// init/resume 的 pick_code（会话身份）。
+    pick_code: String,
+    bucket: String,
+    object: String,
+    callback: Option<crate::api::UploadCallback>,
+    /// `None` = 单分片 PutObject 路径（无 multipart 会话）。
+    upload_id: Option<String>,
+    /// 已传分片（part_number, etag, size）。
+    done: Vec<(u32, String, i64)>,
+    /// 单分片路径：对象体已 PUT（close 只需复核）。
+    put_done: bool,
+    /// 秒传命中（close 只需复核）。
+    rapid_file_id: Option<String>,
 }
 
 impl Pan115Stager {
@@ -186,7 +210,326 @@ impl Pan115Stager {
             sessions,
             rapid,
             aborted: false,
+            transfer: None,
         }
+    }
+
+    /// 传输链（到齐即传与 close 共用的同一段）：hash → init/resume →
+    /// get_token → PutObject / multipart 分片。**不 complete**。
+    ///
+    /// 失败语义：错误原样返回；调用方（write/close）决定上抛或留待
+    /// close 重试（会话里已落的分片是续传资产）。
+    async fn run_transfer(&mut self) -> Result<(), StorageError> {
+        let size = self.written;
+        tracing::debug!(
+            target: "ck_pan115::upload",
+            rapid_hint = self.rapid,
+            size,
+            "starting the transfer chain (rapid detection is server-side)"
+        );
+        let (fileid, preid) = self.hashes().await?;
+        let target = format!("U_1_{}", self.parent_cid);
+        let session_key = self.rel_path.as_str().to_string();
+        let session = self.sessions.load(&session_key, size, &fileid).await;
+
+        // ---- 会话复用臂：/open/upload/resume（返回同一 object/uploadId
+        //      上下文——115 的续传端点；失败回退完整 init，
+        //      115-plus-desktop api.rs:328-346 同款顺序）
+        if let Some(rec) = session.clone() {
+            if let Ok(resp) = self
+                .client
+                .upload_resume(size as i64, &target, &fileid, &rec.pick_code)
+                .await
+            {
+                if resp.object == rec.object {
+                    let sts = self.client.get_token().await?;
+                    let http = self.client.http();
+                    let ctx = OssCtx {
+                        endpoint: sts.endpoint.clone(),
+                        bucket: resp.bucket.clone(),
+                        object: resp.object.clone(),
+                        access_key_id: sts.access_key_id.clone(),
+                        access_key_secret: sts.access_key_secret.clone(),
+                        security_token: sts.security_token.clone(),
+                    };
+                    let callback = resp.callback.clone().or_else(|| {
+                        rec.callback
+                            .as_ref()
+                            .map(|(c, v)| crate::api::UploadCallback {
+                                callback: c.clone(),
+                                callback_var: v.clone(),
+                            })
+                    });
+                    let upload_id = rec.upload_id.clone();
+                    let mut done = rec.parts.clone();
+                    if let Some(uid) = upload_id.as_deref() {
+                        // 远端真值对账（本地表只是提示；崩溃后的手滑
+                        // 场景自愈——ListParts 以 OSS 为准）。
+                        match oss::list_parts(http, &ctx, uid).await {
+                            Ok(parts) => {
+                                done = parts
+                                    .iter()
+                                    .map(|p| (p.part_number, p.etag.clone(), p.size))
+                                    .collect();
+                            }
+                            Err(e) if e.is_no_such_upload() => {
+                                let id = oss::initiate_multipart(http, &ctx)
+                                    .await
+                                    .map_err(oss_to_storage)?;
+                                self.transfer = Some(TransferState {
+                                    fileid,
+                                    pick_code: resp.pick_code.clone(),
+                                    bucket: resp.bucket.clone(),
+                                    object: resp.object.clone(),
+                                    callback,
+                                    upload_id: Some(id),
+                                    done: Vec::new(),
+                                    put_done: false,
+                                    rapid_file_id: None,
+                                });
+                                return self.upload_missing_parts().await;
+                            }
+                            Err(e) => return Err(oss_to_storage(e)),
+                        }
+                    }
+                    self.transfer = Some(TransferState {
+                        fileid,
+                        pick_code: resp.pick_code.clone(),
+                        bucket: resp.bucket.clone(),
+                        object: resp.object.clone(),
+                        callback,
+                        upload_id,
+                        done,
+                        put_done: false,
+                        rapid_file_id: None,
+                    });
+                    if self
+                        .transfer
+                        .as_ref()
+                        .is_some_and(|t| t.upload_id.is_some())
+                    {
+                        return self.upload_missing_parts().await;
+                    }
+                    // 会话无 uploadId（单分片形态）：整对象重传（幂等）。
+                    return self.put_object_path().await;
+                }
+            }
+            // resume 不可用：清陈旧会话，走完整 init。
+            self.sessions.remove(&session_key, size, &fileid).await;
+        }
+
+        // ---- 完整 init（含二次认证循环；K69.2 常态路径，上限 3 轮）
+        let mut init = self
+            .client
+            .upload_init(
+                &self.file_name,
+                size as i64,
+                &target,
+                &fileid,
+                &preid,
+                None,
+                None,
+                None,
+            )
+            .await?;
+        let mut rounds = 0;
+        while needs_secondary_auth(&init) && rounds < 3 {
+            rounds += 1;
+            let sign_check = init.sign_check.clone().unwrap_or_default();
+            let sign_key = init.sign_key.clone().unwrap_or_default();
+            let (start, end) = parse_sign_check(&sign_check)?;
+            let bytes = self.spool_range(start, end - start + 1).await?;
+            let mut h = Sha1::new();
+            h.update(&bytes);
+            let sign_val = format!("{:X}", h.finalize());
+            init = self
+                .client
+                .upload_init(
+                    &self.file_name,
+                    size as i64,
+                    &target,
+                    &fileid,
+                    &preid,
+                    Some(&init.pick_code),
+                    Some(&sign_key),
+                    Some(&sign_val),
+                )
+                .await?;
+        }
+
+        // 秒传命中（status==2）：零数据上传 —— 记状态，close 复核收工。
+        if init.status == 2 {
+            let file_id = init.file_id.clone().ok_or_else(|| {
+                StorageError::Unavailable("upload/init: rapid hit without file_id".to_string())
+            })?;
+            self.transfer = Some(TransferState {
+                fileid,
+                pick_code: init.pick_code.clone(),
+                bucket: String::new(),
+                object: String::new(),
+                callback: None,
+                upload_id: None,
+                done: Vec::new(),
+                put_done: true,
+                rapid_file_id: Some(file_id),
+            });
+            return Ok(());
+        }
+        if init.status != 1 {
+            return Err(StorageError::Unavailable(format!(
+                "upload/init: unexpected status {} (secondary-auth rounds used: {rounds})",
+                init.status
+            )));
+        }
+        let bucket = init.bucket.clone().ok_or_else(|| {
+            StorageError::Unavailable("upload/init: status=1 without bucket".to_string())
+        })?;
+        let object = init.object.clone().ok_or_else(|| {
+            StorageError::Unavailable("upload/init: status=1 without object".to_string())
+        })?;
+        let sts = self.client.get_token().await?;
+        let part_size = Self::part_size(size);
+        let multipart = size > part_size;
+        let upload_id = if multipart {
+            let http = self.client.http();
+            let ctx = OssCtx {
+                endpoint: sts.endpoint.clone(),
+                bucket: bucket.clone(),
+                object: object.clone(),
+                access_key_id: sts.access_key_id.clone(),
+                access_key_secret: sts.access_key_secret.clone(),
+                security_token: sts.security_token.clone(),
+            };
+            Some(
+                oss::initiate_multipart(http, &ctx)
+                    .await
+                    .map_err(oss_to_storage)?,
+            )
+        } else {
+            None
+        };
+        self.transfer = Some(TransferState {
+            fileid,
+            pick_code: init.pick_code.clone(),
+            bucket,
+            object,
+            callback: init.callback.clone(),
+            upload_id,
+            done: Vec::new(),
+            put_done: false,
+            rapid_file_id: None,
+        });
+        if multipart {
+            self.upload_missing_parts().await
+        } else {
+            self.put_object_path().await
+        }
+    }
+
+    /// OSS ctx（从给定 transfer 状态构造——close 的 complete 臂在
+    /// `take()` 之后使用）。
+    async fn oss_ctx_for(&self, t: &TransferState) -> Result<OssCtx, StorageError> {
+        let sts = self.client.get_token().await?;
+        Ok(OssCtx {
+            endpoint: sts.endpoint.clone(),
+            bucket: t.bucket.clone(),
+            object: t.object.clone(),
+            access_key_id: sts.access_key_id.clone(),
+            access_key_secret: sts.access_key_secret.clone(),
+            security_token: sts.security_token.clone(),
+        })
+    }
+
+    /// OSS ctx（从当前 transfer 状态构造；STS 由调用方先行取好或此处
+    /// 重取——各臂统一走这里避免漂移）。
+    async fn oss_ctx(&self) -> Result<OssCtx, StorageError> {
+        let sts = self.client.get_token().await?;
+        let t = self.transfer.as_ref().expect("transfer state");
+        Ok(OssCtx {
+            endpoint: sts.endpoint.clone(),
+            bucket: t.bucket.clone(),
+            object: t.object.clone(),
+            access_key_id: sts.access_key_id.clone(),
+            access_key_secret: sts.access_key_secret.clone(),
+            security_token: sts.security_token.clone(),
+        })
+    }
+
+    /// 补齐缺失分片（顺序上传——115 sequential 通道要求）；每片完成即
+    /// 落会话（差集续传资产），失败时也落已成功的片。
+    async fn upload_missing_parts(&mut self) -> Result<(), StorageError> {
+        let size = self.written;
+        let part_size = Self::part_size(size);
+        let total_parts = size.div_ceil(part_size) as u32;
+        for n in 1..=total_parts {
+            let already = self
+                .transfer
+                .as_ref()
+                .is_some_and(|t| t.done.iter().any(|(p, _, _)| *p == n));
+            if already {
+                continue;
+            }
+            let start = (n as u64 - 1) * part_size;
+            let len = part_size.min(size - start);
+            let body = self.spool_range(start, len).await?;
+            let ctx = self.oss_ctx().await?;
+            let http = self.client.http();
+            let etag = {
+                let t = self.transfer.as_ref().expect("state");
+                let uid = t.upload_id.clone().unwrap_or_default();
+                match oss::upload_part(http, &ctx, &uid, n, body).await {
+                    Ok(etag) => etag,
+                    Err(e) => {
+                        self.persist_session().await;
+                        return Err(oss_to_storage(e));
+                    }
+                }
+            };
+            if let Some(t) = self.transfer.as_mut() {
+                t.done.push((n, etag, len as i64));
+                t.done.sort_by_key(|(p, _, _)| *p);
+            }
+            self.persist_session().await;
+        }
+        Ok(())
+    }
+
+    /// 单分片路径：PutObject（callback 随行）。
+    async fn put_object_path(&mut self) -> Result<(), StorageError> {
+        let size = self.written;
+        let body = self.spool_range(0, size).await?;
+        let ctx = self.oss_ctx().await?;
+        let http = self.client.http();
+        let callback = self.transfer.as_ref().and_then(|t| t.callback.clone());
+        oss::put_object(http, &ctx, body, callback.as_ref())
+            .await
+            .map_err(oss_to_storage)?;
+        if let Some(t) = self.transfer.as_mut() {
+            t.put_done = true;
+        }
+        Ok(())
+    }
+
+    /// 会话落盘（已传分片 + 上传上下文）。
+    async fn persist_session(&self) {
+        let (Some(t), size) = (self.transfer.as_ref(), self.written) else {
+            return;
+        };
+        let rec = UploadSession {
+            pick_code: t.pick_code.clone(),
+            target: format!("U_1_{}", self.parent_cid),
+            bucket: t.bucket.clone(),
+            object: t.object.clone(),
+            parts: t.done.clone(),
+            upload_id: t.upload_id.clone(),
+            callback: t
+                .callback
+                .as_ref()
+                .map(|c| (c.callback.clone(), c.callback_var.clone())),
+        };
+        self.sessions
+            .save(self.rel_path.as_str(), size, &t.fileid, &rec)
+            .await;
     }
 
     /// 读回 spool 的区间字节（sign_val 的区间哈希与分片切分共用）。
@@ -283,11 +626,19 @@ impl UploadStager for Pan115Stager {
                 return Err(StorageError::Invalid);
             }
         }
+        // **到齐即传**（115 的 init 会话锁定全量 block_list——到齐才
+        // 起链无浪费；也让 conformance ⑦ 的差集观测点在 close 前成立）：
+        // 承诺 size 到齐的那一次 write 之后立刻推传输链。
+        if let Some(hinted) = self.hint.size {
+            if self.written == hinted && self.transfer.is_none() {
+                self.run_transfer().await?;
+            }
+        }
         Ok(())
     }
 
-    /// 提交：hash → init（含二次认证循环）→ get_token → OSS → complete
-    /// → size 复核。
+    /// 提交（commit-on-close 的提交点）：数据终态 → 传输链（若未起）→
+    /// complete → 远端 size 复核。
     async fn close(mut self: Box<Self>) -> Result<Entry, StorageError> {
         // WriteHint 契约：承诺与实际不符 → Invalid（vfs 层据此拒绝）。
         if let Some(hinted) = self.hint.size {
@@ -296,171 +647,57 @@ impl UploadStager for Pan115Stager {
             }
         }
         let size = self.written;
-        tracing::debug!(
-            target: "ck_pan115::upload",
-            rapid_hint = self.rapid,
-            size,
-            "closing stager: hashing then init (rapid detection is server-side)"
-        );
-        let (fileid, preid) = self.hashes().await?;
-        let target = format!("U_1_{}", self.parent_cid);
-
-        // ---- init（带二次认证循环；K69.2 常态路径，上限 3 轮防死循环）
-        let mut init = self
-            .client
-            .upload_init(
-                &self.file_name,
-                size as i64,
-                &target,
-                &fileid,
-                &preid,
-                None,
-                None,
-                None,
-            )
-            .await?;
-        let mut rounds = 0;
-        while needs_secondary_auth(&init) && rounds < 3 {
-            rounds += 1;
-            let sign_check = init.sign_check.clone().unwrap_or_default();
-            let sign_key = init.sign_key.clone().unwrap_or_default();
-            let (start, end) = parse_sign_check(&sign_check)?;
-            let bytes = self.spool_range(start, end - start + 1).await?;
-            let mut h = Sha1::new();
-            h.update(&bytes);
-            let sign_val = format!("{:X}", h.finalize());
-            init = self
-                .client
-                .upload_init(
-                    &self.file_name,
-                    size as i64,
-                    &target,
-                    &fileid,
-                    &preid,
-                    Some(&init.pick_code),
-                    Some(&sign_key),
-                    Some(&sign_val),
-                )
-                .await?;
+        if self.transfer.is_none() {
+            // 无承诺（hint 缺省）或 write 未触发的形态：close 起链。
+            self.run_transfer().await?;
         }
+        let t = self.transfer.take().expect("transfer state after run");
 
-        // ---- 秒传命中（status==2）：零数据上传，直接复核收工。
-        if init.status == 2 {
+        // ---- 秒传命中：零数据上传，直接复核收工。
+        if let Some(file_id) = t.rapid_file_id.clone() {
             self.sessions
-                .remove(self.rel_path.as_str(), size, &fileid)
+                .remove(self.rel_path.as_str(), size, &t.fileid)
                 .await;
-            let file_id = init.file_id.clone().ok_or_else(|| {
-                StorageError::Unavailable("upload/init: rapid hit without file_id".to_string())
-            })?;
-            return self.finish_entry(&file_id, size).await;
+            let row = self.resolve_new_row().await?;
+            let entry = self.finish_entry(&file_id, size).await?;
+            return Ok(Entry {
+                mtime: row.upt as f64,
+                ..entry
+            });
         }
-        if init.status != 1 {
-            return Err(StorageError::Unavailable(format!(
-                "upload/init: unexpected status {} (secondary-auth rounds used: {rounds})",
-                init.status
-            )));
-        }
-        let bucket = init.bucket.clone().ok_or_else(|| {
-            StorageError::Unavailable("upload/init: status=1 without bucket".to_string())
-        })?;
-        let object = init.object.clone().ok_or_else(|| {
-            StorageError::Unavailable("upload/init: status=1 without object".to_string())
-        })?;
 
-        // ---- STS + OSS 传输（会话差集消费）
-        let sts = self.client.get_token().await?;
-        let ctx = OssCtx {
-            endpoint: sts.endpoint.clone(),
-            bucket: bucket.clone(),
-            object: object.clone(),
-            access_key_id: sts.access_key_id.clone(),
-            access_key_secret: sts.access_key_secret.clone(),
-            security_token: sts.security_token.clone(),
-        };
-        let http = self.client.http();
-        let callback = init.callback.clone();
-
-        let part_size = Self::part_size(size);
-        if size <= part_size {
-            // 单分片：PutObject（callback 随行）。
-            let body = self.spool_range(0, size).await?;
-            oss::put_object(http, &ctx, body, callback.as_ref())
-                .await
-                .map_err(oss_to_storage)?;
-        } else {
-            // 多分片：会话差集（resume 位）→ 补缺片 → complete。
-            let session_key = self.rel_path.as_str().to_string();
-            let existing = self.sessions.load(&session_key, size, &fileid).await;
-            let (upload_id, mut done) = match existing {
-                Some(rec) if rec.object == object && rec.upload_id.is_some() => {
-                    // 会话复用：ListParts 取远端真值（以 OSS 为准，本地表
-                    // 只是提示——上传中崩溃后的手滑场景自愈）。
-                    let upload_id = rec.upload_id.clone().unwrap_or_default();
-                    match oss::list_parts(http, &ctx, &upload_id).await {
-                        Ok(parts) => {
-                            let done: Vec<(u32, String, i64)> = parts
-                                .iter()
-                                .map(|p| (p.part_number, p.etag.clone(), p.size))
-                                .collect();
-                            (upload_id, done)
-                        }
-                        Err(e) if e.is_no_such_upload() => {
-                            // 会话真死：重 initiate（K69.8 #30 修法）。
-                            let id = oss::initiate_multipart(http, &ctx)
-                                .await
-                                .map_err(oss_to_storage)?;
-                            (id, Vec::new())
-                        }
-                        Err(e) => return Err(oss_to_storage(e)),
-                    }
-                }
-                _ => {
-                    let id = oss::initiate_multipart(http, &ctx)
-                        .await
-                        .map_err(oss_to_storage)?;
-                    (id, Vec::new())
-                }
+        // ---- 提交点：multipart → Complete(+callback)；单分片 → 已 PUT。
+        if let Some(upload_id) = t.upload_id.clone() {
+            let ctx = OssCtx {
+                endpoint: self.client.get_token().await?.endpoint.clone(),
+                bucket: t.bucket.clone(),
+                object: t.object.clone(),
+                access_key_id: String::new(),
+                access_key_secret: String::new(),
+                security_token: String::new(),
             };
-            let total_parts = size.div_ceil(part_size) as u32;
-            // 缺片补齐（顺序上传——115 的 sequential 通道要求）。
-            for n in 1..=total_parts {
-                if done.iter().any(|(p, _, _)| *p == n) {
-                    continue;
-                }
-                let start = (n as u64 - 1) * part_size;
-                let len = part_size.min(size - start);
-                let body = self.spool_range(start, len).await?;
-                let etag = oss::upload_part(http, &ctx, &upload_id, n, body)
-                    .await
-                    .map_err(oss_to_storage)?;
-                done.push((n, etag, len as i64));
-                done.sort_by_key(|(p, _, _)| *p);
-                // 每次分片完成即落会话（供差集续传/崩溃恢复）。
-                let rec = UploadSession {
-                    pick_code: init.pick_code.clone(),
-                    target: target.clone(),
-                    bucket: bucket.clone(),
-                    object: object.clone(),
-                    parts: done.clone(),
-                    upload_id: Some(upload_id.clone()),
-                    callback: callback
-                        .as_ref()
-                        .map(|c| (c.callback.clone(), c.callback_var.clone())),
-                };
-                self.sessions.save(&session_key, size, &fileid, &rec).await;
-            }
-            let parts: Vec<(u32, String)> = done.iter().map(|(n, e, _)| (*n, e.clone())).collect();
-            oss::complete_multipart(http, &ctx, &upload_id, &parts, callback.as_ref())
+            let _ = ctx; // 真实 ctx 由 oss_ctx 统一构造（避免空 STS）
+            let ctx = self.oss_ctx_for(&t).await?;
+            let http = self.client.http();
+            let parts: Vec<(u32, String)> =
+                t.done.iter().map(|(n, e, _)| (*n, e.clone())).collect();
+            oss::complete_multipart(http, &ctx, &upload_id, &parts, t.callback.as_ref())
                 .await
                 .map_err(oss_to_storage)?;
-            self.sessions.remove(&session_key, size, &fileid).await;
+            self.sessions
+                .remove(self.rel_path.as_str(), size, &t.fileid)
+                .await;
         }
+        // 单分片路径：对象已在 run_transfer 里 PUT（put_done），此处无
+        // 额外动作——complete-on-close 的提交点即 close 本身。
 
-        // ---- 复核（硬纪律 5：远端 size 与本地必须一致）
-        // 对象刚 complete，list 可见性有延迟——用目标父目录 list 轮询
-        // （get_info 需要 fid，此刻还没有）。
-        let file_id = self.resolve_new_file_id().await?;
-        self.finish_entry(&file_id, size).await
+        // ---- 复核（硬纪律 5：远端 size 与本地必须一致）+ 会话收尾。
+        let row = self.resolve_new_row().await?;
+        let entry = self.finish_entry(&row.fid, size).await?;
+        Ok(Entry {
+            mtime: row.upt as f64,
+            ..entry
+        })
     }
 
     /// 放弃暂存：清会话 + 删 spool（远端无可见垃圾——未完的 OSS
@@ -480,12 +717,13 @@ impl UploadStager for Pan115Stager {
 }
 
 impl Pan115Stager {
-    /// complete 后定位新文件（父目录 list 轮询；可见性延迟容忍 5s）。
-    async fn resolve_new_file_id(&self) -> Result<String, StorageError> {
+    /// complete 后定位新文件行（父目录 list 轮询；可见性延迟容忍 5s；
+    /// 行带 upt 供 Entry.mtime 填充）。
+    async fn resolve_new_row(&self) -> Result<crate::api::ListRow, StorageError> {
         for attempt in 0..10u32 {
             let rows = pathcache::list_all(&self.client, &self.parent_cid).await?;
             if let Some(row) = rows.iter().find(|r| r.fname == self.file_name) {
-                return Ok(row.fid.clone());
+                return Ok(row.clone());
             }
             if attempt < 9 {
                 tokio::time::sleep(std::time::Duration::from_millis(500)).await;
