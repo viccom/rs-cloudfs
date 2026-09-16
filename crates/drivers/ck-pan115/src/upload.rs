@@ -905,6 +905,29 @@ pub(crate) fn default_spool_dir(params: &crate::Pan115Params) -> PathBuf {
     }
 }
 
+/// 驱动侧写入口（[`Pan115Driver::writer`] 的实现体——lib.rs 保持薄）。
+pub(crate) async fn writer(
+    driver: &Pan115Driver,
+    path: &RelPath,
+    hint: &WriteHint,
+) -> Result<Box<dyn UploadStager>, StorageError> {
+    if path.is_root() {
+        return Err(StorageError::Invalid);
+    }
+    let spool_dir = default_spool_dir(driver.params_ref());
+    open_writer(
+        driver.client_arc(),
+        driver.volume_ref(),
+        driver.root_cid(),
+        driver.paths(),
+        path,
+        hint,
+        driver.sessions_arc(),
+        &spool_dir,
+    )
+    .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::{normalize_endpoint, parse_sign_check};
@@ -963,27 +986,4 @@ mod tests {
         assert!(parse_sign_check("abc").is_err(), "not a range");
         assert!(parse_sign_check("5-").is_err(), "half-open rejected");
     }
-}
-
-/// 驱动侧写入口（[`Pan115Driver::writer`] 的实现体——lib.rs 保持薄）。
-pub(crate) async fn writer(
-    driver: &Pan115Driver,
-    path: &RelPath,
-    hint: &WriteHint,
-) -> Result<Box<dyn UploadStager>, StorageError> {
-    if path.is_root() {
-        return Err(StorageError::Invalid);
-    }
-    let spool_dir = default_spool_dir(driver.params_ref());
-    open_writer(
-        driver.client_arc(),
-        driver.volume_ref(),
-        driver.root_cid(),
-        driver.paths(),
-        path,
-        hint,
-        driver.sessions_arc(),
-        &spool_dir,
-    )
-    .await
 }
