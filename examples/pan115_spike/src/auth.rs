@@ -34,22 +34,28 @@ const REFRESH_TOKEN: &str = "https://passportapi.115.com/open/refreshToken";
 /// BOOLEAN `state` and put the error code in `code`, so `state` is kept as a
 /// raw Value and `code` is surfaced alongside `errno`.
 #[derive(Debug, Deserialize)]
-struct Envelope {
-    state: serde_json::Value,
+pub struct Envelope {
+    pub state: serde_json::Value,
     #[serde(default)]
-    code: i64,
+    pub code: i64,
     #[serde(default)]
-    errno: i64,
+    pub errno: i64,
     #[serde(default)]
-    message: String,
+    pub message: String,
     #[serde(default)]
-    data: serde_json::Value,
+    pub data: serde_json::Value,
+    /// Top-level sibling of `data` on `ufile/files` (total row count) —
+    /// absent elsewhere, hence defaulted.
+    #[serde(default)]
+    pub count: i64,
 }
 
 impl Envelope {
-    /// Success = numeric `state==1 && errno==0` (errors use `state:false`).
-    fn is_ok(&self) -> bool {
-        self.state.as_i64() == Some(1) && self.errno == 0
+    /// Success = `state` numeric 1 OR boolean true, with errno 0 (live-probed
+    /// 2026-09-16: proapi user/info SUCCESS returns `{"state":true,...}`,
+    /// errors `state:false`; passportapi uses numeric 1/0).
+    pub fn is_ok(&self) -> bool {
+        (self.state.as_i64() == Some(1) || self.state.as_bool() == Some(true)) && self.errno == 0
     }
 
     fn ok(self, stage: &str, http: reqwest::StatusCode) -> Result<serde_json::Value> {
@@ -72,7 +78,10 @@ impl Envelope {
 
 /// Read a response into the envelope; unparseable bodies fail with the HTTP
 /// status only (body text is never echoed — it may embed secrets).
-async fn envelope(resp: reqwest::Response, stage: &str) -> Result<(reqwest::StatusCode, Envelope)> {
+pub async fn envelope(
+    resp: reqwest::Response,
+    stage: &str,
+) -> Result<(reqwest::StatusCode, Envelope)> {
     let http = resp.status();
     let body = resp
         .text()

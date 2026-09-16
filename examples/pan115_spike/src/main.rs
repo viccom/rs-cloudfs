@@ -8,6 +8,16 @@
 //! pan115-spike auth-poll [--max-wait-secs N]  # long-poll scan status -> tokens
 //! pan115-spike probe-user                     # user/info with cached token
 //! pan115-spike probe-refresh                  # ONE refreshToken + verify
+//! pan115-spike probe-mkdir <pid> <name>       # folder/add -> file_id
+//! pan115-spike probe-ls [--cid X] [--limit N] # ufile/files table
+//! pan115-spike probe-ensure-dir               # idempotent /_e2e_pan115/
+//! pan115-spike probe-upload <file> [--target-cid X]   # full upload chain
+//! pan115-spike probe-rapid <file>             # init-only second-pass check
+//! pan115-spike probe-garbage-hash <file>      # fake-hash server-validation probe
+//! pan115-spike probe-downurl <fid> [--ua browser|spike|empty]  # UA-binding matrix
+//! pan115-spike probe-resume <file>            # two-phase breakpoint probe
+//! pan115-spike probe-rm <fid> <parent_cid>    # delete (recycle bin)
+//! pan115-spike probe-qps [--rps N] [--secs S] [--cid X]        # rate storm
 //! ```
 //!
 //! Env: PAN115_SPIKE_TEST_DIR (default E:\GitHub\rs-CyDrive\test — gitignored,
@@ -18,8 +28,12 @@
 //! Exit codes (auth-poll): 0 = tokens obtained, 3 = QR expired/cancelled,
 //! 4 = max-wait reached with no scan, 1 = other error, 2 = usage.
 
+mod api;
 mod auth;
+mod oss;
+mod probes;
 mod state;
+mod upload;
 
 use std::time::Duration;
 
@@ -30,7 +44,11 @@ const DEFAULT_CLIENT_ID: &str = "100197303";
 
 fn usage() -> ! {
     eprintln!(
-        "usage: pan115-spike <auth-qr | auth-poll [--max-wait-secs N] | probe-user | probe-refresh>"
+        "usage: pan115-spike <auth-qr | auth-poll [--max-wait-secs N] | probe-user | probe-refresh |\n\
+         \x20        probe-mkdir <pid> <name> | probe-ls [--cid X] [--limit N] | probe-ensure-dir |\n\
+         \x20        probe-upload <file> [--target-cid X] | probe-rapid <file> | probe-garbage-hash <file> |\n\
+         \x20        probe-downurl <fid> [--ua browser|spike|empty] | probe-resume <file> |\n\
+         \x20        probe-rm <fid> <parent_cid> | probe-qps [--rps N] [--secs S] [--cid X]>"
     );
     std::process::exit(2);
 }
@@ -59,32 +77,23 @@ async fn main() {
     let Some(cmd) = args.get(1).map(String::as_str) else {
         usage()
     };
-
-    // `auth-poll [--max-wait-secs N]` — hand-rolled, no clap (baidu_spike style).
-    let mut max_wait_secs: u64 = 480;
-    if cmd == "auth-poll" {
-        let mut i = 2;
-        while i < args.len() {
-            if args[i] == "--max-wait-secs" {
-                i += 1;
-                max_wait_secs = args
-                    .get(i)
-                    .and_then(|v| v.parse().ok())
-                    .unwrap_or_else(|| usage());
-            } else {
-                usage();
-            }
-            i += 1;
-        }
-    } else if args.len() > 2 {
-        usage();
-    }
+    let rest = &args[2..];
 
     let result = match cmd {
         "auth-qr" => cmd_auth_qr().await,
-        "auth-poll" => cmd_auth_poll(max_wait_secs).await,
+        "auth-poll" => cmd_auth_poll(parse_max_wait(rest)).await,
         "probe-user" => cmd_probe_user().await,
         "probe-refresh" => cmd_probe_refresh().await,
+        "probe-mkdir" => probes::cmd_mkdir(rest).await,
+        "probe-ls" => probes::cmd_ls(rest).await,
+        "probe-ensure-dir" => probes::cmd_ensure_dir(rest).await,
+        "probe-upload" => probes::cmd_upload(rest).await,
+        "probe-rapid" => probes::cmd_rapid(rest).await,
+        "probe-garbage-hash" => probes::cmd_garbage_hash(rest).await,
+        "probe-downurl" => probes::cmd_downurl(rest).await,
+        "probe-resume" => probes::cmd_resume(rest).await,
+        "probe-rm" => probes::cmd_rm(rest).await,
+        "probe-qps" => probes::cmd_qps(rest).await,
         _ => usage(),
     };
     let code = match result {
@@ -95,6 +104,26 @@ async fn main() {
         }
     };
     std::process::exit(code);
+}
+
+/// `auth-poll` keeps its historical `--max-wait-secs N` parsing (hand-rolled,
+/// no clap — baidu_spike style).
+fn parse_max_wait(rest: &[String]) -> u64 {
+    let mut max_wait_secs: u64 = 480;
+    let mut i = 0;
+    while i < rest.len() {
+        if rest[i] == "--max-wait-secs" {
+            i += 1;
+            max_wait_secs = rest
+                .get(i)
+                .and_then(|v| v.parse().ok())
+                .unwrap_or_else(|| usage());
+        } else {
+            usage();
+        }
+        i += 1;
+    }
+    max_wait_secs
 }
 
 /// auth-qr: new verifier -> authDeviceCode -> state file + QR PNG.
