@@ -800,6 +800,13 @@ async fn doctor_cmd() -> Result<()> {
                 &cloudkit_cli::sftp_backend_probe(&cfg).await,
             ));
         }
+        // Phase 5 / 115-1 placeholder: the pan115 live token probe (the
+        // user/info liveness leg + the QR-scan setup guidance) is a 115-4
+        // item; the offline checks run now (SF1's sftp arm was the same
+        // shape until SF3 grew the dial-out leg).
+        cloudkit_core::config::Backend::Pan115 => {
+            results.extend(cloudkit_cli::doctor::backend_checks(&cfg));
+        }
     }
     print!("{}", cloudkit_cli::doctor::render_report(&results));
     Ok(())

@@ -621,6 +621,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ck-pan115"
+version = "0.10.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "base64 0.22.1",
+ "cloudkit-storage",
+ "hmac 0.12.1",
+ "httpdate",
+ "rand 0.10.2",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "sha1 0.10.7",
+ "sha2 0.10.9",
+ "tokio",
+ "tracing",
+]
+
+[[package]]
 name = "ck-sftp"
 version = "0.10.0"
 dependencies = [
@@ -716,6 +736,7 @@ dependencies = [
  "chrono",
  "ck-baidu",
  "ck-local",
+ "ck-pan115",
  "ck-sftp",
  "ck-telegram",
  "clap",

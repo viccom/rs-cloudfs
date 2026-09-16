@@ -120,6 +120,15 @@ pub const SFTP_DRIVER_REQUIRED: &str = "this binary was built without the sftp d
      rebuild with `cargo build --features sftp`, or set `backend = \"telegram\"` / \
      `backend = \"baidu\"` / `backend = \"local\"` in config.toml";
 
+/// The actionable message every pan115 surface carries when the binary was
+/// built without the pan115 driver (K31 shape, Phase 5 / 115-1 — same form
+/// as the four driver constants above): name the rebuild command, then
+/// name the backend switch. Consumed by the 115-4 dispatch arms; pinned by
+/// the off-feature test when that wiring lands.
+pub const PAN115_DRIVER_REQUIRED: &str = "this binary was built without the pan115 driver; \
+     rebuild with `cargo build --features pan115`, or set `backend = \"telegram\"` / \
+     `backend = \"baidu\"` / `backend = \"local\"` / `backend = \"sftp\"` in config.toml";
+
 /// The driver list the binary was compiled with (K32,
 /// docs/plans/2026-09-09-driver-feature-gates.md) — the `(drivers: ...)`
 /// segment of the `--version` banner.
@@ -130,18 +139,19 @@ pub const SFTP_DRIVER_REQUIRED: &str = "this binary was built without the sftp d
 /// `none` — adding a driver is one appended row (the SF0-era 3-tuple
 /// match would grow 2^n arms instead). Each row is still selected by the
 /// feature set at compile time (`cfg!` expands to a literal), in the
-/// fixed order telegram, baidu, local, sftp; onboarding the next driver
-/// (driver-onboarding §1) appends its row here. Pinned by
+/// fixed order telegram, baidu, local, sftp, pan115; onboarding the next
+/// driver (driver-onboarding §1) appends its row here. Pinned by
 /// `tests::compiled_drivers_lists_the_feature_set_in_fixed_order`
 /// (cfg-gated arms — one assertion per build; the 3-driver combinations'
-/// output is byte-identical to the pre-SF1 refactor, and the sftp row
-/// simply appends to the fixed order).
+/// output is byte-identical to the pre-SF1 refactor, and the sftp/pan115
+/// rows simply append to the fixed order).
 pub fn compiled_drivers() -> String {
     const DRIVER_ROWS: &[(bool, &str)] = &[
         (cfg!(feature = "telegram"), "telegram"),
         (cfg!(feature = "baidu"), "baidu"),
         (cfg!(feature = "local"), "local"),
         (cfg!(feature = "sftp"), "sftp"),
+        (cfg!(feature = "pan115"), "pan115"),
     ];
     let enabled: Vec<&str> = DRIVER_ROWS
         .iter()
@@ -4699,6 +4709,14 @@ pub async fn run_sync_command(cfg: &CyDriveConfig, secret: Option<&str>) -> Resu
         // source of truth, not a mirror target. `is_sync_supported`
         // reports the same and doctor shares the warning.
         Backend::Sftp => anyhow::bail!("{SFTP_SYNC_UNSUPPORTED}"),
+        // Phase 5 / 115-1 placeholder: the pan115 volume is
+        // authoritative-index like baidu/local/sftp, but its sync
+        // participation ruling lands with the 115-4 assembly (the SF1
+        // sftp placeholder refused the same way until SF3).
+        Backend::Pan115 => anyhow::bail!(
+            "cydrive sync does not support the pan115 backend yet (Phase 5 / 115-4 \
+             wires the assembly)"
+        ),
     };
 
     let db = MetaDatabase::open(Path::new(&cfg.db_path))
@@ -5258,6 +5276,15 @@ pub async fn build_backend_transport_with(
                 anyhow::bail!("{SFTP_DRIVER_REQUIRED}")
             }
         }
+        // Phase 5 / 115-1 placeholder: the pan115 dispatch arm (the
+        // transport assembly) lands with the 115-4 wiring — 115-1 ships
+        // the driver crate (auth layer + config keys) only, so the only
+        // honest arm today is the refusal, feature or not (the SF1 sftp
+        // placeholder refused the same way until SF3).
+        Backend::Pan115 => anyhow::bail!(
+            "the pan115 backend is not wired into this build yet (Phase 5 / 115-1 ships \
+             the driver crate and config keys; 115-4 wires the dispatch)"
+        ),
     }
 }
 
@@ -5306,6 +5333,13 @@ pub async fn build_backend_transport_with(cfg: &CyDriveConfig) -> Result<Backend
                 anyhow::bail!("{SFTP_DRIVER_REQUIRED}")
             }
         }
+        // Phase 5 / 115-1 placeholder — the baidu-feature twin above
+        // carries the same refusal (the transport assembly lands with
+        // the 115-4 wiring, feature or not).
+        Backend::Pan115 => anyhow::bail!(
+            "the pan115 backend is not wired into this build yet (Phase 5 / 115-1 ships \
+             the driver crate and config keys; 115-4 wires the dispatch)"
+        ),
     }
 }
 
@@ -5594,6 +5628,17 @@ async fn build_driver(cfg: &CyDriveConfig) -> Result<Arc<dyn StorageDriver>> {
         }
         #[cfg(not(feature = "sftp"))]
         Backend::Sftp => anyhow::bail!("{SFTP_DRIVER_REQUIRED}"),
+        // Phase 5 / 115-1 placeholder: the pan115 factory assembly (the
+        // `pan115_params` mapping + ConfigTokenStore bridge) is a 115-4
+        // item; the driver itself compiles with placeholder methods until
+        // 115-2/3. Both arms refuse loudly until then.
+        #[cfg(feature = "pan115")]
+        Backend::Pan115 => anyhow::bail!(
+            "the pan115 rebuild walk is not wired yet (Phase 5 / 115-4 ships the \
+             assembly); use backend = \"baidu\" / \"local\" / \"sftp\" meanwhile"
+        ),
+        #[cfg(not(feature = "pan115"))]
+        Backend::Pan115 => anyhow::bail!("{PAN115_DRIVER_REQUIRED}"),
     }
 }
 
@@ -7030,21 +7075,31 @@ mod tests {
         // arm is a cfg-gated literal — no runtime feature probing — so
         // exactly one assertion is compiled per build and it pins the
         // expected list for that feature combination: fixed order
-        // telegram, baidu, local, sftp; the all-off build reports
-        // `none`.
+        // telegram, baidu, local, sftp, pan115; the all-off build
+        // reports `none`.
         //
         // SF3 structure: the sftp row (appended after local, never
         // interleaved) is factored out of the literal pins — the
         // 3-driver expectations below stay byte-identical, and the two
         // sftp assertions pin the suffix rule and the 4-driver list.
+        // 115-1 mirror: the pan115 row strips the same way before the
+        // sftp strip — every pre-existing assertion is untouched.
         let drivers = compiled_drivers();
+        let without_pan115: String = if cfg!(feature = "pan115") {
+            match drivers.strip_suffix(", pan115") {
+                Some(base) => base.to_string(),
+                None => "none".to_string(), // pan115 is the only driver enabled
+            }
+        } else {
+            drivers.clone()
+        };
         let base: String = if cfg!(feature = "sftp") {
-            match drivers.strip_suffix(", sftp") {
+            match without_pan115.strip_suffix(", sftp") {
                 Some(base) => base.to_string(),
                 None => "none".to_string(), // sftp is the only driver enabled
             }
         } else {
-            drivers.clone()
+            without_pan115.clone()
         };
 
         #[cfg(all(feature = "telegram", feature = "baidu", feature = "local"))]
@@ -7070,23 +7125,50 @@ mod tests {
         // reports just the row.
         #[cfg(feature = "sftp")]
         assert!(
-            drivers.ends_with("sftp"),
-            "sftp must be the last row: {drivers}"
+            without_pan115.ends_with("sftp"),
+            "sftp must precede pan115 when both are on: {drivers}"
         );
         #[cfg(all(
             feature = "telegram",
             feature = "baidu",
             feature = "local",
-            feature = "sftp"
+            feature = "sftp",
+            not(feature = "pan115")
         ))]
         assert_eq!(drivers, "telegram, baidu, local, sftp");
         #[cfg(all(
             not(feature = "telegram"),
             not(feature = "baidu"),
             not(feature = "local"),
-            feature = "sftp"
+            feature = "sftp",
+            not(feature = "pan115")
         ))]
         assert_eq!(drivers, "sftp");
+
+        // 115-1: the pan115 row is the same pure-append rule — last
+        // whenever on, the all-five build reads in the documented order,
+        // and the pan115-only build reports just the row.
+        #[cfg(feature = "pan115")]
+        assert!(
+            drivers.ends_with("pan115"),
+            "pan115 must be the last row: {drivers}"
+        );
+        #[cfg(all(
+            feature = "telegram",
+            feature = "baidu",
+            feature = "local",
+            feature = "sftp",
+            feature = "pan115"
+        ))]
+        assert_eq!(drivers, "telegram, baidu, local, sftp, pan115");
+        #[cfg(all(
+            not(feature = "telegram"),
+            not(feature = "baidu"),
+            not(feature = "local"),
+            not(feature = "sftp"),
+            feature = "pan115"
+        ))]
+        assert_eq!(drivers, "pan115");
     }
 
     /// H1 (review fix): `take` used to find the position under one lock

@@ -368,6 +368,7 @@ fn backend_enum_round_trips_wire_names() {
     assert_eq!(Backend::Baidu.as_str(), "baidu");
     assert_eq!(Backend::Local.as_str(), "local");
     assert_eq!(Backend::Sftp.as_str(), "sftp");
+    assert_eq!(Backend::Pan115.as_str(), "pan115");
 }
 
 // -------------------------------------------------- sftp keys (Phase 4 SF1) ---
@@ -629,6 +630,232 @@ fn volume_file_accepts_the_sftp_key_group() {
         .expect("a volume file carrying the sftp key group loads");
     assert_eq!(spec.settings.backend, Backend::Sftp);
     assert_eq!(spec.settings.sftp_host.as_deref(), Some("nas.lan"));
+    spec.settings
+        .validate()
+        .expect("the parsed volume settings validate");
+}
+
+// ------------------------------------------------- pan115 keys (Phase 5 115-1) ---
+//
+// Contract under test — three-place key sync (interfaces §4) for the
+// four `pan115_*` keys plus the `pan115` backend's cross-field rules
+// (K69: route A decided — the open platform with a token pair the
+// driver self-refreshes):
+//
+// - `backend = "pan115"` requires `pan115_access_token` AND
+//   `pan115_refresh_token` set and non-empty (each error names its
+//   CYDRIVE_PAN115_* env route; the initial pair comes from the setup
+//   QR scan or a hand-filled token pair — the message says so).
+// - `pan115_root`: optional; when present it must be all digits (a
+//   115 folder id — "0" is the drive root, the D3 default).
+// - `pan115_client_id`: optional non-secret (the app identity the QR
+//   scan binds to; the driver injects the K69 default 100197303 — no
+//   config rule fires on it).
+// - The telegram default triggers none of these rules — pre-Phase-5
+//   configs validate unchanged.
+
+/// A minimal valid pan115 config: backend set + the token pair (short
+/// dummy values — the scanner gate only matches 20+ char literals).
+fn pan115_config() -> CyDriveConfig {
+    CyDriveConfig {
+        backend: Backend::Pan115,
+        pan115_access_token: Some("mock-access-0".to_string()),
+        pan115_refresh_token: Some("mock-refresh-0".to_string()),
+        ..CyDriveConfig::default()
+    }
+}
+
+#[test]
+fn pan115_defaults_are_unset_and_telegram_stays_inert() {
+    // The compatibility contract: a config that predates Phase 5 keeps
+    // validating — every pan115 key defaults to None and the telegram
+    // backend fires no pan115 rule even when pan115 keys are dirty.
+    let cfg = CyDriveConfig::default();
+    assert_eq!(cfg.backend, Backend::Telegram, "default backend");
+    assert_eq!(cfg.pan115_client_id, None);
+    assert_eq!(cfg.pan115_access_token, None);
+    assert_eq!(cfg.pan115_refresh_token, None);
+    assert_eq!(cfg.pan115_root, None);
+    cfg.validate().expect("default config still validates");
+
+    let dirty = CyDriveConfig {
+        pan115_access_token: Some(String::new()),
+        pan115_root: Some("not-a-folder-id".to_string()),
+        ..CyDriveConfig::default()
+    };
+    dirty
+        .validate()
+        .expect("the telegram backend ignores every pan115 rule");
+}
+
+#[test]
+fn load_toml_reads_all_pan115_keys() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        concat!(
+            "backend = \"pan115\"\n",
+            "pan115_client_id = \"100197303\"\n",
+            "pan115_access_token = \"mock-access-0\"\n",
+            "pan115_refresh_token = \"mock-refresh-0\"\n",
+            "pan115_root = \"1234567890\"\n",
+        ),
+    )
+    .expect("write config.toml");
+
+    let cfg = CyDriveConfig::load_toml(&path).expect("config with pan115 keys loads");
+    assert_eq!(cfg.backend, Backend::Pan115);
+    assert_eq!(cfg.pan115_client_id.as_deref(), Some("100197303"));
+    assert_eq!(cfg.pan115_access_token.as_deref(), Some("mock-access-0"));
+    assert_eq!(cfg.pan115_refresh_token.as_deref(), Some("mock-refresh-0"));
+    assert_eq!(cfg.pan115_root.as_deref(), Some("1234567890"));
+    cfg.validate().expect("complete pan115 config validates");
+}
+
+#[test]
+fn toml_roundtrip_preserves_pan115_keys() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+
+    let mut cfg = pan115_config();
+    cfg.pan115_client_id = Some("100197303".to_string());
+    cfg.pan115_root = Some("0".to_string());
+    cfg.save_toml(&path).expect("save_toml");
+    let loaded = CyDriveConfig::load_toml(&path).expect("load_toml");
+    assert_eq!(loaded, cfg, "pan115 keys must survive the TOML round-trip");
+}
+
+#[test]
+fn pan115_backend_requires_the_token_pair() {
+    for (name, clear_access) in [
+        ("pan115_access_token", true),
+        ("pan115_refresh_token", false),
+    ] {
+        let mut cfg = pan115_config();
+        if clear_access {
+            cfg.pan115_access_token = Some(String::new());
+        } else {
+            cfg.pan115_refresh_token = None;
+        }
+        let err = cfg
+            .validate()
+            .expect_err("backend=pan115 without {name} must be invalid");
+        assert!(
+            matches!(err, ConfigError::Invalid(ref message) if message.contains(name)),
+            "expected Invalid naming {name}, got: {err:?}"
+        );
+    }
+
+    // Empty-means-unset also rejects the pair form (the baidu keys'
+    // semantics, mirrored).
+    let mut cfg = pan115_config();
+    cfg.pan115_refresh_token = Some(String::new());
+    assert!(
+        cfg.validate().is_err(),
+        "an empty refresh token must not count"
+    );
+}
+
+#[test]
+fn pan115_token_error_names_the_setup_route() {
+    // Actionable-text contract: with no pair at all the error offers the
+    // ways to obtain one (the setup QR scan / a hand-filled pair) and
+    // names the env routes.
+    let cfg = CyDriveConfig {
+        backend: Backend::Pan115,
+        ..CyDriveConfig::default()
+    };
+    let err = cfg
+        .validate()
+        .expect_err("backend=pan115 without tokens must be invalid");
+    match err {
+        ConfigError::Invalid(message) => {
+            assert!(
+                message.contains("pan115_access_token"),
+                "names the key: {message}"
+            );
+            assert!(
+                message.contains("CYDRIVE_PAN115_ACCESS_TOKEN"),
+                "names the env route: {message}"
+            );
+            assert!(
+                message.contains("setup"),
+                "offers the setup route: {message}"
+            );
+        }
+        other => panic!("expected Invalid, got {other:?}"),
+    }
+}
+
+#[test]
+fn pan115_root_must_be_numeric_when_present() {
+    for bad in ["abc", "12x45", "-1", "", "0x10"] {
+        let mut cfg = pan115_config();
+        cfg.pan115_root = Some(bad.to_string());
+        assert!(
+            cfg.validate().is_err(),
+            "pan115_root={bad:?} must be rejected for backend=pan115"
+        );
+    }
+
+    // The good forms: the drive root "0" (D3 default), a real folder id,
+    // and absent (the driver's own default "0").
+    for good in [None, Some("0"), Some("1234567890")] {
+        let mut cfg = pan115_config();
+        cfg.pan115_root = good.map(str::to_string);
+        cfg.validate()
+            .unwrap_or_else(|e| panic!("pan115_root={good:?} must be valid: {e}"));
+    }
+}
+
+#[test]
+fn legacy_json_rejects_all_pan115_keys() {
+    for key in [
+        "pan115_client_id",
+        "pan115_access_token",
+        "pan115_refresh_token",
+        "pan115_root",
+    ] {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("config.json");
+        fs::write(
+            &path,
+            format!(r#"{{ "bot_token": "111:AA", "chat_id": 5, "{key}": "x" }}"#),
+        )
+        .expect("write config.json");
+
+        let err = CyDriveConfig::load_legacy_json(&path)
+            .expect_err("legacy json must reject the {key} key");
+        assert!(
+            matches!(err, ConfigError::Parse { ref message, .. } if message.contains(key)),
+            "expected Parse error naming {key}, got: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn volume_file_accepts_the_pan115_key_group() {
+    // The four keys are volume-scoped (K19 partition — a volume file
+    // carries its own drive credentials); a minimal pan115 volume file
+    // loads through the strict volume surface.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("net115.toml");
+    fs::write(
+        &path,
+        concat!(
+            "backend = \"pan115\"\n",
+            "pan115_access_token = \"mock-access-0\"\n",
+            "pan115_refresh_token = \"mock-refresh-0\"\n",
+            "pan115_root = \"0\"\n",
+        ),
+    )
+    .expect("write volume file");
+
+    let spec = cloudkit_core::config::load_volume_config(&path)
+        .expect("a volume file carrying the pan115 key group loads");
+    assert_eq!(spec.settings.backend, Backend::Pan115);
+    assert_eq!(spec.settings.pan115_root.as_deref(), Some("0"));
     spec.settings
         .validate()
         .expect("the parsed volume settings validate");

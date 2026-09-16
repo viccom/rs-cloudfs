@@ -1,0 +1,59 @@
+[package]
+name = "ck-pan115"
+description = "115 open-platform StorageDriver - skeleton + auth layer + config integration (Phase 5 / 115-1; read path 115-2, write path 115-3)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# StorageDriver trait 为 #[async_trait]，实现侧必须使用同一宏
+# （ck-baidu / ck-local / ck-sftp 同款）。
+async-trait = "0.1"
+# L2 契约层是唯一 workspace 依赖——驱动 crate 禁依赖 cloudkit-core 与
+# 任何 L3+ crate（driver-onboarding §1 / R1，scripts/check_layers 拦截）。
+cloudkit-storage = { path = "../../cloudkit-storage" }
+# PKCE code_challenge 的 base64（STANDARD，带填充）与 OSS callback 头
+# （x-oss-callback/-var 的 base64 载荷）——spike auth.rs/oss.rs 同款。
+base64 = "0.22"
+# OSS V1 签名 HMAC-SHA1（spike oss.rs 已真机验证的组合，K69.5 自研
+# 签名层裁决；115-0 spike 源码整体 port）。
+hmac = "0.12"
+sha1 = "0.10"
+# OSS 签名的 HTTP Date 行（RFC 7231 IMF-fixdate）。
+httpdate = "1"
+# PKCE code_challenge = base64(SHA-256(verifier))。
+sha2 = "0.10"
+# PKCE code_verifier 的随机源（rand 0.10 线 = ck-sftp dev-dep 同款，
+# lock 既有版本；`rand::rng()` 在默认特性面内）。
+rand = "0.10"
+# 开放平台 API 面（特性集照 ck-baidu：rustls 禁 native-tls 先例对齐；
+# json=表单与响应解析）。
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+] }
+# 载荷模型（envelope/TokenPair/DeviceCode 等响应结构体）。
+serde = { version = "1", features = ["derive"] }
+# envelope 与业务面 JSON 载荷。
+serde_json = "1"
+# token 状态 RwLock + limiter 的异步等待（tokio::time 而非 std——
+# 可测性经毫秒级参数注入，RebuildTuning::fast 先例）。
+tokio = { version = "1", features = ["sync", "time"] }
+# 911/退避等分类学边界外的可行动文案经 warn 通道（ck-sftp error.rs
+# 同款双通道裁决——StorageError::Unauthorized 无载荷）。
+tracing = "0.1"
+
+[dev-dependencies]
+# mock 115 开放平台服务端（axum 钉 0.8.9，ck-baidu tests 同款特性集）。
+axum = { version = "=0.8.9", default-features = false, features = [
+    "http1",
+    "json",
+    "tokio",
+] }
+# mock 监听（net）+ #[tokio::test]（rt/macros）。
+tokio = { version = "1", features = ["rt", "macros", "net"] }
+# 集成测试构造 envelope JSON 样本（serde_json::from_str 直入 Envelope）。
+serde_json = "1"
