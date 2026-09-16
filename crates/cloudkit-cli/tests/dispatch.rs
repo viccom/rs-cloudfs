@@ -580,3 +580,144 @@ fn baidu_connectivity_verdicts() {
     ));
     assert_eq!(unreachable.status, cloudkit_cli::doctor::CheckStatus::Warn);
 }
+
+// ------------------------------------------------------------ pan115 -------
+
+/// A validate-clean pan115 config (placeholder token pair; the dispatch
+/// connects — tests point the endpoints at a loopback mock).
+fn pan115_config() -> CyDriveConfig {
+    CyDriveConfig {
+        backend: Backend::Pan115,
+        pan115_access_token: Some("stub-access".to_string()),
+        pan115_refresh_token: Some("stub-refresh".to_string()),
+        pan115_client_id: None,
+        pan115_root: Some("0".to_string()),
+        ..CyDriveConfig::default()
+    }
+}
+
+/// Loopback mock answering only `GET /open/user/info` (the connect leg);
+/// returns the `state:true` boolean envelope with a uid and space block.
+#[cfg(feature = "pan115")]
+async fn pan115_user_info_mock() -> String {
+    let app = Router::new().route(
+        "/open/user/info",
+        get(|| async {
+            axum::Json(serde_json::json!({
+                "state": true,
+                "errno": 0,
+                "data": {
+                    "user_id": 7742,
+                    "user_name": "mock",
+                    "rt_space_info": {
+                        "all_total": {"size": 1000},
+                        "all_use": {"size": 100},
+                        "all_remain": {"size": 900}
+                    }
+                }
+            }))
+        }),
+    );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+    format!("http://{addr}")
+}
+
+/// Without the driver: the K31 rebuild message — not an assembly attempt.
+#[cfg(not(feature = "pan115"))]
+#[tokio::test]
+async fn missing_pan115_driver_refuses_with_the_rebuild_message() {
+    let err = match build_backend_transport(&pan115_config()).await {
+        Ok(_) => panic!("a driver-less binary cannot assemble the pan115 arm"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains(cloudkit_cli::PAN115_DRIVER_REQUIRED),
+        "the off-feature refusal is the K31 rebuild message: {message}"
+    );
+}
+
+/// With the driver: the dispatch connects (uid → `pan115:<uid>` — the
+/// real identity, never the `pan115:pending` placeholder), and the
+/// capability face carries the driver bits plus `remote_delete`.
+#[cfg(feature = "pan115")]
+#[tokio::test]
+async fn pan115_key_builds_pan115_transport_with_the_account_identity() {
+    let cfg = pan115_config();
+    cfg.validate().expect("the test config validates");
+    let base = pan115_user_info_mock().await;
+    let dispatched =
+        cloudkit_cli::build_pan115_transport_with_endpoints(&cfg, &base, &base, None, None)
+            .await
+            .expect("the pan115 arm assembles against the mock");
+    assert!(matches!(dispatched, BackendTransport::Pan115(_)));
+    assert_eq!(
+        dispatched.volume(),
+        "pan115:7742",
+        "the volume identity is pan115:<uid> from user/info"
+    );
+    let caps = dispatched.caps();
+    assert!(caps.range_read && caps.multipart && caps.server_side_move);
+    assert!(caps.rapid_upload && caps.authoritative_index && caps.resume);
+    assert!(
+        caps.remote_delete,
+        "the transport face declares remote_delete"
+    );
+    // The sync namespace follows the baidu shape: the raw volume id.
+    assert_eq!(dispatched.sync_namespace_key(), "pan115:7742");
+}
+
+/// A dead token pair on the assembly leg surfaces as a classified error
+/// (401* envelope → Unauthorized), not a panic — the doctor leg renders
+/// it into the re-scan guidance.
+#[cfg(feature = "pan115")]
+#[tokio::test]
+async fn pan115_assembly_classifies_a_dead_token_pair() {
+    // The 401* legs: user/info rejects, and the refresh it triggers also
+    // rejects (a dead refresh_token — the NeedsReauth shape). Without the
+    // refresh route the driver's attempt 404s and the classification
+    // would mask as Unreachable.
+    let app = Router::new()
+        .route(
+            "/open/user/info",
+            get(|| async {
+                (
+                    axum::http::StatusCode::OK,
+                    axum::Json(serde_json::json!({
+                        "state": false,
+                        "code": 40140123,
+                        "errno": 0,
+                        "message": "access_token 格式错误"
+                    })),
+                )
+            }),
+        )
+        .route(
+            "/open/refreshToken",
+            axum::routing::post(|| async {
+                axum::Json(serde_json::json!({
+                    "state": 0,
+                    "code": 99,
+                    "errno": 99,
+                    "message": "refresh token invalid"
+                }))
+            }),
+        );
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+    let base = format!("http://{addr}");
+
+    let cfg = pan115_config();
+    let probe = cloudkit_cli::pan115_backend_probe_with_endpoints(&cfg, &base, &base).await;
+    assert!(
+        matches!(probe, ck_pan115::Pan115Probe::NeedsReauth),
+        "a dead token pair classifies as NeedsReauth, got {probe:?}"
+    );
+}

@@ -33,6 +33,7 @@ pub mod limiter;
 pub mod oauth;
 pub mod oss;
 pub mod pathcache;
+pub mod transport_face;
 pub mod upload;
 
 use std::sync::Arc;
@@ -45,6 +46,7 @@ use cloudkit_storage::{
 
 pub use api::{Pan115Client, UA};
 pub use oauth::TokenStore;
+pub use transport_face::Pan115Transport;
 
 /// 生产 API base（proapi——文件/上传面；spike auth.rs 同值）。
 pub const DEFAULT_API_BASE: &str = "https://proapi.115.com";
@@ -618,10 +620,81 @@ fn name_is_addressable(name: &str) -> bool {
     !name.is_empty() && !name.contains('\\') && !name.contains('\u{0}')
 }
 
-/// 装配工厂：构造驱动（**不连网**——首请求惰性建立；token 对齐备性
-/// 在构造期校验）。
+/// 装配工厂：构造驱动并**取真身份**（`user/info` 的 uid → VolumeId
+/// `pan115:<uid>`）。
+///
+/// 与 [`Pan115Driver::new`] 的分工：`new` 是离线构造面（占位 VolumeId
+/// `pan115:pending`——纯本地测试与 conformance 桩复用）；本入口是生产
+/// 装配面（baidu `factory` → `connect` 同形）。**占位身份绝不进生产**
+/// ——它会同时污染 VolumeId/web_volume/sync_namespace_key 三面。
 pub async fn factory(params: &Pan115Params) -> Result<Arc<Pan115Driver>, StorageError> {
-    Ok(Arc::new(Pan115Driver::new(params.clone())?))
+    Ok(Arc::new(Pan115Driver::connect(params.clone()).await?))
+}
+
+/// 探连接的结构化结果（doctor 腿；baidu `BackendProbe` / sftp
+/// `SftpProbe` 同款形态）。
+///
+/// 探活 = `user/info`（token 活力）+ `quota`（顺带取证空间数字）；失败
+/// 按驱动既有映射归一为下列变体（R3：载荷不含凭据值）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pan115Probe {
+    /// token 活力 + 空间查询全过。
+    Alive {
+        /// 账号 uid（VolumeId 的 key）。
+        uid: String,
+        /// 可用空间（字节）。
+        free: u64,
+        /// 总空间（`None` = 未知）。
+        total: Option<u64>,
+    },
+    /// 需要重新授权（401* 刷新失败族）：token 对失效——重扫或手填。
+    NeedsReauth,
+    /// 账号级访问上限（770004）：驱动已进入硬退避窗。
+    RateLimited {
+        /// 剩余封锁时长。
+        window: std::time::Duration,
+    },
+    /// 网络/协议层不可达（超时、DNS、TLS 等）。
+    Unreachable {
+        /// 不含凭据的诊断文案。
+        detail: String,
+    },
+}
+
+/// 探连接（doctor 腿的直连探针）：构造驱动 + `user/info` + `quota`，
+/// 把失败归一为 [`Pan115Probe`]。
+pub async fn probe(params: &Pan115Params) -> Pan115Probe {
+    let driver = match Pan115Driver::connect(params.clone()).await {
+        Ok(driver) => driver,
+        Err(error) => return classify_probe_error(error),
+    };
+    match driver.quota().await {
+        Ok(quota) => {
+            let uid = driver.volume().key().to_string();
+            Pan115Probe::Alive {
+                uid,
+                free: quota
+                    .total
+                    .map(|t| t.saturating_sub(quota.used))
+                    .unwrap_or(0),
+                total: quota.total,
+            }
+        }
+        Err(error) => classify_probe_error(error),
+    }
+}
+
+/// 探针错误分类（driven by StorageError 变体）。
+fn classify_probe_error(error: StorageError) -> Pan115Probe {
+    match error {
+        StorageError::Unauthorized { .. } => Pan115Probe::NeedsReauth,
+        StorageError::RateLimited { retry_after } => Pan115Probe::RateLimited {
+            window: retry_after.unwrap_or_default(),
+        },
+        other => Pan115Probe::Unreachable {
+            detail: format!("{other}"),
+        },
+    }
 }
 
 #[cfg(test)]

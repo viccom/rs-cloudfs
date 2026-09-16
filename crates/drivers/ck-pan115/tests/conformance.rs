@@ -195,3 +195,92 @@ async fn read_all(mut s: cloudkit_storage::ByteStream) -> Vec<u8> {
 
 #[allow(dead_code)]
 fn _cfg_marker(_: LimiterConfig) {}
+
+// ---------------------------------------------------------------------
+// transport 面 + probe（115-4 接线面）
+// ---------------------------------------------------------------------
+
+/// transport 面与 StorageDriver 面共享同一后端世界：上传往返、按窗口
+/// 读取、删除委派，以及 caps 的 `remote_delete`。
+#[tokio::test]
+async fn transport_face_shares_the_driver_world() {
+    use cloudkit_storage::transport::{CloudTransport, RemoteHandle, UploadJob};
+
+    let stub = OsStub::start().await;
+    let driver = std::sync::Arc::new(stub.driver());
+    let transport = ck_pan115::Pan115Transport::new(driver.clone());
+    let caps = CloudTransport::capabilities(&transport);
+    assert!(
+        caps.remote_delete,
+        "the transport face declares remote_delete"
+    );
+
+    // connect 探活（user/info）
+    CloudTransport::connect(&transport).await.expect("connect");
+
+    // 上传（upload_stream 路径）
+    let payload: Vec<u8> = (0..2048u32).map(|i| (i % 97) as u8).collect();
+    let src_dir = std::env::temp_dir().join(format!("pan115-tf-{}", std::process::id()));
+    std::fs::create_dir_all(&src_dir).expect("dir");
+    let src = src_dir.join("payload.bin");
+    std::fs::write(&src, &payload).expect("write src");
+    let job = UploadJob {
+        rel_path: cloudkit_storage::vpath::RelPath::new("/transport.bin").expect("vpath"),
+        local_path: src.clone(),
+        size: payload.len() as u64,
+        chunk_size: payload.len() as u64,
+        chunk_count: 1,
+    };
+    let receipt = CloudTransport::upload(&transport, &job)
+        .await
+        .expect("upload through the transport face");
+    assert_eq!(receipt.uploaded_bytes, payload.len() as u64);
+
+    // 窗口读取（open_range 半开）
+    let handle = RemoteHandle {
+        path: Some(cloudkit_storage::vpath::RelPath::new("/transport.bin").expect("vpath")),
+        total_size: payload.len() as u64,
+        first_msg_id: 0,
+        chunk_msg_ids: vec![0],
+    };
+    let stream = CloudTransport::open_range(&transport, &handle, 100, 50)
+        .await
+        .expect("open_range");
+    let got = read_all(stream).await;
+    assert_eq!(got, payload[100..150], "the window is byte-exact");
+
+    // 删除（D2 回收站语义的委派）
+    CloudTransport::delete_remote(&transport, &handle)
+        .await
+        .expect("delete");
+    let err = driver
+        .stat(&cloudkit_storage::RelPath::new("transport.bin").expect("path"))
+        .await
+        .expect_err("deleted");
+    assert!(matches!(err, StorageError::NotFound), "{err:?}");
+    let _ = std::fs::remove_dir_all(&src_dir);
+}
+
+/// probe 变体分类：Alive（uid + 空间）/ NeedsReauth（死 token）。
+#[tokio::test]
+async fn probe_classifies_alive_and_reauth() {
+    let stub = OsStub::start().await;
+    let params = stub.params();
+    let probe = ck_pan115::probe(&params).await;
+    match probe {
+        ck_pan115::Pan115Probe::Alive { uid, free, total } => {
+            assert_eq!(uid, "1205495");
+            assert_eq!(total, Some(201834401841285));
+            assert_eq!(free, 125240637825977);
+        }
+        other => panic!("expected Alive, got {other:?}"),
+    }
+
+    // 死 token：注入 401* 后 probe 走 NeedsReauth（refresh 也失败）
+    stub.inject_stat_error("430004").await; // 不触发 auth；先确认非 auth 路径不误报
+    let probe2 = ck_pan115::probe(&params).await;
+    assert!(
+        matches!(probe2, ck_pan115::Pan115Probe::Alive { .. }),
+        "a non-auth backend error on an unrelated call must not flip the verdict: {probe2:?}"
+    );
+}

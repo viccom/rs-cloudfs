@@ -122,6 +122,21 @@ impl OsStub {
         OsStub { state, base }
     }
 
+    /// 构造驱动参数（probe 面单测用；与 [`OsStub::driver`] 同源）。
+    pub fn params(&self) -> Pan115Params {
+        Pan115Params {
+            client_id: "100197303".to_string(),
+            access_token: Some("stub-access".to_string()),
+            refresh_token: Some("stub-refresh".to_string()),
+            root: "0".to_string(),
+            api_base: self.base.clone(),
+            passport_base: self.base.clone(),
+            token_store: None,
+            limiter: Some(LimiterConfig::fast()),
+            sessions_dir: None,
+        }
+    }
+
     /// 构造被测驱动（api/passport/cdn 全指桩；OSS 端点由 get_token 给）。
     pub fn driver(&self) -> Pan115Driver {
         Pan115Driver::new(Pan115Params {
