@@ -768,6 +768,38 @@ async fn mkdir_after_delete_reuses_the_freed_name() {
     );
 }
 
+/// M-S4：rename 的目标存在预检不得只看缓存——目标父目录本进程未列过
+/// 时必须现列预检（mkdir 同款纪律）。跨目录 rename 到冷目录曾直接
+/// 穿透到 move/update，trait 契约的 Exists 语义丢失（同父场景由源
+/// resolve 顺带喂缓存而侥幸成立）。
+#[tokio::test]
+async fn rename_into_a_cold_directory_prechecks_the_target() {
+    let mut vfs = Vfs::new();
+    let d1 = vfs.mkdir("0", "srcdir");
+    let d2 = vfs.mkdir("0", "dst");
+    vfs.put_file(&d1, "a.txt", b"aaa".to_vec());
+    vfs.put_file(&d2, "b.txt", b"bbb".to_vec());
+    let mock = Mock::start(vfs).await;
+    let drv = mock.driver();
+
+    // dst 目录从未被本驱动列过（resolve 源路径只喂了 root 与 srcdir）
+    let err = drv
+        .rename(&path("/srcdir/a.txt"), &path("/dst/b.txt"))
+        .await
+        .expect_err("an occupied target must be refused with Exists");
+    assert!(
+        matches!(err, cloudkit_storage::StorageError::Exists),
+        "{err:?}"
+    );
+
+    // 穿透会造成数据面破坏——源文件必须原位未动
+    let still = drv
+        .stat(&path("/srcdir/a.txt"))
+        .await
+        .expect("source untouched");
+    assert_eq!(still.size, 3);
+}
+
 #[tokio::test]
 async fn rename_file_same_parent_updates_in_place() {
     let mut vfs = Vfs::new();

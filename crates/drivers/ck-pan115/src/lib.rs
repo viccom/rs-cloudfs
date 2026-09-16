@@ -474,8 +474,18 @@ impl StorageDriver for Pan115Driver {
             .to_string();
         let dst_parent = to.parent().unwrap_or_else(RelPath::root);
         let dst = self.resolve(&dst_parent, true).await?;
-        // 目标已存在 → Exists（占位检查先于任何变更）。
-        if self.paths.get_child(&dst.cid, &to_name).await.is_some() {
+        // 目标已存在 → Exists（占位检查先于任何变更）。缓存未列过目标
+        // 目录时**现列预检**（mkdir 同款纪律，M-S4——cache-only 会让冷
+        // 目录的跨父 rename 穿透到 move/update，契约的 Exists 丢失）。
+        let occupied = match self.paths.get_child(&dst.cid, &to_name).await {
+            Some(_) => true,
+            None => {
+                let rows = pathcache::list_all(&self.client, &dst.cid).await?;
+                self.paths.put_dir(&dst.cid, &rows).await;
+                self.paths.get_child(&dst.cid, &to_name).await.is_some()
+            }
+        };
+        if occupied {
             return Err(StorageError::Exists);
         }
         let same_parent = src.parent_cid == dst.cid;
