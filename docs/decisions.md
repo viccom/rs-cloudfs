@@ -751,3 +751,11 @@ Phase 5 五批次全落地（worktree `feat/pan115-driver`，`0b53c14`→`32060b
 - **K70.6 真机数字（115-5 最小冒烟）**：上传 200KiB → 回读逐字节 + close 内 size 复核；Range `[100000,150000)` 逐字节；秒传第二轮**同 fid**（status==2 实证）。作业纪律全守（只 /_e2e_pan115/、清理后核空、1rps 限速、未碰分享/离线/视频族）。
 - **K70.7 未覆盖（如实挂账）**：完整矩阵的断点续传杀进程恢复、rebuild 收敛耗时、加密卷 aead_v2 往返、E2E 三面（WebDAV/web/winfsp）、>5MiB 多分片真机上传（本次三项走 PutObject 与秒传路径）、目录 rename 真机形态（驱动按 move+update 实现未验）；setup 扫码向导未做（oauth.rs 三端点已备，无 GUI 向导——挂账待裁）。真机测试入口 = `crates/drivers/ck-pan115/tests/live_matrix.rs`（`#[ignore]`，凭据只经 env）。
 - **K70.8 回滚**：整批在 worktree 分支 `feat/pan115-driver`（单批 merge，merge 前 `git worktree remove` 即弃；merge 后 `git revert -m 1 <merge>`）；spike `examples/pan115_spike` workspace-excluded 不入 CI。账号侧残留：`/_e2e_pan115/` 空目录保留 + 回收站若干测试文件（D2 语义可恢复）。
+
+## 2026-09-16 K71：pan115 E2E 补批——加密全栈 + WebDAV 双模式真机全过（负责人指令批）
+
+- **K71.1 加密全栈**（`pan115_vfs_aead_v2_full_stack_roundtrip`，K54 tg 先例 + pan115 特化）：1.5MiB 明文跨两个 1MiB VFS 块 → 行元数据（uploaded/encrypted/aead_v2/明文 size）→ hydrate 逐字节 → open_read 跨块窗口解密 → **远端密文核验**（驱动绕过 VFS 直读远端：1572930B vs 明文 1572864B——+66B = v2 容器 per-chunk 开销；明文首 64B 特征段在远端全文不出现）。
+- **K71.2 WebDAV E2E 双模式**（`pan115_webdav_roundtrip_plain_and_encrypted`）：`run_with_transport` 注入真 Pan115Transport、webdav `:0` 临时端口、auto-mount/web-ui 关——明文与加密（aead_v2+随机口令）各一轮 MKCOL→PUT(256KiB)→GET 逐字节→PROPFIND 207 含目标名；加密轮 GET 面 = 解密后明文逐字节。收尾 driver 删远端（D2 回收站）+ NotFound 核验。
+- **K71.3 执行期注意点（后续 E2E 复用）**：①RFC 4918——PUT 到父集合不存在的路径 409，先 MKCOL；②`cfg.validate()` 生产口径拒 `webdav_port=0`，而 run 流程支持 :0 临时端口——测试 boot 不调 validate（run_e2e 先例同）；③Windows 上写完主动 `shutdown()` 会把连接整断，靠 `Connection: close` 服务端收尾。
+- **K71.4 flaky 观察项（未定位，如实记录）**：cargo clean 后首轮全量中 `ck-pan115::upload_path::size_mismatch_after_complete_is_refused` 失败一次（首建高争用窗口）；单跑 5/5、全量复跑 2/2 绿。疑点在 `resolve_new_row` 的 5s 轮询窗，未证实——不动代码，留观察。
+- **K71.5 回滚**：本批仅新增 `crates/cloudkit-cli/tests/pan115_e2e.rs`（#[ignore] 真机测试，不入 CI）+ 三处文档；`git revert <commit>` 即整批回退。
