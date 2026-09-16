@@ -905,6 +905,66 @@ pub(crate) fn default_spool_dir(params: &crate::Pan115Params) -> PathBuf {
     }
 }
 
+#[cfg(test)]
+mod tests {
+    use super::{normalize_endpoint, parse_sign_check};
+
+    /// M-T4：生产端点剥 scheme + 尾斜杠（115-5 真机缺陷③的修复函数
+    /// ——此前只有 loopback 缝间接覆盖，生产分支无正面钉）。
+    #[test]
+    fn normalize_endpoint_strips_schemes_for_production_hosts() {
+        assert_eq!(
+            normalize_endpoint("https://oss-cn-shenzhen.aliyuncs.com"),
+            "oss-cn-shenzhen.aliyuncs.com"
+        );
+        assert_eq!(
+            normalize_endpoint("https://oss-cn-shenzhen.aliyuncs.com/"),
+            "oss-cn-shenzhen.aliyuncs.com"
+        );
+        assert_eq!(
+            normalize_endpoint("http://oss-example.aliyuncs.com/"),
+            "oss-example.aliyuncs.com"
+        );
+        // 已裸形态原样通过（大小写不敏感的 scheme 前缀不剥——115 下发
+        // 恒小写，宽松处理无必要）。
+        assert_eq!(
+            normalize_endpoint("oss-x.aliyuncs.com"),
+            "oss-x.aliyuncs.com"
+        );
+    }
+
+    /// M-T4：loopback 测试缝——http scheme 原样保留（path-style 消费）。
+    #[test]
+    fn normalize_endpoint_keeps_the_loopback_test_seam() {
+        assert_eq!(
+            normalize_endpoint("http://127.0.0.1:39147"),
+            "http://127.0.0.1:39147"
+        );
+        assert_eq!(
+            normalize_endpoint("http://127.0.0.1:39147/"),
+            "http://127.0.0.1:39147"
+        );
+        assert_eq!(
+            normalize_endpoint("http://localhost:9000"),
+            "http://localhost:9000"
+        );
+    }
+
+    /// M-T1 关联：sign_check 区间解析（闭区间形态；spike upload.rs:54
+    /// 语义 = [start, end] 含两端）。
+    #[test]
+    fn parse_sign_check_accepts_closed_ranges_only() {
+        assert_eq!(parse_sign_check("0-127").expect("ok"), (0, 127));
+        assert_eq!(
+            parse_sign_check("1585000-1733288").expect("ok"),
+            (1585000, 1733288)
+        );
+        assert!(parse_sign_check("128-0").is_err(), "inverted");
+        assert!(parse_sign_check("abc").is_err(), "not a range");
+        assert!(parse_sign_check("5-").is_err(), "half-open rejected");
+    }
+}
+
 /// 驱动侧写入口（[`Pan115Driver::writer`] 的实现体——lib.rs 保持薄）。
 pub(crate) async fn writer(
     driver: &Pan115Driver,

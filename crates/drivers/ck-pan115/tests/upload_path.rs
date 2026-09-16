@@ -76,6 +76,10 @@ struct UState {
     pc_objects: HashMap<String, String>,
     /// get_token 调用计数（M-S2 断言面：STS 每传输链只取一次）
     get_token_calls: u32,
+    /// 最近一次下发的 sign_check 挑战区间（M-T1 对账面）
+    sign_check_issued: String,
+    /// 收到的 sign_val 应答（M-T1 对账面——数值正确性事后核验）
+    sign_vals: Vec<String>,
 }
 
 struct Mock {
@@ -219,12 +223,17 @@ async fn upload_init(State(state): State<Arc<Mutex<UState>>>, body: String) -> R
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         let end = (size / 2).max(1) - 1;
+        st.sign_check_issued = format!("0-{end}");
         return ok_json(json!({
             "pick_code": pick_code,
             "status": 8,
             "sign_key": "mock-sign-key",
             "sign_check": format!("0-{end}"),
         }));
+    }
+    // 挑战应答轮：记录 sign_val（M-T1——桩不校验数值，测试事后对账）
+    if let Some(sv) = form.get("sign_val") {
+        st.sign_vals.push(sv.clone());
     }
 
     // 秒传命中：status=2 + file_id
@@ -653,6 +662,45 @@ async fn secondary_auth_loop_replays_with_sign_val() {
         calls[1].3.as_deref(),
         Some("mock-sign-key"),
         "replay carries the challenge key"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M-T1：sign_val 的数值正确性——区间 [start, end] **闭区间** SHA1（大写
+/// hex；spike upload.rs:54 同语义）。桩只记录不校验（真机才是裁判），
+/// 此处用预计算常量对账（载荷与桩的挑战区间都是确定的：end = size/2-1
+/// = 4095，即 payload[0..=4095]）。
+#[tokio::test]
+async fn secondary_auth_sign_val_matches_the_interval_sha1() {
+    let mock = Mock::start(1, false).await;
+    arm_base(&mock.base);
+    let dir = tmpdir();
+    let drv = mock.driver(dir.clone());
+
+    let payload: Vec<u8> = (0..8192u32).map(|i| (i % 249) as u8).collect();
+    let mut stager = drv
+        .writer(
+            &path("/signval.bin"),
+            &WriteHint {
+                size: Some(payload.len() as u64),
+                ..WriteHint::default()
+            },
+        )
+        .await
+        .expect("writer");
+    stager.write(&payload).await.expect("write");
+    stager.close().await.expect("close");
+
+    let (issued, vals) = {
+        let st = mock.st();
+        (st.sign_check_issued.clone(), st.sign_vals.clone())
+    };
+    assert_eq!(vals.len(), 1, "exactly one challenge answer");
+    // 桩的挑战区间形态自检（"0-4095" = 前半段闭区间）
+    assert_eq!(issued, "0-4095", "the stub issued the expected range");
+    assert_eq!(
+        vals[0], "65DD36214E5D4837A8F1DD6868A1F14EFD8FC20C",
+        "sign_val = uppercase SHA1 over the inclusive [0,4095] slice of the payload"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

@@ -55,6 +55,9 @@ pub struct StubState {
     pub object_bytes: u64,
     /// 一次性 stat 错误注入（断言⑤）
     pub stat_inject: Option<String>,
+    /// **持续** user/info 错误注入（probe 分类面——H-T2：NeedsReauth/
+    /// RateLimited/Unreachable 三变体的触发器；不 take，恒失败）
+    pub user_info_inject: Option<String>,
     /// 第 N 片之后的 PUT 失败注入（分片级 resume 用例）
     pub fail_part_after: Option<u32>,
     pub part_puts: u32,
@@ -101,6 +104,7 @@ impl OsStub {
         }
         let app = Router::new()
             .route("/open/user/info", get(user_info))
+            .route("/open/refreshToken", post(refresh_token))
             .route("/open/ufile/files", get(ufile_files))
             .route("/open/folder/get_info", get(folder_get_info))
             .route("/open/folder/add", post(folder_add))
@@ -159,6 +163,11 @@ impl OsStub {
 
     pub fn part_put_count(&self) -> u32 {
         self.state.lock().unwrap().part_puts
+    }
+
+    /// probe 分类注入：user/info 恒返回该错误码（H-T2——持续，非一次性）。
+    pub async fn inject_user_info_error(&self, code: &str) {
+        self.state.lock().unwrap().user_info_inject = Some(code.to_string());
     }
 
     /// 断言⑤注入：下一次 stat（= ufile/files 的目录解析面）返回该码。
@@ -279,7 +288,11 @@ fn urldecode(s: &str) -> String {
     out
 }
 
-async fn user_info() -> Response {
+async fn user_info(State(state): State<Arc<Mutex<StubState>>>) -> Response {
+    if let Some(code) = state.lock().unwrap().user_info_inject.clone() {
+        let code: i64 = code.parse().unwrap_or(0);
+        return err_json_code(code, "injected");
+    }
     ok_json(json!({
         "user_id": 1205495,
         "user_name": "stub",
@@ -289,6 +302,13 @@ async fn user_info() -> Response {
             "all_remain": {"size": 125240637825977i64}
         }
     }))
+}
+
+/// `/open/refreshToken`：恒失败（errno 99 = token 过期族——「死
+/// refresh_token」形态；probe 的 NeedsReauth 腿消费。成功刷新路径由
+/// oauth_state_machine.rs 的专用 mock 覆盖，不经本桩）。
+async fn refresh_token() -> Response {
+    err_json_code(99, "refresh token invalid")
 }
 
 async fn ufile_files(
