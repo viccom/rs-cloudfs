@@ -356,10 +356,12 @@ async fn ufile_move(State(vfs): State<Arc<Mutex<Vfs>>>, body: String) -> Respons
     let mut vfs = vfs.lock().unwrap();
     vfs.api_calls += 1;
     let fid = form.get("file_ids").cloned().unwrap_or_default();
-    let to = form
-        .get("to_pid")
-        .cloned()
-        .unwrap_or_else(|| "0".to_string());
+    // SDK 文档形态（115-sdk-go MoveReq：file_ids + to_cid）——真机实证
+    // （2026-09-17）：to_pid 形态被后端静默接受但移动不生效（索引孤儿：
+    // get_info 活着、源/目标两个 list 都不可见）。桩按文档严格建模。
+    let Some(to) = form.get("to_cid").cloned() else {
+        return err_json(701000, "参数错误：缺少 to_cid");
+    };
     let Some(node) = vfs.nodes.get(&fid).cloned() else {
         return err_json(430004, "文件不存在");
     };

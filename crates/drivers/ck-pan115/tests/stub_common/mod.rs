@@ -466,10 +466,11 @@ async fn ufile_update(State(state): State<Arc<Mutex<StubState>>>, body: String) 
 async fn ufile_move(State(state): State<Arc<Mutex<StubState>>>, body: String) -> Response {
     let form = parse_form(&body);
     let fid = form.get("file_ids").cloned().unwrap_or_default();
-    let to = form
-        .get("to_pid")
-        .cloned()
-        .unwrap_or_else(|| "0".to_string());
+    // SDK 文档形态（115-sdk-go MoveReq：file_ids + to_cid）——真机实证
+    // （2026-09-17）to_pid 形态是静默黑洞，桩按文档严格建模（缺参即拒）。
+    let Some(to) = form.get("to_cid").cloned() else {
+        return err_json_code(701000, "参数错误：缺少 to_cid");
+    };
     let mut st = state.lock().unwrap();
     if !st.dirs.contains_key(&to) {
         return err_json_code(430004, "目标目录不存在");

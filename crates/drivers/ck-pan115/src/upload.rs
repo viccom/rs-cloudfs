@@ -755,7 +755,12 @@ impl Pan115Stager {
 /// 保留 scheme 的形态只出现在 loopback 测试缝（`http://127.0.0.1:port`
 /// ——`oss_execute` 按 loopback 判定走 path-style）；生产端点一律剥离
 /// scheme 并强制 https。
-fn normalize_endpoint(raw: &str) -> String {
+///
+/// `pub` 的唯一理由：live-matrix 测试自建直连 OSS 探针（对真后端
+/// `list_parts`）必须套用与驱动**同一**生产行为——测试侧自拼
+/// `format!("https://{}", endpoint)` 会在真机 get_token 载荷上双前缀
+/// scheme（2026-09-17 真机发现），传输层即死。
+pub fn normalize_endpoint(raw: &str) -> String {
     let stripped = raw
         .trim_start_matches("https://")
         .trim_start_matches("http://")

@@ -440,7 +440,9 @@ async fn resume_reuses_the_session_after_a_process_death() {
     // 远端真值：ListParts（真 OSS）应报同样 3 片。
     let sts = driver.client().get_token().await.expect("STS");
     let ctx = ck_pan115::oss::OssCtx {
-        endpoint: format!("https://{}", sts.endpoint),
+        // 真机 get_token 下发**带 scheme** 的端点——测试探针必须套驱动
+        // 的同一生产行为（自拼 https:// 会双前缀，2026-09-17 真机发现）。
+        endpoint: ck_pan115::upload::normalize_endpoint(&sts.endpoint),
         bucket: session.bucket.clone(),
         object: session.object.clone(),
         access_key_id: sts.access_key_id.clone(),

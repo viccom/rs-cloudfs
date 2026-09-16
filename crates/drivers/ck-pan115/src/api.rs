@@ -689,12 +689,18 @@ impl Pan115Client {
         .map(|_| ())
     }
 
-    /// `POST /open/ufile/move`——移动（rename 的目录腿 = move 自身；
-    /// `file_ids` 逗号分隔）。
-    pub async fn move_entries(&self, file_ids: &str, to_pid: &str) -> Result<(), StorageError> {
+    /// `POST /open/ufile/move`——移动（rename 的跨父腿；`file_ids` 逗号
+    /// 分隔）。
+    ///
+    /// wire 形态 = SDK 文档（115-sdk-go MoveReq：`file_ids` + **`to_cid`**，
+    /// 根目录为 "0"）。真机实证（2026-09-17）：`to_pid` 形态被后端**静默
+    /// 接受但移动不生效**——文件成索引孤儿（get_info 可查、源/目标两个
+    /// list 都不可见，≥25s 不恢复）。这是「错误包恒 HTTP 200」信封文化
+    /// 下最危险的一类坑：参数名错不报错。
+    pub async fn move_entries(&self, file_ids: &str, to_cid: &str) -> Result<(), StorageError> {
         self.dispatch_post(
             "/open/ufile/move",
-            &[("file_ids", file_ids), ("to_pid", to_pid)],
+            &[("file_ids", file_ids), ("to_cid", to_cid)],
             "ufile/move",
             None,
         )
