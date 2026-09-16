@@ -59,6 +59,9 @@ struct Vfs {
     cdn_base: String,
     /// CDN 忽略 Range（返回 200 全量——写偏防线的负例注入）
     cdn_ignore_range: bool,
+    /// 最近一次 ufile/delete 收到的 parent_id 原始值（M-S1 的观测面：
+    /// 句柄 parent 段必须把真实父 cid 送到 API——空形态真机未验）
+    last_delete_parent: String,
 }
 
 impl Vfs {
@@ -304,6 +307,7 @@ async fn ufile_delete(State(vfs): State<Arc<Mutex<Vfs>>>, body: String) -> Respo
         .get("parent_id")
         .cloned()
         .unwrap_or_else(|| "0".to_string());
+    vfs.last_delete_parent = parent.clone();
     let Some(node) = vfs.nodes.get(&fid).cloned() else {
         return err_json(430004, "文件不存在");
     };
@@ -722,6 +726,32 @@ async fn delete_uses_composite_handle_and_second_delete_is_not_found() {
     assert!(
         matches!(err, cloudkit_storage::StorageError::NotFound),
         "{err:?}"
+    );
+}
+
+#[tokio::test]
+async fn mkdir_after_delete_reuses_the_freed_name() {
+    let mut vfs = Vfs::new();
+    let a = vfs.mkdir("0", "a");
+    vfs.put_file(&a, "doomed.txt", b"bye".to_vec());
+    let mock = Mock::start(vfs).await;
+    let drv = mock.driver();
+
+    // stat 喂路径缓存（该目录已列过）→ 句柄 delete → 同名 mkdir：缓存
+    // 里的 ghost 行不得让 mkdir 误报 Exists（审查 M-S1——句柄 parent 段
+    // 恒空使 delete 的 invalidate("") 成为 no-op）。
+    let e = drv.stat(&path("/a/doomed.txt")).await.expect("stat");
+    drv.delete(&e.id).await.expect("delete");
+    drv.mkdir(&path("/a/doomed.txt"))
+        .await
+        .expect("the freed name is mkdir-able again");
+
+    // delete API 的 parent_id 必须是真实父 cid（spike 真机形态；空串
+    // 形态真机从未验证过——句柄 parent 段修复的 API 面）。
+    let seen_parent = mock.vfs.lock().unwrap().last_delete_parent.clone();
+    assert_eq!(
+        seen_parent, a,
+        "delete parent_id carries the real parent cid"
     );
 }
 

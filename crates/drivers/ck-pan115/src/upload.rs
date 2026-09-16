@@ -751,7 +751,7 @@ impl Pan115Stager {
                 cloudkit_storage::BackendHandle::new(crate::encode_handle(
                     file_id,
                     &info.pick_code,
-                    "",
+                    &self.parent_cid,
                 )),
             ),
             path: self.rel_path.clone(),

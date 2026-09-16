@@ -346,7 +346,7 @@ impl StorageDriver for Pan115Driver {
         self.paths.put_dir(&resolved.cid, &rows).await;
         let mut entries: Vec<Entry> = rows
             .iter()
-            .filter_map(|row| self.entry_from_row(dir, row))
+            .filter_map(|row| self.entry_from_row(&resolved.cid, dir, row))
             .collect();
         entries.sort_by(|a, b| a.path.cmp(&b.path));
         let total = entries.len();
@@ -385,7 +385,7 @@ impl StorageDriver for Pan115Driver {
             .await?;
         let row = resolved.row.as_ref().ok_or(StorageError::NotFound)?;
         let parent = path.parent().unwrap_or_else(RelPath::root);
-        self.entry_from_row(&parent, row)
+        self.entry_from_row(&resolved.parent_cid, &parent, row)
             .ok_or(StorageError::NotFound)
     }
 
@@ -568,8 +568,10 @@ impl StorageDriver for Pan115Driver {
 impl Pan115Driver {
     /// 后端行 → [`Entry`]（list/stat 共用换算面）。不可寻址名（空名 /
     /// 含反斜杠 / 含 NUL）过滤 → None（「list 产出即可寻址」纪律，
-    /// K67.2 ck-local/ck-sftp 同源硬化）。
-    fn entry_from_row(&self, dir: &RelPath, row: &api::ListRow) -> Option<Entry> {
+    /// K67.2 ck-local/ck-sftp 同源硬化）。`parent_cid` 编进句柄第三段
+    /// ——delete 的缓存失效与 API `parent_id` 都消费它（M-S1：恒空段
+    /// 曾使 invalidate("") 成为 no-op，删除后 ghost 行驻留缓存）。
+    fn entry_from_row(&self, parent_cid: &str, dir: &RelPath, row: &api::ListRow) -> Option<Entry> {
         if !name_is_addressable(&row.fname) {
             tracing::debug!(
                 target: "ck_pan115::list",
@@ -587,7 +589,7 @@ impl Pan115Driver {
         Some(Entry {
             id: EntryId::new(
                 self.volume.clone(),
-                BackendHandle::new(encode_handle(&row.fid, &row.pc, "")),
+                BackendHandle::new(encode_handle(&row.fid, &row.pc, parent_cid)),
             ),
             path,
             kind,
