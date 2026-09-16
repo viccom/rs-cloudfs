@@ -74,6 +74,8 @@ struct UState {
     fail_part_after: Option<u32>,
     /// pick_code → object key（resume 会话复用：同一 pc 回同一对象）
     pc_objects: HashMap<String, String>,
+    /// get_token 调用计数（M-S2 断言面：STS 每传输链只取一次）
+    get_token_calls: u32,
 }
 
 struct Mock {
@@ -268,7 +270,8 @@ async fn upload_init(State(state): State<Arc<Mutex<UState>>>, body: String) -> R
 }
 
 /// `upload/get_token`：STS 端点 = **本桩 base**（scheme 缝 → path-style）。
-async fn upload_get_token(State(_state): State<Arc<Mutex<UState>>>) -> Response {
+async fn upload_get_token(State(state): State<Arc<Mutex<UState>>>) -> Response {
+    state.lock().unwrap().get_token_calls += 1;
     // 端点形态：scheme 前缀（测试缝触发 path-style；生产无 scheme）
     let base = CURRENT_BASE.with(|b| b.borrow().clone());
     ok_json(json!({
@@ -681,6 +684,36 @@ async fn rapid_upload_hit_skips_transfer() {
         0,
         "rapid hit performs no part uploads"
     );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M-S2：STS 凭证每传输链只取一次——分片循环与 close 的 complete 都
+/// 复用链首取的那份，不逐片重取（1rps 限流 API 上 N 片上传曾平白多
+/// 花 N+1 次 get_token）。
+#[tokio::test]
+async fn sts_token_is_fetched_once_per_multipart_transfer() {
+    let mock = Mock::start(0, false).await;
+    arm_base(&mock.base);
+    let dir = tmpdir();
+    let drv = mock.driver(dir.clone());
+
+    let payload: Vec<u8> = vec![9u8; 12 * 1024 * 1024]; // 3 片
+    let mut stager = drv
+        .writer(
+            // 桩的可见名推导按 '-' 切 object key——测试文件名避开连字符。
+            &path("/sts_once.bin"),
+            &WriteHint {
+                size: Some(payload.len() as u64),
+                ..WriteHint::default()
+            },
+        )
+        .await
+        .expect("writer");
+    stager.write(&payload).await.expect("write");
+    stager.close().await.expect("close");
+
+    let calls = mock.state.lock().unwrap().get_token_calls;
+    assert_eq!(calls, 1, "one STS fetch per transfer chain (got {calls})");
     let _ = std::fs::remove_dir_all(&dir);
 }
 

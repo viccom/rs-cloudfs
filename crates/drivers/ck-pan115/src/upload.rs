@@ -175,6 +175,9 @@ struct TransferState {
     callback: Option<crate::api::UploadCallback>,
     /// `None` = 单分片 PutObject 路径（无 multipart 会话）。
     upload_id: Option<String>,
+    /// 链首取得、整链复用的 STS（M-S2：曾逐分片重取——1rps 限流 API 上
+    /// N 片上传平白多 N+1 次；`None` 仅秒传终态，不进 OSS 面）。
+    sts: Option<crate::api::StsToken>,
     /// 已传分片（part_number, etag, size）。
     done: Vec<(u32, String, i64)>,
     /// 单分片路径：对象体已 PUT（close 只需复核）。
@@ -283,6 +286,7 @@ impl Pan115Stager {
                                     object: resp.object.clone(),
                                     callback,
                                     upload_id: Some(id),
+                                    sts: Some(sts),
                                     done: Vec::new(),
                                     put_done: false,
                                     rapid_file_id: None,
@@ -299,6 +303,7 @@ impl Pan115Stager {
                         object: resp.object.clone(),
                         callback,
                         upload_id,
+                        sts: Some(sts),
                         done,
                         put_done: false,
                         rapid_file_id: None,
@@ -369,6 +374,7 @@ impl Pan115Stager {
                 object: String::new(),
                 callback: None,
                 upload_id: None,
+                sts: None,
                 done: Vec::new(),
                 put_done: true,
                 rapid_file_id: Some(file_id),
@@ -415,6 +421,7 @@ impl Pan115Stager {
             object,
             callback: init.callback.clone(),
             upload_id,
+            sts: Some(sts),
             done: Vec::new(),
             put_done: false,
             rapid_file_id: None,
@@ -426,33 +433,19 @@ impl Pan115Stager {
         }
     }
 
-    /// OSS ctx（从给定 transfer 状态构造——close 的 complete 臂在
-    /// `take()` 之后使用）。
-    async fn oss_ctx_for(&self, t: &TransferState) -> Result<OssCtx, StorageError> {
-        let sts = self.client.get_token().await?;
-        Ok(OssCtx {
+    /// OSS ctx（传输链缓存的那份 STS——M-S2：每链取一次，分片循环与
+    /// complete 复用；链的时长（分钟级）远小于 STS 有效期，过期边缘的
+    /// 失败由「错误上抛 → 重试开新链新取」兜底，已传分片都在会话里）。
+    fn oss_ctx_of(t: &TransferState) -> OssCtx {
+        let sts = t.sts.as_ref().expect("the transfer state carries its STS");
+        OssCtx {
             endpoint: normalize_endpoint(&sts.endpoint),
             bucket: t.bucket.clone(),
             object: t.object.clone(),
             access_key_id: sts.access_key_id.clone(),
             access_key_secret: sts.access_key_secret.clone(),
             security_token: sts.security_token.clone(),
-        })
-    }
-
-    /// OSS ctx（从当前 transfer 状态构造；STS 由调用方先行取好或此处
-    /// 重取——各臂统一走这里避免漂移）。
-    async fn oss_ctx(&self) -> Result<OssCtx, StorageError> {
-        let sts = self.client.get_token().await?;
-        let t = self.transfer.as_ref().expect("transfer state");
-        Ok(OssCtx {
-            endpoint: normalize_endpoint(&sts.endpoint),
-            bucket: t.bucket.clone(),
-            object: t.object.clone(),
-            access_key_id: sts.access_key_id.clone(),
-            access_key_secret: sts.access_key_secret.clone(),
-            security_token: sts.security_token.clone(),
-        })
+        }
     }
 
     /// 补齐缺失分片（顺序上传——115 sequential 通道要求）；每片完成即
@@ -472,7 +465,7 @@ impl Pan115Stager {
             let start = (n as u64 - 1) * part_size;
             let len = part_size.min(size - start);
             let body = self.spool_range(start, len).await?;
-            let ctx = self.oss_ctx().await?;
+            let ctx = Self::oss_ctx_of(self.transfer.as_ref().expect("state"));
             let http = self.client.http();
             let etag = {
                 let t = self.transfer.as_ref().expect("state");
@@ -498,7 +491,7 @@ impl Pan115Stager {
     async fn put_object_path(&mut self) -> Result<(), StorageError> {
         let size = self.written;
         let body = self.spool_range(0, size).await?;
-        let ctx = self.oss_ctx().await?;
+        let ctx = Self::oss_ctx_of(self.transfer.as_ref().expect("state"));
         let http = self.client.http();
         let callback = self.transfer.as_ref().and_then(|t| t.callback.clone());
         oss::put_object(http, &ctx, body, callback.as_ref())
@@ -668,16 +661,7 @@ impl UploadStager for Pan115Stager {
 
         // ---- 提交点：multipart → Complete(+callback)；单分片 → 已 PUT。
         if let Some(upload_id) = t.upload_id.clone() {
-            let ctx = OssCtx {
-                endpoint: self.client.get_token().await?.endpoint.clone(),
-                bucket: t.bucket.clone(),
-                object: t.object.clone(),
-                access_key_id: String::new(),
-                access_key_secret: String::new(),
-                security_token: String::new(),
-            };
-            let _ = ctx; // 真实 ctx 由 oss_ctx 统一构造（避免空 STS）
-            let ctx = self.oss_ctx_for(&t).await?;
+            let ctx = Self::oss_ctx_of(&t);
             let http = self.client.http();
             let parts: Vec<(u32, String)> =
                 t.done.iter().map(|(n, e, _)| (*n, e.clone())).collect();
