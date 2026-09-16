@@ -738,3 +738,16 @@
 - **K69.8 上传链实证**：PutObject（3MiB）1.8s / 三片 multipart（12MiB）2.3s（OSS 直传，callback JSON 回应）；complete 后 size 复核纪律有效；resume 差集补片（1 复用 2 补）过。分片 min 5MiB、10000 片上限、sequential 子资源、callback 挂 Complete/Put（`x-oss-callback(-var)` base64 头）。
 - **K69.9 扫码停点协议记录（自主会话专用）**：QR 有效期 **~5 分钟**（签发→40199002 快拒），等待循环按 <5min 周期自动换码（同路径 PNG 恒新鲜），长轮询 30s/次。两轮窗口共 ~6.5h 无扫码、第三轮 13:05 捕获（80+1 周期、authDeviceCode 81 次无频控）。
 - **K69.10 回滚**：整批在 worktree 分支 `feat/pan115-driver`（merge 前 `git checkout main && git worktree remove` 即弃）；spike 为 workspace-excluded 不入 CI。账号侧残留：`/_e2e_pan115/` 空目录保留 + 回收站 4 个测试文件（D2 语义可恢复）。
+
+## 2026-09-16 K70：Phase 5 完成（115-0…115-5）——pan115 驱动上线，装配批两处真实缺陷修复
+
+Phase 5 五批次全落地（worktree `feat/pan115-driver`，`0b53c14`→`32060be`）。115-0 的路线裁决见 K69（路线 A go）。
+
+- **K70.1 批次链**：115-0 spike（auth 腿 `0b53c14` + 探针腿 `acebe05`）→ 115-1 骨架/认证/配置（`65efd51`）→ 115-2 读路径（`12ecddd`）→ 115-3 写路径（`cfbf907`）→ 115-4a conformance（`26bc85d`）+ 4b 全装配（`05a7c7d`）→ 115-5 真机冒烟（`32060be`）。
+- **K70.2 装配批揭出的两个真实设计缺陷（非桩面瑕疵）**：①**`stat` 曾被路径缓存整层服务**——后端错误永远浮不出来（conformance ⑤ 不可满足）；修复 = 末级新鲜查询（前缀仍缓存，list 的零网络缓存保护不破）。②**分片传输中途失败不落会话**——差集续传资产丢失（断言⑦ 失效）；修复 = 每片落地即持久化、失败路径同样落盘，并按 115「init 锁定 block_list」语义实现**到齐即传**（`write` 到齐承诺量即推传输链，`close` 仍是提交点）。
+- **K70.3 真机揭出的生产级缺陷**：**OSS endpoint 带 scheme 未剥离**——115 `get_token` 下发 `https://oss-….aliyuncs.com`，port 时丢了 spike 的剥离步骤（`probes.rs:611`），`host()` 拼出 `bucket.https://…` → OSS `SecondLevelDomainForbidden`（真机首跑即中）。修复 = `normalize_endpoint`；同时**测试缝判据改按 loopback host**（原按「含 `://`」会把生产流量误导向 path-style——同一缺陷的另一半）。教训：**桩测不出的形态只有真机揭**，115-5 的最小冒烟价值即在此。
+- **K70.4 sync 裁决**：pan115 支持 sync（baidu 式接入，`sync_namespace_key = pan115:<uid>`），依据 = 计划 §4.3 明文「sync_namespace 同 baidu 形态」+ 零 core 改动最可逆（回滚 = 单臂改回 bail）。
+- **K70.5 conformance ⑤ 表形态裁决**：`error_table` 只放可被「注入恰好一次后恢复」契约验证的码（`430004 → NotFound`）；**刻意不放 `770004`**——账号级上限触发的是 D4 硬退避窗（驱动主动进入封锁态），与断言⑤的一次性语义天然冲突，强塞只能靠削弱断言通过；映射由 `tests/errno_mapping.rs` 单测钉。
+- **K70.6 真机数字（115-5 最小冒烟）**：上传 200KiB → 回读逐字节 + close 内 size 复核；Range `[100000,150000)` 逐字节；秒传第二轮**同 fid**（status==2 实证）。作业纪律全守（只 /_e2e_pan115/、清理后核空、1rps 限速、未碰分享/离线/视频族）。
+- **K70.7 未覆盖（如实挂账）**：完整矩阵的断点续传杀进程恢复、rebuild 收敛耗时、加密卷 aead_v2 往返、E2E 三面（WebDAV/web/winfsp）、>5MiB 多分片真机上传（本次三项走 PutObject 与秒传路径）、目录 rename 真机形态（驱动按 move+update 实现未验）；setup 扫码向导未做（oauth.rs 三端点已备，无 GUI 向导——挂账待裁）。真机测试入口 = `crates/drivers/ck-pan115/tests/live_matrix.rs`（`#[ignore]`，凭据只经 env）。
+- **K70.8 回滚**：整批在 worktree 分支 `feat/pan115-driver`（单批 merge，merge 前 `git worktree remove` 即弃；merge 后 `git revert -m 1 <merge>`）；spike `examples/pan115_spike` workspace-excluded 不入 CI。账号侧残留：`/_e2e_pan115/` 空目录保留 + 回收站若干测试文件（D2 语义可恢复）。
