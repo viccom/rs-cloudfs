@@ -9,7 +9,7 @@
 | 任务 | 内容 | 状态 | 完成情况 | 证据 |
 |---|---|---|---|---|
 | 115-0 | 路线 spike 与裁决 | ✅ 完成（2026-09-16，K69） | 五项全过，**裁决路线 A go**：① 路径丙全链成立（client_id **100197303** OpenList 托管 app → PKCE 扫码 → Bearer user/info → refresh 自续轮换落盘）② UA **逐字节绑定**（错配恒 403）但形态不约束（空 UA 通）；HEAD/Range/206、etag=MD5 全过 ③ **770004 账号级限流**（~4rps 可持续、5rps 10s 内 22% 拒、封 ≥10min、跨端点族）→ D4 落值 1rps+硬退避 ④ 上传双路+callback+size 复核+resume 差集全过；**sign_key=用户级挑战非 app 签名**（K65 未决销账）⑤ 秒传命中过；伪造哈希 init 不拒（complete 侧校验）→ 省哈希优化不做 | spike 真机全输出（`examples/pan115_spike`，workspace-excluded）；上传 3MiB 1.8s/12MiB 2.3s；扫码停点协议见 K69.9；错误码表 K69.7 |
-| 115-1 | 认证与驱动骨架 | ⏸ | oauth.rs（device-code/QR/refresh+TokenStore；路线 B 则 cookie）+ 四件套骨架 + 配置键三处同步 + SECRET_VALUED_KEYS 增补 + ali-oss-rs 版本树核对 | — |
+| 115-1 | 认证与驱动骨架 | ✅ 完成（2026-09-16，commit 65efd51） | ck-pan115 五模块（api/oauth/oss/limiter/lib，~2.4k 行）：envelope 双形态 + K69.7 错误分类（401*/99 一次刷+重放、770004 硬退避、911 fail-fast）；PKCE 三端点 + 单飞 refresh + ConfigTokenStore 回写；OSS V1 签名层 port（K69.5 不引 ali-oss-rs）；D4 限速器落值（1rps+300s 起退避）；九方法占位。配置四清单 + Backend::Pan115 + validate；编译面 feature 三件套 + DRIVER_ROWS + 占位臂（SF1 深度）| workspace **1189/0/24**（基线 1149+40）；clippy/fmt/layers/secrets 全绿；双裁剪腿构建过（local,baidu 无 pan115 / pan115-only）|
 | 115-2 | 读路径 | ⏸ | list/stat/mkdir/delete/rename + downurl 流读（HEAD 探测/Range/429 分段重生） | — |
 | 115-3 | 写路径 | ⏸ | upload init/get_token/ali-oss-rs 分片/complete/resume/秒传 + 硬纪律 3/4/5 | — |
 | 115-4 | conformance + 装配 | ⏸ | 假开放平台 + 假 OSS 桩（get_token 端点指向 loopback）八断言全绿 + 12 装配点 + web 表单/扫码引导 | — |
