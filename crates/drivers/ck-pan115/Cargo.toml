@@ -45,8 +45,9 @@ serde = { version = "1", features = ["derive"] }
 # envelope 与业务面 JSON 载荷。
 serde_json = "1"
 # token 状态 RwLock + limiter 的异步等待（tokio::time 而非 std——
-# 可测性经毫秒级参数注入，RebuildTuning::fast 先例）。
-tokio = { version = "1", features = ["sync", "time"] }
+# 可测性经毫秒级参数注入，RebuildTuning::fast 先例）；fs/io-util = 写
+# 路径的 spool 文件与区间读回（115-3）。
+tokio = { version = "1", features = ["sync", "time", "fs", "io-util"] }
 # 911/退避等分类学边界外的可行动文案经 warn 通道（ck-sftp error.rs
 # 同款双通道裁决——StorageError::Unauthorized 无载荷）。
 tracing = "0.1"

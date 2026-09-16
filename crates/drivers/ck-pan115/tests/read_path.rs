@@ -200,6 +200,7 @@ impl Mock {
             passport_base: self.base.clone(),
             token_store: None,
             limiter: Some(LimiterConfig::fast()),
+            sessions_dir: None,
         })
         .expect("driver constructs")
     }

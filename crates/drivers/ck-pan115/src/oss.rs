@@ -265,15 +265,25 @@ async fn oss_execute(
         &resource,
     );
 
-    let url = if url_query.is_empty() {
-        format!("https://{}/{}", ctx.host(), pct_encode(&ctx.object))
-    } else {
+    // URL 构造。生产 = 强制 https + virtual-host（`<bucket>.<endpoint>`）；
+    // 测试缝（115-4 conformance 桩）：endpoint 自带 scheme（含 `://`）时
+    // 走 path-style `{endpoint}/{bucket}/{object}` 且保留该 scheme——
+    // **签名不依赖二者**（CanonicalizedResource 恒为 `/bucket/object`，
+    // V1 签名与 host 形态无关），因此该缝不改变任何被签名输入。
+    let base = if ctx.endpoint.contains("://") {
         format!(
-            "https://{}/{}?{}",
-            ctx.host(),
-            pct_encode(&ctx.object),
-            url_query
+            "{}/{}/{}",
+            ctx.endpoint.trim_end_matches('/'),
+            ctx.bucket,
+            pct_encode(&ctx.object)
         )
+    } else {
+        format!("https://{}/{}", ctx.host(), pct_encode(&ctx.object))
+    };
+    let url = if url_query.is_empty() {
+        base
+    } else {
+        format!("{base}?{url_query}")
     };
 
     let mut request = client

@@ -33,6 +33,7 @@ pub mod limiter;
 pub mod oauth;
 pub mod oss;
 pub mod pathcache;
+pub mod upload;
 
 use std::sync::Arc;
 
@@ -85,6 +86,9 @@ pub struct Pan115Params {
     pub token_store: Option<Arc<dyn TokenStore>>,
     /// 限流参数（`None` = K69.3 生产缺省；测试注入毫秒级窗口）。
     pub limiter: Option<limiter::LimiterConfig>,
+    /// 会话/spool 目录（`None` = 系统临时目录；生产装配给卷家目录——
+    /// K21 锚形态，baidu `sessions_dir` 同义）。
+    pub sessions_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for Pan115Params {
@@ -98,6 +102,7 @@ impl Default for Pan115Params {
             passport_base: DEFAULT_PASSPORT_BASE.to_string(),
             token_store: None,
             limiter: None,
+            sessions_dir: None,
         }
     }
 }
@@ -172,6 +177,8 @@ pub struct Pan115Driver {
     paths: pathcache::PathCache,
     /// pick_code → CDN 直链 TTL 缓存（115-2；与流任务经 Arc 共享）。
     dlinks: Arc<download::DlinkCache>,
+    /// 上传会话表（115-3；resume 差集资产，与 stager 经 Arc 共享）。
+    sessions: Arc<upload::SessionStore>,
 }
 
 impl Pan115Driver {
@@ -199,12 +206,14 @@ impl Pan115Driver {
             params.token_store.clone(),
             Arc::new(limiter::RateLimiter::new(limiter_cfg)),
         )?);
+        let sessions = Arc::new(upload::SessionStore::new(params.sessions_dir.clone()));
         Ok(Pan115Driver {
             volume: VolumeId::new("pan115", "pending")?,
             client,
             params,
             paths: pathcache::PathCache::new(),
             dlinks: Arc::new(download::DlinkCache::new()),
+            sessions,
         })
     }
 
@@ -235,6 +244,32 @@ impl Pan115Driver {
         &self.params.root
     }
 
+    /// 共享 HTTP 面（upload.rs 的 stager 构造面）。
+    pub(crate) fn client_arc(&self) -> &Arc<Pan115Client> {
+        &self.client
+    }
+
+    /// 路径解析缓存（upload.rs 的父目录解析面）。
+    pub(crate) fn paths(&self) -> &pathcache::PathCache {
+        &self.paths
+    }
+
+    /// 上传会话表（upload.rs 的面）。
+    pub(crate) fn sessions_arc(&self) -> &Arc<upload::SessionStore> {
+        &self.sessions
+    }
+
+    /// 驱动参数只读面（upload.rs 的 spool 目录解析）。
+    pub(crate) fn params_ref(&self) -> &Pan115Params {
+        &self.params
+    }
+
+    /// 卷身份（upload.rs 的 Entry 产出面；`StorageDriver::volume` 需要
+    /// trait 导入，内部面直接给出）。
+    pub(crate) fn volume_ref(&self) -> &VolumeId {
+        &self.volume
+    }
+
     /// 路径 → 解析层（list/stat/mkdir/rename 共用）。
     async fn resolve(
         &self,
@@ -256,15 +291,6 @@ impl Pan115Driver {
     pub fn params(&self) -> &Pan115Params {
         &self.params
     }
-}
-
-/// 占位面的统一「未接线」形态：载荷指明落地批次（可行动文案——消费
-/// 方/开发者一眼定位；SF1 的 CLI 占位臂同款文案纪律）。
-fn not_wired(face: &str, batch: &str) -> StorageError {
-    StorageError::Unavailable(format!(
-        "pan115 {face} lands in Phase 5 / {batch} (the 115-1 skeleton ships the auth layer, \
-         config keys and the compile surface only)"
-    ))
 }
 
 #[async_trait]
@@ -500,12 +526,13 @@ impl StorageDriver for Pan115Driver {
         download::open_range(&self.client, &self.dlinks, &pick_code, size, start, end).await
     }
 
+    /// 打开写暂存器（commit-on-close；115-3 全链见 [`upload`] 模块）。
     async fn writer(
         &self,
-        _path: &RelPath,
-        _hint: &WriteHint,
+        path: &RelPath,
+        hint: &WriteHint,
     ) -> Result<Box<dyn UploadStager>, StorageError> {
-        Err(not_wired("writer", "115-3"))
+        upload::writer(self, path, hint).await
     }
 
     /// 配额：`user/info` 的 `rt_space_info`（K69 采样：`all_total.size`
@@ -701,22 +728,17 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writer_holds_the_not_wired_shape_until_115_3() {
-        // 115-2 后仅 writer 仍是占位（读面已接线——协议面拒绝由
-        // read_path.rs 桩回放矩阵覆盖）。占位载荷指明落地批次。
+    async fn writer_refuses_the_root_path() {
+        // 115-3 后九方法全数接线（协议面行为由 read_path.rs /
+        // upload_path.rs 的桩回放矩阵覆盖）；本单测只钉驱动的纯输入
+        // 守卫：卷根不可作为写入目标（trait 语义——根是目录）。
         let driver = Pan115Driver::new(skeleton_params()).expect("driver");
         let err = driver
             .writer(&RelPath::root(), &WriteHint::default())
             .await
             .err()
-            .expect("writer still refuses");
-        match &err {
-            StorageError::Unavailable(detail) => {
-                assert!(detail.contains("writer"), "names itself: {detail}");
-                assert!(detail.contains("115-3"), "names the batch: {detail}");
-            }
-            other => panic!("writer must hold the Unavailable shape, got {other:?}"),
-        }
+            .expect("root is not writable");
+        assert!(matches!(err, StorageError::Invalid), "got {err:?}");
     }
 
     // ------------------------------------------------------ oauth 面 ---
