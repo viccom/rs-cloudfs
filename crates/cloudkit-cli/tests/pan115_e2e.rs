@@ -55,12 +55,19 @@ fn env_pair() -> (String, String) {
 
 /// 真机驱动（生产端点 + 生产限速；connect 读 uid 定卷身份）。
 async fn live_driver() -> Arc<Pan115Driver> {
+    live_driver_with_root("0").await
+}
+
+/// 同上但卷根可指定——rebuild 腿把卷根指到作业目录 cid（rebuild 从
+/// **driver 的**卷根走：`run_rebuild_with_driver` 契约；cfg 的
+/// pan115_root 只做装配面的一致性，不重定已构造 driver 的根）。
+async fn live_driver_with_root(root: &str) -> Arc<Pan115Driver> {
     let (access, refresh) = env_pair();
     let params = Pan115Params {
         client_id: ck_pan115::DEFAULT_CLIENT_ID.to_string(),
         access_token: Some(access),
         refresh_token: Some(refresh),
-        root: "0".to_string(),
+        root: root.to_string(),
         api_base: ck_pan115::DEFAULT_API_BASE.to_string(),
         passport_base: ck_pan115::DEFAULT_PASSPORT_BASE.to_string(),
         token_store: None,
@@ -487,21 +494,28 @@ async fn pan115_webdav_roundtrip_plain_and_encrypted() {
 #[tokio::test]
 #[ignore = "real network: needs the live 115 token pair from env; run with --ignored --test-threads=1"]
 async fn pan115_rebuild_converges_under_the_rate_limit() {
-    let driver = live_driver().await;
+    // bootstrap：unscoped driver 解析作业目录 cid，随后换 scoped driver
+    // （rebuild 从 driver 的卷根走——run_rebuild_with_driver 契约；首轮
+    // live 跑曾误用 root="0" 的 driver，1rps 下全账号 11.7 万文件 = 疑似
+    // 卡死，2026-09-17 真机实证）。
+    let boot = live_driver().await;
     let e2e = RelPath::new("_e2e_pan115").expect("e2e path");
-
-    // 作业目录的 cid（rebuild 的卷根锚点）。
-    let e2e_stat = driver.stat(&e2e).await.expect("e2e dir stat");
+    let e2e_stat = boot.stat(&e2e).await.expect("e2e dir stat");
     let e2e_cid = e2e_stat.id.handle.as_str().split(':').next().expect("fid");
+    let driver = live_driver_with_root(e2e_cid).await;
+    drop(boot);
 
-    // 种子：子目录 + 两个文件（不同大小）。
+    // 种子：stamp 唯一名 + 按轮随机内容（K72——固定名会被上轮残留撞
+    // Exists，固定内容会被服务端 SHA1 去重短路）。
     let stamp = unix_stamp();
-    let sub = e2e.join("rb").expect("sub");
+    let sub_name = format!("rb-{stamp}");
+    let sub = RelPath::new(&sub_name).expect("sub path");
     driver.mkdir(&sub).await.expect("mkdir sub");
     let mut seeded: Vec<(String, Vec<u8>)> = Vec::new();
-    for (name, size) in [("alpha.bin", 1024usize), ("beta.bin", 4096)] {
-        let rel = e2e.join(name).expect("file");
-        let data = pseudo_random(size, 0x5EED);
+    for (base, size) in [("alpha", 1024usize), ("beta", 4096)] {
+        let name = format!("{base}-{stamp}.bin");
+        let data = pseudo_random(size, stamp as u64);
+        let rel = RelPath::new(&name).expect("file path");
         let hint = cloudkit_storage::WriteHint {
             size: Some(data.len() as u64),
             ..Default::default()
@@ -509,7 +523,7 @@ async fn pan115_rebuild_converges_under_the_rate_limit() {
         let mut stager = driver.writer(&rel, &hint).await.expect("writer");
         stager.write(&data).await.expect("write");
         stager.close().await.expect("close");
-        seeded.push((format!("{name}@{stamp}"), data));
+        seeded.push((name, data));
     }
 
     // rebuild 配置：卷根 = 作业目录 cid；实例 db 在临时目录。
@@ -538,12 +552,11 @@ async fn pan115_rebuild_converges_under_the_rate_limit() {
 
     let db = MetaDatabase::open(&dir.path().join("meta.db")).expect("reopen db");
     for (name, data) in &seeded {
-        let bare = name.split('@').next().expect("bare name");
         let row = db
-            .get_file(&format!("/{bare}"))
+            .get_file(&format!("/{name}"))
             .expect("db read")
-            .unwrap_or_else(|| panic!("row for {bare} missing"));
-        assert_eq!(row.size, data.len() as i64, "{bare} size");
+            .unwrap_or_else(|| panic!("row for {name} missing"));
+        assert_eq!(row.size, data.len() as i64, "{name} size");
     }
     println!(
         "[SUMMARY] rebuild_converge|files={}|dirs={}|elapsed_s={:.1}|rate=1rps",
@@ -552,10 +565,9 @@ async fn pan115_rebuild_converges_under_the_rate_limit() {
         elapsed.as_secs_f32()
     );
 
-    // 清理（D2 回收站）。
+    // 清理（D2 回收站；scoped 空间内路径即裸名）。
     for (name, _) in &seeded {
-        let bare = name.split('@').next().expect("bare");
-        cleanup_remote(driver.as_ref(), &format!("_e2e_pan115/{bare}")).await;
+        cleanup_remote(driver.as_ref(), name).await;
     }
     let sub_stat = driver.stat(&sub).await.expect("sub stat");
     driver.delete(&sub_stat.id).await.expect("delete sub");
