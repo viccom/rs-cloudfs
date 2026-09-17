@@ -29,19 +29,23 @@
 
 setup 扫码向导 + live_matrix ④⑤⑥ + pan115_e2e 补腿（K70.7 内容）在审查后修毕自身问题（M-T2/M-T3/M-T5/clippy/fmt/L2 poll 上限 10 次）入库。**注**：该批为上一会话在制工作，自主模式裁决先行 commit 以隔离后续修复——不认可可 `git revert 15195ce`（冲突面：批 1+ 的 live_matrix 改动需手解）。
 
-## Low 挂账（未修，如实记录）
+## Low 挂账（K75 收尾批后状态，2026-09-17）
 
-- rename 跨父错误映射 `Io/Unavailable/Invalid → Exists` 过宽（lib.rs rename 的 move 臂）——传输失败会误报目标占用
-- `open_writer` 不 `create_dir_all` spool 父目录（生产卷家目录存在故不触发；H-T1 修复后测试面也不再触发）
-- OSS 传输类错误（status=0）不在 `retryable()` 集——最瞬态的失败不标可重试（当前无自动重试消费面，影响=分类语义）
-- `setup_http_client()` 缺 IPv4 `local_address` 绑定（K18 纪律；spike 直连形态可达故无实害，对齐性缺口）
-- complete 的 callback 响应体被丢弃（诊断信息丢；可见性由 resolve_new_row 兜底）
-- doctor 文案 22/18 连续空格（doctor.rs:919/926 + lib.rs:6836 非 pan115 批）；conformance/read_path 遗留 debris（_cfg_marker 等）
-- 桩面缺口：envelope 数字形态无 API 面回放、downurl 端点自身 UA 绑定无桩、OSS V1 签名整体不校验（string_to_sign 纯函数钉）
-- 多卷同账号 = 每卷独立 limiter（合计超 1rps；K69.3 实测 4rps 可持续——可接受注记）
-- conformance.rs:223 的 pid-only 临时目录名（单测试使用不撞；与 H-T1 同类，改 tempfile 更稳）
-- live ⑥ 的「杀进程」实为 drop 形态（真 kill 未测；孤儿 uploadId 无 AbortMultipartUpload 清理）
-- https-loopback 端点在 normalize_endpoint 会被剥 scheme（现无此形态消费方）
+**已修（K75）**：
+- ~~rename 跨父错误映射 `Io/Unavailable/Invalid → Exists` 过宽~~ **✅ K75-1**（红→绿：`rename_reports_transport_failure_as_is_not_exists`——502 传输形态不再误报目标占用；映射整体删除，后端拒绝码如实上抛）
+- ~~孤儿 uploadId 无 AbortMultipartUpload~~ **✅ K75-2**（`oss::abort_multipart` + stager abort 远端释放先行；红→绿：`aborting_a_multipart_upload_releases_the_remote_session` 桩收到恰一次 DELETE ?uploadId；失败仅告警不阻塞本地清理——真 kill 场景仍由 OSS 生命周期规则兜底）
+- ~~`open_writer` 不 create_dir_all spool 父目录~~ **✅ K75-3**（幂等防御）
+- ~~`setup_http_client()` 缺 IPv4 绑定~~ **✅ K75-3**（K18 对齐）
+- ~~conformance.rs pid-only 临时目录~~ **✅ K75-3**（tempfile 化）
+- ~~doctor 文案 22/18 连续空格 + debris~~ **✅ K75-3**（doctor.rs NeedsReauth/RateLimited 两臂改 `\` 续行；`_cfg_marker`/`let _ = &mut st` 删除；lib.rs:6836 的 WebClient hint 非 pan115 面，未动）
+
+**维持不修（裁决见 K75.3）**：
+- OSS 传输类错误（status=0）不在 `retryable()` 集——已查证 `upload_queue::decide_retry` 对**任何**错误按退避梯重试，分类标签不影响行为；修了零行为变化
+- 多卷同账号 limiter 相加——K69.3 实测 4rps 可持续余量足够；跨卷共享 limiter 的结构改动不买行为改善
+- complete 的 callback 响应体丢弃——诊断信息，可见性由 resolve_new_row 兜底
+- 桩面三条（envelope 数字形态 / downurl UA / OSS 签名不校验）——分别有真机形态未现、CDN 侧桩+真机双覆盖、string_to_sign 纯函数钉 + 真机验证
+- live ⑥「杀进程」实为 drop 形态——真 kill 未测（K75-2 已消解主要危害：abort 路径有远端释放；kill 场景 OSS 生命周期兜底）
+- https-loopback 端点剥 scheme——无消费方
 
 ## 真机待验项（2026-09-17 真机验证批销账——K74，live_matrix 6/6 + pan115_e2e 4/4）
 

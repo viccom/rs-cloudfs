@@ -67,6 +67,9 @@ struct Vfs {
     cdn_gone_budget: u32,
     /// downurl 调用计数（M-S3 断言面：自愈必须重取直链）
     downurl_calls: u32,
+    /// ufile/move 传输失败注入（K75-1：返回 502 + 非 JSON 体——网络/网关
+    /// 错形态；rename 的错误映射不得把它误报成目标占用）
+    move_transport_fail: bool,
 }
 
 impl Vfs {
@@ -355,6 +358,14 @@ async fn ufile_move(State(vfs): State<Arc<Mutex<Vfs>>>, body: String) -> Respons
     let form = parse_form(&body);
     let mut vfs = vfs.lock().unwrap();
     vfs.api_calls += 1;
+    // K75-1 注入：传输/网关错形态（502 + HTML 错误页——非 JSON 信封，
+    // 驱动侧归 Unavailable）。
+    if vfs.move_transport_fail {
+        return Response::builder()
+            .status(502)
+            .body(Body::from("<html>bad gateway</html>"))
+            .unwrap();
+    }
     let fid = form.get("file_ids").cloned().unwrap_or_default();
     // SDK 文档形态（115-sdk-go MoveReq：file_ids + to_cid）——真机实证
     // （2026-09-17）：to_pid 形态被后端静默接受但移动不生效（索引孤儿：
@@ -774,6 +785,36 @@ async fn mkdir_after_delete_reuses_the_freed_name() {
 /// 时必须现列预检（mkdir 同款纪律）。跨目录 rename 到冷目录曾直接
 /// 穿透到 move/update，trait 契约的 Exists 语义丢失（同父场景由源
 /// resolve 顺带喂缓存而侥幸成立）。
+/// K75-1：跨父 rename 的 move 腿遇**传输类失败**（502/非 JSON——映射为
+/// Unavailable）时不得误报 `Exists`——「目标已占用」是数据面判断，只有
+/// 后端明确拒绝（如 430001 同名）才成立；网络错说成目标占用会把用户
+/// 引向覆盖操作。
+#[tokio::test]
+async fn rename_reports_transport_failure_as_is_not_exists() {
+    let mut vfs = Vfs::new();
+    let d1 = vfs.mkdir("0", "srcdir");
+    vfs.mkdir("0", "dst");
+    vfs.put_file(&d1, "a.txt", b"aaa".to_vec());
+    vfs.move_transport_fail = true; // move 请求 502（网络/网关形态）
+    let mock = Mock::start(vfs).await;
+    let drv = mock.driver();
+
+    let err = drv
+        .rename(&path("/srcdir/a.txt"), &path("/dst/b.txt"))
+        .await
+        .expect_err("the move must fail");
+    assert!(
+        !matches!(err, cloudkit_storage::StorageError::Exists),
+        "a transport failure must not masquerade as an occupied target: {err:?}"
+    );
+    // 源文件原位未动（move 从未生效）
+    let still = drv
+        .stat(&path("/srcdir/a.txt"))
+        .await
+        .expect("source untouched");
+    assert_eq!(still.size, 3);
+}
+
 #[tokio::test]
 async fn rename_into_a_cold_directory_prechecks_the_target() {
     let mut vfs = Vfs::new();

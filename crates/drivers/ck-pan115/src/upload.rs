@@ -688,6 +688,22 @@ impl UploadStager for Pan115Stager {
     /// multipart 不是对象）。
     async fn abort(mut self: Box<Self>) -> Result<(), StorageError> {
         self.aborted = true;
+        // 远端释放先行（K75-2）：OSS 对未 complete 的分片会话**保留分片并
+        // 计配额**——只清本地就是泄漏。取 `transfer.take()` 后对
+        // uploadId 发 AbortMultipartUpload；失败仅记日志不阻塞本地清理
+        // （用户已决定放弃，abort 失败不该让 abort 本身报错——孤儿由
+        // OSS 的生命周期规则兜底）。
+        if let Some(t) = self.transfer.take() {
+            if let Some(upload_id) = t.upload_id.as_deref() {
+                let ctx = Self::oss_ctx_of(&t);
+                if let Err(e) = oss::abort_multipart(self.client.http(), &ctx, upload_id).await {
+                    tracing::warn!(
+                        target: "ck_pan115::upload",
+                        "AbortMultipartUpload failed (orphaned parts remain on OSS): {e}"
+                    );
+                }
+            }
+        }
         // 会话键需要 sha1——spool 尚在，可算（失败则不阻塞清理）。
         if let Ok((fileid, _)) = self.hashes().await {
             let size = self.written;
@@ -841,6 +857,11 @@ pub(crate) async fn open_writer(
         }
     }
     let spool = spool_dir.join(format!("pan115-upload-{}.part", unique_tag()));
+    // 防御：spool 父目录缺失即建（生产装配的卷家目录存在；这里的成本
+    // 是一次幂等 create_dir_all，换来 K21 目录被外因移除时的可恢复性）。
+    tokio::fs::create_dir_all(spool_dir)
+        .await
+        .map_err(|e| StorageError::Io(format!("spool dir create: {e}")))?;
     tokio::fs::File::create(&spool)
         .await
         .map_err(|e| StorageError::Io(format!("spool create: {e}")))?;

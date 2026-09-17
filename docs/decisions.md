@@ -783,3 +783,11 @@ Phase 5 五批次全落地（worktree `feat/pan115-driver`，`0b53c14`→`32060b
 - **K74.4 rebuild 契约实证**：`run_rebuild_with_driver` 从 **driver 的卷根**走（cfg 的 `pan115_root` 只做装配面一致性）——测试曾传 root="0" driver + scoped cfg，首轮 1rps 全账号 11.7 万文件 25 分钟未走完；scoped driver 后重建本体 **2.0s**（files=2/dirs=1）。e2e 腿同步落 K72 纪律（stamp 唯一名 + 按轮随机内容）。
 - **K74.5 真机全绿板**：live_matrix **6/6**（①上传回读 ②Range 窗口 ③秒传同 fid ④12MiB multipart 5.1s ⑤目录 rename 双腿 ⑥断点续传：真 OSS ListParts 3 片 + 同 uploadId 复用 + 12MiB 逐字节）；pan115_e2e **4/4**（加密全栈远端密文核验 / WebDAV 明密双轮 / rebuild 收敛 / setup 流三端点探测）。**销账**：M-S1 新句柄 delete 真机形态 ✓（SUMMARY 三段句柄 + cleanup 删除成功）、M-S3 桩建模待真机 401/410 实发（未遇，挂账维持）、④随机化重跑 ✓、downurl 直链 TTL 真值未测（挂账维持）。
 - **K74.6 回滚**：随 `fix/phase5-review` 分支（3c5ab51 + fe4844a）。
+
+## 2026-09-17 K75：Low 挂账收尾批——2 实质修复 + 4 一行级搭车；7 条裁决不修
+
+- **K75.1 rename 错误映射收窄**：move 臂的 `Io/Unavailable/Invalid → Exists` 映射整体删除——传输失败伪装成「目标已占用」会把用户引向覆盖操作（与 M-S4 同族的契约问题）。红→绿：502/非 JSON 传输形态注入下 rename 不再误报 Exists、源文件原位未动；后端明确拒绝码（430001 同名等）仍如实上抛。
+- **K75.2 放弃上传的远端释放**：`oss::abort_multipart`（DELETE ?uploadId，V1 签名走既有 oss_execute）+ stager abort 先释放远端再清本地——OSS 对未 complete 的分片**保留并计配额**，此前每次放弃 multipart 上传都泄漏。红→绿：桩收到恰一次 AbortMultipartUpload。abort 失败仅告警不阻塞（用户已决定放弃）；真 kill（Drop 都不跑）场景仍由 OSS 生命周期规则兜底——诚实边界。
+- **K75.3 一行级批**：open_writer 幂等 create_dir_all（防御）；setup_http_client 补 IPv4 绑定（K18 对齐——向导与驱动在 IPv6-preferring 网络行为一致）；conformance 临时目录 tempfile 化（H-T1 同族）；doctor 两臂 22/18 连续字面空格改 `\` 续行 + `_cfg_marker`/`let _ = &mut st` debris 清除。
+- **K75.4 裁决不修（查证支撑，非省事）**：①OSS status=0 不进 retryable——`upload_queue::decide_retry` 对任何错误按退避梯重试，标签不影响行为；②多卷 limiter 相加——4rps 实测余量足够，跨卷共享的结构改动不买行为；③callback 响应体丢弃——resolve_new_row 兜底；④桩面三条——分别有真机未现/双覆盖/纯函数钉；⑤真 kill 形态——K75.2 已消解主危害；⑥https-loopback——无消费方；⑦lib.rs:6836 WebClient hint 空格——非 pan115 面。
+- **K75.5 验证**：ck-pan115 78/0（+2 红→绿用例）；workspace 全量/clippy/fmt/layers/secrets 五门禁绿（数字见 AGENTS）。回滚随分支。

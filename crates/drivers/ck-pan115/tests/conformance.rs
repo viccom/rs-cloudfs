@@ -36,7 +36,6 @@
 mod stub_common;
 
 use async_trait::async_trait;
-use ck_pan115::limiter::LimiterConfig;
 use ck_pan115::Pan115Driver;
 use cloudkit_storage::conformance::{assert_conforms, ConformanceHarness, ErrorReplay};
 use cloudkit_storage::{RelPath, StorageDriver, StorageError, WriteHint};
@@ -193,9 +192,6 @@ async fn read_all(mut s: cloudkit_storage::ByteStream) -> Vec<u8> {
     out
 }
 
-#[allow(dead_code)]
-fn _cfg_marker(_: LimiterConfig) {}
-
 // ---------------------------------------------------------------------
 // transport 面 + probe（115-4 接线面）
 // ---------------------------------------------------------------------
@@ -218,9 +214,10 @@ async fn transport_face_shares_the_driver_world() {
     // connect 探活（user/info）
     CloudTransport::connect(&transport).await.expect("connect");
 
-    // 上传（upload_stream 路径）
+    // 上传（upload_stream 路径）；src 目录 OS 级唯一命名（H-T1 同族——
+    // 自拼 pid 名在并行/重跑下不撞的论证靠不住，tempfile 一步到位）。
     let payload: Vec<u8> = (0..2048u32).map(|i| (i % 97) as u8).collect();
-    let src_dir = std::env::temp_dir().join(format!("pan115-tf-{}", std::process::id()));
+    let src_dir = tempfile::tempdir().expect("src tempdir").keep();
     std::fs::create_dir_all(&src_dir).expect("dir");
     let src = src_dir.join("payload.bin");
     std::fs::write(&src, &payload).expect("write src");

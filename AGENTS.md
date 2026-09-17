@@ -36,9 +36,11 @@
 
 **K74 真机验证批完成（2026-09-17，fix/phase5-review）**：真机 token（`E:\GitHub\rs-CyDrive\test\pan115-tokens.json`，probe-refresh 先轮换落盘）跑全真机板——**live_matrix 6/6 + pan115_e2e 4/4**。**真机新揭审查漏网缺陷**：`ufile/move` 目标参数官方形态是 **`to_cid`**（SDK/桌面版双参照），驱动误发 `to_pid` → 错误包恒 200 文化下**静默错置**（文件落账号根、目标列表不可见）——修复 3c5ab51（两桩同步改 SDK 严格建模，「桩照实现抄」第三例）；旧形态在账号根累积 21 件测试碎片已严格命名模式清扫核空。**e2e rebuild 腿双缺陷**（root="0" driver 传给 rebuild = 全账号 11.7 万文件 1rps 25 分钟 vs scoped driver **2.0s**——rebuild 从 driver 卷根走的契约实证；固定名种子撞 K72）修复 fe4844a。**探针方法论教训（K74.3）**：「不可见」调查先核对观察点与操作目标是否同一目录，结论必须出自直查端点的原始响应。M-S1 新句柄 delete 真机 ✓、④随机化 ✓、⑥ resume 真 OSS 对账 ✓；M-S3 真机 401/410 实发未遇（挂账维持）、直链 TTL 真值未测（维持）。
 
+**K75 Low 收尾批完成（2026-09-17，fix/phase5-review）**：Low 挂账 13 条清偿 6、裁决不修 7（查证支撑）。**K75-1** rename move 臂的 `Io/Unavailable → Exists` 宽映射删除（传输失败伪装目标占用会引导用户覆盖操作；红→绿：502 形态不误报 + 源原位）。**K75-2** 放弃上传远端释放：`oss::abort_multipart`（DELETE ?uploadId）+ stager abort 先释放远端再清本地——OSS 未 complete 分片**保留计配额**，此前每次放弃 multipart 都泄漏（红→绿：桩恰一次 abort；失败仅告警）。**K75-3** 一行级×4：open_writer create_dir_all / setup_http_client IPv4（K18 对齐）/ conformance tempfile / doctor 两臂字面空格 + debris。**裁决不修**（K75.4）：OSS status=0 retryable 标签（`decide_retry` 对任何错误都退避重试，零行为差）、多卷 limiter 相加（4rps 余量足）等 7 条各有查证。workspace 1238/0/34，五门禁绿。
+
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 1236 测试（2026-09-17：Phase 5 审查修复批 K73——flaky 根因清除 + 驱动五缺陷 + 裁剪组合双缺口 + 覆盖钉，既有断言零漂移；ignored 34 = 真机/平台/真网类，其中 sftp 真机矩阵 12 + pan115 live_matrix 6 + pan115_e2e 4）
+cargo test --workspace --no-fail-fast            # 1238 测试（2026-09-17：K75 收尾批——rename 映射收窄 + 孤儿 uploadId abort + 4 一行级，Low 挂账清偿 6/13、7 条裁决不修；既有断言零漂移；ignored 34 = 真机/平台/真网类，其中 sftp 真机矩阵 12 + pan115 live_matrix 6 + pan115_e2e 4）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo build -p cloudkit-cli --no-default-features --features local,baidu   # 驱动裁剪构建（K30 四 feature）；缺驱动构建运行期报可行动错误（K31 rebuild 指引），cydrive --version 显示驱动清单（K32）

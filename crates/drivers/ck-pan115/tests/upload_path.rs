@@ -21,7 +21,7 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use ck_pan115::limiter::LimiterConfig;
 use ck_pan115::{Pan115Driver, Pan115Params};
@@ -76,6 +76,8 @@ struct UState {
     pc_objects: HashMap<String, String>,
     /// get_token 调用计数（M-S2 断言面：STS 每传输链只取一次）
     get_token_calls: u32,
+    /// K75-2 观测面：收到的 AbortMultipartUpload（DELETE ?uploadId）次数
+    aborted_uploads: u32,
     /// 最近一次下发的 sign_check 挑战区间（M-T1 对账面）
     sign_check_issued: String,
     /// 收到的 sign_val 应答（M-T1 对账面——数值正确性事后核验）
@@ -109,6 +111,8 @@ impl Mock {
             .route("/{bucket}/{*object}", put(oss_put))
             .route("/{bucket}/{*object}", post(oss_post))
             .route("/{bucket}/{*object}", get(oss_list_parts))
+            // K75-2：AbortMultipartUpload（DELETE ?uploadId）
+            .route("/{bucket}/{*object}", delete(oss_delete))
             // 桩要收 5MiB 级 OSS 分片：抬高 axum 的默认 body 上限
             // （2MB——否则大分片直接 413）。layer 在路由之后 → 覆盖全部。
             .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
@@ -431,6 +435,32 @@ async fn oss_put(
         .header("etag", etag)
         .body(axum::body::Body::empty())
         .unwrap()
+}
+
+/// OSS DELETE ?uploadId：AbortMultipartUpload（K75-2 观测面——计数并
+/// 清掉对象的 upload 会话记录；错误体原样 204 空成功，与 OSS 形态一致）。
+async fn oss_delete(
+    State(state): State<Arc<Mutex<UState>>>,
+    axum::extract::Path((_bucket, object)): axum::extract::Path<(String, String)>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> Response {
+    let q = query.unwrap_or_default();
+    let Some(uid) = q
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("uploadId="))
+        .map(str::to_string)
+    else {
+        return (StatusCode::BAD_REQUEST, "no uploadId").into_response();
+    };
+    let mut st = state.lock().unwrap();
+    st.aborted_uploads += 1;
+    if let Some(obj) = st.objs.get_mut(&object) {
+        if obj.upload_id == uid {
+            obj.upload_id = String::new();
+            obj.parts.clear();
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
 }
 
 /// OSS GET：ListParts（resume 对账面）。
@@ -762,6 +792,41 @@ async fn sts_token_is_fetched_once_per_multipart_transfer() {
 
     let calls = mock.state.lock().unwrap().get_token_calls;
     assert_eq!(calls, 1, "one STS fetch per transfer chain (got {calls})");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// K75-2：放弃 multipart 上传必须 AbortMultipartUpload——OSS 对未
+/// complete 的分片会话**保留分片并计配额**；abort 只清本地（会话+spool）
+/// 是远端资源泄漏。断言：abort 后桩收到一次 DELETE ?uploadId（且会话
+/// 记录已清——差集资产不复存在）。
+#[tokio::test]
+async fn aborting_a_multipart_upload_releases_the_remote_session() {
+    let mock = Mock::start(0, false).await;
+    arm_base(&mock.base);
+    let dir = tmpdir();
+    let drv = mock.driver(dir.clone());
+
+    let payload: Vec<u8> = vec![5u8; 12 * 1024 * 1024]; // 3 片
+    let hint = WriteHint {
+        size: Some(payload.len() as u64),
+        ..WriteHint::default()
+    };
+    let mut stager = drv
+        .writer(&path("/abortme.bin"), &hint)
+        .await
+        .expect("writer");
+    stager
+        .write(&payload)
+        .await
+        .expect("write (parts fly at 到齐)");
+    let boxed = Box::new(stager);
+    boxed.abort().await.expect("abort");
+
+    let aborted = mock.st().aborted_uploads;
+    assert_eq!(
+        aborted, 1,
+        "one AbortMultipartUpload must reach the OSS stub"
+    );
     let _ = std::fs::remove_dir_all(&dir);
 }
 

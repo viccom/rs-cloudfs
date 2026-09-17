@@ -94,10 +94,13 @@ pub enum PollStatus {
 // ---------------------------------------------------------------------------
 
 /// setup 向导的直连 http client（spike auth.rs `http_client` 同形态：
-/// no_proxy + 恒定 UA + 60s 超时——oauth 三端点与 user/info 验证共用）。
+/// no_proxy + 恒定 UA + 60s 超时——oauth 三端点与 user/info 验证共用；
+/// IPv4 dial 与 Pan115Client 对齐——K18 纪律，IPv6-preferring 网络上
+/// 向导与驱动的行为必须一致）。
 pub fn setup_http_client() -> reqwest::Client {
     reqwest::Client::builder()
         .no_proxy()
+        .local_address(std::net::IpAddr::V4(std::net::Ipv4Addr::UNSPECIFIED))
         .user_agent(crate::UA)
         .timeout(REQUEST_TIMEOUT)
         .build()

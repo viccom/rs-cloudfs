@@ -340,7 +340,6 @@ async fn ufile_files(
         })
         .collect();
     let count = rows.len() as i64;
-    let _ = &mut st;
     Json(json!({"state": true, "errno": 0, "data": rows, "count": count})).into_response()
 }
 

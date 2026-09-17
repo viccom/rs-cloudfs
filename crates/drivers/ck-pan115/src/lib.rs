@@ -491,15 +491,7 @@ impl StorageDriver for Pan115Driver {
         let same_parent = src.parent_cid == dst.cid;
         if !same_parent {
             // 跨父：move 到目标父，再按需改名（move 被拒 = 竞态占位）。
-            self.client
-                .move_entries(&src_row.fid, &dst.cid)
-                .await
-                .map_err(|e| match e {
-                    StorageError::Io(_) | StorageError::Unavailable(_) | StorageError::Invalid => {
-                        StorageError::Exists
-                    }
-                    other => other,
-                })?;
+            self.client.move_entries(&src_row.fid, &dst.cid).await?;
         }
         // 改名腿（同父改名或跨父后改名；名字已同则跳过）。
         if src_row.fname != to_name {
