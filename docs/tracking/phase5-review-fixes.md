@@ -43,12 +43,14 @@ setup 扫码向导 + live_matrix ④⑤⑥ + pan115_e2e 补腿（K70.7 内容）
 - live ⑥ 的「杀进程」实为 drop 形态（真 kill 未测；孤儿 uploadId 无 AbortMultipartUpload 清理）
 - https-loopback 端点在 normalize_endpoint 会被剥 scheme（现无此形态消费方）
 
-## 真机待验项（需真机窗口，如实挂账）
+## 真机待验项（2026-09-17 真机验证批销账——K74，live_matrix 6/6 + pan115_e2e 4/4）
 
-- M-S1 修复后 delete 带真实 parent_id 的真机形态（此前空串形态也从未真机验过）
-- M-S3 的 401/410 自愈在真机 CDN 的实际形态（桩按 K69.4 注记建模）
-- live ④ 随机化后的重跑（multipart 真机）+ ⑥ 的 drop-形态断言沿用
-- downurl 直链 TTL 真值（DLINK_TTL 保守 30min 未校准）
+- ~~M-S1 修复后 delete 带真实 parent_id 的真机形态~~ **✅ 验证过**：live 全程三段句柄（SUMMARY `fid:pc:parent`，parent 段已填充），cleanup 经新句柄 delete 成功（D2 回收站）。
+- ~~live ④ 随机化后的重跑~~ **✅ 12MiB multipart 5.1s 过**（stamp 名 + 按轮随机内容——K72 纪律生效）。
+- ~~live ⑥ 的 drop-形态断言~~ **✅**：真 OSS ListParts 报 3 片 + 第二轮**同 uploadId 复用** + 12MiB 逐字节回读。
+- **真机新揭缺陷（审查漏网）**：`ufile/move` 目标参数官方形态是 `to_cid`（SDK/桌面版双参照），驱动误发 `to_pid` → 静默错置（文件落账号根、目标列表不可见）。修复 3c5ab51（桩同步改严格建模，离线红→绿）；旧形态碎片 21 件已清扫核空。e2e rebuild 腿两个缺陷（root="0" driver 全账号 25 分钟 vs scoped 2.0s 契约 + 固定名种子）修复 fe4844a。探针方法论教训见 K74.3。
+- M-S3 的 401/410 自愈在真机 CDN 的实际形态：**未遇**（本轮真机无直链过期实发）——桩按 K69.4 注记建模，挂账维持。
+- downurl 直链 TTL 真值：未测（DLINK_TTL 保守 30min 维持）。
 
 ## 验证总账
 

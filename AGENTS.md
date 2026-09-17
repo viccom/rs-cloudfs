@@ -34,6 +34,8 @@
 
 **K73 审查修复批完成（2026-09-17，fix/phase5-review，未并 main）**：合入后三路深度审查（主会话精读九模块 + 子代理测试/桩面 + 集成/装配面）→ **2 High + 12 Medium 全清偿**，逐项 TDD 红→绿（销账表 = `docs/tracking/phase5-review-fixes.md`）。驱动五缺陷：M-S1 delete 句柄 parent 段恒空（ghost 缓存行 + API parent_id 空形态）；M-S2 STS 每分片重取（N+2 次 1rps 调用 → 每链 1 次）；M-S3 直链 401/410 中途硬死 → 失效缓存+重取+续窗口自愈；M-S4 rename 冷目标目录预检穿透（Exists 契约丢失）；M-S5 pathcache 无 TTL/无上界（10min TTL + 1024 目录 LRU 驱逐）。裁剪组合双缺口：M-I1 `not(baidu)+pan115` twin 丢 TokenStore 回写（重启失授权）、M-I2 同组合多卷 dispatch 误装配任意卷——`dispatch_unified_backend_volume` 移入 lib 成可测缝 + 单一 match 全组合通用 + 组合构建红→绿钉（pan115_combo_dispatch.rs）。测试面：H-T1 自拼 tmpdir 撞名 flaky 根因（tempfile 化，压测 2/26 失败 → 0/30）；H-T2 probe 假覆盖重写（四变体真实触发，桩加 user_info 注入 + refreshToken 恒败路由）；M-T1 sign_val 数值常量钉（dev-dep sha1 触发 E0464 → 预计算常量）；M-T4 normalize_endpoint 生产分支正面钉。Low 挂账与真机待验项见跟踪单两节。
 
+**K74 真机验证批完成（2026-09-17，fix/phase5-review）**：真机 token（`E:\GitHub\rs-CyDrive\test\pan115-tokens.json`，probe-refresh 先轮换落盘）跑全真机板——**live_matrix 6/6 + pan115_e2e 4/4**。**真机新揭审查漏网缺陷**：`ufile/move` 目标参数官方形态是 **`to_cid`**（SDK/桌面版双参照），驱动误发 `to_pid` → 错误包恒 200 文化下**静默错置**（文件落账号根、目标列表不可见）——修复 3c5ab51（两桩同步改 SDK 严格建模，「桩照实现抄」第三例）；旧形态在账号根累积 21 件测试碎片已严格命名模式清扫核空。**e2e rebuild 腿双缺陷**（root="0" driver 传给 rebuild = 全账号 11.7 万文件 1rps 25 分钟 vs scoped driver **2.0s**——rebuild 从 driver 卷根走的契约实证；固定名种子撞 K72）修复 fe4844a。**探针方法论教训（K74.3）**：「不可见」调查先核对观察点与操作目标是否同一目录，结论必须出自直查端点的原始响应。M-S1 新句柄 delete 真机 ✓、④随机化 ✓、⑥ resume 真 OSS 对账 ✓；M-S3 真机 401/410 实发未遇（挂账维持）、直链 TTL 真值未测（维持）。
+
 ## 常用命令（仓库根）
 ```
 cargo test --workspace --no-fail-fast            # 1236 测试（2026-09-17：Phase 5 审查修复批 K73——flaky 根因清除 + 驱动五缺陷 + 裁剪组合双缺口 + 覆盖钉，既有断言零漂移；ignored 34 = 真机/平台/真网类，其中 sftp 真机矩阵 12 + pan115 live_matrix 6 + pan115_e2e 4）

@@ -774,3 +774,12 @@ Phase 5 五批次全落地（worktree `feat/pan115-driver`，`0b53c14`→`32060b
 - **K73.4 测试面可信度**：H-T1 flaky 根因（自拼 tmpdir 撞名）tempfile 化（压测 2/26 失败 → 0/30）；H-T2 probe 假覆盖（名实不符 + 注入空转）重写为四变体真实触发；M-T1 sign_val 数值常量钉；M-T4 normalize_endpoint 生产分支正面钉。dev-dep sha1 触发 E0464 双 rlib → 预计算常量替代（同性质零依赖面）。
 - **K73.5 自主模式裁决记录**：工作区在制改动（setup 向导 + live ④⑤⑥ + e2e 腿）是多项 Medium 的修复载体，先修其自身问题（探针/④随机化/K72 补档/门禁红/poll 上限）commit 为 15195ce 再叠修复批——不动 main、不 push，`git branch -D fix/phase5-review` 即整批回退。`examples/sftp-config/`（Phase 4 运行遗留，含内网 IP/root 名）判定不入库，留负责人处置。
 - **K73.6 挂账**：Low 项与真机待验项见跟踪单「Low 挂账」「真机待验项」两节（rename 宽映射 / OSS status=0 重试分类 / setup IPv4 对齐 / 真机 parent_id 与直链 TTL 等）。
+
+## 2026-09-17 K74：Phase 5 审查修复批真机验证——10/10 全绿；揭出 move wire-form 静默错置缺陷（to_pid → to_cid）
+
+- **K74.1 凭据定位与轮换**：真机 token 对在 `E:\GitHub\rs-CyDrive\test\pan115-tokens.json`（spike `Paths::tokens()` 落盘位；授权目录）；`probe-refresh` 先行一次（轮换对回写盘上 + user/info 验活）——测试全程落在 7200s 有效窗内，无内存刷新消耗盘上一次一换对。
+- **K74.2 move wire-form 缺陷（审查漏网，真机才揭）**：`/open/ufile/move` 的目标参数官方 SDK 形态是 **`to_cid`**（115-sdk-go MoveReq / 115-plus-desktop file.ts 双参照一致），驱动误发 `to_pid`——错误包恒 HTTP 200 的信封文化下**静默接受但移动错置**（文件落到账号根，get_info 活着、目标列表不可见）。修复 = `to_cid` + 两桩改按 SDK 文档严格建模（缺参即拒——「桩照实现抄参数」与 M-T1 同类的第三例）。**旧形态在用户账号根累积了 21 件测试碎片，已按严格命名模式清扫核空（remaining: 0，D2 回收站可恢复）。**
+- **K74.3 探针方法论教训**：v1–v3 探针曾误判「后端根列表索引黑洞」——实为探针把文件 move 到账号根却在 `_e2e_pan115` 里找；v4 绕过驱动直查端点三形态（cid=0 / 无 cid / 全参）一次证伪。**纪律：调查「不可见」先核对观察点与操作目标是否同一目录；结论必须出自直查端点的原始响应。**
+- **K74.4 rebuild 契约实证**：`run_rebuild_with_driver` 从 **driver 的卷根**走（cfg 的 `pan115_root` 只做装配面一致性）——测试曾传 root="0" driver + scoped cfg，首轮 1rps 全账号 11.7 万文件 25 分钟未走完；scoped driver 后重建本体 **2.0s**（files=2/dirs=1）。e2e 腿同步落 K72 纪律（stamp 唯一名 + 按轮随机内容）。
+- **K74.5 真机全绿板**：live_matrix **6/6**（①上传回读 ②Range 窗口 ③秒传同 fid ④12MiB multipart 5.1s ⑤目录 rename 双腿 ⑥断点续传：真 OSS ListParts 3 片 + 同 uploadId 复用 + 12MiB 逐字节）；pan115_e2e **4/4**（加密全栈远端密文核验 / WebDAV 明密双轮 / rebuild 收敛 / setup 流三端点探测）。**销账**：M-S1 新句柄 delete 真机形态 ✓（SUMMARY 三段句柄 + cleanup 删除成功）、M-S3 桩建模待真机 401/410 实发（未遇，挂账维持）、④随机化重跑 ✓、downurl 直链 TTL 真值未测（挂账维持）。
+- **K74.6 回滚**：随 `fix/phase5-review` 分支（3c5ab51 + fe4844a）。
