@@ -160,6 +160,32 @@ pub(crate) async fn open_range(
                         return;
                     }
                 }
+                Err(StorageError::NotFound) => {
+                    // 直链过期（401/410）：失效缓存 + 重取直链 + 重试当前
+                    // 窗口一次；重取或重试失败即上报（30min TTL 只在 open
+                    // 时检查——中途回 401/410 由这里兜底，模块文档声明
+                    // 的自愈语义）。
+                    cache_handle.invalidate(&pc).await;
+                    let healed = async {
+                        let fresh = fetch_dlink(&client, &pc).await?;
+                        cache_handle.insert(&pc, &fresh).await;
+                        get_window(&client, &fresh, pos, win_end).await
+                    }
+                    .await;
+                    match healed {
+                        Ok(bytes) => {
+                            let n = bytes.len() as u64;
+                            if tx.send(Ok(bytes)).await.is_err() {
+                                return;
+                            }
+                            pos += n;
+                        }
+                        Err(e) => {
+                            let _ = tx.send(Err(e)).await;
+                            return;
+                        }
+                    }
+                }
                 Err(e) => {
                     let _ = tx.send(Err(e)).await;
                     return;
@@ -219,9 +245,8 @@ async fn head_probe(client: &Pan115Client, url: &str) -> Result<bool, StorageErr
 /// 拉一个 `[start, end)` 窗口：Range GET + 206/Content-Range 校验。
 ///
 /// 返回码语义（K69.4）：403 → `RateLimited`（CDN 限流，退避路径）；
-/// 401/410 → `NotFound` 形态的「直链过期」由调用方重取（此处归一
-/// `Unavailable`——重取由上层 403 梯度同路承担）；其余非 200/206 或
-/// Content-Range 不吻合 → `Unavailable`。
+/// 401/410 → `NotFound`（直链过期——流循环失效缓存并重取直链，M-S3）；
+/// 其余非 200/206 或 Content-Range 不吻合 → `Unavailable`。
 async fn get_window(
     client: &Pan115Client,
     url: &str,
@@ -243,6 +268,13 @@ async fn get_window(
     let status = resp.status();
     if status.as_u16() == 403 {
         return Err(StorageError::RateLimited { retry_after: None });
+    }
+    if status.as_u16() == 401 || status.as_u16() == 410 {
+        // 直链过期（auth/寿命形态，K69.4）：`NotFound` 作为流循环的
+        // 「失效缓存 + 重取直链」信号——本函数只在 CDN 面产出该变体，
+        // 与 403（限流→退避梯度）分道（M-S3：曾直接归 Unavailable
+        // 杀死长流）。
+        return Err(StorageError::NotFound);
     }
     if !status.is_success() {
         return Err(StorageError::Unavailable(format!(

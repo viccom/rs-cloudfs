@@ -21,7 +21,7 @@ use axum::body::Bytes;
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
 use axum::response::{IntoResponse, Response};
-use axum::routing::{get, post, put};
+use axum::routing::{delete, get, post, put};
 use axum::{Json, Router};
 use ck_pan115::limiter::LimiterConfig;
 use ck_pan115::{Pan115Driver, Pan115Params};
@@ -74,6 +74,14 @@ struct UState {
     fail_part_after: Option<u32>,
     /// pick_code → object key（resume 会话复用：同一 pc 回同一对象）
     pc_objects: HashMap<String, String>,
+    /// get_token 调用计数（M-S2 断言面：STS 每传输链只取一次）
+    get_token_calls: u32,
+    /// K75-2 观测面：收到的 AbortMultipartUpload（DELETE ?uploadId）次数
+    aborted_uploads: u32,
+    /// 最近一次下发的 sign_check 挑战区间（M-T1 对账面）
+    sign_check_issued: String,
+    /// 收到的 sign_val 应答（M-T1 对账面——数值正确性事后核验）
+    sign_vals: Vec<String>,
 }
 
 struct Mock {
@@ -103,6 +111,8 @@ impl Mock {
             .route("/{bucket}/{*object}", put(oss_put))
             .route("/{bucket}/{*object}", post(oss_post))
             .route("/{bucket}/{*object}", get(oss_list_parts))
+            // K75-2：AbortMultipartUpload（DELETE ?uploadId）
+            .route("/{bucket}/{*object}", delete(oss_delete))
             // 桩要收 5MiB 级 OSS 分片：抬高 axum 的默认 body 上限
             // （2MB——否则大分片直接 413）。layer 在路由之后 → 覆盖全部。
             .layer(axum::extract::DefaultBodyLimit::max(64 * 1024 * 1024))
@@ -217,12 +227,17 @@ async fn upload_init(State(state): State<Arc<Mutex<UState>>>, body: String) -> R
             .and_then(|v| v.parse().ok())
             .unwrap_or(0);
         let end = (size / 2).max(1) - 1;
+        st.sign_check_issued = format!("0-{end}");
         return ok_json(json!({
             "pick_code": pick_code,
             "status": 8,
             "sign_key": "mock-sign-key",
             "sign_check": format!("0-{end}"),
         }));
+    }
+    // 挑战应答轮：记录 sign_val（M-T1——桩不校验数值，测试事后对账）
+    if let Some(sv) = form.get("sign_val") {
+        st.sign_vals.push(sv.clone());
     }
 
     // 秒传命中：status=2 + file_id
@@ -268,7 +283,8 @@ async fn upload_init(State(state): State<Arc<Mutex<UState>>>, body: String) -> R
 }
 
 /// `upload/get_token`：STS 端点 = **本桩 base**（scheme 缝 → path-style）。
-async fn upload_get_token(State(_state): State<Arc<Mutex<UState>>>) -> Response {
+async fn upload_get_token(State(state): State<Arc<Mutex<UState>>>) -> Response {
+    state.lock().unwrap().get_token_calls += 1;
     // 端点形态：scheme 前缀（测试缝触发 path-style；生产无 scheme）
     let base = CURRENT_BASE.with(|b| b.borrow().clone());
     ok_json(json!({
@@ -421,6 +437,32 @@ async fn oss_put(
         .unwrap()
 }
 
+/// OSS DELETE ?uploadId：AbortMultipartUpload（K75-2 观测面——计数并
+/// 清掉对象的 upload 会话记录；错误体原样 204 空成功，与 OSS 形态一致）。
+async fn oss_delete(
+    State(state): State<Arc<Mutex<UState>>>,
+    axum::extract::Path((_bucket, object)): axum::extract::Path<(String, String)>,
+    axum::extract::RawQuery(query): axum::extract::RawQuery,
+) -> Response {
+    let q = query.unwrap_or_default();
+    let Some(uid) = q
+        .split('&')
+        .find_map(|kv| kv.strip_prefix("uploadId="))
+        .map(str::to_string)
+    else {
+        return (StatusCode::BAD_REQUEST, "no uploadId").into_response();
+    };
+    let mut st = state.lock().unwrap();
+    st.aborted_uploads += 1;
+    if let Some(obj) = st.objs.get_mut(&object) {
+        if obj.upload_id == uid {
+            obj.upload_id = String::new();
+            obj.parts.clear();
+        }
+    }
+    StatusCode::NO_CONTENT.into_response()
+}
+
 /// OSS GET：ListParts（resume 对账面）。
 async fn oss_list_parts(
     State(state): State<Arc<Mutex<UState>>>,
@@ -529,18 +571,13 @@ fn path(s: &str) -> RelPath {
     RelPath::new(s.trim_start_matches('/')).expect("valid path")
 }
 
-/// 每个用例独立的 spool 目录（临时）。
+/// 每个用例独立的 spool 目录（临时）。tempfile 的 OS 级唯一命名（审查
+/// H-T1：自拼 pid+纳秒在 Windows ~1ms 时钟粒度下并行初始化会撞名——
+/// A 的尾部 remove_dir_all 删掉 B 正在用的目录，`spool create` os error 3
+/// 的 flaky 根因）。`keep()` 放弃自动删除，保持调用方尾部手动清理的
+/// 原语义。
 fn tmpdir() -> std::path::PathBuf {
-    let dir = std::env::temp_dir().join(format!(
-        "ck-pan115-test-{}-{}",
-        std::process::id(),
-        std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0)
-    ));
-    std::fs::create_dir_all(&dir).expect("tmpdir");
-    dir
+    tempfile::tempdir().expect("tmpdir").keep()
 }
 
 /// 把桩 base 注入 get_token 的 thread-local（每个测试起点调用）。
@@ -659,6 +696,45 @@ async fn secondary_auth_loop_replays_with_sign_val() {
     let _ = std::fs::remove_dir_all(&dir);
 }
 
+/// M-T1：sign_val 的数值正确性——区间 [start, end] **闭区间** SHA1（大写
+/// hex；spike upload.rs:54 同语义）。桩只记录不校验（真机才是裁判），
+/// 此处用预计算常量对账（载荷与桩的挑战区间都是确定的：end = size/2-1
+/// = 4095，即 payload[0..=4095]）。
+#[tokio::test]
+async fn secondary_auth_sign_val_matches_the_interval_sha1() {
+    let mock = Mock::start(1, false).await;
+    arm_base(&mock.base);
+    let dir = tmpdir();
+    let drv = mock.driver(dir.clone());
+
+    let payload: Vec<u8> = (0..8192u32).map(|i| (i % 249) as u8).collect();
+    let mut stager = drv
+        .writer(
+            &path("/signval.bin"),
+            &WriteHint {
+                size: Some(payload.len() as u64),
+                ..WriteHint::default()
+            },
+        )
+        .await
+        .expect("writer");
+    stager.write(&payload).await.expect("write");
+    stager.close().await.expect("close");
+
+    let (issued, vals) = {
+        let st = mock.st();
+        (st.sign_check_issued.clone(), st.sign_vals.clone())
+    };
+    assert_eq!(vals.len(), 1, "exactly one challenge answer");
+    // 桩的挑战区间形态自检（"0-4095" = 前半段闭区间）
+    assert_eq!(issued, "0-4095", "the stub issued the expected range");
+    assert_eq!(
+        vals[0], "65DD36214E5D4837A8F1DD6868A1F14EFD8FC20C",
+        "sign_val = uppercase SHA1 over the inclusive [0,4095] slice of the payload"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
 #[tokio::test]
 async fn rapid_upload_hit_skips_transfer() {
     let mock = Mock::start(0, true).await; // rapid_hit → status=2
@@ -685,6 +761,71 @@ async fn rapid_upload_hit_skips_transfer() {
         mock.st().part_put_count,
         0,
         "rapid hit performs no part uploads"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// M-S2：STS 凭证每传输链只取一次——分片循环与 close 的 complete 都
+/// 复用链首取的那份，不逐片重取（1rps 限流 API 上 N 片上传曾平白多
+/// 花 N+1 次 get_token）。
+#[tokio::test]
+async fn sts_token_is_fetched_once_per_multipart_transfer() {
+    let mock = Mock::start(0, false).await;
+    arm_base(&mock.base);
+    let dir = tmpdir();
+    let drv = mock.driver(dir.clone());
+
+    let payload: Vec<u8> = vec![9u8; 12 * 1024 * 1024]; // 3 片
+    let mut stager = drv
+        .writer(
+            // 桩的可见名推导按 '-' 切 object key——测试文件名避开连字符。
+            &path("/sts_once.bin"),
+            &WriteHint {
+                size: Some(payload.len() as u64),
+                ..WriteHint::default()
+            },
+        )
+        .await
+        .expect("writer");
+    stager.write(&payload).await.expect("write");
+    stager.close().await.expect("close");
+
+    let calls = mock.state.lock().unwrap().get_token_calls;
+    assert_eq!(calls, 1, "one STS fetch per transfer chain (got {calls})");
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// K75-2：放弃 multipart 上传必须 AbortMultipartUpload——OSS 对未
+/// complete 的分片会话**保留分片并计配额**；abort 只清本地（会话+spool）
+/// 是远端资源泄漏。断言：abort 后桩收到一次 DELETE ?uploadId（且会话
+/// 记录已清——差集资产不复存在）。
+#[tokio::test]
+async fn aborting_a_multipart_upload_releases_the_remote_session() {
+    let mock = Mock::start(0, false).await;
+    arm_base(&mock.base);
+    let dir = tmpdir();
+    let drv = mock.driver(dir.clone());
+
+    let payload: Vec<u8> = vec![5u8; 12 * 1024 * 1024]; // 3 片
+    let hint = WriteHint {
+        size: Some(payload.len() as u64),
+        ..WriteHint::default()
+    };
+    let mut stager = drv
+        .writer(&path("/abortme.bin"), &hint)
+        .await
+        .expect("writer");
+    stager
+        .write(&payload)
+        .await
+        .expect("write (parts fly at 到齐)");
+    let boxed = Box::new(stager);
+    boxed.abort().await.expect("abort");
+
+    let aborted = mock.st().aborted_uploads;
+    assert_eq!(
+        aborted, 1,
+        "one AbortMultipartUpload must reach the OSS stub"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }

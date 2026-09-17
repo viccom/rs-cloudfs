@@ -916,14 +916,17 @@ pub fn pan115_connectivity_check(probe: &ck_pan115::Pan115Probe) -> CheckResult 
         Pan115Probe::NeedsReauth => CheckResult {
             name: "pan115_connectivity".to_string(),
             status: CheckStatus::Fail,
-            detail: "the pan115 token pair is no longer accepted — re-scan the QR in                      `cydrive setup`, or write fresh pan115_access_token /                      pan115_refresh_token values into the volume config"
+            detail: "the pan115 token pair is no longer accepted — re-scan the QR in \
+                     `cydrive setup`, or write fresh pan115_access_token / \
+                     pan115_refresh_token values into the volume config"
                 .to_string(),
         },
         Pan115Probe::RateLimited { window } => CheckResult {
             name: "pan115_connectivity".to_string(),
             status: CheckStatus::Warn,
             detail: format!(
-                "the 115 account hit its access cap (770004); the driver backs off for                  {}s before retrying — lower the request rate if this repeats",
+                "the 115 account hit its access cap (770004); the driver backs off for \
+                 {}s before retrying — lower the request rate if this repeats",
                 window.as_secs()
             ),
         },

@@ -36,7 +36,6 @@
 mod stub_common;
 
 use async_trait::async_trait;
-use ck_pan115::limiter::LimiterConfig;
 use ck_pan115::Pan115Driver;
 use cloudkit_storage::conformance::{assert_conforms, ConformanceHarness, ErrorReplay};
 use cloudkit_storage::{RelPath, StorageDriver, StorageError, WriteHint};
@@ -193,9 +192,6 @@ async fn read_all(mut s: cloudkit_storage::ByteStream) -> Vec<u8> {
     out
 }
 
-#[allow(dead_code)]
-fn _cfg_marker(_: LimiterConfig) {}
-
 // ---------------------------------------------------------------------
 // transport 面 + probe（115-4 接线面）
 // ---------------------------------------------------------------------
@@ -218,9 +214,10 @@ async fn transport_face_shares_the_driver_world() {
     // connect 探活（user/info）
     CloudTransport::connect(&transport).await.expect("connect");
 
-    // 上传（upload_stream 路径）
+    // 上传（upload_stream 路径）；src 目录 OS 级唯一命名（H-T1 同族——
+    // 自拼 pid 名在并行/重跑下不撞的论证靠不住，tempfile 一步到位）。
     let payload: Vec<u8> = (0..2048u32).map(|i| (i % 97) as u8).collect();
-    let src_dir = std::env::temp_dir().join(format!("pan115-tf-{}", std::process::id()));
+    let src_dir = tempfile::tempdir().expect("src tempdir").keep();
     std::fs::create_dir_all(&src_dir).expect("dir");
     let src = src_dir.join("payload.bin");
     std::fs::write(&src, &payload).expect("write src");
@@ -261,7 +258,11 @@ async fn transport_face_shares_the_driver_world() {
     let _ = std::fs::remove_dir_all(&src_dir);
 }
 
-/// probe 变体分类：Alive（uid + 空间）/ NeedsReauth（死 token）。
+/// probe 变体分类（H-T2 重写）：Alive / NeedsReauth / RateLimited /
+/// Unreachable 四变体全部真实触发——原版的两条腿名实不符（宣称测
+/// NeedsReauth 却从未触发；430004 注在 probe 不经过的 ufile_files 面
+/// 上，「不误报」断言空转）。注入走 user/info（probe 全链唯一端点），
+/// NeedsReauth 腿配 refreshToken 恒败路由（死 refresh_token 形态）。
 #[tokio::test]
 async fn probe_classifies_alive_and_reauth() {
     let stub = OsStub::start().await;
@@ -275,12 +276,35 @@ async fn probe_classifies_alive_and_reauth() {
         }
         other => panic!("expected Alive, got {other:?}"),
     }
+}
 
-    // 死 token：注入 401* 后 probe 走 NeedsReauth（refresh 也失败）
-    stub.inject_stat_error("430004").await; // 不触发 auth；先确认非 auth 路径不误报
-    let probe2 = ck_pan115::probe(&params).await;
+#[tokio::test]
+async fn probe_classifies_reauth_rate_limited_and_unreachable() {
+    // NeedsReauth：user/info 恒 401*，dispatch 刷新一次即败（refreshToken
+    // 路由恒 99）→ Unauthorized{recoverable:true}。
+    let stub = OsStub::start().await;
+    stub.inject_user_info_error("40101017").await;
+    let probe = ck_pan115::probe(&stub.params()).await;
     assert!(
-        matches!(probe2, ck_pan115::Pan115Probe::Alive { .. }),
-        "a non-auth backend error on an unrelated call must not flip the verdict: {probe2:?}"
+        matches!(probe, ck_pan115::Pan115Probe::NeedsReauth),
+        "a dead token pair classifies as NeedsReauth: {probe:?}"
+    );
+
+    // RateLimited：user/info 恒 770004（账号级上限——硬退避窗触发）。
+    let stub = OsStub::start().await;
+    stub.inject_user_info_error("770004").await;
+    let probe = ck_pan115::probe(&stub.params()).await;
+    assert!(
+        matches!(probe, ck_pan115::Pan115Probe::RateLimited { .. }),
+        "an account-level cap classifies as RateLimited: {probe:?}"
+    );
+
+    // Unreachable：未映射码（555001）→ Rejected → Unavailable 载荷。
+    let stub = OsStub::start().await;
+    stub.inject_user_info_error("555001").await;
+    let probe = ck_pan115::probe(&stub.params()).await;
+    assert!(
+        matches!(probe, ck_pan115::Pan115Probe::Unreachable { .. }),
+        "an unmapped backend error classifies as Unreachable: {probe:?}"
     );
 }

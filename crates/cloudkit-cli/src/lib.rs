@@ -5310,6 +5310,54 @@ pub async fn build_pan115_transport_with(
     build_pan115_transport(cfg, token_store, state_dir).await
 }
 
+/// The unified multi-volume backend dispatch (RV2 extraction shared by
+/// the main.rs boot loop and the runtime-volume dispatch): K13/K21 —
+/// token rotations write back into the volume's own file, upload
+/// sessions live in the volume home. The dispatched RunOptions fields
+/// (sync namespace, dashboard identity, quota snapshot) land in
+/// `run_options`.
+pub async fn dispatch_unified_backend_volume(
+    spec: &VolumeConfig,
+    settings: &CyDriveConfig,
+    home: &std::path::Path,
+    run_options: &mut RunOptions,
+) -> Result<Arc<dyn CloudTransport>> {
+    // Per-backend assembly (K13/K21: token rotations write back into the
+    // volume's own file; upload sessions live in the volume home).
+    //
+    // The baidu arm routes through its endpoint-injecting twin; pan115
+    // has its own assembly (the driver connects to read the uid and
+    // takes the same write-back store plus the volume home as its
+    // session base); every other backend — including the no-driver
+    // refusals (K31) — routes through `build_backend_transport`, whose
+    // twins carry the right message per feature. One match for ALL
+    // feature combos (review M-I2: the former `not(baidu)+pan115`
+    // special block assembled ANY backend through the pan115 path).
+    let dispatched = match settings.backend {
+        #[cfg(feature = "baidu")]
+        Backend::Baidu => {
+            let token_store = ConfigTokenStore::new(spec.file_path.clone());
+            build_backend_transport_with(
+                settings,
+                &BaiduEndpoints::default(),
+                Some(Arc::new(token_store)),
+                home,
+            )
+            .await?
+        }
+        #[cfg(feature = "pan115")]
+        Backend::Pan115 => {
+            let token_store = ConfigTokenStore::new(spec.file_path.clone());
+            build_pan115_transport_with(settings, Some(Arc::new(token_store)), Some(home)).await?
+        }
+        _ => build_backend_transport(settings).await?,
+    };
+    run_options.sync_namespace = Some(dispatched.sync_namespace_key());
+    run_options.web_volume = Some(dispatched.volume().to_string());
+    run_options.web_quota = dispatched.web_quota_snapshot().await;
+    Ok(dispatched.clone_dyn())
+}
+
 /// The `pan115_*` config-key flattening shared by the dispatch twins and
 /// [`build_driver`] (Phase 5 / 115-4). Credential resolution follows the
 /// same R3 chain as the other drivers — the credential keys ride
@@ -5518,11 +5566,19 @@ pub async fn build_backend_transport_with(cfg: &CyDriveConfig) -> Result<Backend
         }
         // Phase 5 / 115-4: same assembly as the baidu-feature twin above
         // (this no-baidu twin still carries the pan115 arm when the
-        // `pan115` feature is on).
+        // `pan115` feature is on) — including the K13 write-back store
+        // and the cwd session base (review M-I1: passing None, None lost
+        // every rotation — a one-use refresh_token pair that is never
+        // written back is a dead credential after restart).
         Backend::Pan115 => {
             #[cfg(feature = "pan115")]
             {
-                build_pan115_transport(cfg, None, None).await
+                build_pan115_transport(
+                    cfg,
+                    Some(Arc::new(ConfigTokenStore::default())),
+                    Some(Path::new(".")),
+                )
+                .await
             }
             #[cfg(not(feature = "pan115"))]
             {

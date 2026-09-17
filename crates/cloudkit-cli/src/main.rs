@@ -27,12 +27,9 @@ use anyhow::{Context, Result};
 use ck_telegram::transport::GrammersTransport;
 use clap::{Parser, Subcommand};
 use cloudkit_cli::{discover_config, discover_config_with_volumes, DiscoveredConfig, VolumeStatus};
-// Driver-only run-flow glue (FT2 / 115-4): the baidu endpoint set ships
-// with its driver; the K13 write-back store is shared by baidu/pan115.
-#[cfg(feature = "baidu")]
-use cloudkit_cli::BaiduEndpoints;
-#[cfg(any(feature = "baidu", feature = "pan115"))]
-use cloudkit_cli::ConfigTokenStore;
+// Driver-only run-flow glue moved with `dispatch_unified_backend_volume`
+// into the lib (115 review batch): BaiduEndpoints and the K13
+// ConfigTokenStore are assembled behind that seam now.
 use cloudkit_core::config::{Backend, CyDriveConfig, MountBackend, VolumeConfig};
 use cloudkit_core::logging::LogConfig;
 #[cfg(feature = "telegram")]
@@ -1017,7 +1014,13 @@ async fn run_multi_volume(
                 // RV2 extraction: the arm below is shared verbatim with
                 // the runtime ADD's dispatch (`dispatch_runtime_volume`)
                 // so the two dispatch sites cannot drift.
-                dispatch_unified_backend_volume(&spec, &settings, &home, &mut run_options).await?
+                cloudkit_cli::dispatch_unified_backend_volume(
+                    &spec,
+                    &settings,
+                    &home,
+                    &mut run_options,
+                )
+                .await?
             }
         };
         injections.push((spec, run_options, transport));
@@ -1256,73 +1259,11 @@ async fn dispatch_runtime_volume(
                 name = spec.name,
                 backend = settings.backend.as_str()
             );
-            dispatch_unified_backend_volume(spec, &settings, &home, &mut run_options).await?
+            cloudkit_cli::dispatch_unified_backend_volume(spec, &settings, &home, &mut run_options)
+                .await?
         }
     };
     Ok(Some((run_options, transport)))
-}
-
-/// The unified baidu/local transport dispatch (RV2 extraction of the
-/// multi-volume boot loop's catch-all arm, shared verbatim by the boot
-/// loop and [`dispatch_runtime_volume`]): K13/K21 — token rotations
-/// write back into the volume's own file, upload sessions live in the
-/// volume home. Without the baidu driver: the reduced twin (K31 — a
-/// baidu volume refuses with the rebuild message; a local volume
-/// assembles unchanged). The dispatched RunOptions fields (sync
-/// namespace, dashboard identity, quota snapshot) land in `run_options`.
-async fn dispatch_unified_backend_volume(
-    spec: &VolumeConfig,
-    settings: &CyDriveConfig,
-    home: &std::path::Path,
-    run_options: &mut cloudkit_cli::RunOptions,
-) -> Result<Arc<dyn cloudkit_core::transport::CloudTransport>> {
-    // Per-backend assembly (K13/K21: token rotations write back into the
-    // volume's own file; upload sessions live in the volume home).
-    //
-    // The baidu arm routes through its endpoint-injecting twin; pan115
-    // has its own assembly (the driver connects to read the uid and
-    // takes the same write-back store plus the volume home as its
-    // session base); the no-driver twins keep the K31 refusals.
-    #[cfg(feature = "baidu")]
-    let dispatched = match settings.backend {
-        cloudkit_core::config::Backend::Baidu => {
-            let token_store = ConfigTokenStore::new(spec.file_path.clone());
-            cloudkit_cli::build_backend_transport_with(
-                settings,
-                &BaiduEndpoints::default(),
-                Some(Arc::new(token_store)),
-                home,
-            )
-            .await?
-        }
-        #[cfg(feature = "pan115")]
-        cloudkit_core::config::Backend::Pan115 => {
-            let token_store = ConfigTokenStore::new(spec.file_path.clone());
-            cloudkit_cli::build_pan115_transport_with(
-                settings,
-                Some(std::sync::Arc::new(token_store)),
-                Some(home),
-            )
-            .await?
-        }
-        _ => cloudkit_cli::build_backend_transport(settings).await?,
-    };
-    #[cfg(all(not(feature = "baidu"), feature = "pan115"))]
-    let dispatched = {
-        let token_store = ConfigTokenStore::new(spec.file_path.clone());
-        cloudkit_cli::build_pan115_transport_with(
-            settings,
-            Some(std::sync::Arc::new(token_store)),
-            Some(home),
-        )
-        .await?
-    };
-    #[cfg(not(any(feature = "baidu", feature = "pan115")))]
-    let dispatched = cloudkit_cli::build_backend_transport_with(settings).await?;
-    run_options.sync_namespace = Some(dispatched.sync_namespace_key());
-    run_options.web_volume = Some(dispatched.volume().to_string());
-    run_options.web_quota = dispatched.web_quota_snapshot().await;
-    Ok(dispatched.clone_dyn())
 }
 
 /// The runtime twin of [`connect_telegram_volume`]'s connect core (RV2):

@@ -18,13 +18,16 @@
 //! 上传遵守 D4 限速（驱动内 1 rps 令牌桶 + 770004 硬退避）；不碰
 //! 分享/离线下载/视频族端点。
 //!
-//! 三项冒烟（115-0 裁决后的最小真机验证）：
+//! 真机矩阵（115-0 裁决后的最小三项 + K70.7 挂账收口三项）：
 //! 1. `upload_and_read_back`：上传 → 回读逐字节 + 远端 size 复核；
 //! 2. `range_window_is_byte_exact`：Range 窗口读与本地切片逐字节一致；
 //! 3. `rapid_upload_hits_on_the_second_round`：同内容重传 → 秒传命中
-//!    （status==2 路径；K69.6 真机形态）。
-//!
-//! 另附 `cleanup_e2e_dir`（收尾 delete——进回收站）。
+//!    （status==2 路径；K69.6 真机形态）；
+//! 4. `multipart_upload_over_5mib_roundtrips`：>5MiB 三片 multipart 真机；
+//! 5. `directory_rename_moves_the_tree`：目录 rename（同父 update +
+//!    跨父 move 两腿）真机形态；
+//! 6. `resume_reuses_the_session_after_a_process_death`：断点续传（drop
+//!    形态的进程死亡 → 会话落盘 + ListParts 真值 + 同 uploadId 复用）。
 
 use ck_pan115::limiter::LimiterConfig;
 use ck_pan115::{Pan115Driver, Pan115Params};
@@ -100,6 +103,21 @@ async fn read_all(mut stream: cloudkit_storage::ByteStream) -> Vec<u8> {
 
 fn pattern(len: usize) -> Vec<u8> {
     (0..len).map(|i| (i % 251) as u8).collect()
+}
+
+/// 按轮随机内容（stamp 作种子的小 LCG）：115 按 **SHA1** 全局去重且
+/// 与文件名无关（K72）——固定内容的真机用例会被历史轮次/跨用例同
+/// 内容秒传短路，绕过待测路径且不可见。
+fn stamp_content(len: usize, stamp: u128) -> Vec<u8> {
+    (0..len)
+        .map(|i| {
+            let mut x = (i as u64).wrapping_add(stamp as u64);
+            x = x
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (x >> 33) as u8
+        })
+        .collect()
 }
 
 /// ① 上传 → 回读逐字节 + 远端 size 复核（驱动 close 内的复核之外，
@@ -216,4 +234,261 @@ async fn rapid_upload_hits_on_the_second_round() {
     );
 
     cleanup(&driver, &dir, &[name]).await;
+}
+
+// ---------------------------------------------------------------------
+// 挂账收口扩展（2026-09-16 晚批）：多分片 / 目录 rename / 断点续传
+// ---------------------------------------------------------------------
+
+/// 真机驱动的参数形态（resume 用例需要注入 sessions_dir）。
+fn live_params(sessions_dir: Option<std::path::PathBuf>) -> Pan115Params {
+    let (access, refresh) = (
+        std::env::var("CYDRIVE_PAN115_TEST_ACCESS_TOKEN").expect("env access token"),
+        std::env::var("CYDRIVE_PAN115_TEST_REFRESH_TOKEN").expect("env refresh token"),
+    );
+    Pan115Params {
+        client_id: ck_pan115::DEFAULT_CLIENT_ID.to_string(),
+        access_token: Some(access),
+        refresh_token: Some(refresh),
+        root: "0".to_string(),
+        api_base: ck_pan115::DEFAULT_API_BASE.to_string(),
+        passport_base: ck_pan115::DEFAULT_PASSPORT_BASE.to_string(),
+        token_store: None,
+        limiter: Some(LimiterConfig::default()),
+        sessions_dir,
+    }
+}
+
+/// ④ >5MiB 多分片上传（OSS multipart 真机路径——PutObject/秒传之外的
+/// 第三条腿）：12MiB = 3 片（5+5+2），close 内 size 复核 + 逐字节回读。
+#[tokio::test]
+#[ignore = "live 115 network + real credentials (see module docs)"]
+async fn multipart_upload_over_5mib_roundtrips() {
+    let driver = Pan115Driver::connect(live_params(None))
+        .await
+        .expect("connect");
+    let dir = ensure_e2e_dir(&driver).await;
+    // 唯一名 + 按轮随机内容（K72：固定名/固定内容会被服务端 SHA1 去重
+    // 或历史残留短路 multipart 路径且不可见——⑤⑥ 同款纪律）。
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let name = format!("smoke-multipart-{stamp}.bin");
+    let data = stamp_content(12 * 1024 * 1024, stamp); // 3 片（min 5MiB）
+    let path = dir.join(&name).expect("path");
+
+    let hint = WriteHint {
+        size: Some(data.len() as u64),
+        ..WriteHint::default()
+    };
+    let started = std::time::Instant::now();
+    let mut stager = driver.writer(&path, &hint).await.expect("writer");
+    stager.write(&data).await.expect("write (到齐即传推全链)");
+    let entry = stager
+        .close()
+        .await
+        .expect("close (multipart + size re-verify)");
+    assert_eq!(entry.size, data.len() as u64);
+    let elapsed = started.elapsed();
+
+    let stat = driver.stat(&path).await.expect("stat");
+    let got = read_all(driver.reader(&stat.id, None).await.expect("reader")).await;
+    assert_eq!(got, data, "multipart roundtrip byte-exact");
+    println!(
+        "[SUMMARY] multipart_roundtrip|ok=1|bytes={}|elapsed_s={:.1}",
+        data.len(),
+        elapsed.as_secs_f32()
+    );
+
+    cleanup(&driver, &dir, &[&name]).await;
+}
+
+/// ⑤ 目录 rename 真机形态（115-0 未覆盖项）：驱动按「update 改名 +
+/// move 跨父」实现（OpenList 生产形态）——真机验证对目录成立：目录
+/// 改名后自身与内部文件在新路径可达、旧路径 NotFound。
+#[tokio::test]
+#[ignore = "live 115 network + real credentials (see module docs)"]
+async fn directory_rename_moves_the_tree() {
+    let driver = Pan115Driver::connect(live_params(None))
+        .await
+        .expect("connect");
+    let root = ensure_e2e_dir(&driver).await;
+
+    // 唯一名（跨运行残留与 115 服务端同名去重的免疫——固定名会让上一
+    // 轮失败残留污染本轮，live 实证见 K72）。
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let src = root.join(&format!("ren-a-{stamp}")).expect("src dir");
+    let dst = root.join(&format!("ren-b-{stamp}")).expect("dst dir");
+    let inner_name = format!("inner-{stamp}.txt");
+    let relocated_name = format!("moved-{stamp}.txt");
+
+    driver.mkdir(&src).await.expect("mkdir src");
+    let file = src.join(&inner_name).expect("file");
+    let payload = pattern(4096);
+    let hint = WriteHint {
+        size: Some(payload.len() as u64),
+        ..WriteHint::default()
+    };
+    let mut stager = driver.writer(&file, &hint).await.expect("writer");
+    stager.write(&payload).await.expect("write");
+    stager.close().await.expect("close");
+
+    // 同父改名（目录 update 腿的真机验证点）
+    driver.rename(&src, &dst).await.expect("rename dir");
+
+    let moved = driver.stat(&dst).await.expect("renamed dir stat");
+    assert_eq!(moved.kind, cloudkit_storage::EntryKind::Dir);
+    let inner = driver
+        .stat(&dst.join(&inner_name).expect("inner"))
+        .await
+        .expect("inner under new path");
+    assert_eq!(
+        inner.size,
+        payload.len() as u64,
+        "the file rides the rename"
+    );
+    match driver.stat(&src).await {
+        Err(StorageError::NotFound) => {}
+        other => panic!("old dir must be gone, got {other:?}"),
+    }
+
+    // 跨父移动腿（move + 改名）
+    let relocated = root.join(&relocated_name).expect("relocated");
+    driver
+        .rename(&dst.join(&inner_name).expect("inner2"), &relocated)
+        .await
+        .expect("cross-parent rename (move + name)");
+    let check = driver.stat(&relocated).await.expect("relocated stat");
+    assert_eq!(check.size, payload.len() as u64);
+    println!("[SUMMARY] dir_rename|ok=1|same_parent=update|cross_parent=move+update");
+
+    // 清理：relocated + dst 目录
+    cleanup(&driver, &root, &[&relocated_name]).await;
+    let dst_stat = driver.stat(&dst).await.expect("dst stat for cleanup");
+    driver
+        .delete(&dst_stat.id)
+        .await
+        .expect("delete dir (recycle bin)");
+    println!("PASS: directory rename live");
+}
+
+/// ⑥ 断点续传（杀进程形态）：第一轮 write 全量（到齐即传把 3 片全部
+/// 推上远端）后 **drop**（= 进程死亡后的状态：spool 没了、会话与远端
+/// 分片仍在）——断言会话落盘、ListParts 远端真值、第二轮同内容经
+/// `/open/upload/resume` 复用**同一 uploadId**（会话复用而非重起）并
+/// 完成提交、逐字节回读。
+#[tokio::test]
+#[ignore = "live 115 network + real credentials (see module docs)"]
+async fn resume_reuses_the_session_after_a_process_death() {
+    let sessions_dir = tempfile::tempdir().expect("sessions tempdir");
+    let params = live_params(Some(sessions_dir.path().to_path_buf()));
+    let driver = Pan115Driver::connect(params).await.expect("connect");
+    let dir = ensure_e2e_dir(&driver).await;
+    // 唯一名：115 按 target+名+SHA1 去重——固定名会让上一轮残留命中
+    // 服务端秒传而非 resume 路径（live 实证，见 K72）。
+    let stamp = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .expect("clock")
+        .as_millis();
+    let name = format!("resume-{stamp}.bin");
+    // 内容按轮随机化（stamp 作种子）：115 按 **SHA1** 去重（K72——与
+    // 名字无关）——固定内容会让首轮命中服务端秒传、零分片零会话，
+    // 测不到 resume 路径。轮内两段用同一份 data（同 SHA1）。
+    let data = stamp_content(12 * 1024 * 1024, stamp); // 3 片
+    let path = dir.join(&name).expect("path");
+    let hint = WriteHint {
+        size: Some(data.len() as u64),
+        ..WriteHint::default()
+    };
+
+    // 第一轮：write 全量（3 片上远端）→ drop（不 close——进程死亡后
+    // 的世界：会话 + 远端分片在，spool 没了，complete 没发生）。
+    {
+        let mut stager = driver.writer(&path, &hint).await.expect("writer 1");
+        stager
+            .write(&data)
+            .await
+            .expect("write 1 (parts fly at 到齐)");
+        drop(stager);
+    }
+
+    // 会话落盘断言：唯一一个 session 文件，3 片 + upload_id。
+    // 会话文件落在 <sessions_dir>/pan115_state/sessions/<hash>.json
+    // （SessionStore::file_path 的两级布局——baidu K7 同形）。
+    let sessions_root = sessions_dir.path().join("pan115_state").join("sessions");
+    let session_files: Vec<_> = std::fs::read_dir(&sessions_root)
+        .expect("sessions root")
+        .filter_map(|e| e.ok())
+        .filter(|e| e.file_name().to_string_lossy().ends_with(".json"))
+        .collect();
+    assert_eq!(session_files.len(), 1, "exactly one session file");
+    let session: ck_pan115::upload::UploadSession = serde_json::from_str(
+        &std::fs::read_to_string(session_files[0].path()).expect("session json"),
+    )
+    .expect("UploadSession shape");
+    assert_eq!(session.parts.len(), 3, "all three parts recorded");
+    assert!(
+        session.upload_id.is_some(),
+        "the uploadId rides the session"
+    );
+    let round1_upload_id = session.upload_id.clone().expect("upload id");
+
+    // 远端真值：ListParts（真 OSS）应报同样 3 片。
+    let sts = driver.client().get_token().await.expect("STS");
+    let ctx = ck_pan115::oss::OssCtx {
+        // 真机 get_token 下发**带 scheme** 的端点——测试探针必须套驱动
+        // 的同一生产行为（自拼 https:// 会双前缀，2026-09-17 真机发现）。
+        endpoint: ck_pan115::upload::normalize_endpoint(&sts.endpoint),
+        bucket: session.bucket.clone(),
+        object: session.object.clone(),
+        access_key_id: sts.access_key_id.clone(),
+        access_key_secret: sts.access_key_secret.clone(),
+        security_token: sts.security_token.clone(),
+    };
+    let http = reqwest::Client::builder()
+        .no_proxy()
+        .user_agent(ck_pan115::UA)
+        .build()
+        .expect("oss http");
+    let parts = ck_pan115::oss::list_parts(&http, &ctx, &round1_upload_id)
+        .await
+        .expect("ListParts against the real OSS");
+    assert_eq!(parts.len(), 3, "the real OSS reports the three parts");
+    println!(
+        "[SUMMARY] resume_after_death|parts_on_remote={}|upload_id_len={}",
+        parts.len(),
+        round1_upload_id.len()
+    );
+
+    // 第二轮：同路径同内容 → close。run_transfer 走 upload_resume 复用
+    // 会话（同一 uploadId），无缺片可补，直接 complete。
+    let mut stager = driver.writer(&path, &hint).await.expect("writer 2");
+    stager.write(&data).await.expect("write 2");
+    // write 到齐即传已完成对账；此刻会话仍应指向同一 uploadId。
+    let session2: ck_pan115::upload::UploadSession = serde_json::from_str(
+        &std::fs::read_to_string(session_files[0].path()).expect("session json 2"),
+    )
+    .expect("UploadSession shape 2");
+    assert_eq!(
+        session2.upload_id.as_deref(),
+        Some(round1_upload_id.as_str()),
+        "round 2 REUSED the session uploadId (a restart would mint a new one)"
+    );
+    assert_eq!(session2.parts.len(), 3, "no part needed re-uploading");
+    let entry = stager.close().await.expect("close after resume");
+    assert_eq!(entry.size, data.len() as u64);
+
+    let stat = driver.stat(&path).await.expect("stat");
+    let got = read_all(driver.reader(&stat.id, None).await.expect("reader")).await;
+    assert_eq!(got, data, "resumed object is byte-exact");
+    println!(
+        "[SUMMARY] resume_roundtrip|ok=1|bytes={}|upload_id_reused=1",
+        data.len()
+    );
+
+    cleanup(&driver, &dir, &[&name]).await;
 }

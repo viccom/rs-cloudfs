@@ -175,6 +175,9 @@ struct TransferState {
     callback: Option<crate::api::UploadCallback>,
     /// `None` = 单分片 PutObject 路径（无 multipart 会话）。
     upload_id: Option<String>,
+    /// 链首取得、整链复用的 STS（M-S2：曾逐分片重取——1rps 限流 API 上
+    /// N 片上传平白多 N+1 次；`None` 仅秒传终态，不进 OSS 面）。
+    sts: Option<crate::api::StsToken>,
     /// 已传分片（part_number, etag, size）。
     done: Vec<(u32, String, i64)>,
     /// 单分片路径：对象体已 PUT（close 只需复核）。
@@ -283,6 +286,7 @@ impl Pan115Stager {
                                     object: resp.object.clone(),
                                     callback,
                                     upload_id: Some(id),
+                                    sts: Some(sts),
                                     done: Vec::new(),
                                     put_done: false,
                                     rapid_file_id: None,
@@ -299,6 +303,7 @@ impl Pan115Stager {
                         object: resp.object.clone(),
                         callback,
                         upload_id,
+                        sts: Some(sts),
                         done,
                         put_done: false,
                         rapid_file_id: None,
@@ -369,6 +374,7 @@ impl Pan115Stager {
                 object: String::new(),
                 callback: None,
                 upload_id: None,
+                sts: None,
                 done: Vec::new(),
                 put_done: true,
                 rapid_file_id: Some(file_id),
@@ -415,6 +421,7 @@ impl Pan115Stager {
             object,
             callback: init.callback.clone(),
             upload_id,
+            sts: Some(sts),
             done: Vec::new(),
             put_done: false,
             rapid_file_id: None,
@@ -426,33 +433,19 @@ impl Pan115Stager {
         }
     }
 
-    /// OSS ctx（从给定 transfer 状态构造——close 的 complete 臂在
-    /// `take()` 之后使用）。
-    async fn oss_ctx_for(&self, t: &TransferState) -> Result<OssCtx, StorageError> {
-        let sts = self.client.get_token().await?;
-        Ok(OssCtx {
+    /// OSS ctx（传输链缓存的那份 STS——M-S2：每链取一次，分片循环与
+    /// complete 复用；链的时长（分钟级）远小于 STS 有效期，过期边缘的
+    /// 失败由「错误上抛 → 重试开新链新取」兜底，已传分片都在会话里）。
+    fn oss_ctx_of(t: &TransferState) -> OssCtx {
+        let sts = t.sts.as_ref().expect("the transfer state carries its STS");
+        OssCtx {
             endpoint: normalize_endpoint(&sts.endpoint),
             bucket: t.bucket.clone(),
             object: t.object.clone(),
             access_key_id: sts.access_key_id.clone(),
             access_key_secret: sts.access_key_secret.clone(),
             security_token: sts.security_token.clone(),
-        })
-    }
-
-    /// OSS ctx（从当前 transfer 状态构造；STS 由调用方先行取好或此处
-    /// 重取——各臂统一走这里避免漂移）。
-    async fn oss_ctx(&self) -> Result<OssCtx, StorageError> {
-        let sts = self.client.get_token().await?;
-        let t = self.transfer.as_ref().expect("transfer state");
-        Ok(OssCtx {
-            endpoint: normalize_endpoint(&sts.endpoint),
-            bucket: t.bucket.clone(),
-            object: t.object.clone(),
-            access_key_id: sts.access_key_id.clone(),
-            access_key_secret: sts.access_key_secret.clone(),
-            security_token: sts.security_token.clone(),
-        })
+        }
     }
 
     /// 补齐缺失分片（顺序上传——115 sequential 通道要求）；每片完成即
@@ -472,7 +465,7 @@ impl Pan115Stager {
             let start = (n as u64 - 1) * part_size;
             let len = part_size.min(size - start);
             let body = self.spool_range(start, len).await?;
-            let ctx = self.oss_ctx().await?;
+            let ctx = Self::oss_ctx_of(self.transfer.as_ref().expect("state"));
             let http = self.client.http();
             let etag = {
                 let t = self.transfer.as_ref().expect("state");
@@ -498,7 +491,7 @@ impl Pan115Stager {
     async fn put_object_path(&mut self) -> Result<(), StorageError> {
         let size = self.written;
         let body = self.spool_range(0, size).await?;
-        let ctx = self.oss_ctx().await?;
+        let ctx = Self::oss_ctx_of(self.transfer.as_ref().expect("state"));
         let http = self.client.http();
         let callback = self.transfer.as_ref().and_then(|t| t.callback.clone());
         oss::put_object(http, &ctx, body, callback.as_ref())
@@ -668,16 +661,7 @@ impl UploadStager for Pan115Stager {
 
         // ---- 提交点：multipart → Complete(+callback)；单分片 → 已 PUT。
         if let Some(upload_id) = t.upload_id.clone() {
-            let ctx = OssCtx {
-                endpoint: self.client.get_token().await?.endpoint.clone(),
-                bucket: t.bucket.clone(),
-                object: t.object.clone(),
-                access_key_id: String::new(),
-                access_key_secret: String::new(),
-                security_token: String::new(),
-            };
-            let _ = ctx; // 真实 ctx 由 oss_ctx 统一构造（避免空 STS）
-            let ctx = self.oss_ctx_for(&t).await?;
+            let ctx = Self::oss_ctx_of(&t);
             let http = self.client.http();
             let parts: Vec<(u32, String)> =
                 t.done.iter().map(|(n, e, _)| (*n, e.clone())).collect();
@@ -704,6 +688,22 @@ impl UploadStager for Pan115Stager {
     /// multipart 不是对象）。
     async fn abort(mut self: Box<Self>) -> Result<(), StorageError> {
         self.aborted = true;
+        // 远端释放先行（K75-2）：OSS 对未 complete 的分片会话**保留分片并
+        // 计配额**——只清本地就是泄漏。取 `transfer.take()` 后对
+        // uploadId 发 AbortMultipartUpload；失败仅记日志不阻塞本地清理
+        // （用户已决定放弃，abort 失败不该让 abort 本身报错——孤儿由
+        // OSS 的生命周期规则兜底）。
+        if let Some(t) = self.transfer.take() {
+            if let Some(upload_id) = t.upload_id.as_deref() {
+                let ctx = Self::oss_ctx_of(&t);
+                if let Err(e) = oss::abort_multipart(self.client.http(), &ctx, upload_id).await {
+                    tracing::warn!(
+                        target: "ck_pan115::upload",
+                        "AbortMultipartUpload failed (orphaned parts remain on OSS): {e}"
+                    );
+                }
+            }
+        }
         // 会话键需要 sha1——spool 尚在，可算（失败则不阻塞清理）。
         if let Ok((fileid, _)) = self.hashes().await {
             let size = self.written;
@@ -751,7 +751,7 @@ impl Pan115Stager {
                 cloudkit_storage::BackendHandle::new(crate::encode_handle(
                     file_id,
                     &info.pick_code,
-                    "",
+                    &self.parent_cid,
                 )),
             ),
             path: self.rel_path.clone(),
@@ -771,7 +771,12 @@ impl Pan115Stager {
 /// 保留 scheme 的形态只出现在 loopback 测试缝（`http://127.0.0.1:port`
 /// ——`oss_execute` 按 loopback 判定走 path-style）；生产端点一律剥离
 /// scheme 并强制 https。
-fn normalize_endpoint(raw: &str) -> String {
+///
+/// `pub` 的唯一理由：live-matrix 测试自建直连 OSS 探针（对真后端
+/// `list_parts`）必须套用与驱动**同一**生产行为——测试侧自拼
+/// `format!("https://{}", endpoint)` 会在真机 get_token 载荷上双前缀
+/// scheme（2026-09-17 真机发现），传输层即死。
+pub fn normalize_endpoint(raw: &str) -> String {
     let stripped = raw
         .trim_start_matches("https://")
         .trim_start_matches("http://")
@@ -852,6 +857,11 @@ pub(crate) async fn open_writer(
         }
     }
     let spool = spool_dir.join(format!("pan115-upload-{}.part", unique_tag()));
+    // 防御：spool 父目录缺失即建（生产装配的卷家目录存在；这里的成本
+    // 是一次幂等 create_dir_all，换来 K21 目录被外因移除时的可恢复性）。
+    tokio::fs::create_dir_all(spool_dir)
+        .await
+        .map_err(|e| StorageError::Io(format!("spool dir create: {e}")))?;
     tokio::fs::File::create(&spool)
         .await
         .map_err(|e| StorageError::Io(format!("spool create: {e}")))?;
@@ -942,4 +952,64 @@ pub(crate) async fn writer(
         &spool_dir,
     )
     .await
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{normalize_endpoint, parse_sign_check};
+
+    /// M-T4：生产端点剥 scheme + 尾斜杠（115-5 真机缺陷③的修复函数
+    /// ——此前只有 loopback 缝间接覆盖，生产分支无正面钉）。
+    #[test]
+    fn normalize_endpoint_strips_schemes_for_production_hosts() {
+        assert_eq!(
+            normalize_endpoint("https://oss-cn-shenzhen.aliyuncs.com"),
+            "oss-cn-shenzhen.aliyuncs.com"
+        );
+        assert_eq!(
+            normalize_endpoint("https://oss-cn-shenzhen.aliyuncs.com/"),
+            "oss-cn-shenzhen.aliyuncs.com"
+        );
+        assert_eq!(
+            normalize_endpoint("http://oss-example.aliyuncs.com/"),
+            "oss-example.aliyuncs.com"
+        );
+        // 已裸形态原样通过（大小写不敏感的 scheme 前缀不剥——115 下发
+        // 恒小写，宽松处理无必要）。
+        assert_eq!(
+            normalize_endpoint("oss-x.aliyuncs.com"),
+            "oss-x.aliyuncs.com"
+        );
+    }
+
+    /// M-T4：loopback 测试缝——http scheme 原样保留（path-style 消费）。
+    #[test]
+    fn normalize_endpoint_keeps_the_loopback_test_seam() {
+        assert_eq!(
+            normalize_endpoint("http://127.0.0.1:39147"),
+            "http://127.0.0.1:39147"
+        );
+        assert_eq!(
+            normalize_endpoint("http://127.0.0.1:39147/"),
+            "http://127.0.0.1:39147"
+        );
+        assert_eq!(
+            normalize_endpoint("http://localhost:9000"),
+            "http://localhost:9000"
+        );
+    }
+
+    /// M-T1 关联：sign_check 区间解析（闭区间形态；spike upload.rs:54
+    /// 语义 = [start, end] 含两端）。
+    #[test]
+    fn parse_sign_check_accepts_closed_ranges_only() {
+        assert_eq!(parse_sign_check("0-127").expect("ok"), (0, 127));
+        assert_eq!(
+            parse_sign_check("1585000-1733288").expect("ok"),
+            (1585000, 1733288)
+        );
+        assert!(parse_sign_check("128-0").is_err(), "inverted");
+        assert!(parse_sign_check("abc").is_err(), "not a range");
+        assert!(parse_sign_check("5-").is_err(), "half-open rejected");
+    }
 }

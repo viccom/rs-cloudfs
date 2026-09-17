@@ -759,3 +759,35 @@ Phase 5 五批次全落地（worktree `feat/pan115-driver`，`0b53c14`→`32060b
 - **K71.3 执行期注意点（后续 E2E 复用）**：①RFC 4918——PUT 到父集合不存在的路径 409，先 MKCOL；②`cfg.validate()` 生产口径拒 `webdav_port=0`，而 run 流程支持 :0 临时端口——测试 boot 不调 validate（run_e2e 先例同）；③Windows 上写完主动 `shutdown()` 会把连接整断，靠 `Connection: close` 服务端收尾。
 - **K71.4 flaky 观察项（未定位，如实记录）**：cargo clean 后首轮全量中 `ck-pan115::upload_path::size_mismatch_after_complete_is_refused` 失败一次（首建高争用窗口）；单跑 5/5、全量复跑 2/2 绿。疑点在 `resolve_new_row` 的 5s 轮询窗，未证实——不动代码，留观察。
 - **K71.5 回滚**：本批仅新增 `crates/cloudkit-cli/tests/pan115_e2e.rs`（#[ignore] 真机测试，不入 CI）+ 三处文档；`git revert <commit>` 即整批回退。
+
+## 2026-09-16 K72：115 live 用例的 SHA1 去重短路教训（K70.7 收口批执行期实证；补档 2026-09-17，深度审查 M-T5 销账）
+
+- **K72.1 去重与名字无关**：115 的秒传按**内容 SHA1 全局去重**（K69.6 语义延伸）——live 用例若用固定名 + 固定内容，历史轮次残留（或跨用例同内容，含离线桩跑过的同 pattern）会让 init 直接命中秒传，**绕过待测路径且真机无桩计数不可见**。纪律：真机用例一律 stamp 唯一名 + 按轮随机内容（live_matrix ⑤⑥ 形态；④ 原漏此纪律，2026-09-17 审查 M-T3 对齐）。
+- **K72.2 会话/秒传的判定面**：固定形态下「零分片零会话」是命中秒传的可观测信号（⑥ 的会话文件断言即以此兜底——resume 路径被短路时 `session_files.len() == 1` 断言先红）。
+- **K72.3 关联**：同批删除 `debug_rename_landing` 排查探针（无断言、不清理，`--ignored` 会连带执行——审查 M-T2）；其调查目的（跨父 move 后落点/索引延迟）已由 ⑤ 的断言化用例覆盖。回滚随 `fix/phase5-review` 分支。
+
+## 2026-09-17 K73：Phase 5 合入后深度审查修复批——2 High + 12 Medium 全清偿（fix/phase5-review）
+
+- **K73.1 审查形态**：三路并行（主会话精读 ck-pan115 九模块 + 子代理测试/桩面 + 子代理集成/装配面，关键发现主会话亲验）；在制未提交改动纳入审查范围。产出 2 High + 12 Medium + Low 若干，逐项销账表 = `docs/tracking/phase5-review-fixes.md`。
+- **K73.2 实质修复五处驱动缺陷**：①delete 句柄 parent 段恒空（ghost 缓存 + API 形态未验，M-S1）；②STS 每分片重取（N+2 次 1rps 限流调用，M-S2）；③直链 401/410 不自愈（长流硬死，M-S3）；④rename 冷目录预检穿透（Exists 契约丢失，M-S4）；⑤pathcache 无 TTL/无上界（外部删改永久陈旧 + rebuild 内存无界，M-S5）。全部 TDD 红→绿留证。
+- **K73.3 裁剪组合双缺口**（M-I1/M-I2）：`not(baidu)+pan115` 曾丢 TokenStore 回写（一次一换下 = 重启失授权）+ 多卷 dispatch 把非 pan115 卷误装配——修复 = dispatch_unified_backend_volume 移入 lib 成可测缝 + 单一 match 全组合通用 + twin 对齐主 twin；组合构建下红→绿钉死（pan115_combo_dispatch.rs）。
+- **K73.4 测试面可信度**：H-T1 flaky 根因（自拼 tmpdir 撞名）tempfile 化（压测 2/26 失败 → 0/30）；H-T2 probe 假覆盖（名实不符 + 注入空转）重写为四变体真实触发；M-T1 sign_val 数值常量钉；M-T4 normalize_endpoint 生产分支正面钉。dev-dep sha1 触发 E0464 双 rlib → 预计算常量替代（同性质零依赖面）。
+- **K73.5 自主模式裁决记录**：工作区在制改动（setup 向导 + live ④⑤⑥ + e2e 腿）是多项 Medium 的修复载体，先修其自身问题（探针/④随机化/K72 补档/门禁红/poll 上限）commit 为 15195ce 再叠修复批——不动 main、不 push，`git branch -D fix/phase5-review` 即整批回退。`examples/sftp-config/`（Phase 4 运行遗留，含内网 IP/root 名）判定不入库，留负责人处置。
+- **K73.6 挂账**：Low 项与真机待验项见跟踪单「Low 挂账」「真机待验项」两节（rename 宽映射 / OSS status=0 重试分类 / setup IPv4 对齐 / 真机 parent_id 与直链 TTL 等）。
+
+## 2026-09-17 K74：Phase 5 审查修复批真机验证——10/10 全绿；揭出 move wire-form 静默错置缺陷（to_pid → to_cid）
+
+- **K74.1 凭据定位与轮换**：真机 token 对在 `E:\GitHub\rs-CyDrive\test\pan115-tokens.json`（spike `Paths::tokens()` 落盘位；授权目录）；`probe-refresh` 先行一次（轮换对回写盘上 + user/info 验活）——测试全程落在 7200s 有效窗内，无内存刷新消耗盘上一次一换对。
+- **K74.2 move wire-form 缺陷（审查漏网，真机才揭）**：`/open/ufile/move` 的目标参数官方 SDK 形态是 **`to_cid`**（115-sdk-go MoveReq / 115-plus-desktop file.ts 双参照一致），驱动误发 `to_pid`——错误包恒 HTTP 200 的信封文化下**静默接受但移动错置**（文件落到账号根，get_info 活着、目标列表不可见）。修复 = `to_cid` + 两桩改按 SDK 文档严格建模（缺参即拒——「桩照实现抄参数」与 M-T1 同类的第三例）。**旧形态在用户账号根累积了 21 件测试碎片，已按严格命名模式清扫核空（remaining: 0，D2 回收站可恢复）。**
+- **K74.3 探针方法论教训**：v1–v3 探针曾误判「后端根列表索引黑洞」——实为探针把文件 move 到账号根却在 `_e2e_pan115` 里找；v4 绕过驱动直查端点三形态（cid=0 / 无 cid / 全参）一次证伪。**纪律：调查「不可见」先核对观察点与操作目标是否同一目录；结论必须出自直查端点的原始响应。**
+- **K74.4 rebuild 契约实证**：`run_rebuild_with_driver` 从 **driver 的卷根**走（cfg 的 `pan115_root` 只做装配面一致性）——测试曾传 root="0" driver + scoped cfg，首轮 1rps 全账号 11.7 万文件 25 分钟未走完；scoped driver 后重建本体 **2.0s**（files=2/dirs=1）。e2e 腿同步落 K72 纪律（stamp 唯一名 + 按轮随机内容）。
+- **K74.5 真机全绿板**：live_matrix **6/6**（①上传回读 ②Range 窗口 ③秒传同 fid ④12MiB multipart 5.1s ⑤目录 rename 双腿 ⑥断点续传：真 OSS ListParts 3 片 + 同 uploadId 复用 + 12MiB 逐字节）；pan115_e2e **4/4**（加密全栈远端密文核验 / WebDAV 明密双轮 / rebuild 收敛 / setup 流三端点探测）。**销账**：M-S1 新句柄 delete 真机形态 ✓（SUMMARY 三段句柄 + cleanup 删除成功）、M-S3 桩建模待真机 401/410 实发（未遇，挂账维持）、④随机化重跑 ✓、downurl 直链 TTL 真值未测（挂账维持）。
+- **K74.6 回滚**：随 `fix/phase5-review` 分支（3c5ab51 + fe4844a）。
+
+## 2026-09-17 K75：Low 挂账收尾批——2 实质修复 + 4 一行级搭车；7 条裁决不修
+
+- **K75.1 rename 错误映射收窄**：move 臂的 `Io/Unavailable/Invalid → Exists` 映射整体删除——传输失败伪装成「目标已占用」会把用户引向覆盖操作（与 M-S4 同族的契约问题）。红→绿：502/非 JSON 传输形态注入下 rename 不再误报 Exists、源文件原位未动；后端明确拒绝码（430001 同名等）仍如实上抛。
+- **K75.2 放弃上传的远端释放**：`oss::abort_multipart`（DELETE ?uploadId，V1 签名走既有 oss_execute）+ stager abort 先释放远端再清本地——OSS 对未 complete 的分片**保留并计配额**，此前每次放弃 multipart 上传都泄漏。红→绿：桩收到恰一次 AbortMultipartUpload。abort 失败仅告警不阻塞（用户已决定放弃）；真 kill（Drop 都不跑）场景仍由 OSS 生命周期规则兜底——诚实边界。
+- **K75.3 一行级批**：open_writer 幂等 create_dir_all（防御）；setup_http_client 补 IPv4 绑定（K18 对齐——向导与驱动在 IPv6-preferring 网络行为一致）；conformance 临时目录 tempfile 化（H-T1 同族）；doctor 两臂 22/18 连续字面空格改 `\` 续行 + `_cfg_marker`/`let _ = &mut st` debris 清除。
+- **K75.4 裁决不修（查证支撑，非省事）**：①OSS status=0 不进 retryable——`upload_queue::decide_retry` 对任何错误按退避梯重试，标签不影响行为；②多卷 limiter 相加——4rps 实测余量足够，跨卷共享的结构改动不买行为；③callback 响应体丢弃——resolve_new_row 兜底；④桩面三条——分别有真机未现/双覆盖/纯函数钉；⑤真 kill 形态——K75.2 已消解主危害；⑥https-loopback——无消费方；⑦lib.rs:6836 WebClient hint 空格——非 pan115 面。
+- **K75.5 验证**：ck-pan115 78/0（+2 红→绿用例）；workspace 全量/clippy/fmt/layers/secrets 五门禁绿（数字见 AGENTS）。回滚随分支。

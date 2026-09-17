@@ -59,6 +59,17 @@ struct Vfs {
     cdn_base: String,
     /// CDN 忽略 Range（返回 200 全量——写偏防线的负例注入）
     cdn_ignore_range: bool,
+    /// 最近一次 ufile/delete 收到的 parent_id 原始值（M-S1 的观测面：
+    /// 句柄 parent 段必须把真实父 cid 送到 API——空形态真机未验）
+    last_delete_parent: String,
+    /// CDN GET 返 410（直链过期形态）的预算——每发一次消耗一次（M-S3
+    /// 的注入面：耗尽后 GET 恢复正常 = 「重取直链后可用」的模拟）
+    cdn_gone_budget: u32,
+    /// downurl 调用计数（M-S3 断言面：自愈必须重取直链）
+    downurl_calls: u32,
+    /// ufile/move 传输失败注入（K75-1：返回 502 + 非 JSON 体——网络/网关
+    /// 错形态；rename 的错误映射不得把它误报成目标占用）
+    move_transport_fail: bool,
 }
 
 impl Vfs {
@@ -304,6 +315,7 @@ async fn ufile_delete(State(vfs): State<Arc<Mutex<Vfs>>>, body: String) -> Respo
         .get("parent_id")
         .cloned()
         .unwrap_or_else(|| "0".to_string());
+    vfs.last_delete_parent = parent.clone();
     let Some(node) = vfs.nodes.get(&fid).cloned() else {
         return err_json(430004, "文件不存在");
     };
@@ -346,11 +358,21 @@ async fn ufile_move(State(vfs): State<Arc<Mutex<Vfs>>>, body: String) -> Respons
     let form = parse_form(&body);
     let mut vfs = vfs.lock().unwrap();
     vfs.api_calls += 1;
+    // K75-1 注入：传输/网关错形态（502 + HTML 错误页——非 JSON 信封，
+    // 驱动侧归 Unavailable）。
+    if vfs.move_transport_fail {
+        return Response::builder()
+            .status(502)
+            .body(Body::from("<html>bad gateway</html>"))
+            .unwrap();
+    }
     let fid = form.get("file_ids").cloned().unwrap_or_default();
-    let to = form
-        .get("to_pid")
-        .cloned()
-        .unwrap_or_else(|| "0".to_string());
+    // SDK 文档形态（115-sdk-go MoveReq：file_ids + to_cid）——真机实证
+    // （2026-09-17）：to_pid 形态被后端静默接受但移动不生效（索引孤儿：
+    // get_info 活着、源/目标两个 list 都不可见）。桩按文档严格建模。
+    let Some(to) = form.get("to_cid").cloned() else {
+        return err_json(701000, "参数错误：缺少 to_cid");
+    };
     let Some(node) = vfs.nodes.get(&fid).cloned() else {
         return err_json(430004, "文件不存在");
     };
@@ -375,8 +397,8 @@ async fn ufile_move(State(vfs): State<Arc<Mutex<Vfs>>>, body: String) -> Respons
 
 async fn ufile_downurl(State(vfs): State<Arc<Mutex<Vfs>>>, body: String) -> Response {
     let form = parse_form(&body);
-    let vfs = vfs.lock().unwrap();
-    vfs.api_calls.clone_into(&mut { 0 }); // no-op 读取（保持锁语义）
+    let mut vfs = vfs.lock().unwrap();
+    vfs.downurl_calls += 1;
     let pc = form.get("pick_code").cloned().unwrap_or_default();
     if !vfs.nodes.values().any(|n| n.pick_code == pc) {
         return err_json(430004, "pick_code 无效");
@@ -419,15 +441,23 @@ async fn cdn_get(
     AxPath(pc): AxPath<String>,
     headers: HeaderMap,
 ) -> Response {
-    let (node, ignore_range, force_403) = {
-        let vfs = vfs.lock().unwrap();
+    let (node, ignore_range, force_403, gone) = {
+        let mut vfs = vfs.lock().unwrap();
+        let gone = vfs.cdn_gone_budget > 0;
+        if gone {
+            vfs.cdn_gone_budget -= 1;
+        }
         let force = vfs.cdn_403;
         let ignore = vfs.cdn_ignore_range;
         let node = vfs.nodes.values().find(|n| n.pick_code == pc).cloned();
-        (node, ignore, force)
+        (node, ignore, force, gone)
     };
     if force_403 {
         return (StatusCode::FORBIDDEN, "rate limited").into_response();
+    }
+    if gone {
+        // 直链过期形态（真机 K69.4 注记的 401/410 族——这里用 410 Gone）
+        return (StatusCode::GONE, "link expired").into_response();
     }
     let Some(node) = node else {
         return (StatusCode::NOT_FOUND, "no such pick_code").into_response();
@@ -726,6 +756,94 @@ async fn delete_uses_composite_handle_and_second_delete_is_not_found() {
 }
 
 #[tokio::test]
+async fn mkdir_after_delete_reuses_the_freed_name() {
+    let mut vfs = Vfs::new();
+    let a = vfs.mkdir("0", "a");
+    vfs.put_file(&a, "doomed.txt", b"bye".to_vec());
+    let mock = Mock::start(vfs).await;
+    let drv = mock.driver();
+
+    // stat 喂路径缓存（该目录已列过）→ 句柄 delete → 同名 mkdir：缓存
+    // 里的 ghost 行不得让 mkdir 误报 Exists（审查 M-S1——句柄 parent 段
+    // 恒空使 delete 的 invalidate("") 成为 no-op）。
+    let e = drv.stat(&path("/a/doomed.txt")).await.expect("stat");
+    drv.delete(&e.id).await.expect("delete");
+    drv.mkdir(&path("/a/doomed.txt"))
+        .await
+        .expect("the freed name is mkdir-able again");
+
+    // delete API 的 parent_id 必须是真实父 cid（spike 真机形态；空串
+    // 形态真机从未验证过——句柄 parent 段修复的 API 面）。
+    let seen_parent = mock.vfs.lock().unwrap().last_delete_parent.clone();
+    assert_eq!(
+        seen_parent, a,
+        "delete parent_id carries the real parent cid"
+    );
+}
+
+/// M-S4：rename 的目标存在预检不得只看缓存——目标父目录本进程未列过
+/// 时必须现列预检（mkdir 同款纪律）。跨目录 rename 到冷目录曾直接
+/// 穿透到 move/update，trait 契约的 Exists 语义丢失（同父场景由源
+/// resolve 顺带喂缓存而侥幸成立）。
+/// K75-1：跨父 rename 的 move 腿遇**传输类失败**（502/非 JSON——映射为
+/// Unavailable）时不得误报 `Exists`——「目标已占用」是数据面判断，只有
+/// 后端明确拒绝（如 430001 同名）才成立；网络错说成目标占用会把用户
+/// 引向覆盖操作。
+#[tokio::test]
+async fn rename_reports_transport_failure_as_is_not_exists() {
+    let mut vfs = Vfs::new();
+    let d1 = vfs.mkdir("0", "srcdir");
+    vfs.mkdir("0", "dst");
+    vfs.put_file(&d1, "a.txt", b"aaa".to_vec());
+    vfs.move_transport_fail = true; // move 请求 502（网络/网关形态）
+    let mock = Mock::start(vfs).await;
+    let drv = mock.driver();
+
+    let err = drv
+        .rename(&path("/srcdir/a.txt"), &path("/dst/b.txt"))
+        .await
+        .expect_err("the move must fail");
+    assert!(
+        !matches!(err, cloudkit_storage::StorageError::Exists),
+        "a transport failure must not masquerade as an occupied target: {err:?}"
+    );
+    // 源文件原位未动（move 从未生效）
+    let still = drv
+        .stat(&path("/srcdir/a.txt"))
+        .await
+        .expect("source untouched");
+    assert_eq!(still.size, 3);
+}
+
+#[tokio::test]
+async fn rename_into_a_cold_directory_prechecks_the_target() {
+    let mut vfs = Vfs::new();
+    let d1 = vfs.mkdir("0", "srcdir");
+    let d2 = vfs.mkdir("0", "dst");
+    vfs.put_file(&d1, "a.txt", b"aaa".to_vec());
+    vfs.put_file(&d2, "b.txt", b"bbb".to_vec());
+    let mock = Mock::start(vfs).await;
+    let drv = mock.driver();
+
+    // dst 目录从未被本驱动列过（resolve 源路径只喂了 root 与 srcdir）
+    let err = drv
+        .rename(&path("/srcdir/a.txt"), &path("/dst/b.txt"))
+        .await
+        .expect_err("an occupied target must be refused with Exists");
+    assert!(
+        matches!(err, cloudkit_storage::StorageError::Exists),
+        "{err:?}"
+    );
+
+    // 穿透会造成数据面破坏——源文件必须原位未动
+    let still = drv
+        .stat(&path("/srcdir/a.txt"))
+        .await
+        .expect("source untouched");
+    assert_eq!(still.size, 3);
+}
+
+#[tokio::test]
 async fn rename_file_same_parent_updates_in_place() {
     let mut vfs = Vfs::new();
     vfs.put_file("0", "old.txt", b"content".to_vec());
@@ -914,6 +1032,31 @@ async fn reader_maps_cdn_403_to_rate_limited() {
         }
     }
     assert!(saw_rate_limit, "CDN 403 classifies as RateLimited");
+}
+
+/// M-S3：直链中途过期（CDN 410）必须自愈——失效缓存、重取直链、续传
+/// 剩余字节。模块文档声明的「401/410 → 重取直链一次」曾只对 403 生效：
+/// 长流在 30min TTL 假设之外会硬死（Unavailable 直接杀死流）。
+#[tokio::test]
+async fn reader_self_heals_a_mid_stream_link_expiry() {
+    let mut vfs = Vfs::new();
+    let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+    vfs.put_file("0", "stream.bin", payload.clone());
+    vfs.cdn_gone_budget = 1; // 首个 CDN GET 返 410（直链过期形态）
+    let mock = Mock::start(vfs).await;
+    let drv = mock.driver();
+    let entry = drv.stat(&path("/stream.bin")).await.expect("stat");
+
+    let mut stream = drv.reader(&entry.id, None).await.expect("stream opens");
+    use futures_util::StreamExt;
+    let mut got: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        got.extend_from_slice(&chunk.expect("the healed stream keeps serving bytes"));
+    }
+    assert_eq!(got, payload, "the stream survives a mid-flight link expiry");
+
+    let calls = mock.vfs.lock().unwrap().downurl_calls;
+    assert!(calls >= 2, "the driver refetched the dlink (got {calls})");
 }
 
 #[tokio::test]

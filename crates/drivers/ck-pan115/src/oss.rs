@@ -590,6 +590,29 @@ pub async fn complete_multipart(
     Ok((status, body))
 }
 
+/// DELETE `?uploadId` —— AbortMultipartUpload：释放未 complete 的分片
+/// 会话（K75-2：OSS 对未 complete 的 multipart **保留分片并计配额**——
+/// 放弃上传而不 abort 就是远端资源泄漏）。成功响应体通常为空，原样返回。
+pub async fn abort_multipart(
+    client: &reqwest::Client,
+    ctx: &OssCtx,
+    upload_id: &str,
+) -> Result<String, OssError> {
+    let (_s, _h, body) = oss_execute(
+        client,
+        ctx,
+        OssRequest {
+            verb: "DELETE",
+            params: vec![("uploadId", upload_id.to_string())],
+            content_type: None,
+            body: Vec::new(),
+            callback: None,
+        },
+    )
+    .await?;
+    Ok(body)
+}
+
 /// 纯函数层的测试观测面（lib.rs 单测引用——签名输入构造/编码/XML
 /// 工具是 TDD 钉死的防回归面）。
 #[cfg(test)]
