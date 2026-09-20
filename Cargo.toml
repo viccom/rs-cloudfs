@@ -26,6 +26,7 @@ exclude = [
     "crates/vendor/grammers-session",
     "examples/baidu_spike",
     "examples/pan115_spike",
+    "examples/pan123_spike",
 ]
 
 [workspace.package]
