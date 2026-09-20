@@ -26,6 +26,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::extract::{Query, State};
 use axum::http::HeaderMap;
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -44,6 +45,9 @@ struct MockState {
     poll_queue: std::collections::VecDeque<Value>,
     /// wx_code 应答（None = 未挂路由形态由默认 404 承担；Some("") 空）。
     wx_code: Option<String>,
+    /// generate 端点的原始应答注入（M2/K78：HTTP 状态 + 原文 body——
+    /// 钉 read_envelope 的 2xx 成功门）。
+    generate_raw: Option<(u16, String)>,
     recorded: Vec<Recorded>,
 }
 
@@ -88,6 +92,11 @@ impl MockLogin {
         self.state.lock().unwrap().wx_code = Some(code.to_string());
     }
 
+    /// M2/K78：注入 generate 端点的原始应答（HTTP 状态 + 原文 body）。
+    fn set_generate_raw(&self, status: u16, body: &str) {
+        self.state.lock().unwrap().generate_raw = Some((status, body.to_string()));
+    }
+
     fn recorded(&self) -> Vec<Recorded> {
         self.state.lock().unwrap().recorded.clone()
     }
@@ -121,14 +130,23 @@ fn record(state: &Arc<Mutex<MockState>>, headers: &HeaderMap, path: &str, query:
 async fn qr_generate(
     State(state): State<Arc<Mutex<MockState>>>,
     headers: HeaderMap,
-) -> (axum::http::StatusCode, Json<Value>) {
+) -> axum::response::Response {
     record(&state, &headers, "generate", "", "");
+    let raw = state.lock().unwrap().generate_raw.take();
+    if let Some((status, body)) = raw {
+        return axum::http::Response::builder()
+            .status(axum::http::StatusCode::from_u16(status).expect("injectable status"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .expect("raw injectable response");
+    }
     (
         axum::http::StatusCode::OK,
         Json(
             json!({"code": 0, "data": {"uniID": "mock-uni-id", "url": "https://www.123pan.com/wx-app-login.html?uniID=mock-uni-id"}}),
         ),
     )
+        .into_response()
 }
 
 async fn qr_result(
@@ -408,4 +426,24 @@ async fn sign_in_pins_the_wire_form_and_persists_on_first_save() {
         StorageError::Invalid,
         "400 parameter-class rejections are Invalid (123-2 errno table)"
     );
+}
+
+/// M2（K78）：`read_envelope` 的 2xx 成功门——HTTP 403 + `code:0` 信封
+/// （网关把拒绝写成成功形态）→ `Unavailable`，不得产出会话。
+#[tokio::test]
+async fn generate_over_non_2xx_with_an_ok_envelope_is_unavailable() {
+    let mock = MockLogin::start().await;
+    mock.set_generate_raw(403, r#"{"code":0,"data":{"uniID":"x","url":"https://x/"}}"#);
+    let http = MockLogin::http();
+
+    let err = oauth::qr_generate(&http, &mock.base)
+        .await
+        .expect_err("the HTTP gate must reject a non-2xx success envelope");
+    match err {
+        StorageError::Unavailable(detail) => {
+            assert!(detail.contains("403"), "carries the HTTP status: {detail}");
+            assert!(detail.contains("generate"), "carries the stage: {detail}");
+        }
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
 }

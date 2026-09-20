@@ -9,6 +9,9 @@
 //! - **envelope 终态错误**：`Unauthorized`（20101——K76.4 契约级禁
 //!   重试）与 `RateLimited`（5113/5114——D5 不绕过）**恒不重试**
 //!   （恰一次请求）；
+//! - **提交点不重试（M1/K78）**：非幂等提交端点（upload_complete/v2
+//!   族）注入 5xx → 恰一次请求 + 终态上抛（双应用防护）；幂等面
+//!   （GET/`user_info`）同注入下维持重试——边界钉死；
 //! - **退避等待真实发生**（重试之间有时间间隔——非忙重试）；
 //! - 生产缺省常量钉死（§5.15：限流 6 / 普通 3 / Retry-After clamp
 //!   1–60s / 退避封顶 30s）。
@@ -18,11 +21,11 @@ use std::time::{Duration, Instant};
 
 use axum::extract::State;
 use axum::http::StatusCode;
-use axum::routing::get;
+use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
 
-use ck_pan123::api::{Pan123Client, RetryConfig};
+use ck_pan123::api::{Pan123Client, RetryConfig, UploadTicket};
 use cloudkit_storage::StorageError;
 
 const TOKEN: &str = "mock-token-0123456789abcdef";
@@ -56,6 +59,7 @@ impl Mock {
                 get(|| async { Json(json!({"code":0,"data":{"domains":[]}})) }),
             )
             .route("/b/api/user/info", get(user_info))
+            .route("/b/api/file/upload_complete/v2", post(upload_complete_v2))
             .with_state(state.clone());
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
             .await
@@ -102,6 +106,31 @@ async fn user_info(State(state): State<Arc<Mutex<MockState>>>) -> axum::response
         .header("content-type", "application/json")
         .body(axum::body::Body::from(
             r#"{"code":0,"message":"ok","data":{"UID":7}}"#,
+        ))
+        .unwrap()
+}
+
+/// 提交点端点（upload_complete/v2）的 fail-first 腿（M1/K78 用例）——
+/// 与 user_info 同款注入语义，请求计数共享同一 `requests` 序列。
+async fn upload_complete_v2(
+    State(state): State<Arc<Mutex<MockState>>>,
+) -> axum::response::Response {
+    let mut st = state.lock().unwrap();
+    st.requests.push(Instant::now());
+    if st.fail_first > 0 {
+        st.fail_first -= 1;
+        let mut builder =
+            axum::http::Response::builder().status(StatusCode::from_u16(st.status).unwrap());
+        if let Some(ra) = st.retry_after {
+            builder = builder.header("retry-after", ra.to_string());
+        }
+        return builder.body(axum::body::Body::empty()).unwrap();
+    }
+    axum::http::Response::builder()
+        .status(StatusCode::OK)
+        .header("content-type", "application/json")
+        .body(axum::body::Body::from(
+            r#"{"code":0,"data":{"file_info":{"FileId":11,"FileName":"ok","Type":0,"Size":1}}}"#,
         ))
         .unwrap()
 }
@@ -262,4 +291,49 @@ fn production_retry_constants_are_pinned() {
     assert_eq!(cfg.backoff_cap, Duration::from_secs(30), "backoff cap 30s");
     assert_eq!(cfg.retry_after_min, Duration::from_secs(1));
     assert_eq!(cfg.retry_after_max, Duration::from_secs(60));
+}
+
+// ------------------------------------------- M1（K78）提交点不重试通道 ---
+
+/// M1（K78）：提交点（upload_complete/v2）注入 5xx → **恰一次请求** +
+/// 终态上抛——重试会把「响应丢失但服务端已入库」放大成双应用假失败
+/// （第一次已消费会话，重放报错 → 挂载面误报「写入失败」）。
+#[tokio::test]
+async fn commit_point_5xx_is_a_single_attempt_without_retry() {
+    let mock = Mock::start(1, 503, None).await;
+    let client = mock.client();
+    let ticket = UploadTicket {
+        up_file_id: 1,
+        bucket: "mock-bucket".into(),
+        key: "mock-key".into(),
+        upload_id: "mock-upload".into(),
+        storage_node: "mock-node".into(),
+        slice_size: None,
+    };
+    let err = client
+        .upload_complete_v2(&ticket, 1)
+        .await
+        .expect_err("commit points surface the failure terminally");
+    match &err {
+        StorageError::Unavailable(detail) => {
+            assert!(detail.contains("503"), "carries the status: {detail}");
+            assert!(
+                detail.contains("upload_complete/v2"),
+                "carries the stage: {detail}"
+            );
+        }
+        other => panic!("5xx single-shot is Unavailable, got {other:?}"),
+    }
+    assert_eq!(mock.requests().len(), 1, "commit points never retry");
+}
+
+/// M1 对照腿：同注入（fail_first=1 / 503）下 GET 面（user_info）维持
+/// 可重试——钉「只有提交点不重试」的边界（重试收益只让给幂等面）。
+#[tokio::test]
+async fn the_get_face_keeps_retrying_under_the_same_injection() {
+    let mock = Mock::start(1, 503, None).await;
+    let client = mock.client();
+    let info = client.user_info().await.expect("recovers on retry");
+    assert_eq!(info.uid, 7);
+    assert_eq!(mock.requests().len(), 2, "the retryable face retries");
 }

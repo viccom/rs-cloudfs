@@ -20,6 +20,14 @@
 //!   （PUT 命中差分是能力位⑦的驱动层可观测证据）；
 //! - **会话失效**（ListParts NoSuchKey）→ 重走 upload_request 全量重传
 //!   恰一次；仍失效 → `Io`（不自陷循环）；
+//! - **close 对未确认态复核**（M8/K78）：write 在④步中途失败后吞错
+//!   close → 未过⑤确认的传输态先复跑「对账+补缺」再进 ⑥⑦（只补
+//!   缺片、远端逐字节——缺片盲信 = 半截数据被报成功）；
+//! - **⑦ v2 失败腿**（M12/K78）：v2 终态失败（单次通道不重试）→
+//!   会话已被 ⑥ 消费，第二腿 SessionGone → re-request 新会话**全量
+//!   重传**（差集不可能——假失败的干净恢复出路）；
+//! - **分片 PUT 429**（M10b/K78）：限流类重试消化注入（尝试数 =
+//!   分片+注入数）与超预算耗尽（`RateLimited`）两腿；
 //! - **size 校验**：/v2 回的 file_info.size 与本地 spool 不符 → 报错
 //!   不静默（数据完整性纪律）；
 //! - **etag 恒真 MD5**：桩对空 etag 回 400「请输入Etag」（真形态）——
@@ -383,6 +391,149 @@ async fn session_gone_twice_is_an_io_error_not_a_loop() {
     assert_eq!(s.put_hits_total(), 0, "nothing was PUT into a dead session");
 }
 
+// ------------------------------------------- 未确认态复核 / v2 失败腿 ---
+
+/// M8（K78 Round C）：write() 在④步中途失败（部分分片已传、⑤确认未过）
+/// 后调用方吞错继续 close()——close 不得盲信部分传输态直接进 ⑥⑦：
+/// 缺片 complete 的服务端真形未实证，桩 v2 按会话**声称 size** 落库
+/// （size 校验对缺片失防），盲信 = 半截数据被报成功。修复语义：未过
+/// ⑤确认的传输态先复跑「对账+补缺」（与 resume 差集同一逻辑）——
+/// 只补缺片、远端逐字节完整。
+#[tokio::test]
+async fn close_reconciles_a_transfer_that_failed_midway() {
+    let s = stub().await;
+    {
+        let mut st = s.state.lock().unwrap();
+        st.put_fail_after_parts = 1; // 第 1 片落地后位置故障（恒 5xx）
+    }
+    let driver = s.driver();
+    let data = content(6 * 1024 * 1024, 0xB3); // 两片（5MiB 客户端定值）
+    let p = path("midfail.bin");
+
+    let mut stager = driver
+        .writer(
+            &p,
+            &WriteHint {
+                size: Some(data.len() as u64),
+                content_hash: None,
+                rapid_upload: false,
+            },
+        )
+        .await
+        .expect("writer");
+    // 第一腿：到齐即传在④步中途失败（part 2 重试预算耗尽后上抛，
+    // part 1 已落地）。
+    let err = stager
+        .write(&data)
+        .await
+        .expect_err("the eager transfer fails midway through the PUT stage");
+    assert!(matches!(err, StorageError::Unavailable(_)), "{err:?}");
+    assert_eq!(s.hits("/put:1"), 1, "part 1 landed exactly once");
+    assert_eq!(s.hits("/put:2"), 4, "part 2 exhausted the 3-retry budget");
+
+    // 调用方吞错后提交。位置故障是瞬态的——旋钮解除（conformance
+    // 差集用例同款形态：故障只在第一腿存在）。
+    s.state.lock().unwrap().put_fail_after_parts = 0;
+    let entry = stager
+        .close()
+        .await
+        .expect("close reconciles the unconfirmed partial state");
+    assert_eq!(entry.size, data.len() as u64);
+
+    // 远端内容逐字节完整——修复前这里是「close 成功 + 半截数据」
+    // （桩 v2 回声称 size 骗过 size 校验，远端只有 part 1 的 5MiB）。
+    let round = read_all(&driver, &p).await;
+    assert_eq!(
+        round, data,
+        "remote content is complete after the reconcile"
+    );
+
+    // 只补缺片：close 阶段新增 PUT 恰一次（part 2），part 1 零重传。
+    assert_eq!(s.hits("/put:1"), 1);
+    assert_eq!(s.hits("/put:2"), 5);
+    // 复核插在 ⑥ 之前：list→repare→补片→再 list 确认，然后才提交族。
+    assert_eq!(
+        s.seq(),
+        vec![
+            "/b:upload_request",
+            "/b:list_parts",
+            "/b:repare",
+            "/put:1",
+            // part 2 的 4 次失败尝试（touch 逐命中记录）。
+            "/put:2",
+            "/put:2",
+            "/put:2",
+            "/put:2",
+            // close 的复核腿（M8 修复新增）。
+            "/b:list_parts",
+            "/b:repare",
+            "/put:2",
+            "/b:list_parts",
+            // 提交族。
+            "/b:s3_complete",
+            "/b:complete_v2",
+        ],
+        "the reconcile leg runs before the commit family"
+    );
+}
+
+/// M12（K78 Round C）：⑦ upload_complete/v2 失败腿（`v2_fail_times`
+/// 死旋钮激活）。第一腿 v2 code=5000 → close Err；重开 writer 同路径
+/// 同内容 → establish_session 走「本地记录 → list → **SessionGone**
+/// （⑥ s3_complete 已把会话标记消费）→ 清记录 → re-request」。
+/// re-request 按桩的 123-5 规则（任一分片已传后重发恒铸**新会话**）
+/// 拿到零片新会话 → **全量重传**。⑦ 失败无法差集：会话已被 ⑥ 消费，
+/// 旧 tuple 的分片 list 恒 NoSuchKey——这正是 v2 单次通道（不重试，
+/// 重放即双应用）「假失败 + 干净恢复」自愈故事的桩面钉。
+#[tokio::test]
+async fn v2_failure_recovers_via_a_fresh_full_retransmit() {
+    let s = stub().await;
+    {
+        let mut st = s.state.lock().unwrap();
+        st.v2_fail_times = 1; // 第一腿⑦失败
+    }
+    let driver = s.driver();
+    let data = content(6 * 1024 * 1024, 0x64); // 两片——重传量可观测
+    let p = path("v2fail.bin");
+
+    // 第一腿：①–⑥ 全过（会话被⑥消费），⑦ code=5000 终态上抛
+    // （单次通道不重试）。
+    let err = write_and_close(&driver, &p, &data, 1024 * 1024)
+        .await
+        .expect_err("the first leg fails at upload_complete/v2");
+    assert!(matches!(err, StorageError::Unavailable(_)), "{err:?}");
+    assert_eq!(
+        s.hits("/b:s3_complete"),
+        1,
+        "leg 1 consumed the session via step 6"
+    );
+    assert_eq!(s.hits("/b:complete_v2"), 1);
+    assert_eq!(s.put_hits_total(), 2, "leg 1 PUT both parts");
+    assert!(
+        matches!(driver.stat(&p).await, Err(StorageError::NotFound)),
+        "nothing lands while v2 fails"
+    );
+
+    // 第二腿：SessionGone → 清记录 → re-request 恰一次 → 新会话
+    // 全量重传（差集不可能：旧 tuple 已消费）→ 提交成功。
+    let entry = write_and_close(&driver, &p, &data, 1024 * 1024)
+        .await
+        .expect("the second leg recovers");
+    assert_eq!(entry.size, data.len() as u64);
+    assert_eq!(
+        s.hits("/b:upload_request"),
+        2,
+        "exactly one re-request on the second leg"
+    );
+    assert_eq!(
+        s.put_hits_total(),
+        4,
+        "the fresh session retransmits both parts in full (no differential is possible)"
+    );
+    let round = read_all(&driver, &p).await;
+    assert_eq!(round, data);
+}
+
 // --------------------------------------------------- 完整性 ---
 
 /// size 校验：/v2 回的 file_info.size 与本地不符 → 报错不静默（数据
@@ -456,6 +607,50 @@ async fn part_put_retries_through_injected_5xx() {
     assert_eq!(s.hits("/put:1"), 3);
     let round = read_all(&driver, &path("retry.bin")).await;
     assert_eq!(round, data);
+}
+
+/// 分片 PUT 的 429 限流重试（§5.15 限流类：预算 6、`Retry-After` 头
+/// 优先 clamp）——M10b：注入 2 次 429 被消化，上传成功，PUT 尝试数 =
+/// 分片数 + 2（桩 `RetryConfig::fast()` 把 Retry-After clamp 到毫秒级，
+/// 真实退避是 50ms 非真睡 1s）。
+#[tokio::test]
+async fn part_put_rides_through_injected_429s() {
+    let s = stub().await;
+    {
+        let mut st = s.state.lock().unwrap();
+        st.put_429_times = 2; // 首两击 429 + Retry-After: 1
+    }
+    let driver = s.driver();
+    let data = content(1024 * 1024, 0x3D);
+
+    let entry = write_and_close(&driver, &path("limited.bin"), &data, 256 * 1024)
+        .await
+        .expect("retries ride through the injected 429s");
+    assert_eq!(entry.size, data.len() as u64);
+    assert_eq!(s.hits("/put:1"), 3, "1 part + 2 rejected attempts");
+    let round = read_all(&driver, &path("limited.bin")).await;
+    assert_eq!(round, data);
+}
+
+/// 429 超预算（§5.15 限流类 ≤6）：注入 7 次 → 重试 6 次后耗尽上抛
+/// `RateLimited`，PUT 尝试 = 分片 + 6；提交族零命中（耗尽腿）。
+#[tokio::test]
+async fn part_put_429_budget_exhaustion_is_rate_limited() {
+    let s = stub().await;
+    {
+        let mut st = s.state.lock().unwrap();
+        st.put_429_times = 7; // 超过 limited_max=6 的预算
+    }
+    let driver = s.driver();
+    let data = content(1024 * 1024, 0x4E);
+
+    let err = write_and_close(&driver, &path("exhausted.bin"), &data, 256 * 1024)
+        .await
+        .expect_err("the limited budget is finite");
+    assert!(matches!(err, StorageError::RateLimited { .. }), "{err:?}");
+    assert_eq!(s.hits("/put:1"), 7, "1 part + 6 limited retries");
+    assert_eq!(s.hits("/b:s3_complete"), 0, "no commit after exhaustion");
+    assert_eq!(s.hits("/b:complete_v2"), 0);
 }
 
 /// 隐式父目录：writer 目标父目录缺失 → 逐级隐式创建（mkdir /a/ 面）。

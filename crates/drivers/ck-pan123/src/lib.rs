@@ -330,6 +330,37 @@ fn name_is_addressable(name: &str) -> bool {
     !name.is_empty() && !name.contains('\\') && !name.contains('\u{0}')
 }
 
+/// 跨父 rename 改名腿失败后的错误文案面（M11）：`file/mod_pid` 已
+/// 生效——文件已移至目标父目录但**保留旧名**（旧路径 resolve
+/// NotFound、新名不可见的「消失」假象实为移位）。追加部分变更事实
+/// 与可行动出路（在目标目录下用旧名重试 rename）。
+///
+/// 错误大类纪律：只动**载荷型**变体（`Io`/`Unavailable`——同形拼接、
+/// 保留原始错误文本）；契约类变体（`Exists`/`NotFound`/`Invalid`/
+/// `Unauthorized` 等）无载荷且语义不可动——原样透传，部分变更事实经
+/// warn 通道补观（R2 双通道先例）。
+fn partial_move_error(e: StorageError, old_name: &str, dst_parent: &RelPath) -> StorageError {
+    let hint = format!(
+        "partial move: file/mod_pid already moved the file to '{}' but the rename leg \
+         failed; it keeps its old name '{}' there — retry rename from that location",
+        dst_parent.as_str(),
+        old_name
+    );
+    match e {
+        StorageError::Io(msg) => StorageError::Io(format!("{msg}; {hint}")),
+        StorageError::Unavailable(msg) => StorageError::Unavailable(format!("{msg}; {hint}")),
+        other => {
+            tracing::warn!(
+                target: "ck_pan123::rename",
+                %hint,
+                error = %other,
+                "cross-parent rename failed after mod_pid (contract-class error kept as-is)"
+            );
+            other
+        }
+    }
+}
+
 #[async_trait]
 impl StorageDriver for Pan123Driver {
     fn volume(&self) -> &VolumeId {
@@ -523,6 +554,8 @@ impl StorageDriver for Pan123Driver {
     /// - 同父改名：`file/rename`（**文件与目录同端点**——任务 0 真机
     ///   实证目录可用：同 FileId、Type 保持、list 回读新名）；
     /// - 跨父移动：`file/mod_pid`（pan123-rs wire 形态）+ 按需改名；
+    ///   改名腿失败 = 部分变更（文件已在目标父、保留旧名）——文案
+    ///   明示 + 不回滚（[`partial_move_error`]，M11）；
     /// - 预检目标存在 → `Exists`（冷目录现列预检——M-S4 同源纪律）；
     ///   目标在源之下 → `Invalid`（契约）。
     async fn rename(&self, from: &RelPath, to: &RelPath) -> Result<(), StorageError> {
@@ -564,7 +597,21 @@ impl StorageDriver for Pan123Driver {
         }
         // 改名腿（同父改名或跨父后改名；名字已同则跳过）。
         if src_row.file_name != to_name {
-            self.client.rename(src_row.file_id, &to_name).await?;
+            if let Err(e) = self.client.rename(src_row.file_id, &to_name).await {
+                // 跨父时 mod_pid 已生效：源父缓存已无此行、目标父缓存
+                // 少了旧名行——两父级与成功路径同一失效面，失败也不例外
+                //（否则过期缓存把新位置藏掉，重试 rename/stat 全瞎）。
+                self.paths.invalidate(&src.parent_cid).await;
+                if !same_parent {
+                    self.paths.invalidate(&dst.cid).await;
+                    // M11：两步非原子的部分变更面——文件已移至目标父
+                    // 目录但保留旧名（旧路径 NotFound、新名不可见的
+                    // 「消失」假象）。**不回滚**（回滚自身也可能失败，
+                    // 把状态搞得更糟）；文案明示实情 + 可行动出路。
+                    return Err(partial_move_error(e, &src_row.file_name, &dst_parent));
+                }
+                return Err(e);
+            }
         }
         // 结构变更：两个父级都失效（同父时同一个）。
         self.paths.invalidate(&src.parent_cid).await;

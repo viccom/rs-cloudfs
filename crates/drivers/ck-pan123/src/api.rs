@@ -10,6 +10,11 @@
 //! `code==200` 仅认证类成功（sign_in 与 QR 确认态——唯一非 0 成功码）。
 //! [`Envelope::is_ok`] 只认 0；认证面（[`Envelope::is_auth_ok`]）加认
 //! 200。非 JSON 响应（HTML 错误页/空体）→ `Unavailable`，serde 不崩穿。
+//! `code` 键**必填**——缺键的 JSON（网关 `{"error":"forbidden"}`）落
+//! 终态 `Unavailable`，不经缺省 0 吞成成功（M2/K78）；成功判定带
+//! **HTTP 门**：envelope 成功但 HTTP 非 2xx → `Unavailable`（envelope
+//! 显式错误码仍走 errno 映射——真机 user/info 面 = HTTP 401 + envelope
+//! 401 → `Unauthorized`）。
 //!
 //! ## 错误分类表（R2；123-1 认证面 + 123-2 读写面扩充）
 //!
@@ -31,6 +36,11 @@
 //!   30s + 抖动；限流类（HTTP 429）重试 ≤6、普通错误（传输/5xx）≤3；
 //!   envelope 终态错误（`Unauthorized`/`RateLimited`/映射表错误）与
 //!   非 JSON 体**恒不重试**；
+//! - **提交点不重试**（M1/K78）：非幂等提交端点（upload_complete/v2、
+//!   s3_complete、trash）走 [`Pan123Client::dispatch_post_json_single`]
+//!   单次尝试通道——传输/可重试 HTTP 形态一律终态上抛（重放已受理的
+//!   提交 = 双应用假失败）；域名 failover 的连接级重放保留（请求未
+//!   发出，安全）；
 //! - **域名粘性 fallback**（§5.17）：主域连接错误 → 备域重放恰一次
 //!   （会话级粘性，不回切）。
 //!
@@ -87,15 +97,26 @@ pub(crate) fn mask(secret: &str) -> String {
     }
 }
 
+/// 截断 + 掩码的诊断片段（R3：错误页/网关体可能回显请求头中的
+/// token——先换成掩码再入错误文本；与 [`mask`] 同一防线）。
+fn masked_snippet(body: &str, token: &str) -> String {
+    let snippet: String = body.chars().take(200).collect();
+    snippet.replace(token, &mask(token))
+}
+
 // ---------------------------------------------------------------------------
 // envelope
 // ---------------------------------------------------------------------------
 
 /// 统一响应信封（顶层键双拼：`code/Code`、`message/Message`、
 /// `data/Data`——123-0 真机实证的代际混拼形态）。
+///
+/// `code` 键**必填**（M2/K78）：无 `code` 键的 JSON（网关/WAF 的
+/// `{"error":"forbidden"}`）不得经缺省 0 吞成成功——解析失败落终态
+/// `Unavailable`；`message`/`data` 的缺省容错保留。
 #[derive(Debug, Clone, Deserialize)]
 pub struct Envelope {
-    #[serde(default, alias = "Code")]
+    #[serde(alias = "Code")]
     pub code: i64,
     #[serde(default, alias = "Message")]
     pub message: String,
@@ -169,8 +190,13 @@ impl Envelope {
     }
 }
 
-/// 响应体 → 信封（非 JSON → `Unavailable`，载荷不回显 body——错误页
-/// 可能回显请求头片段；携带 HTTP 状态与长度供诊断）。
+/// 响应体 → 信封（非 JSON / 缺 `code` 键 → `Unavailable`，载荷不回显
+/// body——错误页可能回显请求头片段；携带 HTTP 状态与长度供诊断）。
+///
+/// M2（K78）成功门：envelope 声称成功（业务/认证任一脸）但 HTTP 非
+/// 2xx → `Unavailable`——网关把拒绝写成 `code:0/200` 形态时不误判
+/// 成功；envelope 显式错误码（401/20101 等）不受门影响，仍由调用方
+/// 走 errno 映射（真机 user/info 面 = HTTP 401 + envelope 形态）。
 pub(crate) async fn read_envelope(
     resp: reqwest::Response,
     stage: &'static str,
@@ -180,11 +206,24 @@ pub(crate) async fn read_envelope(
         StorageError::Unavailable(format!("{stage} body read: {}", e.without_url()))
     })?;
     let env: Envelope = serde_json::from_str(&body).map_err(|_| {
+        // 两类终态形态（M2）：非 JSON（HTML 错误页/空体）与合法 JSON
+        // 但缺 `code` 键（网关 `{"error":"forbidden"}`——code 必填后
+        // 不再被 default=0 吞成成功）。
+        let reason = if serde_json::from_str::<Value>(&body).is_ok() {
+            "json without a code key"
+        } else {
+            "non-envelope"
+        };
         StorageError::Unavailable(format!(
-            "{stage} non-envelope (http {http}, len {})",
+            "{stage} {reason} (http {http}, len {})",
             body.len()
         ))
     })?;
+    if env.is_auth_ok() && !(200..=299).contains(&http) {
+        return Err(StorageError::Unavailable(format!(
+            "{stage}: HTTP {http} with a success envelope — success requires 2xx"
+        )));
+    }
     Ok((http, env))
 }
 
@@ -545,6 +584,20 @@ impl Pan123Client {
         self.dispatch(path, true, &[], Some(body), stage).await
     }
 
+    /// POST dispatch（单次尝试通道——提交点族专用，M1/K78）：Bearer +
+    /// JSON body → `data`。语义见 [`Self::dispatch_single`]；接入面 =
+    /// [`Self::upload_complete_v2`] / [`Self::s3_complete_multipart`] /
+    /// [`Self::trash`] 三个提交点。
+    pub async fn dispatch_post_json_single(
+        &self,
+        path: &str,
+        body: &Value,
+        stage: &'static str,
+    ) -> Result<Value, StorageError> {
+        self.dispatch_single(path, true, &[], Some(body), stage)
+            .await
+    }
+
     /// `GET /b/api/user/info` → uid/空间/流量字段（VolumeId 的 uid 真源
     /// 与 quota 面的地基）。
     pub async fn user_info(&self) -> Result<UserInfo, StorageError> {
@@ -637,6 +690,51 @@ impl Pan123Client {
         }
     }
 
+    /// 单次尝试通道（提交点族专用——M1/K78）。
+    ///
+    /// 与 [`Self::dispatch`] 的差别只在**重试**：传输错误与可重试 HTTP
+    /// 形态（429/5xx）一律不重试、直接终态上抛——5xx 与 body 读败时
+    /// **请求可能已被服务端受理**，重放一个非幂等提交就是双应用：
+    /// upload_complete/v2 第一次已入库、响应丢失，重放撞「会话已消
+    /// 费」→ 挂载面报「写入失败」但文件实际已上传（假失败）。
+    ///
+    /// 保留的能力面（与 dispatch 全同）：`ensure_bootstrapped` + 令牌
+    /// 桶 + 域名 failover——failover 只在 `is_connect()`（连接建立失
+    /// 败，**请求未发出**）时重放同一请求，安全。
+    ///
+    /// **自愈故事**（v2 假失败的干净出路）：单次失败后本地会话记录保
+    /// 留，下次 resume 走 `s3_list_upload_parts` → `SessionGone`（会话
+    /// 已被服务端消费）→ 清本地记录 → re-request——内容已在服务端
+    /// 则 Reuse 秒传命中，否则全量重传，零数据损失。即把「假失败 +
+    /// 双应用」换成「假失败 + 干净恢复」。
+    async fn dispatch_single(
+        &self,
+        path: &str,
+        post: bool,
+        query: &[(&str, &str)],
+        body: Option<&Value>,
+        stage: &'static str,
+    ) -> Result<Value, StorageError> {
+        self.ensure_bootstrapped().await;
+        self.limiter.check_wait().await;
+        match self.attempt_once(path, post, query, body, stage).await {
+            AttemptOutcome::Done(result) => result,
+            // 不重试——请求可能已被受理，重放即双应用（见上）。
+            AttemptOutcome::Transport(err) => Err(err),
+            AttemptOutcome::HttpRetry {
+                status,
+                retry_after,
+            } => Err(if status == 429 {
+                StorageError::RateLimited { retry_after }
+            } else {
+                StorageError::Unavailable(format!(
+                    "{stage}: HTTP {status} on a commit-point call \
+                     (single attempt, no retry)"
+                ))
+            }),
+        }
+    }
+
     /// 单次尝试（含域名 failover 重放恰一次）；产出可重试分类。
     async fn attempt_once(
         &self,
@@ -702,15 +800,32 @@ impl Pan123Client {
             let env: Envelope = match serde_json::from_str(&body_text) {
                 Ok(env) => env,
                 Err(_) => {
-                    // 非 JSON（HTML 错误页/空体）：截断 + 掩码当前 token
-                    // （错误页可能回显请求头；R3）——终态，不重试。
-                    let snippet: String = body_text.chars().take(200).collect();
-                    let masked = snippet.replace(token.as_str(), &mask(&token));
+                    // 终态、不重试。两类形态（M2）：非 JSON（HTML 错误
+                    // 页/空体）与合法 JSON 但缺 `code` 键（网关
+                    // `{"error":"forbidden"}`——code 必填后不再被
+                    // default=0 吞成成功）。截断片段经当前 token 掩码
+                    // （错误页可能回显请求头；R3）。
+                    let reason = if serde_json::from_str::<Value>(&body_text).is_ok() {
+                        "json without a code key"
+                    } else {
+                        "non-json"
+                    };
+                    let masked = masked_snippet(&body_text, &token);
                     return AttemptOutcome::Done(Err(StorageError::Unavailable(format!(
-                        "{stage} non-json (http {http}): {masked}"
+                        "{stage} {reason} (http {http}): {masked}"
                     ))));
                 }
             };
+            if env.is_ok() && !(200..=299).contains(&http) {
+                // M2 HTTP 门：成功判定必须伴随 2xx——网关错误体即便带
+                // code:0 也不放行；envelope 显式错误码（非 0）不受门
+                // 影响，仍走 errno 映射（真机 user/info 面 = HTTP 401 +
+                // envelope 401 → Unauthorized）。掩码片段供诊断（R3）。
+                let masked = masked_snippet(&body_text, &token);
+                return AttemptOutcome::Done(Err(StorageError::Unavailable(format!(
+                    "{stage}: HTTP {http} with a success envelope: {masked}"
+                ))));
+            }
             return if env.is_ok() {
                 AttemptOutcome::Done(Ok(env.data))
             } else {
@@ -819,6 +934,10 @@ impl Pan123Client {
     ///
     /// 5060 同名冲突 → `Exists`（errno 表）；`NotReuse:true` 与 etag:""
     /// 是 spike 真机验证过的请求形态（§5.11 逐端点保真）。
+    ///
+    /// **维持可重试**（M1/K78 裁决）：双发的第二次撞 5060 → errno 表
+    /// 归一 `Exists`——「预检竞争窗口兜底」同款自愈面（下次 list 预检
+    /// 即恢复）；弱网下保住目录创建的收益大于双发自愈代价。
     pub async fn mkdir(&self, parent_file_id: i64, name: &str) -> Result<i64, StorageError> {
         let data = self
             .dispatch_post_json(
@@ -856,7 +975,10 @@ impl Pan123Client {
         // Operation`（live_matrix cleanup 三连红揭出；123-0 spike 一直发
         // 四键形故真机从未踩到）。`event`/`driveId` 实测可省，保留发：
         // spike 真机四连绿形态 + intoRecycle 语义显式（D2）。
-        self.dispatch_post_json(
+        //
+        // **单次尝试通道**（M1/K78）：trash 双发的第二次形态真机未采样
+        // ——提交点不赌幂等。
+        self.dispatch_post_json_single(
             "/a/api/file/trash",
             &serde_json::json!({
                 "driveId": 0,
@@ -962,6 +1084,10 @@ impl Pan123Client {
     ///
     /// `Reuse:true`（内容已在服务端——**Reuse 优先于 5060**）时真 FileId
     /// 在 `data.Info.FileId`（顶层 FileId 是临时形态大数、`UploadId:""`）。
+    ///
+    /// **维持可重试**（M1/K78 裁决）：双发最坏形态 = 首次已受理 → 零片
+    /// 孤儿会话（123 无 abort 端点，挂账⑩放大面）——孤儿为零片不入
+    /// 库、不耗流量，低危害；弱网下保住会话获取的收益更大。
     pub async fn upload_request_file(
         &self,
         parent: i64,
@@ -1152,9 +1278,12 @@ impl Pan123Client {
     ///
     /// `-1 rpc MalformedXML` 是读路径腿实证的无害先例形态（单 PUT 会话
     /// 误调时）——容忍并 warn（repare 创建的恒 multipart 会话常态回 0）。
+    ///
+    /// **单次尝试通道**（M1/K78）：complete 是提交点——首次已消费会话
+    /// 而响应丢失时，重放只会撞「已消费」错误形态，把已成功误报失败。
     pub async fn s3_complete_multipart(&self, ticket: &UploadTicket) -> Result<(), StorageError> {
         match self
-            .dispatch_post_json(
+            .dispatch_post_json_single(
                 "/b/api/file/s3_complete_multipart_upload",
                 &serde_json::json!({
                     "bucket": ticket.bucket,
@@ -1184,13 +1313,17 @@ impl Pan123Client {
     /// `{fileId}` / `isMultipart:false` 对该会话 code=0 **静默不入库**）。
     /// 响应 `data.file_info`（snake_case 键，内层双拼条目）= 真实
     /// FileId + 声称 etag + 完整条目。
+    ///
+    /// **单次尝试通道**（M1/K78 裁决）：v2 双应用会把「已入库」误报成
+    /// 「写入失败」——假失败的干净出路是 SessionGone→清记录→re-request
+    /// 的 resume 自愈（见 [`Self::dispatch_single`]），不是重放。
     pub async fn upload_complete_v2(
         &self,
         ticket: &UploadTicket,
         size: u64,
     ) -> Result<crate::models::FileEntry, StorageError> {
         let data = self
-            .dispatch_post_json(
+            .dispatch_post_json_single(
                 "/b/api/file/upload_complete/v2",
                 &serde_json::json!({
                     "fileId": ticket.up_file_id,

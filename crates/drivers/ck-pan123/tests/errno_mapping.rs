@@ -21,6 +21,7 @@ use std::sync::{Arc, Mutex};
 
 use axum::extract::State;
 use axum::http::{HeaderMap, StatusCode};
+use axum::response::IntoResponse;
 use axum::routing::{get, post};
 use axum::{Json, Router};
 use serde_json::{json, Value};
@@ -51,7 +52,8 @@ fn envelope_accepts_dual_cased_top_level_keys() {
     assert_eq!(upper.code, 5060);
     assert_eq!(upper.message, "检测到1个同名文件");
 
-    // 字段缺省容错：裸 code / 空对象不炸
+    // 字段缺省容错：裸 code 不炸（message/data 缺省；code 键本身必填——
+    // M2/K78 后缺 code 的 JSON 落终态 Unavailable，`{}` 不再解析成功）
     let bare: Envelope = serde_json::from_str(r#"{"code":0}"#).expect("bare envelope");
     assert!(bare.is_ok());
     assert_eq!(bare.message, "", "message defaults empty");
@@ -194,6 +196,9 @@ const TOKEN: &str = "mock-token-0123456789abcdef";
 struct MockState {
     /// 错误注入队列（顶掉下一次业务请求的 envelope）。
     injected: std::collections::VecDeque<Value>,
+    /// 原始应答注入（M2/K78：HTTP 状态 + 原文 body——钉 HTTP 门与
+    /// code 键必填的网关形态）。
+    injected_raw: std::collections::VecDeque<(u16, String)>,
     recorded: Vec<Recorded>,
 }
 
@@ -231,6 +236,15 @@ impl Mock123 {
         self.state.lock().unwrap().injected.push_back(body);
     }
 
+    /// M2/K78：注入原始应答（HTTP 状态 + 原文 body——网关形态腿）。
+    fn inject_raw(&self, status: u16, body: &str) {
+        self.state
+            .lock()
+            .unwrap()
+            .injected_raw
+            .push_back((status, body.to_string()));
+    }
+
     fn recorded(&self) -> Vec<Recorded> {
         self.state.lock().unwrap().recorded.clone()
     }
@@ -250,7 +264,7 @@ async fn handle_common(
     state: &Arc<Mutex<MockState>>,
     headers: &HeaderMap,
     path: &str,
-) -> Option<(StatusCode, Json<Value>)> {
+) -> Option<axum::response::Response> {
     let mut state = state.lock().unwrap();
     state.recorded.push(Recorded {
         path: path.to_string(),
@@ -259,8 +273,16 @@ async fn handle_common(
             .and_then(|v| v.to_str().ok())
             .map(str::to_string),
     });
+    if let Some((status, body)) = state.injected_raw.pop_front() {
+        let resp = axum::http::Response::builder()
+            .status(StatusCode::from_u16(status).expect("injectable status"))
+            .header("content-type", "application/json")
+            .body(axum::body::Body::from(body))
+            .expect("raw injectable response");
+        return Some(resp);
+    }
     if let Some(injected) = state.injected.pop_front() {
-        return Some((StatusCode::OK, Json(injected)));
+        return Some((StatusCode::OK, Json(injected)).into_response());
     }
     None
 }
@@ -268,7 +290,7 @@ async fn handle_common(
 async fn user_info(
     State(state): State<Arc<Mutex<MockState>>>,
     headers: HeaderMap,
-) -> (StatusCode, Json<Value>) {
+) -> axum::response::Response {
     if let Some(reply) = handle_common(&state, &headers, "/b/api/user/info").await {
         return reply;
     }
@@ -276,12 +298,13 @@ async fn user_info(
         StatusCode::OK,
         Json(json!({"code": 0, "data": {"UID": 42, "SpacePermanent": 2199023255552i64}})),
     )
+        .into_response()
 }
 
 async fn list_new(
     State(state): State<Arc<Mutex<MockState>>>,
     headers: HeaderMap,
-) -> (StatusCode, Json<Value>) {
+) -> axum::response::Response {
     if let Some(reply) = handle_common(&state, &headers, "/api/file/list/new").await {
         return reply;
     }
@@ -289,16 +312,17 @@ async fn list_new(
         StatusCode::OK,
         Json(json!({"code": 0, "data": {"InfoList": [], "Total": 0}})),
     )
+        .into_response()
 }
 
 async fn rename(
     State(state): State<Arc<Mutex<MockState>>>,
     headers: HeaderMap,
-) -> (StatusCode, Json<Value>) {
+) -> axum::response::Response {
     if let Some(reply) = handle_common(&state, &headers, "/b/api/file/rename").await {
         return reply;
     }
-    (StatusCode::OK, Json(json!({"code": 0, "data": {}})))
+    (StatusCode::OK, Json(json!({"code": 0, "data": {}}))).into_response()
 }
 
 #[tokio::test]
@@ -413,4 +437,99 @@ async fn non_json_response_maps_to_unavailable_with_a_masked_snippet() {
         }
         other => panic!("expected Unavailable, got {other:?}"),
     }
+}
+
+// ------------------------------------------ M2（K78）HTTP 门 + code 必填 ---
+
+/// M2 ①：HTTP 403 + 网关 JSON（**无 code 键**，WAF `{"error":"forbidden"}`
+/// 形态）→ `Unavailable` 终态——不得经 `code` 缺省 0 误判成功（旧形态：
+/// UserInfo 全字段 default → 静默 Ok(uid=0)）。
+#[tokio::test]
+async fn gateway_json_without_code_over_http_403_is_terminal_unavailable() {
+    let mock = Mock123::start().await;
+    let client = mock.client();
+
+    mock.inject_raw(403, r#"{"error":"forbidden"}"#);
+    let err = client
+        .user_info()
+        .await
+        .expect_err("a code-less gateway body must never pass as success");
+    match err {
+        StorageError::Unavailable(detail) => {
+            assert!(detail.contains("403"), "carries the HTTP status: {detail}");
+            assert!(
+                detail.contains("forbidden"),
+                "carries the (masked) body snippet: {detail}"
+            );
+            assert!(
+                !detail.contains("data parse"),
+                "not downstream parse noise — the gate fires at dispatch: {detail}"
+            );
+        }
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+    assert_eq!(mock.recorded().len(), 1, "terminal, no retry");
+}
+
+/// M2 ①b：HTTP 403 + **完整 code:0 信封**（网关把拒绝写成成功形态）→
+/// HTTP 门终态 `Unavailable`——成功判定必须伴随 2xx。
+#[tokio::test]
+async fn an_ok_envelope_over_non_2xx_is_still_terminal_unavailable() {
+    let mock = Mock123::start().await;
+    let client = mock.client();
+
+    mock.inject_raw(403, r#"{"code":0,"message":"ok","data":{"UID":42}}"#);
+    let err = client
+        .user_info()
+        .await
+        .expect_err("an ok envelope must not pass over a non-2xx status");
+    match err {
+        StorageError::Unavailable(detail) => {
+            assert!(detail.contains("403"), "carries the HTTP status: {detail}");
+        }
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+    assert_eq!(mock.recorded().len(), 1);
+}
+
+/// M2 ②（回归守卫）：HTTP 401 + envelope 显式 `code:401` → 仍
+/// `Unauthorized{recoverable:false}`——真机 user/info 面 = HTTP 401 +
+/// envelope 形态，HTTP 门不得吞掉 errno 映射。
+#[tokio::test]
+async fn http_401_with_an_explicit_envelope_still_maps_to_unauthorized() {
+    let mock = Mock123::start().await;
+    let client = mock.client();
+
+    mock.inject_raw(401, r#"{"code":401,"message":"cookie token is empty"}"#);
+    let err = client.user_info().await.expect_err("401 must surface");
+    assert_eq!(
+        err,
+        StorageError::Unauthorized { recoverable: false },
+        "the envelope error mapping survives the HTTP gate"
+    );
+    assert_eq!(mock.recorded().len(), 1, "no retry, no loop");
+}
+
+/// M2 ③：HTTP 200 + 无 code 键 JSON → `Unavailable` 终态（`code` 键
+/// 必填——message/data 的缺省容错保留）。
+#[tokio::test]
+async fn http_200_body_without_a_code_key_is_terminal_unavailable() {
+    let mock = Mock123::start().await;
+    let client = mock.client();
+
+    mock.inject_raw(200, r#"{"error":"forbidden"}"#);
+    let err = client
+        .user_info()
+        .await
+        .expect_err("code is a mandatory envelope key");
+    match err {
+        StorageError::Unavailable(detail) => {
+            assert!(
+                detail.contains("code"),
+                "the message distinguishes the missing-code form: {detail}"
+            );
+        }
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+    assert_eq!(mock.recorded().len(), 1, "terminal, no retry");
 }

@@ -117,7 +117,9 @@ impl FileEntry {
 
 /// 时间字段反序列化：int Unix 秒（含浮点形态，截断）或 ISO8601 字符串
 /// （`2026-09-20T12:20:15+08:00`；纳秒精度截断；`Z` 与 `±HH:MM` 偏移
-/// 都认）——统一归 Unix 秒。
+/// 都认）——统一归 Unix 秒；**显式 null 容错为 0**（M3/K78——服务端
+/// 单条目回 `"UpdateAt": null` 不得毒死整页 list；键缺失由字段级
+/// `#[serde(default)]` 兜 0）。
 pub fn deserialize_unix_secs<'de, D>(deserializer: D) -> Result<i64, D::Error>
 where
     D: serde::Deserializer<'de>,
@@ -136,6 +138,13 @@ where
         }
         fn visit_f64<E: serde::de::Error>(self, v: f64) -> Result<i64, E> {
             Ok(v as i64)
+        }
+        /// 显式 null（JSON null / Option None 形态）→ 0（M3/K78）。
+        fn visit_unit<E: serde::de::Error>(self) -> Result<i64, E> {
+            Ok(0)
+        }
+        fn visit_none<E: serde::de::Error>(self) -> Result<i64, E> {
+            Ok(0)
         }
         fn visit_str<E: serde::de::Error>(self, v: &str) -> Result<i64, E> {
             parse_iso8601_unix(v)
@@ -299,5 +308,31 @@ mod tests {
         assert_eq!(parse_iso8601_unix("2026-09-20T12:20:15"), None);
         assert_eq!(parse_iso8601_unix("not a date"), None);
         assert_eq!(parse_iso8601_unix(""), None);
+    }
+
+    /// M3（K78）：时间字段**显式 null** 容错为 0——服务端任何一条目回
+    /// `"UpdateAt": null` 不得毒死整页 list（`#[serde(default)]` 只管
+    /// 键缺失，显式 null 走 Visitor 的 unit 形态）。
+    #[test]
+    fn explicit_null_time_fields_tolerate_as_zero_without_poisoning_the_page() {
+        let row: FileEntry =
+            serde_json::from_str(r#"{"FileId":9,"FileName":"n.txt","Type":0,"UpdateAt":null}"#)
+                .expect("explicit null tolerates as 0");
+        assert_eq!(row.file_id, 9);
+        assert_eq!(row.update_at, 0, "explicit null -> 0");
+        assert_eq!(row.create_at, 0, "missing key keeps the field default");
+
+        // 整页形态：一条 null 时间条目不炸整个 Vec（list_page 单道解析）
+        let page: Vec<FileEntry> = serde_json::from_str(
+            r#"[
+                {"FileId":1,"FileName":"a","Type":0,"UpdateAt":1789878015,"CreateAt":1789878015},
+                {"FileId":2,"FileName":"b","Type":1,"UpdateAt":null,"CreateAt":null}
+            ]"#,
+        )
+        .expect("one null-time row must not poison the whole page");
+        assert_eq!(page.len(), 2);
+        assert_eq!(page[0].update_at, 1789878015);
+        assert_eq!(page[1].update_at, 0);
+        assert_eq!(page[1].create_at, 0);
     }
 }

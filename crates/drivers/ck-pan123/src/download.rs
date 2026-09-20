@@ -51,11 +51,16 @@ use crate::models::FileEntry;
 
 /// 直链缓存 TTL（真值未测——保守 15min；命中后 404/410 自愈重取）。
 const DLINK_TTL: Duration = Duration::from_secs(15 * 60);
+/// 直链缓存条目上界（M4，对齐 pathcache `DIR_CAP` 先例）：长期挂载
+/// 进程扫库大量文件时的内存上界——超出先清过期、仍满则驱逐最旧。
+const DLINK_CAP: usize = 1024;
 /// CDN 分片窗口：4 MiB（baidu/pan115 有界分片先例——流控粒度）。
 const WINDOW: u64 = 4 * 1024 * 1024;
 /// 解析跳数封顶（§5.14：最深跟 3 跳——30x 与 210-JSON 都计入）。
 const MAX_HOPS: u32 = 3;
-/// CDN 403/429 退避梯度（限流形态；每次 1s→2s→4s，超限走重取直链）。
+/// CDN 403/429 退避梯度（限流形态；失败间隔 1s→2s→4s）。三个使用面：
+/// 后续窗口 [`fetch_window`]（超限走重取直链）、首窗口两路径经
+/// [`window_get_backoff`]（M10a——超限上抛 `RateLimited`）。
 const CDN_BACKOFF: [Duration; 3] = [
     Duration::from_secs(1),
     Duration::from_secs(2),
@@ -84,7 +89,24 @@ impl DlinkCache {
 
     pub async fn insert(&self, file_id: i64, url: &str) {
         let mut entries = self.entries.write().await;
-        entries.insert(file_id.to_string(), (url.to_string(), Instant::now()));
+        let key = file_id.to_string();
+        // M4：新键且超上界——先清过期条目（TTL 到点的本就该走），仍满
+        // 则驱逐最旧（1024 规模线性扫描可接受；pathcache 先例同款）。
+        // 同键覆盖不进此分支（时间戳刷新 = 「最近用过」）。
+        if !entries.contains_key(&key) && entries.len() >= DLINK_CAP {
+            let now = Instant::now();
+            entries.retain(|_, (_, at)| now.duration_since(*at) < DLINK_TTL);
+            if entries.len() >= DLINK_CAP {
+                if let Some(oldest) = entries
+                    .iter()
+                    .min_by_key(|(_, (_, at))| *at)
+                    .map(|(k, _)| k.clone())
+                {
+                    entries.remove(&oldest);
+                }
+            }
+        }
+        entries.insert(key, (url.to_string(), Instant::now()));
     }
 
     /// 失效一个键（直链死亡自愈路径调用）。
@@ -125,7 +147,7 @@ pub(crate) async fn open_range(
     // 首窗口：缓存命中直接 GET；未命中（或死亡自愈）走冷解析（traffic
     // 预检 + download_info + 跳链）——GET 本身就是跳链的推进器。
     let (first, _landed_url) = match cache.get(entry.file_id).await {
-        Some(url) => match window_get(client, &url, start, win_end).await {
+        Some(url) => match window_get_backoff(client, &url, start, win_end).await {
             Ok(HopOutcome::Final(bytes)) => (bytes, url),
             // 缓存 URL 上的中途重定向形态：从该跳继续（跳数预算内）。
             Ok(HopOutcome::Redirect(next)) => {
@@ -153,10 +175,18 @@ pub(crate) async fn open_range(
             let win_end = (pos + WINDOW).min(end); // 半开
             match fetch_window(&client, &cache, &entry, pos, win_end).await {
                 Ok(bytes) => {
-                    if bytes.is_empty() {
-                        break; // 服务端提前 EOF：停止（截断流为真）
-                    }
                     let n = bytes.len() as u64;
+                    if n == 0 {
+                        // M6/L1：窗口面（window_get）已拒空 206——此处纯
+                        // 防御：任何空窗口产出都以错误呈现，绝不静默
+                        // 截断流（原 break 形态 = 消费者零信号收短流）。
+                        let _ = tx
+                            .send(Err(StorageError::Unavailable(
+                                "CDN window came back empty mid-stream".to_string(),
+                            )))
+                            .await;
+                        return;
+                    }
                     if tx.send(Ok(bytes)).await.is_err() {
                         return; // 消费方丢弃
                     }
@@ -219,16 +249,31 @@ async fn cold_resolve(
 ) -> Result<(Bytes, String), StorageError> {
     // traffic 预检（§5.7）：超额 → RateLimited（D5 不绕过；人话经 warn
     // 已在 errno/dispatch 面给出——5113/5114 走 download_info 的映射）。
-    let status = client.traffic_check(&[entry.file_id]).await?;
-    if status.is_traffic_exceeded {
-        tracing::warn!(
-            target: "ck_pan123::download",
-            file_id = entry.file_id,
-            remain_bytes = status.original_remain_traffic,
-            "123pan daily download traffic quota exceeded (D5: not bypassed): traffic resets \
-             tomorrow, or a 123pan VIP subscription lifts the cap"
-        );
-        return Err(StorageError::RateLimited { retry_after: None });
+    // M5：检查**端点自身**的失败（传输错/未映射码/坏体）降级放行——
+    // 与 probe 面同端点的尽力而为语义对齐；D5 红线不受影响：限额拦截
+    // 由 `isTrafficExceeded` 硬停 + download_info 的 5113/5114 两道保证，
+    // 不依赖这个端点的存活。
+    match client.traffic_check(&[entry.file_id]).await {
+        Ok(status) if status.is_traffic_exceeded => {
+            tracing::warn!(
+                target: "ck_pan123::download",
+                file_id = entry.file_id,
+                remain_bytes = status.original_remain_traffic,
+                "123pan daily download traffic quota exceeded (D5: not bypassed): traffic resets \
+                 tomorrow, or a 123pan VIP subscription lifts the cap"
+            );
+            return Err(StorageError::RateLimited { retry_after: None });
+        }
+        Ok(_) => {}
+        Err(e) => {
+            tracing::warn!(
+                target: "ck_pan123::download",
+                file_id = entry.file_id,
+                error = %e,
+                "traffic/check endpoint failed; proceeding with the fetch (D5 quota guards \
+                 remain: isTrafficExceeded + download_info 5113/5114)"
+            );
+        }
     }
     // download_info（5113/5114 → RateLimited 由 errno 表映射）。
     let relay = client.download_info(entry).await?;
@@ -238,8 +283,39 @@ async fn cold_resolve(
     follow_hops(client, cache, entry.file_id, candidate, start, win_end).await
 }
 
+/// 首窗口/跳链 GET 的限流退避（M10a）：RateLimited 时按 [`CDN_BACKOFF`]
+/// 梯度退避后重试同一 URL，梯度用尽（3 次尝试）才上抛末次
+/// `RateLimited`（`Retry-After` 随终态透出）；其他结果原样返回——
+/// 404/410 死亡信号、传输错、206/重定向等语义不变。
+///
+/// 此前梯度只在 [`fetch_window`]（后续窗口）生效，首窗口的两条路径
+/// （缓存命中 GET 与冷解析首跳）429 直接上抛——恰是每次打开的必经
+/// 路径。形态与 fetch_window 的差别仅在末次失败：这里后续无动作，
+/// 不白睡（梯度语义 = 失败**间隔**）。
+async fn window_get_backoff(
+    client: &Pan123Client,
+    url: &str,
+    start: u64,
+    win_end: u64,
+) -> Result<HopOutcome, StorageError> {
+    let mut last = StorageError::RateLimited { retry_after: None };
+    for (i, delay) in CDN_BACKOFF.iter().enumerate() {
+        match window_get(client, url, start, win_end).await {
+            Err(StorageError::RateLimited { retry_after }) => {
+                last = StorageError::RateLimited { retry_after };
+                if i + 1 < CDN_BACKOFF.len() {
+                    tokio::time::sleep(*delay).await;
+                }
+            }
+            other => return other,
+        }
+    }
+    Err(last)
+}
+
 /// 从 candidate 起 GET 推进跳链（≤[`MAX_HOPS`] 跳）：206 落点 URL 入
-/// 缓存并返回字节。
+/// 缓存并返回字节。每跳经 [`window_get_backoff`]（冷解析首跳的限流
+/// 退避——M10a；跳链中途的重定向目标同理）。
 async fn follow_hops(
     client: &Arc<Pan123Client>,
     cache: &Arc<DlinkCache>,
@@ -251,7 +327,7 @@ async fn follow_hops(
     let mut candidate = candidate;
     let mut hops = 0u32;
     loop {
-        match window_get(client, &candidate, start, win_end).await {
+        match window_get_backoff(client, &candidate, start, win_end).await {
             Ok(HopOutcome::Final(bytes)) => {
                 cache.insert(file_id, &candidate).await;
                 return Ok((bytes, candidate));
@@ -370,15 +446,37 @@ async fn window_get(
             .bytes()
             .await
             .map_err(|e| StorageError::Unavailable(format!("CDN body: {}", e.without_url())))?;
+        // M6 窗口长度防线：只拦「越窗多给」与「空体」。
+        // - 越窗多给 → 整窗拒绝（多余字节透传消费者后按 `end-start`
+        //   拼接即错位 = 数据损坏面；baidu 精确长度校验同款纪律）；
+        // - 空体（期望非零）→ 拒（原「静默截断流」无信号——L1 销账）；
+        // - 少给非空保留（续窗补齐自洽设计：消费方按实际字节推进 pos）。
+        let expected = (end - start) as usize;
+        if body.len() > expected {
+            return Err(StorageError::Unavailable(format!(
+                "CDN 206 body exceeds the requested window: got {} bytes, expected {} \
+                 (Content-Range {content_range:?})",
+                body.len(),
+                expected,
+            )));
+        }
+        if body.is_empty() && expected > 0 {
+            return Err(StorageError::Unavailable(
+                "CDN returned an empty 206 body".to_string(),
+            ));
+        }
         return Ok(HopOutcome::Final(body));
     }
-    // 210（或任何 2xx 非 206）+ JSON 体 = 重定向体形态（spike 实证
-    // HTTP 210 + {"code":0,"data":{"redirect_url":...}}）。
+    // 210 + JSON 体 = 重定向体形态（spike 实证 HTTP 210 +
+    // {"code":0,"data":{"redirect_url":...}}）。**限定 210**（M7）：任何
+    // 其他 2xx（尤其 200）+ JSON 是**文件内容**不是协议指令——内容里
+    // 的 `data.redirect_url` 键绝不能被当重定向跟随（内容注入面）；200
+    // 全量落到底下的「Range 被忽略」防线正确归因。
     let body = resp
         .text()
         .await
         .map_err(|e| StorageError::Unavailable(format!("CDN body: {}", e.without_url())))?;
-    if content_type.contains("json") || body.starts_with('{') {
+    if status == 210 && (content_type.contains("json") || body.starts_with('{')) {
         if let Ok(v) = serde_json::from_str::<serde_json::Value>(&body) {
             let next = v
                 .get("data")
@@ -518,5 +616,43 @@ mod tests {
         assert_eq!(cache.get(7).await.as_deref(), Some("http://x/7"));
         cache.invalidate(7).await;
         assert_eq!(cache.get(7).await, None);
+    }
+
+    /// M4：容量上限——超出 DLINK_CAP 时最旧条目被驱逐、新近条目保留；
+    /// 同键覆盖刷新时间戳（覆盖本身不触发驱逐）。pathcache DIR_CAP
+    /// 先例同款（M-S5 族）。
+    #[tokio::test]
+    async fn dlink_cache_caps_and_evicts_the_oldest_entry() {
+        let cache = DlinkCache::new();
+        for i in 0..DLINK_CAP as i64 {
+            cache.insert(i, &format!("http://x/{i}")).await;
+        }
+        assert_eq!(
+            cache.get(0).await.as_deref(),
+            Some("http://x/0"),
+            "at cap: every entry lives"
+        );
+        // 同键覆盖 = 刷新时间戳：fid 0 从最旧变为最新。
+        cache.insert(0, "http://x/0-fresh").await;
+        // 超上界再插一条：最旧（此刻是 fid 1）被驱逐。
+        cache.insert(DLINK_CAP as i64, "http://x/new").await;
+        assert_eq!(
+            cache.get(0).await.as_deref(),
+            Some("http://x/0-fresh"),
+            "the refreshed key survives the eviction"
+        );
+        assert_eq!(
+            cache.get(1).await,
+            None,
+            "the oldest entry was evicted at cap"
+        );
+        assert!(
+            cache.get(DLINK_CAP as i64).await.is_some(),
+            "the newcomer stays"
+        );
+        assert!(
+            cache.get(DLINK_CAP as i64 - 1).await.is_some(),
+            "recent entries stay"
+        );
     }
 }

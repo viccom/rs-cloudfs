@@ -62,7 +62,8 @@
 //!
 //! 各端点命中计数（harness 断言用：`download_info` 恰一次 = dlink
 //! 一次性纪律）与注入旋钮（流量超额/错误码/静默陷阱/直链死亡/200
-//! 忽略 Range/链形态/写面完成失败/幽灵会话/v2 size 偏移/PUT 5xx）。
+//! 忽略 Range/越窗多给/空 206/前 N 次 429/链形态/写面完成失败/幽灵
+//! 会话/v2 size 偏移/PUT 5xx/PUT 前 N 次 429）。
 //! 写面另有 `seq`（写面端点命中时序列——七步严格序的断言面）。
 #![allow(dead_code)]
 
@@ -159,6 +160,16 @@ pub struct StubState {
     pub mirror_dead: bool,
     /// mirror 忽略 Range：200 全量（写偏防线用例）。
     pub mirror_ignore_range: bool,
+    /// mirror 越窗多给（M6 注入面）：206 + 按请求窗口声明的正确
+    /// Content-Range 前缀，但 body 超出窗口 16 字节——CDN 对 end
+    /// 钳制/忽略的怪癖家族建模（多余字节绝不该透传消费者）。
+    pub mirror_overdeliver: bool,
+    /// mirror 空 206 body（M6/L1 注入面）：Content-Range 前缀正确但
+    /// 零字节体——原「静默截断流」形态的建模。
+    pub mirror_empty_206: bool,
+    /// mirror 前 N 次 GET 回 429 + `Retry-After: 1`（M10a 注入面，
+    /// 之后恢复正常 206；fail_times 递减形态）。
+    pub mirror_429_first: u32,
     /// download_info 产出的链形态：
     /// `relay`（默认——params 自解码 → 210 JSON → mirror，真机三跳）/
     /// `direct-cdn`（直指 210 JSON 重定向体）/ `location`（302 链）/
@@ -193,6 +204,13 @@ pub struct StubState {
     pub v2_size_skew: i64,
     /// /put 注入 5xx 次数（分片 PUT 幂等重试用例）。
     pub put_fail_times: u32,
+    /// `/a/api/file/rename` 注入失败次数（每次命中递减，>0 时
+    /// code=5000——M11 跨父 rename 改名腿的部分变更文案用例；失败
+    /// 时**不落改名**——文件保持旧名，部分变更形态的桩侧建模）。
+    pub rename_fail_times: u32,
+    /// /put 注入：前 N 次 PUT 回 429 + `Retry-After: 1`（M10b 注入面，
+    /// 递减形态——之后恢复正常 200；PUT 面限流重试的恢复/耗尽两腿）。
+    pub put_429_times: u32,
     /// /put 注入：**成功落地的分片数**达到该值后，后续 PUT 恒 5xx
     /// （分片级差集用例——先落 N 片再断；0 = 关闭。pan115 桩
     /// `fail_part_after` 同形态）。123-4 增补。
@@ -341,17 +359,6 @@ impl ApiStub {
             .filter(|(k, _)| k.starts_with("/put:"))
             .map(|(_, v)| *v)
             .sum()
-    }
-
-    /// 指定 upload_id 的会话分片布局（part_number → 字节数）。
-    pub fn session_part_sizes(&self, upload_id: &str) -> Vec<(u32, usize)> {
-        self.state
-            .lock()
-            .unwrap()
-            .sessions
-            .get(upload_id)
-            .map(|s| s.parts.iter().map(|(n, d)| (*n, d.len())).collect())
-            .unwrap_or_default()
     }
 
     /// /put 累计接收字节数（conformance ⑦ 差集观测点；只增不减）。
@@ -670,6 +677,11 @@ async fn rename(State(state): State<Arc<Mutex<StubState>>>, body: String) -> Res
     let Some(fid) = fid else {
         return err_code(400, "fileId required");
     };
+    // M11 注入面：失败时不改名（文件保持旧名——部分变更形态建模）。
+    if st.rename_fail_times > 0 {
+        st.rename_fail_times -= 1;
+        return err_code(5000, "injected rename failure");
+    }
     let mut found = None;
     for rows in st.dirs.values_mut() {
         for e in rows.iter_mut() {
@@ -1181,6 +1193,16 @@ async fn put_part(
 ) -> Response {
     let mut st = state.lock().unwrap();
     touch(&mut st, &format!("/put:{part}"));
+    // M10b 限流注入：前 N 次 PUT 回 429 + Retry-After: 1（递减形态，
+    // 之后恢复正常落地）。
+    if st.put_429_times > 0 {
+        st.put_429_times -= 1;
+        return Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header("retry-after", "1")
+            .body(axum::body::Body::empty())
+            .unwrap();
+    }
     if st.put_fail_times > 0 {
         st.put_fail_times -= 1;
         return (StatusCode::INTERNAL_SERVER_ERROR, "injected part failure").into_response();
@@ -1425,6 +1447,16 @@ async fn mirror_get(
 ) -> Response {
     let mut st = state.lock().unwrap();
     count_hit(&mut st, "/mirror");
+    // M10a 限流注入：前 N 次 GET 回 429 + Retry-After: 1（fail_times
+    // 递减形态——之后恢复正常行为）。
+    if st.mirror_429_first > 0 {
+        st.mirror_429_first -= 1;
+        return Response::builder()
+            .status(StatusCode::TOO_MANY_REQUESTS)
+            .header("retry-after", "1")
+            .body(axum::body::Body::empty())
+            .unwrap();
+    }
     if st.mirror_dead {
         return (StatusCode::NOT_FOUND, "gone").into_response();
     }
@@ -1458,6 +1490,32 @@ async fn mirror_get(
                     .unwrap();
             }
             let end = end_incl.map(|e| e + 1).unwrap_or(size).min(size);
+            // M6 注入面（Content-Range 均按请求窗口声明——前缀校验可过，
+            // 长度防线才是被测对象）。
+            if st.mirror_empty_206 {
+                // 空 206 body（L1「静默截断流」形态）。
+                return Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(
+                        axum::http::header::CONTENT_RANGE,
+                        format!("bytes {}-{}/{}", start, end - 1, size),
+                    )
+                    .body(axum::body::Body::empty())
+                    .unwrap();
+            }
+            if st.mirror_overdeliver {
+                // 越窗多给：body 超出请求窗口 16 字节（钳到文件尾）。
+                let extra = 16u64.min(size - end);
+                let slice = data[start as usize..(end + extra) as usize].to_vec();
+                return Response::builder()
+                    .status(StatusCode::PARTIAL_CONTENT)
+                    .header(
+                        axum::http::header::CONTENT_RANGE,
+                        format!("bytes {}-{}/{}", start, end - 1, size),
+                    )
+                    .body(axum::body::Body::from(slice))
+                    .unwrap();
+            }
             let slice = data[start as usize..end as usize].to_vec();
             Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)

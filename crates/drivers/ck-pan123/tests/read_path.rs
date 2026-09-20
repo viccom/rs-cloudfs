@@ -474,6 +474,88 @@ async fn rename_across_parents_moves_then_renames() {
     let _ = dst;
 }
 
+/// M11：跨父 rename 两步非原子——mod_pid 成功后改名腿失败 → 部分
+/// 变更要**可观测**：错误文案明示「文件已移至目标目录、保留旧名」+
+/// 保留原始错误文本（不回滚——回滚自身也可能失败）；桩状态实锤
+/// 文件已在目标父目录且保持旧名；旋钮解除后在新位置用旧名重试成功。
+#[tokio::test]
+async fn rename_across_parents_partial_move_failure_is_observable() {
+    let s = stub().await;
+    let src = s.mkdir("0", "src").to_string();
+    let dst = s.mkdir("0", "dst").to_string();
+    s.put_file(&src, "movable.bin", vec![7; 9]);
+    s.state.lock().unwrap().rename_fail_times = 1; // 改名腿恰一次失败
+
+    let driver = s.driver();
+    let err = driver
+        .rename(&path("/src/movable.bin"), &path("/dst/renamed.bin"))
+        .await
+        .expect_err("rename leg fails after mod_pid");
+    // 两步各恰一次（mod_pid 成功 + 改名腿终态失败不重试）。
+    assert_eq!(s.hits("/b/api/file/mod_pid"), 1);
+    assert_eq!(s.hits("/a/api/file/rename"), 1);
+    // 错误大类不变（5000 → Rejected → Unavailable）+ 文案：原始错误
+    // 文本保留、部分变更事实、旧名与目标目录、重试出路。
+    let StorageError::Unavailable(msg) = &err else {
+        panic!("expected Unavailable (code=5000), got: {err:?}")
+    };
+    assert!(msg.contains("pan123 code=5000"), "原始错误文本保留: {msg}");
+    assert!(msg.contains("partial move"), "部分变更提示: {msg}");
+    assert!(msg.contains("movable.bin"), "旧名入文案: {msg}");
+    assert!(msg.contains("dst"), "目标目录入文案: {msg}");
+
+    // 部分变更实锤（桩状态直查）：文件已在目标父目录下、保留旧名，
+    // 源父已无此行。
+    {
+        let st = s.state.lock().unwrap();
+        let in_dst = st.dirs.get(&dst).unwrap();
+        assert_eq!(in_dst.len(), 1, "exactly the moved file in target");
+        assert_eq!(in_dst[0].name, "movable.bin", "old name kept");
+        assert!(
+            st.dirs.get(&src).unwrap().is_empty(),
+            "no longer in source parent"
+        );
+    }
+
+    // 旋钮已解除：在新位置（目标目录下旧名）resolve 源重试 rename
+    // → 成功走到位（驱动不得拿过期缓存把新位置藏掉）。
+    driver
+        .rename(&path("/dst/movable.bin"), &path("/dst/renamed.bin"))
+        .await
+        .expect("retry from the new location with the old name");
+    let entry = driver
+        .stat(&path("/dst/renamed.bin"))
+        .await
+        .expect("fully moved and renamed now");
+    assert_eq!(entry.size, 9);
+}
+
+/// 对照（M11）：同父 rename 失败腿——无部分变更面，错误原样上抛
+/// （无 partial-move 提示），文件原地未动。
+#[tokio::test]
+async fn rename_in_place_failure_has_no_partial_move_hint() {
+    let s = stub().await;
+    s.put_file("0", "old.bin", vec![1, 2, 3]);
+    s.state.lock().unwrap().rename_fail_times = 1;
+
+    let driver = s.driver();
+    let err = driver
+        .rename(&path("/old.bin"), &path("/new.bin"))
+        .await
+        .expect_err("in-place rename fails");
+    assert_eq!(s.hits("/b/api/file/mod_pid"), 0, "no move involved");
+    let StorageError::Unavailable(msg) = &err else {
+        panic!("expected Unavailable, got: {err:?}")
+    };
+    assert!(msg.contains("pan123 code=5000"), "原始错误原样: {msg}");
+    assert!(!msg.contains("partial move"), "无部分变更提示: {msg}");
+    // 桩状态：文件仍在原父目录、旧名未动、新名未落。
+    let st = s.state.lock().unwrap();
+    let root = st.dirs.get("0").unwrap();
+    assert!(root.iter().any(|e| e.name == "old.bin"), "untouched");
+    assert!(root.iter().all(|e| e.name != "new.bin"), "no rename landed");
+}
+
 /// 目标占用 → Exists（冷目标目录现列预检——M-S4 同源）；后代目标 →
 /// Invalid；根参与 → Invalid。
 #[tokio::test]

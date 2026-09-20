@@ -236,6 +236,30 @@ async fn traffic_exceeded_blocks_before_any_link_fetch() {
     );
 }
 
+/// M5：traffic/check **端点自身失败**（未映射错误码——检查面病态，非
+/// 限额信号）→ 降级放行（与 probe 面同端点的尽力而为语义对齐）：
+/// reader 照常取链、窗口数据正确。D5 红线不因此绕过——限额拦截由
+/// `isTrafficExceeded` 硬停 + download_info 的 5113/5114 两道保证。
+#[tokio::test]
+async fn traffic_check_endpoint_failure_degrades_open() {
+    let s = stub().await;
+    s.state.lock().unwrap().traffic_check_code = Some(555001);
+    let data: Vec<u8> = (0..64u32).map(|i| (i % 13) as u8).collect();
+    let fid = s.put_file("0", "degraded.bin", data.clone());
+
+    let driver = s.driver();
+    let got = read_all(&driver, fid, None)
+        .await
+        .expect("a sick check endpoint must not kill the download");
+    assert_eq!(got, data, "window bytes correct through the degraded open");
+    assert_eq!(s.hits("/b/api/file/download/traffic/check"), 1);
+    assert_eq!(
+        s.hits("/mirror"),
+        1,
+        "the link fetch proceeded past the failing check"
+    );
+}
+
 /// download_info 回 5113（流量限额信封形态）→ RateLimited（D5）。
 #[tokio::test]
 async fn download_info_5113_maps_to_rate_limited() {
@@ -387,6 +411,168 @@ async fn range_ignored_200_is_rejected() {
         }
         other => panic!("expected Unavailable, got {other:?}"),
     }
+}
+
+/// M6：206 越窗多给——Content-Range 前缀正确但 body 超出请求窗口 →
+/// `Unavailable`（got/expected 文案可观测）。多余字节直透消费者时，
+/// 消费方按 `end-start` 拼接即错位（VFS 跨块窗口解密 = 数据损坏面）
+/// ——必须整窗拒绝，绝不截断放行。
+#[tokio::test]
+async fn overlong_206_body_is_rejected_not_passed_through() {
+    let s = stub().await;
+    s.state.lock().unwrap().mirror_overdeliver = true;
+    let fid = s.put_file("0", "over.bin", vec![5u8; 300]);
+
+    let driver = s.driver();
+    let err = read_all(
+        &driver,
+        fid,
+        Some(Range {
+            start: 10,
+            end: Some(50),
+        }),
+    )
+    .await
+    .expect_err("an over-window 206 body is fatal");
+    match err {
+        StorageError::Unavailable(detail) => {
+            assert!(
+                detail.contains("got") && detail.contains("expected"),
+                "got/expected diagnosis: {detail}"
+            );
+        }
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+}
+
+/// M6+L1：空 206 body（期望非零窗口）→ `Unavailable` 明示——替换原
+/// 「静默截断流」形态（消费者收到零字节成功流 = 无信号丢数据）。
+#[tokio::test]
+async fn empty_206_body_errors_instead_of_silently_truncating() {
+    let s = stub().await;
+    s.state.lock().unwrap().mirror_empty_206 = true;
+    let fid = s.put_file("0", "void.bin", vec![7u8; 128]);
+
+    let driver = s.driver();
+    let err = read_all(&driver, fid, None)
+        .await
+        .expect_err("an empty 206 body on a non-empty window is fatal");
+    match err {
+        StorageError::Unavailable(detail) => {
+            assert!(detail.contains("empty 206"), "{detail}");
+        }
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+}
+
+/// M7：200 + JSON 文件体——内容里的 `data.redirect_url` 键是**文件
+/// 数据**不是协议指令（真机实证的重定向体形态是 HTTP 210）。200 全量
+/// 的真病因是「Range 被忽略」：必须归因到既有防线，绝不从文件内容
+/// 指定的 URL 拉字节当文件数据（= 内容注入攻击面）。
+#[tokio::test]
+async fn json_file_body_on_200_is_range_ignored_not_a_redirect() {
+    let s = stub().await;
+    // 诱饵：另一个文件的 mirror URL——若被误当重定向跟随，读回的就
+    // 是它的字节（数据损坏形态）。
+    let decoy = s.put_file("0", "decoy.bin", vec![9u8; 32]);
+    let json_body = format!(
+        "{{\"code\":0,\"data\":{{\"redirect_url\":\"{}/mirror/{}\"}}}}",
+        s.base, decoy
+    );
+    let fid = s.put_file("0", "content.json", json_body.into_bytes());
+    s.state.lock().unwrap().mirror_ignore_range = true;
+
+    let driver = s.driver();
+    let err = read_all(&driver, fid, None)
+        .await
+        .expect_err("a JSON file body is file data, not a protocol directive");
+    match err {
+        StorageError::Unavailable(detail) => {
+            assert!(
+                detail.contains("Range"),
+                "Range-ignored attribution, not a redirect follow: {detail}"
+            );
+        }
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+    assert_eq!(
+        s.hits("/mirror"),
+        1,
+        "only the file's own mirror was fetched; the in-content URL was never followed"
+    );
+}
+
+/// M10a：首窗口限流退避——**冷解析路径**首 GET 撞 429（前 2 次，带
+/// `Retry-After: 1`）→ 按 1/2/4s 梯度退避重试后成功、数据逐字节正确
+/// （此前首窗 429 直接上抛——恰是每次打开的必经路径，梯度只在后续
+/// 窗口生效）。真 sleep 1+2s（paused-time 需 tokio test-util feature，
+/// 仓库测试哲学=毫秒级结构注入而非时钟替身——此处梯度常量不可注入，
+/// 3s 真等待在预算内）。
+#[tokio::test]
+async fn first_window_backs_off_rate_limits_and_recovers() {
+    let s = stub().await;
+    s.state.lock().unwrap().mirror_429_first = 2;
+    let data: Vec<u8> = (0..64u32).map(|i| (i % 17) as u8).collect();
+    let fid = s.put_file("0", "throttled.bin", data.clone());
+
+    let driver = s.driver();
+    let got = read_all(&driver, fid, None)
+        .await
+        .expect("the first window backs off and recovers");
+    assert_eq!(got, data);
+    assert_eq!(
+        s.hits("/mirror"),
+        3,
+        "two 429s then one 206 (gradient retry)"
+    );
+}
+
+/// M10a：梯度用尽 → `RateLimited` 上抛（3 次尝试 = 梯度形态；注入的
+/// `Retry-After` 随终态透出）。真 sleep 1+2s（末次失败不白睡——见
+/// window_get_backoff 形态注释）。
+#[tokio::test]
+async fn first_window_gradient_exhaustion_surfaces_rate_limited() {
+    let s = stub().await;
+    s.state.lock().unwrap().mirror_429_first = 999;
+    let fid = s.put_file("0", "capped.bin", vec![1; 32]);
+
+    let driver = s.driver();
+    let err = read_all(&driver, fid, None)
+        .await
+        .expect_err("an exhausted gradient surfaces RateLimited");
+    assert!(
+        matches!(
+            err,
+            StorageError::RateLimited { retry_after: Some(d) } if d == std::time::Duration::from_secs(1)
+        ),
+        "the injected Retry-After rides the surfaced error: {err:?}"
+    );
+    assert_eq!(s.hits("/mirror"), 3, "three attempts = the gradient shape");
+}
+
+/// M10a：**缓存命中路径**的首窗口同样退避（二次 open 对缓存 URL 单
+/// 发——此前该路径 429 同样直接上抛）。真 sleep 1+2s。
+#[tokio::test]
+async fn cached_first_window_backs_off_too() {
+    let s = stub().await;
+    let data = vec![3u8; 48];
+    let fid = s.put_file("0", "warm.bin", data.clone());
+
+    let driver = s.driver();
+    let first = read_all(&driver, fid, None)
+        .await
+        .expect("warm the dlink cache");
+    assert_eq!(first, data);
+    s.state.lock().unwrap().mirror_429_first = 2;
+    let second = read_all(&driver, fid, None)
+        .await
+        .expect("the cache-hit first window backs off");
+    assert_eq!(second, data);
+    assert_eq!(
+        s.hits("/mirror"),
+        4,
+        "1 warm + 2x429 + 1 recovery on the cached URL"
+    );
 }
 
 /// reader 形态守卫：目录句柄 → Invalid；未知句柄 → NotFound；垃圾

@@ -205,6 +205,10 @@ struct TransferState {
     /// 本地内容的真 MD5（close/abort 的会话键与会话落盘复用——避免
     /// 二遍哈希）。
     etag: String,
+    /// ⑤ 再 list 确认分片齐后置 true（M8/K78：④ 中途失败上抛的部分
+    /// 态为 false——close 对未确认态先复跑对账，绝不盲信进 ⑥⑦）。
+    /// 秒传终态天然 true（零分片，无可确认面）。
+    confirmed: bool,
 }
 
 /// 上传暂存器（[`UploadStager`] 实现；commit-on-close）。
@@ -301,6 +305,7 @@ impl Pan123Stager {
                         ticket,
                         rapid_file_id: None,
                         etag: etag.to_string(),
+                        confirmed: false,
                     });
                 }
                 // 旧会话已被 complete 消费/过期 → 清本地记录走 re-request。
@@ -346,7 +351,9 @@ impl Pan123Stager {
                         done: Vec::new(),
                         rapid_file_id: Some(file_id),
                         etag: etag.to_string(),
-                    })
+                        // 秒传终态零分片，无对账面——视为已确认。
+                        confirmed: true,
+                    });
                 }
                 UploadRequestOutcome::Conflict => {
                     // duplicate=2 后仍 5060：异常形态（同名目录等）——
@@ -365,6 +372,7 @@ impl Pan123Stager {
                         ticket: *ticket,
                         rapid_file_id: None,
                         etag: etag.to_string(),
+                        confirmed: false,
                     });
                 }
                 // 会话失效（已被 complete 消费）→ 重走 upload_request
@@ -389,9 +397,8 @@ impl Pan123Stager {
     }
 
     /// 传输链（到齐即传与 close 共用的同一段）：hash → 步骤 ①②（会话
-    /// 建立 + 对账）→ ③④（只补缺片）→ ⑤（确认）。**不含 ⑥⑦**。
+    /// 建立 + 对账）→ [`Self::reconcile_parts`]（③④⑤）。**不含 ⑥⑦**。
     async fn run_transfer(&mut self) -> Result<(), StorageError> {
-        let size = self.written;
         let etag = self.hash_md5().await?;
         let state = self.establish_session(&etag).await?;
         if state.rapid_file_id.is_some() {
@@ -404,11 +411,24 @@ impl Pan123Stager {
         tracing::debug!(
             target: "ck_pan123::upload",
             rapid_hint = self.hint.rapid_upload,
-            size,
+            size = self.written,
             upload_id = %ticket.upload_id,
             present_parts = present.len(),
             "upload session established (rapid detection is server-side via the etag)"
         );
+        self.reconcile_parts().await
+    }
+
+    /// 步骤 ③④⑤：对账 + 补缺 + 确认（run_transfer 与 close 的未确认态
+    /// 复核共用——M8/K78 抽取；resume 差集与 close 复核是同一逻辑）。
+    ///
+    /// 前置：`self.transfer` 已就位且非秒传终态。完成时置 `confirmed`。
+    async fn reconcile_parts(&mut self) -> Result<(), StorageError> {
+        let size = self.written;
+        let (ticket, present) = {
+            let t = self.transfer.as_ref().expect("transfer state in place");
+            (t.ticket.clone(), t.done.clone())
+        };
 
         // 步骤 ③④：缺失分片的连续区间批量预签名（含空洞时多余 URL 不
         // 用即可——单次 API 调用优先）+ 逐片 PUT（每片即落）。
@@ -459,9 +479,35 @@ impl Pan123Stager {
         }
         if let Some(t) = self.transfer.as_mut() {
             t.done = confirmed.into_iter().map(|(n, _)| n).collect();
+            t.confirmed = true;
         }
         self.persist_session().await;
         Ok(())
+    }
+
+    /// 对账基准刷新（close 复核腿的前置）：`t.done` 是写腿的观察值
+    /// （PUT 成功才记），未观察成功的分片服务端可能已在册（响应丢失
+    /// 后重试耗尽的形态）——以服务端 list 为准只补**真**缺片（PUT
+    /// 幂等，重传已在册分片无害但白付流量——「服务端真值，本地记录
+    /// 只是提示」与 establish_session 同纪律）。
+    async fn refresh_present_from_server(&mut self) -> Result<(), StorageError> {
+        let ticket = self
+            .transfer
+            .as_ref()
+            .expect("transfer state in place")
+            .ticket
+            .clone();
+        match self.client.s3_list_parts(&ticket).await? {
+            PartsOutcome::Parts(parts) => {
+                if let Some(t) = self.transfer.as_mut() {
+                    t.done = parts.into_iter().map(|(n, _)| n).collect();
+                }
+                Ok(())
+            }
+            PartsOutcome::SessionGone => Err(StorageError::Io(
+                "pan123 upload session gone during the reconcile list".into(),
+            )),
+        }
     }
 
     /// 会话落盘（五元组 + 已传分片；etag 取传输态——避免二遍哈希）。
@@ -605,8 +651,9 @@ impl UploadStager for Pan123Stager {
         Ok(())
     }
 
-    /// 提交（commit-on-close 的提交点）：传输链（若未起）→ ⑥ s3_complete
-    /// → ⑦ upload_complete/v2 →（>64MB settle 等待）→ size 复核。
+    /// 提交（commit-on-close 的提交点）：传输链（若未起；部分失败态
+    /// 先复跑对账+补缺——M8/K78）→ ⑥ s3_complete → ⑦ upload_complete/v2
+    /// →（>64MB settle 等待）→ size 复核。
     async fn close(mut self: Box<Self>) -> Result<Entry, StorageError> {
         // WriteHint 契约：承诺与实际不符 → Invalid（vfs 层据此拒绝）。
         if let Some(hinted) = self.hint.size {
@@ -617,6 +664,20 @@ impl UploadStager for Pan123Stager {
         let size = self.written;
         if self.transfer.is_none() {
             self.run_transfer().await?;
+        }
+        // M8/K78：write 在④步中途失败上抛后 `transfer` 已是 Some（部分
+        // done、未过⑤确认）——盲信直接进 ⑥⑦ 会把缺片提交掉（complete
+        // 对缺片的真形未实证；服务端回声称 size 的形态下 size 校验失防，
+        // 半截数据可能被报成功）。未确认态先复跑「对账+补缺」（与
+        // resume 差集同一逻辑），确认齐片才提交。
+        if !self
+            .transfer
+            .as_ref()
+            .expect("transfer state after run")
+            .confirmed
+        {
+            self.refresh_present_from_server().await?;
+            self.reconcile_parts().await?;
         }
         let t = self.transfer.take().expect("transfer state after run");
         let etag = t.etag.clone();
