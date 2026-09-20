@@ -10,7 +10,8 @@
 //! - **stat**：末级新鲜查询（注入的后端错误不被缓存吞掉——M-S1）；
 //! - **mkdir**：已存在**预检** → `Exists` 且**不发** upload_request；
 //!   隐式父目录逐级创建；
-//! - **delete**：trash 正确载荷（恰为两键）+ 回读校验（静默陷阱 → `Io`
+//! - **delete**：trash 四键载荷（`operation:true` **必填**——123-5 真机
+//!   钉死：缺省恒 `400 请输入Operation`）+ 回读校验（静默陷阱 → `Io`
 //!   不吞）；冷句柄走 info 回读（Trashed 标志）；
 //! - **rename**：文件与目录同端点（任务 0 实证）；跨父走 mod_pid
 //!   （wire 形态校验）；目标占用 → `Exists`（冷目录现列预检）；后代
@@ -319,6 +320,56 @@ async fn delete_catches_the_silent_trash_failure_by_read_back() {
         }
         other => panic!("the silent failure must surface as Io, got {other:?}"),
     }
+}
+
+/// trash 载荷四键形（123-5 真机钉死，2026-09-20）：`operation:true`
+/// **必填**——缺省即 `400 请输入Operation`（live_matrix 三个用例的
+/// cleanup 恒红揭出；123-0 spike 一直发四键形故真机从未踩到，123-2
+/// 实现按跟踪单「两键」摘要抄漏——「桩照实现抄」第三例）。`event`/
+/// `driveId` 实测可省（变体 B：code=0），驱动仍发全四键形（语义显式
+/// + spike 真机四连绿形态）。
+#[tokio::test]
+async fn delete_sends_the_operation_key_the_live_server_requires() {
+    let s = stub().await;
+    let fid = s.put_file("0", "op.bin", vec![1, 2]);
+
+    let driver = s.driver();
+    let listing = driver.list(&path("/"), Page::all()).await.expect("warm");
+    let entry = listing
+        .entries
+        .iter()
+        .find(|e| e.path.as_str() == "op.bin")
+        .expect("present");
+    driver.delete(&entry.id).await.expect("trash + verify");
+
+    let body = s
+        .state
+        .lock()
+        .unwrap()
+        .last_trash_body
+        .clone()
+        .expect("the stub saw the trash body");
+    assert_eq!(
+        body.get("operation").and_then(|o| o.as_bool()),
+        Some(true),
+        "operation:true is required by the live server: {body}"
+    );
+    assert_eq!(
+        body.get("event").and_then(|e| e.as_str()),
+        Some("intoRecycle"),
+        "event stays explicit (spike-verified four-key form): {body}"
+    );
+    assert_eq!(body.get("driveId").and_then(|d| d.as_i64()), Some(0));
+    assert_eq!(
+        body.get("fileTrashInfoList")
+            .and_then(|l| l.as_array())
+            .and_then(|a| a.first())
+            .and_then(|it| it.get("FileId"))
+            .and_then(|f| f.as_i64()),
+        Some(fid),
+        "the target fid rides the uppercase FileId key: {body}"
+    );
+    let _ = fid;
 }
 
 /// 冷句柄删除（缓存无父——重启形态）：info 回读（Trashed/查无）。

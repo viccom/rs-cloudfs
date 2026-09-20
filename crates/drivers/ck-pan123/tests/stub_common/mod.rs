@@ -11,8 +11,10 @@
 //! - `/api/file/list/new`——Page 1 基分页
 //! - `/b/api/file/info`——小写 `infoList`
 //! - `/a/api/file/upload_request`——type=1 目录创建，5060 冲突
-//! - `/a/api/file/trash`——载荷恰为 `fileTrashInfoList` 大写 `FileId` +
-//!   `event:"intoRecycle"`；陷阱旋钮 = code=0 但不删（静默陷阱建模）
+//! - `/a/api/file/trash`——`fileTrashInfoList` 大写 `FileId` +
+//!   `operation:true`（**必填**——123-5 真机钉死：缺省恒 400
+//!   `请输入Operation`；`event`/`driveId` 可省）；陷阱旋钮 = code=0
+//!   但不删（静默陷阱建模）
 //! - `/a/api/file/rename`——文件与目录同端点（任务 0 实证）
 //! - `/b/api/file/mod_pid`、`/b/api/user/info`
 //! - `/b/api/file/download/traffic/check`、`/a/api/file/download_info`
@@ -151,6 +153,8 @@ pub struct StubState {
     pub user_info_code: Option<i64>,
     /// trash 静默陷阱：载荷形状不恰当时 code=0 但不删（§5.11 建模）。
     pub trash_silent_trap: bool,
+    /// 最近一次 trash 载荷（123-5 真机钉死后驱动四键形的正向钉）。
+    pub last_trash_body: Option<Value>,
     /// mirror 死亡模式：404。
     pub mirror_dead: bool,
     /// mirror 忽略 Range：200 全量（写偏防线用例）。
@@ -626,36 +630,32 @@ async fn trash(State(state): State<Arc<Mutex<StubState>>>, body: String) -> Resp
     let Ok(v) = serde_json::from_str::<Value>(&body) else {
         return err_code(400, "bad json");
     };
-    // 载荷形状记录（§5.11）：**恰为**两键——fileTrashInfoList[{大写
-    // FileId}] + event:"intoRecycle"。`trash_silent_trap` 旋钮 = 无条件
-    // code=0 但不删（服务端漂移使正确载荷也静默失效的建模——回读校验
-    // 的用例面；形状校验保留为可观测约束，驱动载荷错形由回读间接揭出）。
-    let shape_ok = v.get("event").and_then(|e| e.as_str()) == Some("intoRecycle")
-        && v.as_object().is_some_and(|m| m.len() == 2)
-        && v.get("fileTrashInfoList")
-            .and_then(|l| l.as_array())
-            .is_some_and(|a| {
-                a.first()
-                    .and_then(|it| it.get("FileId"))
-                    .and_then(|f| f.as_i64())
-                    .is_some()
-            });
-    let _ = shape_ok;
-    let fid = v
+    // 服务端真形（123-5 真机钉死，2026-09-20）：`operation:true` **必填**
+    // ——缺省即 `400 请输入Operation`（live 复现：旧两键载荷恒 400）；
+    // `event:"intoRecycle"` 与 `driveId:0` 可省（变体 B/D 实测 code=0）
+    // ——驱动仍发 spike 全四键形（语义显式）。`trash_silent_trap` 旋钮
+    // = 无条件 code=0 但不删（服务端漂移使正确载荷也静默失效的建模
+    // ——回读校验的用例面）。
+    let list_has_fid = v
         .get("fileTrashInfoList")
         .and_then(|l| l.as_array())
         .and_then(|a| a.first())
         .and_then(|it| it.get("FileId"))
         .and_then(|f| f.as_i64());
+    let Some(fid) = list_has_fid else {
+        return err_code(400, "The Fids field is required");
+    };
+    st.last_trash_body = Some(v.clone());
+    if v.get("operation").and_then(|o| o.as_bool()) != Some(true) {
+        return err_code(400, "请输入Operation");
+    }
     if st.trash_silent_trap {
         return ok_json(json!({})); // code=0，实际不删
     }
-    if let Some(fid) = fid {
-        for rows in st.dirs.values_mut() {
-            rows.retain(|e| e.fid != fid);
-        }
-        st.dirs.remove(&fid.to_string());
+    for rows in st.dirs.values_mut() {
+        rows.retain(|e| e.fid != fid);
     }
+    st.dirs.remove(&fid.to_string());
     ok_json(json!({}))
 }
 
@@ -993,7 +993,28 @@ async fn upload_request_file(State(state): State<Arc<Mutex<StubState>>>, body: S
                 overwrite_fid,
             )
         }
-        Some(id) => id,
+        Some(id) => {
+            // 123-5 真机钉死规则（2026-09-20 三轮实验）：同参重发**只在
+            // 零片时复用会话**——任一分片已传后，重发**铸新会话**（旧
+            // 会话服务端保留、其 tuple 仍可直接 list）。原桩的「恒同
+            // UploadId」模型只在首片前成立——123-3 的 re-request 主路径
+            // 对已传分片形永不可达差集（真机缺陷，驱动侧修 = 本地五元组
+            // 优先）。
+            let has_parts = st.sessions.get(&id).is_some_and(|s| !s.parts.is_empty());
+            if has_parts {
+                new_stub_session(
+                    &mut st,
+                    &skey,
+                    parent,
+                    &final_name,
+                    &etag,
+                    size,
+                    overwrite_fid,
+                )
+            } else {
+                id
+            }
+        }
         None => new_stub_session(
             &mut st,
             &skey,

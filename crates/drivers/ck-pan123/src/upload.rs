@@ -28,23 +28,31 @@
 //! 同为「本地 spool + commit-on-close」，差异都在协议面：123 的 etag 是
 //! **全量 MD5**（115 是 SHA1+preid）；123 的 complete **不携带分片表**
 //! （4 键形——115 的 Complete 要 parts 列表）；123 的会话由**服务端
-//! 保留**（同参重发返回同一 UploadId——115 是 resume 端点 + 本地五元组
-//! 优先）；123 的 abort **无远端释放端点**（115 有 AbortMultipartUpload
-//! ——K75-2 教训的 123 形态：孤儿会话服务端保留，配额影响未知挂账）。
+//! 保留**（**仅零片会话**同参重发返回同一 UploadId——见下节 123-5 修正；
+//! 已传分片的差集恢复 = 本地五元组优先，与 115 同归）；123 的 abort
+//! **无远端释放端点**（115 有 AbortMultipartUpload——K75-2 教训的 123
+//! 形态：孤儿会话服务端保留，配额影响未知挂账）。
 //!
 //! ## resume（能力位⑦依据）
 //!
-//! - **重传路径（spike 钉死 c）**：同路径同内容重走 upload_request →
-//!   服务端回**同一 UploadId**（本地五元组丢失亦可恢复）→ list_parts
-//!   对账 → 只补缺片；
-//! - **本地会话记录**（pan115 SessionStore 同形）：每片 PUT 成功即落
-//!   （差集续传资产 + 诊断面）；**键 = `path|size|md5` 三元键**（内容级
-//!   身份——强于 pan123-rs 的 mtime(±1s)/size 判据：md5 相等即内容
-//!   相等，时间戳校验被包含与取代；且本仓 stager 必须算真 MD5，键内
-//!   即内容身份，无额外校验面可加）；
+//! - **本地五元组优先（123-5 真机修正后的主路径）**：每片 PUT 成功
+//!   即落本地会话记录（`path|size|md5` 三元键）；重开同路径时先取记录
+//!   直接对账旧 tuple（list_parts）——只补缺片。**为什么必须本地优先**：
+//!   同参重发的会话复用**只在零片时成立**（2026-09-20 真机三轮实验：
+//!   PUT part1 前 re-request 同 id 同 up_file_id；PUT 后 re-request
+//!   恒铸新 id 且旧 tuple 服务端保留仍可 list）——123-3 按 spike「钉死
+//!   c」实现的 re-request 主路径对已传分片形永不可达差集（每轮续传
+//!   全量重传 + 泄漏孤儿会话），真机矩阵揭出后修正为本地优先；
+//! - **re-request 引导（零片段）**：本地记录 miss / 旧会话已被消费
+//!   （ListParts NoSuchKey）时，同参重发 upload_request 引导新会话
+//!   （零片会话同 id 复用的真机形态）；
+//! - **本地会话记录**（pan115 SessionStore 同形）：键 = `path|size|md5`
+//!   三元键（内容级身份——强于 pan123-rs 的 mtime(±1s)/size 判据：md5
+//!   相等即内容相等，时间戳校验被包含与取代；且本仓 stager 必须算真
+//!   MD5，键内即内容身份，无额外校验面可加）；
 //! - **会话失效**（ListParts NoSuchKey——会话已被 complete 消费）→
-//!   重走 upload_request 全量重传**恰一次**；仍失效 → `Io`（不自陷
-//!   循环）。
+//!   清记录重走 upload_request 全量重传**恰一次**；仍失效 → `Io`
+//!   （不自陷循环）。
 //!
 //! ## errno 写侧（§D）
 //!
@@ -257,9 +265,58 @@ impl Pan123Stager {
 
     /// 步骤 ①：upload_request（含 5060 → duplicate=2 重发 + 会话失效
     /// 重试恰一次）。产出工作会话（或秒传终态）+ 服务端在册分片。
+    ///
+    /// **本地五元组优先（123-5 真机修正）**：同参重发只在**零片会话**
+    /// 上复用同一 UploadId——任一分片已传后，重发恒铸新会话（2026-09-20
+    /// 真机三轮实验钉死：PUT part1 前 re-request 同 id；PUT 后 re-request
+    /// 新 id 且旧 tuple 仍可直接 list）。123-3 的「re-request 主路径」
+    /// 对已传分片形**永不可达差集**（真机矩阵揭出——每轮断点续传都全量
+    /// 重传 + 遗漏孤儿会话）。修法 = pan123-rs/123panNextGen 的本地
+    /// 五元组模型：先取本地会话记录（`path|size|md5` 键）直接对账旧
+    /// tuple；miss / 旧会话已被消费才走 re-request 引导。
     async fn establish_session(&mut self, etag: &str) -> Result<TransferState, StorageError> {
         let size = self.written;
         let parent: i64 = self.parent_cid.parse().unwrap_or(0);
+        // ---- 本地会话记录优先（差集续传的唯一可达路径）。
+        if let Some(rec) = self.sessions.load(self.rel_path.as_str(), size, etag).await {
+            let ticket = UploadTicket {
+                up_file_id: rec.up_file_id,
+                bucket: rec.bucket,
+                key: rec.key,
+                upload_id: rec.upload_id,
+                storage_node: rec.storage_node,
+                slice_size: None,
+            };
+            match self.client.s3_list_parts(&ticket).await? {
+                PartsOutcome::Parts(parts) => {
+                    tracing::debug!(
+                        target: "ck_pan123::upload",
+                        upload_id = %ticket.upload_id,
+                        present = parts.len(),
+                        "resuming the locally recorded multipart session (re-request would \
+                         have minted a fresh one)"
+                    );
+                    return Ok(TransferState {
+                        done: parts.into_iter().map(|(n, _)| n).collect(),
+                        ticket,
+                        rapid_file_id: None,
+                        etag: etag.to_string(),
+                    });
+                }
+                // 旧会话已被 complete 消费/过期 → 清本地记录走 re-request。
+                PartsOutcome::SessionGone => {
+                    tracing::warn!(
+                        target: "ck_pan123::upload",
+                        upload_id = %ticket.upload_id,
+                        "the locally recorded multipart session is gone server-side: \
+                         removing the record and re-requesting a fresh session"
+                    );
+                    self.sessions
+                        .remove(self.rel_path.as_str(), size, etag)
+                        .await;
+                }
+            }
+        }
         for attempt in 0..=1u32 {
             // 首请求不带 duplicate（§5.13）；5060 → duplicate:2 重发
             // （D4：2=同 FileId 原地覆盖——**绝不发 1**）。

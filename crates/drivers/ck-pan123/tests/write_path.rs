@@ -321,8 +321,10 @@ async fn resume_after_failed_close_skips_uploaded_parts() {
         puts_after_leg1,
         "close adds no further PUTs either"
     );
-    // 会话保留模型：同参重发返回同一 UploadId（两腿各一次 request）。
-    assert_eq!(s.hits("/b:upload_request"), 2);
+    // 会话模型（123-5 真机修正后）：第二腿走**本地五元组优先**——零
+    // upload_request（旧模型是同参重发同 id，两腿各一次 request；真机
+    // 三轮实验证伪：分片已传后重发恒铸新会话，本地记录才是差集路径）。
+    assert_eq!(s.hits("/b:upload_request"), 1);
 
     let round = read_all(&driver, &p).await;
     assert_eq!(round, data);

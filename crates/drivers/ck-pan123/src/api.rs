@@ -851,10 +851,17 @@ impl Pan123Client {
     /// `fileTrashInfoList` 大写 `FileId` + `event:"intoRecycle"`；多余键
     /// 曾是静默失败陷阱的形态面——最小载荷 + 调用方回读校验维持纵深）。
     pub async fn trash(&self, file_id: i64) -> Result<(), StorageError> {
+        // 四键形（123-5 真机钉死，2026-09-20）：`operation:true` **必填**
+        // ——旧两键形（fileTrashInfoList + event）真机恒 `400 请输入
+        // Operation`（live_matrix cleanup 三连红揭出；123-0 spike 一直发
+        // 四键形故真机从未踩到）。`event`/`driveId` 实测可省，保留发：
+        // spike 真机四连绿形态 + intoRecycle 语义显式（D2）。
         self.dispatch_post_json(
             "/a/api/file/trash",
             &serde_json::json!({
+                "driveId": 0,
                 "fileTrashInfoList": [{"FileId": file_id}],
+                "operation": true,
                 "event": "intoRecycle",
             }),
             "file/trash",
