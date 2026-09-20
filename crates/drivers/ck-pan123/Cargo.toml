@@ -72,3 +72,6 @@ futures-util = { version = "0.3", default-features = false }
 # 写路径 SessionStore 磁盘层与 spool 目录的测试隔离（ck-baidu/ck-pan115
 # tests 同款）。
 tempfile = "3"
+# live_matrix（123-5 真机矩阵）裸 client 预置中止态需要算内容真 MD5
+# （etag）——与运行时依赖同 crate 同版本，零新增外部代码。
+md-5 = "0.10"

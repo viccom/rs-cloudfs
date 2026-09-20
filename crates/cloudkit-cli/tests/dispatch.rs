@@ -31,9 +31,11 @@ use cloudkit_cli::{
 use cloudkit_cli::BackendTransport;
 // Baidu-gated surface (FT2): the mock backend, the injected dispatch
 // seam and the driver trait only exist with the `baidu` feature.
+// Router is shared by the pan123 mock below (123-5：pan123-only 组合的
+// --all-targets clippy 面揭出——原 baidu-only 门在无 baidu 组合下漏导)。
 #[cfg(feature = "baidu")]
 use axum::routing::get;
-#[cfg(feature = "baidu")]
+#[cfg(any(feature = "baidu", feature = "pan123"))]
 use axum::Router;
 #[cfg(feature = "baidu")]
 use ck_baidu::TokenStore;

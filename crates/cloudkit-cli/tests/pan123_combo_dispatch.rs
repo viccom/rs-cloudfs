@@ -29,8 +29,10 @@ fn combo_spec() -> VolumeConfig {
 /// 而不是被 pan123 装配链吃掉后吐出误导错误。
 #[tokio::test]
 async fn non_pan123_backends_refuse_with_their_own_driver_message() {
-    let mut settings = CyDriveConfig::default();
-    settings.backend = Backend::Baidu;
+    let settings = CyDriveConfig {
+        backend: Backend::Baidu,
+        ..CyDriveConfig::default()
+    };
     let spec = combo_spec();
     let mut run_options = cloudkit_cli::RunOptions::default();
     let home = std::path::Path::new(".");
@@ -62,8 +64,11 @@ async fn non_pan123_backends_refuse_with_their_own_driver_message() {
 /// 不拨号——构造在 `user/info` 连接之前失败。
 #[tokio::test]
 async fn a_pan123_volume_routes_into_the_real_assembly() {
-    let mut settings = CyDriveConfig::default();
-    settings.backend = Backend::Pan123; // 无 token（validate 面由 core 钉）
+    // 无 token（validate 面由 core 钉）。
+    let settings = CyDriveConfig {
+        backend: Backend::Pan123,
+        ..CyDriveConfig::default()
+    };
     let spec = combo_spec();
     let mut run_options = cloudkit_cli::RunOptions::default();
     let home = std::path::Path::new(".");
