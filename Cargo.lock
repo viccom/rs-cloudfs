@@ -173,6 +173,18 @@ dependencies = [
 ]
 
 [[package]]
+name = "async-compression"
+version = "0.4.40"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "7d67d43201f4d20c78bcda740c142ca52482d81da80681533d33bf3f0596c8e2"
+dependencies = [
+ "compression-codecs",
+ "compression-core",
+ "pin-project-lite",
+ "tokio",
+]
+
+[[package]]
 name = "async-io"
 version = "2.6.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -648,6 +660,22 @@ dependencies = [
 ]
 
 [[package]]
+name = "ck-pan123"
+version = "0.10.0"
+dependencies = [
+ "async-trait",
+ "axum",
+ "cloudkit-storage",
+ "md-5",
+ "reqwest",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "ck-sftp"
 version = "0.10.0"
 dependencies = [
@@ -744,6 +772,7 @@ dependencies = [
  "ck-baidu",
  "ck-local",
  "ck-pan115",
+ "ck-pan123",
  "ck-sftp",
  "ck-telegram",
  "clap",
@@ -933,6 +962,23 @@ dependencies = [
  "unicode-segmentation",
  "unicode-width",
 ]
+
+[[package]]
+name = "compression-codecs"
+version = "0.4.37"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "eb7b51a7d9c967fc26773061ba86150f19c50c0d65c887cb1fbe295fd16619b7"
+dependencies = [
+ "compression-core",
+ "flate2",
+ "memchr",
+]
+
+[[package]]
+name = "compression-core"
+version = "0.4.31"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "75984efb6ed102a0d42db99afb6c1948f0380d1d91808d5529916e6c08b49d8d"
 
 [[package]]
 name = "concurrent-queue"
@@ -4807,12 +4853,17 @@ version = "0.6.11"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "4cfcf7e2740e6fc6d4d688b4ef00650406bb94adf4731e43c096c3a19fe40840"
 dependencies = [
+ "async-compression",
  "bitflags",
  "bytes",
+ "futures-core",
  "futures-util",
  "http",
  "http-body",
+ "http-body-util",
  "pin-project-lite",
+ "tokio",
+ "tokio-util",
  "tower",
  "tower-layer",
  "tower-service",

@@ -811,6 +811,13 @@ async fn doctor_cmd() -> Result<()> {
                 &cloudkit_cli::pan115_backend_probe(&cfg).await,
             ));
         }
+        // Phase 6 / 123-1 placeholder: the pan123 live token probe (the
+        // user/info liveness leg + the QR-scan setup guidance) is a
+        // 123-4 item; the offline checks run now (115-1's pan115 arm
+        // was the same shape until 115-4 grew the dial-out leg).
+        cloudkit_core::config::Backend::Pan123 => {
+            results.extend(cloudkit_cli::doctor::backend_checks(&cfg));
+        }
     }
     print!("{}", cloudkit_cli::doctor::render_report(&results));
     Ok(())

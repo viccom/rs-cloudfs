@@ -515,6 +515,11 @@ pub fn backend_checks(cfg: &cloudkit_core::config::CyDriveConfig) -> Vec<CheckRe
                 });
             }
         }
+        // Phase 6 / 123-1 placeholder: the pan123-specific doctor checks
+        // (token liveness via user/info, traffic-quota display, QR-scan
+        // setup guidance) are a 123-4 item; the pan123 keys' cross-field
+        // rules already run in the config validate pass doctor shares.
+        Backend::Pan123 => {}
     }
     results
 }

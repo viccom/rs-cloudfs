@@ -255,6 +255,10 @@ fn toml_roundtrip_preserves_full_config() {
         pan115_access_token: None,
         pan115_refresh_token: None,
         pan115_root: None,
+        // Phase 6 / 123-1: the pan123 key group round-trips too (all
+        // unset — the exhaustive-field shape of this test).
+        pan123_token: None,
+        pan123_root: None,
         volumes_dir: None,
         // Phase 3.6 / RV0: the volume enable switch round-trips too.
         enabled: true,
