@@ -71,6 +71,7 @@ async fn main() {
         "probe-qr" => probes::cmd_probe_qr(rest).await,
         "probe-list" => probes::cmd_probe_list(rest).await,
         "probe-mkdir" => probes::cmd_probe_mkdir(rest).await,
+        "probe-dir-rename" => probes::cmd_probe_dir_rename(rest).await,
         "gen-file" => probes::cmd_gen_file(rest).await,
         "probe-upload" => probes::cmd_probe_upload(rest).await,
         "probe-trash" => probes::cmd_probe_trash(rest).await,

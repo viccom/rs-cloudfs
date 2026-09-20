@@ -15,6 +15,9 @@ async-trait = "0.1"
 # L2 契约层是唯一 workspace 依赖——驱动 crate 禁依赖 cloudkit-core 与
 # 任何 L3+ crate（driver-onboarding §1 / R1，scripts/check_layers 拦截）。
 cloudkit-storage = { path = "../../cloudkit-storage" }
+# web-pro2 中继 URL 的 params= 段自解码（123-2 三跳解析第一跳——
+# urlsafe-base64；纯解析非注入，D5 裁决内的链接解析面）。
+base64 = "0.22"
 # loginuuid = md5(uuid v4)（pan123-rs 形态；会话内稳定）——与 baidu 的
 # 分块 MD5（md-5）同 crate 同生态位。
 md-5 = "0.10"
@@ -22,20 +25,25 @@ uuid = { version = "1", features = ["v4"] }
 # 开放 API 面（特性集照 ck-baidu/ck-pan115 先例：rustls 禁 native-tls；
 # json=响应解析；gzip=123pan 服务端 gzip 压缩体的透明解压——spike 实证
 # 需 gzip feature，手工头不带 feature 会拿到不可解码体）。
-# stream/下载流面是 123-2 的依赖（本批 reader 为占位错误，不构造流）。
 reqwest = { version = "0.12", default-features = false, features = [
     "json",
     "rustls-tls",
     "gzip",
 ] }
+# ByteStream 产生侧（download.rs 的窗口流实现 futures_core::Stream；
+# ck-baidu/ck-pan115 同款依赖面）。
+futures-core = "0.3"
+# CDN 窗口流的帧类型。
+bytes = "1"
 # 载荷模型（envelope/QR/sign_in 响应结构体）。
 serde = { version = "1", features = ["derive"] }
 # envelope 与业务面 JSON 载荷。
 serde_json = "1"
-# token 状态 RwLock + 域名 bootstrap 的单飞锁。
-tokio = { version = "1", features = ["sync"] }
-# 20101/401 的可行动文案经 warn 通道（ck-pan115 api.rs 同款双通道裁决
-# ——StorageError::Unauthorized 无载荷）。
+# token 状态 RwLock + 域名 bootstrap 的单飞锁 + limiter/retry 的节拍与
+# 退避等待（tokio::time——可测性经毫秒级参数注入，RebuildTuning 先例）。
+tokio = { version = "1", features = ["sync", "time"] }
+# 20101/401/5113 的可行动文案经 warn 通道（ck-pan115 api.rs 同款双通道
+# 裁决——StorageError::Unauthorized/RateLimited 无载荷）。
 tracing = "0.1"
 
 [dev-dependencies]
@@ -51,3 +59,5 @@ axum = { version = "=0.8.9", default-features = false, features = [
 tokio = { version = "1", features = ["rt", "macros", "net"] }
 # 集成测试构造 envelope JSON 样本（serde_json::from_str 直入 Envelope）。
 serde_json = "1"
+# 读路径桩回放测试的流消费（StreamExt::next）。
+futures-util = { version = "0.3", default-features = false }

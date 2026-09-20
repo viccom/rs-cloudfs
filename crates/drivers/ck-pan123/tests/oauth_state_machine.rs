@@ -396,18 +396,16 @@ async fn sign_in_pins_the_wire_form_and_persists_on_first_save() {
     // 首存恰一次（无 refresh——不会再有第二次保存机会）
     assert_eq!(store.calls(), vec!["mock-token-from-signin".to_string()]);
 
-    // 错误凭证：失败码上抛且不回显请求体（R3）
+    // 错误凭证：失败码上抛。123-2 起 400 参数类 → `Invalid`（任务 G
+    // errno 表——错凭证即服务端的参数类拒绝；R3「不回显请求体」由
+    // map_rejection 的构造保证——错误文本只拼 code+message，钉在
+    // errno_mapping 的 map_rejection_payloads_never_echo_the_data_member）。
     let err = oauth::sign_in(&http, &mock.base, "wrong", "wrong", None)
         .await
         .expect_err("bad credentials");
-    match err {
-        StorageError::Unavailable(detail) => {
-            assert!(detail.contains("400"), "keeps the raw code: {detail}");
-            assert!(
-                !detail.contains("wrong") && !detail.contains("password"),
-                "never echoes the request body: {detail}"
-            );
-        }
-        other => panic!("expected Unavailable, got {other:?}"),
-    }
+    assert_eq!(
+        err,
+        StorageError::Invalid,
+        "400 parameter-class rejections are Invalid (123-2 errno table)"
+    );
 }

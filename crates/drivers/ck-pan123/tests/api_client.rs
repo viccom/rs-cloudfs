@@ -249,11 +249,19 @@ async fn both_domains_dead_surfaces_unavailable() {
     let dead_addr = probe.local_addr().expect("dead addr");
     drop(probe);
 
-    let client = Pan123Client::new(
+    let client = Pan123Client::with_tuning(
         TOKEN.to_string(),
         format!("http://{dead_addr}"),
         format!("http://{dead_addr}"),
         None,
+        ck_pan123::limiter::LimiterConfig::fast(),
+        // 重试关断：本用例只钉「终态 Unavailable」，避免 Windows 回环
+        // 拒连延迟 × 重试次数的套件拖慢（重试行为由 api_retry.rs 钉）。
+        {
+            let mut cfg = ck_pan123::api::RetryConfig::fast();
+            cfg.ordinary_max = 0;
+            cfg
+        },
     )
     .expect("client");
     let err = client.user_info().await.expect_err("both domains dead");

@@ -757,6 +757,171 @@ pub async fn cmd_probe_mkdir(rest: &[String]) -> Result<i32> {
     Ok(0)
 }
 
+// --------------------------------------------------------- probe-dir-rename
+
+/// 123-2 task 0: is `/a/api/file/rename` usable for DIRECTORIES?
+/// mkdir `e2e_pan123_r<rand>` -> rename the directory (fileId = the dir) ->
+/// list read-back (new name present / old gone / children preserved) ->
+/// trash sweep + verify-empty. Retries <=3 with >=2s spacing; the sweep runs
+/// even on failure (leftovers must be cleaned).
+pub async fn cmd_probe_dir_rename(rest: &[String]) -> Result<i32> {
+    let _ = Args::new(rest);
+    let (_paths, spike) = spike_with_tokens()?;
+    let stamp = format!("e2e_pan123_r{}", &state::rand_hex(4));
+    let old_name = stamp.clone();
+    let new_name = format!("{stamp}b");
+    let prefix = stamp.clone();
+
+    // Sweep helper: trash every root entry with the stamp prefix, verify empty.
+    async fn sweep(spike: &Spike, prefix: &str) -> Result<()> {
+        let url = format!("{}/api/file/list/new", api::PRIMARY_BASE);
+        let mut victims = Vec::new();
+        for page in 1..=10u32 {
+            let r = spike
+                .api_get(&url, &list_query(0, page, 100, false))
+                .await?;
+            let (code, msg) = api::code_of(&r.body);
+            if code != Some(0) {
+                bail!("sweep list page {page} failed code={code:?} msg={msg}");
+            }
+            let items = info_list_of(&r.body);
+            let n = items.len();
+            for it in items {
+                let name = field_str(&it, &["FileName", "fileName"]).unwrap_or("");
+                if name.starts_with(&prefix) {
+                    victims.push((
+                        field_i64(&it, &["FileId", "fileId"]).unwrap_or(0),
+                        name.to_string(),
+                    ));
+                }
+            }
+            if n < 100 {
+                break;
+            }
+        }
+        for (fid, name) in &victims {
+            let r = trash_correct(spike, *fid, true).await?;
+            let (code, msg) = api::code_of(&r.body);
+            println!("[sweep] trash {name:?} (fid={fid}) code={code:?} msg={msg:?}");
+        }
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let r = spike.api_get(&url, &list_query(0, 1, 100, false)).await?;
+        let remaining: Vec<String> = info_list_of(&r.body)
+            .into_iter()
+            .filter_map(|it| field_str(&it, &["FileName", "fileName"]).map(str::to_string))
+            .filter(|n| n.starts_with(&prefix))
+            .collect();
+        println!(
+            "[sweep] trashed={} remaining_with_prefix={} verdict={}",
+            victims.len(),
+            remaining.len(),
+            if remaining.is_empty() { "clean" } else { "INCOMPLETE" }
+        );
+        Ok(())
+    }
+
+    let result = async {
+        // 1. mkdir the directory (retry <=3, spacing >=2s).
+        let mkdir_body = json!({
+            "driveId": 0,
+            "etag": "",
+            "fileName": old_name,
+            "parentFileId": 0,
+            "size": 0,
+            "type": 1,
+            "NotReuse": true,
+        });
+        let url = format!("{}/a/api/file/upload_request", api::PRIMARY_BASE);
+        let mut fid: Option<i64> = None;
+        for attempt in 1..=3u32 {
+            let r = spike.api_post_json(&url, &mkdir_body, &[]).await?;
+            api::show(&format!("mkdir:{attempt}"), &r);
+            let (code, msg) = api::code_of(&r.body);
+            if code == Some(0) {
+                let v: Value = serde_json::from_str(&r.body)?;
+                fid = v
+                    .get("data")
+                    .and_then(|d| d.get("Info"))
+                    .and_then(|i| field_i64(i, &["FileId", "fileId"]))
+                    .or_else(|| {
+                        v.get("data")
+                            .and_then(|d| field_i64(d, &["FileId", "fileId"]))
+                    });
+                if fid.is_some() {
+                    break;
+                }
+                bail!("mkdir code=0 but FileId missing from data.Info");
+            }
+            eprintln!("[mkdir] attempt {attempt} refused code={code:?} msg={msg}");
+            if attempt < 3 {
+                tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+            }
+        }
+        let fid = fid.context("mkdir failed after 3 attempts")?;
+        println!("[dir-rename] mkdir ok FileId={fid} name={old_name:?}");
+
+        // 2. rename the DIRECTORY: new generation first, then old.
+        let rename_body = json!({
+            "driveId": 0,
+            "fileId": fid,
+            "fileName": new_name,
+        });
+        let mut used_gen = "";
+        for (gen, path) in [
+            ("new(/a/)", "/a/api/file/rename"),
+            ("old(/b/)", "/b/api/file/rename"),
+        ] {
+            let url = format!("{}{path}", api::PRIMARY_BASE);
+            let r = spike.api_post_json(&url, &rename_body, &[]).await?;
+            api::show(&format!("dir-rename:{gen}"), &r);
+            let (code, msg) = api::code_of(&r.body);
+            if code == Some(0) {
+                used_gen = gen;
+                break;
+            }
+            println!("[dir-rename] {gen} refused code={code:?} msg={msg} — trying next");
+        }
+        if used_gen.is_empty() {
+            bail!("directory rename refused on BOTH generations");
+        }
+
+        // 3. list read-back: new name present, old gone.
+        tokio::time::sleep(std::time::Duration::from_secs(1)).await;
+        let found_new = find_by_name(&spike, 0, &new_name).await?;
+        let found_old = find_by_name(&spike, 0, &old_name).await?;
+        let new_type = found_new
+            .as_ref()
+            .and_then(|it| field_i64(it, &["Type", "type"]));
+        println!(
+            "[dir-rename] read-back new_name_found={} old_name_found={} new_type={:?}",
+            found_new.is_some(),
+            found_old.is_some(),
+            new_type
+        );
+        let ok = found_new.is_some() && found_old.is_none();
+        println!(
+            "[SUMMARY] dir_rename|usable={}|gen={used_gen}|same_fid={:?}|type_preserved={:?}",
+            ok,
+            found_new
+                .as_ref()
+                .and_then(|it| field_i64(it, &["FileId", "fileId"]))
+                .map(|f| f == fid),
+            new_type.map(|t| t == 1)
+        );
+        if !ok {
+            bail!("read-back mismatch: rename not effective");
+        }
+        Ok::<(), anyhow::Error>(())
+    }
+    .await;
+
+    // 4. mandatory sweep (even on failure).
+    let sweep_result = sweep(&spike, &prefix).await;
+    result?;
+    sweep_result?;
+    Ok(0)
+}
+
 // -------------------------------------------------------------- gen-file
 
 /// Random-content payload file + MD5 (for upload etag).

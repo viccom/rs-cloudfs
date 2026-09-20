@@ -1,6 +1,7 @@
-//! 123 云盘 web API 面（Phase 6 / 123-1）——域名管理（dydomain 动态
-//! 发现 + 会话级粘性 fallback）、web 身份头集合（D5）与 envelope
-//! 解析/认证面错误分类。
+//! 123 云盘 web API 面（Phase 6 / 123-1 骨架 + 123-2 读路径扩展）——
+//! 域名管理（dydomain 动态发现 + 会话级粘性 fallback）、web 身份头集合
+//! （D5）、envelope 解析/错误分类、令牌桶限流 + HTTP 重试/退避与读路径
+//! 端点封装。
 //!
 //! ## envelope（§5.10 双成功码——123-0 真机实证）
 //!
@@ -10,13 +11,28 @@
 //! [`Envelope::is_ok`] 只认 0；认证面（[`Envelope::is_auth_ok`]）加认
 //! 200。非 JSON 响应（HTML 错误页/空体）→ `Unavailable`，serde 不崩穿。
 //!
-//! ## 错误分类表（R2；本批 = 认证面，后续批扩）
+//! ## 错误分类表（R2；123-1 认证面 + 123-2 读写面扩充）
 //!
 //! | code | 语义 | 分类 | 终态映射 |
 //! |---|---|---|---|
 //! | `20101` | 未登录（list 面） | [`ErrKind::NotLoggedIn`] | `Unauthorized{recoverable:false}`（web API 无 refresh，K76.4——重扫码可行动指引经 warn 通道） |
 //! | `401` | 未登录（user 面，"cookie token is empty"） | [`ErrKind::NotLoggedIn`] | 同上 |
-//! | 其他 | 未知 | [`ErrKind::Rejected`] | `Unavailable` 载荷保留原码与消息（R2 可诊断；5060/5113 等读写面码 123-2/3 入表） |
+//! | `5060` | 同名文件/目录冲突（mkdir/upload 面，data{etag,size,updated_at}） | [`ErrKind::NameConflict`] | `Exists` |
+//! | `5113` / `5114` | 每日下载流量限额（D5：不绕过） | [`ErrKind::TrafficExceeded`] | `RateLimited{retry_after:None}` + warn 人话指引（会员消解/次日恢复） |
+//! | `-1` | rpc 形态失败（MalformedXML / ListParts NoSuchKey 采样） | [`ErrKind::RpcFailure`] | `Io` 保留原码与消息 |
+//! | `400` | 参数类校验失败（"The Fids field is required" / "请输入Etag" 采样） | [`ErrKind::BadParams`] | `Invalid`（warn 通道保留后端消息） |
+//! | 其他 | 未知 | [`ErrKind::Rejected`] | `Unavailable` 载荷保留原码与消息（R2 可诊断） |
+//!
+//! ## 限流与重试（§5.15；任务 G）
+//!
+//! - **令牌桶**（[`crate::limiter`]）：缺省保守 ~2 rps（真值未测挂账），
+//!   dispatch 前统一过门；
+//! - **HTTP 重试**：`Retry-After` 头优先（clamp 1–60s）→ 指数退避封顶
+//!   30s + 抖动；限流类（HTTP 429）重试 ≤6、普通错误（传输/5xx）≤3；
+//!   envelope 终态错误（`Unauthorized`/`RateLimited`/映射表错误）与
+//!   非 JSON 体**恒不重试**；
+//! - **域名粘性 fallback**（§5.17）：主域连接错误 → 备域重放恰一次
+//!   （会话级粘性，不回切）。
 //!
 //! ## 域名管理（§5.17）
 //!
@@ -26,6 +42,11 @@
 //! [`DEFAULT_FALLBACK_BASE`]（`api.123278.com`）且**不回切**（粘性——
 //! 防振荡）。
 //!
+//! ## 传输会话分离（§5.12；123-2）
+//!
+//! CDN GET 走 [`Pan123Client::transfer_http`] 的**裸 client**（仅 UA，
+//! 无 123pan 鉴权头/Cookie；重定向手动跟——三跳封顶的执行面）。
+//!
 //! ## R3（凭据不入载荷/日志）
 //!
 //! 错误文本只拼 stage/code/message——绝不携带 data；reqwest 错误
@@ -33,6 +54,7 @@
 //! 掩码（ck-pan115 dispatch 同款三防线）。
 
 use std::net::{IpAddr, Ipv4Addr};
+use std::sync::Arc;
 use std::time::Duration;
 
 use serde::Deserialize;
@@ -40,7 +62,8 @@ use serde_json::Value;
 
 use cloudkit_storage::StorageError;
 
-use crate::models::UserInfo;
+use crate::limiter::{LimiterConfig, RateLimiter};
+use crate::models::{FileEntry, TrafficStatus, UserInfo};
 
 /// 浏览器 UA（D5 web 身份；spike `api.rs USER_AGENT` 同值——真机验证
 /// 形态。**无安卓头**：platform:android/设备指纹族经 D5 裁决不采纳）。
@@ -110,17 +133,33 @@ impl Envelope {
         }
     }
 
-    /// 错误信封 → StorageError（未登录的可行动文案经 warn 通道——
-    /// `Unauthorized` 无载荷，ck-pan115 api.rs 的双通道裁决）。
+    /// 错误信封 → StorageError（未登录/流量限额的可行动文案经 warn 通道
+    /// ——`Unauthorized`/`RateLimited{None}` 无载荷，ck-pan115 api.rs 的
+    /// 双通道裁决）。
     pub(crate) fn to_storage_error(&self, stage: &'static str) -> StorageError {
-        if classify(self.code) == ErrKind::NotLoggedIn {
-            tracing::warn!(
+        match classify(self.code) {
+            ErrKind::NotLoggedIn => tracing::warn!(
                 target: "ck_pan123::api",
                 stage,
                 code = self.code,
                 "123pan session invalid (web API has no refresh): re-run the setup QR scan \
                  (or paste a fresh token) to re-authorize"
-            );
+            ),
+            ErrKind::TrafficExceeded => tracing::warn!(
+                target: "ck_pan123::api",
+                stage,
+                code = self.code,
+                "123pan daily download traffic quota exceeded (D5: not bypassed): traffic \
+                 resets tomorrow, or a 123pan VIP subscription lifts the cap"
+            ),
+            ErrKind::BadParams => tracing::warn!(
+                target: "ck_pan123::api",
+                stage,
+                code = self.code,
+                message = %self.message,
+                "123pan rejected the request parameters (code 400)"
+            ),
+            _ => {}
         }
         let mapped = map_rejection(self.code, &self.message);
         if let StorageError::Unavailable(detail) = &mapped {
@@ -150,7 +189,7 @@ pub(crate) async fn read_envelope(
 }
 
 // ---------------------------------------------------------------------------
-// 错误分类（认证面；读写面码 123-2/3 入表扩充）
+// 错误分类（认证面 123-1 + 读写面 123-2 扩充）
 // ---------------------------------------------------------------------------
 
 /// 业务错误的归一枚举（分派依据见模块文档映射表）。
@@ -159,15 +198,29 @@ pub enum ErrKind {
     /// `20101`（list 面）/ `401`（user 面）：未登录——web API 无
     /// refresh（K76.4），重扫码是唯一出路。
     NotLoggedIn,
+    /// `5060`：同名冲突（mkdir/upload 面；data 带 etag/size/updated_at）。
+    NameConflict,
+    /// `5113` / `5114`：每日下载流量限额（D5：不绕过——人话指引经 warn）。
+    TrafficExceeded,
+    /// `-1`：rpc 形态失败（写路径采样 MalformedXML / ListParts
+    /// NoSuchKey；Io 保留原文）。
+    RpcFailure,
+    /// `400`：参数类校验失败（采样："The Fids field is required" /
+    /// "请输入Etag"）。
+    BadParams,
     /// 未知码（终态 `Unavailable` 保留原码与消息）。
     Rejected,
 }
 
 /// code 命中即分类（真机采样：未登录码按端点族分叉——list 族 20101、
-/// user 族 401）。
+/// user 族 401；5060/5113/5114/-1/400 为 123-0 两腿采样入表）。
 pub fn classify(code: i64) -> ErrKind {
     match code {
         20101 | 401 => ErrKind::NotLoggedIn,
+        5060 => ErrKind::NameConflict,
+        5113 | 5114 => ErrKind::TrafficExceeded,
+        -1 => ErrKind::RpcFailure,
+        400 => ErrKind::BadParams,
         _ => ErrKind::Rejected,
     }
 }
@@ -177,6 +230,14 @@ pub fn map_rejection(code: i64, message: &str) -> StorageError {
     match classify(code) {
         // web API 无 refresh（K76.4）——不可恢复；重扫码是唯一出路。
         ErrKind::NotLoggedIn => StorageError::Unauthorized { recoverable: false },
+        // 同名冲突（调用方预检竞争窗口的兜底；mkdir 面常态形态）。
+        ErrKind::NameConflict => StorageError::Exists,
+        // D5：流量限额不绕过——人话指引走 warn 通道（见 to_storage_error）。
+        ErrKind::TrafficExceeded => StorageError::RateLimited { retry_after: None },
+        // rpc 形态失败：Io 保留原码与消息（可诊断；写路径采样形态）。
+        ErrKind::RpcFailure => StorageError::Io(format!("pan123 code={code}: {message}")),
+        // 参数类：Invalid 无载荷——后端消息经 warn 保留（R2 双通道）。
+        ErrKind::BadParams => StorageError::Invalid,
         ErrKind::Rejected => StorageError::Unavailable(format!("pan123 code={code}: {message}")),
     }
 }
@@ -338,39 +399,133 @@ pub fn web_http_client(login_uuid: &str) -> Result<reqwest::Client, StorageError
         .map_err(|e| StorageError::Io(format!("pan123 http client build: {e}")))
 }
 
-/// 123pan web API 客户端（token 状态 + 域名管理 + envelope dispatch）。
+/// HTTP 重试/退避参数（§5.15 实测常量；[`RetryConfig::fast`] 毫秒级
+/// 注入供桩回放）。
+#[derive(Debug, Clone, Copy)]
+pub struct RetryConfig {
+    /// 限流类（HTTP 429）重试上限（§5.15 实测：6）。
+    pub limited_max: u32,
+    /// 普通错误（传输/5xx）重试上限（§5.15 实测：3）。
+    pub ordinary_max: u32,
+    /// 指数退避基数（2^n × base，封顶 cap）。
+    pub backoff_base: Duration,
+    /// 指数退避封顶（§5.15：30s）。
+    pub backoff_cap: Duration,
+    /// `Retry-After` 头的 clamp 下界（§5.15：1s——过小的服务端值不追）。
+    pub retry_after_min: Duration,
+    /// `Retry-After` 头的 clamp 上界（§5.15：60s）。
+    pub retry_after_max: Duration,
+}
+
+impl Default for RetryConfig {
+    fn default() -> Self {
+        RetryConfig {
+            limited_max: 6,
+            ordinary_max: 3,
+            backoff_base: Duration::from_secs(1),
+            backoff_cap: Duration::from_secs(30),
+            retry_after_min: Duration::from_secs(1),
+            retry_after_max: Duration::from_secs(60),
+        }
+    }
+}
+
+impl RetryConfig {
+    /// 毫秒级窗口（测试专用，绝不用于生产）。
+    pub fn fast() -> Self {
+        RetryConfig {
+            limited_max: 6,
+            ordinary_max: 3,
+            backoff_base: Duration::from_millis(5),
+            backoff_cap: Duration::from_millis(20),
+            retry_after_min: Duration::from_millis(1),
+            retry_after_max: Duration::from_millis(50),
+        }
+    }
+
+    /// 第 n 次重试的退避时长：指数（base × 2^n）封顶 cap + 抖动
+    /// （0..=base/2，时钟纳秒源——不引 rand 依赖）。
+    fn backoff(&self, attempt: u32) -> Duration {
+        let exp = self.backoff_base.saturating_mul(1u32 << attempt.min(16));
+        let capped = exp.min(self.backoff_cap);
+        let nanos = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.subsec_nanos())
+            .unwrap_or(0);
+        let jitter = Duration::from_nanos((nanos % 500) as u64);
+        capped + jitter
+    }
+}
+
+/// 123pan web API 客户端（token 状态 + 域名管理 + 令牌桶限流 + HTTP
+/// 重试/退避 + envelope dispatch）。
 ///
 /// 认证头 = **Bearer 单头即足**（123-0 真机实证：cookie-only 才触发
 /// 20101/401 未登录；Cookie sso-token 不发）。无 refresh 状态机——
 /// web API 无 refresh 机制（K76.4），token 失效即 `Unauthorized`
-/// 终态。
+/// 终态（**恒不重试**）。
 pub struct Pan123Client {
     http: reqwest::Client,
+    /// CDN/镜像域 GET 的裸会话（§5.12 双会话分离：仅 UA，无 123pan
+    /// 鉴权头；重定向手动跟——三跳封顶的执行面）。
+    transfer: reqwest::Client,
     domains: DomainState,
     token: tokio::sync::RwLock<String>,
     bootstrap: tokio::sync::Mutex<()>,
+    /// 全局令牌桶（每卷一个；dispatch 前统一过门）。
+    limiter: Arc<RateLimiter>,
+    retry: RetryConfig,
 }
 
 impl Pan123Client {
-    /// 构造（不连网——dydomain 在首个请求前惰性解析一次；
-    /// ck-pan115 `Pan115Client::new` 同款骨架形态）。
+    /// 构造（生产缺省限流/重试参数；不连网——dydomain 在首个请求前
+    /// 惰性解析一次；ck-pan115 `Pan115Client::new` 同款骨架形态）。
     pub fn new(
         token: String,
         primary_base: String,
         fallback_base: String,
         login_uuid: Option<String>,
     ) -> Result<Self, StorageError> {
+        Self::with_tuning(
+            token,
+            primary_base,
+            fallback_base,
+            login_uuid,
+            LimiterConfig::default(),
+            RetryConfig::default(),
+        )
+    }
+
+    /// 可调参构造（测试注入毫秒级限流/退避；RebuildTuning 先例——结构
+    /// 注入而非时钟替身）。
+    pub fn with_tuning(
+        token: String,
+        primary_base: String,
+        fallback_base: String,
+        login_uuid: Option<String>,
+        limiter: LimiterConfig,
+        retry: RetryConfig,
+    ) -> Result<Self, StorageError> {
         let login_uuid = login_uuid.unwrap_or_else(new_login_uuid);
         Ok(Pan123Client {
             http: web_http_client(&login_uuid)?,
+            transfer: transfer_http_client()?,
             domains: DomainState::new(primary_base, fallback_base),
             token: tokio::sync::RwLock::new(token),
             bootstrap: tokio::sync::Mutex::new(()),
+            limiter: Arc::new(RateLimiter::new(limiter)),
+            retry,
         })
     }
 
-    /// GET dispatch：Bearer + query 对 → `data`（123-2 的端点封装地基；
-    /// 123-1 的认证面错误映射桩测试经它回放）。
+    /// 传输会话（download.rs 的 CDN 窗口 GET 面；§5.12——裸 client
+    /// 仅 UA，无 123pan 鉴权头/Cookie，重定向手动跟）。公开只读访问
+    /// 面（桩测试的双会话分离断言）。
+    pub fn transfer_http(&self) -> &reqwest::Client {
+        &self.transfer
+    }
+
+    /// GET dispatch：Bearer + query 对 → `data`。
     pub async fn dispatch_get(
         &self,
         path: &str,
@@ -391,7 +546,7 @@ impl Pan123Client {
     }
 
     /// `GET /b/api/user/info` → uid/空间/流量字段（VolumeId 的 uid 真源
-    /// 与 123-2 quota 面的地基）。
+    /// 与 quota 面的地基）。
     pub async fn user_info(&self) -> Result<UserInfo, StorageError> {
         let data = self
             .dispatch_get("/b/api/user/info", &[], "user/info")
@@ -400,11 +555,14 @@ impl Pan123Client {
             .map_err(|e| StorageError::Unavailable(format!("user/info data parse: {e}")))
     }
 
-    /// 统一请求引擎：域名 failover（连接错误 → 粘性切备域重试一次）+
-    /// envelope 判据（业务面 `code==0`）+ 非 JSON 防崩穿。
+    /// 统一请求策略引擎（模块文档「限流与重试」节）：
     ///
-    /// 循环有界：`fail_over` 只成功一次（粘性位），至多两圈——备域上
-    /// 的连接错误直接上抛 `Unavailable`。
+    /// 1. 每次尝试前过令牌桶（节拍等待在锁外）；
+    /// 2. 单次尝试内部含 §5.17 域名 failover（主域连接错误 → 粘性切
+    ///    备域，同一请求重放恰一次；`fail_over` 只成功一次，有界）；
+    /// 3. 传输错误/HTTP 429/5xx 按退避重试（限流类 ≤6、普通 ≤3）；
+    /// 4. envelope 终态错误与非 JSON 体恒不重试（Unauthorized 更是
+    ///    契约级禁重试——K76.4）。
     async fn dispatch(
         &self,
         path: &str,
@@ -414,6 +572,80 @@ impl Pan123Client {
         stage: &'static str,
     ) -> Result<Value, StorageError> {
         self.ensure_bootstrapped().await;
+        let mut limited_retries = 0u32;
+        let mut ordinary_retries = 0u32;
+        loop {
+            self.limiter.check_wait().await;
+            match self.attempt_once(path, post, query, body, stage).await {
+                AttemptOutcome::Done(result) => return result,
+                AttemptOutcome::Transport(err) => {
+                    if ordinary_retries >= self.retry.ordinary_max {
+                        return Err(err);
+                    }
+                    let delay = self.retry.backoff(ordinary_retries);
+                    ordinary_retries += 1;
+                    tracing::debug!(
+                        target: "ck_pan123::api",
+                        stage,
+                        attempt = ordinary_retries,
+                        ?delay,
+                        "transport failure: backing off before the retry"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+                AttemptOutcome::HttpRetry {
+                    status,
+                    retry_after,
+                } => {
+                    let is_limited = status == 429;
+                    let budget = if is_limited {
+                        &mut limited_retries
+                    } else {
+                        &mut ordinary_retries
+                    };
+                    if *budget
+                        >= (if is_limited {
+                            self.retry.limited_max
+                        } else {
+                            self.retry.ordinary_max
+                        })
+                    {
+                        return Err(if is_limited {
+                            StorageError::RateLimited { retry_after }
+                        } else {
+                            StorageError::Unavailable(format!("{stage}: HTTP {status} persisted"))
+                        });
+                    }
+                    let delay = match retry_after {
+                        // Retry-After 头优先（clamp 1–60s；§5.15）。
+                        Some(ra) => {
+                            ra.clamp(self.retry.retry_after_min, self.retry.retry_after_max)
+                        }
+                        None => self.retry.backoff(*budget),
+                    };
+                    *budget += 1;
+                    tracing::debug!(
+                        target: "ck_pan123::api",
+                        stage,
+                        status,
+                        ?delay,
+                        "retryable HTTP status: backing off"
+                    );
+                    tokio::time::sleep(delay).await;
+                }
+            }
+        }
+    }
+
+    /// 单次尝试（含域名 failover 重放恰一次）；产出可重试分类。
+    async fn attempt_once(
+        &self,
+        path: &str,
+        post: bool,
+        query: &[(&str, &str)],
+        body: Option<&Value>,
+        stage: &'static str,
+    ) -> AttemptOutcome {
         loop {
             let url = format!("{}{path}", self.domains.active());
             let token = self.token.read().await.clone();
@@ -437,32 +669,52 @@ impl Pan123Client {
                         );
                         continue;
                     }
-                    return Err(StorageError::Unavailable(format!(
+                    return AttemptOutcome::Transport(StorageError::Unavailable(format!(
                         "{stage} transport: {}",
                         e.without_url()
                     )));
                 }
             };
             let http = resp.status().as_u16();
-            let body_text = resp.text().await.map_err(|e| {
-                StorageError::Unavailable(format!("{stage} body read: {}", e.without_url()))
-            })?;
+            // 可重试 HTTP 形态：429（限流类）与 5xx（普通类）——envelope
+            // 文化下错误也可能在 body 的 code 里，那些走终态映射不重试。
+            if http == 429 || (500..=599).contains(&http) {
+                let retry_after = resp
+                    .headers()
+                    .get(reqwest::header::RETRY_AFTER)
+                    .and_then(|v| v.to_str().ok())
+                    .and_then(|s| s.trim().parse::<u64>().ok())
+                    .map(Duration::from_secs);
+                return AttemptOutcome::HttpRetry {
+                    status: http,
+                    retry_after,
+                };
+            }
+            let body_text = match resp.text().await {
+                Ok(text) => text,
+                Err(e) => {
+                    return AttemptOutcome::Transport(StorageError::Unavailable(format!(
+                        "{stage} body read: {}",
+                        e.without_url()
+                    )))
+                }
+            };
             let env: Envelope = match serde_json::from_str(&body_text) {
                 Ok(env) => env,
                 Err(_) => {
                     // 非 JSON（HTML 错误页/空体）：截断 + 掩码当前 token
-                    // （错误页可能回显请求头；R3）。
+                    // （错误页可能回显请求头；R3）——终态，不重试。
                     let snippet: String = body_text.chars().take(200).collect();
                     let masked = snippet.replace(token.as_str(), &mask(&token));
-                    return Err(StorageError::Unavailable(format!(
+                    return AttemptOutcome::Done(Err(StorageError::Unavailable(format!(
                         "{stage} non-json (http {http}): {masked}"
-                    )));
+                    ))));
                 }
             };
             return if env.is_ok() {
-                Ok(env.data)
+                AttemptOutcome::Done(Ok(env.data))
             } else {
-                Err(env.to_storage_error(stage))
+                AttemptOutcome::Done(Err(env.to_storage_error(stage)))
             };
         }
     }
@@ -486,4 +738,244 @@ impl Pan123Client {
             }
         }
     }
+
+    // ------------------------------------------------- 读路径端点（123-2） ---
+
+    /// `GET /api/file/list/new` 一页（新代际无前缀形态——123-0 真机实证
+    /// 活）→ `(rows, total)`。
+    ///
+    /// 分页 = `Page`（1 基页码）+ `limit`（服务端排序仅 file_id
+    /// asc/desc——**跨页合并后的稳定排序在驱动层自理**，任务 A）。
+    pub async fn list_page(
+        &self,
+        parent_file_id: i64,
+        page: u32,
+        limit: u32,
+    ) -> Result<(Vec<FileEntry>, i64), StorageError> {
+        let data = self
+            .dispatch_get(
+                "/api/file/list/new",
+                &[
+                    ("driveId", "0"),
+                    ("limit", &limit.to_string()),
+                    ("next", "0"),
+                    ("orderBy", "file_id"),
+                    ("orderDirection", "desc"),
+                    ("parentFileId", &parent_file_id.to_string()),
+                    ("trashed", "false"),
+                    ("SearchData", ""),
+                    ("Page", &page.to_string()),
+                    ("OnlyLookAbnormalFile", "0"),
+                ],
+                "file/list/new",
+            )
+            .await?;
+        // 双拼：list 真机形态大写 InfoList（info 端点是小写 infoList——
+        // §5.10；tolerant 手取两形态）。
+        let rows_value = data
+            .get("InfoList")
+            .or_else(|| data.get("infoList"))
+            .cloned()
+            .unwrap_or(Value::Null);
+        let rows: Vec<FileEntry> = serde_json::from_value(rows_value)
+            .map_err(|e| StorageError::Unavailable(format!("file/list/new rows parse: {e}")))?;
+        let total = data
+            .get("Total")
+            .or_else(|| data.get("total"))
+            .and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+            .unwrap_or(-1);
+        Ok((rows, total))
+    }
+
+    /// `POST /b/api/file/info`（fileIdList 查询；响应键小写 `infoList`——
+    /// spike 实证）→ 条目（不存在 → `None`；形态异常 → 错误）。
+    pub async fn file_info(&self, file_id: i64) -> Result<Option<FileEntry>, StorageError> {
+        let data = self
+            .dispatch_post_json(
+                "/b/api/file/info",
+                &serde_json::json!({"fileIdList": [{"fileId": file_id}]}),
+                "file/info",
+            )
+            .await?;
+        let list = data
+            .get("infoList")
+            .or_else(|| data.get("InfoList"))
+            .and_then(|v| v.as_array().cloned())
+            .ok_or_else(|| StorageError::Unavailable("file/info: infoList missing".into()))?;
+        match list.into_iter().next() {
+            None => Ok(None),
+            Some(v) => serde_json::from_value(v)
+                .map(Some)
+                .map_err(|e| StorageError::Unavailable(format!("file/info row parse: {e}"))),
+        }
+    }
+
+    /// `POST /a/api/file/upload_request`（type=1 目录创建——**注意与文件
+    /// 上传的 `/b/` 前缀分叉**，spike 实证）→ 新目录 FileId（在
+    /// `data.Info`）。
+    ///
+    /// 5060 同名冲突 → `Exists`（errno 表）；`NotReuse:true` 与 etag:""
+    /// 是 spike 真机验证过的请求形态（§5.11 逐端点保真）。
+    pub async fn mkdir(&self, parent_file_id: i64, name: &str) -> Result<i64, StorageError> {
+        let data = self
+            .dispatch_post_json(
+                "/a/api/file/upload_request",
+                &serde_json::json!({
+                    "driveId": 0,
+                    "etag": "",
+                    "fileName": name,
+                    "parentFileId": parent_file_id,
+                    "size": 0,
+                    "type": 1,
+                    "NotReuse": true,
+                }),
+                "mkdir",
+            )
+            .await?;
+        let fid = data
+            .get("Info")
+            .and_then(|i| i.get("FileId").or_else(|| i.get("fileId")))
+            .or_else(|| data.get("FileId").or_else(|| data.get("fileId")))
+            .and_then(|v| {
+                v.as_i64()
+                    .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+            })
+            .filter(|v| *v > 0);
+        fid.ok_or_else(|| StorageError::Unavailable("mkdir: FileId missing from data.Info".into()))
+    }
+
+    /// `POST /a/api/file/trash`——载荷**恰为**最小保真形态（§5.11：
+    /// `fileTrashInfoList` 大写 `FileId` + `event:"intoRecycle"`；多余键
+    /// 曾是静默失败陷阱的形态面——最小载荷 + 调用方回读校验维持纵深）。
+    pub async fn trash(&self, file_id: i64) -> Result<(), StorageError> {
+        self.dispatch_post_json(
+            "/a/api/file/trash",
+            &serde_json::json!({
+                "fileTrashInfoList": [{"FileId": file_id}],
+                "event": "intoRecycle",
+            }),
+            "file/trash",
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// `POST /a/api/file/rename`（`fileId` + 新名）。**目录同样可用**
+    /// （123-2 任务 0 真机实证：同 FileId、Type 保持、list 回读新名）。
+    pub async fn rename(&self, file_id: i64, new_name: &str) -> Result<(), StorageError> {
+        self.dispatch_post_json(
+            "/a/api/file/rename",
+            &serde_json::json!({
+                "driveId": 0,
+                "fileId": file_id,
+                "fileName": new_name,
+            }),
+            "file/rename",
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// `POST /b/api/file/mod_pid`——跨父移动（pan123-rs wire 形态：
+    /// `fileIdList` 大写 `FileId` + `parentFileId` + `event:"fileMove"`；
+    /// §5.11 键名保真）。
+    pub async fn mod_pid(&self, file_id: i64, target_parent: i64) -> Result<(), StorageError> {
+        self.dispatch_post_json(
+            "/b/api/file/mod_pid",
+            &serde_json::json!({
+                "fileIdList": [{"FileId": file_id}],
+                "parentFileId": target_parent,
+                "event": "fileMove",
+                "operatePlace": "bottom",
+                "RequestSource": serde_json::Value::Null,
+            }),
+            "file/mod_pid",
+        )
+        .await
+        .map(|_| ())
+    }
+
+    /// `POST /b/api/file/download/traffic/check`（载荷 `fids`）→ 流量
+    /// 状态（§5.7 预检：`isTrafficExceeded` 才是阻断依据——`isBlocked`
+    /// 含义未明不作为阻断，跟踪单挂账）。
+    pub async fn traffic_check(&self, fids: &[i64]) -> Result<TrafficStatus, StorageError> {
+        let data = self
+            .dispatch_post_json(
+                "/b/api/file/download/traffic/check",
+                &serde_json::json!({"fids": fids}),
+                "traffic/check",
+            )
+            .await?;
+        serde_json::from_value(data)
+            .map_err(|e| StorageError::Unavailable(format!("traffic/check parse: {e}")))
+    }
+
+    /// `POST /a/api/file/download_info`（新形态——spike 实证响应
+    /// `data.DownloadUrl` = web-pro2 中继 URL）。
+    ///
+    /// 载荷携带条目元数据（etag/s3keyFlag/type/size——spike 验证形态）。
+    /// 5113/5114（流量限额）→ `RateLimited`（errno 表，D5）。
+    pub async fn download_info(&self, entry: &FileEntry) -> Result<String, StorageError> {
+        let data = self
+            .dispatch_post_json(
+                "/a/api/file/download_info",
+                &serde_json::json!({
+                    "driveId": 0,
+                    "etag": entry.etag,
+                    "fileId": entry.file_id,
+                    "s3keyFlag": entry.s3_key_flag,
+                    "type": entry.entry_type,
+                    "fileName": entry.file_name,
+                    "size": entry.size,
+                }),
+                "download_info",
+            )
+            .await?;
+        let url = data
+            .get("DownloadUrl")
+            .or_else(|| data.get("downloadUrl"))
+            .and_then(|v| v.as_str())
+            .filter(|s| !s.is_empty())
+            .ok_or_else(|| {
+                StorageError::Unavailable("download_info: DownloadUrl missing".into())
+            })?;
+        Ok(url.to_string())
+    }
+}
+
+/// 单次尝试的可重试分类（dispatch 重试引擎的决策面）。
+enum AttemptOutcome {
+    /// 终态（成功或不可重试错误——envelope 映射/非 JSON 体）。
+    Done(Result<Value, StorageError>),
+    /// 传输层失败（连接/超时/正文读败——退避后重试）。
+    Transport(StorageError),
+    /// 可重试 HTTP 状态（429 限流类 / 5xx 普通类；带可选 Retry-After）。
+    HttpRetry {
+        status: u16,
+        retry_after: Option<Duration>,
+    },
+}
+
+/// 传输会话（§5.12 双会话分离）：裸 client——仅 UA，**无 123pan 鉴权
+/// 头/Cookie**（伪装头对 CDN/镜像域多余且可能干扰；pan115 oss 裸面 +
+/// 123panNextGen 双 Session 同源纪律）；**重定向手动跟**（`Policy::none`
+/// ——三跳封顶由 download.rs 的解析器执行）。
+fn transfer_http_client() -> Result<reqwest::Client, StorageError> {
+    let mut headers = reqwest::header::HeaderMap::new();
+    headers.insert(
+        reqwest::header::USER_AGENT,
+        reqwest::header::HeaderValue::from_str(UA).expect("static UA"),
+    );
+    reqwest::Client::builder()
+        .no_proxy()
+        .local_address(IpAddr::V4(Ipv4Addr::UNSPECIFIED))
+        .default_headers(headers)
+        .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(Duration::from_secs(10))
+        .timeout(Duration::from_secs(120))
+        .build()
+        .map_err(|e| StorageError::Io(format!("pan123 transfer client build: {e}")))
 }

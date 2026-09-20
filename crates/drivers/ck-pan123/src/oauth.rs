@@ -170,7 +170,8 @@ pub async fn qr_wx_code(
 /// → token（90 天）。
 ///
 /// 成功即首存（`store.save_token`）再返回。失败（错密码等）→
-/// `map_rejection` 终态（`Unavailable` 保留原码与后端消息）。
+/// `map_rejection` 终态（123-2 起 400 参数类 → `Invalid`；未知码
+/// `Unavailable` 保留原码与后端消息）。
 pub async fn sign_in(
     http: &reqwest::Client,
     api_base: &str,

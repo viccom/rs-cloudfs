@@ -86,8 +86,27 @@ fn classify_covers_the_sampled_auth_codes() {
     // 未登录族：错误码按端点族分叉（真机实证）
     assert_eq!(classify(20101), ErrKind::NotLoggedIn, "list face");
     assert_eq!(classify(401), ErrKind::NotLoggedIn, "user face");
-    // 未知码 → Rejected（5060/5113/5114 等读写面码 123-2/3 入表）
-    for code in [0i64, 1, 400, 5060, 5113, 5114] {
+}
+
+/// 123-2 读写面扩充（真机采样入表）：5060 同名冲突 / 5113+5114 流量
+/// 限额 / -1 rpc 形态 / 400 参数类。
+#[test]
+fn classify_covers_the_read_write_face_codes() {
+    assert_eq!(classify(5060), ErrKind::NameConflict, "mkdir/upload face");
+    assert_eq!(
+        classify(5113),
+        ErrKind::TrafficExceeded,
+        "daily traffic cap"
+    );
+    assert_eq!(
+        classify(5114),
+        ErrKind::TrafficExceeded,
+        "daily traffic cap twin"
+    );
+    assert_eq!(classify(-1), ErrKind::RpcFailure, "rpc MalformedXML family");
+    assert_eq!(classify(400), ErrKind::BadParams, "parameter validation");
+    // 真正的未知码仍是 Rejected（终态 Unavailable 保留原码）
+    for code in [0i64, 1, 105, 47002] {
         assert_eq!(classify(code), ErrKind::Rejected, "code {code}");
     }
 }
@@ -104,12 +123,43 @@ fn map_rejection_routes_each_kind_to_its_storage_error() {
         StorageError::Unauthorized { recoverable: false }
     );
 
+    // 5060 同名冲突 → Exists（mkdir 预检竞争窗口的兜底终态）
+    assert_eq!(
+        map_rejection(5060, "检测到1个同名文件"),
+        StorageError::Exists
+    );
+
+    // 5113/5114 → RateLimited（D5：流量限额不绕过）
+    assert_eq!(
+        map_rejection(5113, "流量限额"),
+        StorageError::RateLimited { retry_after: None }
+    );
+    assert_eq!(
+        map_rejection(5114, "流量超限"),
+        StorageError::RateLimited { retry_after: None }
+    );
+
+    // -1 rpc 形态 → Io 保留原码与消息（可诊断）
+    match map_rejection(-1, "rpc MalformedXML") {
+        StorageError::Io(detail) => {
+            assert!(detail.contains("-1"), "{detail}");
+            assert!(detail.contains("MalformedXML"), "{detail}");
+        }
+        other => panic!("rpc failure is Io, got {other:?}"),
+    }
+
+    // 400 参数类 → Invalid
+    assert_eq!(
+        map_rejection(400, "The Fids field is required"),
+        StorageError::Invalid
+    );
+
     // 未知码：Unavailable 载荷保留原始码与后端消息（R2）
-    match map_rejection(5060, "检测到1个同名文件") {
+    match map_rejection(47002, "boom") {
         StorageError::Unavailable(detail) => {
-            assert!(detail.contains("5060"), "keeps the raw code: {detail}");
+            assert!(detail.contains("47002"), "keeps the raw code: {detail}");
             assert!(
-                detail.contains("检测到1个同名文件"),
+                detail.contains("boom"),
                 "keeps the backend message: {detail}"
             );
         }
@@ -307,14 +357,16 @@ async fn unknown_code_maps_to_unavailable_keeping_the_code() {
     let mock = Mock123::start().await;
     let client = mock.client();
 
-    mock.inject(json!({"code": 5060, "message": "检测到1个同名文件"}));
+    // 47002 = 真未知码（5060/5113/5114/-1/400 已在 123-2 入表——本用例
+    // 钉未知码的 R2 可诊断形态）。
+    mock.inject(json!({"code": 47002, "message": "boom"}));
     let err = client
         .dispatch_post_json("/b/api/file/rename", &json!({"fileId": 1}), "rename")
         .await
-        .expect_err("5060 must surface");
+        .expect_err("47002 must surface");
     match err {
         StorageError::Unavailable(detail) => {
-            assert!(detail.contains("5060"), "{detail}");
+            assert!(detail.contains("47002"), "{detail}");
             assert!(detail.contains("rename"), "carries the stage: {detail}");
         }
         other => panic!("expected Unavailable, got {other:?}"),

@@ -40,6 +40,27 @@ pub struct UserInfo {
     pub vip: bool,
 }
 
+/// `file/download/traffic/check` 的 data（123-0 真机采样：免费日额
+/// ≈10GiB——`originalRemainTraffic` 实测 10735321088B）。
+///
+/// 阻断判据 = [`TrafficStatus::is_traffic_exceeded`]；`is_blocked` 含义
+/// 未明（流量未超下正常下载——真机观察，跟踪单挂账）**不作为阻断依据**。
+#[derive(Debug, Clone, Default, Deserialize)]
+pub struct TrafficStatus {
+    #[serde(rename = "isTrafficExceeded", alias = "is_traffic_exceeded", default)]
+    pub is_traffic_exceeded: bool,
+    /// 每日下载流量余量（字节；doctor/123-4 透出面）。
+    #[serde(
+        rename = "originalRemainTraffic",
+        alias = "original_remain_traffic",
+        default
+    )]
+    pub original_remain_traffic: i64,
+    /// 含义未明（真机 `true` 且下载正常）——只透出，不阻断。
+    #[serde(rename = "isBlocked", alias = "is_blocked", default)]
+    pub is_blocked: bool,
+}
+
 /// list / info 条目行（123-2 的 list/stat 面消费；123-1 先钉解析契约：
 /// 双拼字段 + 时间双态——桩测试覆盖）。
 ///
@@ -59,6 +80,14 @@ pub struct FileEntry {
     pub size: i64,
     #[serde(rename = "Etag", alias = "etag", default)]
     pub etag: String,
+    /// download_info 载荷需要的 S3 键标志（mkdir/list 的 Info 行真机
+    /// 携带 `"S3KeyFlag": "<uid>-0"` 形态）。
+    #[serde(rename = "S3KeyFlag", alias = "s3keyFlag", default)]
+    pub s3_key_flag: String,
+    /// 回收站标志（info 端点可见；list 恒查非回收站面）。delete 回读
+    /// 校验的消费面（§5.11 数据完整性纪律）。
+    #[serde(rename = "Trashed", alias = "trashed", default)]
+    pub trashed: bool,
     #[serde(
         rename = "UpdateAt",
         alias = "updateAt",
@@ -73,6 +102,13 @@ pub struct FileEntry {
         deserialize_with = "deserialize_unix_secs"
     )]
     pub create_at: i64,
+}
+
+impl FileEntry {
+    /// 1 = 目录（0 = 文件；真机实证）。
+    pub fn is_dir(&self) -> bool {
+        self.entry_type == 1
+    }
 }
 
 // ---------------------------------------------------------------------------
