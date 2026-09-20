@@ -17,7 +17,8 @@ fn extract_href(html: &str) -> Option<String> {
         if let Some(pos) = html.find(marker) {
             let start = pos + marker.len();
             let rest = &html[start..];
-            let end = marker.ends_with('\'')
+            let end = marker
+                .ends_with('\'')
                 .then(|| rest.find('\''))
                 .flatten()
                 .or_else(|| rest.find('"'));
@@ -34,7 +35,7 @@ fn extract_href(html: &str) -> Option<String> {
 
 /// Decode `params=<base64>` from a `/download-v2/` style URL (123panNextGen
 /// resolve level 3 — plain self-decode, no auto_redirect injection).
-fn decode_download_v2_params(url: &str) -> Option<String> {
+pub(crate) fn decode_download_v2_params(url: &str) -> Option<String> {
     if !url.contains("/download-v2/") {
         return None;
     }
@@ -60,8 +61,8 @@ fn decode_download_v2_params(url: &str) -> Option<String> {
 
 fn spike_with_tokens() -> Result<(Paths, Spike)> {
     let paths = Paths::from_env();
-    let tokens = state::load_tokens(&paths)
-        .context("need pan123-tokens.json (run `sign-in` first)")?;
+    let tokens =
+        state::load_tokens(&paths).context("need pan123-tokens.json (run `sign-in` first)")?;
     let spike = Spike::build(Some(tokens))?;
     Ok((paths, spike))
 }
@@ -71,7 +72,12 @@ fn bare_spike() -> Result<(Paths, Spike)> {
 }
 
 /// GET list params in the 123panNextGen current shape.
-fn list_query(parent: i64, page: u32, limit: u32, trashed: bool) -> Vec<(String, String)> {
+pub(crate) fn list_query(
+    parent: i64,
+    page: u32,
+    limit: u32,
+    trashed: bool,
+) -> Vec<(String, String)> {
     vec![
         ("driveId".into(), "0".into()),
         ("limit".into(), limit.to_string()),
@@ -87,11 +93,14 @@ fn list_query(parent: i64, page: u32, limit: u32, trashed: bool) -> Vec<(String,
 }
 
 /// Extract the `data.InfoList` (dual-cased) file rows from a list envelope.
-fn info_list_of(body: &str) -> Vec<Value> {
+pub(crate) fn info_list_of(body: &str) -> Vec<Value> {
     serde_json::from_str::<Value>(body)
         .ok()
         .and_then(|v| {
-            let data = v.get("data")?.get("InfoList").or_else(|| v.get("data")?.get("infoList"))?;
+            let data = v
+                .get("data")?
+                .get("InfoList")
+                .or_else(|| v.get("data")?.get("infoList"))?;
             data.as_array().cloned()
         })
         .unwrap_or_default()
@@ -102,18 +111,18 @@ fn field<'a>(item: &'a Value, keys: &[&str]) -> Option<&'a Value> {
     keys.iter().find_map(|k| obj.get(*k))
 }
 
-fn field_i64(item: &Value, keys: &[&str]) -> Option<i64> {
+pub(crate) fn field_i64(item: &Value, keys: &[&str]) -> Option<i64> {
     field(item, keys).and_then(|v| {
         v.as_i64()
             .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
     })
 }
 
-fn field_str<'a>(item: &'a Value, keys: &[&str]) -> Option<&'a str> {
+pub(crate) fn field_str<'a>(item: &'a Value, keys: &[&str]) -> Option<&'a str> {
     field(item, keys).and_then(|v| v.as_str())
 }
 
-async fn find_by_name(spike: &Spike, parent: i64, name: &str) -> Result<Option<Value>> {
+pub(crate) async fn find_by_name(spike: &Spike, parent: i64, name: &str) -> Result<Option<Value>> {
     let url = format!("{}/api/file/list/new", api::PRIMARY_BASE);
     let r = spike
         .api_get(&url, &list_query(parent, 1, 100, false))
@@ -145,30 +154,36 @@ async fn trash_correct(spike: &Spike, fid: i64, new_gen: bool) -> Result<api::Re
     spike.api_post_json(&url, &body, &[]).await
 }
 
-fn print_item(tag: &str, item: &Value) {
+pub(crate) fn print_item(tag: &str, item: &Value) {
     println!(
         "[{tag}] FileId={:?} FileName={:?} Type={:?} Size={:?} UpdateAt={:?} CreateAt={:?} keys={}",
         field_i64(item, &["FileId", "fileId"]),
         field_str(item, &["FileName", "fileName"]),
         field_i64(item, &["Type", "type"]),
         field_i64(item, &["Size", "size"]),
-        field(item, &["UpdateAt", "updateAt"]).map(|v| v.to_string()).unwrap_or_default(),
-        field(item, &["CreateAt", "createAt"]).map(|v| v.to_string()).unwrap_or_default(),
-        item.as_object().map(|m| m.keys().cloned().collect::<Vec<_>>().join(",")).unwrap_or_default(),
+        field(item, &["UpdateAt", "updateAt"])
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        field(item, &["CreateAt", "createAt"])
+            .map(|v| v.to_string())
+            .unwrap_or_default(),
+        item.as_object()
+            .map(|m| m.keys().cloned().collect::<Vec<_>>().join(","))
+            .unwrap_or_default(),
     );
 }
 
 /// Simple hand-rolled flag parser: `--flag value` pairs, everything else
 /// positional.
-struct Args<'a> {
+pub(crate) struct Args<'a> {
     rest: &'a [String],
 }
 
 impl<'a> Args<'a> {
-    fn new(rest: &'a [String]) -> Self {
+    pub(crate) fn new(rest: &'a [String]) -> Self {
         Args { rest }
     }
-    fn flag(&self, name: &str) -> Option<String> {
+    pub(crate) fn flag(&self, name: &str) -> Option<String> {
         let mut it = self.rest.iter();
         while let Some(a) = it.next() {
             if a == name {
@@ -177,7 +192,7 @@ impl<'a> Args<'a> {
         }
         None
     }
-    fn positional(&self) -> Vec<&str> {
+    pub(crate) fn positional(&self) -> Vec<&str> {
         let mut out = Vec::new();
         let mut i = 0;
         while i < self.rest.len() {
@@ -211,7 +226,10 @@ pub async fn cmd_sign_in(rest: &[String]) -> Result<i32> {
     let path = "/b/api/user/sign_in";
 
     let mut resp = None;
-    for (label, base) in [("primary", api::PRIMARY_BASE), ("fallback", api::FALLBACK_BASE)] {
+    for (label, base) in [
+        ("primary", api::PRIMARY_BASE),
+        ("fallback", api::FALLBACK_BASE),
+    ] {
         let url = format!("{base}{path}");
         let mut last_err = None;
         for attempt in 1..=3u32 {
@@ -272,8 +290,14 @@ pub async fn cmd_sign_in(rest: &[String]) -> Result<i32> {
     // Token liveness probe: lightest endpoints, both generations of list.
     let spike = Spike::build(Some(tokens))?;
     let probes: [(&str, &str); 2] = [
-        ("liveness:list-new", &format!("{}/api/file/list/new", api::PRIMARY_BASE)),
-        ("liveness:list-old", &format!("{}/b/api/file/list/new", api::PRIMARY_BASE)),
+        (
+            "liveness:list-new",
+            &format!("{}/api/file/list/new", api::PRIMARY_BASE),
+        ),
+        (
+            "liveness:list-old",
+            &format!("{}/b/api/file/list/new", api::PRIMARY_BASE),
+        ),
     ];
     for (tag, url) in probes {
         let mut q = list_query(0, 1, 1, false);
@@ -285,7 +309,10 @@ pub async fn cmd_sign_in(rest: &[String]) -> Result<i32> {
             Err(e) => eprintln!("[{tag}] transport error: {e:#}"),
         }
     }
-    println!("[SUMMARY] sign-in|ok=1|domain={label}|token={}", state::mask(&token));
+    println!(
+        "[SUMMARY] sign-in|ok=1|domain={label}|token={}",
+        state::mask(&token)
+    );
     Ok(0)
 }
 
@@ -316,10 +343,7 @@ pub async fn cmd_probe_dydomain(rest: &[String]) -> Result<i32> {
 /// both domains, no-signature form. Mutations use harmless payloads only.
 pub async fn cmd_probe_matrix(rest: &[String]) -> Result<i32> {
     let args = Args::new(rest);
-    let fid: i64 = args
-        .flag("--fid")
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(0);
+    let fid: i64 = args.flag("--fid").and_then(|v| v.parse().ok()).unwrap_or(0);
     let (_paths, spike) = spike_with_tokens()?;
 
     struct Row {
@@ -424,21 +448,27 @@ pub async fn cmd_probe_matrix(rest: &[String]) -> Result<i32> {
             .await?;
         let (c, m) = api::code_of(&info.body);
         if c == Some(0) {
-            if let Some(item) = info_list_of(&format!("{{\"data\":{{\"InfoList\":{}}}}}",
-                serde_json::to_string(&serde_json::from_str::<Value>(&info.body)?
-                    .get("data").cloned().unwrap_or(Value::Null)).unwrap_or_default()))
-                .first()
-                .cloned()
-                .or_else(|| {
-                    serde_json::from_str::<Value>(&info.body)
-                        .ok()?
-                        .get("data")?
-                        .get("InfoList")?
-                        .as_array()?
-                        .first()
+            if let Some(item) = info_list_of(&format!(
+                "{{\"data\":{{\"InfoList\":{}}}}}",
+                serde_json::to_string(
+                    &serde_json::from_str::<Value>(&info.body)?
+                        .get("data")
                         .cloned()
-                })
-            {
+                        .unwrap_or(Value::Null)
+                )
+                .unwrap_or_default()
+            ))
+            .first()
+            .cloned()
+            .or_else(|| {
+                serde_json::from_str::<Value>(&info.body)
+                    .ok()?
+                    .get("data")?
+                    .get("InfoList")?
+                    .as_array()?
+                    .first()
+                    .cloned()
+            }) {
                 let dl_body = json!({
                     "driveId": 0,
                     "etag": field_str(&item, &["Etag", "etag"]).unwrap_or(""),
@@ -466,7 +496,9 @@ pub async fn cmd_probe_matrix(rest: &[String]) -> Result<i32> {
                 });
             }
         } else {
-            eprintln!("[matrix] /b/api/file/info failed code={c:?} msg={m} — skipping download_info rows");
+            eprintln!(
+                "[matrix] /b/api/file/info failed code={c:?} msg={m} — skipping download_info rows"
+            );
         }
     } else {
         eprintln!("[matrix] no --fid given — download_info rows skipped (run probe-download)");
@@ -476,7 +508,11 @@ pub async fn cmd_probe_matrix(rest: &[String]) -> Result<i32> {
         for (dlabel, base) in row.bases {
             let url = format!("{}{}", base, row.path);
             let res = match row.method {
-                "GET" => spike.api_get(&url, row.query.as_deref().unwrap_or(&[])).await,
+                "GET" => {
+                    spike
+                        .api_get(&url, row.query.as_deref().unwrap_or(&[]))
+                        .await
+                }
                 _ => {
                     spike
                         .api_post_json(&url, row.body.as_ref().unwrap(), &[])
@@ -484,8 +520,18 @@ pub async fn cmd_probe_matrix(rest: &[String]) -> Result<i32> {
                 }
             };
             match res {
-                Ok(r) => println!("[matrix] {} {} {} {} -> {}", row.tag, dlabel, row.method, row.path, api::summarize(&r)),
-                Err(e) => eprintln!("[matrix] {} {dlabel} {} {} -> transport error: {e:#}", row.tag, row.method, row.path),
+                Ok(r) => println!(
+                    "[matrix] {} {} {} {} -> {}",
+                    row.tag,
+                    dlabel,
+                    row.method,
+                    row.path,
+                    api::summarize(&r)
+                ),
+                Err(e) => eprintln!(
+                    "[matrix] {} {dlabel} {} {} -> transport error: {e:#}",
+                    row.tag, row.method, row.path
+                ),
             }
         }
     }
@@ -500,7 +546,10 @@ pub async fn cmd_probe_matrix(rest: &[String]) -> Result<i32> {
     let mut qs = q.clone();
     qs.extend(api::dynamic_params());
     match spike.api_get(&url, &qs).await {
-        Ok(r) => println!("[matrix] sign=random-key list-new -> {}", api::summarize(&r)),
+        Ok(r) => println!(
+            "[matrix] sign=random-key list-new -> {}",
+            api::summarize(&r)
+        ),
         Err(e) => eprintln!("[matrix] sign=random-key transport error: {e:#}"),
     }
     Ok(0)
@@ -553,13 +602,11 @@ pub async fn cmd_probe_qr(rest: &[String]) -> Result<i32> {
         match spike.qr_get(&res_url, &q).await {
             Ok(r) => {
                 api::show(&format!("qr:poll#{i}"), &r);
-                let login_status = serde_json::from_str::<Value>(&r.body)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("data")
-                            .and_then(|d| d.get("loginStatus"))
-                            .and_then(|s| s.as_i64())
-                    });
+                let login_status = serde_json::from_str::<Value>(&r.body).ok().and_then(|v| {
+                    v.get("data")
+                        .and_then(|d| d.get("loginStatus"))
+                        .and_then(|s| s.as_i64())
+                });
                 println!("[qr] poll#{i} loginStatus={login_status:?}");
             }
             Err(e) => eprintln!("[qr:poll#{i}] transport error: {e:#}"),
@@ -585,28 +632,42 @@ pub async fn cmd_probe_qr(rest: &[String]) -> Result<i32> {
 /// Page works), field casing, time field forms.
 pub async fn cmd_probe_list(rest: &[String]) -> Result<i32> {
     let args = Args::new(rest);
-    let parent: i64 = args.flag("--parent").and_then(|v| v.parse().ok()).unwrap_or(0);
-    let limit: u32 = args.flag("--limit").and_then(|v| v.parse().ok()).unwrap_or(3);
+    let parent: i64 = args
+        .flag("--parent")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
+    let limit: u32 = args
+        .flag("--limit")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(3);
     let trashed = args.flag("--trashed").is_some();
     let (_paths, spike) = spike_with_tokens()?;
 
     let url = format!("{}/api/file/list/new", api::PRIMARY_BASE);
     let mut first_ids = Vec::new();
     for page in [1u32, 2] {
-        let r = spike.api_get(&url, &list_query(parent, page, limit, trashed)).await?;
+        let r = spike
+            .api_get(&url, &list_query(parent, page, limit, trashed))
+            .await?;
         api::show(&format!("list:page{page}"), &r);
         let items = info_list_of(&r.body);
         let ids: Vec<String> = items
             .iter()
-            .map(|it| field_i64(it, &["FileId", "fileId"]).unwrap_or(-1).to_string())
+            .map(|it| {
+                field_i64(it, &["FileId", "fileId"])
+                    .unwrap_or(-1)
+                    .to_string()
+            })
             .collect();
         println!(
             "[list] page={page} count={} ids=[{}] total={:?}",
             items.len(),
             ids.join(","),
-            serde_json::from_str::<Value>(&r.body)
-                .ok()
-                .and_then(|v| v.get("data")?.get("Total").or_else(|| v.get("data")?.get("total")).cloned())
+            serde_json::from_str::<Value>(&r.body).ok().and_then(|v| v
+                .get("data")?
+                .get("Total")
+                .or_else(|| v.get("data")?.get("total"))
+                .cloned())
         );
         if page == 1 {
             for it in items.iter().take(3) {
@@ -634,7 +695,10 @@ pub async fn cmd_probe_mkdir(rest: &[String]) -> Result<i32> {
         eprintln!("usage: probe-mkdir <name> [--parent X]");
         return Ok(2);
     };
-    let parent: i64 = args.flag("--parent").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let parent: i64 = args
+        .flag("--parent")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let (_paths, spike) = spike_with_tokens()?;
 
     // pan123-rs upload shape: no duplicate on first request (so the second
@@ -651,7 +715,10 @@ pub async fn cmd_probe_mkdir(rest: &[String]) -> Result<i32> {
 
     let mut used_gen = "";
     let mut created: Option<Value> = None;
-    for (gen, path) in [("new(/a/)", "/a/api/file/upload_request"), ("old(/b/)", "/b/api/file/upload_request")] {
+    for (gen, path) in [
+        ("new(/a/)", "/a/api/file/upload_request"),
+        ("old(/b/)", "/b/api/file/upload_request"),
+    ] {
         let url = format!("{}{path}", api::PRIMARY_BASE);
         let r = spike.api_post_json(&url, &body, &[]).await?;
         api::show(&format!("mkdir:{gen}:first"), &r);
@@ -696,18 +763,23 @@ pub async fn cmd_probe_mkdir(rest: &[String]) -> Result<i32> {
 pub async fn cmd_gen_file(rest: &[String]) -> Result<i32> {
     let args = Args::new(rest);
     let pos = args.positional();
-    let size_kb: u64 = pos
-        .first()
-        .and_then(|v| v.parse().ok())
-        .unwrap_or(2048);
+    let size_kb: u64 = pos.first().and_then(|v| v.parse().ok()).unwrap_or(2048);
     let paths = Paths::from_env();
-    let out = args.flag("--out").map(std::path::PathBuf::from).unwrap_or(paths.payload());
+    let out = args
+        .flag("--out")
+        .map(std::path::PathBuf::from)
+        .unwrap_or(paths.payload());
     let mut buf = vec![0u8; (size_kb * 1024) as usize];
     use rand::RngCore;
     rand::thread_rng().fill_bytes(&mut buf);
     std::fs::write(&out, &buf).with_context(|| format!("write {}", out.display()))?;
     let digest = format!("{:x}", md5::compute(&buf));
-    println!("[gen-file] {} bytes={} md5={}", out.display(), buf.len(), digest);
+    println!(
+        "[gen-file] {} bytes={} md5={}",
+        out.display(),
+        buf.len(),
+        digest
+    );
     Ok(0)
 }
 
@@ -724,7 +796,10 @@ pub async fn cmd_probe_upload(rest: &[String]) -> Result<i32> {
         eprintln!("usage: probe-upload <file> [--parent X]");
         return Ok(2);
     };
-    let parent: i64 = args.flag("--parent").and_then(|v| v.parse().ok()).unwrap_or(0);
+    let parent: i64 = args
+        .flag("--parent")
+        .and_then(|v| v.parse().ok())
+        .unwrap_or(0);
     let (_paths, spike) = spike_with_tokens()?;
 
     let data = std::fs::read(file).with_context(|| format!("read {file}"))?;
@@ -745,7 +820,10 @@ pub async fn cmd_probe_upload(rest: &[String]) -> Result<i32> {
     });
     // File upload stays on /b/ per 123panNextGen (mkdir uses /a/).
     let mut up: Option<Value> = None;
-    for (gen, path) in [("old(/b/)", "/b/api/file/upload_request"), ("new(/a/)", "/a/api/file/upload_request")] {
+    for (gen, path) in [
+        ("old(/b/)", "/b/api/file/upload_request"),
+        ("new(/a/)", "/a/api/file/upload_request"),
+    ] {
         let url = format!("{}{path}", api::PRIMARY_BASE);
         let r = spike.api_post_json(&url, &body, &[]).await?;
         api::show(&format!("upload-request:{gen}"), &r);
@@ -764,10 +842,18 @@ pub async fn cmd_probe_upload(rest: &[String]) -> Result<i32> {
         return Ok(0);
     }
 
-    let bucket = field_str(&d, &["Bucket", "bucket"]).context("Bucket missing")?.to_string();
-    let key = field_str(&d, &["Key", "key"]).context("Key missing")?.to_string();
-    let upload_id = field_str(&d, &["UploadId", "uploadId"]).context("UploadId missing")?.to_string();
-    let storage_node = field_str(&d, &["StorageNode", "storageNode"]).context("StorageNode missing")?.to_string();
+    let bucket = field_str(&d, &["Bucket", "bucket"])
+        .context("Bucket missing")?
+        .to_string();
+    let key = field_str(&d, &["Key", "key"])
+        .context("Key missing")?
+        .to_string();
+    let upload_id = field_str(&d, &["UploadId", "uploadId"])
+        .context("UploadId missing")?
+        .to_string();
+    let storage_node = field_str(&d, &["StorageNode", "storageNode"])
+        .context("StorageNode missing")?
+        .to_string();
     let up_file_id = field_i64(&d, &["FileId", "fileId"]).context("temp FileId missing")?;
     let slice_size = field_i64(&d, &["SliceSize", "sliceSize"]);
     println!(
@@ -799,7 +885,10 @@ pub async fn cmd_probe_upload(rest: &[String]) -> Result<i32> {
         .and_then(|p| p.get("1").or_else(|| p.get(1usize)).cloned())
         .and_then(|u| u.as_str().map(|s| s.to_string()))
         .context("presignedUrls[\"1\"] missing")?;
-    println!("[upload] presigned url head={:?}", api::truncate(&put_url, 120));
+    println!(
+        "[upload] presigned url head={:?}",
+        api::truncate(&put_url, 120)
+    );
 
     // Pure PUT on the transfer face — no 123pan headers (§5.12).
     let put = spike
@@ -827,16 +916,27 @@ pub async fn cmd_probe_upload(rest: &[String]) -> Result<i32> {
         "storageNode": storage_node,
     });
     let list_parts_url = format!("{}/b/api/file/s3_list_upload_parts", api::PRIMARY_BASE);
-    let r = spike.api_post_json(&list_parts_url, &comp_body, &[]).await?;
+    let r = spike
+        .api_post_json(&list_parts_url, &comp_body, &[])
+        .await?;
     api::show("upload:s3_list_parts", &r);
-    let s3_complete_url = format!("{}/b/api/file/s3_complete_multipart_upload", api::PRIMARY_BASE);
-    let r = spike.api_post_json(&s3_complete_url, &comp_body, &[]).await?;
+    let s3_complete_url = format!(
+        "{}/b/api/file/s3_complete_multipart_upload",
+        api::PRIMARY_BASE
+    );
+    let r = spike
+        .api_post_json(&s3_complete_url, &comp_body, &[])
+        .await?;
     api::show("upload:s3_complete", &r);
 
     // upload_complete: new (no /v2) first, then old.
     let mut done = false;
     for (gen, path, body) in [
-        ("new", "/b/api/file/upload_complete", json!({"fileId": up_file_id})),
+        (
+            "new",
+            "/b/api/file/upload_complete",
+            json!({"fileId": up_file_id}),
+        ),
         (
             "old",
             "/b/api/file/upload_complete/v2",
@@ -909,12 +1009,16 @@ pub async fn cmd_probe_trash(rest: &[String]) -> Result<i32> {
     tokio::time::sleep(std::time::Duration::from_secs(1)).await;
     // read-back: find by id in parent list
     let url = format!("{}/api/file/list/new", api::PRIMARY_BASE);
-    let lr = spike.api_get(&url, &list_query(parent, 1, 100, false)).await?;
+    let lr = spike
+        .api_get(&url, &list_query(parent, 1, 100, false))
+        .await?;
     let still = info_list_of(&lr.body)
         .into_iter()
         .any(|it| field_i64(&it, &["FileId", "fileId"]) == Some(fid));
     // recycle-bin view (trashed=true)
-    let tr = spike.api_get(&url, &list_query(parent, 1, 100, true)).await?;
+    let tr = spike
+        .api_get(&url, &list_query(parent, 1, 100, true))
+        .await?;
     let in_trash = info_list_of(&tr.body)
         .into_iter()
         .any(|it| field_i64(&it, &["FileId", "fileId"]) == Some(fid));
@@ -967,7 +1071,11 @@ pub async fn cmd_probe_trash_trap(rest: &[String]) -> Result<i32> {
         .unwrap_or(false);
     println!(
         "[SUMMARY] trash-trap|shape={shape}|code={code:?}|file_survived={survived}|verdict={}",
-        if survived { "TRAP REPRODUCED: code=0 but nothing deleted" } else { "no trap: wrong payload actually deleted or errored" }
+        if survived {
+            "TRAP REPRODUCED: code=0 but nothing deleted"
+        } else {
+            "no trap: wrong payload actually deleted or errored"
+        }
     );
     Ok(0)
 }
@@ -1054,27 +1162,38 @@ pub async fn cmd_probe_download(rest: &[String]) -> Result<i32> {
             .and_then(|l| l.as_array())
             .and_then(|a| a.first())
             .and_then(|it| field_str(it, &["Prefix", "prefix"]));
-        let chosen = direct.map(|s| s.to_string()).or_else(|| dl.map(|s| s.to_string()));
+        let chosen = direct
+            .map(|s| s.to_string())
+            .or_else(|| dl.map(|s| s.to_string()));
         let full = chosen.map(|c| match dispatch {
             Some(p) if dl.map(|d| d == c).unwrap_or(false) => format!("{p}{c}"),
             _ => c,
         });
         println!(
             "[download] {gen} data_keys={} direct={:?} dl_len={:?} dispatch_prefix_len={:?}",
-            d.as_object().map(|m| m.keys().cloned().collect::<Vec<_>>().join(",")).unwrap_or_default(),
+            d.as_object()
+                .map(|m| m.keys().cloned().collect::<Vec<_>>().join(","))
+                .unwrap_or_default(),
             direct.is_some(),
             dl.map(|s| s.len()),
             dispatch.map(|s| s.len()),
         );
         if let Some(f) = full {
-            outcomes.push(DlOutcome { url: f, via: gen.to_string() });
+            outcomes.push(DlOutcome {
+                url: f,
+                via: gen.to_string(),
+            });
         }
     }
     if outcomes.is_empty() {
         bail!("no download URL from either generation");
     }
     for o in &outcomes {
-        println!("[download] url via {} head={:?}", o.via, api::truncate(&o.url, 140));
+        println!(
+            "[download] url via {} head={:?}",
+            o.via,
+            api::truncate(&o.url, 140)
+        );
     }
 
     // 4. CDN GET with Range. The web-identity DownloadUrl may be a web-pro2
@@ -1135,17 +1254,17 @@ pub async fn cmd_probe_download(rest: &[String]) -> Result<i32> {
             let body = r.text().await.unwrap_or_default();
             if ct.contains("json") {
                 println!("         json body={}", api::redact(&body));
-                let next = serde_json::from_str::<Value>(&body)
-                    .ok()
-                    .and_then(|v| {
-                        v.get("data")
-                            .and_then(|d| {
-                                field_str(d, &["redirect_url", "RedirectUrl"])
-                                    .or_else(|| field_str(d, &["DownloadUrl", "downloadUrl"]))
-                            })
-                            .map(|s| s.to_string())
-                            .or_else(|| field_str(&v, &["redirect_url", "RedirectUrl"]).map(|s| s.to_string()))
-                    });
+                let next = serde_json::from_str::<Value>(&body).ok().and_then(|v| {
+                    v.get("data")
+                        .and_then(|d| {
+                            field_str(d, &["redirect_url", "RedirectUrl"])
+                                .or_else(|| field_str(d, &["DownloadUrl", "downloadUrl"]))
+                        })
+                        .map(|s| s.to_string())
+                        .or_else(|| {
+                            field_str(&v, &["redirect_url", "RedirectUrl"]).map(|s| s.to_string())
+                        })
+                });
                 match next {
                     Some(n) => {
                         current = n;
@@ -1171,7 +1290,10 @@ pub async fn cmd_probe_download(rest: &[String]) -> Result<i32> {
                 }
                 // fallback: decode params= from a download-v2 style URL
                 if let Some(inner) = decode_download_v2_params(&current) {
-                    println!("         -> params base64 self-decode: {:?}", api::truncate(&inner, 140));
+                    println!(
+                        "         -> params base64 self-decode: {:?}",
+                        api::truncate(&inner, 140)
+                    );
                     current = inner;
                     continue;
                 }
@@ -1193,8 +1315,8 @@ pub async fn cmd_probe_download(rest: &[String]) -> Result<i32> {
         bytes.len()
     );
     if let Some(local_path) = local {
-        let local_bytes = std::fs::read(&local_path)
-            .with_context(|| format!("read {local_path}"))?;
+        let local_bytes =
+            std::fs::read(&local_path).with_context(|| format!("read {local_path}"))?;
         let expect = &local_bytes[100.min(local_bytes.len())..];
         let match_verdict = expect == bytes.as_slice();
         println!(
@@ -1217,7 +1339,9 @@ pub async fn cmd_probe_download(rest: &[String]) -> Result<i32> {
         Ok(r) => println!(
             "[download] dlink-reuse(second GET) HTTP {} content-range={:?}",
             r.status().as_u16(),
-            r.headers().get("content-range").and_then(|v| v.to_str().ok())
+            r.headers()
+                .get("content-range")
+                .and_then(|v| v.to_str().ok())
         ),
         Err(e) => eprintln!("[download] dlink-reuse transport error: {e:#}"),
     }
@@ -1268,9 +1392,21 @@ pub async fn cmd_probe_user(rest: &[String]) -> Result<i32> {
             Ok(r) => {
                 api::show(tag, &r);
                 if let Ok(v) = serde_json::from_str::<Value>(&r.body) {
-                    for key in ["DirectTraffic", "directTraffic", "unlimited", "Unlimited",
-                                "UseTotalSpace", "UseSpace", "TotalSpace", "totalSpace",
-                                "Traffic", "traffic", "ExpirationTime", "IsVip", "isVip"] {
+                    for key in [
+                        "DirectTraffic",
+                        "directTraffic",
+                        "unlimited",
+                        "Unlimited",
+                        "UseTotalSpace",
+                        "UseSpace",
+                        "TotalSpace",
+                        "totalSpace",
+                        "Traffic",
+                        "traffic",
+                        "ExpirationTime",
+                        "IsVip",
+                        "isVip",
+                    ] {
                         if let Some(val) = v.get("data").and_then(|d| d.get(key)) {
                             println!("         {key}={val}");
                         }
@@ -1299,7 +1435,9 @@ pub async fn cmd_cleanup(rest: &[String]) -> Result<i32> {
     let url = format!("{}/api/file/list/new", api::PRIMARY_BASE);
     let mut victims: Vec<(i64, String)> = Vec::new();
     for page in 1..=10u32 {
-        let r = spike.api_get(&url, &list_query(0, page, 100, false)).await?;
+        let r = spike
+            .api_get(&url, &list_query(0, page, 100, false))
+            .await?;
         let (code, msg) = api::code_of(&r.body);
         if code != Some(0) {
             bail!("list page {page} failed code={code:?} msg={msg}");
@@ -1309,7 +1447,10 @@ pub async fn cmd_cleanup(rest: &[String]) -> Result<i32> {
         for it in items {
             let name = field_str(&it, &["FileName", "fileName"]).unwrap_or("");
             if name.starts_with(prefix) {
-                victims.push((field_i64(&it, &["FileId", "fileId"]).unwrap_or(0), name.to_string()));
+                victims.push((
+                    field_i64(&it, &["FileId", "fileId"]).unwrap_or(0),
+                    name.to_string(),
+                ));
             }
         }
         if n < 100 {
@@ -1326,14 +1467,22 @@ pub async fn cmd_cleanup(rest: &[String]) -> Result<i32> {
     let r = spike.api_get(&url, &list_query(0, 1, 100, false)).await?;
     let remaining: Vec<String> = info_list_of(&r.body)
         .into_iter()
-        .map(|it| field_str(&it, &["FileName", "fileName"]).unwrap_or("").to_string())
+        .map(|it| {
+            field_str(&it, &["FileName", "fileName"])
+                .unwrap_or("")
+                .to_string()
+        })
         .filter(|n| n.starts_with(prefix))
         .collect();
     println!(
         "[SUMMARY] cleanup|trashed={}|remaining_with_prefix={}|verdict={}",
         victims.len(),
         remaining.len(),
-        if remaining.is_empty() { "clean" } else { "INCOMPLETE" }
+        if remaining.is_empty() {
+            "clean"
+        } else {
+            "INCOMPLETE"
+        }
     );
     if !remaining.is_empty() {
         bail!("cleanup incomplete: {remaining:?}");

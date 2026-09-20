@@ -114,7 +114,11 @@ impl Spike {
             "accept",
             "application/json, text/plain, */*",
         );
-        ins(&mut api_headers, "accept-language", "zh-CN,zh;q=0.9,en;q=0.8");
+        ins(
+            &mut api_headers,
+            "accept-language",
+            "zh-CN,zh;q=0.9,en;q=0.8",
+        );
         ins(&mut api_headers, "app-version", "3");
         ins(&mut api_headers, "origin", "https://yun.123pan.cn");
         ins(&mut api_headers, "referer", "https://yun.123pan.cn/");
@@ -132,9 +136,7 @@ impl Spike {
         let mut transfer_headers = HeaderMap::new();
         ins(&mut transfer_headers, "user-agent", USER_AGENT);
         ins(&mut transfer_headers, "accept", "*/*");
-        let transfer = base_builder(3)
-            .default_headers(transfer_headers)
-            .build()?;
+        let transfer = base_builder(3).default_headers(transfer_headers).build()?;
 
         Ok(Self {
             api,

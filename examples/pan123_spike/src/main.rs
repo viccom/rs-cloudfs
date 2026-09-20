@@ -1,8 +1,10 @@
-//! pan123-spike — Phase 6 (pan123 driver) 123-0 read-path spike: live 123pan
-//! web-API probes (endpoint generations / auth / list+trash roundtrip /
-//! download_info + Range + traffic quota). Shapes follow
-//! examples/pan115_spike (anyhow + small modules + masked output); endpoint
-//! candidates come from pan123-rs (2026-06) vs 123panNextGen (2026-09) and
+//! pan123-spike — Phase 6 (pan123 driver) 123-0 spike: live 123pan web-API
+//! probes. Read-path legs (endpoint generations / auth / list+trash
+//! roundtrip / download_info + Range + traffic quota) and write-path legs
+//! (full seven-step upload chain, duplicate 1-vs-2 semantics, rapid-upload
+//! Reuse shape, part retention = resume, empty/omitted/wrong etag).
+//! Shapes follow examples/pan115_spike (anyhow + small modules + masked
+//! output); endpoint casing follows 123panNextGen (2026-09) verbatim and
 //! every probe records which generation actually answers.
 //!
 //! ```text
@@ -13,12 +15,20 @@
 //! pan123-spike probe-list [--parent X] [--limit N] [--trashed]
 //! pan123-spike probe-mkdir <name> [--parent X]  # create + 5060 repeat sample
 //! pan123-spike gen-file <size-kb> [--out P]     # random payload + md5
-//! pan123-spike probe-upload <file> [--parent X] # minimal single-slice chain
+//! pan123-spike probe-upload <file> [--parent X] # minimal single-slice chain (old presign)
 //! pan123-spike probe-trash <fid> <parent> [--gen old]   # correct payload + read-back
 //! pan123-spike probe-trash-trap <fid> <parent> <name>  # wrong-payload trap repro
 //! pan123-spike probe-download <fid> [--file P]  # traffic + info + Range 206
 //! pan123-spike probe-user                       # quota / traffic fields
 //! pan123-spike cleanup <prefix>                 # strict-prefix sweep + verify
+//! pan123-spike upload-full <file> [--parent X] [--name X] [--part-mb N]  # ⑤ seven steps
+//! pan123-spike probe-duplicate <v1> <v2> [--parent X] [--dup 1|2]        # 钉死 a
+//! pan123-spike probe-reuse <file> [--parent X]                           # 钉死 b
+//! pan123-spike probe-resume <file> [--parent X]                          # 钉死 c
+//! pan123-spike probe-etag <file> [--parent X]                            # 钉死 d
+//! pan123-spike complete-v2 <fid> <bucket> <key> <uploadId> <node> <size> [--form new|v2] [--name X]
+//! pan123-spike probe-single                    # single-part completion matrix (E0..E4)
+//! pan123-spike list-prefix <prefix> [--parent X]
 //! ```
 //!
 //! Env: PAN123_SPIKE_TEST_DIR (default E:\GitHub\rs-CyDrive\test — gitignored,
@@ -28,6 +38,7 @@
 mod api;
 mod probes;
 mod state;
+mod upload;
 
 use anyhow::Result;
 
@@ -37,7 +48,10 @@ fn usage() -> ! {
          \x20        probe-list [--parent X] [--limit N] [--trashed] | probe-mkdir <name> [--parent X] |\n\
          \x20        gen-file <size-kb> [--out P] | probe-upload <file> [--parent X] |\n\
          \x20        probe-trash <fid> <parent> [--gen old] | probe-trash-trap <fid> <parent> <name> |\n\
-         \x20        probe-download <fid> [--file P] | probe-user | cleanup <prefix>>"
+         \x20        probe-download <fid> [--file P] | probe-user | cleanup <prefix> |\n\
+         \x20        upload-full <file> [--parent X] [--name X] [--part-mb N] |\n\
+         \x20        probe-duplicate <v1> <v2> [--parent X] | probe-reuse <file> [--parent X] |\n\
+         \x20        probe-resume <file> [--parent X] | probe-etag <file> [--parent X]>"
     );
     std::process::exit(2);
 }
@@ -65,6 +79,14 @@ async fn main() {
         "probe-heads" => probes::cmd_probe_heads(rest).await,
         "probe-user" => probes::cmd_probe_user(rest).await,
         "cleanup" => probes::cmd_cleanup(rest).await,
+        "upload-full" => upload::cmd_upload_full(rest).await,
+        "probe-duplicate" => upload::cmd_probe_duplicate(rest).await,
+        "probe-reuse" => upload::cmd_probe_reuse(rest).await,
+        "probe-resume" => upload::cmd_probe_resume(rest).await,
+        "probe-etag" => upload::cmd_probe_etag(rest).await,
+        "complete-v2" => upload::cmd_complete_v2(rest).await,
+        "probe-single" => upload::cmd_probe_single(rest).await,
+        "list-prefix" => upload::cmd_list_prefix(rest).await,
         _ => usage(),
     };
     let code = match result {
