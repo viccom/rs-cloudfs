@@ -9,20 +9,21 @@
 //! 类）+ 顶层与字段双拼解析、dydomain 动态域名 + 粘性 fallback、web
 //! 身份头（D5：无安卓头、无签名）。
 //!
-//! ## 批次边界（123-2 = 读路径）
+//! ## 批次边界（123-3 = 写路径）
 //!
 //! - 认证/分类/域名面（123-1）：TDD 钉死（`tests/oauth_state_machine.rs`
 //!   / `tests/errno_mapping.rs` / `tests/api_client.rs`）；123-2 扩充
 //!   读写面 errno（5060/5113/5114/-1/400）+ 令牌桶限流 + HTTP 重试
 //!   退避（`tests/limiter.rs` / `tests/api_retry.rs`）；
-//! - **读路径全接线**：list（分页合并稳定排序）/ stat（list-walk 末级
-//!   新鲜）/ mkdir（预检+隐式父级）/ delete（trash+回读校验）/ rename
-//!   （文件与目录同端点——任务 0 真机实证 + mod_pid 跨父）/ reader
-//!   （三跳解析 + traffic 预检 + 有界窗口流）/ quota——桩回放矩阵
-//!   （`tests/read_path.rs` / `tests/download_hops.rs`，`tests/stub_common`
-//!   假 123pan API + 假 CDN 桩）；
-//! - **writer 留 123-3**（upload_request/分片 presign/complete）；
-//!   conformance + 12 装配点 123-4、真机矩阵 123-5——cli dispatch 臂
+//! - 读路径（123-2）：list/stat/mkdir/delete/rename/reader/quota——
+//!   `tests/read_path.rs` / `tests/download_hops.rs`；
+//! - **写路径全接线（123-3）**：commit-on-close stager + 七步提交链
+//!   （MD5 预计算 / Reuse 秒传 / 5060→duplicate=2 覆盖 / resume 差集 /
+//!   size 校验）——[`upload`] 模块 + `tests/write_path.rs` 桩矩阵；
+//!   `RapidUpload` 可选 trait **不接**（无驱动先例——秒传由服务端
+//!   `Reuse` 自动完成，`WriteHint` 仅观察面；driver-onboarding §2.9
+//!   可选项）；
+//! - conformance + 12 装配点 123-4、真机矩阵 123-5——cli dispatch 臂
 //!   仍占位，没有装配路径触达驱动。
 //!
 //! 层位置：只依赖 cloudkit-storage（L2）与外部 crate
@@ -34,6 +35,7 @@ pub mod limiter;
 pub mod models;
 pub mod oauth;
 pub mod pathcache;
+pub mod upload;
 
 use std::sync::Arc;
 
@@ -79,6 +81,9 @@ pub struct Pan123Params {
     pub limiter: Option<limiter::LimiterConfig>,
     /// HTTP 重试/退避参数（`None` = §5.15 实测常量；测试注入毫秒级）。
     pub retry: Option<api::RetryConfig>,
+    /// 会话/spool 目录（`None` = 系统临时目录且会话仅内存层；生产装配
+    /// 给卷家目录——K21 锚形态，pan115 `sessions_dir` 同义）。
+    pub sessions_dir: Option<std::path::PathBuf>,
 }
 
 impl Default for Pan123Params {
@@ -91,6 +96,7 @@ impl Default for Pan123Params {
             login_base: DEFAULT_LOGIN_BASE.to_string(),
             limiter: None,
             retry: None,
+            sessions_dir: None,
         }
     }
 }
@@ -139,14 +145,15 @@ impl Pan123Params {
     }
 }
 
-/// 123 存储驱动（123-2 读路径接线；writer 留 123-3）。
+/// 123 存储驱动（123-3 写路径接线后读写两路全通）。
 ///
 /// - 语义：读路径全接线（list 分页合并稳定排序 / stat list-walk 末级
 ///   新鲜 / mkdir 预检+隐式父级 / trash+回读校验 / rename 文件与目录
 ///   同端点（任务 0 实证）+ mod_pid 跨父 / reader 三跳流读）；写路径
-///   123-3；
-/// - 错误：协议面分类表见 [`api`]（认证面 + 读写面扩充）；占位面
-///   （writer）返回指明批次的 `Unavailable`；
+///   commit-on-close（七步链 / Reuse 秒传 / duplicate=2 覆盖 / resume
+///   差集——[`upload`] 模块）；
+/// - 错误：协议面分类表见 [`api`]（认证面 + 读写面）；5060 在 writer
+///   面内部以 duplicate=2 消化（对外 Exists 语义只在 mkdir 面）；
 /// - 并发：全方法可并发调用（`&self`）；无刷新状态机（web API 无
 ///   refresh——K76.4）；
 /// - 生命周期：HTTP client 无连接态；域名粘性状态、令牌桶与 token
@@ -154,13 +161,16 @@ impl Pan123Params {
 ///   生命周期独立于 `&self`，pan115/baidu 同款）。
 pub struct Pan123Driver {
     volume: VolumeId,
-    /// 共享 HTTP 面（CDN 流任务经 Arc 持有）。
+    /// 共享 HTTP 面（CDN 流任务与上传 stager 经 Arc 持有）。
     client: Arc<Pan123Client>,
     params: Pan123Params,
-    /// 路径 → file_id 解析缓存（list/stat 顺带喂）。
-    paths: pathcache::PathCache,
+    /// 路径 → file_id 解析缓存（list/stat 顺带喂；stager close 落库后
+    /// 就近失效——经 Arc 与 stager 共享）。
+    paths: Arc<pathcache::PathCache>,
     /// file_id → 最终应答 URL 的 TTL 缓存（与流任务经 Arc 共享）。
     dlinks: Arc<download::DlinkCache>,
+    /// 上传会话表（resume 差集资产，与 stager 经 Arc 共享）。
+    sessions: Arc<upload::SessionStore>,
 }
 
 impl Pan123Driver {
@@ -181,6 +191,7 @@ impl Pan123Driver {
         };
         let limiter = params.limiter.unwrap_or_default();
         let retry = params.retry.unwrap_or_default();
+        let sessions = Arc::new(upload::SessionStore::new(params.sessions_dir.clone()));
         let client = Arc::new(Pan123Client::with_tuning(
             token.clone(),
             params.api_base.clone(),
@@ -193,8 +204,9 @@ impl Pan123Driver {
             volume: VolumeId::new("pan123", "pending")?,
             client,
             params,
-            paths: pathcache::PathCache::new(),
+            paths: Arc::new(pathcache::PathCache::new()),
             dlinks: Arc::new(download::DlinkCache::new()),
+            sessions,
         })
     }
 
@@ -224,6 +236,38 @@ impl Pan123Driver {
     /// 驱动参数（路径面消费 root；只读）。
     pub fn params(&self) -> &Pan123Params {
         &self.params
+    }
+
+    // ---- upload.rs（写路径）的内部访问面 ------------------------------
+
+    /// 共享 HTTP 面（upload.rs 的 stager 构造面）。
+    pub(crate) fn client_arc(&self) -> &Arc<Pan123Client> {
+        &self.client
+    }
+
+    /// 卷根 folder id（`pan123_root`；D3）。
+    pub(crate) fn root_cid(&self) -> &str {
+        &self.params.root
+    }
+
+    /// 路径解析缓存（upload.rs 的父目录解析与落库后就近失效）。
+    pub(crate) fn paths_arc(&self) -> &Arc<pathcache::PathCache> {
+        &self.paths
+    }
+
+    /// 上传会话表（upload.rs 的 resume 面）。
+    pub(crate) fn sessions_arc(&self) -> &Arc<upload::SessionStore> {
+        &self.sessions
+    }
+
+    /// 卷身份（upload.rs 的 Entry 产出面）。
+    pub(crate) fn volume_ref(&self) -> &VolumeId {
+        &self.volume
+    }
+
+    /// 分片 PUT 重试参数（§5.15——驱动构造时的注入源）。
+    pub(crate) fn retry_config(&self) -> api::RetryConfig {
+        self.params.retry.unwrap_or_default()
     }
 
     /// 路径 → 解析层（list/stat/mkdir/rename 共用）。
@@ -282,15 +326,6 @@ impl Pan123Driver {
 /// （跨平台卷的可寻址性纪律，K67.2 同源）。
 fn name_is_addressable(name: &str) -> bool {
     !name.is_empty() && !name.contains('\\') && !name.contains('\u{0}')
-}
-
-/// 占位面的统一「未接线」形态：载荷指明落地批次（可行动文案——消费
-/// 方/开发者一眼定位；ck-pan115 115-1 同款文案纪律）。
-fn not_wired(face: &str, batch: &str) -> StorageError {
-    StorageError::Unavailable(format!(
-        "pan123 {face} lands in Phase 6 / {batch} (the 123-1 skeleton ships the auth layer, \
-         config keys and the compile surface only)"
-    ))
 }
 
 #[async_trait]
@@ -565,13 +600,17 @@ impl StorageDriver for Pan123Driver {
         download::open_range(&self.client, &self.dlinks, &row, start, end).await
     }
 
-    /// 打开写暂存器（commit-on-close；123-3 写路径全链——本批占位）。
+    /// 打开写暂存器（commit-on-close；[`upload`] 模块——123-3 七步链：
+    /// MD5 预计算 → upload_request（Reuse/5060→duplicate=2）→ list 对账
+    /// → repare 预签名 → 逐分片裸 PUT → 确认 → complete → /v2 全量
+    /// body + size 校验）。根路径 → `Invalid`；目标父目录缺失则逐级隐式
+    /// 创建。
     async fn writer(
         &self,
-        _path: &RelPath,
-        _hint: &WriteHint,
+        path: &RelPath,
+        hint: &WriteHint,
     ) -> Result<Box<dyn UploadStager>, StorageError> {
-        Err(not_wired("writer", "123-3"))
+        upload::writer(self, path, hint).await
     }
 
     /// 配额：`user/info` 的 `SpacePermanent`（总）/`SpaceUsed`（已用）
@@ -696,32 +735,16 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn writer_is_the_last_not_wired_placeholder() {
-        // 123-2 后读路径全接线（协议面行为由 read_path.rs / download_hops.rs
-        // 的桩回放矩阵覆盖）；本单测只钉剩余占位面：writer 是 123-3 的
-        // 未接线形态（载荷指明批次——占位必须明确）+ 卷根不可写入。
+    async fn writer_refuses_the_root_path() {
+        // 写路径已全接线（123-3——协议面行为由 write_path.rs 的桩矩阵
+        // 覆盖）；本单测只钉契约面：根路径不可写入（离线断言，无网络）。
         let driver = Pan123Driver::new(skeleton_params()).expect("driver");
         let err = driver
             .writer(&RelPath::root(), &WriteHint::default())
             .await
             .err()
-            .expect("writer is not wired in 123-2");
-        match &err {
-            StorageError::Unavailable(detail) => {
-                assert!(
-                    detail.contains("Phase 6") && detail.contains("123-3"),
-                    "{detail}"
-                );
-            }
-            other => panic!("expected the not-wired Unavailable, got {other:?}"),
-        }
-        let target = RelPath::new("some/file.txt").expect("path");
-        let err = driver
-            .writer(&target, &WriteHint::default())
-            .await
-            .err()
-            .expect("refuses");
-        assert!(matches!(err, StorageError::Unavailable(_)), "{err:?}");
+            .expect("root is not writable");
+        assert!(matches!(err, StorageError::Invalid), "{err:?}");
     }
 
     // -------------------------------------------------------- api 面 ---

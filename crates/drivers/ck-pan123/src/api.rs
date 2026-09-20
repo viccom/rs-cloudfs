@@ -1,7 +1,7 @@
-//! 123 云盘 web API 面（Phase 6 / 123-1 骨架 + 123-2 读路径扩展）——
-//! 域名管理（dydomain 动态发现 + 会话级粘性 fallback）、web 身份头集合
-//! （D5）、envelope 解析/错误分类、令牌桶限流 + HTTP 重试/退避与读路径
-//! 端点封装。
+//! 123 云盘 web API 面（Phase 6 / 123-1 骨架 + 123-2 读路径扩展 + 123-3
+//! 写路径端点）——域名管理（dydomain 动态发现 + 会话级粘性 fallback）、
+//! web 身份头集合（D5）、envelope 解析/错误分类、令牌桶限流 + HTTP
+//! 重试/退避、读写路径端点封装。
 //!
 //! ## envelope（§5.10 双成功码——123-0 真机实证）
 //!
@@ -445,7 +445,7 @@ impl RetryConfig {
 
     /// 第 n 次重试的退避时长：指数（base × 2^n）封顶 cap + 抖动
     /// （0..=base/2，时钟纳秒源——不引 rand 依赖）。
-    fn backoff(&self, attempt: u32) -> Duration {
+    pub(crate) fn backoff(&self, attempt: u32) -> Duration {
         let exp = self.backoff_base.saturating_mul(1u32 << attempt.min(16));
         let capped = exp.min(self.backoff_cap);
         let nanos = std::time::SystemTime::now()
@@ -944,6 +944,315 @@ impl Pan123Client {
             })?;
         Ok(url.to_string())
     }
+
+    // ------------------------------------------------- 写路径端点（123-3） ---
+
+    /// `POST /b/api/file/upload_request`——文件面（type=0；**与 mkdir 的
+    /// `/a/` 前缀分叉**，§3.1）。首请求不带 `duplicate`；5060 由调用方
+    /// （stager）以 `duplicate:2` 重发消化——**writer 面的覆盖语义恒用
+    /// 2，绝不发 1**（D4 真机钉死：2=同 FileId 原地覆盖 / 1=`name(1).ext`
+    /// 副本）。
+    ///
+    /// `Reuse:true`（内容已在服务端——**Reuse 优先于 5060**）时真 FileId
+    /// 在 `data.Info.FileId`（顶层 FileId 是临时形态大数、`UploadId:""`）。
+    pub async fn upload_request_file(
+        &self,
+        parent: i64,
+        name: &str,
+        size: u64,
+        etag: &str,
+        duplicate: Option<i64>,
+    ) -> Result<UploadRequestOutcome, StorageError> {
+        let mut body = serde_json::json!({
+            "driveId": 0,
+            "etag": etag,
+            "fileName": name,
+            "parentFileId": parent,
+            "size": size,
+            "type": 0,
+        });
+        if let Some(d) = duplicate {
+            body["duplicate"] = serde_json::json!(d);
+        }
+        let data = match self
+            .dispatch_post_json("/b/api/file/upload_request", &body, "upload_request")
+            .await
+        {
+            Ok(data) => data,
+            // 5060 → errno 表归一 Exists；writer 面内部消化（stager 重发
+            // duplicate=2），绝不外泄到挂载面。
+            Err(StorageError::Exists) => return Ok(UploadRequestOutcome::Conflict),
+            Err(e) => return Err(e),
+        };
+        let field = |keys: &[&str]| -> Option<String> {
+            keys.iter().find_map(|k| data.get(*k)).and_then(|v| {
+                v.as_str()
+                    .map(str::to_string)
+                    .or_else(|| v.as_i64().map(|n| n.to_string()))
+            })
+        };
+        let reuse = data
+            .get("Reuse")
+            .or_else(|| data.get("reuse"))
+            .and_then(|v| v.as_bool())
+            .unwrap_or(false);
+        if reuse {
+            // 真 FileId 只在 data.Info（spike 钉死 b：顶层是临时形态）。
+            let fid = data
+                .get("Info")
+                .and_then(|i| i.get("FileId").or_else(|| i.get("fileId")))
+                .and_then(|v| {
+                    v.as_i64()
+                        .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                })
+                .filter(|v| *v > 0);
+            let file_id = fid.ok_or_else(|| {
+                StorageError::Unavailable(
+                    "upload_request: Reuse hit without a real FileId in data.Info".into(),
+                )
+            })?;
+            return Ok(UploadRequestOutcome::Rapid { file_id });
+        }
+        let upload_id = field(&["UploadId", "uploadId"]).unwrap_or_default();
+        if upload_id.is_empty() {
+            return Err(StorageError::Unavailable(
+                "upload_request: neither Reuse nor an UploadId came back".into(),
+            ));
+        }
+        let missing = |k: &str| StorageError::Unavailable(format!("upload_request: {k} missing"));
+        Ok(UploadRequestOutcome::Ticket(Box::new(UploadTicket {
+            up_file_id: data
+                .get("FileId")
+                .or_else(|| data.get("fileId"))
+                .and_then(|v| v.as_i64())
+                .unwrap_or(0),
+            bucket: field(&["Bucket", "bucket"]).ok_or_else(|| missing("Bucket"))?,
+            key: field(&["Key", "key"]).ok_or_else(|| missing("Key"))?,
+            upload_id,
+            storage_node: field(&["StorageNode", "storageNode"])
+                .ok_or_else(|| missing("StorageNode"))?,
+            // 服务端 SliceSize（"16777216" 字符串形态）——上界参考，驱动
+            // 按客户端 5MiB 定值切片（§5.13）。
+            slice_size: data
+                .get("SliceSize")
+                .or_else(|| data.get("sliceSize"))
+                .and_then(|v| {
+                    v.as_str()
+                        .and_then(|s| s.parse().ok())
+                        .or_else(|| v.as_u64())
+                }),
+        })))
+    }
+
+    /// `POST /b/api/file/s3_list_upload_parts`——七步序第 2/5 步（续传
+    /// 差集依据）。body 小写 `storageNode`（与 repare/v2 的大写分叉——
+    /// 逐字照抄）；响应 `data.Parts[]`（`PartNumber`/`Size` 均字符串）。
+    ///
+    /// 会话被 complete 消费 → `code:-1` ListParts NoSuchKey/404 形态 →
+    /// [`PartsOutcome::SessionGone`]（调用方重走 upload_request）。
+    pub async fn s3_list_parts(&self, ticket: &UploadTicket) -> Result<PartsOutcome, StorageError> {
+        let data = match self
+            .dispatch_post_json(
+                "/b/api/file/s3_list_upload_parts",
+                &serde_json::json!({
+                    "bucket": ticket.bucket,
+                    "key": ticket.key,
+                    "uploadId": ticket.upload_id,
+                    "storageNode": ticket.storage_node,
+                }),
+                "s3_list_upload_parts",
+            )
+            .await
+        {
+            Ok(data) => data,
+            Err(StorageError::Io(msg)) if session_gone(&msg) => {
+                return Ok(PartsOutcome::SessionGone)
+            }
+            Err(e) => return Err(e),
+        };
+        let rows = data
+            .get("Parts")
+            .or_else(|| data.get("parts"))
+            .and_then(|v| v.as_array().cloned())
+            .ok_or_else(|| {
+                StorageError::Unavailable("s3_list_upload_parts: Parts missing".into())
+            })?;
+        let mut parts: Vec<(u32, i64)> = rows
+            .iter()
+            .filter_map(|p| {
+                let n = p
+                    .get("PartNumber")
+                    .or_else(|| p.get("partNumber"))
+                    .and_then(|v| {
+                        v.as_u64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    })?;
+                let size = p
+                    .get("Size")
+                    .or_else(|| p.get("size"))
+                    .and_then(|v| {
+                        v.as_i64()
+                            .or_else(|| v.as_str().and_then(|s| s.parse().ok()))
+                    })
+                    .unwrap_or(0);
+                Some((n as u32, size))
+            })
+            .collect();
+        parts.sort_unstable();
+        Ok(PartsOutcome::Parts(parts))
+    }
+
+    /// `POST /b/api/file/s3_repare_upload_parts_batch`——七步序第 3 步。
+    /// **官方拼写 "repare" 勿「纠正」；参数 `StorageNode` 大写；区间
+    /// `[start, end)` 半开**（§5.13 逐字照抄纪律）。响应
+    /// `data.presignedUrls{"1":url,...}`。
+    pub async fn s3_repare_presign(
+        &self,
+        ticket: &UploadTicket,
+        start: u32,
+        end: u32,
+    ) -> Result<std::collections::BTreeMap<u32, String>, StorageError> {
+        let data = self
+            .dispatch_post_json(
+                "/b/api/file/s3_repare_upload_parts_batch",
+                &serde_json::json!({
+                    "bucket": ticket.bucket,
+                    "key": ticket.key,
+                    "partNumberStart": start,
+                    "partNumberEnd": end,
+                    "uploadId": ticket.upload_id,
+                    "StorageNode": ticket.storage_node,
+                }),
+                "s3_repare_upload_parts_batch",
+            )
+            .await?;
+        let map = data
+            .get("presignedUrls")
+            .or_else(|| data.get("PresignedUrls"))
+            .and_then(|v| v.as_object().cloned())
+            .ok_or_else(|| StorageError::Unavailable("s3_repare: presignedUrls missing".into()))?;
+        let mut urls = std::collections::BTreeMap::new();
+        for (k, v) in map {
+            if let (Ok(n), Some(u)) = (k.parse::<u32>(), v.as_str()) {
+                urls.insert(n, u.to_string());
+            }
+        }
+        Ok(urls)
+    }
+
+    /// `POST /b/api/file/s3_complete_multipart_upload`——七步序第 6 步
+    /// （小写 `storageNode` 的同 4 键形）→ `code=0 + data.Location:""`。
+    ///
+    /// `-1 rpc MalformedXML` 是读路径腿实证的无害先例形态（单 PUT 会话
+    /// 误调时）——容忍并 warn（repare 创建的恒 multipart 会话常态回 0）。
+    pub async fn s3_complete_multipart(&self, ticket: &UploadTicket) -> Result<(), StorageError> {
+        match self
+            .dispatch_post_json(
+                "/b/api/file/s3_complete_multipart_upload",
+                &serde_json::json!({
+                    "bucket": ticket.bucket,
+                    "key": ticket.key,
+                    "uploadId": ticket.upload_id,
+                    "storageNode": ticket.storage_node,
+                }),
+                "s3_complete_multipart_upload",
+            )
+            .await
+        {
+            Ok(_) => Ok(()),
+            Err(StorageError::Io(msg)) if msg.contains("MalformedXML") => {
+                tracing::warn!(
+                    target: "ck_pan123::api",
+                    "s3_complete returned the known-harmless -1 MalformedXML form; continuing"
+                );
+                Ok(())
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    /// `POST /b/api/file/upload_complete/v2`——七步序第 7 步（提交点）。
+    /// **全量 body + `isMultipart:true` 恒真 + 大写 `StorageNode`**
+    /// （E0–E4 完成态矩阵：repare 批量恒 multipart 会话，新单键
+    /// `{fileId}` / `isMultipart:false` 对该会话 code=0 **静默不入库**）。
+    /// 响应 `data.file_info`（snake_case 键，内层双拼条目）= 真实
+    /// FileId + 声称 etag + 完整条目。
+    pub async fn upload_complete_v2(
+        &self,
+        ticket: &UploadTicket,
+        size: u64,
+    ) -> Result<crate::models::FileEntry, StorageError> {
+        let data = self
+            .dispatch_post_json(
+                "/b/api/file/upload_complete/v2",
+                &serde_json::json!({
+                    "fileId": ticket.up_file_id,
+                    "bucket": ticket.bucket,
+                    "fileSize": size,
+                    "key": ticket.key,
+                    "isMultipart": true,
+                    "uploadId": ticket.upload_id,
+                    "StorageNode": ticket.storage_node,
+                }),
+                "upload_complete/v2",
+            )
+            .await?;
+        let info = data
+            .get("file_info")
+            .or_else(|| data.get("FileInfo"))
+            .or_else(|| data.get("Info"))
+            .filter(|v| v.is_object())
+            .cloned()
+            .ok_or_else(|| {
+                StorageError::Unavailable(
+                    "upload_complete/v2: file_info missing — the silent no-op form \
+                     (the full body with isMultipart:true is mandatory on a repare \
+                     multipart session)"
+                        .into(),
+                )
+            })?;
+        serde_json::from_value(info).map_err(|e| {
+            StorageError::Unavailable(format!("upload_complete/v2: file_info parse: {e}"))
+        })
+    }
+}
+
+/// 会话失效判据（123-0 采样形态）：`-1 rpc ListParts NoSuchKey/404`——
+/// 会话已被 complete 消费（或查无）。
+fn session_gone(msg: &str) -> bool {
+    msg.contains("NoSuchKey") || msg.contains("404")
+}
+
+/// `upload_request` 文件面的三态产出。
+pub enum UploadRequestOutcome {
+    /// `Reuse:true` 秒传命中（真 FileId 在 `data.Info.FileId`）——零分片
+    /// 零流量，直接跳 size 校验（任务 B Reuse 分支）。
+    Rapid { file_id: i64 },
+    /// 全量会话五元组（bucket/key/uploadId/storageNode + 临时 up_file_id）。
+    Ticket(Box<UploadTicket>),
+    /// 5060 同名冲突——stager 以 `duplicate:2` 重发消化（D4 覆盖语义）。
+    Conflict,
+}
+
+/// 上传会话五元组（resume 持久化的载荷；`up_file_id` 是顶层临时
+/// FileId——/v2 完成体的 `fileId` 键值）。
+#[derive(Debug, Clone)]
+pub struct UploadTicket {
+    pub up_file_id: i64,
+    pub bucket: String,
+    pub key: String,
+    pub upload_id: String,
+    pub storage_node: String,
+    /// 服务端下发的 `SliceSize`（字符串形态解析；上界参考——驱动按
+    /// 客户端 5MiB 定值）。
+    pub slice_size: Option<u64>,
+}
+
+/// `s3_list_upload_parts` 的产出：在册分片（part_number 升序 + size）或
+/// 会话失效（调用方重走 upload_request 全量重传）。
+pub enum PartsOutcome {
+    Parts(Vec<(u32, i64)>),
+    SessionGone,
 }
 
 /// 单次尝试的可重试分类（dispatch 重试引擎的决策面）。
