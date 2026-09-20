@@ -2,7 +2,7 @@
 
 > 计划：`docs/plans/2026-09-14-pan123-driver.md` ｜ 需求口径：自用（K59.1）+ 全量公民 + 编译开关 + 零侵入
 > 基线：main@c819ee8（workspace 1069/0/12；winfsp 腿 117/0/1）
-> 状态：**123-4 完成（2026-09-20，conformance 八断言全绿 + resume 位点亮 + 12 装配点全接线 + M-I2 收口）→ 123-5 真机矩阵解锁**
+> 状态：**六批次全部完成（2026-09-20，K77 收口）**——123-0 两腿 spike / 123-1 骨架认证 / 123-2 读路径 / 123-3 写路径 / 123-4 conformance+装配 / 123-5 真机矩阵 3/3 + E2E 5/5 + 向导/doctor 真机；两真机缺陷（trash operation 键 / resume 本地五元组优先）修复入档；workspace 终态 **1360/0/42**（收尾批复跑）；遗留挂账见下「终态挂账总表」
 > 前置依赖：与 Phase 4/5 共享的 `compiled_drivers()` 可扩展化重构（谁先到谁做，只做一次）
 > worktree：`feat/pan123-driver`（E:\Rs_Codes\rs-cloudfs-pan123）
 
@@ -57,6 +57,10 @@
   - D2/D3 建议沿用 Phase 5 已拍板形态（trash 天然回收站语义 / 根目录可设置缺省网盘根），D4 为本阶段新增（duplicate 覆盖语义）。
 
 ## 风险与未覆盖（如实记录）
+
+**终态挂账总表（2026-09-20 收尾批 K77 整理；各项详细上下文见下列批次条目）**
+- **留挂账（验证/观察类，无正确性影响）**：①5113/5114 真身（额度未耗尽——K77.4 不主动耗尽裁决；桩按 D5 形态建模，映射 `RateLimited`+人话指引有 errno_mapping 钉）；②QR 确认态人扫（终端渲染+Waiting 状态机已钉，Confirmed 需真人——自用项目影响极低）；③空文件链（size=0）真机（桩按 pan123-rs/123panNextGen 推断建模）；④mod_pid 跨父 rename 真机（矩阵只走同父腿；wire 照 pan123-rs，桩按文档严格建模）；⑤dlink TTL 真值（15min 保守维持——web-pro2 中继时效不可知）；⑥token 淘汰精确策略（FIFO-2 为观测推断，未穷举）；⑦123 免费档可持续 rps 真值（2rps/burst4 从宽起步）；⑧观察类：isBlocked:true 含义 / VIP unlimited 键形态 / list 单页 limit=100 服务端上限 / reuse 条目 list 缓存滞后窗口（写腿 0 轮询未复现）/ info 对已 Trashed 条目行为；⑨极端量级类：>64MB sleep 3s 组合行为 / >48.8GiB 大文件自适应分片 / 覆盖（duplicate=2）后旧内容服务端残留计费；⑩abort 孤儿会话服务端配额影响（web API 无释放端点，warn 如实——pan115 K75-2 的 123 形态）；⑪SessionGone 判据基于消息文本匹配（NoSuchKey/404——服务端消息漂移时误报风险，误报退路=全量重传，正确性不变）。
+- **已销（阶段内闭环）**：resume 差集真机形态（123-5 ② 服务端对账 + 同 UploadId + 补缺 timing ✓——123-3 挂账项）、rename 目录可用性（123-2 任务 0 ✓）、端点/认证/上传链/下载链/duplicate/etag 全形态有效性（123-0 两腿 ✓）、setup 双路向导真机（tmux PTY 实走 + sign_in 换发验证 ✓）、doctor 流量面真机（人话化余量 + VIP 指引 ✓）、conformance 八断言 + 分片差集两特化（123-4 ✓）、5113/5114 之外的 errno 面（errno_mapping 钉死 ✓）。
 
 - ~~**123-5 真机矩阵**~~ **完成（2026-09-20）**：矩阵 3/3 + E2E 5/5 + 交互向导 + doctor 全绿；两真机缺陷（trash operation 键 / resume 本地五元组优先）修复入档。**维持挂账**：5113/5114 真身（额度未耗尽——主动耗尽裁决不做）；QR 确认态人扫（渲染+Waiting 已钉）；空文件链（size=0）真机；直链 TTL 真值（15min 保守维持）；token 淘汰精确策略（FIFO-2 观测推断）；mod_pid 跨父 rename 真机（矩阵只走同父腿——挂账维持）。
 - **123-5 新钉协议事实**：trash 载荷 `operation:true` 必填（缺省 400）；同参 upload_request 重发的会话复用**只在零片时成立**（有片恒铸新会话——差集恢复必须本地五元组）；sign_in 换发 token 并存上限（FIFO-2 观测）；流量计数器滞后粗粒度（非即时非全量扣减）。
