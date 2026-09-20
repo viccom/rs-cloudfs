@@ -41,6 +41,7 @@ const VOLUME_LABELS = {
     local: 'backend.local',
     sftp: 'backend.sftp',
     pan115: 'backend.pan115',
+    pan123: 'backend.pan123',
 };
 
 function backendDisplayName(backend) {
@@ -474,6 +475,7 @@ const VF_CRED_GROUPS = {
     local: 'vf-group-local',
     sftp: 'vf-group-sftp',
     pan115: 'vf-group-pan115',
+    pan123: 'vf-group-pan123',
 };
 
 // The starred requireds per backend (UX-level only — the CREATE command
@@ -486,6 +488,7 @@ const VF_REQUIRED = {
     local: ['vf-local-root'],
     sftp: ['vf-sftp-host', 'vf-sftp-username'],
     pan115: ['vf-pan115-access-token', 'vf-pan115-refresh-token'],
+    pan123: ['vf-pan123-token'],
 };
 
 // String fields: input id → payload key (collected only when non-empty —
@@ -510,6 +513,8 @@ const VF_STRINGS = {
     'vf-pan115-access-token': 'pan115_access_token',
     'vf-pan115-refresh-token': 'pan115_refresh_token',
     'vf-pan115-root': 'pan115_root',
+    'vf-pan123-token': 'pan123_token',
+    'vf-pan123-root': 'pan123_root',
     'vf-enc-pass': 'encryption_password',
     'vf-sync-url': 'sync_url',
     'vf-sync-secret': 'sync_secret',
@@ -659,6 +664,7 @@ function vfPrefillEdit(config) {
         'vf-sftp-root': config.sftp_root,
         'vf-pan115-client-id': config.pan115_client_id,
         'vf-pan115-root': config.pan115_root,
+        'vf-pan123-root': config.pan123_root,
     };
     for (const [id, value] of Object.entries(plain)) {
         const el = vfEl(id);
@@ -679,6 +685,7 @@ function vfPrefillEdit(config) {
         'vf-sftp-private-key-passphrase': config.sftp_private_key_passphrase,
         'vf-pan115-access-token': config.pan115_access_token,
         'vf-pan115-refresh-token': config.pan115_refresh_token,
+        'vf-pan123-token': config.pan123_token,
         'vf-enc-pass': config.encryption_password,
         'vf-sync-url': config.sync_url,
         'vf-sync-secret': config.sync_secret,

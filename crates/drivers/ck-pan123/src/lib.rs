@@ -35,6 +35,7 @@ pub mod limiter;
 pub mod models;
 pub mod oauth;
 pub mod pathcache;
+pub mod transport_face;
 pub mod upload;
 
 use std::sync::Arc;
@@ -47,6 +48,7 @@ use cloudkit_storage::{
 
 pub use api::{Pan123Client, UA};
 pub use oauth::TokenStore;
+pub use transport_face::Pan123Transport;
 
 /// 生产主域（dydomain 真机回值；`api::DEFAULT_PRIMARY_BASE` 的 lib 面
 /// 再导出——ck-pan115 基常量同款布局）。
@@ -339,17 +341,19 @@ impl StorageDriver for Pan123Driver {
     /// R4 注记：这些位的**后端原语存在性**已由 123-0 真机验证（下载
     /// Range 206 逐字节 MATCH / 分片 presign PUT / mod_pid 服务端移动 /
     /// MD5 etag 秒传命中 / resume 会话保留差集补传哈希 MATCH）；驱动面
-    /// 的 conformance 八断言在 123-4 验收——**resume 位在断言⑦（差集
-    /// 续传驱动层可观测）通过后复核**，未过则降为 false（标注为
-    /// 「计划位」）。123-1 无装配路径触达本驱动（dispatch 占位臂），
-    /// 位不被生产消费。
+    /// 的 conformance 八断言于 123-4 全绿——**resume 位已点亮**（断言⑦
+    /// 差集上界驱动层可观测验证过：tests/conformance.rs 的
+    /// `conformance_suite_offline` + 分片级特化
+    /// `pan123_partial_parts_resume_only_missing`——第一轮中断后只补
+    /// 缺失片，「到齐即传 + re-request 会话保留」双证）。
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             // download_info → CDN Range 206 实证（123-0 ④：跨窗口
             // 逐字节 MATCH；dlink 会话内可复用）。
             range_read: true,
-            // 计划位（断言⑦后复核）：同参重发返回同一 UploadId +
-            // list_parts 保留分片 + 差集补传哈希 MATCH（123-0 ⑤）。
+            // 已点亮（123-4 断言⑦过）：同参重发返回同一 UploadId +
+            // list_parts 保留分片 + 差集补传哈希 MATCH（123-0 ⑤ 真机 +
+            // conformance ⑦/特化用例离线双证）。
             resume: true,
             // 分片 presigned PUT（repare 批量恒 multipart 会话）。
             multipart: true,
@@ -479,11 +483,12 @@ impl StorageDriver for Pan123Driver {
         if id.volume != self.volume {
             return Err(StorageError::NotFound); // 他卷句柄（trait 契约）
         }
-        let fid: i64 = id
-            .handle
-            .as_str()
-            .parse()
-            .map_err(|_| StorageError::Invalid)?;
+        // 非数字句柄：本卷实体域全是数字 file_id——**查无实体的极端
+        // 形态**，归入幂等 Ok（conformance ④ 的声明形态必须恒定：
+        // delete 不存在 → Ok；123-4 红灯修复——原 Invalid 破坏恒定）。
+        let Ok(fid) = id.handle.as_str().parse::<i64>() else {
+            return Ok(());
+        };
         self.client.trash(fid).await?;
         // 回读校验：优先父目录 list（句柄由 list/stat 铸出时父几乎必在
         // 缓存——反查索引）；冷句柄走 info（Trashed 标志/查无）。
@@ -632,6 +637,86 @@ impl StorageDriver for Pan123Driver {
 /// **占位身份绝不进生产**。
 pub async fn factory(params: &Pan123Params) -> Result<Arc<Pan123Driver>, StorageError> {
     Ok(Arc::new(Pan123Driver::connect(params.clone()).await?))
+}
+
+/// 探连接的结构化结果（doctor 腿；baidu `BackendProbe` / pan115
+/// `Pan115Probe` 同款形态）。
+///
+/// 探活 = `user/info`（token 活力 + uid + 空间 + vip）+ **尽力而为的
+/// traffic/check**（诊断面：失败降级 `None`，不让余量查询失败误报
+/// 连接不可达——D5 的余量透出面）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum Pan123Probe {
+    /// token 活力 + 空间/流量查询全过。
+    Alive {
+        /// 账号 uid（VolumeId 的 key）。
+        uid: String,
+        /// 可用空间（字节）。
+        free: u64,
+        /// 总空间（`None` = 未知）。
+        total: Option<u64>,
+        /// 每日下载流量余量（字节；`Some(0)` = 已超额；`None` = 查询
+        /// 失败/未知——doctor 降级显示）。
+        traffic_remain: Option<u64>,
+        /// 会员标志（VIP 消解流量上限——doctor 的会员指引面）。
+        vip: bool,
+    },
+    /// 需要重新授权（20101/401）：token 失效——web API 无 refresh
+    /// （K76.4），重扫码/重登是唯一出路。
+    NeedsReauth,
+    /// 网络/协议层不可达（超时、DNS、TLS、未映射码等）。
+    Unreachable {
+        /// 不含凭据的诊断文案。
+        detail: String,
+    },
+}
+
+/// 探连接（doctor 腿的直连探针）：connect（user/info 取 uid）→ 再取
+/// user_info 的空间/vip 面 + traffic/check 余量（尽力而为），把失败归一
+/// 为 [`Pan123Probe`]。
+pub async fn probe(params: &Pan123Params) -> Pan123Probe {
+    let driver = match Pan123Driver::connect(params.clone()).await {
+        Ok(driver) => driver,
+        Err(error) => return classify_probe_error(error),
+    };
+    // 空间/vip 面（user_info 是这些字段的真源——quota 的地基）。
+    let info = match driver.client().user_info().await {
+        Ok(info) => info,
+        Err(error) => return classify_probe_error(error),
+    };
+    // 流量余量：诊断面尽力而为（fid = 卷根 folder id——诊断无特定
+    // 文件；失败/超额形态归一为 None/Some(0)）。
+    let root_fid: i64 = params.root.parse().unwrap_or(0);
+    let traffic_remain = match driver.client().traffic_check(&[root_fid]).await {
+        Ok(status) if status.is_traffic_exceeded => Some(0),
+        Ok(status) => Some(status.original_remain_traffic.max(0) as u64),
+        Err(error) => {
+            tracing::warn!(
+                target: "ck_pan123::probe",
+                %error,
+                "traffic/check failed during the probe: the remain display degrades to unknown"
+            );
+            None
+        }
+    };
+    let total = info.space_permanent.max(0) as u64;
+    Pan123Probe::Alive {
+        uid: driver.volume().key().to_string(),
+        free: total.saturating_sub(info.space_used.max(0) as u64),
+        total: (total > 0).then_some(total),
+        traffic_remain,
+        vip: info.vip,
+    }
+}
+
+/// 探针错误分类（driven by StorageError 变体）。
+fn classify_probe_error(error: StorageError) -> Pan123Probe {
+    match error {
+        StorageError::Unauthorized { .. } => Pan123Probe::NeedsReauth,
+        other => Pan123Probe::Unreachable {
+            detail: format!("{other}"),
+        },
+    }
 }
 
 #[cfg(test)]

@@ -348,9 +348,12 @@ async fn cold_handle_delete_verifies_via_info() {
     assert_eq!(s.hits("/b/api/file/info"), 1);
 }
 
-/// 他卷句柄 → NotFound（trait 契约）；垃圾句柄 → Invalid。
+/// 他卷句柄 → NotFound（trait 契约）；垃圾句柄 → **幂等 Ok**（本卷
+/// 实体域全是数字 file_id——查无实体的极端形态归入 delete 的声明形态
+/// 恒定；123-4 conformance ④ 红灯修复：原 Invalid 破坏「delete 不存在
+/// → 幂等 Ok 恒定」的契约）。
 #[tokio::test]
-async fn delete_rejects_foreign_and_malformed_handles() {
+async fn delete_rejects_foreign_and_treats_malformed_as_missing() {
     let s = stub().await;
     let driver = s.driver();
     let foreign = cloudkit_storage::EntryId::new(
@@ -363,8 +366,10 @@ async fn delete_rejects_foreign_and_malformed_handles() {
         driver.volume().clone(),
         cloudkit_storage::BackendHandle::new("not-a-number"),
     );
-    let err = driver.delete(&bad).await.expect_err("malformed handle");
-    assert_eq!(err, StorageError::Invalid);
+    driver
+        .delete(&bad)
+        .await
+        .expect("malformed handle: the idempotent missing form (constant)");
 }
 
 // ----------------------------------------------------------- rename ---

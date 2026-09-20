@@ -70,6 +70,24 @@ pub enum QrPoll {
 /// 请求超时：30s（QR 三端点是轻查询；spike 同量级）。
 const REQUEST_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(30);
 
+/// 终端二维码渲染（Dense1x2 半块字符，两列一字符——横向补偿终端
+/// 字符的高宽比；ck-pan115 oauth 同款形态）。扫码 URL 即 123 App 的
+/// 登录确认页。
+///
+/// 错误只来自编码容量（URL 远低于 V1-L 容量上限，实践不可达）——
+/// 归一 `Invalid` 而非 panic（向导循环里可上抛）。
+pub fn render_qr_terminal(url: &str) -> Result<String, StorageError> {
+    use qrcode::render::unicode::Dense1x2;
+    use qrcode::QrCode;
+    let code = QrCode::with_error_correction_level(url, qrcode::EcLevel::L)
+        .map_err(|_e| StorageError::Invalid)?;
+    Ok(code
+        .render::<Dense1x2>()
+        .quiet_zone(true)
+        .module_dimensions(2, 1)
+        .build())
+}
+
 // ---------------------------------------------------------------------------
 // wire 请求（单次；错误归一 StorageError——R3：错误文本绝不携带凭据值）
 // ---------------------------------------------------------------------------

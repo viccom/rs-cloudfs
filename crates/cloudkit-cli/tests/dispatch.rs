@@ -721,3 +721,156 @@ async fn pan115_assembly_classifies_a_dead_token_pair() {
         "a dead token pair classifies as NeedsReauth, got {probe:?}"
     );
 }
+
+// ------------------------------------------------------------ pan123 -------
+
+/// A validate-clean pan123 config (placeholder token; the dispatch
+/// connects — tests point the bases at a loopback mock).
+fn pan123_config() -> CyDriveConfig {
+    CyDriveConfig {
+        backend: Backend::Pan123,
+        pan123_token: Some("stub-token-90d".to_string()),
+        pan123_root: Some("0".to_string()),
+        ..CyDriveConfig::default()
+    }
+}
+
+/// Loopback mock answering only `GET /b/api/user/info` (the connect leg);
+/// the pan123 envelope (`code==0` + PascalCase data fields).
+#[cfg(feature = "pan123")]
+async fn pan123_user_info_mock(dead: bool) -> String {
+    use axum::routing::get;
+    let app = if dead {
+        Router::new().route(
+            "/b/api/user/info",
+            get(|| async {
+                axum::Json(serde_json::json!({
+                    "code": 401, "message": "cookie token is empty", "data": {}
+                }))
+            }),
+        )
+    } else {
+        Router::new().route(
+            "/b/api/user/info",
+            get(|| async {
+                axum::Json(serde_json::json!({
+                    "code": 0, "message": "ok",
+                    "data": {
+                        "UID": 4006416717i64,
+                        "SpacePermanent": 2199023255552i64,
+                        "SpaceUsed": 1073741824i64,
+                        "Vip": false
+                    }
+                }))
+            }),
+        )
+    };
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0")
+        .await
+        .expect("bind mock");
+    let addr = listener.local_addr().expect("addr");
+    tokio::spawn(async move { axum::serve(listener, app).await.expect("serve") });
+    format!("http://{addr}")
+}
+
+/// Without the driver: the K31 rebuild message — not an assembly attempt.
+#[cfg(not(feature = "pan123"))]
+#[tokio::test]
+async fn missing_pan123_driver_refuses_with_the_rebuild_message() {
+    let err = match build_backend_transport(&pan123_config()).await {
+        Ok(_) => panic!("a driver-less binary cannot assemble the pan123 arm"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains(cloudkit_cli::PAN123_DRIVER_REQUIRED),
+        "the off-feature refusal is the K31 rebuild message: {message}"
+    );
+}
+
+/// With the driver: the dispatch connects (uid → `pan123:<uid>` — the
+/// real identity, never the `pan123:pending` placeholder), the capability
+/// face carries the driver bits (resume lit by the 123-4 conformance ⑦)
+/// plus `remote_delete`, and the sync namespace is the raw volume id.
+#[cfg(feature = "pan123")]
+#[tokio::test]
+async fn pan123_key_builds_pan123_transport_with_the_account_identity() {
+    use cloudkit_cli::BackendTransport;
+    let cfg = pan123_config();
+    cfg.validate().expect("the test config validates");
+    let base = pan123_user_info_mock(false).await;
+    let dispatched =
+        cloudkit_cli::build_pan123_transport_with_endpoints(&cfg, &base, &base, &base, None)
+            .await
+            .expect("the pan123 arm assembles against the mock");
+    assert!(matches!(dispatched, BackendTransport::Pan123(_)));
+    assert_eq!(
+        dispatched.volume(),
+        "pan123:4006416717",
+        "the volume identity is pan123:<uid> from user/info"
+    );
+    let caps = dispatched.caps();
+    assert!(caps.range_read && caps.multipart && caps.server_side_move);
+    assert!(caps.rapid_upload && caps.authoritative_index);
+    assert!(
+        caps.resume,
+        "resume is lit (123-4 conformance ⑦ diff-set verified)"
+    );
+    assert!(
+        caps.remote_delete,
+        "the transport face declares remote_delete"
+    );
+    // The sync namespace follows the baidu/pan115 shape: the raw volume id.
+    assert_eq!(dispatched.sync_namespace_key(), "pan123:4006416717");
+}
+
+/// A dead token on the assembly leg surfaces as a classified error
+/// (401 envelope → Unauthorized{recoverable:false} — the web API has no
+/// refresh, K76.4), not a panic — the doctor leg renders it into the
+/// re-scan guidance.
+#[cfg(feature = "pan123")]
+#[tokio::test]
+async fn pan123_assembly_classifies_a_dead_token() {
+    let base = pan123_user_info_mock(true).await;
+    let err = match cloudkit_cli::build_pan123_transport_with_endpoints(
+        &pan123_config(),
+        &base,
+        &base,
+        &base,
+        None,
+    )
+    .await
+    {
+        Ok(_) => panic!("a dead token must refuse the assembly"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("pan123"),
+        "the failure names the backend: {message}"
+    );
+    // The underlying classification is Unauthorized (probe renders the
+    // same leg) — pin the routed probe verdict.
+    let probe = pan123_dead_probe(&base).await;
+    assert!(
+        matches!(probe, ck_pan123::Pan123Probe::NeedsReauth),
+        "a dead token classifies as NeedsReauth, got {probe:?}"
+    );
+}
+
+#[cfg(feature = "pan123")]
+async fn pan123_dead_probe(base: &str) -> ck_pan123::Pan123Probe {
+    // The probe takes driver params directly (the seam shape of the
+    // pan115 leg): point them at the dead mock.
+    let params = ck_pan123::Pan123Params {
+        token: Some("stub-token-90d".to_string()),
+        root: "0".to_string(),
+        api_base: base.to_string(),
+        fallback_base: base.to_string(),
+        login_base: base.to_string(),
+        limiter: None,
+        retry: None,
+        sessions_dir: None,
+    };
+    ck_pan123::probe(&params).await
+}

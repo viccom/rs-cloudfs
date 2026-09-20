@@ -141,8 +141,14 @@ pub struct StubState {
     pub seq: Vec<String>,
     /// traffic/check 注入：isTrafficExceeded。
     pub traffic_exceeded: bool,
+    /// traffic/check 注入：错误码（None = 正常；probe 的余量降级用例
+    /// ——123-4 增补）。
+    pub traffic_check_code: Option<i64>,
     /// download_info 注入：错误码（0 = 正常）。
     pub download_info_code: i64,
+    /// user/info 注入：错误码（None = 正常；probe 分类用例——123-4
+    /// 增补）。
+    pub user_info_code: Option<i64>,
     /// trash 静默陷阱：载荷形状不恰当时 code=0 但不删（§5.11 建模）。
     pub trash_silent_trap: bool,
     /// mirror 死亡模式：404。
@@ -183,6 +189,16 @@ pub struct StubState {
     pub v2_size_skew: i64,
     /// /put 注入 5xx 次数（分片 PUT 幂等重试用例）。
     pub put_fail_times: u32,
+    /// /put 注入：**成功落地的分片数**达到该值后，后续 PUT 恒 5xx
+    /// （分片级差集用例——先落 N 片再断；0 = 关闭。pan115 桩
+    /// `fail_part_after` 同形态）。123-4 增补。
+    pub put_fail_after_parts: u32,
+    /// /put 成功落地的分片计数（`put_fail_after_parts` 的判据）。
+    pub put_ok_count: u32,
+    /// /put 累计收到的字节数（**conformance ⑦ 的观测点**——真正发给
+    /// presigned 接收端的字节；只增不减，与会话生命周期无关——完成
+    /// 消费后的会话行删除不影响计数）。123-4 增补。
+    pub put_bytes_total: u64,
 }
 
 impl StubState {
@@ -275,7 +291,16 @@ impl ApiStub {
     }
 
     pub fn driver_with_root(&self, root: &str) -> Pan123Driver {
-        Pan123Driver::new(Pan123Params {
+        Pan123Driver::new(self.params_with_root(root)).expect("stub driver")
+    }
+
+    /// 桩参数（probe 面用——与 driver() 同一注入面）。123-4 增补。
+    pub fn params(&self) -> Pan123Params {
+        self.params_with_root("0")
+    }
+
+    fn params_with_root(&self, root: &str) -> Pan123Params {
+        Pan123Params {
             token: Some("stub-token-0123456789".to_string()),
             root: root.to_string(),
             api_base: self.base.clone(),
@@ -284,8 +309,7 @@ impl ApiStub {
             limiter: Some(LimiterConfig::fast()),
             retry: Some(RetryConfig::fast()),
             sessions_dir: None,
-        })
-        .expect("stub driver")
+        }
     }
 
     pub fn hits(&self, path: &str) -> u32 {
@@ -324,6 +348,11 @@ impl ApiStub {
             .get(upload_id)
             .map(|s| s.parts.iter().map(|(n, d)| (*n, d.len())).collect())
             .unwrap_or_default()
+    }
+
+    /// /put 累计接收字节数（conformance ⑦ 差集观测点；只增不减）。
+    pub fn put_bytes_received(&self) -> u64 {
+        self.state.lock().unwrap().put_bytes_total
     }
 
     /// 在目录下建一个子目录（测试准备面；size 注入聚合值——驱动须报 0）。
@@ -488,6 +517,9 @@ async fn list_new(
 async fn user_info(State(state): State<Arc<Mutex<StubState>>>) -> Response {
     let mut st = state.lock().unwrap();
     count_hit(&mut st, "/b/api/user/info");
+    if let Some(code) = st.user_info_code {
+        return err_code(code, "injected");
+    }
     ok_json(json!({
         "UID": 4006416717i64,
         "SpacePermanent": 2199023255552i64,
@@ -700,6 +732,9 @@ async fn mod_pid(State(state): State<Arc<Mutex<StubState>>>, body: String) -> Re
 async fn traffic_check(State(state): State<Arc<Mutex<StubState>>>, body: String) -> Response {
     let mut st = state.lock().unwrap();
     count_hit(&mut st, "/b/api/file/download/traffic/check");
+    if let Some(code) = st.traffic_check_code {
+        return err_code(code, "injected");
+    }
     let Ok(v) = serde_json::from_str::<Value>(&body) else {
         return err_code(400, "bad json");
     };
@@ -1129,10 +1164,19 @@ async fn put_part(
         st.put_fail_times -= 1;
         return (StatusCode::INTERNAL_SERVER_ERROR, "injected part failure").into_response();
     }
+    if st.put_fail_after_parts > 0 && st.put_ok_count >= st.put_fail_after_parts {
+        return (
+            StatusCode::INTERNAL_SERVER_ERROR,
+            "injected part failure (after N parts)",
+        )
+            .into_response();
+    }
     let Some(session) = st.sessions.get_mut(&upload_id) else {
         return (StatusCode::NOT_FOUND, "no such upload session").into_response();
     };
     session.parts.insert(part, body.to_vec());
+    st.put_ok_count += 1;
+    st.put_bytes_total += body.len() as u64;
     let etag = md5_hex(&body);
     Response::builder()
         .status(StatusCode::OK)

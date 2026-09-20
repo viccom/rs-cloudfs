@@ -267,6 +267,8 @@ pub async fn run_setup_interactive(store: Option<&dyn CredentialStore>) -> Resul
         WizardBackend::Local => run_setup_local(),
         #[cfg(feature = "pan115")]
         WizardBackend::Pan115 => run_setup_pan115(store).await,
+        #[cfg(feature = "pan123")]
+        WizardBackend::Pan123 => run_setup_pan123(store).await,
     }
 }
 
@@ -282,6 +284,8 @@ enum WizardBackend {
     Local,
     #[cfg(feature = "pan115")]
     Pan115,
+    #[cfg(feature = "pan123")]
+    Pan123,
 }
 
 /// The backend menu entries: one per compiled-in driver, in boot order.
@@ -300,6 +304,11 @@ fn backend_menu() -> Vec<(WizardBackend, &'static str)> {
     choices.push((WizardBackend::Local, "local (a directory on this machine)"));
     #[cfg(feature = "pan115")]
     choices.push((WizardBackend::Pan115, "pan115 (QR scan via the 115 app)"));
+    #[cfg(feature = "pan123")]
+    choices.push((
+        WizardBackend::Pan123,
+        "pan123 (QR scan via the 123pan app, or passport + password)",
+    ));
     choices
 }
 
@@ -598,6 +607,158 @@ async fn run_setup_pan115(store: Option<&dyn CredentialStore>) -> Result<()> {
     Ok(())
 }
 
+/// Applies the pan123 wizard's outcome onto `cfg` (pure): flips
+/// `backend = "pan123"` LAST with the verified token in hand (the baidu
+/// strict-validate ruling — a half-configured instance must fail in
+/// validate with a naming-what's-missing message).
+pub fn apply_pan123_wizard(mut cfg: CyDriveConfig, token: &str) -> CyDriveConfig {
+    cfg.backend = cloudkit_core::config::Backend::Pan123;
+    cfg.pan123_token = Some(token.trim().to_string());
+    cfg
+}
+
+/// The pan123 branch of the wizard (Phase 6 / 123-4): two roads into the
+/// same 90-day token — QR scan (generate → terminal render → poll the
+/// loginStatus machine → code==200 confirmation) or passport + password
+/// sign_in. The token is verified once against `user/info` before
+/// anything is written. The web API has **no refresh** (K76.4): the
+/// wizard's store callback is only the first-save; when the token dies
+/// (~90 days), re-run the wizard.
+///
+/// The QR result endpoint answers immediately (unlike 115's ~30s
+/// long-poll), so the loop paces itself at ~2s.
+#[cfg(feature = "pan123")]
+async fn run_setup_pan123(store: Option<&dyn CredentialStore>) -> Result<()> {
+    use ck_pan123::oauth::{self, QrPoll};
+    use dialoguer::{Input, Password, Select};
+
+    println!("123 cloud-drive backend: scan a QR with the 123pan app, or sign in with");
+    println!("  passport + password. Either road yields one ~90-day token (the web API");
+    println!("  has no refresh: when it expires, re-run `cydrive setup`).");
+
+    let method = Select::new()
+        .with_prompt("Authorization method")
+        .items(["QR scan (the 123pan app)", "passport + password (sign_in)"])
+        .default(0)
+        .interact()
+        .context("asking for the auth method")?;
+
+    let http = ck_pan123::api::web_http_client(&ck_pan123::api::new_login_uuid())
+        .map_err(|e| anyhow::anyhow!("building the web-identity client: {e}"))?;
+
+    let token = if method == 0 {
+        // ---- QR road: generate → render → poll → (Expired: regenerate).
+        loop {
+            let session = oauth::qr_generate(&http, ck_pan123::DEFAULT_LOGIN_BASE)
+                .await
+                .context("requesting the QR code (login.123pan.com)")?;
+            let art = oauth::render_qr_terminal(&session.url).context("rendering the QR code")?;
+            println!();
+            println!("{art}");
+            println!("Scan with the 123pan app — or open: {}", session.url);
+            println!("(expired QRs regenerate in place)");
+
+            let mut hiccups = 0u32;
+            let confirmed = loop {
+                let verdict =
+                    oauth::qr_poll(&http, ck_pan123::DEFAULT_LOGIN_BASE, &session.uni_id).await;
+                match verdict {
+                    Ok(QrPoll::Waiting) => {
+                        hiccups = 0;
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    Ok(QrPoll::Scanned) => {
+                        hiccups = 0;
+                        println!("Scanned — confirm in the app...");
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                    Ok(QrPoll::Confirmed { token }) => break Some(token),
+                    Ok(QrPoll::Expired) => {
+                        println!("The QR expired — regenerating...");
+                        break None;
+                    }
+                    Ok(QrPoll::Refused) => anyhow::bail!(
+                        "refused in the 123pan app — nothing was written; re-run \
+                         `cydrive setup` to try again"
+                    ),
+                    Err(error) => {
+                        hiccups += 1;
+                        if hiccups >= 10 {
+                            anyhow::bail!(
+                                "poll transport failed {hiccups} times in a row ({error}) — \
+                                 check the network and re-run `cydrive setup`; nothing was \
+                                 written"
+                            );
+                        }
+                        tokio::time::sleep(std::time::Duration::from_secs(2)).await;
+                    }
+                }
+            };
+            if let Some(token) = confirmed {
+                break token;
+            }
+        }
+    } else {
+        // ---- sign_in road: passport + password (TLS 面内明文——R3：错误
+        //      文本绝不回显载荷；凭证只进请求，不进日志/落盘以外的面)。
+        let passport: String = Input::new()
+            .with_prompt("123pan passport (phone / email / username)")
+            .interact_text()
+            .context("reading the passport")?;
+        let password = Password::new()
+            .with_prompt("123pan password")
+            .with_confirmation("Confirm the password", "the entries differ")
+            .interact()
+            .context("reading the password")?;
+        oauth::sign_in(
+            &http,
+            ck_pan123::DEFAULT_API_BASE,
+            passport.trim(),
+            &password,
+            None,
+        )
+        .await
+        .map_err(|e| {
+            anyhow::anyhow!(
+                "sign_in failed: {e} — check the credentials; nothing \
+             was written"
+            )
+        })?
+    };
+
+    // ---- verify once against the live backend before anything is written.
+    println!("Verifying the token against 123pan (user/info)...");
+    let verify = async {
+        let client = ck_pan123::Pan123Client::new(
+            token.clone(),
+            ck_pan123::DEFAULT_API_BASE.to_string(),
+            ck_pan123::DEFAULT_FALLBACK_BASE.to_string(),
+            None,
+        )?;
+        client.user_info().await
+    };
+    let info = verify.await.context(
+        "the freshly obtained token failed verification — nothing was written; re-run \
+                  `cydrive setup`",
+    )?;
+    println!("Token verified — account uid {}.", info.uid);
+
+    let cfg = apply_pan123_wizard(CyDriveConfig::default(), &token);
+    persist_setup(&cfg, store)?;
+    println!(
+        "Configuration saved to ./config.toml (backend = pan123; the pan123_token key is in \
+         the file — K14 allows plaintext token keys there, keep it private)."
+    );
+    println!(
+        "Optionally set pan123_root to a folder id to scope the volume (0 = the whole account)."
+    );
+    println!(
+        "Run `cydrive doctor` to probe the token (it also shows the daily download traffic \
+         remain), or `cydrive run` to start."
+    );
+    Ok(())
+}
+
 /// The local branch of the wizard (Phase 2 / B3b): one absolute-path
 /// prompt (validated; the directory is created on first run by the
 /// driver factory — doctor probes writability on demand). No secrets.
@@ -734,6 +895,24 @@ mod pan115_wizard_tests {
         assert_eq!(cfg.pan115_client_id.as_deref(), Some("100197303"));
         assert_eq!(cfg.pan115_access_token.as_deref(), Some("acc"), "trimmed");
         assert_eq!(cfg.pan115_refresh_token.as_deref(), Some("ref"), "trimmed");
+        cfg.validate().expect("the wizard outcome validates");
+    }
+}
+
+#[cfg(all(test, feature = "pan123"))]
+mod pan123_wizard_tests {
+    use super::apply_pan123_wizard;
+    use cloudkit_core::config::{Backend, CyDriveConfig};
+
+    /// The strict-validate shape: the token lands (trimmed) and the
+    /// backend flips LAST (the baidu ruling) — a pan123 config from the
+    /// wizard always validates (root stays at its "0" default).
+    #[test]
+    fn apply_pan123_wizard_lands_a_validating_config() {
+        let cfg = apply_pan123_wizard(CyDriveConfig::default(), "  tok-90d  ");
+        assert_eq!(cfg.backend, Backend::Pan123);
+        assert_eq!(cfg.pan123_token.as_deref(), Some("tok-90d"), "trimmed");
+        assert_eq!(cfg.pan123_root, None, "root stays at the 0 default");
         cfg.validate().expect("the wizard outcome validates");
     }
 }

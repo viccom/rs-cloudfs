@@ -515,11 +515,34 @@ pub fn backend_checks(cfg: &cloudkit_core::config::CyDriveConfig) -> Vec<CheckRe
                 });
             }
         }
-        // Phase 6 / 123-1 placeholder: the pan123-specific doctor checks
-        // (token liveness via user/info, traffic-quota display, QR-scan
-        // setup guidance) are a 123-4 item; the pan123 keys' cross-field
-        // rules already run in the config validate pass doctor shares.
-        Backend::Pan123 => {}
+        // Phase 6 / 123-4: the pan123 offline checks — the K12 sync
+        // warning is a no-op today (pan123 participates in sync like
+        // baidu/pan115, kept for symmetry), and the D3 root note pairs
+        // with the recycle-bin semantics as the double safety net: an
+        // unset pan123_root maps the whole account through this volume.
+        Backend::Pan123 => {
+            if let Some(warning) = crate::local_sync_unsupported_warning(cfg) {
+                results.push(CheckResult {
+                    name: "sync".to_string(),
+                    status: CheckStatus::Warn,
+                    detail: warning.to_string(),
+                });
+            }
+            // D3 note: an unset pan123_root means the volume maps the
+            // whole account — deletions land in the 123 recycle bin
+            // (recoverable via the official client), but every path the
+            // account holds becomes visible through this volume.
+            if cfg.pan123_root.as_deref().unwrap_or("0") == "0" {
+                results.push(CheckResult {
+                    name: "pan123_root".to_string(),
+                    status: CheckStatus::Warn,
+                    detail: "pan123_root is unset: this volume maps the whole account \
+                             (set a folder id to scope it; deletes go to the 123 \
+                             recycle bin and recover via the official client)"
+                        .to_string(),
+                });
+            }
+        }
     }
     results
 }
@@ -939,6 +962,93 @@ pub fn pan115_connectivity_check(probe: &ck_pan115::Pan115Probe) -> CheckResult 
             name: "pan115_connectivity".to_string(),
             status: CheckStatus::Fail,
             detail: format!("could not reach 115: {detail}"),
+        },
+    }
+}
+
+/// 流量/空间字节的人话化（GiB/MiB 两档足够诊断面——123-0 实测日额
+/// ≈10GiB、空间 2TiB 量级）。
+#[cfg(feature = "pan123")]
+fn human_bytes(bytes: u64) -> String {
+    const GIB: u64 = 1024 * 1024 * 1024;
+    const MIB: u64 = 1024 * 1024;
+    if bytes >= GIB {
+        format!("{:.2} GiB", bytes as f64 / GIB as f64)
+    } else if bytes >= MIB {
+        format!("{:.1} MiB", bytes as f64 / MIB as f64)
+    } else {
+        format!("{bytes} bytes")
+    }
+}
+
+/// The pan123 connectivity leg (Phase 6 / 123-4): renders
+/// [`crate::pan123_backend_probe`]'s verdict into one check result.
+///
+/// The auth distinction is the load-bearing part: a dead token is **not**
+/// a transient failure — the web API has no refresh (K76.4), so
+/// `NeedsReauth` Fails with the re-scan / re-paste guidance. The Alive
+/// detail carries the **D5 traffic face**: the daily download remain
+/// human-readably, with the VIP guidance when the account is not a
+/// member (a 123pan VIP lifts the cap) and a Warn when the quota is
+/// exhausted (downloads will hard-fail `RateLimited` until it resets).
+/// Feature-gated with the driver (K30 pattern): a binary without
+/// `pan123` has no probe value to render.
+#[cfg(feature = "pan123")]
+pub fn pan123_connectivity_check(probe: &ck_pan123::Pan123Probe) -> CheckResult {
+    use ck_pan123::Pan123Probe;
+    match probe {
+        Pan123Probe::Alive {
+            uid,
+            free,
+            total,
+            traffic_remain,
+            vip,
+        } => {
+            let quota_detail = match total {
+                Some(total) => format!("{} of {} free", human_bytes(*free), human_bytes(*total)),
+                None => "space unknown".to_string(),
+            };
+            if *traffic_remain == Some(0) {
+                return CheckResult {
+                    name: "pan123_connectivity".to_string(),
+                    status: CheckStatus::Warn,
+                    detail: format!(
+                        "token alive for account {uid} ({quota_detail}); the daily download \
+                         traffic quota is EXHAUSTED — downloads fail until it resets (tomorrow); \
+                         a 123pan VIP subscription lifts the cap (D5: not bypassed)"
+                    ),
+                };
+            }
+            let traffic_detail = match traffic_remain {
+                Some(remain) => format!(
+                    "daily download traffic remaining: {}{}",
+                    human_bytes(*remain),
+                    if *vip {
+                        String::new()
+                    } else {
+                        " (a 123pan VIP lifts this cap)".to_string()
+                    }
+                ),
+                None => "daily download traffic: unknown (the check failed)".to_string(),
+            };
+            CheckResult {
+                name: "pan123_connectivity".to_string(),
+                status: CheckStatus::Ok,
+                detail: format!("token alive for account {uid} ({quota_detail}); {traffic_detail}"),
+            }
+        }
+        Pan123Probe::NeedsReauth => CheckResult {
+            name: "pan123_connectivity".to_string(),
+            status: CheckStatus::Fail,
+            detail: "the pan123 token is no longer accepted (the web API has no refresh — \
+                     it lives ~90 days): re-run the QR scan / sign_in in `cydrive setup`, or \
+                     paste a fresh pan123_token value into the volume config"
+                .to_string(),
+        },
+        Pan123Probe::Unreachable { detail } => CheckResult {
+            name: "pan123_connectivity".to_string(),
+            status: CheckStatus::Fail,
+            detail: format!("could not reach 123pan: {detail}"),
         },
     }
 }

@@ -671,6 +671,7 @@ dependencies = [
  "futures-core",
  "futures-util",
  "md-5",
+ "qrcode",
  "reqwest",
  "serde",
  "serde_json",

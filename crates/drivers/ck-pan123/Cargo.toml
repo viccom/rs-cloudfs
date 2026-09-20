@@ -33,6 +33,12 @@ reqwest = { version = "0.12", default-features = false, features = [
 # ByteStream 产生侧（download.rs 的窗口流实现 futures_core::Stream；
 # ck-baidu/ck-pan115 同款依赖面）。
 futures-core = "0.3"
+# transport 面（transport_face.rs）的 SyncStream 适配与流消费
+# （StreamExt::next / stream::iter——ck-pan115 同款依赖面；123-4 接线）。
+futures-util = { version = "0.3", default-features = false }
+# setup 向导的终端二维码渲染（纯 Rust；ck-pan115 oauth 同 crate 的
+# 0.13 线——Dense1x2 半块字符形态适合终端；123-4 setup 装配面）。
+qrcode = { version = "0.13", default-features = false }
 # CDN 窗口流的帧类型。
 bytes = "1"
 # 载荷模型（envelope/QR/sign_in 响应结构体）。
