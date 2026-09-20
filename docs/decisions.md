@@ -791,3 +791,12 @@ Phase 5 五批次全落地（worktree `feat/pan115-driver`，`0b53c14`→`32060b
 - **K75.3 一行级批**：open_writer 幂等 create_dir_all（防御）；setup_http_client 补 IPv4 绑定（K18 对齐——向导与驱动在 IPv6-preferring 网络行为一致）；conformance 临时目录 tempfile 化（H-T1 同族）；doctor 两臂 22/18 连续字面空格改 `\` 续行 + `_cfg_marker`/`let _ = &mut st` debris 清除。
 - **K75.4 裁决不修（查证支撑，非省事）**：①OSS status=0 不进 retryable——`upload_queue::decide_retry` 对任何错误按退避梯重试，标签不影响行为；②多卷 limiter 相加——4rps 实测余量足够，跨卷共享的结构改动不买行为；③callback 响应体丢弃——resolve_new_row 兜底；④桩面三条——分别有真机未现/双覆盖/纯函数钉；⑤真 kill 形态——K75.2 已消解主危害；⑥https-loopback——无消费方；⑦lib.rs:6836 WebClient hint 空格——非 pan115 面。
 - **K75.5 验证**：ck-pan115 78/0（+2 红→绿用例）；workspace 全量/clippy/fmt/layers/secrets 五门禁绿（数字见 AGENTS）。回滚随分支。
+
+## 2026-09-20 K76：Phase 6 pan123 增补研究 + D5 拍板——web 身份合规路线；端点代际警示（123panNextGen 深读）
+
+- **K76.1 研究形态**：负责人指令在实施 Phase 6 前深度研究 `E:\GitHub\123panNextGen`（第三方 123 桌面客户端，PySide6/GPLv3，~21k 行，最后提交 2026-09-17，活过 2026-08-29 端点重组）。三路 Explore 子代理（协议层/传输层/文件操作面）+ 主会话综合，零代码改动；情报全文 = pan123 计划附录 A.4。
+- **K76.2 D5 拍板（负责人 2026-09-20，承接 K64-D1）**：客户端身份与流量姿态 = **web 身份合规路线**——认证照 pan123-rs web 形态；**不采纳**安卓协议模拟（platform:android 设备指纹族）与 URL 重写流量绕过链（5113/5114 软处理 + web-pro2 代理 + auto_redirect=0；完整证据链留档计划附录 A.4 备未来姿态变化，当前不进任何代码）；5113/5114 → `RateLimited` 硬错误 + 人话指引，维持会员消解路径。
+- **K76.3 端点代际发现（对 K64 前提的修订）**：123 服务端 2026-08-29 端点大重组（前缀即代际：list 无前缀、trash/rename/建目录/download_info 走 `/a/api/`、upload 族/delete/traffic 走 `/b/api/`）+ 主域迁 `www.123pan.cn`（`api.123278.com` 降级为粘性 fallback）→ **pan123-rs（2026-06-26）线形态部分过时**；123-0 spike 首组验证改为现行形态复验（计划 §3.1 代际警示表）。附加 spike 项：info 端点存活性、签名要求是否放松（123panNextGen 全程无签名）、duplicate 1 vs 2 覆盖语义真机钉死（两参照注释矛盾，D4 框架内）。
+- **K76.4 token 无 refresh 实证**：123 web API 无刷新端点（123panNextGen 同样只能凭密码重登）——pan123 错误映射修订：token 失效 → `Unauthorized{recoverable:false}` + 重扫码可行动指引（原「重登/刷新一次」不成立，也不为此扩密码凭据面）。
+- **K76.5 稳定/性能采纳面**（入计划 §5.10–17）：envelope 双成功码（code==0/200）与字段双拼解析、trash 最小 payload 静默失败陷阱（`code=0` 但不删——数据完整性级，回读校验 + 逐端点键名保真）、传输/API 双会话分离（presigned PUT 无 123pan 头）、上传七步严格序（`upload_complete` 漏掉 = 文件不入库；>64MB sleep 3s）、dlink 一次性纪律 + CDN JSON 重定向体、Retry-After 优先退避常量、时间双态解析、粘性域名 fallback。**漂移监控哨**：以 123panNextGen 仓库提交流为前哨警报源（§7 风险表）。
+- **K76.6 落档**：pan123 计划（头部/§0.1/§3/§3.1/§5/§6/§7/§8/附录 A.4）+ 跟踪单（123-0 行改写/研究表/批次日志/风险节）。Phase 7 webdav 计划原拟占用的 K76/K77 编号顺延为 K77/K78（webdav 未批准未落 decisions，无实际冲突）。
