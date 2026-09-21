@@ -29,7 +29,6 @@ use crate::urls::percent_decode_lossy;
 /// 一条展平的 prop 观察：所属 href、propstat 状态行、prop 名、文本
 /// 内容、`resourcetype` 是否带 `collection` 子元素。
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // WD1a 骨架：WD2 读路径消费
 pub(crate) struct PropRow {
     pub href: String,
     pub propstat_status: Option<String>,
@@ -39,18 +38,22 @@ pub(crate) struct PropRow {
 }
 
 /// 一个 PROPFIND response 条目在驱动需要字段上的投影。
+///
+/// `quota_*` 两字段是 RFC 4331 quota 点名的承载（WD2b quota 面）：内层
+/// 404 propstat 的行不进投影（[`entries`] 的过滤纪律）→ `None` 即驱动
+/// 的「降级到未知」信号。
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // WD1a 骨架：WD2 stat/list 投影消费
 pub(crate) struct PropfindEntry {
     pub href: String,
     pub is_collection: bool,
     pub content_length: Option<u64>,
     pub last_modified: Option<String>,
+    pub quota_used_bytes: Option<u64>,
+    pub quota_available_bytes: Option<u64>,
 }
 
 /// 元素限定名 → local name（最后一个 `:` 之后；无前缀原样——
 /// 多段式前缀也不可混淆判定）。
-#[allow(dead_code)] // WD1a 骨架：parse_multistatus 内部面（测试直达）
 fn local_name(qname: QName<'_>) -> String {
     let raw = String::from_utf8_lossy(qname.as_ref());
     match raw.rsplit_once(':') {
@@ -63,7 +66,6 @@ fn local_name(qname: QName<'_>) -> String {
 ///
 /// 实体反转义失败（非法实体）原样保留——宽收：怪名走
 /// [`is_addressable_name`] 与驱动面兜底，不在解析层硬失败。
-#[allow(dead_code)] // WD1a 骨架：同上
 fn decode_href(raw: &str) -> String {
     let unescaped = match unescape(raw) {
         Ok(cow) => cow.into_owned(),
@@ -73,7 +75,6 @@ fn decode_href(raw: &str) -> String {
 }
 
 /// prop 行是否可采信：propstat 状态行缺失（裸 prop 形态）或 2xx。
-#[allow(dead_code)] // WD1a 骨架：entries 的过滤面
 fn row_is_authoritative(row: &PropRow) -> bool {
     row.propstat_status
         .as_deref()
@@ -85,7 +86,6 @@ fn row_is_authoritative(row: &PropRow) -> bool {
 
 /// Text/CData 的公共下沉（三个汇聚槽：href / status / 当前 prop 文本）。
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // WD1a 骨架：parse_multistatus 内部面
 fn sink_text(
     chunk: &str,
     href_sinking: bool,
@@ -107,9 +107,12 @@ fn sink_text(
 /// 207 multistatus 体 → 展平 prop 行（非 multistatus 体产出空集；
 /// quick-xml 错误转 `String` 载荷）。
 ///
-/// href 在 `</href>` 收尾时经 [`decode_href`] 解码（增强 ①）——
-/// `PropRow::href` 与 [`PropfindEntry::href`] 均为**解码后**形态。
-#[allow(dead_code)] // WD1a 骨架：WD2 的 PROPFIND 动词消费
+/// **截断检测（WD2b 增强，桩 malformed_multistatus 旋钮的行为面）**：
+/// quick-xml 对无闭合的截断文档在 Eof 处温和收尾（不报错）——纯解析
+/// 会把半份 multistatus 当空集/半集吞掉（「不崩不静默」的静默半边）。
+/// 此处在 Eof 上检查元素栈非空 → `Err`（截断即失败，片段进 `Io` 载荷
+/// 由调用方带上）。良构的非 multistatus 体（如 HTML 错误页）栈在 Eof
+/// 时为空 → 维持「空集宽收」的既有契约（WD1a 测试钉死，零漂移）。
 pub(crate) fn parse_multistatus(xml: &str) -> Result<Vec<PropRow>, String> {
     let mut reader = Reader::from_str(xml);
     let mut stack: Vec<String> = Vec::new();
@@ -213,6 +216,14 @@ pub(crate) fn parse_multistatus(xml: &str) -> Result<Vec<PropRow>, String> {
         }
     }
 
+    // 截断检测（见函数文档）：Eof 时栈非空 = 有未闭合元素。
+    if let Some(unclosed) = stack.last() {
+        return Err(format!(
+            "truncated multistatus body: <{unclosed}> is never closed ({} open elements)",
+            stack.len()
+        ));
+    }
+
     Ok(raw
         .into_iter()
         .map(|(href, ordinal, prop, text, collection_child)| PropRow {
@@ -227,7 +238,9 @@ pub(crate) fn parse_multistatus(xml: &str) -> Result<Vec<PropRow>, String> {
 
 /// prop 行 → 每响应 href 一条目（首见序；增强 ②：非 2xx propstat 行
 /// 不进投影——内层 404 的 prop 不覆盖 200 块的真值）。
-#[allow(dead_code)] // WD1a 骨架：WD2 stat/list 投影消费
+///
+/// href 在 `</href>` 收尾时经 [`decode_href`] 解码（增强 ①）——
+/// `PropRow::href` 与 [`PropfindEntry::href`] 均为**解码后**形态。
 pub(crate) fn entries(rows: &[PropRow]) -> Vec<PropfindEntry> {
     let mut out: Vec<PropfindEntry> = Vec::new();
     for row in rows.iter().filter(|row| row_is_authoritative(row)) {
@@ -239,6 +252,8 @@ pub(crate) fn entries(rows: &[PropRow]) -> Vec<PropfindEntry> {
                     is_collection: false,
                     content_length: None,
                     last_modified: None,
+                    quota_used_bytes: None,
+                    quota_available_bytes: None,
                 });
                 out.len() - 1
             }
@@ -252,6 +267,12 @@ pub(crate) fn entries(rows: &[PropRow]) -> Vec<PropfindEntry> {
         }
         if row.prop == "getlastmodified" && !row.text.is_empty() {
             entry.last_modified = Some(row.text.clone());
+        }
+        if row.prop == "quota-used-bytes" {
+            entry.quota_used_bytes = row.text.parse().ok();
+        }
+        if row.prop == "quota-available-bytes" {
+            entry.quota_available_bytes = row.text.parse().ok();
         }
     }
     out

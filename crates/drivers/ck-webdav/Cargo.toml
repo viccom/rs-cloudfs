@@ -52,5 +52,14 @@ tokio = { version = "1", features = ["rt", "io-util", "sync", "time", "fs"] }
 tracing = "0.1"
 
 [dev-dependencies]
-# 纯函数层单测里 async 契约面的 #[tokio::test]（rt/macros）。
-tokio = { version = "1", features = ["rt", "macros"] }
+# 手搓注入桩的进程内服务端（WD2a；axum 钉 0.8.9，ck-pan115 桩同款先例。
+# 只需 http1+tokio——桩不走 json/query 提取器，verbs 经 fallback 单点分发）。
+axum = { version = "=0.8.9", default-features = false, features = [
+    "http1",
+    "tokio",
+] }
+# 桩监听（net）+ #[tokio::test]（rt/macros）。
+tokio = { version = "1", features = ["rt", "macros", "net"] }
+# 桩侧 Basic 凭据校验 + Digest nonce 的 base64 形态（真机 nonce 含 =/+
+# 字符——矩阵⑨；0.22 已在 lock：ck-pan115 运行时依赖同线）。
+base64 = "0.22"

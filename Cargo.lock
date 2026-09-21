@@ -720,6 +720,8 @@ name = "ck-webdav"
 version = "0.10.0"
 dependencies = [
  "async-trait",
+ "axum",
+ "base64 0.22.1",
  "bytes",
  "cloudkit-storage",
  "futures-core",

@@ -25,7 +25,6 @@ use rand::Rng;
 ///
 /// 参数顺序无关（附录 C ⑨：stale=true 实测出现在 algorithm 之后）。
 #[derive(Debug, Clone, PartialEq, Eq)]
-#[allow(dead_code)] // WD1a 骨架：WD2 的 401 重放路径构造
 pub(crate) struct Challenge {
     pub realm: String,
     pub nonce: String,
@@ -51,7 +50,6 @@ pub(crate) struct DigestSession {
 
 impl DigestSession {
     /// 从 challenge 建会话（nc 归零起步）。
-    #[allow(dead_code)] // WD1a 骨架：WD2 协商接线
     pub(crate) fn from_challenge(challenge: &Challenge) -> Self {
         DigestSession {
             realm: challenge.realm.clone(),
@@ -67,7 +65,6 @@ impl DigestSession {
 /// 驱动侧认证协商状态（D1 语义见模块文档；WD2 在 client.rs 的 401
 /// 重放路径里驱动这个状态机）。
 #[derive(Debug, Clone)]
-#[allow(dead_code)] // WD1a 骨架：BasicReady/Digest 臂在 WD2 协商接线构造
 pub(crate) enum AuthState {
     /// 未协商（首请求形态）。
     None,
@@ -81,7 +78,6 @@ pub(crate) enum AuthState {
 /// `qop="auth,auth-int"` 的天真 split 会碎成 `qop="auth` + `auth-int"`；
 /// 反斜杠转义感知）。
 // WD1a 骨架：经 parse_challenge 仅供测试直达——WD2 全链路接线
-#[allow(dead_code)]
 fn split_params(input: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
@@ -118,7 +114,6 @@ fn split_params(input: &str) -> Vec<String> {
 
 /// 去包裹引号（`"value"` → `value`；无引号原样）。
 // WD1a 骨架：同上（split_params 的配套）
-#[allow(dead_code)]
 fn unquote(value: &str) -> String {
     let value = value.trim();
     if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
@@ -133,7 +128,6 @@ fn unquote(value: &str) -> String {
 ///
 /// - realm/nonce 缺一不可；
 /// - algorithm 非 MD5（含 SHA-256、MD5-sess）→ 拒（只支持 MD5）。
-#[allow(dead_code)] // WD1a 骨架：WD2 的 401 处理消费
 pub(crate) fn parse_challenge(header: &str) -> Result<Challenge, String> {
     let header = header.trim();
     let (scheme, rest) = header
@@ -185,7 +179,6 @@ pub(crate) fn parse_challenge(header: &str) -> Result<Challenge, String> {
 }
 
 // WD1a 骨架：经 response_md5 仅供测试直达——WD2 接线
-#[allow(dead_code)]
 fn md5_hex(input: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(input.as_bytes());
@@ -199,7 +192,6 @@ fn md5_hex(input: &str) -> String {
 /// RFC 7616 MD5 `response`（qop 提供时走 qop=auth 形态，否则 RFC 2069
 /// 兼容形态）。
 #[allow(clippy::too_many_arguments)]
-#[allow(dead_code)] // WD1a 骨架：WD2 的 Authorization 构造消费
 pub(crate) fn response_md5(
     user: &str,
     pass: &str,
@@ -220,7 +212,6 @@ pub(crate) fn response_md5(
 }
 
 /// 随机 16 hex 字符 cnonce。
-#[allow(dead_code)] // WD1a 骨架：WD2 的签名路径消费
 pub(crate) fn rand_cnonce() -> String {
     let mut bytes = [0u8; 8];
     rand::rng().fill_bytes(&mut bytes);
@@ -229,7 +220,6 @@ pub(crate) fn rand_cnonce() -> String {
 
 /// 从会话构造 `Authorization` 头值（以 `session.nc` 签名——调用方先
 /// 递增；challenge 给了 qop 列表时取首 token）。
-#[allow(dead_code)] // WD1a 骨架：WD2 的签名路径消费
 pub(crate) fn authorization_header(
     user: &str,
     pass: &str,

@@ -916,8 +916,9 @@ async fn missing_webdav_driver_refuses_with_the_rebuild_message() {
 /// With the driver: the dispatch assembles the WebdavTransport offline
 /// (D6 — no server, no network), the volume identity is
 /// `webdav:<user>@<base-url>` with the trailing slash the WD1a config
-/// layer normalises in, the capability face is the WD1a placeholder
-/// (all-false until WD2 mirrors the driver bits), and the sync
+/// layer normalises in, the capability face mirrors the StorageDriver
+/// bits (WD2b wiring — range_read/server_side_move/authoritative_index/
+/// remote_delete true, resume/multipart false), and the sync
 /// namespace is the raw volume id (the pan115/pan123 shape).
 #[cfg(feature = "webdav")]
 #[tokio::test]
@@ -936,13 +937,18 @@ async fn webdav_key_builds_webdav_transport_offline() {
     );
     let caps = dispatched.caps();
     assert!(
-        !caps.range_read
-            && !caps.server_side_move
-            && !caps.authoritative_index
-            && !caps.remote_delete
-            && !caps.resume,
-        "WD1a placeholder: the transport face is all-false until WD2 wires \
-         the verb faces (got {caps:?})"
+        caps.range_read
+            && caps.server_side_move
+            && caps.authoritative_index
+            && caps.remote_delete
+            && !caps.resume
+            && !caps.multipart
+            && !caps.change_feed
+            && !caps.inbound
+            && !caps.chat
+            && !caps.rapid_upload,
+        "WD2b: the transport face mirrors the StorageDriver capability bits \
+         (got {caps:?})"
     );
     assert_eq!(
         dispatched.sync_namespace_key(),

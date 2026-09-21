@@ -62,7 +62,7 @@ pub async fn factory(cfg: &WebdavParams) -> Result<Arc<WebdavDriver>, StorageErr
 #[allow(clippy::err_expect)]
 mod tests {
     use super::*;
-    use cloudkit_storage::{Page, PageCursor, RelPath, StorageDriver, VolumeId};
+    use cloudkit_storage::{RelPath, StorageDriver, VolumeId};
     use std::collections::HashMap;
 
     fn map(pairs: &[(&str, &str)]) -> HashMap<String, String> {
@@ -771,35 +771,261 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn driver_verb_faces_are_explicit_placeholders() {
-        // WD1a 契约面：动词面接线前一律 Unsupported（绝不 panic /
-        // unimplemented）——WD2/WD3 接线后本断言随批移除。
+    async fn driver_offline_construction_survives_wd2b_wiring() {
+        // WD1a 的「动词面占位恒 Unsupported」断言随 WD2b 读面接线移除
+        //（其文档注明的生命周期）——行为面由 tests/read_path.rs 的桩
+        // 套件接管；本测试只钉「构造仍不碰网络」。
         let driver = WebdavDriver::new(params()).expect("driver");
-        assert!(matches!(
-            driver
-                .list(
-                    &RelPath::root(),
-                    Page {
-                        cursor: PageCursor::Start,
-                        limit: 10,
-                    }
-                )
-                .await,
-            Err(StorageError::Unsupported)
-        ));
-        assert!(matches!(
-            driver.stat(&RelPath::root()).await,
-            Err(StorageError::Unsupported)
-        ));
+        assert_eq!(
+            driver.volume().as_str(),
+            "webdav:spike@https://nas.lan:5006/dav/"
+        );
     }
 
-    #[tokio::test]
-    async fn driver_quota_degrades_to_unknown_total() {
-        // 附录 C ⑪：RFC 4331 双 fixture 均内层 404——`total = None` 是
-        // 实证常态（WD2 起 best-effort 探测，失败同形态降级）。
-        let driver = WebdavDriver::new(params()).expect("driver");
-        let quota = driver.quota().await.expect("quota degrades, not fails");
-        assert_eq!(quota.total, None);
-        assert_eq!(quota.used, 0);
+    // ---------------------------------------------------- client 面 ---
+    // WD2b 纯函数层（重试白名单/退避档/片段截断/Content-Range 解析/
+    // 可行动文案）——桩面行为由 tests/connect_auth.rs 钉死，这里钉数学
+    // 与字面。
+
+    #[test]
+    fn client_retry_whitelist_covers_only_idempotent_verbs() {
+        // §4.5-10：PUT/MOVE/MKCOL/DELETE/PROPPATCH 非幂等，永不自动重试。
+        for verb in ["GET", "HEAD", "PROPFIND", "OPTIONS"] {
+            assert!(
+                crate::client::verb_is_retryable(verb),
+                "{verb} is idempotent and retryable"
+            );
+        }
+        for verb in ["PUT", "MOVE", "MKCOL", "DELETE", "PROPPATCH"] {
+            assert!(
+                !crate::client::verb_is_retryable(verb),
+                "{verb} is NOT auto-retryable (non-idempotent)"
+            );
+        }
+    }
+
+    #[test]
+    fn client_backoff_is_exponential_and_capped() {
+        use std::time::Duration;
+        // 500ms → 1s → 2s → 4s … 封顶 30s。
+        assert_eq!(
+            crate::client::backoff_delay(1, None),
+            Duration::from_millis(500)
+        );
+        assert_eq!(
+            crate::client::backoff_delay(2, None),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            crate::client::backoff_delay(3, None),
+            Duration::from_secs(2)
+        );
+        assert_eq!(
+            crate::client::backoff_delay(9, None),
+            Duration::from_secs(30),
+            "capped at 30s"
+        );
+    }
+
+    #[test]
+    fn client_retry_after_takes_priority_and_clamps_one_to_sixty() {
+        use std::time::Duration;
+        // K79.3：服务端明示的节奏优先；0 → 1s（防空转）、999 → 60s
+        //（防勒索性长眠）。
+        assert_eq!(
+            crate::client::backoff_delay(1, Some(0)),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            crate::client::backoff_delay(1, Some(7)),
+            Duration::from_secs(7)
+        );
+        assert_eq!(
+            crate::client::backoff_delay(1, Some(999)),
+            Duration::from_secs(60)
+        );
+    }
+
+    #[test]
+    fn client_snippet_truncates_at_two_hundred_bytes_on_char_boundaries() {
+        let tiny = "short body";
+        assert_eq!(crate::client::snippet(tiny), tiny);
+        let long = "x".repeat(500);
+        let cut = crate::client::snippet(&long);
+        let body = cut.strip_suffix('…').expect("truncation marker");
+        assert_eq!(body.len(), 200, "body capped at 200 bytes");
+        // 多字节字符不劈开（char boundary 回退：ü = 2 字节 → 100 字符）。
+        let unicode = "ü".repeat(150); // 300 字节
+        let cut = crate::client::snippet(&unicode);
+        let body = cut.strip_suffix('…').expect("truncation marker");
+        assert_eq!(body.chars().count(), 100);
+        assert!(body.chars().all(|c| c == 'ü'));
+    }
+
+    #[test]
+    fn client_content_range_parsing_covers_the_real_shapes() {
+        // 矩阵④真形：`bytes 10-19/100`、钳制 `bytes 90-99/100`。
+        assert_eq!(
+            crate::client::parse_content_range("bytes 10-19/100"),
+            Some((10, 19, Some(100)))
+        );
+        assert_eq!(
+            crate::client::parse_content_range(" bytes 90-99/100 "),
+            Some((90, 99, Some(100)))
+        );
+        assert_eq!(
+            crate::client::parse_content_range("bytes 0-0/*"),
+            Some((0, 0, None))
+        );
+        // 416 形态 `bytes */100` 与垃圾输入不解析（None = mismatch 路径）。
+        assert_eq!(crate::client::parse_content_range("bytes */100"), None);
+        assert_eq!(crate::client::parse_content_range("garbage"), None);
+    }
+
+    #[test]
+    fn client_unauthorized_messages_are_actionable() {
+        // R3 双通道：`Unauthorized{false}` 无载荷——文案住 warn 通道，
+        // 字面在此钉死（键名/方案名/出路必须齐全）。
+        let missing = crate::client::message_missing_credentials();
+        assert!(
+            missing.contains("webdav_username") && missing.contains("webdav_password"),
+            "{missing}"
+        );
+        let ntlm = crate::client::message_unsupported_scheme("ntlm");
+        assert!(
+            ntlm.contains("ntlm") && ntlm.contains("Digest"),
+            "scheme named + a way out: {ntlm}"
+        );
+        let rejected = crate::client::message_credentials_rejected();
+        assert!(
+            rejected.contains("webdav_username") && rejected.contains("verify"),
+            "{rejected}"
+        );
+        let basic = crate::client::message_basic_mode_refused(&[
+            r#"Digest realm="webdavtest", nonce="abc+=""#.to_string(),
+        ]);
+        assert!(
+            basic.contains("webdav_auth=basic") && basic.contains("digest"),
+            "names the mode and the way out: {basic}"
+        );
+    }
+
+    // ------------------------------------------------------ xml 面（WD2b）---
+
+    #[test]
+    fn xml_truncated_multistatus_is_an_error_not_a_silent_empty_set() {
+        // 桩 malformed_multistatus 旋钮的形态：207 + 无闭合截断——纯解析
+        // 不吞（quick-xml 在 Eof 温和收尾，截断检测在这里补位）。
+        let truncated = concat!(
+            r#"<?xml version="1.0" encoding="utf-8"?>"#,
+            r#"<D:multistatus xmlns:D="DAV:"><D:response><D:href>/trunc"#
+        );
+        let error = crate::xml::parse_multistatus(truncated)
+            .err()
+            .expect("truncation must fail");
+        assert!(error.contains("truncated"), "{error}");
+        // 良构的非 multistatus 体维持「空集宽收」（WD1a 契约零漂移）。
+        assert!(
+            crate::xml::parse_multistatus("<html><body>404</body></html>")
+                .expect("lenient")
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn xml_quota_props_project_only_from_2xx_propstats() {
+        // RFC 4331：2xx 块给出真值。
+        let body = concat!(
+            r#"<?xml version="1.0" encoding="utf-8"?>"#,
+            r#"<D:multistatus xmlns:D="DAV:">"#,
+            r#"<D:response><D:href>/</D:href>"#,
+            r#"<D:propstat><D:prop><D:quota-used-bytes>4096</D:quota-used-bytes>"#,
+            r#"<D:quota-available-bytes>1048576</D:quota-available-bytes></D:prop>"#,
+            r#"<D:status>HTTP/1.1 200 OK</D:status></D:propstat>"#,
+            r#"</D:response></D:multistatus>"#,
+        );
+        let entries = crate::xml::entries(&crate::xml::parse_multistatus(body).expect("parses"));
+        assert_eq!(entries[0].quota_used_bytes, Some(4096));
+        assert_eq!(entries[0].quota_available_bytes, Some(1_048_576));
+
+        // 真机/桩形态（矩阵⑪）：主体 props 在 200 块、quota props 在内层
+        // 404 块——条目在（200 块产出），quota 字段 None（404 行不进投
+        // 影）——驱动 quota 面的降级信号。
+        let inner404 = concat!(
+            r#"<?xml version="1.0" encoding="utf-8"?>"#,
+            r#"<D:multistatus xmlns:D="DAV:">"#,
+            r#"<D:response><D:href>/</D:href>"#,
+            r#"<D:propstat><D:prop><D:resourcetype><D:collection/></D:resourcetype>"#,
+            r#"</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat>"#,
+            r#"<D:propstat><D:prop><D:quota-used-bytes/><D:quota-available-bytes/></D:prop>"#,
+            r#"<D:status>HTTP/1.1 404 Not Found</D:status></D:propstat>"#,
+            r#"</D:response></D:multistatus>"#,
+        );
+        let entries =
+            crate::xml::entries(&crate::xml::parse_multistatus(inner404).expect("parses"));
+        assert_eq!(entries.len(), 1, "the 200 block still yields the entry");
+        assert!(entries[0].is_collection);
+        assert_eq!(entries[0].quota_used_bytes, None);
+        assert_eq!(entries[0].quota_available_bytes, None);
+
+        // 全 404 块（无任何 2xx 行）：不产出条目——「成员按成员映射」的
+        // 缺席形态（调用方视作降级/NotFound 的判据）。
+        let all404 = concat!(
+            r#"<?xml version="1.0" encoding="utf-8"?>"#,
+            r#"<D:multistatus xmlns:D="DAV:">"#,
+            r#"<D:response><D:href>/</D:href>"#,
+            r#"<D:propstat><D:prop><D:quota-used-bytes/></D:prop>"#,
+            r#"<D:status>HTTP/1.1 404 Not Found</D:status></D:propstat>"#,
+            r#"</D:response></D:multistatus>"#,
+        );
+        let entries = crate::xml::entries(&crate::xml::parse_multistatus(all404).expect("parses"));
+        assert!(
+            entries.is_empty(),
+            "a member with only non-2xx blocks vanishes"
+        );
+    }
+
+    // ----------------------------------------------------- driver 面 ---
+
+    #[test]
+    fn driver_staging_artifact_double_condition() {
+        // §4.6/断言③：`.ckwd-` 且 .part/.old 结尾才是驱动残件（单条件
+        // 误伤用户合法名）。
+        assert!(crate::driver::is_staging_artifact(
+            "report.bin.ckwd-4242-7.part"
+        ));
+        assert!(crate::driver::is_staging_artifact(
+            "report.bin.ckwd-4242-7.old"
+        ));
+        assert!(!crate::driver::is_staging_artifact("notes.ckwd-diary.txt"));
+        assert!(!crate::driver::is_staging_artifact("keep.part"));
+        assert!(!crate::driver::is_staging_artifact("keep.old"));
+    }
+
+    #[test]
+    fn driver_entry_projection_defaults_bad_mtime_to_zero() {
+        // §4.5-5：坏 mtime → debug 留痕 + 0.0（绝不静默 epoch——「不静
+        // 默」的一半是日志，另一半是这里钉住的可控行为）。桩无法注入
+        // 坏 mtime（恒发 IMF-fixdate 真形），纯函数面钉死。
+        let volume = VolumeId::new("webdav", "t").expect("volume");
+        let rel = RelPath::new("f.txt").expect("rel");
+        let pe = crate::xml::PropfindEntry {
+            href: "/f.txt".to_string(),
+            is_collection: false,
+            content_length: Some(11),
+            last_modified: Some("not a date".to_string()),
+            quota_used_bytes: None,
+            quota_available_bytes: None,
+        };
+        let entry = crate::driver::entry_from_propfind(&volume, &rel, &pe);
+        assert_eq!(entry.size, 11);
+        assert_eq!(entry.mtime, 0.0, "garbage mtime degrades to 0, not a lie");
+        // 好形态照常回真值。
+        let pe = crate::xml::PropfindEntry {
+            last_modified: Some("Mon, 21 Sep 2026 10:51:05 GMT".to_string()),
+            ..pe
+        };
+        let entry = crate::driver::entry_from_propfind(&volume, &rel, &pe);
+        assert_eq!(entry.mtime, 1_789_987_865.0);
     }
 }
