@@ -228,7 +228,9 @@
 
 `/`
 
-`/`` + 64KB 上限。②**db 整库拷贝到第二台机器 → 两机同 client_id → 门铃双向互静默**（两层 origin 跳过都命中；db 拷贝是本项目文档化/验收用过的操作）——正确性无损、实时性静默退化且不可诊断；候选缓解：服务端同 (ns,client_id) 双活检测踢旧连接（~20 行）/至少 warn 日志，客户端 doctor 检查或 client_id 重置途径。
+`/`
+
+` + 64KB 上限。②**db 整库拷贝到第二台机器 → 两机同 client_id → 门铃双向互静默**（两层 origin 跳过都命中；db 拷贝是本项目文档化/验收用过的操作）——正确性无损、实时性静默退化且不可诊断；候选缓解：服务端同 (ns,client_id) 双活检测踢旧连接（~20 行）/至少 warn 日志，客户端 doctor 检查或 client_id 重置途径。
 - **Low 若干**：SYNC_HEARTBEAT_SECS 巨值 panic 循环（加上界 1..=86400）、serde 400 回显理论渗漏面、客户端 connect await 无停机门、debug 日志全量 origin（应对齐前 8 字符）、setup 重跑静默抹手写 sync_secret、enqueue 失败路径不 ring、测试缺口（Lagged/双订阅断一/陈旧 reap/双活）。
 - **审查排除的疑点（附依据）**：三源 select! 无丢唤醒（tokio 文档舞步逐路径推演）；重连无风暴；hydrate/LRU/cache-clear/sync-apply 不 ring 的正确性（payload 字段集+测试钉死）；Bot /mkdir /rm 与 web upload 走 Vfs 已覆盖；唤醒热路径原子级无误唤醒；服务端 publish 在 store 锁外、锁序单一。
 - 修复批建议待负责人裁决：P1=High-1/2/3（三处均小修）；P2=Med-1 帧切分；P3=Med-2 client_id 双活（含语义裁决）；Low 捎带。
@@ -240,7 +242,9 @@
 
 `/`
 
-`/`` 三合法界（新签名返回 (content_len, term_len)，纯 LF 流切点逐字节不变、单测钉死）；`pending` 缓冲 64KB 上限（超限 warn+断流重连）。审查指出的「CRLF 测试只测内容解析」误信源已补流级三测。
+`/`
+
+` 三合法界（新签名返回 (content_len, term_len)，纯 LF 流切点逐字节不变、单测钉死）；`pending` 缓冲 64KB 上限（超限 warn+断流重连）。审查指出的「CRLF 测试只测内容解析」误信源已补流级三测。
 - **P3（Med-2）**：EventHub 增 per-(ns,client_id) 活跃订阅计数（与 receiver 创建同临界区；pump 退出唯一清理点递减、先于 receiver drop）；双活（≥2）时**不跳过且事件 origin 置 None 下发**（客户端二次跳过自然放行、回声走幂等闸；单活保持省一轮 pass 优化不变）；双活出现即 warn（ns/client 各前 8 字符，提示 db 拷贝嫌疑）——静默退化变可诊断。客户端零改动。
 - **门禁**：win workspace 524 / wsl 三 crate 427 全绿（+14）；fmt/clippy 零警告；三单元红→绿断言零漂移（P1 单元 3 绿 commit 的新增对照测试为增量非改动）。
 - **遗留**：Low 项未动（SYNC_HEARTBEAT 上界 panic 循环、serde 400 回显、connect 停机门、debug 全量 origin、setup 抹 secret、enqueue 失败唤醒、测试缺口四项）——decisions 上一条挂账。
@@ -256,7 +260,8 @@
 
 ## 2026-09-07 rs-cloudfs 建仓与 Phase -1 规范先行（负责人六项指令）
 
-- **建仓**：E:\Rs_Codess-cloudfs fork 自 rs-CyDrive@9a691f2（全历史保留；remote 改名 upstream-cydrive 且 push URL 置 no-push 防误推）；test/ 凭据目录未随 fork 入库（gitignore 两仓同规则）。
+- **建仓**：E:\Rs_Codes
+s-cloudfs fork 自 rs-CyDrive@9a691f2（全历史保留；remote 改名 upstream-cydrive 且 push URL 置 no-push 防误推）；test/ 凭据目录未随 fork 入库（gitignore 两仓同规则）。
 - **规范先行（负责人指令「代码未动，规范先行」）**：docs/standards/ 五份（architecture/code-style/interfaces/logging/documentation）+ AGENTS/README 重写 + 融合基线设计 v1.0→v1.2。规范素材 = rs-CyDrive 全部生产纪律 + PrivateCloudFS 正反经验（错误泄漏/硬编码密钥/CTR 无认证/调试残留为反例；能力位/TokenCallback/conformance 思想为正面）。
 - **红队复审（独立子代理）修复集**：H1 本条目与提交落盘；H2 architecture §1.5 过渡豁免清单（ck-telegram→core 反向依赖 Phase 1 R 解除、crate 名 Phase 0、R4 conformance 前置 Phase 2、core 合体长期豁免+组合根豁免）；H3 multicloud 计划加 SUPERSEDED banner（Kickoff 作废、附录 A 仍有效、接口形状以 D1-D10 为准）；H4 conformance 最小断言集八条落 interfaces.md + Phase 2 前置任务「驱动接入手册」；M1 local 入分层图/crate 树；M2 D6 local 卷形态（规范化根路径）+ D10 权威后端 sync 验收口径；M3 Phase 1 R 批验收补真机 Telegram 冒烟；M4 AGENTS 补 PROPPATCH 教训/补遗节指针/继承挂账；M5/M6 Phase 0 交付 check_layers 脚本与 CI 秘密扫描；M7 §7a E2E 隔离裁决（独立测试 chat + /_e2e/ 前缀 + 收尾清理）；M8 层级规则组合根豁免与 crypto 定位；L1-L7 全修（README 链接/章节序/门禁口径统一/参数守卫条款/R4 local 豁免/文档两档制）。
 - **待负责人确认**：基线设计 §9-2/9-3/9-4（旧仓冻结时点 / bot 分 crate 时点 / R-E 批序）。
@@ -824,3 +829,16 @@ Phase 6 六批次全落地（worktree `feat/pan123-driver`，`6bd6ef5`→`e0dbcc
 - **K78.5 跨父 rename 部分变更可观测（M11）**：mod_pid 成功 + rename 失败 → 错误文案明示「已移至目标目录、保留旧名、从新位置重试」+ 失败路径两父级 pathcache 失效（无它则过期缓存把新位置藏掉）。**不做 mod_pid 回滚**（回滚自身也可能失败，把状态搞得更糟——比不回滚差）。
 - **K78.6 测试面销账**：M12 `v2_fail_times` 激活（⑦ 失败腿恢复链钉死——SessionGone→清记录→re-request 恰一次→全量重传；⑦ 失败无法差集是 ⑥ 已消费会话的固有形态，注释留档）+ M10b PUT 429 恢复/耗尽两腿；死 helper `session_part_sizes` 删除；M9 前端标签表补 pan115+pan123（K67 同族，顺带清 Phase 5 欠账——app.js/system.js 两表）。
 - **K78.7 终态与遗留**：workspace **1382/0/42**（+22 测试）、clippy/fmt/check_layers/scan_secrets 绿；既有断言零漂移。**Low ~25 条未动**（含 pan115 侧 DlinkCache 上界同款欠账、doctor "is unset" 文案、真机测试根缺省 "0" 等——留后续 Low 收尾批裁决，参照 K75 形态）。真机新增挂账：无（本批全桩面；缺片 complete 服务端真形维持 findings 挂账——修复后驱动侧已不依赖该形态）。本条占用 K78 后，Phase 7 webdav 计划原拟的 K78/K79 编号再顺延为 K79/K80（webdav 未批准未落 decisions，无实际冲突）。
+
+## 2026-09-21 K79：Phase 6 Low 收尾批——有价值 Low 全清偿
+
+K78（12 Medium）后，负责人批准 Low 收尾范围 =「建议修 8 条 + pan115 DlinkCache 顺带 + 零破坏顺手项」。两路并行子代理 + 主会话直做，落 worktree `feat/pan123-driver`。
+
+- **K79.1 dydomain 域白名单（安全面）**：dydomain 网络产物经 `is_allowed_api_host/_base` 双门（loopback 豁免测试形态；其余点分后缀命中 `.123pan.cn/.123pan.com/.123278.com` 家族 + 强制 https；尾缀伪装不命中）才可激活——Bearer token 外发面封口（pan115 normalize_endpoint 同族先例）。违例按 dydomain 失败降级（回退缺省主域）。**维护面**：123 新增真实域需随版本更新后缀表（与 failover 备域同性质）。
+- **K79.2 cid 解析显式报错**：`parse_cid` 替换 `unwrap_or(0)` 四站点（write 面三处 + lib mkdir 同型第 4 处）+ pathcache list_all 残留——**绝不静默归网盘根**（错置数据面方向）。**裁决不修一处**：lib.rs probe 的 root_fid（流量余量是账号级指标、fid=0 功能等价、只读零危害——改报错反令诊断面丢 token 活性/空间信息）。
+- **K79.3 Retry-After 消费纪律统一**：429 终态三面（dispatch/dispatch_single/PUT 耗尽）clamp 1–60s；CDN 退避（fetch_window/window_get_backoff）解析值优先同 clamp。**留裁决**：download 终态错误里 retry_after 的透出形态（M10a 测试钉死）未同步 clamp——属行为变更，挂账。
+- **K79.4 双拼纪律补漏**：QR 确认防御臂 token 键认 `token/Token` 双形态（§5.10 的漏网执行；大写 + loginStatus:0 缺口红→绿钉）。
+- **K79.5 泄漏面封口**：`Envelope` 手工 Debug——data 恒 `<redacted>`（认证流 data 含 token 的未来打印面）。
+- **K79.6 测试基建**：write_path content() 64 位 LCG（u8 周期 8 的桩 Reuse 碰撞雷）；真机测试根必填 panic（pan123 live_matrix/e2e + pan115 live_matrix 含 live_params 硬编码 root="0" 三用例收口——K74 教训的机制化）；陈旧 resume 注释七处清理（被证伪模型的叙述误导后来者）。
+- **K79.7 pan115 顺带**：DlinkCache 上界 DLINK_CAP=1024（K73 遗留的 M-S5 同族欠账，M4 方案平移）。
+- **K79.8 终态**：workspace **1394/0/42**（+12 测试）、clippy/fmt/check_layers/scan_secrets 绿、既有断言零漂移。剩余 ~14 条 Low 维持不修裁决（findings §8 挂账表）。本条占用 K79 后，Phase 7 webdav 计划原拟编号再顺延为 K80/K81。

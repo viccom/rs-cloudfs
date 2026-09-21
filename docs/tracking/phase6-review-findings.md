@@ -146,3 +146,26 @@ mod_pid 成功 + rename 失败（竞态/网络错）→ 文件已在目标父目
 **随批顺手项**：errno_mapping 过时注释 1 行（M2 关联）；`session_part_sizes` 死 helper 删除。**Low 其余 ~25 条未动**（本批范围 = Medium 12 条；Low 留待后续裁决——含 pan115 侧同款 DlinkCache 上界欠账，注：M4 已在 pan123 侧清偿，pan115 侧仍未清）。
 
 **终态验证**：workspace **1382/0/42**（+22 测试）、clippy `-D warnings` 绿、fmt 绿、check_layers 绿（15 manifests/6 驱动）、scan_secrets 绿。
+
+## 8. Low 收尾批销账（K79，2026-09-21）——有价值 Low 全清
+
+范围 = 负责人批准的「建议修 8 条 + pan115 DlinkCache 顺带 + 零破坏顺手项」。两路并行子代理（pan123 八项 P1–P9 / pan115 两项 Q1–Q2）+ 主会话三处直做（doctor 文案/README/pathcache 残留）。
+
+| 项 | 修复形态 | 证据/备注 |
+|---|---|---|
+| dydomain 域白名单 | `is_allowed_api_host/_base`（loopback 三形态豁免；其余点分后缀命中 `.123pan.cn/.123pan.com/.123278.com` 含裸域 + 必须 https；尾缀伪装不命中）；应用在 resolve_domain 唯一入口 | 红：毒 dydomain 产物经 failover 被激活；绿：回退缺省主域。合法子域接受面由纯函数矩阵钉（hermetic 套件不发真网） |
+| QR 防御臂 token 双拼 | `["token","Token"]` 对齐 parse_token | 红：大写 Token + loginStatus:0 漏进 Waiting；绿：Confirmed |
+| `cid.parse().unwrap_or(0)` ×4→显式 Invalid | `parse_cid(stage)` helper（error! 通道留原值 + Invalid）；**4 站点**（upload×2/lib rename/lib mkdir——第 4 处系执行期发现的同型站点） | 真实红→绿 ×3 条（pub 结构体绕过 from_pairs 构造非数字 root 可驱动）；生产不可达如实声明 |
+| ↳ 同类残留收口 | pathcache.rs:240 list_all 同修（主会话）；**lib.rs:763 probe root_fid 裁决不修**（流量余量账号级、fid=0 功能等价、只读零危害——报错反令诊断面丢信息） | 裁决入本表 |
+| 429 终态 retry_after clamp | dispatch/dispatch_single/PUT 耗尽三终态统一 clamp(1s,60s) | 红：9999s 透传；绿：60s/1s |
+| CDN 退避消费 Retry-After | `cdn_backoff_delay`（解析值优先 clamp 1–60s，否则梯度）接 fetch_window + window_get_backoff | 红：总耗时 3.03s（梯度）→绿：2.03s（消费 1s×2）；M10a 既有用例维持绿 |
+| Envelope 手工 Debug | data 恒打 `<redacted>`（code/message 照打） | 红：`{env:?}` 展开 token；绿：不出现 |
+| write_path LCG 64 位 | content() 内部 64 位状态（live_matrix 同款） | 测试基建；write_path 19/19 |
+| 陈旧 resume 注释 | write_path/conformance 头部 + lib capabilities 注 + stub_common ×4 处 + live_matrix:298 | 纯注释；conformance:158 零片段表述经核对准确保留 |
+| 真机测试根必填 | pan123 live_matrix + pan123_e2e + pan115 live_matrix（含 :257 live_params 硬编码 root="0" 的同族收口）env 缺失即 panic（K74 文案） | #[ignore] 套件离线零影响 |
+| pan115 DlinkCache 上界 | DLINK_CAP=1024（M4 方案平移，注释按 pan115 风格重写） | 红 E0425→绿；ck-pan115 全绿 |
+| doctor 文案 / README | "is unset (or set to \"0\")"；README 去过期「36 键」计数 | 主会话直做；无测试钉文案（已核） |
+
+**剩余未修（裁决挂账）**：findings §3 其余 ~14 条 Low 维持不修裁决（理论路径/安全方向已确认/纯风格）；lib.rs:763 probe root_fid（上表裁决）；download 终态 retry_after 透出形态（M10a 测试钉死的行为，统一 clamp 属行为变更留裁决）。
+
+**终态验证**：workspace **1394/0/42**（+12 测试）、clippy/fmt/check_layers/scan_secrets 绿；既有断言零漂移。

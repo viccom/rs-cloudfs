@@ -42,7 +42,7 @@
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 1382 测试（2026-09-21：K78 审查修复批——12 Medium 全清偿：提交点单次通道/envelope 双门/时间 null 容错/DlinkCache 上界/traffic 降级/206 窗口长度防线/210 限定/close 复核部分态/首窗限流梯度/PUT 429 钉/v2 失败腿钉/跨父 rename 文案 + 前端标签表补行；既有断言零漂移；ignored 42 = 真机/平台/真网类，其中 sftp 真机矩阵 12 + pan115 live_matrix 6 + pan115_e2e 4 + pan123 live_matrix 3 + pan123_e2e 5）
+cargo test --workspace --no-fail-fast            # 1394 测试（2026-09-21：K79 Low 收尾批——有价值 Low 全清偿：dydomain 域白名单/cid 解析显式报错/Retry-After 消费纪律统一/QR 双拼补漏/Envelope Debug 打码/测试根必填/LCG 64 位 + pan115 DlinkCache 上界顺带；既有断言零漂移；ignored 42 = 真机/平台/真网类，其中 sftp 真机矩阵 12 + pan115 live_matrix 6 + pan115_e2e 4 + pan123 live_matrix 3 + pan123_e2e 5）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo build -p cloudkit-cli --no-default-features --features local,baidu   # 驱动裁剪构建（K30 四 feature）；缺驱动构建运行期报可行动错误（K31 rebuild 指引），cydrive --version 显示驱动清单（K32）
