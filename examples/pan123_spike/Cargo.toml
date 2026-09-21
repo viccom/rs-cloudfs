@@ -1,0 +1,36 @@
+[package]
+name = "pan123-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Phase 6 (pan123) 123-0 read-path spike — live 123pan web-API probes
+# (endpoint generations / auth / list+trash roundtrip / download_info +
+# Range + traffic quota). This crate is EXCLUDED from the workspace on
+# purpose (same as examples/baidu_spike and examples/pan115_spike): it
+# performs live network calls and must never enter CI gates. Run manually:
+#   cargo run --manifest-path examples/pan123_spike/Cargo.toml --release -- <cmd>
+#
+# Credential discipline (R3): nothing sensitive is committed. At RUNTIME the
+# spike reads/writes only under the gitignored test dir
+# (default E:\GitHub\rs-CyDrive\test, override PAN123_SPIKE_TEST_DIR):
+#   - pan123-test-account.json  (passport/password/note — read-only input)
+#   - pan123-tokens.json        (Bearer/sso-token persisted after sign-in)
+#   - pan123-spike-file.bin     (generated random test payload)
+# Tokens and the account password are masked in all printed output. Proxy:
+# direct connection by default (123pan is a domestic service);
+# PAN123_SPIKE_PROXY=http://127.0.0.1:7897 overrides.
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+md5 = "0.8"
+rand = "0.8"
+reqwest = { version = "0.12", default-features = false, features = [
+    "json",
+    "rustls-tls",
+    "gzip",
+] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "time"] }

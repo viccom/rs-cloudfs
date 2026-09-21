@@ -113,6 +113,8 @@ pub const KNOWN_TOML_KEYS: &[&str] = &[
     "pan115_access_token",
     "pan115_refresh_token",
     "pan115_root",
+    "pan123_token",
+    "pan123_root",
     "volumes_dir",
     "enabled",
 ];
@@ -163,6 +165,8 @@ const LEGACY_REJECTED_KEYS: &[&str] = &[
     "pan115_access_token",
     "pan115_refresh_token",
     "pan115_root",
+    "pan123_token",
+    "pan123_root",
     "volumes_dir",
     "enabled",
     "allow_remote_admin",
@@ -238,6 +242,9 @@ pub enum Backend {
     /// 115 open-platform drive (ck-pan115, Phase 5 / 115-1 — one 115
     /// account per volume; driver wiring lands in 115-4).
     Pan115,
+    /// 123 cloud-drive via the web API (ck-pan123, Phase 6 / 123-1 — one
+    /// 123pan account per volume; driver wiring lands in 123-4).
+    Pan123,
 }
 
 impl Backend {
@@ -249,6 +256,7 @@ impl Backend {
             Backend::Local => "local",
             Backend::Sftp => "sftp",
             Backend::Pan115 => "pan115",
+            Backend::Pan123 => "pan123",
         }
     }
 }
@@ -365,6 +373,8 @@ pub const VOLUME_SCOPED_KEYS: &[&str] = &[
     "pan115_access_token",
     "pan115_refresh_token",
     "pan115_root",
+    "pan123_token",
+    "pan123_root",
     "enabled",
 ];
 
@@ -453,6 +463,10 @@ const SECRET_VALUED_KEYS: &[&str] = &[
     // ConfigTokenStore precedent rides the baidu keys the same way).
     "pan115_access_token",
     "pan115_refresh_token",
+    // Phase 6 / 123-1: the single 123pan login token (web API has no
+    // refresh — the key is written once per acquisition via the K13
+    // first-save chain).
+    "pan123_token",
 ];
 
 /// Masks a credential value span: length-preserving, first and last two
@@ -1345,6 +1359,18 @@ pub struct CyDriveConfig {
     /// driver's own default). Must be all digits when present —
     /// `validate` rejects anything else.
     pub pan115_root: Option<String>,
+    /// 123 cloud-drive login token (ck-pan123, Phase 6 / 123-1). Required
+    /// when `backend = "pan123"`; inert otherwise. A
+    /// [`SECRET_VALUED_KEYS`] member (R3). The web API has **no refresh
+    /// mechanism** (K76.4) — the token (90 days) comes from the setup QR
+    /// scan or a password sign-in and is only re-persisted on a fresh
+    /// acquisition (the "first save" of the K13 chain).
+    pub pan123_token: Option<String>,
+    /// 123 drive root as a numeric folder id (ck-pan123, Phase 6 / 123-1;
+    /// D3沿用 Phase 5 拍板形态: settable, `None` = the netdisk root
+    /// `"0"`, the driver's own default). Must be all digits when
+    /// present — `validate` rejects anything else.
+    pub pan123_root: Option<String>,
     /// Volumes directory (Phase 2.5 / K19), relative to the process
     /// working directory: one `<name>.toml` file per storage volume
     /// (see [`load_volume_config`]). `None` — the default — means
@@ -1426,6 +1452,8 @@ impl Default for CyDriveConfig {
             pan115_access_token: None,
             pan115_refresh_token: None,
             pan115_root: None,
+            pan123_token: None,
+            pan123_root: None,
             volumes_dir: None,
             enabled: default_enabled(),
         }
@@ -1634,6 +1662,7 @@ impl CyDriveConfig {
     /// | `CYDRIVE_SFTP_PRIVATE_KEY_PASSPHRASE` | `sftp_private_key_passphrase` | same empty-clears rule |
     /// | `CYDRIVE_PAN115_ACCESS_TOKEN` | `pan115_access_token` | same empty-clears rule (Phase 5 / 115-1: the K28 multi-volume skip applies the same way) |
     /// | `CYDRIVE_PAN115_REFRESH_TOKEN` | `pan115_refresh_token` | same empty-clears rule |
+    /// | `CYDRIVE_PAN123_TOKEN` | `pan123_token` | same empty-clears rule (Phase 6 / 123-1: the K28 multi-volume skip applies the same way) |
     pub fn with_env_overrides(self) -> Self {
         let mut config = self;
         if let Some(value) = env_string("CYDRIVE_BOT_TOKEN") {
@@ -1699,6 +1728,13 @@ impl CyDriveConfig {
         }
         if let Some(value) = env_string("CYDRIVE_PAN115_REFRESH_TOKEN") {
             config.pan115_refresh_token = (!value.is_empty()).then_some(value);
+        }
+        // Phase 6 / 123-1: the 123pan token rides the same env > file
+        // chain as the baidu/sftp/pan115 ones — the multi-volume
+        // discovery path never calls this method, so volume files are
+        // immune to cross-volume env bleed by construction (K28).
+        if let Some(value) = env_string("CYDRIVE_PAN123_TOKEN") {
+            config.pan123_token = (!value.is_empty()).then_some(value);
         }
         config
     }
@@ -2020,6 +2056,27 @@ impl CyDriveConfig {
                 if root.is_empty() || !root.bytes().all(|b| b.is_ascii_digit()) {
                     return Err(ConfigError::Invalid(format!(
                         "pan115_root must be a numeric 115 folder id (\"0\" is the netdisk \
+                         root), got {root:?}"
+                    )));
+                }
+            }
+        }
+        // Phase 6 / 123-1 cross-field rules (gated on the backend like
+        // the baidu/local/sftp/pan115 blocks above — the telegram
+        // default never fires them).
+        if self.backend == Backend::Pan123 {
+            if self.pan123_token.as_deref().is_none_or(str::is_empty) {
+                return Err(ConfigError::Invalid(
+                    "backend = \"pan123\" requires pan123_token: obtain the initial token via \
+                     the setup QR scan (or a password sign_in), then set it in config.toml or \
+                     export CYDRIVE_PAN123_TOKEN"
+                        .to_string(),
+                ));
+            }
+            if let Some(root) = &self.pan123_root {
+                if root.is_empty() || !root.bytes().all(|b| b.is_ascii_digit()) {
+                    return Err(ConfigError::Invalid(format!(
+                        "pan123_root must be a numeric 123pan folder id (\"0\" is the netdisk \
                          root), got {root:?}"
                     )));
                 }

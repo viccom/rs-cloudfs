@@ -228,7 +228,9 @@
 
 `/`
 
-`/`` + 64KB 上限。②**db 整库拷贝到第二台机器 → 两机同 client_id → 门铃双向互静默**（两层 origin 跳过都命中；db 拷贝是本项目文档化/验收用过的操作）——正确性无损、实时性静默退化且不可诊断；候选缓解：服务端同 (ns,client_id) 双活检测踢旧连接（~20 行）/至少 warn 日志，客户端 doctor 检查或 client_id 重置途径。
+`/`
+
+` + 64KB 上限。②**db 整库拷贝到第二台机器 → 两机同 client_id → 门铃双向互静默**（两层 origin 跳过都命中；db 拷贝是本项目文档化/验收用过的操作）——正确性无损、实时性静默退化且不可诊断；候选缓解：服务端同 (ns,client_id) 双活检测踢旧连接（~20 行）/至少 warn 日志，客户端 doctor 检查或 client_id 重置途径。
 - **Low 若干**：SYNC_HEARTBEAT_SECS 巨值 panic 循环（加上界 1..=86400）、serde 400 回显理论渗漏面、客户端 connect await 无停机门、debug 日志全量 origin（应对齐前 8 字符）、setup 重跑静默抹手写 sync_secret、enqueue 失败路径不 ring、测试缺口（Lagged/双订阅断一/陈旧 reap/双活）。
 - **审查排除的疑点（附依据）**：三源 select! 无丢唤醒（tokio 文档舞步逐路径推演）；重连无风暴；hydrate/LRU/cache-clear/sync-apply 不 ring 的正确性（payload 字段集+测试钉死）；Bot /mkdir /rm 与 web upload 走 Vfs 已覆盖；唤醒热路径原子级无误唤醒；服务端 publish 在 store 锁外、锁序单一。
 - 修复批建议待负责人裁决：P1=High-1/2/3（三处均小修）；P2=Med-1 帧切分；P3=Med-2 client_id 双活（含语义裁决）；Low 捎带。
@@ -240,7 +242,9 @@
 
 `/`
 
-`/`` 三合法界（新签名返回 (content_len, term_len)，纯 LF 流切点逐字节不变、单测钉死）；`pending` 缓冲 64KB 上限（超限 warn+断流重连）。审查指出的「CRLF 测试只测内容解析」误信源已补流级三测。
+`/`
+
+` 三合法界（新签名返回 (content_len, term_len)，纯 LF 流切点逐字节不变、单测钉死）；`pending` 缓冲 64KB 上限（超限 warn+断流重连）。审查指出的「CRLF 测试只测内容解析」误信源已补流级三测。
 - **P3（Med-2）**：EventHub 增 per-(ns,client_id) 活跃订阅计数（与 receiver 创建同临界区；pump 退出唯一清理点递减、先于 receiver drop）；双活（≥2）时**不跳过且事件 origin 置 None 下发**（客户端二次跳过自然放行、回声走幂等闸；单活保持省一轮 pass 优化不变）；双活出现即 warn（ns/client 各前 8 字符，提示 db 拷贝嫌疑）——静默退化变可诊断。客户端零改动。
 - **门禁**：win workspace 524 / wsl 三 crate 427 全绿（+14）；fmt/clippy 零警告；三单元红→绿断言零漂移（P1 单元 3 绿 commit 的新增对照测试为增量非改动）。
 - **遗留**：Low 项未动（SYNC_HEARTBEAT 上界 panic 循环、serde 400 回显、connect 停机门、debug 全量 origin、setup 抹 secret、enqueue 失败唤醒、测试缺口四项）——decisions 上一条挂账。
@@ -256,7 +260,8 @@
 
 ## 2026-09-07 rs-cloudfs 建仓与 Phase -1 规范先行（负责人六项指令）
 
-- **建仓**：E:\Rs_Codess-cloudfs fork 自 rs-CyDrive@9a691f2（全历史保留；remote 改名 upstream-cydrive 且 push URL 置 no-push 防误推）；test/ 凭据目录未随 fork 入库（gitignore 两仓同规则）。
+- **建仓**：E:\Rs_Codes
+s-cloudfs fork 自 rs-CyDrive@9a691f2（全历史保留；remote 改名 upstream-cydrive 且 push URL 置 no-push 防误推）；test/ 凭据目录未随 fork 入库（gitignore 两仓同规则）。
 - **规范先行（负责人指令「代码未动，规范先行」）**：docs/standards/ 五份（architecture/code-style/interfaces/logging/documentation）+ AGENTS/README 重写 + 融合基线设计 v1.0→v1.2。规范素材 = rs-CyDrive 全部生产纪律 + PrivateCloudFS 正反经验（错误泄漏/硬编码密钥/CTR 无认证/调试残留为反例；能力位/TokenCallback/conformance 思想为正面）。
 - **红队复审（独立子代理）修复集**：H1 本条目与提交落盘；H2 architecture §1.5 过渡豁免清单（ck-telegram→core 反向依赖 Phase 1 R 解除、crate 名 Phase 0、R4 conformance 前置 Phase 2、core 合体长期豁免+组合根豁免）；H3 multicloud 计划加 SUPERSEDED banner（Kickoff 作废、附录 A 仍有效、接口形状以 D1-D10 为准）；H4 conformance 最小断言集八条落 interfaces.md + Phase 2 前置任务「驱动接入手册」；M1 local 入分层图/crate 树；M2 D6 local 卷形态（规范化根路径）+ D10 权威后端 sync 验收口径；M3 Phase 1 R 批验收补真机 Telegram 冒烟；M4 AGENTS 补 PROPPATCH 教训/补遗节指针/继承挂账；M5/M6 Phase 0 交付 check_layers 脚本与 CI 秘密扫描；M7 §7a E2E 隔离裁决（独立测试 chat + /_e2e/ 前缀 + 收尾清理）；M8 层级规则组合根豁免与 crypto 定位；L1-L7 全修（README 链接/章节序/门禁口径统一/参数守卫条款/R4 local 豁免/文档两档制）。
 - **待负责人确认**：基线设计 §9-2/9-3/9-4（旧仓冻结时点 / bot 分 crate 时点 / R-E 批序）。
@@ -800,3 +805,40 @@ Phase 5 五批次全落地（worktree `feat/pan115-driver`，`0b53c14`→`32060b
 - **K76.4 token 无 refresh 实证**：123 web API 无刷新端点（123panNextGen 同样只能凭密码重登）——pan123 错误映射修订：token 失效 → `Unauthorized{recoverable:false}` + 重扫码可行动指引（原「重登/刷新一次」不成立，也不为此扩密码凭据面）。
 - **K76.5 稳定/性能采纳面**（入计划 §5.10–17）：envelope 双成功码（code==0/200）与字段双拼解析、trash 最小 payload 静默失败陷阱（`code=0` 但不删——数据完整性级，回读校验 + 逐端点键名保真）、传输/API 双会话分离（presigned PUT 无 123pan 头）、上传七步严格序（`upload_complete` 漏掉 = 文件不入库；>64MB sleep 3s）、dlink 一次性纪律 + CDN JSON 重定向体、Retry-After 优先退避常量、时间双态解析、粘性域名 fallback。**漂移监控哨**：以 123panNextGen 仓库提交流为前哨警报源（§7 风险表）。
 - **K76.6 落档**：pan123 计划（头部/§0.1/§3/§3.1/§5/§6/§7/§8/附录 A.4）+ 跟踪单（123-0 行改写/研究表/批次日志/风险节）。Phase 7 webdav 计划原拟占用的 K76/K77 编号顺延为 K77/K78（webdav 未批准未落 decisions，无实际冲突）。
+
+## 2026-09-20 K77：Phase 6 完成（123-0…123-5）——pan123 驱动上线，resume 模型真机证伪改本地会话优先
+
+Phase 6 六批次全落地（worktree `feat/pan123-driver`，`6bd6ef5`→`e0dbcc5`）。批次链：123-0 两腿 spike（读腿 `6bd6ef5` + 写腿 `e54970a`）→ 123-1 骨架/认证（`3a61b1c`）→ 123-2 读路径（`829725a`）→ 123-3 写路径（`98fc25d`）→ 123-4 conformance+装配（`2f0987c`）→ 123-5 真机矩阵（`8ecf790` 修复 + `e0dbcc5` 测试）。装配批揭出驱动缺陷：delete 非数字句柄破坏 conformance ④ 幂等契约（归入查无实体 → Ok）。D5 web 身份合规路线（K76.2）全程执行。
+
+- **K77.1 resume 模型证伪（数据面级，123-5 三轮裸实验）**：spike 钉死的「同参重发 `upload_request` 返回同一 UploadId」**只在零分片时成立**——PUT 首片后同参重发恒铸新会话（旧 tuple 仍可 list_parts，成为远端孤儿泄漏）。123-3 按 spike 建的 re-request 主路径对已传分片**永不可达差集**（每次重开 = 全量重传 + 会话累积泄漏）。修复 = **本地五元组优先**（`establish_session` 先取本地会话记录对账旧 tuple：Parts 即差集续传 / gone 即清记录走 re-request——pan123-rs/123panNextGen 本地持久化模型即为此；spike 之所以看到会话保留，是因为中止在零片态）。红→绿：桩改真形（有片会话的重发铸新）后 conformance `pan123_partial_parts_resume_only_missing` + suite 红 → 绿；write_path 的 upload_request 计数断言随模型修正 2→1（差集 PUT 计数断言不动）。真机对账：服务端 list 恰 [(1,5MiB)]、同 UploadId、补缺 1.7s vs 全量 5.3s。
+- **K77.2 trash 载荷真值（「桩照实现抄」第三例）**：`operation:true` 必填（缺则 400「请输入Operation」）——123-0 spike 恒发四键形故未踩到，123-2 按跟踪单摘要抄漏两键形；真机 curl A/B 钉死（`{fileTrashInfoList, operation:true}` 即 code=0，`event`/`driveId` 可省）。三例全录：pan115 `to_cid`（K74.2）/ pan115 sign 键形（K73 M-T1）/ 本次 trash operation——**教训：wire 形态必须出自服务端真形或官方 SDK 建模，驱动实现与二手摘要都不足为据；「桩照实现抄」会把实现缺陷铸成桩钉**。
+- **K77.3 sign_in token 并存上限（FIFO-2 观测）**：同账号新 mint 的 token 至多两枚并存，第 3 枚踢掉最旧（T1/T2 并存、T3 mint 后 T1 死 Unauthorized、T4/T5 mint 后 T4 仍活 = 连续 mint 踢最旧）。操作纪律：多测试轮换 token 时并行有效数 ≤2；被踢的旧 token 直接 Unauthorized，无缓冲期。
+- **K77.4 流量触顶腿跳过裁决**：不主动耗尽当日 ≈10GiB 免费下载额度来采 5113/5114 真身（不可逆消耗 + 阻塞当日后续验证窗口）——5113/5114 真身维持挂账（桩按 D5 形态建模，映射 `RateLimited`+人话指引由 errno_mapping 单测钉死）。余量计数器滞后粗粒度实证：10.5MiB 下载的 15s 窗采样 Δ0~14,713B 不等、全天 ≈95MiB 实际下载对应计数 9.99→9.77GiB——非即时、非全量扣减（真机硬断言只保余量不增）。
+- **K77.5 端点代际并存事实收口（123-0 实证，修订 K76.3 表述）**：`/api/`、`/a/`、`/b/` 三前缀**并存全活而非代际替换**——2026-08-29「重组」实为「并存分叉」。驱动取用清单：list=`/api`（new）、mkdir/trash/rename/download_info=`/a`、upload 族/traffic/user_info/mod_pid=`/b`、complete=`/v2`。单选不做双发（已验证形态钉死；漂移由 123panNextGen 提交流监控哨兜底，计划 §7）。
+- **K77.6 K72 复现（去重纪律第三验）**：123-5 首轮 resume 腿「expected Ticket got Reuse」红——u8 种子确定性内容跨轮撞 etag 触发服务端秒传短路（且真机无桩计数可见）；换 64 位 LCG（pan115_e2e 同款）修复。**真机用例 stamp 唯一名 + 按轮随机内容，两条缺一即被秒传短路**。
+- **K77.7 终态与回滚**：六批次完成态 + 证据全录跟踪单 `docs/tracking/phase6-pan123.md`；workspace 终态 **1360/0/42**（收尾批复跑，170 suites 全 ok；ignored 42 = sftp 12 + pan115 6+4 + pan123 3+5 + 真网/平台类）；clippy/fmt/check_layers/scan_secrets 绿 + 裁剪六组合零告警（123-4 批）。遗留挂账终表 = 跟踪单「终态挂账总表」（5113/5114 真身、QR 人扫、空文件链真机、mod_pid 跨父、dlink TTL 真值、token 淘汰精确策略等，均验证/观察类）。回滚：整批在 worktree 分支 `feat/pan123-driver`（merge 前 `git worktree remove` 即弃；merge 后 `git revert -m 1 <merge>`）；spike `examples/pan123_spike` workspace-excluded 不入 CI；账号侧：专用测试根 `e2e_pan123_root_3800` 与 `e2e_pan123` 前缀已 trash 清扫 + 根 Total=0 核空（回收站残留为 D2 语义可恢复）。本条占用 K77 后，Phase 7 webdav 计划原拟的 K77/K78 编号再顺延为 K78/K79（webdav 未批准未落 decisions，无实际冲突）。
+
+## 2026-09-21 K78：Phase 6 审查修复批——12 Medium 全清偿（合入前）
+
+合入裁决前深度审查（五路子代理精读 + 主会话门禁复跑与逐条代码复核；清单 = `docs/tracking/phase6-review-findings.md`：**0 High / 12 Medium / ~27 Low**，workspace 复跑 1360/0/42 与声称吻合）后，12 条 Medium 修复批落地（worktree `feat/pan123-driver`，四轮串行 + M9 直做，逐项 TDD 红→绿）。
+
+- **K78.1 提交点不重试（M1）**：`upload_complete/v2`、`s3_complete_multipart`、`trash` 三个非幂等提交端点走单次尝试通道（`dispatch_post_json_single`——传输/可重试 HTTP 一律终态上抛；域名 failover 的连接级重放保留，请求未发出安全）。裁决依据：重放已受理的提交 = 双应用假失败（v2 撞已消费会话 → close 报错但文件已入库）；单次失败后的恢复由既有 resume 机器承担（本地记录→SessionGone→清记录→re-request，Reuse 或全量重传，零数据损失）。mkdir（双发→5060→Exists 自愈）与 upload_request（孤儿为零片低危害）维持可重试。
+- **K78.2 envelope 双门（M2）**：成功判定加 HTTP 门（envelope 声称成功但 HTTP 非 2xx → `Unavailable`；envelope 显式错误码不受门影响，401→Unauthorized 映射保留——真机 user/info 面形态）+ `code` 键必填（网关 `{"error":"forbidden"}` 不再经缺省 0 吞成成功）。`read_envelope`（oauth 面）同门。
+- **K78.3 下载面四防线（M4–M7+M10a）**：DlinkCache 上界 1024（M-S5 同族）；traffic/check 端点故障降级放行（**D5 裁定：限额拦截在 isTrafficExceeded 硬停 + download_info 5113/5114 两道，检查端点存活不是 D5 的承重面**——与 probe 面同语义）；206 窗口长度防线（越窗多给=错、空体=错、少给非空续窗保留——baidu 先例对齐）；JSON 重定向体限定 HTTP 210（200 全量 JSON 文件内容不再可能被当协议指令——内容注入面关闭）；首窗/冷解析限流梯度（与后续窗口一致化）。
+- **K78.4 close 复核部分传输态（M8）**：`TransferState.confirmed` + `reconcile_parts`（③④⑤抽取，resume 差集与 close 复核同一逻辑）——write 中途失败后吞错 close 不再可能以「会话声称 size」提交半截数据（桩面红证据：报成功+远端 416）。正常腿不加双 list（七步序契约零漂移）。
+- **K78.5 跨父 rename 部分变更可观测（M11）**：mod_pid 成功 + rename 失败 → 错误文案明示「已移至目标目录、保留旧名、从新位置重试」+ 失败路径两父级 pathcache 失效（无它则过期缓存把新位置藏掉）。**不做 mod_pid 回滚**（回滚自身也可能失败，把状态搞得更糟——比不回滚差）。
+- **K78.6 测试面销账**：M12 `v2_fail_times` 激活（⑦ 失败腿恢复链钉死——SessionGone→清记录→re-request 恰一次→全量重传；⑦ 失败无法差集是 ⑥ 已消费会话的固有形态，注释留档）+ M10b PUT 429 恢复/耗尽两腿；死 helper `session_part_sizes` 删除；M9 前端标签表补 pan115+pan123（K67 同族，顺带清 Phase 5 欠账——app.js/system.js 两表）。
+- **K78.7 终态与遗留**：workspace **1382/0/42**（+22 测试）、clippy/fmt/check_layers/scan_secrets 绿；既有断言零漂移。**Low ~25 条未动**（含 pan115 侧 DlinkCache 上界同款欠账、doctor "is unset" 文案、真机测试根缺省 "0" 等——留后续 Low 收尾批裁决，参照 K75 形态）。真机新增挂账：无（本批全桩面；缺片 complete 服务端真形维持 findings 挂账——修复后驱动侧已不依赖该形态）。本条占用 K78 后，Phase 7 webdav 计划原拟的 K78/K79 编号再顺延为 K79/K80（webdav 未批准未落 decisions，无实际冲突）。
+
+## 2026-09-21 K79：Phase 6 Low 收尾批——有价值 Low 全清偿
+
+K78（12 Medium）后，负责人批准 Low 收尾范围 =「建议修 8 条 + pan115 DlinkCache 顺带 + 零破坏顺手项」。两路并行子代理 + 主会话直做，落 worktree `feat/pan123-driver`。
+
+- **K79.1 dydomain 域白名单（安全面）**：dydomain 网络产物经 `is_allowed_api_host/_base` 双门（loopback 豁免测试形态；其余点分后缀命中 `.123pan.cn/.123pan.com/.123278.com` 家族 + 强制 https；尾缀伪装不命中）才可激活——Bearer token 外发面封口（pan115 normalize_endpoint 同族先例）。违例按 dydomain 失败降级（回退缺省主域）。**维护面**：123 新增真实域需随版本更新后缀表（与 failover 备域同性质）。
+- **K79.2 cid 解析显式报错**：`parse_cid` 替换 `unwrap_or(0)` 四站点（write 面三处 + lib mkdir 同型第 4 处）+ pathcache list_all 残留——**绝不静默归网盘根**（错置数据面方向）。**裁决不修一处**：lib.rs probe 的 root_fid（流量余量是账号级指标、fid=0 功能等价、只读零危害——改报错反令诊断面丢 token 活性/空间信息）。
+- **K79.3 Retry-After 消费纪律统一**：429 终态三面（dispatch/dispatch_single/PUT 耗尽）clamp 1–60s；CDN 退避（fetch_window/window_get_backoff）解析值优先同 clamp。**留裁决**：download 终态错误里 retry_after 的透出形态（M10a 测试钉死）未同步 clamp——属行为变更，挂账。
+- **K79.4 双拼纪律补漏**：QR 确认防御臂 token 键认 `token/Token` 双形态（§5.10 的漏网执行；大写 + loginStatus:0 缺口红→绿钉）。
+- **K79.5 泄漏面封口**：`Envelope` 手工 Debug——data 恒 `<redacted>`（认证流 data 含 token 的未来打印面）。
+- **K79.6 测试基建**：write_path content() 64 位 LCG（u8 周期 8 的桩 Reuse 碰撞雷）；真机测试根必填 panic（pan123 live_matrix/e2e + pan115 live_matrix 含 live_params 硬编码 root="0" 三用例收口——K74 教训的机制化）；陈旧 resume 注释七处清理（被证伪模型的叙述误导后来者）。
+- **K79.7 pan115 顺带**：DlinkCache 上界 DLINK_CAP=1024（K73 遗留的 M-S5 同族欠账，M4 方案平移）。
+- **K79.8 终态**：workspace **1394/0/42**（+12 测试）、clippy/fmt/check_layers/scan_secrets 绿、既有断言零漂移。剩余 ~14 条 Low 维持不修裁决（findings §8 挂账表）。本条占用 K79 后，Phase 7 webdav 计划原拟编号再顺延为 K80/K81。

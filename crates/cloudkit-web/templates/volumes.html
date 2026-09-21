@@ -124,6 +124,7 @@
                             <label><input type="radio" name="vf-backend" value="local"> <span data-i18n="backend.local">Local Disk</span></label>
                             <label><input type="radio" name="vf-backend" value="sftp"> <span data-i18n="backend.sftp">SFTP (SSH)</span></label>
                             <label><input type="radio" name="vf-backend" value="pan115"> <span data-i18n="backend.pan115">115 Netdisk</span></label>
+                            <label><input type="radio" name="vf-backend" value="pan123"> <span data-i18n="backend.pan123">123 Cloud Drive</span></label>
                         </div>
                     </fieldset>
 
@@ -246,6 +247,22 @@
                             </label>
                         </div>
                         <small class="vf-hint" data-i18n="volumes.form.pan115_recycle_note">Deleting in this volume moves files to the 115 recycle bin — recover them in the official 115 app or site.</small>
+                    </fieldset>
+
+                    <fieldset class="volume-fieldset vf-cred-group" id="vf-group-pan123" hidden>
+                        <legend data-i18n="volumes.form.cred_pan123">123 Cloud Drive backend</legend>
+                        <div class="volume-form-grid">
+                            <label class="volume-field">
+                                <span data-i18n="volumes.form.pan123_token">Login token <em>*</em></span>
+                                <input type="password" id="vf-pan123-token" autocomplete="new-password"
+                                       placeholder="from `cydrive setup` (QR scan or sign_in)">
+                            </label>
+                            <label class="volume-field">
+                                <span data-i18n="volumes.form.pan123_root">Remote root (folder id)</span>
+                                <input type="text" id="vf-pan123-root" autocomplete="off" placeholder="0 (whole account, default)">
+                            </label>
+                        </div>
+                        <small class="vf-hint" data-i18n="volumes.form.pan123_recycle_note">Deleting in this volume moves files to the 123pan recycle bin — recover them in the official app or site; the daily download traffic quota applies (a VIP lifts it).</small>
                     </fieldset>
 
                     <details class="vf-advanced" id="vf-advanced">

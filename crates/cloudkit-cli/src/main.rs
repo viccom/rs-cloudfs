@@ -811,6 +811,19 @@ async fn doctor_cmd() -> Result<()> {
                 &cloudkit_cli::pan115_backend_probe(&cfg).await,
             ));
         }
+        // Phase 6 / 123-4: the pan123 leg — the offline checks (D3 root
+        // note) plus the live probe (user/info token liveness + space +
+        // the D5 traffic-remain display, with the re-scan / re-paste
+        // guidance on a dead token). A binary without the driver skips
+        // the dial-out leg (K31 shape, the baidu rule): no fake
+        // Unreachable.
+        cloudkit_core::config::Backend::Pan123 => {
+            results.extend(cloudkit_cli::doctor::backend_checks(&cfg));
+            #[cfg(feature = "pan123")]
+            results.push(cloudkit_cli::doctor::pan123_connectivity_check(
+                &cloudkit_cli::pan123_backend_probe(&cfg).await,
+            ));
+        }
     }
     print!("{}", cloudkit_cli::doctor::render_report(&results));
     Ok(())

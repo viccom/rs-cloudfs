@@ -16,7 +16,8 @@
 //!
 //! 缓存形态（baidu `DlinkCache` 先例）：pick_code → (url, fetched_at)；
 //! TTL 缺省 30 分钟（K69.4：115 的直链 TTL 未实测，取保守下界；baidu
-//! 的 60min 实证值不通用）。取链一次一链，缓存命中零网络。
+//! 的 60min 实证值不通用）。条目上界 [`DLINK_CAP`]——超限先清过期、
+//! 仍满则驱逐最旧（K79 Q1）。取链一次一链，缓存命中零网络。
 
 use std::collections::HashMap;
 use std::time::{Duration, Instant};
@@ -32,6 +33,11 @@ use crate::api::{Pan115Client, UA};
 /// 直链缓存 TTL（K69.4 未实测 115 的 TTL——保守 30min；命中后任何
 /// 403/401/410 都触发一次重取，缓存错值自愈）。
 const DLINK_TTL: Duration = Duration::from_secs(30 * 60);
+
+/// 直链缓存条目上界（K79 Q1，pathcache `DIR_CAP`/M-S5 同族）：长期
+/// 挂载进程扫库大量文件时的内存上界——新键超上界时先清过期、仍满
+/// 则驱逐最旧。
+const DLINK_CAP: usize = 1024;
 
 /// CDN 分片窗口：4 MiB（baidu 有界分片先例——115 未声明窗口约束，
 /// 该值只是流控粒度，不涉协议）。
@@ -66,6 +72,22 @@ impl DlinkCache {
 
     pub async fn insert(&self, pick_code: &str, url: &str) {
         let mut entries = self.entries.write().await;
+        // 新键且超上界：先清过期条目（TTL 到点的读取面本就 miss，
+        // 这里只是顺势回收），仍满则驱逐最旧。同键覆盖不进此分支
+        // ——时间戳刷新 = 「最近用过」。
+        if !entries.contains_key(pick_code) && entries.len() >= DLINK_CAP {
+            let now = Instant::now();
+            entries.retain(|_, (_, at)| now.duration_since(*at) < DLINK_TTL);
+            if entries.len() >= DLINK_CAP {
+                if let Some(oldest) = entries
+                    .iter()
+                    .min_by_key(|(_, (_, at))| *at)
+                    .map(|(k, _)| k.clone())
+                {
+                    entries.remove(&oldest);
+                }
+            }
+        }
         entries.insert(pick_code.to_string(), (url.to_string(), Instant::now()));
     }
 
@@ -306,4 +328,47 @@ async fn get_window(
         .await
         .map_err(|e| StorageError::Unavailable(format!("CDN body: {}", e.without_url())))?;
     Ok(body)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// K79 Q1：容量上限——超出 DLINK_CAP 时最旧条目被驱逐、新近条目
+    /// 保留；同键覆盖刷新时间戳（覆盖本身不触发驱逐）——pathcache
+    /// `DIR_CAP`（M-S5）同族。
+    #[tokio::test]
+    async fn dlink_cache_caps_and_evicts_the_oldest_entry() {
+        let cache = DlinkCache::new();
+        for i in 0..DLINK_CAP {
+            cache
+                .insert(&format!("pc{i}"), &format!("http://x/{i}"))
+                .await;
+        }
+        assert_eq!(
+            cache.get("pc0").await.as_deref(),
+            Some("http://x/0"),
+            "满 cap：全量存活（不提前驱逐）"
+        );
+        // 同键覆盖 = 刷新时间戳：pc0 从最旧变为最新。
+        cache.insert("pc0", "http://x/0-fresh").await;
+        // 超上界再插一条：最旧（此刻是 pc1）被驱逐。
+        cache
+            .insert(&format!("pc{}", DLINK_CAP), "http://x/new")
+            .await;
+        assert_eq!(
+            cache.get("pc0").await.as_deref(),
+            Some("http://x/0-fresh"),
+            "覆盖刷新过的键在驱逐中存活"
+        );
+        assert_eq!(cache.get("pc1").await, None, "超上界时最旧条目被驱逐");
+        assert!(
+            cache.get(&format!("pc{}", DLINK_CAP)).await.is_some(),
+            "新键照常落缓存"
+        );
+        assert!(
+            cache.get(&format!("pc{}", DLINK_CAP - 1)).await.is_some(),
+            "新近条目保留"
+        );
+    }
 }

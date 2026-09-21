@@ -36,9 +36,11 @@ use cloudkit_core::config::{Backend, ConfigError, CyDriveConfig};
 // ------------------------------------------------------------- helpers ---
 
 /// Every credential env key these tests touch (isolated against ambient env):
-/// the four CYDRIVE_BAIDU_* overrides and the two CYDRIVE_SFTP_* ones
+/// the four CYDRIVE_BAIDU_* overrides, the two CYDRIVE_SFTP_* ones
 /// (review fix: the sftp keys ride the same `with_env_overrides` chain, so
-/// the K28 multi-volume skip covers them — volumes never see env values).
+/// the K28 multi-volume skip covers them — volumes never see env values),
+/// the two CYDRIVE_PAN115_* ones (Phase 5) and CYDRIVE_PAN123_TOKEN
+/// (Phase 6 / 123-1 — same chain).
 const BAIDU_ENV_KEYS: &[&str] = &[
     "CYDRIVE_BAIDU_APP_KEY",
     "CYDRIVE_BAIDU_APP_SECRET",
@@ -46,6 +48,9 @@ const BAIDU_ENV_KEYS: &[&str] = &[
     "CYDRIVE_BAIDU_REFRESH_TOKEN",
     "CYDRIVE_SFTP_PASSWORD",
     "CYDRIVE_SFTP_PRIVATE_KEY_PASSPHRASE",
+    "CYDRIVE_PAN115_ACCESS_TOKEN",
+    "CYDRIVE_PAN115_REFRESH_TOKEN",
+    "CYDRIVE_PAN123_TOKEN",
 ];
 
 /// Serialises env-touching tests (same precedent as `tests/config.rs`).
@@ -369,6 +374,7 @@ fn backend_enum_round_trips_wire_names() {
     assert_eq!(Backend::Local.as_str(), "local");
     assert_eq!(Backend::Sftp.as_str(), "sftp");
     assert_eq!(Backend::Pan115.as_str(), "pan115");
+    assert_eq!(Backend::Pan123.as_str(), "pan123");
 }
 
 // -------------------------------------------------- sftp keys (Phase 4 SF1) ---
@@ -856,6 +862,196 @@ fn volume_file_accepts_the_pan115_key_group() {
         .expect("a volume file carrying the pan115 key group loads");
     assert_eq!(spec.settings.backend, Backend::Pan115);
     assert_eq!(spec.settings.pan115_root.as_deref(), Some("0"));
+    spec.settings
+        .validate()
+        .expect("the parsed volume settings validate");
+}
+
+// ------------------------------------------------- pan123 keys (Phase 6 123-1) ---
+//
+// Contract under test — three-place key sync (interfaces §4) for the two
+// `pan123_*` keys plus the `pan123` backend's cross-field rules (K64: web
+// API route with a single 90-day token — no refresh exists, K76.4):
+//
+// - `backend = "pan123"` requires `pan123_token` set and non-empty (the
+//   error names the CYDRIVE_PAN123_TOKEN env route; the initial token
+//   comes from the setup QR scan or a password sign_in — the message
+//   says so).
+// - `pan123_root`: optional; when present it must be all digits (a
+//   123pan folder id — "0" is the netdisk root, the D3-on-Phase-5
+//   default).
+// - The telegram default triggers none of these rules — pre-Phase-6
+//   configs validate unchanged.
+
+/// A minimal valid pan123 config: backend set + the token (short dummy
+/// value — the scanner gate only matches 20+ char literals).
+fn pan123_config() -> CyDriveConfig {
+    CyDriveConfig {
+        backend: Backend::Pan123,
+        pan123_token: Some("mock-token-0".to_string()),
+        ..CyDriveConfig::default()
+    }
+}
+
+#[test]
+fn pan123_defaults_are_unset_and_telegram_stays_inert() {
+    // The compatibility contract: a config that predates Phase 6 keeps
+    // validating — every pan123 key defaults to None and the telegram
+    // backend fires no pan123 rule even when pan123 keys are dirty.
+    let cfg = CyDriveConfig::default();
+    assert_eq!(cfg.backend, Backend::Telegram, "default backend");
+    assert_eq!(cfg.pan123_token, None);
+    assert_eq!(cfg.pan123_root, None);
+    cfg.validate().expect("default config still validates");
+
+    let dirty = CyDriveConfig {
+        pan123_token: Some(String::new()),
+        pan123_root: Some("not-a-folder-id".to_string()),
+        ..CyDriveConfig::default()
+    };
+    dirty
+        .validate()
+        .expect("the telegram backend ignores every pan123 rule");
+}
+
+#[test]
+fn pan123_backend_requires_the_token() {
+    let mut cfg = pan123_config();
+    cfg.pan123_token = None;
+    let err = cfg.validate().expect_err("token required");
+    assert!(
+        matches!(&err, ConfigError::Invalid(msg)
+            if msg.contains("pan123_token")
+                && msg.contains("CYDRIVE_PAN123_TOKEN")
+                && (msg.contains("QR") || msg.contains("sign_in"))),
+        "actionable text naming the key, the env route and the acquisition path: {err:?}"
+    );
+    // Empty string is as good as absent (empty-means-unset).
+    let mut empty = pan123_config();
+    empty.pan123_token = Some(String::new());
+    assert!(
+        empty.validate().is_err(),
+        "an empty token must not satisfy the requirement"
+    );
+    // The valid minimal config passes.
+    pan123_config()
+        .validate()
+        .expect("minimal pan123 config validates");
+}
+
+#[test]
+fn pan123_root_must_be_numeric_when_present() {
+    let mut cfg = pan123_config();
+    cfg.pan123_root = Some("12x45".to_string());
+    let err = cfg.validate().expect_err("non-numeric root rejected");
+    assert!(
+        matches!(&err, ConfigError::Invalid(msg) if msg.contains("pan123_root")),
+        "names the offending key: {err:?}"
+    );
+    // "0" (the netdisk root) and any digit string pass.
+    let mut root = pan123_config();
+    root.pan123_root = Some("0".to_string());
+    root.validate().expect("the netdisk root is legal");
+    let mut deep = pan123_config();
+    deep.pan123_root = Some("64379791".to_string());
+    deep.validate().expect("a folder id is legal");
+}
+
+#[test]
+fn load_toml_reads_both_pan123_keys() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        concat!(
+            "backend = \"pan123\"\n",
+            "pan123_token = \"mock-token-0\"\n",
+            "pan123_root = \"64379791\"\n",
+        ),
+    )
+    .expect("write config");
+
+    let cfg = CyDriveConfig::load_toml(&path).expect("the pan123 key group loads");
+    assert_eq!(cfg.backend, Backend::Pan123);
+    assert_eq!(cfg.pan123_token.as_deref(), Some("mock-token-0"));
+    assert_eq!(cfg.pan123_root.as_deref(), Some("64379791"));
+    cfg.validate().expect("the loaded config validates");
+}
+
+#[test]
+fn toml_roundtrip_preserves_pan123_keys() {
+    let mut cfg = pan123_config();
+    cfg.pan123_root = Some("0".to_string());
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    cfg.save_toml(&path).expect("save");
+    let reloaded = CyDriveConfig::load_toml(&path).expect("reload");
+    assert_eq!(reloaded, cfg, "both keys round-trip verbatim");
+}
+
+#[test]
+fn legacy_json_rejects_the_pan123_keys() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.json");
+    for key in ["pan123_token", "pan123_root"] {
+        fs::write(
+            &path,
+            format!("{{\"bot_token\": \"t\", \"chat_id\": 1, \"{key}\": \"x\"}}"),
+        )
+        .expect("write legacy json");
+        let err = CyDriveConfig::load_legacy_json(&path)
+            .expect_err("legacy config.json must reject the pan123 keys");
+        assert!(
+            matches!(err, ConfigError::Parse { ref message, .. } if message.contains(key)),
+            "expected Parse error naming {key}, got: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn pan123_token_env_override_applies_and_empty_clears() {
+    let _guard = env_guard(); // clears CYDRIVE_PAN123_TOKEN on drop too
+    let mut cfg = pan123_config();
+    cfg.pan123_token = None;
+
+    std::env::set_var("CYDRIVE_PAN123_TOKEN", "mock-token-from-env");
+    let overridden = cfg.clone().with_env_overrides();
+    assert_eq!(
+        overridden.pan123_token.as_deref(),
+        Some("mock-token-from-env"),
+        "env > file for the pan123 token"
+    );
+
+    std::env::set_var("CYDRIVE_PAN123_TOKEN", "");
+    let cleared = cfg.with_env_overrides();
+    assert_eq!(
+        cleared.pan123_token, None,
+        "a set-but-empty variable clears back to None"
+    );
+    std::env::remove_var("CYDRIVE_PAN123_TOKEN");
+}
+
+#[test]
+fn volume_file_accepts_the_pan123_key_group() {
+    // The two keys are volume-scoped (K19 partition — a volume file
+    // carries its own drive credentials); a minimal pan123 volume file
+    // loads through the strict volume surface.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("pan123.toml");
+    fs::write(
+        &path,
+        concat!(
+            "backend = \"pan123\"\n",
+            "pan123_token = \"mock-token-0\"\n",
+            "pan123_root = \"0\"\n",
+        ),
+    )
+    .expect("write volume file");
+
+    let spec = cloudkit_core::config::load_volume_config(&path)
+        .expect("a volume file carrying the pan123 key group loads");
+    assert_eq!(spec.settings.backend, Backend::Pan123);
+    assert_eq!(spec.settings.pan123_root.as_deref(), Some("0"));
     spec.settings
         .validate()
         .expect("the parsed volume settings validate");

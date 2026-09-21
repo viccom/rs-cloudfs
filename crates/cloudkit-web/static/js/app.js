@@ -52,6 +52,8 @@ const BACKEND_LABELS = {
     baidu: 'backend.baidu',
     local: 'backend.local',
     sftp: 'backend.sftp',
+    pan115: 'backend.pan115',
+    pan123: 'backend.pan123',
 };
 
 function backendDisplayName(backend) {
