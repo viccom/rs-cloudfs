@@ -330,6 +330,29 @@ fn name_is_addressable(name: &str) -> bool {
     !name.is_empty() && !name.contains('\\') && !name.contains('\u{0}')
 }
 
+/// cid（目录句柄字符串）→ i64（P3/K79 防御性加固）。
+///
+/// **可达性如实声明**：生产路径下不可达——本卷 cid 全部由
+/// `params.root`（[`Pan123Params::from_pairs`] 的纯数字校验门）或
+/// `file_id.to_string()`（i64）铸出，类型系统 + 配置门保证解析成功。
+/// 但 [`Pan123Params`] 是 pub 结构体：绕过 `from_pairs` 直接构造（或
+/// 未来新增装配面漏检）即得非数字 cid——旧形态 `unwrap_or(0)` 会把
+/// 破损**静默归到网盘根（0）**：错向账号根做 mkdir/move/upload 是数据
+/// 破坏面。显式报错（`Invalid`）+ error 通道保留原值（R2 双通道先例
+/// ——`Invalid` 无载荷，诊断文案走日志）。
+pub(crate) fn parse_cid(cid: &str, stage: &'static str) -> Result<i64, StorageError> {
+    cid.parse::<i64>().map_err(|_| {
+        tracing::error!(
+            target: "ck_pan123::cid",
+            stage,
+            cid = %cid,
+            "pan123 internal cid invariant broken: a directory id is not numeric — refusing \
+             to fall back to the netdisk root (0)"
+        );
+        StorageError::Invalid
+    })
+}
+
 /// 跨父 rename 改名腿失败后的错误文案面（M11）：`file/mod_pid` 已
 /// 生效——文件已移至目标父目录但**保留旧名**（旧路径 resolve
 /// NotFound、新名不可见的「消失」假象实为移位）。追加部分变更事实
@@ -376,15 +399,16 @@ impl StorageDriver for Pan123Driver {
     /// 差集上界驱动层可观测验证过：tests/conformance.rs 的
     /// `conformance_suite_offline` + 分片级特化
     /// `pan123_partial_parts_resume_only_missing`——第一轮中断后只补
-    /// 缺失片，「到齐即传 + re-request 会话保留」双证）。
+    /// 缺片，「到齐即传 + 本地五元组记录优先（123-5 真机修正）」双证）。
     fn capabilities(&self) -> Capabilities {
         Capabilities {
             // download_info → CDN Range 206 实证（123-0 ④：跨窗口
             // 逐字节 MATCH；dlink 会话内可复用）。
             range_read: true,
-            // 已点亮（123-4 断言⑦过）：同参重发返回同一 UploadId +
+            // 已点亮（123-4 断言⑦过）：本地五元组记录优先 +
             // list_parts 保留分片 + 差集补传哈希 MATCH（123-0 ⑤ 真机 +
-            // conformance ⑦/特化用例离线双证）。
+            // conformance ⑦/特化用例离线双证；同参重发的会话复用只在
+            // 零片会话上成立——123-5 真机三轮实验）。
             resume: true,
             // 分片 presigned PUT（repare 批量恒 multipart 会话）。
             multipart: true,
@@ -497,7 +521,9 @@ impl StorageDriver for Pan123Driver {
                 continue;
             }
             // 不存在 → create（5060 同名竞争窗口 → Exists 由 errno 表归一）。
-            let fid = self.client.mkdir(cid.parse().unwrap_or(0), comp).await?;
+            // cid 解析：防御性显式报错（P3/K79——不变式见 parse_cid）。
+            let parent = parse_cid(&cid, "mkdir")?;
+            let fid = self.client.mkdir(parent, comp).await?;
             self.paths.invalidate(&cid).await; // 结构变更：父级缓存失效
             cid = fid.to_string();
         }
@@ -591,9 +617,10 @@ impl StorageDriver for Pan123Driver {
         let same_parent = src.parent_cid == dst.cid;
         if !same_parent {
             // 跨父：mod_pid 到目标父，再按需改名（move 被拒 = 竞态占位）。
-            self.client
-                .mod_pid(src_row.file_id, dst.cid.parse().unwrap_or(0))
-                .await?;
+            // 目标父 cid 解析：防御性显式报错（P3/K79——绝不静默归 0
+            // 把文件移进网盘根）。
+            let target_parent = parse_cid(&dst.cid, "rename/mod_pid")?;
+            self.client.mod_pid(src_row.file_id, target_parent).await?;
         }
         // 改名腿（同父改名或跨父后改名；名字已同则跳过）。
         if src_row.file_name != to_name {

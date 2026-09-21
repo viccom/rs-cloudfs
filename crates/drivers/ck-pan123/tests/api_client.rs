@@ -271,6 +271,114 @@ async fn both_domains_dead_surfaces_unavailable() {
     );
 }
 
+/// P1（K79）：dydomain 产物域白名单——纯函数矩阵（host 后缀门 +
+/// scheme 双门）。dydomain 是**网络应答**，其产物直接成为后续全部 API
+/// 请求的 base（Bearer token 会发过去）；恶意/被劫持的应答不得把凭据
+/// 导向任意域（pan115 normalize_endpoint 教训同源）。
+#[test]
+fn api_base_allow_list_covers_hosts_and_schemes() {
+    use ck_pan123::api::{is_allowed_api_base, is_allowed_api_host};
+
+    // host 白名单：loopback 恒真；123 家族点分后缀（含裸域）真。
+    assert!(is_allowed_api_host("127.0.0.1"));
+    assert!(is_allowed_api_host("localhost"));
+    assert!(is_allowed_api_host("::1"));
+    assert!(is_allowed_api_host("[::1]"));
+    assert!(is_allowed_api_host("www.123pan.cn"));
+    assert!(is_allowed_api_host("api2.123pan.cn"), "合法新子域接受");
+    assert!(is_allowed_api_host("123pan.cn"), "裸域");
+    assert!(is_allowed_api_host("123pan.com"));
+    assert!(is_allowed_api_host("www.123pan.com"));
+    assert!(is_allowed_api_host("api.123278.com"), "硬编码备域天然过门");
+    assert!(!is_allowed_api_host("evil.com"));
+    assert!(!is_allowed_api_host("127.0.0.2"), "loopback 豁免只认三形态");
+    assert!(
+        !is_allowed_api_host("www.123pan.cn.evil.com"),
+        "尾缀伪装不命中"
+    );
+    assert!(!is_allowed_api_host("123pan.cn.evil.com"));
+    assert!(!is_allowed_api_host("123pan.evil.cn"));
+
+    // base 双门：非 loopback 必须 https；loopback 豁免 http（桩形态）。
+    assert!(is_allowed_api_base("https://www.123pan.cn"));
+    assert!(is_allowed_api_base("https://api2.123pan.cn"));
+    assert!(is_allowed_api_base("https://www.123pan.cn/a/path"));
+    assert!(is_allowed_api_base("http://127.0.0.1:39721"));
+    assert!(is_allowed_api_base("http://localhost:39721"));
+    assert!(is_allowed_api_base("http://[::1]:39721"));
+    assert!(
+        !is_allowed_api_base("http://www.123pan.cn"),
+        "非 loopback http 拒（任务书钉的形态）"
+    );
+    assert!(!is_allowed_api_base("https://evil.com"));
+    assert!(!is_allowed_api_base("https://www.123pan.cn.evil.com"));
+    assert!(!is_allowed_api_base("http://127.0.0.2:9"));
+    assert!(!is_allowed_api_base("www.123pan.cn"), "无 scheme 拒");
+    assert!(!is_allowed_api_base("ftp://www.123pan.cn"));
+}
+
+/// P1（K79）：dydomain 产物落在域白名单外 → 按 dydomain 失败处理
+/// （warn + 维持缺省主域），绝不把业务请求（携带 Bearer token）发去
+/// 陌生域——dydomain 是**网络应答**，产物直接成为后续全部请求的 base
+/// （pan115 normalize_endpoint 教训同源）。注入形态用
+/// `http://127.0.0.2:9`（白名单只认 127.0.0.1/localhost/[::1]——
+/// 127.0.0.2 即白名单外的 hermetic 形态，测试零真实 DNS）。修复前
+/// 行为 = 主域被毒换 → 连接错误 → failover 备域服务（业务命中落在
+/// 备域上——断言据此判红）。
+#[tokio::test]
+async fn dydomain_product_outside_the_allow_list_keeps_the_default_primary() {
+    let fallback = Mock::start().await; // B：备域（正确世界零命中）
+    let probe = Mock::start_with(MockState {
+        serve_dydomain: true,
+        dydomains: vec!["http://127.0.0.2:9".to_string()],
+        ..MockState::default()
+    })
+    .await; // A：构造主域（缺省主域 = 它自己）
+
+    let client = Pan123Client::new(
+        TOKEN.to_string(),
+        probe.base.clone(),
+        fallback.base.clone(),
+        None,
+    )
+    .expect("client");
+
+    let info = client
+        .user_info()
+        .await
+        .expect("the default primary keeps serving");
+    assert_eq!(info.uid, 7);
+    // 业务命中留在缺省主域 A——毒产物从未激活为 base。
+    assert!(
+        probe.hits().contains(&"/b/api/user/info".to_string()),
+        "the default primary served the business call: {:?}",
+        probe.hits()
+    );
+    assert!(
+        fallback.hits().is_empty(),
+        "no fail-over: the poisoned dydomain product never became the primary (got {:?})",
+        fallback.hits()
+    );
+}
+
+/// P6（K79）：`Envelope` 手工 Debug——`data` 恒打 `<redacted>`
+/// （认证流的 data 携带 token——derive 展开是未来泄漏面），`code`/
+/// `message` 照打（错误分类诊断面不受影响）。
+#[test]
+fn envelope_debug_redacts_the_data_member() {
+    let env: ck_pan123::api::Envelope =
+        serde_json::from_str(r#"{"code":0,"message":"ok","data":{"token":"secret-token-xyzw"}}"#)
+            .expect("parses");
+    let dbg = format!("{env:?}");
+    assert!(dbg.contains("<redacted>"), "data is redacted: {dbg}");
+    assert!(
+        !dbg.contains("secret-token-xyzw"),
+        "the token inside data never reaches Debug output: {dbg}"
+    );
+    assert!(dbg.contains("code"), "code stays visible: {dbg}");
+    assert!(dbg.contains("message"), "message stays visible: {dbg}");
+}
+
 /// web 身份头集合（D5）：客户端默认头带浏览器 UA + platform:web +
 /// app-version:3 + loginuuid；**无安卓头**。
 #[tokio::test]

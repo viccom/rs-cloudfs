@@ -551,7 +551,7 @@ async fn first_window_gradient_exhaustion_surfaces_rate_limited() {
 }
 
 /// M10a：**缓存命中路径**的首窗口同样退避（二次 open 对缓存 URL 单
-/// 发——此前该路径 429 同样直接上抛）。真 sleep 1+2s。
+/// 发——此前该路径 429 直接上抛）。真 sleep 1+2s。
 #[tokio::test]
 async fn cached_first_window_backs_off_too() {
     let s = stub().await;
@@ -572,6 +572,36 @@ async fn cached_first_window_backs_off_too() {
         s.hits("/mirror"),
         4,
         "1 warm + 2x429 + 1 recovery on the cached URL"
+    );
+}
+
+/// P5（K79）：CDN 退避消费解析出的 `Retry-After`（钳制 1–60s——api
+/// 面同纪律）——注入 429 带 `Retry-After: 1`：两档退避都睡 1s（总耗
+/// 时 ≥2s 且 <3s）；修复前第二档仍按梯度 2s（总耗时 ≥3s——sleep 只
+/// 超不欠，红绿判定确定性成立）。既有 M10a 用例（同注入）维持绿：
+/// 消费后 1s 与梯度首档等值，时序只会更短。
+#[tokio::test]
+async fn cdn_backoff_consumes_the_parsed_retry_after() {
+    let s = stub().await;
+    s.state.lock().unwrap().mirror_429_first = 2;
+    let data: Vec<u8> = (0..32u32).map(|i| (i % 11) as u8).collect();
+    let fid = s.put_file("0", "paced.bin", data.clone());
+
+    let driver = s.driver();
+    let t0 = std::time::Instant::now();
+    let got = read_all(&driver, fid, None)
+        .await
+        .expect("recovers through the paced 429s");
+    let elapsed = t0.elapsed();
+    assert_eq!(got, data);
+    assert_eq!(s.hits("/mirror"), 3, "two 429s then one 206");
+    assert!(
+        elapsed >= std::time::Duration::from_secs(2),
+        "two paced retries happened: {elapsed:?}"
+    );
+    assert!(
+        elapsed < std::time::Duration::from_secs(3),
+        "the second backoff consumed Retry-After: 1 (1s), not the 2s gradient slot: {elapsed:?}"
     );
 }
 

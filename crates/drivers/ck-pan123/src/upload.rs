@@ -280,7 +280,9 @@ impl Pan123Stager {
     /// tuple；miss / 旧会话已被消费才走 re-request 引导。
     async fn establish_session(&mut self, etag: &str) -> Result<TransferState, StorageError> {
         let size = self.written;
-        let parent: i64 = self.parent_cid.parse().unwrap_or(0);
+        // cid 解析：防御性显式报错（P3/K79——不变式见 lib.rs parse_cid；
+        // 绝不 unwrap_or(0) 把上传会话静默建到网盘根）。
+        let parent: i64 = crate::parse_cid(&self.parent_cid, "upload/establish_session")?;
         // ---- 本地会话记录优先（差集续传的唯一可达路径）。
         if let Some(rec) = self.sessions.load(self.rel_path.as_str(), size, etag).await {
             let ticket = UploadTicket {
@@ -792,7 +794,13 @@ async fn put_part_with_retry(
                     };
                     if *budget >= max {
                         return Err(if is_limited {
-                            StorageError::RateLimited { retry_after }
+                            // P4（K79，与 api.rs 终态同纪律）：耗尽终态的
+                            // retry_after 过 clamp——服务端离谱值不透传。
+                            StorageError::RateLimited {
+                                retry_after: retry_after.map(|ra| {
+                                    ra.clamp(retry.retry_after_min, retry.retry_after_max)
+                                }),
+                            }
                         } else {
                             StorageError::Unavailable(format!("part PUT HTTP {status} persisted"))
                         });
@@ -860,7 +868,10 @@ async fn ensure_parents(
             Some(row) if row.is_dir() => cid = row.file_id.to_string(),
             Some(_) => return Err(StorageError::NotFound), // 父链上有文件
             None => {
-                let fid = client.mkdir(cid.parse().unwrap_or(0), &comp).await?;
+                // cid 解析：防御性显式报错（P3/K79——不变式见 lib.rs
+                // parse_cid；绝不 unwrap_or(0) 把隐式父级建到网盘根）。
+                let parent = crate::parse_cid(&cid, "upload/ensure_parents")?;
+                let fid = client.mkdir(parent, &comp).await?;
                 paths.invalidate(&cid).await;
                 cid = fid.to_string();
             }

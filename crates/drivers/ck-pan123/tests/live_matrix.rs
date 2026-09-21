@@ -12,10 +12,12 @@
 //! 前置注明：
 //! - **token**：`cydrive setup`（QR/sign_in）产出，或网页控制台手取；
 //!   90 天有效（K76.4 无 refresh——过期重扫）；
-//! - **root**：**强烈建议专用测试目录的 folder id**（纯数字）——矩阵
-//!   会在卷内建删大量 `cydrive-conformance-*` 条目；缺省 `"0"` =
-//!   网盘根（脏数据自担）；K74 教训：测试 root 绝不用 "0"（rebuild/
-//!   测试完整目录 trash 语义需要专用根）；
+//! - **root**：**必填**——专用测试目录的 folder id（纯数字；既有专用根
+//!   = 名为 `e2e_pan123_root_3800` 的目录，见
+//!   docs/tracking/phase6-pan123.md）。矩阵会在卷内建删大量
+//!   `cydrive-conformance-*` 条目；**绝不直跑账号根**——K74 教训：
+//!   测试 root 绝不用 "0"（忘设即 panic，不默认回退；rebuild/测试
+//!   完整目录 trash 语义需要专用根）；
 //! - 断言族与离线 conformance 同源（interfaces §6 八条；⑤ 错误映射
 //!   与分片级故障注入无真机注入面——离线桩钉死，本套不重复）；
 //! - 命名纪律（K72）：stamp 唯一名 + 按轮随机内容；全部真机文件限定
@@ -96,11 +98,19 @@ fn live_params_with_sessions(dir: Option<PathBuf>) -> Pan123Params {
     let token = std::env::var("CYDRIVE_PAN123_TEST_TOKEN").unwrap_or_else(|_| {
         panic!(
             "CYDRIVE_PAN123_TEST_TOKEN is required for the live matrix: obtain a token via \
-             `cydrive setup` (QR scan or sign_in) and export it; CYDRIVE_PAN123_TEST_ROOT may \
-             pin a dedicated test folder id (default 0 = the netdisk root)"
+             `cydrive setup` (QR scan or sign_in) and export it"
         )
     });
-    let root = std::env::var("CYDRIVE_PAN123_TEST_ROOT").unwrap_or_else(|_| "0".to_string());
+    // P9（K79）：真机根必填——绝不默认 "0"（账号根）。忘设即 panic：
+    // 矩阵在卷根建删大量条目，直跑账号根 = K74 教训复现。
+    let root = std::env::var("CYDRIVE_PAN123_TEST_ROOT").unwrap_or_else(|_| {
+        panic!(
+            "CYDRIVE_PAN123_TEST_ROOT is mandatory for the live matrix: set the dedicated \
+             test folder id (the existing dedicated root is the folder named \
+             `e2e_pan123_root_3800` — see docs/tracking/phase6-pan123.md); never run \
+             against \"0\" (the account root)"
+        )
+    });
     Pan123Params {
         token: Some(token),
         root,
@@ -295,7 +305,8 @@ async fn live_rapid_upload_reuse_hits() {
 /// - **服务端对账**（K74「真 OSS 对账」形态）：中止态 list_parts ==
 ///   [(1, 5MiB)]；完成后会话被消费（本地会话文件清空）；
 /// - **同 UploadId**：writer 的会话文件 upload_id 与裸 client 拿到的
-///   ticket.upload_id 相等——re-request 模型经驱动的端到端钉；
+///   ticket.upload_id 相等——本地五元组记录优先路径经驱动的端到端钉
+///   （有片后 re-request 恒铸新会话，同 id 只可能来自本地记录续传）；
 /// - **只补缺片**（timing）：补 2 片的 write 显著短于对照全量 3 片
 ///   的 write（任务书明示的 timing 证据面）；
 /// - **逐字回读**：续传产物全量读与源逐字（预算内恰一次）。

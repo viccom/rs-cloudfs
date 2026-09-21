@@ -52,6 +52,10 @@
 //! [`DEFAULT_FALLBACK_BASE`]（`api.123278.com`）且**不回切**（粘性——
 //! 防振荡）。
 //!
+//! **域白名单（P1/K79）**：dydomain 产物过 [`is_allowed_api_base`]
+//! （loopback 或 https + 123 家族后缀）——网络应答不得把 Bearer 凭据
+//! 导向任意域；白名单外按 dydomain 失败处理（warn + 维持缺省主域）。
+//!
 //! ## 传输会话分离（§5.12；123-2）
 //!
 //! CDN GET 走 [`Pan123Client::transfer_http`] 的**裸 client**（仅 UA，
@@ -114,7 +118,7 @@ fn masked_snippet(body: &str, token: &str) -> String {
 /// `code` 键**必填**（M2/K78）：无 `code` 键的 JSON（网关/WAF 的
 /// `{"error":"forbidden"}`）不得经缺省 0 吞成成功——解析失败落终态
 /// `Unavailable`；`message`/`data` 的缺省容错保留。
-#[derive(Debug, Clone, Deserialize)]
+#[derive(Clone, Deserialize)]
 pub struct Envelope {
     #[serde(alias = "Code")]
     pub code: i64,
@@ -122,6 +126,19 @@ pub struct Envelope {
     pub message: String,
     #[serde(default, alias = "Data")]
     pub data: Value,
+}
+
+/// P6（K79）：`data` 不进 Debug 输出——恒打 `<redacted>`（认证流的
+/// data 携带 token：sign_in/QR 确认态的成功信封都在 `data` 里，derive
+/// 展开是未来泄漏面）；`code`/`message` 照打（错误分类的诊断面）。
+impl std::fmt::Debug for Envelope {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Envelope")
+            .field("code", &self.code)
+            .field("message", &self.message)
+            .field("data", &"<redacted>")
+            .finish()
+    }
 }
 
 impl Envelope {
@@ -359,8 +376,8 @@ impl DomainState {
 /// 启动期动态域名发现：`GET {primary}/api/dydomain` →
 /// `data.domains[0]`（真机回 `["www.123pan.cn"]` + `ucenterDomain`）。
 ///
-/// 任何失败（传输/非 JSON/`code!=0`/空列表）→ `None`——调用方维持
-/// 缺省主域（123-0 实证三域同答，探测主域即可）。
+/// 任何失败（传输/非 JSON/`code!=0`/空列表/**白名单外**）→ `None`——
+/// 调用方维持缺省主域（123-0 实证三域同答，探测主域即可）。
 pub async fn resolve_domain(http: &reqwest::Client, primary_base: &str) -> Option<String> {
     let resp = http
         .get(format!("{primary_base}/api/dydomain"))
@@ -378,10 +395,80 @@ pub async fn resolve_domain(http: &reqwest::Client, primary_base: &str) -> Optio
     }
     // 真机回裸主机名（`www.123pan.cn`）→ 补 https；已带 scheme 的
     // 容忍原样（测试注入 loopback mock 的形态）。
-    Some(match domain {
+    let base = match domain {
         d if d.starts_with("http://") || d.starts_with("https://") => d.to_string(),
         d => format!("https://{d}"),
-    })
+    };
+    // P1（K79）域白名单：dydomain 是**网络应答**，产物直接成为后续全部
+    // API 请求的 base——Bearer token 会发过去。恶意/被劫持的应答不得
+    // 把凭据导向任意域（pan115 normalize_endpoint 教训同源）。白名单
+    // 外 → warn + 按 dydomain 失败处理（维持缺省主域；failover 机制
+    // 不动——硬编码备域 `api.123278.com` 天然过白名单）。
+    if !is_allowed_api_base(&base) {
+        tracing::warn!(
+            target: "ck_pan123::api",
+            base = %base,
+            "dydomain returned a base outside the API allow-list \
+             (loopback or https on a 123pan.cn/123pan.com/123278.com suffix required): \
+             keeping the default primary"
+        );
+        return None;
+    }
+    Some(base)
+}
+
+/// API 域白名单的 host 判定（P1/K79）：
+///
+/// - loopback（`127.0.0.1` / `localhost` / `[::1]`）恒真——测试桩的
+///   回环注入形态（scheme 豁免见 [`is_allowed_api_base`]）；
+/// - 其余 host 必须后缀命中 123 家族域（`.123pan.cn` / `.123pan.com` /
+///   `.123278.com`，含裸域）——`www.123pan.cn.evil.com` 这类尾缀伪装
+///   不命中（要求的是点分后缀）。
+///
+/// 入参是纯 host（无 scheme/端口；剥取在 [`is_allowed_api_base`]），
+/// 带方括号的 IPv6 字面量容忍原样。
+pub fn is_allowed_api_host(host: &str) -> bool {
+    let h = host.trim_start_matches('[').trim_end_matches(']');
+    if matches!(h, "127.0.0.1" | "localhost" | "::1") {
+        return true;
+    }
+    ["123pan.cn", "123pan.com", "123278.com"]
+        .iter()
+        .any(|bare| h == *bare || h.ends_with(&format!(".{bare}")))
+}
+
+/// dydomain 产物/激活 base 的完整白名单判定（scheme + host 双门）：
+///
+/// - `https` → host 过 [`is_allowed_api_host`] 即真；
+/// - `http` → **仅 loopback 豁免**（无 TLS 的回环测试桩形态；生产
+///   123pan 域恒 https）；
+/// - 其他 scheme / 无 scheme → 假。
+///
+/// 应用面 = [`resolve_domain`]——网络数据变成激活 base 的唯一入口
+/// （构造期 primary/fallback 来自代码常量或测试注入的 loopback，不经
+/// 此门）。
+pub fn is_allowed_api_base(base: &str) -> bool {
+    let Some((scheme, rest)) = base.split_once("://") else {
+        return false;
+    };
+    let authority = rest.split(['/', '?', '#']).next().unwrap_or("");
+    // host:port 与 [IPv6]:port 两种形态剥出 host。
+    let host = if let Some(inner) = authority.strip_prefix('[') {
+        inner.split(']').next().unwrap_or("")
+    } else {
+        authority.split(':').next().unwrap_or("")
+    };
+    match scheme.to_ascii_lowercase().as_str() {
+        "https" => is_allowed_api_host(host),
+        "http" => {
+            is_allowed_api_host(host)
+                && matches!(
+                    host.trim_start_matches('[').trim_end_matches(']'),
+                    "127.0.0.1" | "localhost" | "::1"
+                )
+        }
+        _ => false,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -664,7 +751,14 @@ impl Pan123Client {
                         })
                     {
                         return Err(if is_limited {
-                            StorageError::RateLimited { retry_after }
+                            // P4（K79）：终态 `retry_after` 与等待路径同一
+                            // clamp 纪律——服务端的离谱值（9999s）不透传
+                            // 给消费者（可能照睡一小时）。
+                            StorageError::RateLimited {
+                                retry_after: retry_after.map(|ra| {
+                                    ra.clamp(self.retry.retry_after_min, self.retry.retry_after_max)
+                                }),
+                            }
                         } else {
                             StorageError::Unavailable(format!("{stage}: HTTP {status} persisted"))
                         });
@@ -725,7 +819,12 @@ impl Pan123Client {
                 status,
                 retry_after,
             } => Err(if status == 429 {
-                StorageError::RateLimited { retry_after }
+                // P4（K79）：与 dispatch 的终态同一 clamp 纪律（单次通道
+                // 不重试，载荷纪律不变）。
+                StorageError::RateLimited {
+                    retry_after: retry_after
+                        .map(|ra| ra.clamp(self.retry.retry_after_min, self.retry.retry_after_max)),
+                }
             } else {
                 StorageError::Unavailable(format!(
                     "{stage}: HTTP {status} on a commit-point call \

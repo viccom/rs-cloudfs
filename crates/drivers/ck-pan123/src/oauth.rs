@@ -138,8 +138,10 @@ pub async fn qr_poll(
     let stage = "qr-code/result";
     let (_http, env) = read_envelope(resp, stage).await?;
     // 确认态：code==200 直返 token（真机协议形态——§5.10 唯一非 0
-    // 成功码的第二现场）；code==0 但 data 已带 token 同样收敛到确认。
-    if env.code == 200 || v_str(&env.data, &["token"]).is_some() {
+    // 成功码的第二现场）；code==0 但 data 已带 token 同样收敛到确认
+    // （防御臂——token 键双拼 `token/Token`，与 parse_token 同纪律
+    // P2/K79：大写键形态此前被臂上小写单拼漏掉、误报 Waiting）。
+    if env.code == 200 || v_str(&env.data, &["token", "Token"]).is_some() {
         return Ok(QrPoll::Confirmed {
             token: parse_token(&env.data, stage)?,
         });

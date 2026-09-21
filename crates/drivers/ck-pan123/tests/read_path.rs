@@ -639,3 +639,68 @@ async fn params_carry_limiter_and_retry_tuning() {
     let quota = driver.quota().await.expect("quota");
     assert_eq!(quota.used, 1073741824);
 }
+
+// --------------------------------------- P3（K79）cid 不变式防御 ---
+//
+// 生产不可达性声明：cid 全部由 `params.root`（`from_pairs` 配置校验
+// 纯数字）或 `file_id.to_string()`（i64）铸出——三条链在类型系统 +
+// 配置门下解析失败不可达。但 [`Pan123Params`] 是直接可构造的 pub
+// 结构体（绕过 `from_pairs` 的第二道门即得非数字 root），旧形态
+// `unwrap_or(0)` 会把破损**静默归到网盘根（0）**——错向账号根做
+// mkdir/move 是数据破坏面。P3 = 防御性显式报错（Invalid + error 通道
+// 保留原值）；下列用例以「绕过校验的 root」驱动该防御臂。
+
+/// P3：mkdir 链（lib.rs mkdir 的 `cid.parse()`）——非数字卷根下建目录
+/// 不得静默落进网盘根，显式 Invalid。
+#[tokio::test]
+async fn mkdir_with_a_non_numeric_root_fails_instead_of_targeting_the_netdisk_root() {
+    let s = stub().await;
+    let driver = s.driver_with_root("junk"); // 绕过 from_pairs 校验的形态
+
+    let err = driver
+        .mkdir(&path("d"))
+        .await
+        .expect_err("a non-numeric root must not silently become 0");
+    assert!(matches!(err, StorageError::Invalid), "{err:?}");
+    // 桩状态实锤：网盘根（"0"）零写入。
+    let st = s.state.lock().unwrap();
+    assert!(
+        st.dirs.get("0").unwrap().iter().all(|e| e.name != "d"),
+        "nothing landed in the netdisk root"
+    );
+}
+
+/// P3：rename 的 mod_pid 臂（跨父移动的目标父 cid）——目标父是卷根
+/// 且卷根非数字时，显式 Invalid 而非移动进网盘根。
+#[tokio::test]
+async fn rename_mod_pid_with_a_non_numeric_root_fails_instead_of_moving_to_root() {
+    let s = stub().await;
+    let sub = s.mkdir("0", "src").to_string();
+    s.put_file(&sub, "movable.bin", vec![7; 4]);
+    let driver = s.driver_with_root("junk");
+
+    // 源在数字 cid 子目录、目标父 = 卷根（"junk"）→ 跨父 → mod_pid 臂。
+    let err = driver
+        .rename(&path("src/movable.bin"), &path("renamed.bin"))
+        .await
+        .expect_err("a non-numeric target parent must not silently become 0");
+    assert!(matches!(err, StorageError::Invalid), "{err:?}");
+    // 桩状态实锤：文件仍在源父、网盘根无新行。
+    let st = s.state.lock().unwrap();
+    assert!(
+        st.dirs
+            .get(&sub)
+            .unwrap()
+            .iter()
+            .any(|e| e.name == "movable.bin"),
+        "the file stays in its source parent"
+    );
+    assert!(
+        st.dirs
+            .get("0")
+            .unwrap()
+            .iter()
+            .all(|e| e.name != "renamed.bin" && e.name != "movable.bin"),
+        "nothing moved into the netdisk root"
+    );
+}

@@ -447,3 +447,60 @@ async fn generate_over_non_2xx_with_an_ok_envelope_is_unavailable() {
         other => panic!("expected Unavailable, got {other:?}"),
     }
 }
+
+/// P2（K79）：QR 确认**防御臂**的 token 键双拼（对齐 `parse_token` 的
+/// `token/Token` 双拼纪律——§5.10）。防御臂 = code==0 但 data 已带
+/// token 也收敛 Confirmed；大写 `Token` 键此前被臂上小写单拼漏掉，
+/// 误报 Waiting。
+#[tokio::test]
+async fn qr_confirm_defense_arm_accepts_both_token_key_spellings() {
+    let mock = MockLogin::start().await;
+    let http = MockLogin::http();
+
+    // 小写键：既有行为钉（防御臂的原形态——loginStatus 未报 3 也归
+    // Confirmed）。
+    mock.push_poll(json!({"code": 0, "data": {"loginStatus": 0, "token": "lower"}}));
+    assert_eq!(
+        oauth::qr_poll(&http, &mock.base, "uni")
+            .await
+            .expect("lowercase key confirms"),
+        QrPoll::Confirmed {
+            token: "lower".to_string()
+        }
+    );
+
+    // 大写键 + loginStatus:3：状态机 Some(3) 臂 + parse_token 双拼本已
+    // 归 Confirmed（回归钉——K79 任务的字面形态）。
+    mock.push_poll(json!({"code": 0, "data": {"loginStatus": 3, "Token": "cap-three"}}));
+    assert_eq!(
+        oauth::qr_poll(&http, &mock.base, "uni")
+            .await
+            .expect("status 3 with a capital Token"),
+        QrPoll::Confirmed {
+            token: "cap-three".to_string()
+        }
+    );
+
+    // 大写键 + loginStatus 未报 3（防御臂的真正缺口）：与大写前的小写
+    // 形态同语义——应 Confirmed 而非 Waiting。
+    mock.push_poll(json!({"code": 0, "data": {"loginStatus": 0, "Token": "cap-zero"}}));
+    assert_eq!(
+        oauth::qr_poll(&http, &mock.base, "uni")
+            .await
+            .expect("capital key confirms through the defense arm"),
+        QrPoll::Confirmed {
+            token: "cap-zero".to_string()
+        }
+    );
+
+    // 大写键、无 loginStatus（缺状态 = 等待包的形态）：token 在即确认。
+    mock.push_poll(json!({"code": 0, "data": {"Token": "cap-only"}}));
+    assert_eq!(
+        oauth::qr_poll(&http, &mock.base, "uni")
+            .await
+            .expect("a capital token alone confirms"),
+        QrPoll::Confirmed {
+            token: "cap-only".to_string()
+        }
+    );
+}

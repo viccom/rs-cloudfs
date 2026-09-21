@@ -3,7 +3,7 @@
 //!   真网测试，凭据只经 env / 仓外测试文件（R3）。
 //!
 //! ```text
-//! CYDRIVE_PAN123_TEST_TOKEN=... [CYDRIVE_PAN123_TEST_ROOT=<专用测试目录 fid>] \
+//! CYDRIVE_PAN123_TEST_TOKEN=... CYDRIVE_PAN123_TEST_ROOT=<专用测试目录 fid> \
 //!   cargo test -p cloudkit-cli --test pan123_e2e -- --ignored --test-threads=1 --nocapture
 //! ```
 //!
@@ -63,7 +63,17 @@ fn env_token() -> String {
 }
 
 fn env_root() -> String {
-    std::env::var("CYDRIVE_PAN123_TEST_ROOT").unwrap_or_else(|_| "0".to_string())
+    // P9（K79）：真机根必填——绝不默认 "0"（账号根）。忘设即 panic
+    //（K74 教训：测试直跑账号根会在根下建删条目）；既有专用根 =
+    // 名为 `e2e_pan123_root_3800` 的目录（docs/tracking/phase6-pan123.md）。
+    std::env::var("CYDRIVE_PAN123_TEST_ROOT").unwrap_or_else(|_| {
+        panic!(
+            "CYDRIVE_PAN123_TEST_ROOT is mandatory for the live e2e suite: set the dedicated \
+             test folder id (the existing dedicated root is the folder named \
+             `e2e_pan123_root_3800` — see docs/tracking/phase6-pan123.md); never run \
+             against \"0\" (the account root) — K74 lesson"
+        )
+    })
 }
 
 fn live_params_with_root(root: &str) -> Pan123Params {

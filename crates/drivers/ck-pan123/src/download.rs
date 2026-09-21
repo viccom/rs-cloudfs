@@ -67,6 +67,17 @@ const CDN_BACKOFF: [Duration; 3] = [
     Duration::from_secs(4),
 ];
 
+/// 退避档的选择（P5/K79）：CDN 429/403 已解析的 `Retry-After` **存在时
+/// 优先**（钳制 1–60s——api 面 §5.15 同纪律），否则用梯度档。此前两
+/// 个退避面只睡固定梯度、无视服务端明示的节奏（`Retry-After` 只在终态
+/// 透出）。
+fn cdn_backoff_delay(parsed: Option<Duration>, gradient: Duration) -> Duration {
+    match parsed {
+        Some(ra) => ra.clamp(Duration::from_secs(1), Duration::from_secs(60)),
+        None => gradient,
+    }
+}
+
 /// file_id → 最终应答 URL 的 TTL 缓存。
 #[derive(Default)]
 pub struct DlinkCache {
@@ -224,8 +235,10 @@ async fn fetch_window(
                     }
                     break;
                 }
-                Err(StorageError::RateLimited { .. }) => {
-                    tokio::time::sleep(delay).await;
+                Err(StorageError::RateLimited { retry_after }) => {
+                    // P5（K79）：消费服务端明示的 Retry-After（钳制 1–60s）
+                    // ——缺失才用梯度档。
+                    tokio::time::sleep(cdn_backoff_delay(retry_after, delay)).await;
                 }
                 Err(StorageError::NotFound) => break, // 直链死亡 → 自愈路径
                 Err(e) => return Err(e),
@@ -283,8 +296,9 @@ async fn cold_resolve(
     follow_hops(client, cache, entry.file_id, candidate, start, win_end).await
 }
 
-/// 首窗口/跳链 GET 的限流退避（M10a）：RateLimited 时按 [`CDN_BACKOFF`]
-/// 梯度退避后重试同一 URL，梯度用尽（3 次尝试）才上抛末次
+/// 首窗口/跳链 GET 的限流退避（M10a）：RateLimited 时退避后重试同一
+/// URL（P5/K79：解析出的 `Retry-After` 钳制 1–60s 优先，否则
+/// [`CDN_BACKOFF`] 梯度档），梯度用尽（3 次尝试）才上抛末次
 /// `RateLimited`（`Retry-After` 随终态透出）；其他结果原样返回——
 /// 404/410 死亡信号、传输错、206/重定向等语义不变。
 ///
@@ -304,7 +318,8 @@ async fn window_get_backoff(
             Err(StorageError::RateLimited { retry_after }) => {
                 last = StorageError::RateLimited { retry_after };
                 if i + 1 < CDN_BACKOFF.len() {
-                    tokio::time::sleep(*delay).await;
+                    // P5（K79）：Retry-After（钳制 1–60s）优先于梯度档。
+                    tokio::time::sleep(cdn_backoff_delay(retry_after, *delay)).await;
                 }
             }
             other => return other,
@@ -606,6 +621,38 @@ mod tests {
         );
         assert_eq!(extract_href(r#"<a href="/rel">r</a>"#), None);
         assert_eq!(extract_href("no links"), None);
+    }
+
+    /// P5（K79）：退避档选择——`Retry-After`（钳制 1–60s，api 面同
+    /// 纪律）存在时优先，缺失才用梯度档。
+    #[test]
+    fn cdn_backoff_delay_prefers_the_clamped_retry_after() {
+        let g1 = CDN_BACKOFF[0];
+        let g2 = CDN_BACKOFF[1];
+        // 缺失 → 梯度档。
+        assert_eq!(cdn_backoff_delay(None, g1), g1);
+        assert_eq!(cdn_backoff_delay(None, g2), g2);
+        // 界内 → 服务端值胜过梯度（1s 档等值、5s 胜过 1s 梯度）。
+        assert_eq!(
+            cdn_backoff_delay(Some(Duration::from_secs(1)), g1),
+            Duration::from_secs(1)
+        );
+        assert_eq!(
+            cdn_backoff_delay(Some(Duration::from_secs(5)), g1),
+            Duration::from_secs(5),
+            "an in-range server hint beats the gradient slot"
+        );
+        // 越界 → 钳制（0s 托底 1s；9999s 压顶 60s）。
+        assert_eq!(
+            cdn_backoff_delay(Some(Duration::from_secs(0)), g1),
+            Duration::from_secs(1),
+            "floored to 1s"
+        );
+        assert_eq!(
+            cdn_backoff_delay(Some(Duration::from_secs(9999)), g2),
+            Duration::from_secs(60),
+            "capped at 60s"
+        );
     }
 
     /// dlink 缓存 TTL 与失效。

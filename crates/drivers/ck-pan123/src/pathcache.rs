@@ -233,12 +233,13 @@ pub struct Resolved {
 /// 全量计数）：本页短于请求 limit（页短即尽为硬终止——防 Total 抖动
 /// 死循环），或累计行数 ≥ `Total`。
 pub async fn list_all(client: &Pan123Client, cid: &str) -> Result<Vec<FileEntry>, StorageError> {
+    // cid 非数字 → Invalid（绝不静默归网盘根——错置缓存行同 mkdir/move
+    // 面的防御裁决，见 lib.rs 的 parse_cid 文档）。
+    let cid = crate::parse_cid(cid, "pathcache::list_all")?;
     let mut out: Vec<FileEntry> = Vec::new();
     let mut page = 1u32;
     loop {
-        let (rows, total) = client
-            .list_page(cid.parse().unwrap_or(0), page, PAGE)
-            .await?;
+        let (rows, total) = client.list_page(cid, page, PAGE).await?;
         let short = (rows.len() as u32) < PAGE;
         out.extend(rows);
         if short || (total >= 0 && out.len() as i64 >= total) {

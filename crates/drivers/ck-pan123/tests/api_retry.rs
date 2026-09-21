@@ -337,3 +337,96 @@ async fn the_get_face_keeps_retrying_under_the_same_injection() {
     assert_eq!(info.uid, 7);
     assert_eq!(mock.requests().len(), 2, "the retryable face retries");
 }
+
+// ------------------------------------------- P4（K79）终态 clamp 纪律 ---
+
+/// 429 耗尽终态的 `retry_after` 过 clamp（与等待路径同一纪律——§5.15
+/// 的 1–60s）：服务端明示 9999s 不得原样透传（消费者可能照睡一小时），
+/// 过小值（0）托底到 min。`limited_max = 0`：首击即耗尽——零退避等待
+/// 的纯终态断言（等待路径的 clamp 已有既有用例钉）。
+#[tokio::test]
+async fn exhausted_429_clamps_the_terminal_retry_after() {
+    let client_with = |mock: &Mock| {
+        // 生产 clamp 1–60s + 首击即终态（limited_max = 0——零退避等待）。
+        let cfg = RetryConfig {
+            limited_max: 0,
+            ..RetryConfig::default()
+        };
+        Pan123Client::with_tuning(
+            TOKEN.to_string(),
+            mock.base.clone(),
+            mock.base.clone(),
+            Some("mock-login-uuid".to_string()),
+            ck_pan123::limiter::LimiterConfig::fast(),
+            cfg,
+        )
+        .expect("client")
+    };
+
+    // 上界腿：9999s → 60s。
+    let mock = Mock::start(1, 429, Some(9999)).await;
+    let err = client_with(&mock)
+        .user_info()
+        .await
+        .expect_err("exhausts at once");
+    assert!(
+        matches!(
+            &err,
+            StorageError::RateLimited { retry_after: Some(d) } if *d == Duration::from_secs(60)
+        ),
+        "9999s clamps down to the 60s ceiling: {err:?}"
+    );
+
+    // 下界腿：0s → 1s。
+    let mock = Mock::start(1, 429, Some(0)).await;
+    let err = client_with(&mock)
+        .user_info()
+        .await
+        .expect_err("exhausts at once");
+    assert!(
+        matches!(
+            &err,
+            StorageError::RateLimited { retry_after: Some(d) } if *d == Duration::from_secs(1)
+        ),
+        "0s clamps up to the 1s floor: {err:?}"
+    );
+}
+
+/// P4 对照腿：提交点单次通道（dispatch_single）的 429 终态同样过
+/// clamp——单次通道不重试，但终态 `RateLimited` 的载荷纪律与 dispatch
+/// 一致（不透传服务端的离谱值）。
+#[tokio::test]
+async fn commit_point_429_terminal_also_clamps_retry_after() {
+    let mock = Mock::start(1, 429, Some(9999)).await;
+    // 单次通道本就不重试——配置只影响 clamp 常量（生产 1–60s）。
+    let cfg = RetryConfig::default();
+    let client = Pan123Client::with_tuning(
+        TOKEN.to_string(),
+        mock.base.clone(),
+        mock.base.clone(),
+        Some("mock-login-uuid".to_string()),
+        ck_pan123::limiter::LimiterConfig::fast(),
+        cfg,
+    )
+    .expect("client");
+    let ticket = UploadTicket {
+        up_file_id: 1,
+        bucket: "mock-bucket".into(),
+        key: "mock-key".into(),
+        upload_id: "mock-upload".into(),
+        storage_node: "mock-node".into(),
+        slice_size: None,
+    };
+    let err = client
+        .upload_complete_v2(&ticket, 1)
+        .await
+        .expect_err("commit point surfaces the 429 terminally");
+    assert!(
+        matches!(
+            &err,
+            StorageError::RateLimited { retry_after: Some(d) } if *d == Duration::from_secs(60)
+        ),
+        "the single-shot terminal clamps too: {err:?}"
+    );
+    assert_eq!(mock.requests().len(), 1, "still a single attempt");
+}

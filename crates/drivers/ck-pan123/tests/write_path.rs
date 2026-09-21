@@ -16,8 +16,10 @@
 //! - **5060 → duplicate:2 重发**（D4：2=同 FileId 原地覆盖；**绝不发
 //!   1**——dup1 的 name(1).ext 副本形态只在桩侧真相建模）；
 //! - **resume 差集**：到齐即传 + 每片即落会话；close 失败后重开 writer
-//!   同路径同内容 → 同参重发返回同一会话 → list 对账 → **只补缺片**
-//!   （PUT 命中差分是能力位⑦的驱动层可观测证据）；
+//!   同路径同内容 → **本地五元组记录优先**（123-5 真机修正：已传分片
+//!   后 re-request 恒铸新会话——本地记录才是差集路径；miss/会话已亡
+//!   才 re-request 引导）→ list 对账 → **只补缺片**（PUT 命中差分是
+//!   能力位⑦的驱动层可观测证据）；
 //! - **会话失效**（ListParts NoSuchKey）→ 重走 upload_request 全量重传
 //!   恰一次；仍失效 → `Io`（不自陷循环）；
 //! - **close 对未确认态复核**（M8/K78）：write 在④步中途失败后吞错
@@ -59,15 +61,20 @@ fn md5_hex(data: &[u8]) -> String {
     out.iter().map(|b| format!("{b:02x}")).collect()
 }
 
-/// 伪随机内容（确定性：索引字节流——避免同内容意外命中桩的 Reuse）。
+/// 伪随机内容（确定性）：64 位 LCG（live_matrix `pattern` 同款形态——
+/// P7/K79）。**不用 u8 小种子线性递推**：u8 状态空间 256、周期仅 8，
+/// 同 size 用例间（不同 seed）有撞桩 Reuse 的隐患（etag 撞车 = 服务端
+/// 秒传短路）；u8 种子入口保留，内部扩到 64 位状态。
 fn content(len: usize, seed: u8) -> Vec<u8> {
-    let mut data = Vec::with_capacity(len);
-    let mut x = seed;
-    for _ in 0..len {
-        x = x.wrapping_mul(31).wrapping_add(17);
-        data.push(x);
-    }
-    data
+    let mut state = (seed as u64) | 1;
+    (0..len)
+        .map(|_| {
+            state = state
+                .wrapping_mul(6364136223846793005)
+                .wrapping_add(1442695040888963407);
+            (state >> 33) as u8
+        })
+        .collect()
 }
 
 async fn read_all(driver: &Pan123Driver, p: &RelPath) -> Vec<u8> {
@@ -763,4 +770,33 @@ async fn abort_never_reaches_the_commit_family() {
         driver.stat(&path("gone.bin")).await,
         Err(StorageError::NotFound)
     ));
+}
+
+/// P3（K79）：establish_session 的 parent cid（upload.rs
+/// `parent_cid.parse()`）——非数字卷根（绕过 `from_pairs` 校验直接构造
+/// 参数的形态；生产路径 root 经配置门恒数字，此处钉防御臂）下，上传
+/// 会话的建立显式 Invalid，**绝不**把 upload_request 静默发给网盘根
+/// （parent=0 会把文件建进账号根——数据破坏面）。根级文件路径让
+/// ensure_parents 零迭代（cid 原样透传到 stager）——正好命中该解析点。
+#[tokio::test]
+async fn upload_with_a_non_numeric_root_fails_instead_of_targeting_the_netdisk_root() {
+    let s = stub().await;
+    let driver = s.driver_with_root("junk");
+    let data = content(4096, 0x5A);
+
+    let err = write_and_close(&driver, &path("root-level.bin"), &data, 1024)
+        .await
+        .expect_err("a non-numeric parent must not silently become 0");
+    assert!(matches!(err, StorageError::Invalid), "{err:?}");
+    // 桩状态实锤：网盘根零上传、上传会话零建立。
+    assert_eq!(s.hits("/b:upload_request"), 0);
+    let st = s.state.lock().unwrap();
+    assert!(
+        st.dirs
+            .get("0")
+            .unwrap()
+            .iter()
+            .all(|e| e.name != "root-level.bin"),
+        "nothing landed in the netdisk root"
+    );
 }

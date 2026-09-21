@@ -30,8 +30,9 @@
 //! 落 spool，写入量达到承诺 size 的那次 write 立刻推传输链（①–⑤，
 //! 含全部分片 PUT 与确认 list），close 只做 ⑥⑦。断言⑦第一段「写满
 //! staged 后 drop」因此**已经把全部整片发给后端**（drop 只清 spool，
-//! 会话保留——resume 声明），第二轮同路径同内容经 re-request 模型拿
-//! 回同一 UploadId + list 对账全在册 → 零重传。下方
+//! 会话保留——resume 声明），第二轮同路径同内容走**本地五元组记录
+//! 优先**（123-5 真机修正后的主路径——已传分片后 re-request 恒铸新
+//! 会话，本地记录才是差集路径）→ list 对账全在册 → 零重传。下方
 //! `pan123_part_level_diff_resume` 再钉分片级差集（第一轮中途故障，
 //! 第二轮只补缺失片）。
 
@@ -207,7 +208,8 @@ async fn pan123_partial_parts_resume_only_missing() {
     let first_pass_bytes = stub.put_bytes_received();
     assert_eq!(first_pass_bytes, CHUNK, "exactly part 1 landed");
 
-    // 第二轮：同参 re-request → 同一 UploadId → list 对账 [1] 在册
+    // 第二轮：本地五元组记录优先（第 1 片已传 → re-request 恒铸新会话
+    // ——123-5 真机修正；本地记录才是差集路径）→ list 对账 [1] 在册
     // → 只补 2、3 两片（旋钮解除——位置故障只在第一轮存在）。
     stub.state.lock().unwrap().put_fail_after_parts = 0;
     let mut st2 = driver.writer(&path, &hint).await.expect("writer 2");

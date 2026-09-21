@@ -28,7 +28,8 @@
 //!   `UploadId:""`）；同名冲突 bare → 5060 + `data{etag,size,updated_at}`，
 //!   `duplicate:1` = `name(1).ext` 副本（KeepBoth）、`duplicate:2` = 同
 //!   FileId 原地覆盖（会话记 overwrite_fid，v2 落库时替换）；**同参重发
-//!   返回同一 UploadId + up_file_id（resume 会话保留实证）**
+//!   仅在零片会话上复用同一 UploadId + up_file_id；任一分片已传后重发
+//!   恒铸新会话（123-5 真机三轮实验，resume 会话保留实证）**
 //! - `/b/api/file/s3_list_upload_parts`——**小写 `storageNode`**；响应
 //!   `data.Parts[]`（`ETag`/`PartNumber` 字符串/`Size` 字符串）；会话被
 //!   complete 消费/幽灵 → `code:-1` ListParts NoSuchKey 404 形态
@@ -113,7 +114,8 @@ impl StubEntry {
     }
 }
 
-/// 上传会话（服务端保留形态——同参重发返回同一 UploadId + up_file_id）。
+/// 上传会话（服务端保留形态——零片会话的同参重发复用同一 UploadId +
+/// up_file_id；有片后重发铸新，123-5 真机规则）。
 pub struct StubUploadSession {
     pub parent: i64,
     pub name: String,
@@ -181,7 +183,8 @@ pub struct StubState {
     // ------------------------------------------------------- 写面旋钮 ---
     /// 上传会话表（upload_id → 会话）。
     pub sessions: HashMap<String, StubUploadSession>,
-    /// 同参键（parent|name|etag|size）→ upload_id（会话保留模型）。
+    /// 同参键（parent|name|etag|size）→ upload_id（会话保留模型——
+    /// 零片重发复用同 id，有片重发铸新）。
     pub session_index: HashMap<String, String>,
     /// 下一个临时 up_file_id（大数形态起点）。
     pub next_up_file_id: i64,
@@ -838,8 +841,9 @@ fn renamed_copy(st: &StubState, parent: &str, name: &str) -> String {
 /// 3. 同名冲突：bare → `code:5060` + `data{etag,size,updated_at}`；
 ///    `duplicate:1` → `name(1).ext` 副本；`duplicate:2` → 会话记
 ///    overwrite_fid（v2 落库时原地替换）；
-/// 4. 会话保留：同参键（parent|name|etag|size）重发返回**同一
-///    UploadId + up_file_id**、已收分片保留（resume 实证）；幽灵会话
+/// 4. 会话保留：同参键（parent|name|etag|size）重发**仅在零片时**返回
+///    同一 UploadId + up_file_id；有片后重发铸新会话、旧会话已收分片
+///    保留（123-5 真机实证）；幽灵会话
 ///    （被 complete 消费）按 `reissue_fresh_after_ghost` 旋钮换新或粘住。
 async fn upload_request_file(State(state): State<Arc<Mutex<StubState>>>, body: String) -> Response {
     let mut st = state.lock().unwrap();
@@ -987,7 +991,8 @@ async fn upload_request_file(State(state): State<Arc<Mutex<StubState>>>, body: S
         (None, _) => name.clone(),
     };
 
-    // ---- 会话（保留模型：同参重发返回同一 UploadId + up_file_id）。
+    // ---- 会话（保留模型：零片重发复用同 id；有片重发铸新——真机规则
+    // 见下方 123-5 注释）。
     let skey = format!("{parent}|{name}|{etag}|{size}");
     let existing_sid = st.session_index.get(&skey).cloned();
     let sid = match existing_sid {

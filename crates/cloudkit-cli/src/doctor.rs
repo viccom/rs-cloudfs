@@ -536,9 +536,10 @@ pub fn backend_checks(cfg: &cloudkit_core::config::CyDriveConfig) -> Vec<CheckRe
                 results.push(CheckResult {
                     name: "pan123_root".to_string(),
                     status: CheckStatus::Warn,
-                    detail: "pan123_root is unset: this volume maps the whole account \
-                             (set a folder id to scope it; deletes go to the 123 \
-                             recycle bin and recover via the official client)"
+                    detail: "pan123_root is unset (or set to \"0\"): this volume maps \
+                             the whole account (set a folder id to scope it; deletes \
+                             go to the 123 recycle bin and recover via the official \
+                             client)"
                         .to_string(),
                 });
             }
