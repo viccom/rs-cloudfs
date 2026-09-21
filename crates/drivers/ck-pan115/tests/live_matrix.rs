@@ -7,11 +7,14 @@
 //! ```text
 //! CYDRIVE_PAN115_TEST_ACCESS_TOKEN=... \
 //! CYDRIVE_PAN115_TEST_REFRESH_TOKEN=... \
+//! CYDRIVE_PAN115_TEST_ROOT=<专用测试根> \
 //! cargo test -p ck-pan115 --test live_matrix -- --ignored --test-threads=1 --nocapture
 //! ```
 //!
-//! 可选：`CYDRIVE_PAN115_TEST_ROOT`（缺省 `0` 网盘根——矩阵自建
-//! `/_e2e_pan115/` 子目录并只在该目录内作业）、`CYDRIVE_PAN115_TEST_CLIENT_ID`。
+//! **必填**：`CYDRIVE_PAN115_TEST_ROOT`——专用测试根（K74 教训：`0` =
+//! 账号根，e2e rebuild 腿曾以 root=`0` 跑出全账号 11.7 万文件 25 分钟
+//! 扫描；缺失即 panic）。矩阵自建 `/_e2e_pan115/` 子目录并只在该目录
+//! 内作业。可选：`CYDRIVE_PAN115_TEST_CLIENT_ID`。
 //!
 //! 作业纪律（负责人 115-0 指令）：所有测试文件限定 `/_e2e_pan115/`
 //! 专用子目录；收尾清理（删除进回收站 = D2 语义，可恢复）；列目录/
@@ -43,7 +46,8 @@ async fn live_driver() -> Pan115Driver {
         .expect("set CYDRIVE_PAN115_TEST_ACCESS_TOKEN (see the module docs)");
     let refresh = std::env::var("CYDRIVE_PAN115_TEST_REFRESH_TOKEN")
         .expect("set CYDRIVE_PAN115_TEST_REFRESH_TOKEN");
-    let root = std::env::var("CYDRIVE_PAN115_TEST_ROOT").unwrap_or_else(|_| "0".to_string());
+    let root = std::env::var("CYDRIVE_PAN115_TEST_ROOT")
+        .expect("set CYDRIVE_PAN115_TEST_ROOT to a dedicated test root (K74: \"0\" = account root — rebuild walks the whole account; a dedicated folder is mandatory)");
     let client_id = std::env::var("CYDRIVE_PAN115_TEST_CLIENT_ID")
         .unwrap_or_else(|_| ck_pan115::DEFAULT_CLIENT_ID.to_string());
     let params = Pan115Params {
@@ -240,17 +244,20 @@ async fn rapid_upload_hits_on_the_second_round() {
 // 挂账收口扩展（2026-09-16 晚批）：多分片 / 目录 rename / 断点续传
 // ---------------------------------------------------------------------
 
-/// 真机驱动的参数形态（resume 用例需要注入 sessions_dir）。
+/// 真机驱动的参数形态（resume 用例需要注入 sessions_dir）。测试根同
+/// [`live_driver`] 必填（K74：`0` = 账号根全账号扫描）。
 fn live_params(sessions_dir: Option<std::path::PathBuf>) -> Pan115Params {
     let (access, refresh) = (
         std::env::var("CYDRIVE_PAN115_TEST_ACCESS_TOKEN").expect("env access token"),
         std::env::var("CYDRIVE_PAN115_TEST_REFRESH_TOKEN").expect("env refresh token"),
     );
+    let root = std::env::var("CYDRIVE_PAN115_TEST_ROOT")
+        .expect("set CYDRIVE_PAN115_TEST_ROOT to a dedicated test root (K74: \"0\" = account root — rebuild walks the whole account; a dedicated folder is mandatory)");
     Pan115Params {
         client_id: ck_pan115::DEFAULT_CLIENT_ID.to_string(),
         access_token: Some(access),
         refresh_token: Some(refresh),
-        root: "0".to_string(),
+        root,
         api_base: ck_pan115::DEFAULT_API_BASE.to_string(),
         passport_base: ck_pan115::DEFAULT_PASSPORT_BASE.to_string(),
         token_store: None,
