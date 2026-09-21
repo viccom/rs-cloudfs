@@ -13,7 +13,7 @@
 3. `docs/standards/code-style.md` / `interfaces.md` / `logging.md` / `documentation.md` / `driver-onboarding.md` —— 门禁与规范（driver-onboarding = 新驱动 PR 验收依据；**v1.1 §10 = transport-only 驱动类**——两班制只在驱动契约面：窄面 `CloudTransport`（telegram 先例，后端无按路径枚举面）vs 宽面 `StorageDriver`+conformance（baidu/local/sftp）；**编译开关面全驱动平权**）
 4. `docs/plans/2026-09-06-multicloud.md` —— 百度情报附录 A（端点/参数/errno/dlink/Range 实证）
 5. `docs/decisions.md` —— 历史裁决（自 rs-CyDrive 继承，继续追加）
-6. `docs/tracking/<phase>.md` —— 当前阶段任务跟踪单（最近：`phase6-pan123.md`——**六批次完成（2026-09-20 收口，K77）**，遗留挂账见其「风险与未覆盖」节；下一阶段未立项；**开工先读、每批收口更新**）
+6. `docs/tracking/<phase>.md` —— 当前阶段任务跟踪单（最近：`phase6-pan123.md`——**六批次完成（2026-09-20 收口，K77）**，遗留挂账见其「风险与未覆盖」节；当前 = `phase7-webdav.md`——**Phase 7 webdav 驱动立项（2026-09-21，K80/K81），WD0–WD5 执行中**；**开工先读、每批收口更新**）
 7. `docs/platform-builds.md` —— 三平台构建指南（Windows/Linux 原生 + macOS 交叉；实测数字与坑速查——**做平台相关构建/交叉编译前先读**）
 
 ## 当前阶段
@@ -39,6 +39,8 @@
 **K74 真机验证批完成（2026-09-17，fix/phase5-review）**：真机 token（`E:\GitHub\rs-CyDrive\test\pan115-tokens.json`，probe-refresh 先轮换落盘）跑全真机板——**live_matrix 6/6 + pan115_e2e 4/4**。**真机新揭审查漏网缺陷**：`ufile/move` 目标参数官方形态是 **`to_cid`**（SDK/桌面版双参照），驱动误发 `to_pid` → 错误包恒 200 文化下**静默错置**（文件落账号根、目标列表不可见）——修复 3c5ab51（两桩同步改 SDK 严格建模，「桩照实现抄」第三例）；旧形态在账号根累积 21 件测试碎片已严格命名模式清扫核空。**e2e rebuild 腿双缺陷**（root="0" driver 传给 rebuild = 全账号 11.7 万文件 1rps 25 分钟 vs scoped driver **2.0s**——rebuild 从 driver 卷根走的契约实证；固定名种子撞 K72）修复 fe4844a。**探针方法论教训（K74.3）**：「不可见」调查先核对观察点与操作目标是否同一目录，结论必须出自直查端点的原始响应。M-S1 新句柄 delete 真机 ✓、④随机化 ✓、⑥ resume 真 OSS 对账 ✓；M-S3 真机 401/410 实发未遇（挂账维持）、直链 TTL 真值未测（维持）。
 
 **K75 Low 收尾批完成（2026-09-17，fix/phase5-review）**：Low 挂账 13 条清偿 6、裁决不修 7（查证支撑）。**K75-1** rename move 臂的 `Io/Unavailable → Exists` 宽映射删除（传输失败伪装目标占用会引导用户覆盖操作；红→绿：502 形态不误报 + 源原位）。**K75-2** 放弃上传远端释放：`oss::abort_multipart`（DELETE ?uploadId）+ stager abort 先释放远端再清本地——OSS 未 complete 分片**保留计配额**，此前每次放弃 multipart 都泄漏（红→绿：桩恰一次 abort；失败仅告警）。**K75-3** 一行级×4：open_writer create_dir_all / setup_http_client IPv4（K18 对齐）/ conformance tempfile / doctor 两臂字面空格 + debris。**裁决不修**（K75.4）：OSS status=0 retryable 标签（`decide_retry` 对任何错误都退避重试，零行为差）、多卷 limiter 相加（4rps 余量足）等 7 条各有查证。workspace 1238/0/34，五门禁绿。
+
+**Phase 7 立项（2026-09-21，K80+K81，批准令 = 负责人实施指令）**：webdav 驱动（第 7 驱动）——计划 `docs/plans/2026-09-17-webdav-driver.md` + 跟踪单 `docs/tracking/phase7-webdav.md`。**选型**：自铸薄异步客户端（reqwest + quick-xml——唯一新增 crates.io 直接依赖；骨架移植负责人自有 rs-f4ss + OpenList gowebdav 负面清单逐条正面修 + rclone webdav.go 怪癖情报；reqwest_dav 不采）；宽面 `StorageDriver`+`CloudTransport` 双面照 ck-sftp；组合根 K30 feature `webdav` 平权门控。**测试策略**：双桩制（手搓注入桩按 RFC 4918/7616 严格建模 + dav-server 参照桩——K74「桩照实现抄」防线）+ WD5 WSL2 双真机服务器（rclone serve webdav + Apache mod_dav 含 Digest），四实现交叉。D1–D6 拍板（Basic/Digest 协商、mtime best-effort 双 vendor、rustls+开洞键、vendor 显式两值、PUT(.part)+MOVE 固化、单连接池 8MiB 窗口）见 decisions K81。批次 WD0–WD5 顺序执行，worktree `feat/webdav-driver` 独立 target。
 
 ## 常用命令（仓库根）
 ```
