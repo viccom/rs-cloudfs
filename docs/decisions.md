@@ -842,3 +842,20 @@ K78（12 Medium）后，负责人批准 Low 收尾范围 =「建议修 8 条 + p
 - **K79.6 测试基建**：write_path content() 64 位 LCG（u8 周期 8 的桩 Reuse 碰撞雷）；真机测试根必填 panic（pan123 live_matrix/e2e + pan115 live_matrix 含 live_params 硬编码 root="0" 三用例收口——K74 教训的机制化）；陈旧 resume 注释七处清理（被证伪模型的叙述误导后来者）。
 - **K79.7 pan115 顺带**：DlinkCache 上界 DLINK_CAP=1024（K73 遗留的 M-S5 同族欠账，M4 方案平移）。
 - **K79.8 终态**：workspace **1394/0/42**（+12 测试）、clippy/fmt/check_layers/scan_secrets 绿、既有断言零漂移。剩余 ~14 条 Low 维持不修裁决（findings §8 挂账表）。本条占用 K79 后，Phase 7 webdav 计划原拟编号再顺延为 K80/K81。
+
+## 2026-09-21 K80：Phase 7 立项——WebDAV 驱动选型与方案（负责人实施指令批准）
+
+- **K80.1 批准形态**：负责人 2026-09-21 实施指令即计划批准令（`docs/plans/2026-09-17-webdav-driver.md`），全程自主执行；编号顺延落 K80/K81（原拟 K77/K78 已被 Phase 6 占用，计划头部留痕）。
+- **K80.2 选型**：协议层为**自铸薄异步客户端**（reqwest + quick-xml，~800 行）——骨架移植 rs-f4ss 已验证资产（负责人自有项目，零许可负担，按本仓风格重构不逐字搬）；**reqwest_dav 不采**（能省的恰是最薄部分，digest 正确性无从掌控、桩故障注入要绕它的抽象）；OpenList gowebdav fork 为认证协商正面结构 + 负面清单（§4.5 逐条正面修），rclone webdav.go 为服务端怪癖矩阵情报源。依赖增量 = 唯一新增 quick-xml（MIT 无传递）。
+- **K80.3 形态**：宽面 `StorageDriver` + `CloudTransport` 双面（照 ck-sftp——WebDAV 有按路径枚举面，走 driver-onboarding §1–§9 全量公民路线）；crate `crates/drivers/ck-webdav` 七模块；feature 门控 `webdav` 与其他驱动平权（第 7 驱动）；L2 以上零改动，既有六驱动零侵入。
+- **K80.4 测试策略**：双桩制（手搓注入桩按 RFC 4918/7616 严格建模 + dav-server 参照桩防「桩照实现抄」共享盲区）+ WD5 WSL2 双真机服务器（rclone serve webdav / Apache mod_dav 含 Digest）——四实现交叉。
+- **K80.5 边界**：计划 §7「明确不做」照行（NTLM/Kerberos、OC-Chunked、秒传、多源并行分片读、LOCK/版本、RFC 6578 sync、vendor 嗅探）；D2/D5 被 WD0 证据推翻属计划预设修订路径，按计划修订留痕不算越权。
+
+## 2026-09-21 K81：Phase 7 D1–D6 拍板正式生效（承接计划 §8 负责人 2026-09-17 已批倾向）
+
+- **D1 认证** = Basic（预发）+ Digest（401 challenge 协商恰一次；stale nonce 再协商恰一次）；`webdav_auth` 缺省 auto；NTLM/Kerberos 明确拒绝 + 可行动文案；明文 HTTP + Basic 启动 warn。
+- **D2 mtime** = 读 `getlastmodified` 真源；写 best-effort：generic=PROPPATCH lastmodified（405/507 静默+debug）、nextcloud=PUT 携 `X-OC-Mtime`。WD0 怪癖矩阵复核，两服务器均反证则降级「只读 mtime」并修订计划。
+- **D3 TLS** = rustls 严格校验默认 + 卷键 `webdav_accept_invalid_certs`（缺省 false）开洞；true 时启动 warn + doctor 提示；非凭据键不入 SECRET 清单。
+- **D4 vendor 键** = generic（缺省）/ nextcloud 两值，只影响 mtime 写策略；v1 不嗅探。
+- **D5 上传** = v1 全量本地 spool → PUT(.part) 带 Content-Length → MOVE 固化；chunked 直传快路径挂账（WD0 证 chunked 普遍接受再议）。
+- **D6 连接** = 单 reqwest Client（池内并发），读窗口 8 MiB 串行；同卷多连接分片留 WD5 实测后再议（sftp SF5 判例口径）。
