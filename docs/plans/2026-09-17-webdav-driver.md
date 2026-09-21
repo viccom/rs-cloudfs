@@ -235,10 +235,10 @@ quota 方法：RFC 4331 `quota-used/bytes`、`quota-available-bytes` PROPFIND be
 ## 8. 拍板记录（D1–D6，负责人 2026-09-17 会话已批准倾向，随本计划批准正式生效 → decisions K77）
 
 - **D1 认证 = Basic（预发）+ Digest（401 challenge 协商，恰一次重试；stale nonce 再协商恰一次）**。auto 缺省；NTLM/Kerberos 明确拒绝。明文 HTTP + Basic 时启动 warn（凭据裸奔提示）。
-- **D2 mtime = 读 `getlastmodified` 真源；写 best-effort**：generic = PROPPATCH lastmodified（405/507 静默 + debug 日志）；nextcloud = PUT 携 `X-OC-Mtime`。WD0 怪癖矩阵复核后若有反证（如两服务器均不支持）则降级为「只读 mtime」并修订本条。
+- **D2 mtime = 只读真源 `getlastmodified`；generic 不写 mtime**（**WD0 修订 2026-09-21**，触发计划预设降级路径：rclone 对 PROPPATCH 双形态皆 207+内层 403、apache 假成功存 dead prop 真实 mtime 不变——两家均不能真写，证据 = 附录 C ①/fixture 文档）。nextcloud = PUT 携 `X-OC-Mtime` 保留（fixture 无 Nextcloud 未实证、零成本搭车；vendor 键语义不变，仍只影响此头是否发送）。原案「generic PROPPATCH best-effort」撤销——对 rclone 白吃 403、对 apache 制造假成功日志，均无价值。
 - **D3 TLS = rustls 严格校验默认** + 卷键 `webdav_accept_invalid_certs`（缺省 false）开洞；true 时启动 warn + doctor 提示。
 - **D4 vendor 键 = generic（缺省）/ nextcloud 两值**，只影响 mtime 写策略；v1 不嗅探（Server 头嗅探是脆弱面）。
-- **D5 上传 = v1 全量本地 spool → PUT(.part) 带 Content-Length → MOVE 固化**；chunked 直传快路径挂账（WD0 证 chunked 普遍接受再议）。
+- **D5 上传 = v1 全量本地 spool → PUT(.part) 带 Content-Length → MOVE 固化**；chunked 直传快路径挂账（WD0 证 chunked 普遍接受再议。**WD0 复核 2026-09-21**：双 fixture 均接受 chunked PUT（附录 C ③），但样本仅二不构成「普遍」——v1 维持 Content-Length 路线，挂账维持）。
 - **D6 连接 = 单 reqwest Client（池内并发）**，读窗口 8 MiB 串行；同卷多连接分片留 WD5 实测后再议（sftp SF5 判例）。
 
 ## 9. 验收总纲（driver-onboarding §8 清单对照）
@@ -284,8 +284,18 @@ vendor 键三分（nextcloud/owncloud/other）决定 mtime 策略与 `X-OC-Mtime
 - twin 组合测试先例：`crates/cloudkit-cli/tests/pan115_combo_dispatch.rs`（WD4 复制模式）
 - fixture 先例：`docs/tracking/phase4-sftp-fixture.md`（WD0 产出 `phase7-webdav-fixture.md` 同形态）
 
-## 附录 C：WD0 spike 输出（占位——spike 批次后回填怪癖矩阵）
+## 附录 C：WD0 spike 输出（2026-09-21 回填；证据全文 = `docs/tracking/phase7-webdav-fixture.md` 怪癖矩阵表）
 
-| 怪癖 | rclone serve webdav | Apache mod_dav | 判定 |
+| 怪癖 | rclone serve webdav v1.60.1 | Apache mod_dav 2.4.58 | 判定/对策 |
 |---|---|---|---|
-| （WD0 回填） | | | |
+| ① PROPPATCH 写 mtime | 207+内层 403（双形态皆拒） | 207+内层 200 但存 dead prop（真实 mtime 不变）；getlastmodified 形态→内层 409 | **D2 降级：generic 只读 mtime**（§8-D2 已修订留痕） |
+| ② X-OC-Mtime | 忽略 | 忽略 | nextcloud 值保留搭车（fixture 无 NC 未实证） |
+| ③ chunked PUT | 接受 | 接受 | D5 维持（样本仅二，挂账） |
+| ④ Range | 206/钳制 206/416；倒序→416 | 206/钳制 206/416；**倒序→200 全量** | 200 截断回退必须实现 |
+| ⑤ MOVE | F→412/T→204；**缺 Overwrite 头+存在→412**（偏离 RFC 缺省 T）；目录 201；**VFS 缓存不可见窗 ≈5min**（子项 404/500、窗内 DELETE 撒谎；数据已落盘） | F→412/T→204；目录 no-slash→301 不执行；slashed→201；缺父→500 | 恒显式 Overwrite；目录腿全尾斜杠；rclone 窗口挂账 |
+| ⑥ MKCOL | **已存在→201（幂等成功陷阱）**；缺父 409 | 已存在 slashed→405；缺父 409 | **mkdir 先 stat 预检**（baidu 同型先例） |
+| ⑦ DELETE | 204/404/递归 204（尾斜杠不敏感） | slashed 204；no-slash 集合→301 不执行 | 集合 DELETE 尾斜杠 |
+| ⑧ PROPFIND | 尾斜杠全不敏感（文件+/也 207）；`D:` 前缀；href 大写 `%C3%BC`+`&amp;` | **集合 no-slash→301**；同文档 `D:/ns0:/lp1:/g0:` 多前缀并存；ISO8601 creationdate | 集合 PROPFIND 尾斜杠；**local-name 解析**；href 反转义+解码 |
+| ⑨ 认证 | Basic challenge `realm="rclone"` | Digest challenge；stale=true 位置不定；**nc 重放不查**；过期→401+stale→新 nonce 一次恢复 | 引号感知+顺序无关解析；nc 单调自守；stale 恰一次（D1 实证可行） |
+| ⑩ Destination | 相对 URI 接受 | 相对 URI→400 拒 | 恒绝对 URI |
+| ⑪ quota RFC4331 | 内层 404 | 内层 404 | None 降级实证 |
