@@ -876,3 +876,98 @@ async fn pan123_dead_probe(base: &str) -> ck_pan123::Pan123Probe {
     };
     ck_pan123::probe(&params).await
 }
+
+// ------------------------------------------------------------- webdav -------
+//
+// Phase 7 / WD1b: the dispatch wiring over the WD1a skeleton — the
+// factory constructs OFFLINE (D6: the reqwest pool connects lazily),
+// so the with-driver arm needs no server; the verb faces stay
+// Unsupported placeholders until WD2/WD3 (asserted in ck-webdav's own
+// tests). The volume identity mirrors the WD1a driver:
+// `webdav:<user>@<normalized-base-url>`.
+
+/// A validate-clean webdav config (anonymous would also do — the pair
+/// shape exercises the identity's user segment).
+fn webdav_config() -> CyDriveConfig {
+    CyDriveConfig {
+        backend: Backend::Webdav,
+        webdav_url: Some("https://nas.lan:5006/dav".to_string()),
+        webdav_username: Some("spike".to_string()),
+        webdav_password: Some("pw".to_string()),
+        ..CyDriveConfig::default()
+    }
+}
+
+/// Without the driver: the K31 rebuild message — not an assembly attempt.
+#[cfg(not(feature = "webdav"))]
+#[tokio::test]
+async fn missing_webdav_driver_refuses_with_the_rebuild_message() {
+    let err = match build_backend_transport(&webdav_config()).await {
+        Ok(_) => panic!("a driver-less binary cannot assemble the webdav arm"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains(cloudkit_cli::WEBDAV_DRIVER_REQUIRED),
+        "the off-feature refusal is the K31 rebuild message: {message}"
+    );
+}
+
+/// With the driver: the dispatch assembles the WebdavTransport offline
+/// (D6 — no server, no network), the volume identity is
+/// `webdav:<user>@<base-url>` with the trailing slash the WD1a config
+/// layer normalises in, the capability face is the WD1a placeholder
+/// (all-false until WD2 mirrors the driver bits), and the sync
+/// namespace is the raw volume id (the pan115/pan123 shape).
+#[cfg(feature = "webdav")]
+#[tokio::test]
+async fn webdav_key_builds_webdav_transport_offline() {
+    use cloudkit_cli::BackendTransport;
+    let cfg = webdav_config();
+    cfg.validate().expect("the test config validates");
+    let dispatched = build_backend_transport(&cfg)
+        .await
+        .expect("the webdav arm assembles offline (D6 lazy connect)");
+    assert!(matches!(dispatched, BackendTransport::Webdav(_)));
+    assert_eq!(
+        dispatched.volume(),
+        "webdav:spike@https://nas.lan:5006/dav/",
+        "the identity is <user>@<normalized-base-url>"
+    );
+    let caps = dispatched.caps();
+    assert!(
+        !caps.range_read
+            && !caps.server_side_move
+            && !caps.authoritative_index
+            && !caps.remote_delete
+            && !caps.resume,
+        "WD1a placeholder: the transport face is all-false until WD2 wires \
+         the verb faces (got {caps:?})"
+    );
+    assert_eq!(
+        dispatched.sync_namespace_key(),
+        "webdav:spike@https://nas.lan:5006/dav/",
+        "the sync namespace is the raw volume id (the pan115/pan123 shape)"
+    );
+}
+
+/// With the driver but an invalid config: the assembly surfaces the
+/// driver-side parse error (the second gate — the core `validate` pass
+/// runs at load time in production; here the empty password reads as
+/// unset on the flatten, so the driver's map face sees a lone username
+/// and names BOTH keys), never a panic.
+#[cfg(feature = "webdav")]
+#[tokio::test]
+async fn webdav_assembly_surfaces_the_driver_parse_gate() {
+    let mut cfg = webdav_config();
+    cfg.webdav_password = Some(String::new()); // empty-means-unset on the flatten
+    let err = match build_backend_transport(&cfg).await {
+        Ok(_) => panic!("a lone username must refuse the webdav assembly"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("webdav_username") && message.contains("webdav_password"),
+        "the driver gate names both keys: {message}"
+    );
+}

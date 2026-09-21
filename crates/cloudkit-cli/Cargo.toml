@@ -23,13 +23,14 @@ path = "src/main.rs"
 # that refuses that driver's surfaces at runtime with the actionable
 # rebuild message (K31).
 [features]
-default = ["telegram", "baidu", "local", "sftp", "pan115", "pan123"]
+default = ["telegram", "baidu", "local", "sftp", "pan115", "pan123", "webdav"]
 telegram = ["dep:ck-telegram"]
 baidu = ["dep:ck-baidu"]
 local = ["dep:ck-local"]
 sftp = ["dep:ck-sftp"]
 pan115 = ["dep:ck-pan115"]
 pan123 = ["dep:ck-pan123"]
+webdav = ["dep:ck-webdav"]
 # WinFsp mount backend (Phase 3, K38/K40): OFF by default and it must
 # stay out of `default` — enabling it pulls the GPL-3.0 winfsp-rs
 # bindings into the graph, and the release artifacts must stay GPL-free.
@@ -88,6 +89,12 @@ ck-pan115 = { path = "../drivers/ck-pan115", optional = true }
 # pan123 surfaces with the actionable rebuild message (K31,
 # `cloudkit_cli::PAN123_DRIVER_REQUIRED`).
 ck-pan123 = { path = "../drivers/ck-pan123", optional = true }
+# The webdav driver is feature-gated (K30 pattern, Phase 7 / WD1b — the
+# WD1a crate skeleton + pure-function layer ships; the client verbs land
+# in WD2/3, the probe in WD4). `default` keeps it on like every driver
+# before it; a build without `webdav` refuses webdav surfaces with the
+# actionable rebuild message (K31, `cloudkit_cli::WEBDAV_DRIVER_REQUIRED`).
+ck-webdav = { path = "../drivers/ck-webdav", optional = true }
 cloudkit-web = { path = "../cloudkit-web" }
 cloudkit-webdav = { path = "../cloudkit-webdav" }
 # WinFsp native mount adapter (Phase 3, L5). Optional and feature-gated

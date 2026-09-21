@@ -125,6 +125,7 @@
                             <label><input type="radio" name="vf-backend" value="sftp"> <span data-i18n="backend.sftp">SFTP (SSH)</span></label>
                             <label><input type="radio" name="vf-backend" value="pan115"> <span data-i18n="backend.pan115">115 Netdisk</span></label>
                             <label><input type="radio" name="vf-backend" value="pan123"> <span data-i18n="backend.pan123">123 Cloud Drive</span></label>
+                            <label><input type="radio" name="vf-backend" value="webdav"> <span data-i18n="backend.webdav">WebDAV</span></label>
                         </div>
                     </fieldset>
 
@@ -263,6 +264,47 @@
                             </label>
                         </div>
                         <small class="vf-hint" data-i18n="volumes.form.pan123_recycle_note">Deleting in this volume moves files to the 123pan recycle bin — recover them in the official app or site; the daily download traffic quota applies (a VIP lifts it).</small>
+                    </fieldset>
+
+                    <fieldset class="volume-fieldset vf-cred-group" id="vf-group-webdav" hidden>
+                        <legend data-i18n="volumes.form.cred_webdav">WebDAV backend</legend>
+                        <div class="volume-form-grid">
+                            <label class="volume-field">
+                                <span><span data-i18n="volumes.form.webdav_url">Server URL</span> <em>*</em></span>
+                                <input type="text" id="vf-webdav-url" autocomplete="off" spellcheck="false"
+                                       placeholder="https://nas.lan:5006/dav (sub-path = volume root)" data-i18n-placeholder="volumes.form.placeholder_webdav_url">
+                            </label>
+                            <label class="volume-field">
+                                <span data-i18n="volumes.form.webdav_username">Username</span>
+                                <input type="text" id="vf-webdav-username" autocomplete="off" spellcheck="false"
+                                       placeholder="optional — leave both empty for anonymous">
+                            </label>
+                            <label class="volume-field">
+                                <span data-i18n="volumes.form.webdav_password">Password</span>
+                                <input type="password" id="vf-webdav-password" autocomplete="new-password"
+                                       placeholder="paired with the username">
+                            </label>
+                            <label class="volume-field">
+                                <span data-i18n="volumes.form.webdav_auth">Auth method</span>
+                                <select id="vf-webdav-auth">
+                                    <option value="" selected>auto (default — Basic, then Digest)</option>
+                                    <option value="basic">basic</option>
+                                    <option value="digest">digest</option>
+                                </select>
+                            </label>
+                            <label class="volume-field">
+                                <span data-i18n="volumes.form.webdav_vendor">Server flavour</span>
+                                <select id="vf-webdav-vendor">
+                                    <option value="" selected>generic (default)</option>
+                                    <option value="nextcloud">nextcloud</option>
+                                </select>
+                            </label>
+                            <label class="volume-field volume-field-check">
+                                <span data-i18n="volumes.form.webdav_accept_invalid_certs">Accept self-signed certificates</span>
+                                <input type="checkbox" id="vf-webdav-accept-invalid-certs">
+                                <small class="vf-hint" data-i18n="volumes.form.webdav_certs_warning">WARNING: skips TLS certificate verification — only for a trusted LAN NAS with a self-signed certificate.</small>
+                            </label>
+                        </div>
                     </fieldset>
 
                     <details class="vf-advanced" id="vf-advanced">

@@ -115,6 +115,12 @@ pub const KNOWN_TOML_KEYS: &[&str] = &[
     "pan115_root",
     "pan123_token",
     "pan123_root",
+    "webdav_url",
+    "webdav_username",
+    "webdav_password",
+    "webdav_auth",
+    "webdav_vendor",
+    "webdav_accept_invalid_certs",
     "volumes_dir",
     "enabled",
 ];
@@ -167,6 +173,15 @@ const LEGACY_REJECTED_KEYS: &[&str] = &[
     "pan115_root",
     "pan123_token",
     "pan123_root",
+    // Phase 7 / WD1b: the six webdav keys are Rust-added (no Python
+    // dataclass ever carried them), so a legacy config.json must reject
+    // them like the other driver keys above.
+    "webdav_url",
+    "webdav_username",
+    "webdav_password",
+    "webdav_auth",
+    "webdav_vendor",
+    "webdav_accept_invalid_certs",
     "volumes_dir",
     "enabled",
     "allow_remote_admin",
@@ -245,6 +260,10 @@ pub enum Backend {
     /// 123 cloud-drive via the web API (ck-pan123, Phase 6 / 123-1 — one
     /// 123pan account per volume; driver wiring lands in 123-4).
     Pan123,
+    /// WebDAV share drive (ck-webdav, Phase 7 / WD1a — one server base
+    /// URL per volume, sub-path = the volume root; the assembly wiring
+    /// lands in WD1b, client verbs in WD2/3).
+    Webdav,
 }
 
 impl Backend {
@@ -257,6 +276,7 @@ impl Backend {
             Backend::Sftp => "sftp",
             Backend::Pan115 => "pan115",
             Backend::Pan123 => "pan123",
+            Backend::Webdav => "webdav",
         }
     }
 }
@@ -375,6 +395,15 @@ pub const VOLUME_SCOPED_KEYS: &[&str] = &[
     "pan115_root",
     "pan123_token",
     "pan123_root",
+    // Phase 7 / WD1b: all six webdav keys are volume-scoped — one WebDAV
+    // server base URL (with its credentials and tuning keys) identifies
+    // exactly one storage volume.
+    "webdav_url",
+    "webdav_username",
+    "webdav_password",
+    "webdav_auth",
+    "webdav_vendor",
+    "webdav_accept_invalid_certs",
     "enabled",
 ];
 
@@ -467,6 +496,11 @@ const SECRET_VALUED_KEYS: &[&str] = &[
     // refresh — the key is written once per acquisition via the K13
     // first-save chain).
     "pan123_token",
+    // Phase 7 / WD1b: the WebDAV password credential (the username is
+    // not secret — it labels the volume identity). Rides the same
+    // masking funnel as the sftp passphrase (parse-error redaction +
+    // the SHOW `{"set": bool}` write-only folding).
+    "webdav_password",
 ];
 
 /// Masks a credential value span: length-preserving, first and last two
@@ -1371,6 +1405,36 @@ pub struct CyDriveConfig {
     /// `"0"`, the driver's own default). Must be all digits when
     /// present — `validate` rejects anything else.
     pub pan123_root: Option<String>,
+    /// WebDAV server base URL (ck-webdav, Phase 7 / WD1a). Required when
+    /// `backend = "webdav"`; inert otherwise. The full http(s) URL of the
+    /// share — the sub-path becomes the volume root (there is no separate
+    /// root key); a trailing slash is tolerated (the driver normalises).
+    /// No filesystem meaning: it is never rebased against the volume home.
+    pub webdav_url: Option<String>,
+    /// WebDAV auth user name; must be set as a pair with
+    /// [`Self::webdav_password`] (both absent = anonymous access).
+    pub webdav_username: Option<String>,
+    /// WebDAV auth password (D1: Basic pre-empt + Digest 401 negotiation).
+    /// A [`SECRET_VALUED_KEYS`] member (R3): masked in parse errors,
+    /// folded to `{"set": bool}` in SHOW replies; env route
+    /// `CYDRIVE_WEBDAV_PASSWORD`.
+    pub webdav_password: Option<String>,
+    /// Auth shape selector: `"auto"` (the default — Basic first, then
+    /// Digest negotiation on 401), `"basic"` or `"digest"`. `validate`
+    /// enforces the value domain (lenient casing/whitespace) when the
+    /// backend is webdav; the driver re-checks on its map face.
+    pub webdav_auth: Option<String>,
+    /// Server flavour: `"generic"` (the default — read-only mtime, the
+    /// D2 downgrade) or `"nextcloud"` (PUT carries `X-OC-Mtime`).
+    /// Only tunes the mtime write strategy; `validate` enforces the two
+    /// values when the backend is webdav.
+    pub webdav_vendor: Option<String>,
+    /// Accept self-signed TLS certificates (D3; default `false` = the
+    /// rustls strict posture). A typed bool — the value domain is
+    /// exhaustive at parse time (a non-bool toml value is a `Parse`
+    /// error), so `validate` adds no rule for it; the driver's map face
+    /// does the lenient `"true"/"false"` string parsing (trim + case).
+    pub webdav_accept_invalid_certs: Option<bool>,
     /// Volumes directory (Phase 2.5 / K19), relative to the process
     /// working directory: one `<name>.toml` file per storage volume
     /// (see [`load_volume_config`]). `None` — the default — means
@@ -1454,6 +1518,12 @@ impl Default for CyDriveConfig {
             pan115_root: None,
             pan123_token: None,
             pan123_root: None,
+            webdav_url: None,
+            webdav_username: None,
+            webdav_password: None,
+            webdav_auth: None,
+            webdav_vendor: None,
+            webdav_accept_invalid_certs: None,
             volumes_dir: None,
             enabled: default_enabled(),
         }
@@ -1663,6 +1733,7 @@ impl CyDriveConfig {
     /// | `CYDRIVE_PAN115_ACCESS_TOKEN` | `pan115_access_token` | same empty-clears rule (Phase 5 / 115-1: the K28 multi-volume skip applies the same way) |
     /// | `CYDRIVE_PAN115_REFRESH_TOKEN` | `pan115_refresh_token` | same empty-clears rule |
     /// | `CYDRIVE_PAN123_TOKEN` | `pan123_token` | same empty-clears rule (Phase 6 / 123-1: the K28 multi-volume skip applies the same way) |
+    /// | `CYDRIVE_WEBDAV_PASSWORD` | `webdav_password` | same empty-clears rule (Phase 7 / WD1b: the credential rides this chain — the assembly NEVER reads env directly, B-M1) |
     pub fn with_env_overrides(self) -> Self {
         let mut config = self;
         if let Some(value) = env_string("CYDRIVE_BOT_TOKEN") {
@@ -1735,6 +1806,15 @@ impl CyDriveConfig {
         // immune to cross-volume env bleed by construction (K28).
         if let Some(value) = env_string("CYDRIVE_PAN123_TOKEN") {
             config.pan123_token = (!value.is_empty()).then_some(value);
+        }
+        // Phase 7 / WD1b: the webdav password rides the same env > file
+        // chain as the baidu/sftp/pan115/pan123 credentials — the
+        // multi-volume discovery path never calls this method, so volume
+        // files are immune to cross-volume env bleed by construction
+        // (K28); the assembly reads it off the resolved config only
+        // (B-M1: no direct env read at the assembly point).
+        if let Some(value) = env_string("CYDRIVE_WEBDAV_PASSWORD") {
+            config.webdav_password = (!value.is_empty()).then_some(value);
         }
         config
     }
@@ -2081,6 +2161,95 @@ impl CyDriveConfig {
                     )));
                 }
             }
+        }
+        // Phase 7 / WD1b cross-field rules (gated on the backend like the
+        // baidu/local/sftp/pan115/pan123 blocks above — the telegram
+        // default never fires them). The rules mirror
+        // `ck_webdav::config::parse_from_map` (the driver's second gate)
+        // at the string level core can check without the url crate: the
+        // full URL normalisation (trailing slash, percent forms) stays on
+        // the driver side — a config that passes here must parse there.
+        if self.backend == Backend::Webdav {
+            let url = self.webdav_url.as_deref().unwrap_or("").trim();
+            if url.is_empty() {
+                return Err(ConfigError::Invalid(
+                    "backend = \"webdav\" requires webdav_url: set the full http(s) URL of the \
+                     WebDAV share in config.toml (the sub-path becomes the volume root), e.g. \
+                     https://nas.lan:5006/dav/"
+                        .to_string(),
+                ));
+            }
+            // Minimal authority parse (the sync_url precedent — no url
+            // crate in core): scheme, non-empty host, no query/fragment.
+            let Some(rest) = url
+                .strip_prefix("http://")
+                .or_else(|| url.strip_prefix("https://"))
+            else {
+                return Err(ConfigError::Invalid(format!(
+                    "webdav_url must start with http:// or https://, got {url:?} (a WebDAV \
+                     share is a plain http(s) URL, e.g. https://nas.lan:5006/dav/)"
+                )));
+            };
+            if url.contains(['?', '#']) {
+                return Err(ConfigError::Invalid(format!(
+                    "webdav_url must not carry a query or fragment, got {url:?} (the share URL \
+                     is a plain http(s) path, e.g. https://nas.lan:5006/dav/)"
+                )));
+            }
+            let authority = rest.split('/').next().unwrap_or_default();
+            let host = authority.split(':').next().unwrap_or_default();
+            if host.is_empty() {
+                return Err(ConfigError::Invalid(format!(
+                    "webdav_url needs a host, e.g. \"https://nas.lan:5006/dav/\", got {url:?}"
+                )));
+            }
+            // Credentials arrive as a pair (both absent = anonymous).
+            let has_username = self
+                .webdav_username
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty());
+            let has_password = self
+                .webdav_password
+                .as_deref()
+                .is_some_and(|v| !v.trim().is_empty());
+            if has_username != has_password {
+                return Err(ConfigError::Invalid(
+                    "webdav_username and webdav_password must be set as a pair: only one of \
+                     them is set — add the other, or remove both for anonymous access"
+                        .to_string(),
+                ));
+            }
+            // Enum keys: lenient casing/whitespace (the driver's map face
+            // parses the same trio). Empty values read as unset.
+            if let Some(value) = self.webdav_auth.as_deref().filter(|v| !v.trim().is_empty()) {
+                if !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "auto" | "basic" | "digest"
+                ) {
+                    return Err(ConfigError::Invalid(format!(
+                        "webdav_auth must be one of auto, basic, digest, got {value:?} \
+                         (auto = Basic first, then Digest negotiation on 401)"
+                    )));
+                }
+            }
+            if let Some(value) = self
+                .webdav_vendor
+                .as_deref()
+                .filter(|v| !v.trim().is_empty())
+            {
+                if !matches!(
+                    value.trim().to_ascii_lowercase().as_str(),
+                    "generic" | "nextcloud"
+                ) {
+                    return Err(ConfigError::Invalid(format!(
+                        "webdav_vendor must be one of generic, nextcloud, got {value:?} \
+                         (vendor only tunes the mtime write strategy)"
+                    )));
+                }
+            }
+            // webdav_accept_invalid_certs: a typed bool — the serde parse
+            // is exhaustive (a non-bool value is a Parse error), so no
+            // rule here (the enable_encryption precedent).
         }
         Ok(())
     }

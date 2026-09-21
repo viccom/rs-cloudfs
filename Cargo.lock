@@ -716,6 +716,26 @@ dependencies = [
 ]
 
 [[package]]
+name = "ck-webdav"
+version = "0.10.0"
+dependencies = [
+ "async-trait",
+ "bytes",
+ "cloudkit-storage",
+ "futures-core",
+ "futures-util",
+ "httpdate",
+ "md-5",
+ "quick-xml",
+ "rand 0.10.2",
+ "reqwest",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "url",
+]
+
+[[package]]
 name = "clang-sys"
 version = "1.9.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -781,6 +801,7 @@ dependencies = [
  "ck-pan123",
  "ck-sftp",
  "ck-telegram",
+ "ck-webdav",
  "clap",
  "cloudkit-core",
  "cloudkit-platform",
@@ -3501,6 +3522,15 @@ name = "qrcode"
 version = "0.13.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "166f136dfdb199f98186f3649cf7a0536534a61417a1a30221b492b4fb60ce3f"
+
+[[package]]
+name = "quick-xml"
+version = "0.37.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "331e97a1af0bf59823e6eadffe373d7b27f485be8748f71471c662c1f269b7fb"
+dependencies = [
+ "memchr",
+]
 
 [[package]]
 name = "quinn"

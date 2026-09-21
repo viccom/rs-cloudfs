@@ -56,6 +56,7 @@ const VOLUME_LABELS = {
     sftp: 'backend.sftp',
     pan115: 'backend.pan115',
     pan123: 'backend.pan123',
+    webdav: 'backend.webdav',
 };
 
 function backendDisplayName(backend) {

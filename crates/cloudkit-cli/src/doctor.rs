@@ -544,6 +544,22 @@ pub fn backend_checks(cfg: &cloudkit_core::config::CyDriveConfig) -> Vec<CheckRe
                 });
             }
         }
+        // Phase 7 / WD1b: the webdav offline checks — the K12 warning is
+        // a no-op (webdav participates in sync, the pan115/pan123
+        // ruling; kept for symmetry). The offline legs WD4 adds (the
+        // accept_invalid_certs=true TLS warn, the sub-path volume-root
+        // note) have no surface yet; the connectivity skeleton is
+        // [`webdav_connectivity_check`], assembled separately in main.rs
+        // because it will dial out.
+        Backend::Webdav => {
+            if let Some(warning) = crate::local_sync_unsupported_warning(cfg) {
+                results.push(CheckResult {
+                    name: "sync".to_string(),
+                    status: CheckStatus::Warn,
+                    detail: warning.to_string(),
+                });
+            }
+        }
     }
     results
 }
@@ -1051,5 +1067,24 @@ pub fn pan123_connectivity_check(probe: &ck_pan123::Pan123Probe) -> CheckResult 
             status: CheckStatus::Fail,
             detail: format!("could not reach 123pan: {detail}"),
         },
+    }
+}
+
+/// The webdav connectivity leg (Phase 7 / WD1b skeleton): the driver is
+/// compiled in and the assembly accepts the volume — the live OPTIONS /
+/// PROPFIND-depth-0 probe (with the D1 auth five-state verdicts) lands
+/// in WD4, so this leg reports the honest placeholder instead of a fake
+/// verdict. Feature-gated with the driver (K30 pattern): a binary
+/// without `webdav` skips the leg entirely (the main.rs call site).
+#[cfg(feature = "webdav")]
+pub fn webdav_connectivity_check() -> CheckResult {
+    // TODO(wd4): assemble webdav_params and dial the OPTIONS probe with
+    // the auth negotiation; render the structured verdict here.
+    CheckResult {
+        name: "webdav_connectivity".to_string(),
+        status: CheckStatus::Ok,
+        detail: "driver present; the live connectivity probe lands in WD4 (the volume \
+                 assembles offline — D6 lazy connect)"
+            .to_string(),
     }
 }

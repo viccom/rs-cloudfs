@@ -259,6 +259,14 @@ fn toml_roundtrip_preserves_full_config() {
         // unset — the exhaustive-field shape of this test).
         pan123_token: None,
         pan123_root: None,
+        // Phase 7 / WD1b: the webdav key group round-trips too (all
+        // unset — the exhaustive-field shape of this test).
+        webdav_url: None,
+        webdav_username: None,
+        webdav_password: None,
+        webdav_auth: None,
+        webdav_vendor: None,
+        webdav_accept_invalid_certs: None,
         volumes_dir: None,
         // Phase 3.6 / RV0: the volume enable switch round-trips too.
         enabled: true,

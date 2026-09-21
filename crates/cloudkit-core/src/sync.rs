@@ -267,6 +267,11 @@ fn local_root_digest(root: &str) -> String {
 /// is the same warning. This is the判定 function for the doctor warning
 /// and the task-start gate; the run-flow wiring lands with the backend
 /// dispatch (Batch B3b 段二b).
+///
+/// Phase 7 / WD1b: a **webdav** drive syncs (the pan115/pan123 ruling —
+/// the namespace-key details land with the WD4 assembly). The
+/// `!matches!` form needs no arm for it: every backend not named below
+/// is a sync participant.
 pub fn is_sync_supported(backend: &crate::config::Backend) -> bool {
     !matches!(
         backend,

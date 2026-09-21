@@ -824,6 +824,15 @@ async fn doctor_cmd() -> Result<()> {
                 &cloudkit_cli::pan123_backend_probe(&cfg).await,
             ));
         }
+        // Phase 7 / WD1b: the webdav leg — the offline checks plus the
+        // connectivity skeleton (the OPTIONS probe with the D1 auth
+        // verdicts lands in WD4). A binary without the driver skips the
+        // leg (K31 shape, the baidu rule): no fake Unreachable.
+        cloudkit_core::config::Backend::Webdav => {
+            results.extend(cloudkit_cli::doctor::backend_checks(&cfg));
+            #[cfg(feature = "webdav")]
+            results.push(cloudkit_cli::doctor::webdav_connectivity_check());
+        }
     }
     print!("{}", cloudkit_cli::doctor::render_report(&results));
     Ok(())
