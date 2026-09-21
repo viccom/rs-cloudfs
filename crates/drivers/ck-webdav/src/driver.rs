@@ -1,13 +1,9 @@
-//! WebdavDriver——WebDAV 存储驱动（Phase 7 / WD2b：读面全接线）。
+//! WebdavDriver——WebDAV 存储驱动（Phase 7 / WD3：读面 + 写面全接线）。
 //!
 //! 后端 = 一台 WebDAV 服务器上的一个（可含子路径的）基地址——
 //! 「通用挂载协议」面：rclone serve / OpenList/Alist / Nextcloud /
 //! 群晖 DSM / Apache mod_dav / 本仓 cloudkit-webdav 自举，全部成为
 //! 可用后端（计划 §0 定位）。
-//!
-//! **批次边界（WD2b）**：读路径（stat/list/reader/quota）+ transport
-//! 读面全接线；写路径（mkdir/delete/rename/writer + client 的 MKCOL/
-//! MOVE/DELETE/PROPPATCH 动词）留 WD3（各方法 `TODO(wd3)` 锚）。
 //!
 //! ## 读路径形态（计划 §4.7）
 //!
@@ -25,16 +21,27 @@
 //!   调用方重开 reader 更简单也更诚实）；416 → stat 复核（offset 仍
 //!   越界 = 并发收缩 → EOF 空收尾；否则 `Unavailable`）。
 //!
-//! ## commit-on-close（WD3 接线，[`crate::stager`]）
+//! ## 写路径形态（WD3，计划 §4.4/§4.6）
 //!
-//! spool → `PUT <final>.ckwd-<pid>-<seq>.part`（Content-Length 已知，
-//! D5）→ `MOVE` 固化 → stat size 复核；覆盖写 stash 预案与断言①实测
-//! 裁决在 WD3（计划 §4.6）。`.ckwd-` 暂存件对 `list` 恒过滤。
+//! - `mkdir`：**stat 预检先行**（存在→`Exists`——rclone MKCOL-201 幂等
+//!   陷阱，附录 C ⑥）→ MKCOL 恒尾斜杠 → 409 → 隐式建父重试恰一次
+//!   （仍败 → `NotFound`（父））；
+//! - `delete(EntryId)`：**幂等形态声明 = 不存在恒 `NotFound`**（sftp
+//!   先例同款并恒定）——stat 预检（目录腿尾斜杠判定 + 形态归一）后
+//!   DELETE；stat 与 DELETE 之间被并发删除的 404 同归 `NotFound`；
+//! - `rename`：stat from 先行 → MOVE `Overwrite: F`（trait 契约与 sftp
+//!   先例：目标存在 → `Exists`，不覆盖），恒显式头、绝对 Destination、
+//!   目录腿双侧尾斜杠（附录 C ⑤/⑩）→ 412 → **重 stat 复核后
+//!   `Exists`**（K75-1：只认显式 precondition，传输/服务端类绝不映射
+//!   Exists）→ 403/409/500（缺父嫌疑三态）→ stat 目标父核实：缺则
+//!   隐式建父重试恰一次（仍败 → `NotFound`（父）），在则按 §4.4
+//!   通用表归一；
+//! - `writer` → [`crate::stager`]（commit-on-close，模块文档）。
 //!
 //! ## 错误映射（R2，计划 §4.4 表——WD2/WD3 双桩回放钉死）
 //!
 //! 404→NotFound；401 协商后仍拒/403→Unauthorized{false}；405（MKCOL
-//! 目标已存在）→Exists；409（MKCOL 父缺失）→隐式建父重试；412→重
+//! 目标已存在）→Exists；409（MKCOL/MOVE 父缺失）→隐式建父重试；412→重
 //! stat 复核后 Exists（K75-1：传输类绝不映射 Exists）；416→EOF 语义；
 //! 200 应答 Range→截断回退；429/5xx→Unavailable；连接类→Unavailable。
 //!
@@ -56,7 +63,7 @@ use cloudkit_storage::{
 };
 
 use crate::client::{WebdavClient, ALLPROP_BODY, QUOTA_BODY};
-use crate::config::WebdavParams;
+use crate::config::{Vendor, WebdavParams};
 use crate::mtime::parse_http_time;
 use crate::urls::{collection_url, join_path, percent_decode_lossy};
 use crate::xml::{is_addressable_name, PropfindEntry};
@@ -78,8 +85,12 @@ const READ_WINDOW: u64 = 8 * 1024 * 1024;
 pub struct WebdavDriver {
     volume: VolumeId,
     /// `Arc` 形态：reader 的窗口流（`stream::unfold` 状态机）需要跨
-    /// `await` 持有客户端句柄（流不持 `&self` 借用——K47 流式语义）。
+    /// `await` 持有客户端句柄（流不持 `&self` 借用——K47 流式语义）；
+    /// stager 同源共用（WD3）。
     client: Arc<WebdavClient>,
+    /// 服务端风味（D4：只影响写面的 mtime 策略——nextcloud 的 stager
+    /// PUT 搭车 `X-OC-Mtime`；generic 不写 mtime，D2 降级）。
+    vendor: Vendor,
 }
 
 impl WebdavDriver {
@@ -93,7 +104,11 @@ impl WebdavDriver {
             .unwrap_or_else(|| "anonymous".to_string());
         let volume = VolumeId::new("webdav", &format!("{user}@{}", params.url))?;
         let client = Arc::new(WebdavClient::new(&params)?);
-        Ok(WebdavDriver { volume, client })
+        Ok(WebdavDriver {
+            volume,
+            client,
+            vendor: params.vendor,
+        })
     }
 
     /// 客户端句柄（transport 面共用同一连接/协商世界）。
@@ -102,19 +117,10 @@ impl WebdavDriver {
     }
 
     /// 卷内相对路径 → 文件形态 URL（无尾斜杠；卷根 = 基地址尾斜杠形态
-    /// ——stat 的 Depth 0 / reader 的 GET / WD3 写动词共用锚）。
+    /// ——stat 的 Depth 0 / reader 的 GET / 写动词共用锚；自由函数面
+    /// [`url_for`] 的方法壳）。
     fn url_of(&self, rel: &RelPath) -> Result<url::Url, StorageError> {
-        join_path(self.client.base(), rel.as_str()).map_err(|error| {
-            // 不可达防御（词汇层已拒穿越/非法段；`Invalid` 无载荷——
-            // 诊断进 debug 通道）。
-            tracing::debug!(
-                target: "ck_webdav::driver",
-                path = %rel,
-                error,
-                "webdav URL construction rejected the path"
-            );
-            StorageError::Invalid
-        })
+        url_for(&self.client, rel)
     }
 
     /// stat 的驱动面（reader 的 stat 先行/416 复核共用）。
@@ -124,28 +130,138 @@ impl WebdavDriver {
         Ok(entry_from_propfind(&self.volume, rel, &pe))
     }
 
-    /// Test seam（baidu `build_backend_transport_with_endpoints` 先例）：
-    /// WD2b 重试白名单的**写侧**断言面——「PUT 永不自动重试」需要直测
-    /// client 动词，而 driver 写面（stager）要到 WD3 才落地。不是生产
-    /// 路径；WD3 writer 落地后由正式写面取代并随批移除。
-    #[doc(hidden)]
-    pub async fn test_put(&self, path: &RelPath, body: Bytes) -> Result<(), StorageError> {
-        let url = self.url_of(path)?;
-        self.client.put(&url, body).await
+    /// MKCOL 的驱动半边（恒尾斜杠——附录 C ⑥/⑧；mkdir 与
+    /// [`ensure_parents`] 共用）。
+    async fn mkcol_rel(&self, rel: &RelPath) -> Result<crate::client::MkcolOutcome, StorageError> {
+        let url = collection_url(&self.url_of(rel)?);
+        self.client.mkcol(&url).await
     }
 
-    /// Test seam（同上）：越窗 GET 的协议半边——driver reader 的窗口恒
-    /// 在 stat 尺寸内，416 只能由陈旧尺寸触发，复核腿的客户端侧（416 →
-    /// `Ok(None)` passthrough）在此直测。
-    #[doc(hidden)]
-    pub async fn test_get_range(
+    /// MOVE 的驱动半边（rename 与 stager 的 stash/固化腿共用形态：
+    /// 恒显式 Overwrite + 绝对 Destination + 目录腿双侧尾斜杠——
+    /// 附录 C ⑤/⑩）。
+    async fn move_rel(
         &self,
-        path: &RelPath,
-        window: Option<(u64, u64)>,
-    ) -> Result<Option<Bytes>, StorageError> {
-        let url = self.url_of(path)?;
-        self.client.get_range(&url, window).await
+        from: &RelPath,
+        to: &RelPath,
+        dir_leg: bool,
+        overwrite: bool,
+    ) -> Result<crate::client::MoveOutcome, StorageError> {
+        let mut from_url = self.url_of(from)?;
+        let mut to_url = self.url_of(to)?;
+        if dir_leg {
+            from_url = collection_url(&from_url);
+            to_url = collection_url(&to_url);
+        }
+        self.client.move_(&from_url, &to_url, overwrite).await
     }
+}
+
+// ----------------------------------------------- 写面共享助手（stager 共用）---
+
+/// 卷内相对路径 → 文件形态 URL（stager 的 PUT/MOVE/stat 腿共用锚——
+/// 错误归一与 [`WebdavDriver::url_of`] 同源）。
+pub(crate) fn url_for(client: &WebdavClient, rel: &RelPath) -> Result<url::Url, StorageError> {
+    join_path(client.base(), rel.as_str()).map_err(|error| {
+        // 不可达防御（词汇层已拒穿越/非法段；`Invalid` 无载荷——诊断进
+        // debug 通道）。
+        tracing::debug!(
+            target: "ck_webdav::driver",
+            path = %rel,
+            error,
+            "webdav URL construction rejected the path"
+        );
+        StorageError::Invalid
+    })
+}
+
+/// stat 的自由函数面（stager 的 size 复核/对账腿与 [`ensure_parents`]
+/// 的逐级探测共用——PROPFIND 原始条目形态，投影归调用方）。
+pub(crate) async fn stat_pe(
+    client: &WebdavClient,
+    rel: &RelPath,
+) -> Result<PropfindEntry, StorageError> {
+    client.stat(&url_for(client, rel)?).await
+}
+
+/// 隐式建父（trait 契约：写入/建目录路径缺失的父级隐式创建；mkdir 的
+/// 409 重试腿与 rename 的缺父重试腿与 stager close 共用）。
+///
+/// 自浅向深逐级 stat：存在的目录即屏障（更浅层必然存在）；被文件占住
+/// 的祖先 → `Exists`（占位冲突）；缺失的祖先自浅向深 MKCOL（此时父级
+/// 已核实/已建，MKCOL 的 409 只剩竞态窗——按 `NotFound` 归一（父），
+/// §4.4 终局形态）。
+pub(crate) async fn ensure_parents(
+    client: &WebdavClient,
+    rel: &RelPath,
+) -> Result<(), StorageError> {
+    let Some(deepest) = rel.parent() else {
+        return Ok(()); // 根自身：无父可建
+    };
+    if deepest.is_root() {
+        // 卷根 = 挂载基地址——恒按存在处理（其缺失由紧随的动词自己
+        // 暴露，省一次 PROPFIND 往返）。
+        return Ok(());
+    }
+    // 自深向浅收集缺失链，直到命中存在的目录（或链尽 = 卷根）。
+    let mut missing: Vec<RelPath> = Vec::new();
+    let mut cursor = Some(deepest);
+    while let Some(dir) = cursor {
+        match stat_pe(client, &dir).await {
+            Ok(pe) if pe.is_collection => break,
+            Ok(_) => return Err(StorageError::Exists), // 文件占住祖先路径
+            Err(StorageError::NotFound) => missing.push(dir.clone()),
+            Err(other) => return Err(other),
+        }
+        cursor = dir.parent();
+    }
+    // 自浅向深补建（missing 是自深向浅收集的 → rev 即自浅向深）。
+    for dir in missing.iter().rev() {
+        let url = collection_url(&url_for(client, dir)?);
+        match client.mkcol(&url).await? {
+            crate::client::MkcolOutcome::Created => {}
+            crate::client::MkcolOutcome::ParentMissing => {
+                // 父级已核实仍在（或刚建）——409 只剩竞态窗：按 §4.4
+                // 的「仍败 → NotFound（父）」归一。
+                return Err(StorageError::NotFound);
+            }
+        }
+    }
+    Ok(())
+}
+
+/// [`crate::client::map_status`] 的 u16 包装（`MoveOutcome::ParentSuspect`
+/// 携带数字码；403/409/500 在构造面恒可转，防御臂保留原文）。
+fn map_status_of(status: u16, verb: &str, diagnostic: &str) -> StorageError {
+    match reqwest::StatusCode::from_u16(status) {
+        Ok(code) => crate::client::map_status(code, verb, diagnostic),
+        Err(_) => StorageError::Unavailable(format!(
+            "webdav {verb} failed (HTTP {status}): {diagnostic}"
+        )),
+    }
+}
+
+/// 进程内暂存件序号（`<pid>-<seq>` = 进程内唯一名；跨进程由 pid 区分。
+/// 崩溃残留的 `.part`/`.old` 是孤儿暂存件——list 恒过滤，同 pid 序号
+/// 复用时 Overwrite:T 清扫）。sftp `staging_names` 同款形态。
+fn next_staging_seq() -> u64 {
+    static STAGING_SEQ: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+    STAGING_SEQ.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1
+}
+
+/// 暂存件命名（§4.6）：`<final>.ckwd-<pid>-<seq><suffix>`
+///（suffix ∈ `.part`/`.old`——`is_staging_artifact` 的双条件过滤面）。
+pub(crate) fn staging_rel(
+    final_rel: &RelPath,
+    seq: u64,
+    suffix: &str,
+) -> Result<RelPath, StorageError> {
+    RelPath::new(&format!(
+        "{}.ckwd-{}-{}{suffix}",
+        final_rel.as_str(),
+        std::process::id(),
+        seq
+    ))
 }
 
 /// 句柄 → RelPath（K6 往返：句柄字符串 = rel_path 形态，sftp/pan123
@@ -375,27 +491,125 @@ impl StorageDriver for WebdavDriver {
         self.stat_entry(path).await
     }
 
-    /// mkdir（stat 预检——rclone 已存在 201 幂等陷阱，附录 C ⑥——
+    /// mkdir（stat 预检先行——rclone 已存在 201 幂等陷阱，附录 C ⑥——
     /// baidu 同型先例；MKCOL 恒尾斜杠；409 父缺失 → 隐式建父重试
-    /// 一次，§4.4）。已存在 → `Exists`（断言④）。
-    async fn mkdir(&self, _path: &RelPath) -> Result<(), StorageError> {
-        // TODO(wd3): 写路径批接线（stager 前置依赖）。
-        Err(StorageError::Unsupported)
+    /// 一次，§4.4；重试仍败 → `NotFound`（父））。已存在（目录或文件
+    /// 占位）→ `Exists`（断言④）。
+    async fn mkdir(&self, path: &RelPath) -> Result<(), StorageError> {
+        match self.stat_entry(path).await {
+            // 预检：已存在（无论形态）→ Exists——不赌服务器的「已存在」
+            // 回应形态（rclone 201 / apache 405 两真形）。
+            Ok(_) => return Err(StorageError::Exists),
+            Err(StorageError::NotFound) => {}
+            Err(other) => return Err(other),
+        }
+        match self.mkcol_rel(path).await? {
+            crate::client::MkcolOutcome::Created => Ok(()),
+            crate::client::MkcolOutcome::ParentMissing => {
+                // 409：父集合缺失——隐式建父后重试恰一次（§4.4）。
+                ensure_parents(&self.client, path).await?;
+                match self.mkcol_rel(path).await? {
+                    crate::client::MkcolOutcome::Created => Ok(()),
+                    // 仍 409 = 建父与重试之间的竞态/父仍不可建——§4.4
+                    // 终局形态：NotFound（父）。Err 通道（含竞态 405→
+                    // Exists）按动词映射原样上浮。
+                    crate::client::MkcolOutcome::ParentMissing => Err(StorageError::NotFound),
+                }
+            }
+        }
     }
 
-    /// 按句柄删除；目录递归（DELETE 恒尾斜杠——附录 C ⑦）。声明幂等
-    /// 形态：不存在 → `NotFound`（WD3 写面接线时随批落文档终稿）。
-    async fn delete(&self, _id: &EntryId) -> Result<(), StorageError> {
-        // TODO(wd3): 写路径批接线。
-        Err(StorageError::Unsupported)
+    /// 按句柄删除；目录递归（DELETE 恒尾斜杠——附录 C ⑦）。**幂等形态
+    /// 声明：不存在 → 恒 `NotFound`**（stat 预检天然给出，sftp 先例同
+    /// 款并恒定；stat 与 DELETE 之间被并发删除的 404 亦同归 NotFound）。
+    async fn delete(&self, id: &EntryId) -> Result<(), StorageError> {
+        if id.volume != self.volume {
+            return Err(StorageError::NotFound); // 他卷句柄（trait 契约）
+        }
+        let Some(rel) = rel_from_handle(id) else {
+            return Err(StorageError::Invalid);
+        };
+        if rel.is_root() {
+            return Err(StorageError::Invalid); // 卷根不可删
+        }
+        // stat 预检：①目录腿需要尾斜杠判定（apache no-slash 集合 301
+        // 不执行——附录 C ⑦）；②不存在的幂等形态在此归一。
+        let entry = self.stat_entry(&rel).await?;
+        let url = if entry.kind == EntryKind::Dir {
+            collection_url(&self.url_of(&rel)?)
+        } else {
+            self.url_of(&rel)?
+        };
+        self.client.delete(&url).await
     }
 
-    /// rename（MOVE = 服务端单侧移动，`server_side_move` 依据；恒显式
-    /// `Overwrite` + 绝对 `Destination` + 目录腿全尾斜杠——附录 C ⑤/⑩；
-    /// 412 → 重 stat 复核后 `Exists`，K75-1）。
-    async fn rename(&self, _from: &RelPath, _to: &RelPath) -> Result<(), StorageError> {
-        // TODO(wd3): 写路径批接线。
-        Err(StorageError::Unsupported)
+    /// rename（MOVE = 服务端单侧移动，`server_side_move` 依据）。
+    ///
+    /// - **Overwrite 选型 = `F`**（trait 契约与 sftp 先例：目标存在 →
+    ///   `Exists`，rename 不做覆盖语义——目标是调用方的显式错误）；
+    /// - 恒显式 `Overwrite` 头 + 绝对 `Destination` + 目录腿（stat from
+    ///   判 is_dir）双侧尾斜杠（附录 C ⑤/⑩）；
+    /// - 412 → 重 stat 复核后 `Exists`（K75-1：只认显式 precondition，
+    ///   传输/服务端类绝不映射 Exists）；
+    /// - 403/409/500（缺父嫌疑三态：rclone403 / apache500 / RFC 409）→
+    ///   stat 目标父核实：缺 → 隐式建父重试恰一次（仍败 → `NotFound`
+    ///   （父），§4.4 行）；在 → 按 §4.4 通用表归一（403→Unauthorized /
+    ///   409→Invalid / 500→Unavailable）；
+    /// - `to` 是 `from` 的后代 → `Invalid`（自搬进自身，sftp 先例）；
+    ///   任一端点是卷根 → `Invalid`。
+    async fn rename(&self, from: &RelPath, to: &RelPath) -> Result<(), StorageError> {
+        if from.is_root() || to.is_root() {
+            return Err(StorageError::Invalid); // 卷根不可作为 rename 端点
+        }
+        let from_prefix = format!("{}/", from.as_str());
+        if to.as_str().starts_with(&from_prefix) {
+            return Err(StorageError::Invalid); // to 在 from 之内
+        }
+        // 源先行（语义早失败——NotFound 归 stat）+ 目录腿判定。
+        let from_entry = self.stat_entry(from).await?;
+        let dir_leg = from_entry.kind == EntryKind::Dir;
+        match self.move_rel(from, to, dir_leg, false).await {
+            Ok(crate::client::MoveOutcome::Done) => Ok(()),
+            Ok(crate::client::MoveOutcome::PreconditionFailed { diagnostic }) => {
+                // 412 = Overwrite:F 撞既有目标：重 stat 复核后 Exists——
+                // 目标在 = 真撞；不在 = 状态异常（保留 412 原文）。
+                match self.stat_entry(to).await {
+                    Ok(_) => Err(StorageError::Exists),
+                    Err(StorageError::NotFound) => Err(StorageError::Unavailable(format!(
+                        "webdav MOVE failed with 412 Precondition Failed but the destination \
+                         is absent: {diagnostic}"
+                    ))),
+                    Err(other) => Err(StorageError::Unavailable(format!(
+                        "webdav MOVE failed with 412 Precondition Failed and the destination \
+                         re-check errored ({other}): {diagnostic}"
+                    ))),
+                }
+            }
+            Ok(crate::client::MoveOutcome::ParentSuspect { status, diagnostic }) => {
+                // 缺父嫌疑核实：父在 → 非缺父形态（403 的真拒绝 / 500 的
+                // 服务端故障），按通用表归一——绝不折叠 Exists（K75-1）。
+                let parent = to.parent().ok_or(StorageError::Invalid)?;
+                match self.stat_entry(&parent).await {
+                    Err(StorageError::NotFound) => {}
+                    Err(other) => return Err(other),
+                    Ok(parent_entry) if parent_entry.kind == EntryKind::Dir => {
+                        return Err(map_status_of(status, "MOVE", &diagnostic))
+                    }
+                    // 父路径被文件占住：隐式建父不可行——按「父不可用」归
+                    // Exists（占位冲突，与 mkdir 的同型判定一致）。
+                    Ok(_) => return Err(StorageError::Exists),
+                }
+                ensure_parents(&self.client, to).await?;
+                // 重试恰一次；仍败 → NotFound（父）（§4.4 终局形态——
+                // 竞态窗内的新失败不逐类细分，调用方按「路径当前不可
+                // 达」处置）。
+                match self.move_rel(from, to, dir_leg, false).await {
+                    Ok(crate::client::MoveOutcome::Done) => Ok(()),
+                    _ => Err(StorageError::NotFound),
+                }
+            }
+            Err(error) => Err(error),
+        }
     }
 
     /// 流式读（stat 先行 → 8 MiB 串行窗口循环 → 206 校验/200 截断
@@ -474,13 +688,48 @@ impl StorageDriver for WebdavDriver {
 
     /// 打开上传暂存器（commit-on-close——[`crate::stager`]；hint.size
     /// 超承诺 → `Invalid`，sftp 同款契约）。
+    ///
+    /// **stash 裁决在打开时**（断言①覆盖写腿，sftp `.old` 判例）：目标
+    /// 已存在（文件）→ 先 `MOVE final → .ckwd-*.old`——staging 窗口内
+    /// 旧对象不可见，close 成功删 stash、abort 恢复；目标是目录 →
+    /// `Invalid`（目录不可被文件覆盖写）。
     async fn writer(
         &self,
-        _path: &RelPath,
-        _hint: &WriteHint,
+        path: &RelPath,
+        hint: &WriteHint,
     ) -> Result<Box<dyn UploadStager>, StorageError> {
-        // TODO(wd3): 写路径批接线（spool → PUT .part → MOVE → size 复核）。
-        Err(StorageError::Unsupported)
+        if path.is_root() {
+            return Err(StorageError::Invalid); // 卷根不可作为上传目标
+        }
+        let seq = next_staging_seq();
+        let stash_rel = match self.stat_entry(path).await {
+            Err(StorageError::NotFound) => None,
+            Ok(entry) if entry.kind == EntryKind::Dir => {
+                return Err(StorageError::Invalid);
+            }
+            Ok(_) => {
+                // 覆盖写：旧对象先 stash 成 .old（Overwrite:T——清扫上次
+                // 崩溃残留的同名孤儿 stash；staging 窗口内目标不可见。
+                // 断言①实测裁决（WD3，dav-server 参照桩）：无 stash 形态
+                // 红证在案——close 前旧对象可见；stash 上车后绿）。
+                let stash = staging_rel(path, seq, ".old")?;
+                match self.move_rel(path, &stash, false, true).await {
+                    Ok(crate::client::MoveOutcome::Done) => Some(stash),
+                    Ok(other) => return Err(other.into_storage_error()),
+                    Err(error) => return Err(error),
+                }
+            }
+            Err(other) => return Err(other),
+        };
+        Ok(Box::new(crate::stager::WebdavStager::new(
+            self.client.clone(),
+            self.volume.clone(),
+            self.vendor,
+            path.clone(),
+            stash_rel,
+            seq,
+            hint.size,
+        )?))
     }
 
     /// 卷配额：RFC 4331 `quota-*-bytes` PROPFIND best-effort，失败

@@ -26,7 +26,6 @@
 
 mod stub;
 
-use std::sync::atomic::AtomicUsize;
 use std::time::Duration;
 
 use cloudkit_storage::transport::CloudTransport;
@@ -440,28 +439,37 @@ async fn rate_limited_consumes_retry_after() {
 }
 
 /// §4.5-10：PUT **永不自动重试**（非幂等——重放可能重复写效果）。kill
-/// 旋钮断掉首个 PUT 的响应，之后不得有第二个 PUT 到达。写侧面用桩直测
-/// client 动词（driver 写面 = WD3 stager；test seam 见 driver.rs）。
+/// 旋钮断掉 PUT 的响应，之后不得有第二个 PUT 到达。WD3 起经正式写面
+/// 驱动（writer → close 的 PUT `.part` 腿；kill 在 writer 返回后经运行
+/// 期旋钮面武装——效果未落、如实上抛、close 失败路径清理暂存件）。
 #[tokio::test]
 async fn put_is_never_auto_retried() {
     let handle = spawn_stub(
         Vfs::new(),
         AuthMode::None,
-        Knobs {
-            kill_connections: AtomicUsize::new(1),
-            ..Knobs::default()
-        },
+        Knobs::default(),
         StubStyle::rclone(),
     )
     .await;
     let driver = driver(&handle, &[]);
-    let error = driver
-        .test_put(
-            &RelPath::new("f.bin").expect("rel path"),
-            bytes::Bytes::from_static(b"payload"),
-        )
+    let hint = cloudkit_storage::WriteHint {
+        size: Some(7),
+        ..Default::default()
+    };
+    let mut stager = driver
+        .writer(&RelPath::new("f.bin").expect("rel path"), &hint)
         .await
-        .expect_err("killed PUT surfaces");
+        .expect("writer");
+    // writer 的 stat 预检已完成（PROPFIND 重试链是 1+3 次尝试——启动期
+    // 固定计数的 kill 会被它吃光或致死）；此刻经旋钮的**运行期可调面**
+    // 武装恰一枚 kill——close 链在 PUT 前无 PROPFIND（父=卷根短路），
+    // 这一枚必然落在 PUT 上。
+    handle
+        .knobs
+        .kill_connections
+        .store(1, std::sync::atomic::Ordering::SeqCst);
+    stager.write(b"payload").await.expect("spool write");
+    let error = stager.close().await.expect_err("killed PUT surfaces");
     assert!(
         matches!(error, StorageError::Unavailable(_) | StorageError::Io(_)),
         "{error:?}"
@@ -470,10 +478,18 @@ async fn put_is_never_auto_retried() {
     let puts: Vec<_> = count(&requests, "PUT").collect();
     assert_eq!(puts.len(), 1, "no auto-retry for non-idempotent verbs");
     // kill 旋钮在路由前断连（效果未落——「效果已落」是 lost_ack 旋钮的
-    // 语义）：失败如实上抛、远端无残留、无第二次尝试。
+    // 语义）：失败如实上抛、远端无残留（含 .part——close 失败路径的
+    // 现场恢复清理）、无第二次尝试。
     assert!(
         !handle.exists("/f.bin"),
         "the killed PUT must leave no remote residue"
+    );
+    assert!(
+        handle
+            .snapshot()
+            .keys()
+            .all(|path| !path.contains(".ckwd-")),
+        "no staging residue after the failed close"
     );
 }
 

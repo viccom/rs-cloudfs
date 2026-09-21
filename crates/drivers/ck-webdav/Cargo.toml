@@ -1,6 +1,6 @@
 [package]
 name = "ck-webdav"
-description = "WebDAV StorageDriver - crate skeleton + pure-function layer (Phase 7 / WD1a; client verbs WD2, write path WD3, assembly WD4)"
+description = "WebDAV StorageDriver - read+write paths with commit-on-close stager and the conformance suite (Phase 7 / WD3; assembly WD4)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -63,3 +63,12 @@ tokio = { version = "1", features = ["rt", "macros", "net"] }
 # 桩侧 Basic 凭据校验 + Digest nonce 的 base64 形态（真机 nonce 含 =/+
 # 字符——矩阵⑨；0.22 已在 lock：ck-pan115 运行时依赖同线）。
 base64 = "0.22"
+# conformance 参照桩（WD3）：dav-server 与 cloudkit-webdav 同版 pin
+#（=0.11.0——计划 §6 风险表「版本漂移双版本」行）；hyper/http/
+# hyper-util 的装配面照抄其 server.rs（http1 server + TokioIo）。
+dav-server = "=0.11.0"
+http = "1"
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+# conformance 套件的流消费（read_all 辅助）。
+futures-util = { version = "0.3", default-features = false }

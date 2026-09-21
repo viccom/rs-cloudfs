@@ -14,7 +14,7 @@
 //! | reader 全量/跨窗（8 MiB）/Range 钳制 | §4.7 |
 //! | start ≥ size 空流不开 GET | §4.7 |
 //! | 200 截断回退（range_ignore 旋钮） | 矩阵④/§4.5-6 |
-//! | 416 → `Ok(None)` passthrough（越窗 GET 直测） | §4.4 |
+//! | 416 → 复核 EOF 空收尾（并发收缩形态，WD3 经正式读面） | §4.4 |
 //! | malformed multistatus → Io 带截断片段 | §4.4/§6 风险表 |
 //! | unexpected 301 → Unavailable + Location | §4.4 |
 //! | 慢滴流不卡死（窗口超时内完成） | §4.5-7 |
@@ -445,22 +445,29 @@ async fn reader_falls_back_to_200_truncation_when_range_is_ignored() {
     );
 }
 
-/// §4.4：416 → `Ok(None)` passthrough（越窗 GET 的协议半边；driver 面
-/// 的复核决策由 reader 窗口循环持有——test seam 直测客户端形态）。
+/// §4.4：416 → `Ok(None)` passthrough 的驱动面决策腿（reader 的 stat
+/// 复核）——并发收缩形态：reader() 的 stat 先行拿到旧尺寸，首窗 GET
+/// 前文件被替换为更短版本 → 416 → 复核 stat 见 offset ≥ 新尺寸 →
+/// EOF 空收尾（不报错）。原 WD2 seam 直测（`test_get_range`）已随
+/// WD3 写面落地移除，此处经正式读面覆盖同一契约。
 #[tokio::test]
-async fn beyond_eof_window_get_passes_416_through_as_none() {
+async fn beyond_eof_window_after_shrink_ends_the_stream_at_eof() {
     let mut vfs = Vfs::new();
-    vfs.seed_file("/f.bin", b"0123456789");
+    vfs.seed_file("/f.bin", &pattern(300));
     let handle = plain(vfs).await;
     let driver = driver(&handle);
-    let outcome = driver
-        .test_get_range(&rel("f.bin"), Some((50, 60)))
+    let entry = driver.stat(&rel("f.bin")).await.expect("stat");
+
+    let stream = driver
+        .reader(&entry.id, Some(Range::new(250, None).expect("range")))
         .await
-        .expect("416 is not an error at the client layer");
-    assert!(
-        outcome.is_none(),
-        "416 → Ok(None) for the driver to re-check"
-    );
+        .expect("reader built on the pre-shrink size");
+    // reader() 的 stat 已完成——首窗 GET 前替换为 20 字节版本（确定性
+    // 注入：窗口 GET 只在首次 poll 时发出）。
+    handle.seed_file("/f.bin", &pattern(20));
+    let bytes = collect(stream).await.expect("416 recheck ends at EOF");
+    assert!(bytes.is_empty());
+    assert_eq!(gets(&handle), 1, "exactly one window GET (the 416)");
 }
 
 /// §4.4：malformed multistatus（截断无闭合）→ `Io` 带截断片段（≤200 字
@@ -618,4 +625,39 @@ async fn transport_open_and_open_range_stream_bytes() {
         slice.extend_from_slice(&frame.expect("frame"));
     }
     assert_eq!(slice, pattern(1000)[100..250]);
+}
+
+/// WD3：transport upload——读盘 → stager 链 → K6 占位 receipt
+///（first_msg_id = 0 / chunk_msg_ids = [0]，单 chunk 簿记形态）。
+#[tokio::test]
+async fn transport_upload_roundtrips_via_the_stager_chain() {
+    let handle = plain(Vfs::new()).await;
+    let transport = WebdavTransport::new(Arc::new(driver(&handle)));
+    transport.connect().await.expect("connect");
+
+    let local = tempfile::NamedTempFile::new().expect("local spool");
+    let payload = pattern(2048);
+    std::fs::write(local.path(), &payload).expect("local write");
+    let vpath = cloudkit_storage::vpath::RelPath::new("/up/f.bin").expect("vpath");
+    let job = cloudkit_storage::transport::UploadJob {
+        rel_path: vpath,
+        local_path: local.path().to_path_buf(),
+        size: payload.len() as u64,
+        chunk_count: 1,
+        chunk_size: payload.len() as u64,
+    };
+    let receipt = transport.upload(&job).await.expect("upload");
+    assert_eq!(receipt.first_msg_id, 0, "K6 placeholder receipt");
+    assert_eq!(receipt.chunk_msg_ids, vec![0], "single-chunk placeholder");
+    assert_eq!(receipt.uploaded_bytes, payload.len() as u64);
+
+    let entry = driver(&handle)
+        .stat(&rel("up/f.bin"))
+        .await
+        .expect("landed (parents created implicitly)");
+    assert_eq!(entry.size, payload.len() as u64);
+    assert_eq!(
+        handle.take("/up/f.bin").as_deref(),
+        Some(payload.as_slice())
+    );
 }

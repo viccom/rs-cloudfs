@@ -68,6 +68,14 @@ const RETRY_BASE: Duration = Duration::from_millis(500);
 /// 退避封顶（§4.5-7 同表：30s）。
 const RETRY_CAP: Duration = Duration::from_secs(30);
 
+/// spool PUT 的体量预算（§4.5-7 分层的写面补充——模块文档「WD3 的
+/// spool PUT 会按体量另设预算」的兑现）：控制面 30s 基线 + 每 MiB 2s
+///（pan123 分片超时同款斜率）。
+fn put_timeout(len: u64) -> Duration {
+    let per_mib = Duration::from_secs(2 * (len / (1024 * 1024)));
+    CONTROL_TIMEOUT.max(per_mib)
+}
+
 /// `Retry-After` 秒数的消费钳制（K79.3 纪律：下限防 0s 空转、上限防
 /// 服务器勒索性长眠）。
 const RETRY_AFTER_CLAMP_SECS: (u64, u64) = (1, 60);
@@ -442,7 +450,11 @@ impl WebdavClient {
         }
     }
 
-    /// stat 语义的 PROPFIND Depth 0 → 单条目投影（404 → `NotFound`）。
+    /// stat 语义的 PROPFIND **Depth 0** → 单条目投影（404 → `NotFound`）。
+    ///
+    /// **Depth 头恒显式发送**（RFC 4918 §9.1 要求；缺省值留给服务器
+    /// 自由发挥——dav-server 0.11 对无 Depth 的 PROPFIND 回**空
+    /// multistatus**，真实现揭出的 WD2 缺陷，双桩制的参照腿首功）。
     ///
     /// **尾斜杠重试腿（附录 C ⑧ apache SlashStrict）**：文件形态 URL
     /// （无尾斜杠）遇 3xx → 以集合形态（尾斜杠）重试恰一次——集合
@@ -450,8 +462,9 @@ impl WebdavClient {
     /// 真值；其余 3xx（如 unexpected_301 旋钮的文件腿）两次都 3xx →
     /// `Unavailable` + Location 提示（§4.4）。
     pub(crate) async fn stat(&self, url: &Url) -> Result<PropfindEntry, StorageError> {
+        let depth = [("depth", Depth::Zero.as_str().to_string())];
         let response = self
-            .execute("PROPFIND", url, &[], None, CONTROL_TIMEOUT)
+            .execute("PROPFIND", url, &depth, None, CONTROL_TIMEOUT)
             .await?;
         if response.status().is_redirection() {
             let location = response
@@ -463,7 +476,7 @@ impl WebdavClient {
             drain_bounded(response).await;
             let slashed = collection_url(url);
             let second = self
-                .execute("PROPFIND", &slashed, &[], None, CONTROL_TIMEOUT)
+                .execute("PROPFIND", &slashed, &depth, None, CONTROL_TIMEOUT)
                 .await?;
             return self.stat_entry_of(second, &slashed, Some(&location)).await;
         }
@@ -582,11 +595,31 @@ impl WebdavClient {
 
     /// PUT（带 Content-Length 的整体上传——D5；`.part` 暂存件腿）。
     /// **永不自动重试**（§4.5-10：PUT 非幂等——重放可能重复写效果；
-    /// stager 的 lost-ACK 重放窗协议在 WD3 承担恢复语义）。响应体做有
-    /// 界排空（连接杀在 PUT 上的可观察面——排空即传输错误浮现）。
-    pub(crate) async fn put(&self, url: &Url, body: bytes::Bytes) -> Result<(), StorageError> {
+    /// stager 的 lost-ACK 重放窗协议承担恢复语义）。响应体做有界排空
+    /// （连接杀在 PUT 上的可观察面——排空即传输错误浮现）。
+    ///
+    /// `x_oc_mtime`：nextcloud vendor 的 `X-OC-Mtime` 搭车（D4/D2 修订
+    /// ——generic 恒 `None` 不发；客户端只搬运头，vendor 决策归 stager）。
+    /// 超时按体量另设预算（§4.5-7 写面补充：30s 基线 + 每 MiB 2s——
+    /// 整件 PUT 的宽收斜率，pan123 分片超时同款）。
+    pub(crate) async fn put(
+        &self,
+        url: &Url,
+        body: bytes::Bytes,
+        x_oc_mtime: Option<u64>,
+    ) -> Result<(), StorageError> {
+        let headers: Vec<(&'static str, String)> = match x_oc_mtime {
+            Some(secs) => vec![("x-oc-mtime", secs.to_string())],
+            None => Vec::new(),
+        };
         let response = self
-            .execute("PUT", url, &[], Some(body), CONTROL_TIMEOUT)
+            .execute(
+                "PUT",
+                url,
+                &headers,
+                Some(body.clone()),
+                put_timeout(body.len() as u64),
+            )
             .await?;
         let status = response.status();
         if !status.is_success() {
@@ -617,43 +650,101 @@ impl WebdavClient {
         ))
     }
 
-    // -------------------------------------------- 写侧动词占位（WD3 接线）---
+    // ------------------------------------------------ 写侧动词（WD3 接线）---
 
     /// MKCOL（恒带尾斜杠——附录 C ⑥/⑧；rclone 已存在 201 幂等陷阱由
     /// 驱动 stat 预检吸收）。**永不自动重试**（非幂等）。
-    #[allow(dead_code)] // WD3 写路径批接线（stager/驱动写面落地后进入使用）
-    pub(crate) async fn mkcol(&self, _url: &Url) -> Result<(), StorageError> {
-        // TODO(wd3): 写路径批接线。
-        Err(StorageError::Unsupported)
+    ///
+    /// 结果分类（§4.4 verb 专用行的驱动介入面——[`get_range`] 的 416
+    /// `Ok(None)` passthrough 同款纪律：可处置形态不预映射，语义决策归
+    /// 驱动）：
+    /// - 2xx → [`MkcolOutcome::Created`]；
+    /// - 409（父集合缺失）→ [`MkcolOutcome::ParentMissing`]——驱动隐式
+    ///   建父后重试恰一次；
+    /// - 405（目标已被占用——RFC/apache 形态；rclone 的 201 陷阱由预检
+    ///   吸收，此臂只接预检后的竞态带）→ `Err(Exists)`；
+    /// - 其余 → [`map_status`]。
+    pub(crate) async fn mkcol(&self, url: &Url) -> Result<MkcolOutcome, StorageError> {
+        let response = self
+            .execute("MKCOL", url, &[], None, CONTROL_TIMEOUT)
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            if status == reqwest::StatusCode::CONFLICT {
+                return Ok(MkcolOutcome::ParentMissing);
+            }
+            if status == reqwest::StatusCode::METHOD_NOT_ALLOWED {
+                return Err(StorageError::Exists);
+            }
+            return Err(map_status(status, "MKCOL", &diagnostic(&text, url)));
+        }
+        drain_bounded(response).await;
+        Ok(MkcolOutcome::Created)
     }
 
-    /// DELETE（集合腿恒带尾斜杠——附录 C ⑦）。**永不自动重试**。
-    #[allow(dead_code)] // WD3 写路径批接线
-    pub(crate) async fn delete(&self, _url: &Url) -> Result<(), StorageError> {
-        // TODO(wd3): 写路径批接线。
-        Err(StorageError::Unsupported)
+    /// DELETE（集合腿恒带尾斜杠——附录 C ⑦，由驱动 stat 预检判形态）。
+    /// **永不自动重试**。404 → `NotFound`（幂等形态声明的动词半边）；
+    /// 其余非 2xx → [`map_status`]。
+    pub(crate) async fn delete(&self, url: &Url) -> Result<(), StorageError> {
+        let response = self
+            .execute("DELETE", url, &[], None, CONTROL_TIMEOUT)
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            return Err(map_status(status, "DELETE", &diagnostic(&text, url)));
+        }
+        drain_bounded(response).await;
+        Ok(())
     }
 
-    /// MOVE（恒显式 `Overwrite` 头 + 绝对 `Destination`——附录 C ⑤/⑩；
-    /// 目录腿源与 Destination 均带尾斜杠）。**永不自动重试**。
-    #[allow(dead_code)] // WD3 写路径批接线
+    /// MOVE（**恒显式 `Overwrite` 头 + 绝对 `Destination`**——附录 C ⑤
+    /// rclone 缺头偏离 / ⑩ apache 拒相对 URI 两行的驱动对策；目录腿源
+    /// 与 Destination 的尾斜杠由驱动经 [`crate::urls::collection_url`]
+    /// 组合后传入）。**永不自动重试**（非幂等——重放窗防线归 stager，
+    /// K67 H2）。
+    ///
+    /// 结果分类（§4.4 verb 专用行，passthrough 纪律同 [`Self::mkcol`]）：
+    /// - 2xx → [`MoveOutcome::Done`]；
+    /// - 412 且 `overwrite == false`（Overwrite:F 撞既有目标）→
+    ///   [`MoveOutcome::PreconditionFailed`]——驱动重 stat 复核后定
+    ///   `Exists`（K75-1：只认显式 precondition）；
+    /// - 403/409/500（缺父嫌疑：矩阵⑤ rclone403 / apache500 + RFC 409
+    ///   形态）→ [`MoveOutcome::ParentSuspect`]——驱动 stat 目标父核实
+    ///   后定夺（缺→隐式建父重试恰一次；在→按通用表归一）；
+    /// - 其余 → `Err(map_status)`。
     pub(crate) async fn move_(
         &self,
-        _from: &Url,
-        _to: &Url,
-        _overwrite: bool,
-    ) -> Result<(), StorageError> {
-        // TODO(wd3): 写路径批接线。
-        Err(StorageError::Unsupported)
-    }
-
-    /// PROPPATCH（D2 降级后 generic 不写 mtime——仅作动词面占位保留，
-    /// 驱动面无调用方；WD3 conformance 批复核后若无消费面则随批移除）。
-    /// **永不自动重试**。
-    #[allow(dead_code)] // WD3 复核去留
-    pub(crate) async fn proppatch(&self, _url: &Url) -> Result<(), StorageError> {
-        // TODO(wd3): conformance 批复核去留。
-        Err(StorageError::Unsupported)
+        from: &Url,
+        to: &Url,
+        overwrite: bool,
+    ) -> Result<MoveOutcome, StorageError> {
+        let headers = [
+            ("overwrite", if overwrite { "T" } else { "F" }.to_string()),
+            // Destination 恒绝对 URI（url::Url 的序列化面——构造即保证）。
+            ("destination", to.as_str().to_string()),
+        ];
+        let response = self
+            .execute("MOVE", from, &headers, None, CONTROL_TIMEOUT)
+            .await?;
+        let status = response.status();
+        if !status.is_success() {
+            let text = response.text().await.unwrap_or_default();
+            let diagnostic = diagnostic(&text, from);
+            if status == reqwest::StatusCode::PRECONDITION_FAILED && !overwrite {
+                return Ok(MoveOutcome::PreconditionFailed { diagnostic });
+            }
+            if matches!(status.as_u16(), 403 | 409 | 500) {
+                return Ok(MoveOutcome::ParentSuspect {
+                    status: status.as_u16(),
+                    diagnostic,
+                });
+            }
+            return Err(map_status(status, "MOVE", &diagnostic));
+        }
+        drain_bounded(response).await;
+        Ok(MoveOutcome::Done)
     }
 }
 
@@ -667,6 +758,65 @@ enum Authz {
     Basic { user: String, pass: String },
     /// Digest（已签名头值）。
     Digest(String),
+}
+
+// ------------------------------------------------ 写侧结果分类（WD3）---
+
+/// MKCOL 的结果分类（§4.4 verb 专用行——409 缺父形态 passthrough 给
+/// 驱动的隐式建父重试腿；见 [`WebdavClient::mkcol`]）。
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(crate) enum MkcolOutcome {
+    /// 建成（2xx）。
+    Created,
+    /// 409：父集合缺失——驱动隐式建父后重试恰一次。
+    ParentMissing,
+}
+
+/// MOVE 的结果分类（§4.4 verb 专用行——412/缺父形态 passthrough 给驱动；
+/// 见 [`WebdavClient::move_`]）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum MoveOutcome {
+    /// 移动完成（2xx）。
+    Done,
+    /// 412（`Overwrite: F` 撞既有目标）——驱动重 stat 复核后定 `Exists`
+    ///（K75-1：只认显式 precondition，传输类绝不映射 Exists）。
+    PreconditionFailed {
+        /// 截断诊断片段（复核不成立时的原文保留）。
+        diagnostic: String,
+    },
+    /// 缺父嫌疑（403/409/500——矩阵⑤ rclone403 / apache500 + RFC 409）：
+    /// 驱动 stat 目标父核实——缺则隐式建父重试恰一次；在则按通用表归一。
+    ParentSuspect {
+        /// 原始状态码。
+        status: u16,
+        /// 截断诊断片段。
+        diagnostic: String,
+    },
+}
+
+impl MoveOutcome {
+    /// 非 `Done` 形态的终局映射（stager 等不做处置腿的调用方共用）：
+    /// 412 → `Unavailable` 保留原文；缺父三态 → [`map_status`] 通用表
+    ///（403→Unauthorized / 409→Invalid / 500→Unavailable）。
+    pub(crate) fn into_storage_error(self) -> StorageError {
+        match self {
+            MoveOutcome::PreconditionFailed { diagnostic } => StorageError::Unavailable(format!(
+                "webdav MOVE failed with 412 Precondition Failed: {diagnostic}"
+            )),
+            MoveOutcome::ParentSuspect { status, diagnostic } => {
+                match reqwest::StatusCode::from_u16(status) {
+                    Ok(code) => map_status(code, "MOVE", &diagnostic),
+                    // 不可达防御（构造面只产 403/409/500）。
+                    Err(_) => StorageError::Unavailable(format!(
+                        "webdav MOVE failed (HTTP {status}): {diagnostic}"
+                    )),
+                }
+            }
+            MoveOutcome::Done => StorageError::Unavailable(
+                "internal: MoveOutcome::Done has no error form".to_string(),
+            ),
+        }
+    }
 }
 
 // ---------------------------------------------------- 纯函数（单测面）---
@@ -808,7 +958,9 @@ pub(crate) fn map_transport(error: reqwest::Error) -> StorageError {
     }
 }
 
-/// HTTP 状态映射（§4.4 表——读写共用，WD3 写面扩展 MKCOL/MOVE 专用行）。
+/// HTTP 状态映射（§4.4 表——读写共用的通用行；MKCOL/MOVE/PUT 的 verb
+/// 专用行——MKCOL 405→Exists / MKCOL·MOVE 409·403·500 缺父处置 /
+/// MOVE 412 复核——在各动词方法内先行拦截，不经过本函数）。
 ///
 /// `snippet` 是截断诊断片段（body 片段 + url；3xx 场景由调用方组装进
 /// Location 提示）。
@@ -817,8 +969,8 @@ pub(crate) fn map_status(status: reqwest::StatusCode, verb: &str, snippet: &str)
         404 => StorageError::NotFound,
         // 认证协商已尽（驱动先自救的契约在 execute 的 401 路径履行）。
         401 | 403 => StorageError::Unauthorized { recoverable: false },
-        // 读面：405（对读动词不允许）/409（状态冲突）按非法调用归类；
-        // 写面（MKCOL 405→Exists、409→隐式建父）WD3 扩展。
+        // 通用面：405（动词不被允许）/409（状态冲突）按非法调用归类
+        //（MKCOL/MOVE 的专用形态已在动词方法内拦截）。
         405 | 409 => StorageError::Invalid,
         410 => StorageError::NotFound,
         416 => StorageError::Unavailable(format!(

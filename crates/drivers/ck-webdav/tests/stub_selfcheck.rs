@@ -1481,6 +1481,134 @@ async fn lost_ack_move_replay_finds_source_gone() {
     assert_eq!(response.status().as_u16(), 404);
 }
 
+/// lost_ack_after_effect_skip：让过前 N 个效果型请求后才断 ACK——
+/// stager close 链（PUT .part → MOVE 固化）要把 lost-ACK 打在 MOVE 上
+/// 的 WD3 注入面（skip=1：PUT 正常 201，MOVE 效果已落但 ACK 断）。
+#[tokio::test]
+async fn lost_ack_skip_breaks_the_next_effect_request() {
+    let mut vfs = Vfs::new();
+    vfs.seed_file("/a.txt", b"MOVE-CONTENT");
+    let knobs = Knobs {
+        lost_ack_after_effect: true,
+        lost_ack_after_effect_skip: 1,
+        ..Knobs::default()
+    };
+    let handle = spawn_stub(vfs, AuthMode::None, knobs, StubStyle::rclone()).await;
+    // 首个效果型请求（PUT）消耗 skip 槽：正常应答、无断连。
+    let response = client()
+        .put(url_of(&handle, "/part.txt"))
+        .body("staged")
+        .send()
+        .await
+        .expect("PUT passes through the skip slot");
+    assert_eq!(response.status().as_u16(), 201);
+    // 下一个效果型请求（MOVE）断 ACK：效果已落、响应丢失。
+    let result = client()
+        .request(method("MOVE"), url_of(&handle, "/a.txt"))
+        .header("destination", url_of(&handle, "/b.txt"))
+        .header("overwrite", "T")
+        .send()
+        .await;
+    assert!(
+        transport_failed(result).await,
+        "the ACK loss must land on the MOVE, not the PUT"
+    );
+    assert_eq!(
+        handle.take("/b.txt").as_deref(),
+        Some(b"MOVE-CONTENT".as_slice()),
+        "the move effect landed before the connection died"
+    );
+}
+
+/// stat_size_delta（一次性）：下一个**文件目标**的 PROPFIND 自条目把
+/// getcontentlength 谎报为 真实+delta（负值钳 0）；只影响自条目、只
+/// 谎报一次——stager close 的 size 复核注入面。
+#[tokio::test]
+async fn stat_size_delta_lies_once_on_the_file_selfentry() {
+    let mut vfs = Vfs::new();
+    vfs.seed_file("/f.bin", b"0123456789");
+    vfs.seed_file("/sub/child.bin", b"xyz");
+    let knobs = Knobs {
+        stat_size_delta: Some(3),
+        ..Knobs::default()
+    };
+    let handle = spawn_stub(vfs.clone(), AuthMode::None, knobs, StubStyle::rclone()).await;
+    let body = propfind(&handle, "/f.bin", "0")
+        .await
+        .text()
+        .await
+        .expect("body");
+    assert!(
+        body.contains("<D:getcontentlength>13</D:getcontentlength>"),
+        "the self-entry lies: real 10 + delta 3"
+    );
+    // 一次性：第二次恢复真值。
+    let body = propfind(&handle, "/f.bin", "0")
+        .await
+        .text()
+        .await
+        .expect("body");
+    assert!(
+        body.contains("<D:getcontentlength>10</D:getcontentlength>"),
+        "the lie is one-shot"
+    );
+    // 子条目不受影响（旋钮只作用于自条目）。
+    let knobs2 = Knobs {
+        stat_size_delta: Some(100),
+        ..Knobs::default()
+    };
+    let handle2 = spawn_stub(vfs, AuthMode::None, knobs2, StubStyle::rclone()).await;
+    let body = propfind(&handle2, "/sub", "1")
+        .await
+        .text()
+        .await
+        .expect("body");
+    assert!(
+        body.contains("<D:getcontentlength>3</D:getcontentlength>"),
+        "children entries carry the true length"
+    );
+}
+
+/// transient_5xx_move：前 N 次 MOVE 回 503（与 transient_5xx 独立计数
+/// ——PROPFIND/GET 不消耗它，MOVE 也不消耗前者）。
+#[tokio::test]
+async fn transient_5xx_move_hits_only_moves() {
+    let mut vfs = Vfs::new();
+    vfs.seed_file("/a.txt", b"x");
+    let knobs = Knobs {
+        transient_5xx_move: 1,
+        ..Knobs::default()
+    };
+    let handle = spawn_stub(vfs, AuthMode::None, knobs, StubStyle::rclone()).await;
+    // PROPFIND/GET 不消耗 MOVE 计数。
+    let response = client()
+        .get(url_of(&handle, "/a.txt"))
+        .send()
+        .await
+        .expect("get");
+    assert_eq!(response.status().as_u16(), 200);
+    // 首个 MOVE 吃 503（效果未落——故障门在路由前）。
+    let response = client()
+        .request(method("MOVE"), url_of(&handle, "/a.txt"))
+        .header("destination", url_of(&handle, "/b.txt"))
+        .header("overwrite", "T")
+        .send()
+        .await
+        .expect("move");
+    assert_eq!(response.status().as_u16(), 503);
+    assert!(handle.exists("/a.txt"), "no effect before the fault gate");
+    // 计数耗尽后恢复。
+    let response = client()
+        .request(method("MOVE"), url_of(&handle, "/a.txt"))
+        .header("destination", url_of(&handle, "/b.txt"))
+        .header("overwrite", "T")
+        .send()
+        .await
+        .expect("move retry");
+    assert_eq!(response.status().as_u16(), 201);
+    assert!(handle.exists("/b.txt"));
+}
+
 /// slow_drip：分块延迟但不丢字节（窗口读不卡死/超时面的载体）。
 #[tokio::test]
 async fn slow_drip_delivers_full_body() {

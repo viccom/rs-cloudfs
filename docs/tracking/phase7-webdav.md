@@ -2,7 +2,7 @@
 
 > 计划：`docs/plans/2026-09-17-webdav-driver.md` ｜ 需求口径：负责人 2026-09-17「按推荐方案执行；与既有 phase 同策略（计划+跟踪单+TDD）；编译可选；严格遵循项目规范与约束」；**批准：2026-09-21 负责人实施指令（全程自主执行，批次 WD0–WD5 顺延执行）**
 > 基线：main@eda60a7（workspace **1394/0/42**，ignored 42 = 真机/平台/真网类；编号漂移修正——立项裁决用 **K80/K81**，webdav 为**第 7 驱动**，见计划头部留痕）
-> 状态：**WD2 完成（2026-09-21）——WD3 待开工**
+> 状态：**WD3 完成（2026-09-22）——WD4 待开工**
 > worktree：`feat/webdav-driver`，独立 target（共享 CARGO_TARGET_DIR 双指纹既有教训）
 
 | 任务 | 内容 | 状态 | 完成情况 | 证据 |
@@ -10,11 +10,26 @@
 | WD0 | 立项落档 + 真机怪癖 spike（无生产代码） | ✅ 2026-09-21 | decisions K80/K81 入档（main `b2d8b67`）；计划落库+批准状态（main `c4a042d`）+ AGENTS 联动（main `da2c4ed`）；`examples/webdav_spike/`（5 模块 + digest/xml 可移植资产）双服务器 11 项怪癖矩阵钉死（附录 C 回填）；fixture 文档落盘（凭据只经 env）；**D2 修订**（generic 只读 mtime，预设降级路径触发）+ D5 维持留痕 | 本批日志 |
 | WD1 | 驱动骨架 + 配置接入（无真实网络） | ✅ 2026-09-21 | WD1a：`ck-webdav` 十文件 crate（config/urls/mtime/auth/xml 纯函数层 + client/driver/stager/transport_face 骨架；能力位 R4 逐位依据注码）；45 测试红（42 失败）→绿。WD1b：十三处接入 + **编译器揭出 3 处清单外**（CyDriveConfig 六字段/穷举 round-trip 测试/run_sync_command namespace 臂）全补；feature 三件套 + `compiled_drivers()` 第 7 行（六驱动输出逐字不变，pinned 测试零漂移）+ K31 文案 + twin 双臂 + doctor 骨架臂 + B-M1 env 路由 + web 前端四文件；16 文件 +1048/−25（−25 限 compiled_drivers 测试 cfg 守卫机械重写，pan123 先例） | 本批日志 |
 | WD2 | 手搓注入桩 + 客户端核心 + 读路径 | ✅ 2026-09-21 | WD2a 桩（1826 行：RFC 严格 + WD0 真形双 ns 风格整字节钉 + 服务端真实验证 RFC7616 + 10 故障旋钮 + 请求记录器）+ 33 自检；WD2b 客户端（认证状态机恰一次预算/重试白名单/动词读侧/错误映射）+ 读面（stat/list/reader 8MiB 窗口/quota 降级）+ transport_face connect/open；connect_auth 18 + read_path 17 + 纯函数 10 测试，红→绿留证 | 本批日志 |
-| WD3 | 写路径 stager + conformance | ⬜ | commit-on-close（spool→PUT .part→MOVE 固化→size 复核→mtime best-effort）；断言①覆盖写形态实测裁决（.ckwd- stash 预案在案，K67 H2 重放窗防线 + lost-ACK 桩注入）；错误映射表 §4.4 全行双桩回放；conformance 八断言（**dav-server 参照桩**注入，RESUME 门控跳过） | — |
+| WD3 | 写路径 stager + conformance | ✅ 2026-09-22 | client 写侧四动词（恒显式 Overwrite 构造性 bool/绝对 Destination/X-OC-Mtime 仅 nextcloud）+ mkdir stat 预检（rclone201 陷阱）/隐式建父/409 重试 + delete NotFound 恒定 + rename 412→重 stat Exists（K75-1）/缺父三态；stager 严格序（PUT .part→MOVE T→size 复核→清理）+ **断言①裁决=stash 协议上车**（红→绿留证）+ restore_scene + lost-ACK 两半边对账；**dav-server 参照桩揭真缺陷：stat 缺 Depth 头→dav-server 空回应→已修**（双桩制首功）；conformance ①–⑥⑧ 绿（⑦ RESUME 门控）+ error_table 取舍留档；write_path 20 测试 | 本批日志 |
 | WD4 | 装配接线 + 裁剪组合 | ⬜ | 十三处生效路径 + doctor probe（OPTIONS+auth 五态）+ web 表单/volumes.js/i18n/app.js+system.js 标签表（B-M4 别漏行）+ sync 门控 + `CYDRIVE_WEBDAV_PASSWORD` 入 with_env_overrides（B-M1）；裁剪组合构建（含 `not(baidu)+webdav` twin dispatch 测试，pan115_combo_dispatch 模式）+ K31 文案测试 | — |
 | WD5 | WSL2 真机矩阵 | ⬜ | 双服务器（rclone 明文 Basic 全动词 + Apache Digest/PROPPATCH 腿）十腿矩阵：①上传回读逐字 ②Range 跨窗口 ③吞吐 128 MiB ④会话复用 ⑤覆盖写+staging 不可见+abort 恢复 ⑥外部文件可见 ⑦错误腿分类 ⑧digest 全链路 nc 真实递增 ⑨断线白名单自愈 ⑩拒绝腿可行动文案；可选自举冒烟腿（不作判据）；fixture 文档完备 | — |
 
 ## 批次日志
+
+### WD3（2026-09-22，worktree feat/webdav-driver）
+
+**完成**：写路径全量 + conformance（dav-server 参照桩上线）。前次派发撞使用限额中断，桩侧观测面（lost_ack_skip/stat_size_delta/三头记录）已留工作树——本次修复其借用缺陷后续用。
+
+- **断言①裁决（§4.6 预案路径）**：无 stash 版先跑 → dav-server 参照桩上覆盖写腿红（staging 窗口旧对象可见）→ **stash 协议上车**（writer 开时 `MOVE final→.ckwd-<pid>-<seq>.old`；close 成功删/失败与 abort 经 `restore_scene` 恢复——sftp 判例同款「删自己的、还别人的」）→ 绿。
+- **参照桩揭真缺陷**：client.stat 原不发 `Depth` 头——dav-server 0.11 对无 Depth 的 PROPFIND 回空 multistatus → `ensure_parents` 把卷根误判缺失 → `MKCOL /` 500。修复 = stat 恒显式 `Depth: 0`（RFC 4918 §9.1）。手搓桩「缺头按 Depth 1」宽收掩盖了它——**双桩制的参照腿首功**（「桩照实现抄」防线实证）。
+- **stager**：严格序（建父→PUT .part（Content-Length，X-OC-Mtime 仅 nextcloud 搭车、generic 零 PROPPATCH——记录器断言）→MOVE T→**stat size 复核**（不符→Unavailable；`stat_size_delta` 旋钮注入）→清理）；lost-ACK 两半边对账（PUT 断 ACK 重放 vs MOVE 断 ACK .part 不在+final 就位+size 吻合=按已提交继续——K67 H2 防线）；abort 恢复现场。
+- **mkdir**：stat 预检（rclone MKCOL-201 幂等陷阱——桩双模式钉）+ 409 隐式建父重试恰一次；**rename**：Overwrite:F + 412→重 stat Exists + 缺父三态（403/409/500→建父重试；父被文件占位→Exists）；**delete**：NotFound 恒定声明（conformance ④）。
+- **error_table 取舍**：404→NotFound + 401→Unauthorized{false}；刻意不选 5xx/429（重试白名单自愈消费掉单注入——sftp 刻意不选同款互指）；重试腿由 connect_auth 独立钉。
+- **桩增强**：`transient_5xx_move` 独立计数旋钮（共享计数被 PROPFIND 重试链吃光——实证后新增）+ 自检 3 个（36 总）。
+
+**验证**：workspace **1558/0/42**（1532 基线+26：write_path 20+selfcheck 3+conformance 2+upload 1；既有断言零漂移——connect_auth/read_path 各 1 个 seam 测试随 seam 移除原地重写）；clippy/fmt/check_layers/scan_secrets 绿；dead_code 锚与 TODO(wd3) 清零。回滚 = revert 本批 commit。
+
+**挂账**：①close 整读 spool 进内存 PUT（D5 最简实现；流式 file body 挂账真机吞吐批复核后议——stager 模块文档「已知上界」节声明）；②X-OC-Mtime 值源 = spool mtime（WriteHint 无 mtime 字段的诚实值）；③真机 stash 腿/lost-ACK 形态/Nextcloud 实服 X-OC-Mtime = WD5。
 
 ### WD2（2026-09-21，a+b 两子批，worktree feat/webdav-driver）
 

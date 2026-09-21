@@ -599,8 +599,22 @@ pub struct Knobs {
     /// 一次性（消费即复位）：**先执行效果再断连不回响应**——PUT/MOVE
     /// 的 lost-ACK 重放窗测试关键旋钮（K67 H2 同型）。
     pub lost_ack_after_effect: bool,
+    /// 与 `lost_ack_after_effect` 组合：跳过前 N 个「效果型写请求」
+    /// （PUT/MOVE）后才断下一个的 ACK——stager close 链（PUT .part →
+    /// MOVE 固化）要把 lost-ACK 打在 **MOVE** 上（PUT 先行消耗首个槽）
+    /// 的 WD3 断言面；0 = 现行语义（首个效果型请求即断）。
+    pub lost_ack_after_effect_skip: usize,
+    /// 一次性：下一个**文件目标的 PROPFIND**（Depth 0/1 的自条目）把
+    /// getcontentlength 谎报为 `真实长度 + delta`（负值钳 0）——stager
+    /// close 的 size 复核腿（不符 → Unavailable 不静默）注入面；服务器
+    /// 谎报长度是同型真实故障形态。
+    pub stat_size_delta: Option<i64>,
     /// 前 N 次 PROPFIND/GET 回 503（重试白名单自愈面）。
     pub transient_5xx: usize,
+    /// 前 N 次 MOVE 回 503（WD3：rename 错误分类的注入面——K75-1 断言
+    /// 腿「服务端瞬态 5xx 落在 MOVE 上」；与 `transient_5xx` 不共计数，
+    /// 因 stat 预检的 PROPFIND 重试链会先吃光共享计数）。
+    pub transient_5xx_move: usize,
     /// 前 N 次请求（全部动词）回 429，可带 Retry-After 秒数。
     pub rate_limit_429: Option<(usize, Option<u64>)>,
     /// 对**文件** PROPFIND 回 301 + Location（意外重定向的错误分类面；
@@ -611,8 +625,11 @@ pub struct Knobs {
 /// 消耗型旋钮的运行副本（启动时从 [`Knobs`] 快照）。
 struct FaultLedger {
     transient_left: usize,
+    transient_move_left: usize,
     rate_left: Option<(usize, Option<u64>)>,
     lost_ack: bool,
+    lost_ack_skip: usize,
+    stat_size_delta: Option<i64>,
 }
 
 // ------------------------------------------------------------ 记录器 ---
@@ -632,6 +649,15 @@ pub struct RecordedRequest {
     pub digest_nc: Option<u64>,
     /// Authorization 里解析出的 nonce（服务器签发物，日志安全）。
     pub digest_nonce: Option<String>,
+    /// `Overwrite` 头原样（WD3：恒显式 T/F 的断言面——矩阵⑤ rclone
+    /// 缺头偏离行的驱动对策）。
+    pub overwrite: Option<String>,
+    /// `Destination` 头原样（WD3：恒绝对 URI 的断言面——矩阵⑩ apache
+    /// 400 拒相对 URI 行的驱动对策）。
+    pub destination: Option<String>,
+    /// `X-OC-Mtime` 头原样（WD3：nextcloud 搭车断言面——D4/D2 修订；
+    /// generic 恒 None）。
+    pub x_oc_mtime: Option<String>,
 }
 
 fn mask_authorization(raw: &str) -> String {
@@ -704,6 +730,13 @@ impl StubState {
             .get(axum::http::header::AUTHORIZATION)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
+        // WD3 头观测面（纯观察，不参与任何路由/认证决策）。
+        let header_of = |name: &str| {
+            headers
+                .get(name)
+                .and_then(|value| value.to_str().ok())
+                .map(str::to_string)
+        };
         let record = RecordedRequest {
             method: method.as_str().to_string(),
             path: wire_path.to_string(),
@@ -711,6 +744,9 @@ impl StubState {
             body_len,
             digest_nc: raw_auth.as_deref().and_then(extract_nc),
             digest_nonce: raw_auth.as_deref().and_then(extract_nonce_param),
+            overwrite: header_of("overwrite"),
+            destination: header_of("destination"),
+            x_oc_mtime: header_of("x-oc-mtime"),
         };
         self.lock().requests.push(record);
     }
@@ -850,6 +886,18 @@ impl StubState {
                         .unwrap(),
                 );
             }
+            // MOVE 专属瞬态（WD3）：与 transient_5xx 不共计数——rename 的
+            // stat 预检在 MOVE 之前且 PROPFIND 重试链会把共享计数先吃光，
+            // 「503 恰落在 MOVE 上」需要独立计数面。
+            if ctx.method.as_str() == "MOVE" && inner.ledger.transient_move_left > 0 {
+                inner.ledger.transient_move_left -= 1;
+                return Some(
+                    Response::builder()
+                        .status(StatusCode::SERVICE_UNAVAILABLE)
+                        .body(Body::from("503 transient on MOVE (stub)"))
+                        .unwrap(),
+                );
+            }
         }
         if self.knobs.unexpected_301 && ctx.method.as_str() == "PROPFIND" {
             let is_file = self.lock().vfs.file(&ctx.canonical).is_some();
@@ -890,7 +938,7 @@ impl StubState {
     }
 
     fn handle_propfind(&self, ctx: &Ctx) -> Response {
-        let inner = self.lock();
+        let mut inner = self.lock();
         if !inner.vfs.exists(&ctx.canonical) {
             return (StatusCode::NOT_FOUND, "404 Not Found (stub)").into_response();
         }
@@ -947,16 +995,26 @@ impl StubState {
                 }
             }
         } else {
-            let (bytes, mtime) = inner
-                .vfs
-                .file(&ctx.canonical)
-                .expect("exists checked above");
+            // vfs 借用在块内收口（stat_size_delta.take() 要独占 mutable
+            // 借用 inner——先拷出 length/mtime 两标量再动 ledger）。
+            let (mut length, mtime) = {
+                let (bytes, mtime) = inner
+                    .vfs
+                    .file(&ctx.canonical)
+                    .expect("exists checked above");
+                (bytes.len(), *mtime)
+            };
+            // stat_size_delta（一次性）：谎报**文件目标**自条目的长度
+            //（close 的 size 复核注入面；子条目不受影响——确定性优先）。
+            if let Some(delta) = inner.ledger.stat_size_delta.take() {
+                length = (length as i64 + delta).max(0) as usize;
+            }
             xml.push_str(&propfind_entry(
                 self.style.ns,
                 &href_of(&ctx.canonical, false),
                 false,
-                *mtime,
-                bytes.len(),
+                mtime,
+                length,
                 quota_requested,
             ));
         }
@@ -1064,10 +1122,15 @@ impl StubState {
             .vfs
             .insert_file(&ctx.canonical, ctx.body.to_vec(), MTIME_WRITE);
         if inner.ledger.lost_ack {
-            // lost-ACK：效果已落、响应即断（一次性——重放请求要能拿到
-            // 正常响应才能测重放窗）。
-            inner.ledger.lost_ack = false;
-            return killed_response();
+            if inner.ledger.lost_ack_skip > 0 {
+                // 让过这个效果型请求（slot 计数消耗），断下一个。
+                inner.ledger.lost_ack_skip -= 1;
+            } else {
+                // lost-ACK：效果已落、响应即断（一次性——重放请求要能拿到
+                // 正常响应才能测重放窗）。
+                inner.ledger.lost_ack = false;
+                return killed_response();
+            }
         }
         if existed {
             (StatusCode::NO_CONTENT, "").into_response()
@@ -1211,9 +1274,14 @@ impl StubState {
         }
         inner.vfs.move_subtree(&ctx.canonical, &destination);
         if inner.ledger.lost_ack {
-            // lost-ACK：效果已落、响应即断（一次性，K67 H2 重放窗）。
-            inner.ledger.lost_ack = false;
-            return killed_response();
+            if inner.ledger.lost_ack_skip > 0 {
+                // 让过这个效果型请求（slot 计数消耗），断下一个。
+                inner.ledger.lost_ack_skip -= 1;
+            } else {
+                // lost-ACK：效果已落、响应即断（一次性，K67 H2 重放窗）。
+                inner.ledger.lost_ack = false;
+                return killed_response();
+            }
         }
         // 状态语义（spike 记录腿）：目标新建 → 201（目录腿文案
         // "Destination has been created" 是 apache 记录形态）；覆盖既有
@@ -1791,8 +1859,11 @@ pub async fn spawn_stub(vfs: Vfs, auth: AuthMode, knobs: Knobs, style: StubStyle
     let knobs = Arc::new(knobs);
     let ledger = FaultLedger {
         transient_left: knobs.transient_5xx,
+        transient_move_left: knobs.transient_5xx_move,
         rate_left: knobs.rate_limit_429,
         lost_ack: knobs.lost_ack_after_effect,
+        lost_ack_skip: knobs.lost_ack_after_effect_skip,
+        stat_size_delta: knobs.stat_size_delta,
     };
     let state = Arc::new(StubState {
         knobs: knobs.clone(),

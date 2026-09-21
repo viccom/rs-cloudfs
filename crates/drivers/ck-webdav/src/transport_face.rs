@@ -132,10 +132,16 @@ impl CloudTransport for WebdavTransport {
     }
 
     /// 整文件复制上传（读盘 → stager 链；WD3 接线）。receipt 遵循 K6
-    ///（`first_msg_id = 0` 占位、`chunk_msg_ids = [0]` 单 chunk 占位）。
-    async fn upload(&self, _job: &UploadJob) -> Result<UploadReceipt, StorageError> {
-        // TODO(wd3): stager 链接线。
-        Err(StorageError::Unsupported)
+    ///（first_msg_id = 0 占位、chunk_msg_ids = [0] 单 chunk 占位）。
+    async fn upload(&self, job: &UploadJob) -> Result<UploadReceipt, StorageError> {
+        let rel = vocab_rel(&job.rel_path)?;
+        if rel.is_root() {
+            return Err(StorageError::Invalid); // 卷根不可作为上传目标
+        }
+        let data = tokio::fs::read(&job.local_path)
+            .await
+            .map_err(|e| StorageError::Io(format!("reading {}: {e}", job.local_path.display())))?;
+        self.store_bytes(&rel, job.size, &data).await
     }
 
     /// 全文件读：预算帽语义下等价 `open_range(0, total_size)`。
@@ -161,8 +167,8 @@ impl CloudTransport for WebdavTransport {
         Ok(sync_stream(stream))
     }
 
-    /// 删除句柄指向的卷内对象：薄壳委派 `StorageDriver::delete`（WD3
-    /// 写面接线后生效——当前驱动 delete 仍是占位，本面同留 WD3）。
+    /// 删除句柄指向的卷内对象：薄壳委派 `StorageDriver::delete`
+    /// （WD3 写面已接线——缺失句柄 `NotFound` 幂等、目录递归）。
     async fn delete_remote(&self, handle: &RemoteHandle) -> Result<(), StorageError> {
         let id = entry_id(&self.driver, handle)?;
         self.driver.delete(&id).await
@@ -173,5 +179,30 @@ impl CloudTransport for WebdavTransport {
     /// Nextcloud trashbin 是服务端行为不可依赖，计划 §4.3）。
     fn capabilities(&self) -> Capabilities {
         StorageDriver::capabilities(self.driver.as_ref())
+    }
+}
+
+impl WebdavTransport {
+    /// 上传收尾共通（sftp `store_bytes` 同款薄壳）：writer + 全量
+    /// write + close → K6 receipt（first_msg_id = 0、chunk_msg_ids =
+    /// [0] 占位——整件 PUT 无 chunk 簿记）。
+    async fn store_bytes(
+        &self,
+        rel: &RelPath,
+        promised: u64,
+        data: &[u8],
+    ) -> Result<UploadReceipt, StorageError> {
+        let hint = cloudkit_storage::WriteHint {
+            size: Some(promised),
+            ..Default::default()
+        };
+        let mut stager = self.driver.writer(rel, &hint).await?;
+        stager.write(data).await?;
+        let entry = stager.close().await?;
+        Ok(UploadReceipt {
+            first_msg_id: 0,
+            chunk_msg_ids: vec![0],
+            uploaded_bytes: entry.size,
+        })
     }
 }
