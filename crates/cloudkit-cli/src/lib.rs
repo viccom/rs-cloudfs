@@ -6020,9 +6020,19 @@ impl ck_pan115::TokenStore for ConfigTokenStore {
 /// telegram (the proxy is a live setting there) or when no proxy is
 /// configured.
 pub fn proxy_ineffective_warning(cfg: &CyDriveConfig) -> Option<&'static str> {
-    let effective =
-        cfg.proxy_url.as_deref().is_some_and(|p| !p.is_empty()) && cfg.backend != Backend::Telegram;
-    effective.then_some(PROXY_DIRECT_BACKEND_NOTICE)
+    if cfg.backend == Backend::Telegram {
+        return None;
+    }
+    if cfg.proxy_url.as_deref().is_some_and(|p| !p.is_empty()) {
+        // webdav 刻意尊重系统代理 env（自备服务器 = 用户自己的网络路径），
+        // 「恒直连」声明对它不成立——专属文案避免误导排查方向
+        //（Phase 7 审查 M14；pan123 落地时的文案联动先例同族）。
+        if cfg.backend == Backend::Webdav {
+            return Some(WEBDAV_PROXY_NOTICE);
+        }
+        return Some(PROXY_DIRECT_BACKEND_NOTICE);
+    }
+    None
 }
 
 /// The K18 declaration text shared by the assembly log and doctor.
@@ -6030,6 +6040,14 @@ pub const PROXY_DIRECT_BACKEND_NOTICE: &str =
     "proxy_url is set but has no effect on this backend: baidu/local/sftp/pan115/pan123 always \
      connect directly (no_proxy + forced IPv4; the sftp transport has no proxy support); the \
      proxy only serves the telegram transport";
+
+/// The webdav variant (Phase 7 审查 M14): the config key is not read by the
+/// driver, but its client deliberately honors the standard proxy environment
+/// variables — the honest diagnosis names both halves.
+pub const WEBDAV_PROXY_NOTICE: &str =
+    "proxy_url is set but the webdav driver does not read this config key; it connects with the \
+     standard http_proxy/https_proxy environment variables instead (deliberate: user-provided \
+     servers ride the user's own network path)";
 
 /// K12: a local instance cannot run the metadata-sync task (the local
 /// root IS the source of truth); a `sync_url` on such an instance is a
@@ -6169,7 +6187,8 @@ pub async fn webdav_backend_probe(cfg: &CyDriveConfig) -> ck_webdav::WebdavProbe
         Err(error) => {
             return ck_webdav::WebdavProbe::Unreachable {
                 detail: format!(
-                    "the webdav configuration is incomplete ({error}); set the webdav_* keys                      in config.toml and retry"
+                    "the webdav configuration is incomplete ({error}); set the webdav_* keys \
+                     in config.toml and retry"
                 ),
             }
         }
