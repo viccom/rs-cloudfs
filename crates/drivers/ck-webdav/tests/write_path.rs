@@ -418,6 +418,109 @@ async fn rename_missing_parent_is_created_then_retried() {
     assert_eq!(requests_of(&handle, "MOVE").len(), 2);
 }
 
+/// M13③：MOVE 缺父 409（RFC 4918 §9.9.4 形态——缺父三态的第三态，
+/// rclone403/apache500 之外的补腿）→ 隐式建父后重试恰一次 → 成功。
+#[tokio::test]
+async fn rename_missing_parent_409_is_created_then_retried() {
+    let mut vfs = Vfs::new();
+    vfs.seed_file("/src.bin", b"moved");
+    let handle = spawn_stub(
+        vfs,
+        stub::AuthMode::None,
+        Knobs::default(),
+        StubStyle {
+            move_missing_parent: stub::MoveMissingParent::Apache409,
+            ..StubStyle::rclone()
+        },
+    )
+    .await;
+    let driver = driver(&handle);
+
+    driver
+        .rename(&rel("src.bin"), &rel("newdir/sub/g.bin"))
+        .await
+        .expect("409 → implicit parents → MOVE retry");
+    assert_eq!(
+        handle.take("/newdir/sub/g.bin").as_deref(),
+        Some(b"moved".as_slice())
+    );
+    // 重试恰一次：MOVE 到达两次（首次 409 + 建父后的重试）。
+    assert_eq!(requests_of(&handle, "MOVE").len(), 2);
+}
+
+/// M13③ 补臂：409 + 目标父路径被文件占住 → `Exists`（占位冲突——隐式
+/// 建父不可行，与既有 Apache500 腿同型判定；传输/服务端类绝不映射
+/// Exists 的 K75-1 纪律不适用于此：这是 stat 核实的真实占位）。
+#[tokio::test]
+async fn rename_409_with_a_file_occupied_parent_yields_exists() {
+    let mut vfs = Vfs::new();
+    vfs.seed_file("/src.bin", b"source");
+    vfs.seed_file("/blocker", b"x");
+    let handle = spawn_stub(
+        vfs,
+        stub::AuthMode::None,
+        Knobs::default(),
+        StubStyle {
+            move_missing_parent: stub::MoveMissingParent::Apache409,
+            ..StubStyle::rclone()
+        },
+    )
+    .await;
+    let driver = driver(&handle);
+
+    let error = driver
+        .rename(&rel("src.bin"), &rel("blocker/new.bin"))
+        .await
+        .expect_err("a file occupies the destination parent path");
+    assert!(matches!(error, StorageError::Exists), "{error:?}");
+    assert!(handle.exists("/src.bin"), "source untouched");
+}
+
+/// M13①：PUT 507（配额满真形）→ `Io` 带码（map_status 尾行），零效果
+/// 且不进重试白名单（PUT 非幂等）。注入：`storage_full_once` 旋钮打在
+/// close 链的 `.part` PUT 上；lost-ACK 对账核实未落 → 如实上抛原错误。
+#[tokio::test]
+async fn put_insufficient_storage_maps_to_io_with_the_code() {
+    let handle = spawn_stub(
+        Vfs::new(),
+        stub::AuthMode::None,
+        Knobs {
+            storage_full_once: true,
+            ..Knobs::default()
+        },
+        StubStyle::rclone(),
+    )
+    .await;
+    let driver = driver(&handle);
+
+    let error = upload_bytes(&driver, &rel("f.bin"), b"payload")
+        .await
+        .expect_err("the .part PUT hits the injected 507");
+    match error {
+        StorageError::Io(message) => {
+            assert!(message.contains("507"), "{message}");
+            assert!(
+                message.contains("insufficient storage"),
+                "the code is spelled out: {message}"
+            );
+        }
+        other => panic!("expected Io, got {other:?}"),
+    }
+    // 零效果：final 与 `.part` 都未落地（快照只剩根目录）。
+    assert_eq!(
+        handle.snapshot().len(),
+        1,
+        "a rejected PUT must land nothing: {:?}",
+        handle.snapshot()
+    );
+    // 旋钮已耗：同一目标重传成功（507 不在重试白名单——重传是调用方
+    // 的显式决定）。
+    let entry = upload_bytes(&driver, &rel("f.bin"), b"payload")
+        .await
+        .expect("retry lands after the knob is spent");
+    assert_eq!(entry.size, 7);
+}
+
 // ------------------------------------------------------------ stager ---
 
 /// §4.6 提交链：PUT `<final>.ckwd-<pid>-<seq>.part`（Content-Length =

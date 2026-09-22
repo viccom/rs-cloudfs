@@ -17,8 +17,8 @@ use std::time::{Duration, Instant};
 
 use md5::{Digest as Md5Digest, Md5};
 use stub::{
-    spawn_stub, AuthMode, Knobs, ProppatchMode, StubHandle, StubStyle, Vfs, VfsEntry,
-    ALLPROP_PROPFIND, MTIME_SEED, MTIME_WRITE,
+    spawn_stub, AuthMode, Knobs, MoveMissingParent, ProppatchMode, StubHandle, StubStyle, Vfs,
+    VfsEntry, ALLPROP_PROPFIND, MTIME_SEED, MTIME_WRITE,
 };
 
 // ------------------------------------------------------------ 测试工具 ---
@@ -1820,6 +1820,211 @@ async fn member_500_once_yields_a_500_only_propstat() {
     handle.shutdown().await;
 }
 
+/// range_416_once（M10 注入面，一次性）：下一个**带 Range 头**的文件
+/// GET 无条件 416（Content-Range `bytes */total` 真形——satisfiable 与
+/// 否不影响）；第二个 Range GET 恢复 206；无 Range 头的 GET 不触发。
+#[tokio::test]
+async fn range_416_once_answers_416_to_the_next_range_get() {
+    let mut vfs = Vfs::new();
+    vfs.seed_file("/f.bin", b"0123456789");
+    let knobs = Knobs {
+        range_416_once: true,
+        ..Knobs::default()
+    };
+    let handle = spawn_stub(vfs, AuthMode::None, knobs, StubStyle::rclone()).await;
+    let url = url_of(&handle, "/f.bin");
+
+    let response = client()
+        .get(&url)
+        .header("range", "bytes=2-5")
+        .send()
+        .await
+        .expect("range get");
+    assert_eq!(
+        response.status().as_u16(),
+        416,
+        "satisfiable or not, the knob fires"
+    );
+    assert_eq!(
+        response
+            .headers()
+            .get("content-range")
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes */10"),
+        "the 416 carries the RFC content-range form"
+    );
+    // 一次性：第二个 Range GET 恢复正常 206。
+    let response = client()
+        .get(&url)
+        .header("range", "bytes=2-5")
+        .send()
+        .await
+        .expect("second range get");
+    assert_eq!(response.status().as_u16(), 206);
+    // 无 Range 头的 GET 照常 200（旋钮只打在 Range 请求上）。
+    let response = client().get(&url).send().await.expect("plain get");
+    assert_eq!(response.status().as_u16(), 200);
+    handle.shutdown().await;
+}
+
+/// forbidden_propfinds（M11 注入面）：前 N 次 PROPFIND 回 403 后自愈；
+/// GET 不消耗计数（403 只打在 PROPFIND 上——stat/list 的权限真形）。
+#[tokio::test]
+async fn forbidden_propfinds_answers_403_then_recovers() {
+    let mut vfs = Vfs::new();
+    vfs.seed_file("/f.txt", b"x");
+    let knobs = Knobs {
+        forbidden_propfinds: 1,
+        ..Knobs::default()
+    };
+    let handle = spawn_stub(vfs, AuthMode::None, knobs, StubStyle::rclone()).await;
+    // GET 先行不消耗计数：照常 200。
+    let response = client()
+        .get(url_of(&handle, "/f.txt"))
+        .send()
+        .await
+        .expect("get");
+    assert_eq!(response.status().as_u16(), 200);
+    // 首个 PROPFIND 吃 403；第二个自愈 207。
+    let response = propfind(&handle, "/f.txt", "0").await;
+    assert_eq!(response.status().as_u16(), 403);
+    let response = propfind(&handle, "/f.txt", "0").await;
+    assert_eq!(
+        response.status().as_u16(),
+        207,
+        "recovers after the count is spent"
+    );
+    handle.shutdown().await;
+}
+
+/// range_206_lie（M12 注入面）：206 的 Content-Range 相对请求整体平移
+/// +1（头与请求不符——驱动 206 校验 mismatch 臂的载体）；body 仍是
+/// 请求区间的真字节（撒谎只在头）。
+#[tokio::test]
+async fn range_206_lie_shifts_the_content_range() {
+    let mut vfs = Vfs::new();
+    vfs.seed_file("/f.bin", b"0123456789");
+    let knobs = Knobs {
+        range_206_lie: true,
+        ..Knobs::default()
+    };
+    let handle = spawn_stub(vfs, AuthMode::None, knobs, StubStyle::rclone()).await;
+    let response = client()
+        .get(url_of(&handle, "/f.bin"))
+        .header("range", "bytes=2-5")
+        .send()
+        .await
+        .expect("lie get");
+    assert_eq!(response.status().as_u16(), 206);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-range")
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes 3-6/10"),
+        "the header no longer matches the request bytes=2-5"
+    );
+    assert_eq!(
+        response.bytes().await.expect("body").as_ref(),
+        b"2345",
+        "the body is still the requested window's true bytes"
+    );
+    handle.shutdown().await;
+}
+
+/// range_206_short（M12 注入面）：206 的 Content-Range 正确但 body 短
+/// 一字节（驱动 206 长度校验臂的载体）。
+#[tokio::test]
+async fn range_206_short_truncates_the_body_by_one_byte() {
+    let mut vfs = Vfs::new();
+    vfs.seed_file("/f.bin", b"0123456789");
+    let knobs = Knobs {
+        range_206_short: true,
+        ..Knobs::default()
+    };
+    let handle = spawn_stub(vfs, AuthMode::None, knobs, StubStyle::rclone()).await;
+    let response = client()
+        .get(url_of(&handle, "/f.bin"))
+        .header("range", "bytes=2-5")
+        .send()
+        .await
+        .expect("short get");
+    assert_eq!(response.status().as_u16(), 206);
+    assert_eq!(
+        response
+            .headers()
+            .get("content-range")
+            .and_then(|value| value.to_str().ok()),
+        Some("bytes 2-5/10"),
+        "the header stays truthful"
+    );
+    let body = response.bytes().await.expect("body");
+    assert_eq!(body.len(), 3, "one byte short of the 4-byte window");
+    assert_eq!(body.as_ref(), b"234", "the prefix bytes stay intact");
+    handle.shutdown().await;
+}
+
+/// storage_full_once（M13 注入面，一次性）：下一个 PUT 回 507 且**零效
+/// 果**（先于任何 VFS 变更——拒绝语义）；计数耗尽后恢复 201。
+#[tokio::test]
+async fn storage_full_once_rejects_the_first_put_with_507() {
+    let knobs = Knobs {
+        storage_full_once: true,
+        ..Knobs::default()
+    };
+    let handle = spawn_stub(Vfs::new(), AuthMode::None, knobs, StubStyle::rclone()).await;
+    let response = client()
+        .put(url_of(&handle, "/f.txt"))
+        .body("x")
+        .send()
+        .await
+        .expect("507 put");
+    assert_eq!(response.status().as_u16(), 507);
+    assert_eq!(
+        handle.snapshot().len(),
+        1,
+        "a rejected PUT must land nothing: {:?}",
+        handle.snapshot()
+    );
+    // 一次性：恢复 201。
+    let response = client()
+        .put(url_of(&handle, "/f.txt"))
+        .body("x")
+        .send()
+        .await
+        .expect("recovered put");
+    assert_eq!(response.status().as_u16(), 201);
+    handle.shutdown().await;
+}
+
+/// move_missing_parent=Apache409（M13 注入面）：目标父缺失 → 409 且移动
+/// 不执行（RFC 4918 §9.9.4 形态臂——客户端缺父三态处置的第三态载体）。
+#[tokio::test]
+async fn move_missing_parent_409_variant_answers_409_without_effect() {
+    let mut vfs = Vfs::new();
+    vfs.seed_file("/m.txt", b"M");
+    let handle = spawn_stub(
+        vfs,
+        AuthMode::None,
+        Knobs::default(),
+        StubStyle {
+            move_missing_parent: MoveMissingParent::Apache409,
+            ..StubStyle::rclone()
+        },
+    )
+    .await;
+    let response = client()
+        .request(method("MOVE"), url_of(&handle, "/m.txt"))
+        .header("destination", url_of(&handle, "/missing/m.txt"))
+        .send()
+        .await
+        .expect("409 move");
+    assert_eq!(response.status().as_u16(), 409);
+    assert!(handle.exists("/m.txt"), "no move may execute");
+    assert!(!handle.exists("/missing/m.txt"));
+    handle.shutdown().await;
+}
+
 // -------------------------------------------------------------- 记录器 ---
 
 /// 打码形态（scheme + 前 8 字符）、body_len、Digest nc/nonce 提取。
@@ -1871,6 +2076,36 @@ async fn request_recorder_masks_auth_and_extracts_digest_fields() {
     assert_eq!(requests[2].path, "/docs/f.bin");
     assert_eq!(requests[2].body_len, 10);
     // Digest nc/nonce 提取面在 digest_roundtrip 用例已钉（[1,1,2] 序列）。
+}
+
+/// 记录器 range 字段（M9）：GET 的 `Range` 头原样入账；无 Range 头为
+/// None——驱动读面的「每窗携带 bytes=a-b」断言面（M9 缺口的观测半边）。
+#[tokio::test]
+async fn request_recorder_captures_the_range_header() {
+    let mut vfs = Vfs::new();
+    vfs.seed_file("/f.bin", b"0123456789");
+    let handle = stub_rclone(vfs).await;
+    let _ = client()
+        .get(url_of(&handle, "/f.bin"))
+        .send()
+        .await
+        .expect("plain get");
+    let _ = client()
+        .get(url_of(&handle, "/f.bin"))
+        .header("range", "bytes=2-5")
+        .send()
+        .await
+        .expect("range get");
+
+    let requests = handle.requests();
+    assert_eq!(requests.len(), 2);
+    assert_eq!(requests[0].range, None, "no Range header records None");
+    assert_eq!(
+        requests[1].range.as_deref(),
+        Some("bytes=2-5"),
+        "the Range header is captured verbatim"
+    );
+    handle.shutdown().await;
 }
 
 // --------------------------------------------------------------- 停机 ---

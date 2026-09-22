@@ -1153,6 +1153,47 @@ mod tests {
         );
     }
 
+    #[test]
+    fn client_timeout_tiers_are_the_documented_literals() {
+        use std::time::Duration;
+        // §4.5-7 超时分层逐字钉死（M8——负面清单 13 条中唯一零测试面）：
+        // 常量漂移先在这里红。消费形态（结构性钉位）：`.connect_timeout`
+        // 烙在 client builder（client.rs 构造面）、`.timeout(timeout)` 在
+        // execute 每请求烙上（三档经动词方法传入：PROPFIND/OPTIONS/写动
+        // 词 = CONTROL、窗口 GET = WINDOW、PUT = put_timeout）。真触发腿
+        // 无桩覆盖（loopback 恒快于预算）——慢服务器超时腿挂账真机矩阵。
+        assert_eq!(crate::client::CONNECT_TIMEOUT, Duration::from_secs(15));
+        assert_eq!(crate::client::CONTROL_TIMEOUT, Duration::from_secs(30));
+        assert_eq!(crate::client::WINDOW_TIMEOUT, Duration::from_secs(120));
+    }
+
+    #[test]
+    fn client_put_timeout_slopes_from_the_control_baseline() {
+        use std::time::Duration;
+        // spool PUT 预算 = max(30s 基线, 每 MiB 2s)（§4.5-7 写面补充——
+        // pan123 分片超时同款斜率）；不足整 MiB 不进位（整数除法截断）。
+        let mib = 1024u64 * 1024;
+        assert_eq!(crate::client::put_timeout(0), Duration::from_secs(30));
+        assert_eq!(
+            crate::client::put_timeout(mib),
+            Duration::from_secs(30),
+            "the baseline is the floor"
+        );
+        assert_eq!(
+            crate::client::put_timeout(16 * mib),
+            Duration::from_secs(32)
+        );
+        assert_eq!(
+            crate::client::put_timeout(16 * mib + 1),
+            Duration::from_secs(32),
+            "a partial MiB does not round up"
+        );
+        assert_eq!(
+            crate::client::put_timeout(100 * mib),
+            Duration::from_secs(200)
+        );
+    }
+
     // ------------------------------------------------------ xml 面（WD2b）---
 
     #[test]

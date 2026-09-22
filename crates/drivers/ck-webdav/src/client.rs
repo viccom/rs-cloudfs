@@ -72,8 +72,8 @@ const RETRY_CAP: Duration = Duration::from_secs(30);
 
 /// spool PUT 的体量预算（§4.5-7 分层的写面补充——模块文档「WD3 的
 /// spool PUT 会按体量另设预算」的兑现）：控制面 30s 基线 + 每 MiB 2s
-///（pan123 分片超时同款斜率）。
-fn put_timeout(len: u64) -> Duration {
+///（pan123 分片超时同款斜率）。`pub(crate)` 供 lib 单测钉字面（M8）。
+pub(crate) fn put_timeout(len: u64) -> Duration {
     let per_mib = Duration::from_secs(2 * (len / (1024 * 1024)));
     CONTROL_TIMEOUT.max(per_mib)
 }

@@ -494,6 +494,9 @@ pub enum MoveMissingParent {
     Rclone403,
     /// apache 真形：500。
     Apache500,
+    /// RFC 4918 形态：409（M13 注入面——客户端缺父三态处置的第三态
+    /// 载体；矩阵未记 409 真形，按 RFC 4918 §9.9.4 语义建模）。
+    Apache409,
 }
 
 /// PROPPATCH 的回应形态（矩阵①）。
@@ -654,6 +657,27 @@ pub struct Knobs {
     /// 计数会先被 close 链上的 PUT/MOVE 吃掉）。运行期可调（同
     /// kill_connections）。
     pub kill_propfinds: AtomicUsize,
+    /// 一次性（启动快照，消费即复位）：下一个**带 Range 头**的文件 GET
+    /// 无条件回 416（Content-Range `bytes */total` 真形——satisfiable 与
+    /// 否不影响）。416 复核决策腿的注入面（M10）：并发增长/收缩形态由
+    /// 测试侧种入新版本后经真实 PROPFIND 复核浮现。无 Range 头的 GET 不
+    /// 触发也不消耗。
+    pub range_416_once: bool,
+    /// 前 N 次 PROPFIND 回 403（M11 注入面——NAS 权限真形，apache GET
+    /// 集合 403 的同族）。GET/写动词不消耗计数；403 不在重试白名单——
+    /// 每次驱动面 PROPFIND 恰消耗 1。
+    pub forbidden_propfinds: usize,
+    /// 文件 GET 的 206 窗口把 Content-Range 相对请求**平移 +1**（M12 注
+    /// 入面：头与请求不符——驱动 206 校验 mismatch 臂的载体；body 仍是
+    /// 请求区间的真字节，撒谎只在头）。
+    pub range_206_lie: bool,
+    /// 文件 GET 的 206 窗口 Content-Range 正确但 **body 短一字节**（M12
+    /// 注入面：驱动 206 长度校验臂的载体）。
+    pub range_206_short: bool,
+    /// 一次性（启动快照，消费即复位）：下一个 PUT 回 507 且**零效果**
+    ///（先于任何 VFS 变更——配额满真形）。PUT 非幂等不入重试白名单，
+    /// 每次驱动面 PUT 恰消耗 1。
+    pub storage_full_once: bool,
 }
 
 /// 消耗型旋钮的运行副本（启动时从 [`Knobs`] 快照）。
@@ -665,6 +689,9 @@ struct FaultLedger {
     lost_ack: bool,
     lost_ack_skip: usize,
     stat_size_delta: Option<i64>,
+    range_416: bool,
+    forbidden_left: usize,
+    storage_full: bool,
 }
 
 // ------------------------------------------------------------ 记录器 ---
@@ -693,6 +720,9 @@ pub struct RecordedRequest {
     /// `X-OC-Mtime` 头原样（WD3：nextcloud 搭车断言面——D4/D2 修订；
     /// generic 恒 None）。
     pub x_oc_mtime: Option<String>,
+    /// `Range` 头原样（M9：窗口 GET 逐窗核对 `bytes=a-b` 的断言面——
+    /// 驱动丢 Range 头则 200 回退切出同字节、全绿假象的防线）。
+    pub range: Option<String>,
 }
 
 fn mask_authorization(raw: &str) -> String {
@@ -784,6 +814,7 @@ impl StubState {
             overwrite: header_of("overwrite"),
             destination: header_of("destination"),
             x_oc_mtime: header_of("x-oc-mtime"),
+            range: header_of("range"),
         };
         self.lock().requests.push(record);
     }
@@ -916,6 +947,17 @@ impl StubState {
                     }
                     return Some(builder.body(Body::from("429 rate limited (stub)")).unwrap());
                 }
+            }
+            // M11 旋钮：前 N 次 PROPFIND 回 403（权限真形；不在重试白名单
+            // ——每次驱动面 PROPFIND 恰消耗 1；GET/写动词不消耗计数）。
+            if ctx.method.as_str() == "PROPFIND" && inner.ledger.forbidden_left > 0 {
+                inner.ledger.forbidden_left -= 1;
+                return Some(
+                    Response::builder()
+                        .status(StatusCode::FORBIDDEN)
+                        .body(Body::from("403 forbidden (stub)"))
+                        .unwrap(),
+                );
             }
             let idempotent_read = ctx.method.as_str() == "PROPFIND" || ctx.method.as_str() == "GET";
             if idempotent_read && inner.ledger.transient_left > 0 {
@@ -1087,7 +1129,7 @@ impl StubState {
     }
 
     fn handle_get(&self, ctx: &Ctx) -> Response {
-        let inner = self.lock();
+        let mut inner = self.lock();
         if !inner.vfs.exists(&ctx.canonical) {
             return (StatusCode::NOT_FOUND, "404 Not Found (stub)").into_response();
         }
@@ -1118,6 +1160,10 @@ impl StubState {
             .file(&ctx.canonical)
             .expect("exists checked above")
             .clone();
+        // M10 旋钮（一次性，锁内消费）：下一个**带 Range 头**的文件 GET
+        // 无条件 416 一次——复核决策腿注入面；无 Range 头不触发也不消耗。
+        let force_416 =
+            ctx.headers.get("range").is_some() && std::mem::take(&mut inner.ledger.range_416);
         drop(inner);
         let total = bytes.len() as u64;
         let last_modified = http_date(mtime);
@@ -1131,20 +1177,37 @@ impl StubState {
         if self.style.range_ignore || range_header.is_none() {
             return file_response(bytes, &last_modified, drip, StatusCode::OK, &self.knobs);
         }
+        if force_416 {
+            // M10：无条件 416（Content-Range `bytes */total`——RFC 9110
+            // 真形）。satisfiable 与否不影响——复核决策归客户端。
+            return Response::builder()
+                .status(StatusCode::RANGE_NOT_SATISFIABLE)
+                .header("content-range", format!("bytes */{total}"))
+                .body(Body::from("416 injected by range_416_once (stub)"))
+                .unwrap();
+        }
         match parse_range(range_header.as_deref().expect("checked above"), total) {
             RangeOutcome::Full => {
                 file_response(bytes, &last_modified, drip, StatusCode::OK, &self.knobs)
             }
             RangeOutcome::Partial(start, end_inclusive) => {
-                let slice = bytes[start as usize..=(end_inclusive as usize)].to_vec();
+                let mut slice = bytes[start as usize..=(end_inclusive as usize)].to_vec();
+                let mut content_range = format!("bytes {start}-{end_inclusive}/{total}");
+                // M12 旋钮（请求时读取，语义同 range_ignore）：撒谎只在
+                // 头——Content-Range 相对请求整体平移 +1。
+                if self.knobs.range_206_lie {
+                    content_range = format!("bytes {}-{}/{}", start + 1, end_inclusive + 1, total);
+                }
+                // M12 旋钮：头正确、body 短窗口一字节。
+                if self.knobs.range_206_short {
+                    let keep = slice.len().saturating_sub(1);
+                    slice.truncate(keep);
+                }
                 let builder = Response::builder()
                     .status(StatusCode::PARTIAL_CONTENT)
                     .header("accept-ranges", "bytes")
                     .header("last-modified", last_modified)
-                    .header(
-                        "content-range",
-                        format!("bytes {start}-{end_inclusive}/{total}"),
-                    );
+                    .header("content-range", content_range);
                 match drip {
                     // 慢滴流同样作用于 206 窗口（窗口读不卡死/超时面）。
                     Some(delay) => builder.body(Body::from_stream(DripStream::new(
@@ -1169,6 +1232,15 @@ impl StubState {
 
     fn handle_put(&self, ctx: &Ctx) -> Response {
         let mut inner = self.lock();
+        // M13 旋钮（一次性）：507 配额满——先于任何效果（拒绝语义，
+        // VFS 零变更）。
+        if std::mem::take(&mut inner.ledger.storage_full) {
+            return (
+                StatusCode::INSUFFICIENT_STORAGE,
+                "507 insufficient storage (stub)",
+            )
+                .into_response();
+        }
         if inner.vfs.is_dir(&ctx.canonical) {
             return match self.style.put_on_collection {
                 PutCollectionMode::Rclone404 => {
@@ -1314,6 +1386,11 @@ impl StubState {
                 MoveMissingParent::Apache500 => (
                     StatusCode::INTERNAL_SERVER_ERROR,
                     "500 destination parent does not exist (stub, apache form)",
+                )
+                    .into_response(),
+                MoveMissingParent::Apache409 => (
+                    StatusCode::CONFLICT,
+                    "409 destination parent does not exist (stub, RFC form)",
                 )
                     .into_response(),
             };
@@ -2038,6 +2115,9 @@ pub async fn spawn_stub(vfs: Vfs, auth: AuthMode, knobs: Knobs, style: StubStyle
         lost_ack: knobs.lost_ack_after_effect,
         lost_ack_skip: knobs.lost_ack_after_effect_skip,
         stat_size_delta: knobs.stat_size_delta,
+        range_416: knobs.range_416_once,
+        forbidden_left: knobs.forbidden_propfinds,
+        storage_full: knobs.storage_full_once,
     };
     let state = Arc::new(StubState {
         knobs: knobs.clone(),
