@@ -112,6 +112,20 @@ pub enum VfsError {
          knows \"gcm\" and \"aead_v2\" (upgrade the instance that stored it)"
     )]
     UnsupportedEncryptionScheme { scheme: String, path: String },
+    /// Read-through refuses an encrypted instance (Phase 8 / D10,
+    /// rebuild's K11 gate parity): the backend only sees ciphertext
+    /// containers under plaintext names, so a materialized row would
+    /// mislabel encrypted payloads as plaintext (size = ciphertext, not
+    /// the R6 plaintext contract). The message points at `cydrive sync` —
+    /// the sync payload carries the encrypted row semantics
+    /// (is_encrypted/scheme) to the other instance.
+    #[error(
+        "read-through refuses encrypted instances: the backend only sees ciphertext containers \
+         under plaintext names, so a materialized row would mislabel encrypted payloads as \
+         plaintext; use `cydrive sync` instead — the sync payload carries the encrypted row \
+         semantics (is_encrypted / scheme) to the other instance"
+    )]
+    EncryptedInstance,
     /// Local file I/O failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -336,6 +350,10 @@ pub struct Vfs {
     transport: Arc<dyn CloudTransport>,
     cfg: VfsConfig,
     queue: UploadQueueHandle,
+    /// Read-through 的目录级缓存状态（Phase 8 / RT2）：TTL 窗 + 单飞闸
+    /// + 世代计数；纯进程内运行态，无构造参数（见
+    ///   [`Vfs::read_dir_fresh`]）。
+    dir_cache: crate::readthrough::DirCache,
 }
 
 impl Vfs {
@@ -366,6 +384,7 @@ impl Vfs {
             transport,
             cfg,
             queue,
+            dir_cache: crate::readthrough::DirCache::new(),
         }
     }
 
@@ -495,6 +514,10 @@ impl Vfs {
             })
             .await
             .map_err(map_queue_error)?;
+        // Write-side read-through invalidation (Phase 8 / RT2): the
+        // pending row is in; the parent's fast-path window must go so the
+        // next stat_fresh re-lists (the row itself is in the db either way).
+        self.invalidate_dir_cache(rel);
         // No manual doorbell here anymore: the pending-row upsert above
         // already rang it through the db-layer files hook (the chokepoint).
         Ok(())
@@ -836,6 +859,54 @@ impl Vfs {
         })
     }
 
+    /// Read-through 目录列表（Phase 8 / RT2，D3/D5）：宽面权威卷每次调
+    /// 用现查后端并调和本地行（RaiDrive 对等体验——每视图一次现查）；
+    /// 门不过的卷（telegram 窄面 / 能力位未申报）逐字退化为
+    /// [`MetaDatabase::list_dir`]（D2，零行为变化）。机制本体在
+    /// [`crate::readthrough`]。
+    pub async fn read_dir_fresh(&self, dir: &RelPath) -> Result<Vec<FileRecord>, VfsError> {
+        crate::readthrough::read_dir_fresh(
+            &self.db,
+            self.transport.as_ref(),
+            &self.cache,
+            &self.dir_cache,
+            // D10 加密实例判定（rebuild K11 闸门的 Vfs 侧同源形态：
+            // enable_encryption ⇔ 配置了密码——commit_put 的
+            // is_encrypted 判据同款）。
+            self.cfg.encryption_password.is_some(),
+            dir,
+        )
+        .await
+    }
+
+    /// Read-through 单路径 stat（Phase 8 / RT2，D6）：父目录 TTL 窗
+    /// （5s）内行命中零网络直出；过期/缺行重列父目录恰一次（Explorer
+    /// 的 stat 风暴归并），仍无行再 `driver.stat` 兜底。根恒存（合成
+    /// 元数据，消费面同形）。门不过的卷逐字退化为 [`MetaDatabase::get_file`]。
+    pub async fn stat_fresh(&self, rel: &RelPath) -> Result<FileRecord, VfsError> {
+        crate::readthrough::stat_fresh(
+            &self.db,
+            self.transport.as_ref(),
+            &self.cache,
+            &self.dir_cache,
+            // D10 加密实例判定（read_dir_fresh 同款）。
+            self.cfg.encryption_password.is_some(),
+            rel,
+        )
+        .await
+    }
+
+    /// 写侧就近失效（pan115 先例；Phase 8 / RT2）：本侧增删落库后撤父
+    /// 目录的 TTL 窗，下一次 [`Vfs::stat_fresh`] 强制重列。D5 的
+    /// `read_dir_fresh` 本就每调必列，失效是快路径的双保险。
+    fn invalidate_dir_cache(&self, rel: &RelPath) {
+        let parent = rel
+            .parent()
+            .map(|parent| parent.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        self.dir_cache.invalidate(&parent);
+    }
+
     /// Snapshot of the upload queue counters.
     pub fn queue_stats(&self) -> QueueStats {
         self.queue.stats()
@@ -972,6 +1043,9 @@ impl Vfs {
             chunk_count: 0,
             mime_type: None,
         })?;
+        // Write-side read-through invalidation (Phase 8 / RT2): the new
+        // directory row is in; revoke the parent's fast-path window.
+        self.invalidate_dir_cache(rel);
         // No manual doorbell: the directory row upsert above rang it
         // through the db-layer files hook.
         Ok(())
@@ -1011,6 +1085,10 @@ impl Vfs {
         // local state only after the remote side is gone.
         self.delete_remote_gated(rel, &row).await?;
         self.db.delete_file(rel.as_str())?;
+        // Write-side read-through invalidation (Phase 8 / RT2): the row is
+        // gone; revoke the parent's fast-path window so the next stat does
+        // not serve the dead path from it.
+        self.invalidate_dir_cache(rel);
         // The cached copy goes too; a missing copy is the normal
         // not-cached case, and other removal errors never fail the call.
         if let Err(error) = tokio::fs::remove_file(self.cache.local_path(rel)).await {

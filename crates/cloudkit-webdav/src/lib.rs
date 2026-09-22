@@ -979,8 +979,13 @@ fn vfs_err(error: VfsError) -> FsError {
         VfsError::NotFound(_) => FsError::NotFound,
         // No dedicated is-a-directory code in FsError; dav-server maps
         // EISDIR to Forbidden, so mirror that. MissingPassword is a
-        // policy refusal -> Forbidden as well.
-        VfsError::IsDirectory(_) | VfsError::MissingPassword => FsError::Forbidden,
+        // policy refusal -> Forbidden as well — same class as the
+        // read-through encrypted-instance refusal (Phase 8 / D10): the
+        // instance must use `cydrive sync`, so the gateway answers with a
+        // refusal, never a fabricated listing.
+        VfsError::IsDirectory(_) | VfsError::MissingPassword | VfsError::EncryptedInstance => {
+            FsError::Forbidden
+        }
         // Same conventions this adapter already uses: duplicate target is
         // Exists (405); missing parent maps to NotFound, which dav-server
         // turns into 409 on PUT/MKCOL (see `require_dir_parent`); a

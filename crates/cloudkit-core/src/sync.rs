@@ -279,6 +279,16 @@ pub fn is_sync_supported(backend: &crate::config::Backend) -> bool {
     )
 }
 
+/// The in-flight upload judgement (decisions 2026-09-05 «later action
+/// wins»): the row is still pending (`is_uploaded = 0`) AND its local
+/// cache copy sits on disk — an upload in progress whose source file must
+/// survive. Single source for every consumer (the sync pull's tombstone
+/// and replace arms; read-through reconcile's upsert/prune sides —
+/// Phase 8 / D7/D10) so the criterion cannot drift between them.
+pub fn is_in_flight_row(record: Option<&FileRecord>, cache: &CacheManager, rel: &RelPath) -> bool {
+    record.is_some_and(|rec| !rec.is_uploaded) && cache.local_path(rel).exists()
+}
+
 /// Lowercase hex of a digest (mirror of the `chunker` helper).
 fn hex_lower(bytes: &[u8]) -> String {
     const HEX: &[u8; 16] = b"0123456789abcdef";
@@ -576,8 +586,9 @@ pub fn apply_pulled_rows(
             // upload in progress, and its source file must survive so
             // the upload worker's success write-back can revive the row.
             let local = db.get_file(&row.rel_path)?;
-            let inflight_upload = local.as_ref().is_some_and(|rec| !rec.is_uploaded)
-                && cache.local_path(&rel).exists();
+            // In-flight via the shared helper (`is_in_flight_row` — the
+            // single source; read-through reconcile judges the same way).
+            let inflight_upload = is_in_flight_row(local.as_ref(), cache, &rel);
             // delete_file removes the chunks in the same transaction and
             // is a no-op for a missing path; same for the mirror delete.
             db.delete_file(&row.rel_path)?;
@@ -631,8 +642,10 @@ pub fn apply_pulled_rows(
         // on disk) keeps its source file so the worker's success
         // write-back can revive the row («later action wins»). Any other
         // on-disk copy under changed content is stale bytes and must not
-        // survive; removal is best-effort.
-        let inflight_upload = local.as_ref().is_some_and(|rec| !rec.is_uploaded);
+        // survive; removal is best-effort. (`is_in_flight_row` = the
+        // shared helper; the branch's separate disk probe stays — it
+        // needs the disk fact on its own, one extra metadata syscall.)
+        let inflight_upload = is_in_flight_row(local.as_ref(), cache, &rel);
         if !inflight_upload && cache.local_path(&rel).exists() {
             let _ = std::fs::remove_file(cache.local_path(&rel));
         }
