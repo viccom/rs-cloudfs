@@ -2,7 +2,7 @@
 
 > 计划：`docs/plans/2026-09-22-readthrough-index.md` ｜ 需求口径：负责人 2026-09-22 拍板路线 C（B 为主 + A 最小集），三点要求：①先出详细可行方案与计划；②六后端+未来驱动共性提炼；③证明架构增强非破坏
 > 基线：main@86003a0（workspace **1602/0/52** + 五门禁绿；Phase 7 webdav 已合入并反向复核毕）
-> 状态：**RT4 完成（2026-09-22）——RT5 待开工（真机矩阵+文档+收口）**
+> 状态：**RT5 测试批完成（2026-09-22）——剩余：文档联动（README/AGENTS/driver-onboarding/architecture）+ decisions K83 入档 + 深度审查批（K78 形态）**
 > worktree：`feat/readthrough-index`，独立 target（共享 CARGO_TARGET_DIR 双指纹既有教训）
 > 编号：裁决 K83（待入 decisions）；批次 RT0–RT5 顺序执行，RT3 与 RT4 可并行派发
 
@@ -13,9 +13,28 @@
 | RT2 | readthrough 原语（read_dir_fresh/stat_fresh/reconcile/DirCache） | ✅ 2026-09-22 | `readthrough.rs`（DirCache：TTL 5s+with_ttl 缝/单飞闸+世代归并/就近失效；reconcile：upsert 侧 in-flight 豁免+双确认 prune+32 上限+NotFound 臂本层删除+stale-if-error）+ Vfs 两薄壳 + 写侧失效三调用点 + `VfsError::EncryptedInstance`；门序 D2 退化→D10 拒收；`sync::is_in_flight_row` 提取单点同源 | commit `aa47649`；readthrough 16/0、rebuild 4/0 零漂移、sync 27/0 零漂移；workspace **1623/0/52**；五门禁绿；批次日志 RT2 节 |
 | RT3 | 四消费面接线（网关/仪表盘/winfs；bot 零改动） | ✅ 2026-09-22 | 三面只换数据获取函数：webdav `read_dir`/`metadata`/`open` 读臂改 `stat_fresh`/`read_dir_fresh`（存在性+is_dir 预检保留经 stat_fresh，NotFound/Forbidden 语义不变）；winfsp `dir_entries`（仅 marker=None 腿到达）改 `read_dir_fresh`，`meta_for`/`open_with_read` 经新 `resolve_row_fresh`（精确命中零网络 → stat_fresh → K45 大小写扫描；NotFound 不终判、其余错误传播；guard/miss 判定路径保持纯 db）；web `api_list` 改 `read_dir_fresh`（驱动 NotFound→404、其余错→500；窄面空目录存在性探针保留=A6；`api_files` 零改动 D9 且测试钉零 list；bot `/ls` 零改动 D2） | commit `2d00c64`；三包 153/0、winfsp 腿 118/0+1ign、workspace **1627/0/52**（+5=webdav 3+web 1+winfsp 腿 1）；五门禁绿；批次日志 RT3 节 |
 | RT4 | rebuild 三件套（续跑/上限/sweep） | ✅ 2026-09-22 | D8①②③ 全落地：database.rs 新 `rebuild_state(key,value)` KV 表（sync_mirror 同先例，零 files DDL）+ `rebuild_state_get/set/clear` + `sweep_unseen`（is_uploaded=1 且 updated_at<锚点；chunks 同事务显式级联照 delete_file 先例）；rebuild.rs boxed 递归改显式 VecDeque 工作队列 + 每目录完成落盘（pending JSON 队列/scan_started_at 首趟锚点续跑复用/entries_done 累计）+ `RebuildLimits`（max_entries 缺省 20 万/趟、目录粒度检查不重扫已完成目录）+ `RebuildOutcome` 扩 `pruned`+`interrupted: Option<EntriesBudget/TimeBudget>`（Display 含 rerun to continue）+ 完成趟才 sweep 后清检查点；cli `RebuildTuning.max_entries` + 离线路径补 15min 预算（limits(true)）+ 活实例执行器喂 max_entries（time_budget=None 留 R4 监督）+ 三入口文案（main 单/多卷 + RebuildTask Done 臂按 interrupted 分叉）；既有 4 测试：2 处 RebuildOutcome 字面量 ..Default::default() 编译适配 + ghost 行断言按 D8③ 新契约改（唯一语义变更）| commit 见批次日志；rebuild **9/0**（+5）、readthrough 16/0 零漂移、cli rebuild 3/0 + runtime_rebuild 10/0；workspace **1632/0/52**；五门禁绿；批次日志 RT4 节 |
-| RT5 | 真机矩阵 + 文档 + 收口（含深度审查批，K78 形态） | ⬜ 待开工 | — | — |
+| RT5 | 真机矩阵 + 文档 + 收口（含深度审查批，K78 形态） | 🔄 测试批完成（2026-09-22）；README/AGENTS/driver-onboarding/architecture 文档联动 + decisions K83 入档 + 深度审查批待收口 | 真机矩阵腿全落地：`ck-webdav tests/live_readthrough.rs` 七腿（A1 apache 外部真值+rclone 双形态 / A2 删除双确认 prune / A2 新增 D5 即时 / A3 千级条目 2 页 PROPFIND+TTL 零网络+深跳 1 list——**apache access log 差分精确计数** / A4 max_entries 断趟→rerun 完成趟 9 PROPFIND=目录数零重扫+sweep pruned=0+全树落库 / AList 真实场景（负责人实例，env 注入，前缀目录纪律+清扫核空）/ 全局残留核空）+ `ck-local tests/readthrough_smoke.rs` 非 ignored 共性冒烟（外部真值四形态全链）+ `ck-sftp tests/live_readthrough.rs` ignored 共性冒烟（OpenSSH 真机全链）；L1→L3 dev-dep 三处（check_layers 机械面通过，字面张力见批次日志）；workspace **1633/0/60**（+1 非 ignored +8 ignored）；五门禁绿；真机 webdav **7/7 零残留**、sftp **1/1**（0.85s）、local 1/1 | commit 见批次日志；批次日志 RT5 节 |
 
 ## 批次日志
+
+### RT5 测试批（2026-09-22，子代理实现）
+
+**完成**：真机矩阵腿 + 跨后端共性冒烟腿全落地（commit 本批）——
+①**`ck-webdav tests/live_readthrough.rs`（新，七腿全 `#[ignore]`）**：A1 空索引零 rebuild（apache = WSL fs 侧外部真值预置；rclone = 驱动自落盘 + 独立空索引实例；逐层进入语义）、A2 删除腿（外部 rm → 双确认 prune，兄弟行完好）、A2 新增腿（外部加文件 → 下一次 read_dir_fresh 即见，D5）、A3 规模腿（1000 条目 read_dir_fresh = **恰 2 PROPFIND**（512/页×2，O(1) 页界非逐条 stat）+ stat_fresh TTL 窗内 **0 请求** + 未列目录深跳 **恰 1 次父 list**）、A4 续跑腿（max_entries=40 断趟 → rerun 至完成：首趟 3 PROPFIND（root+sub1+sub2）、**全序列 9 PROPFIND = 目录总数 = 零重扫**、完成趟 pruned=0（净树）、8×24 文件 + 8 目录行全落库逐路径断言）、AList 真实场景腿（负责人实例 env 注入；mkcol 前缀目录 + 3 PUT → 冷索引全见 → stat_fresh 深跳 → 删 1 → 再枚举行消失 → 清扫核空 stat NotFound）、全局残留核空腿（find 两服务器根零残留，照 live_matrix 腿⑩）。
+②**计数断言面选型（A3/A4 关键设计）**：真驱动不可注入计数 → **apache access log 差分**（mod_dav_fs 直连 fs，combined log 含请求路径；`grep -c <stamp>` 前后差 = 真实网络请求数）——比任务单降级预案「总耗时」强；比 tracing 抓取确定（驱动无逐 list 日志行）。
+③**`ck-local tests/readthrough_smoke.rs`（新，非 ignored 进常规门）**：真 LocalDriver+LocalTransport（as_driver 探针+authoritative_index 门真装配面）+ 外部真值（fs 直写）空索引即见 / stat_fresh 深跳 / 外部新增 D5 即见 / 外部删除双确认 prune / 删除后深跳 NotFound——五形态一条全链；夹具 db/cache 落驱动根外（独立 tempdir）。
+④**`ck-sftp tests/live_readthrough.rs`（新，`#[ignore]`）**：真 SftpDriver+OpenSSH fixture（env 惯例照 live_matrix；指纹必钉 D2）+ 冷索引全见 / stat_fresh 深跳 / 驱动面删除 → 双确认 prune / 收尾核空；sftp 真机 1/1（0.85s）。
+⑤**L1→L3 dev-dep（三驱动 crate dev-dependencies + cloudkit-core）**：RT5 任务单指定 `scripts/check_layers` 为裁决面——机械正则不覆盖 dev-only 的 L1→L3 边（16 manifests OK）；**字面张力如实挂账**：driver-onboarding §1/各驱动 Cargo.toml 注释写「禁依赖 cloudkit-core 及任何 L3+ crate」，check_layers 自身头注亦言 drivers now depend downward only——dev 边仅入测试图、生产依赖图不变（驱动运行时仍只依赖 cloudkit-storage），三处 Cargo.toml 注释已就地记录例外与裁决来源；**文档批需负责人裁定 driver-onboarding §1 是否补「dev-dep 例外」一句**。
+⑥**fixture 重建**：WSL 实例重置过（/srv/rclone-dav 与 apache 站点配置消失）——照 phase7-webdav-fixture.md 幂等重建（rclone 8080 Basic + apache 8081 Digest/stale 双 Location，一次性凭据 env/命令行形态不入库）；sshd 2222 重启（/run/sshd 先建）；AList /dav/ 顶层 = 挂载命名空间（顶层 MKCOL 405）→ AList 腿 URL 指向可写挂载（/dav/local/），前缀纪律不变。
+
+**真机执行期实证（沉淀入测试代码注释）**：
+- **wsl.exe 通道 `$()` 抢先展开**：wsl.exe 把单参数脚本双引号包层交外层 shell，脚本内 `$(...)` 被外层 shell **先于脚本执行**展开——对不存在文件的 `$(wc)` 产生「test: unary operator expected」+ 假 ENOENT、多行 `$(find)` 回填被折成逐行脚本执行（rm -rf $(find) 实锤）——**零 `$()` 纪律再补强**（此前 WD5 从未真跑过非空 `$()`，教训落 preset_script/腿⑦注释）；
+- **root 树 × mod_dav DELETE 207 半失败**：wsl 通道以 root 落盘的预置树，www-data 无权删内容 → 驱动 DELETE 收 207（multi-status 部分失败）且**驱动按成功返回**、目录残留——preset 加 `chown -R www-data:www-data` 归一后全绿；**驱动 delete 对 207 半失败的处理挂账**（Phase 7 WD0 怪癖矩阵未钉 207 形态，收口审查批复核是否需要按 207 内层状态判定失败）；
+- **A3 分页界**：read_dir_fresh 千级条目 = 2 PROPFIND（materialize::list_all_pages limit 512 的页界），断言按 `div_ceil(512)` 钉页数而非恒 1——机制不变量是 O(1) 页非 O(1) 请求。
+
+**TDD/验证证据**：workspace **1633/0/60**（基线 1632 +1 非 ignored（ck-local 冒烟）+8 ignored（webdav 7 + sftp 1））；webdav live_readthrough 真机 **7/7**（11.2s，`--test-threads=1`，收尾零残留核空通过）；sftp 腿 **1/1**（0.85s）；五门禁绿（clippy -D warnings / fmt --check / check_layers 16 manifests / scan_secrets / workspace）；AList 凭据只经 env（生产卷 toml 读键位结构，值不落任何文件/日志/报告）。
+
+**RT5 剩余（待收口）**：README/AGENTS 计数与机制说明、driver-onboarding §1 dev-dep 例外句 + §11 未来驱动共性义务、architecture.md 解析顺序「已落地」、decisions.md K83 入档、裁剪组合构建、深度审查批（K78 形态）。
 
 ### RT4（2026-09-22，子代理实现）
 
