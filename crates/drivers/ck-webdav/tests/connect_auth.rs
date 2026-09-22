@@ -373,6 +373,87 @@ async fn digest_signed_uri_matches_the_wire_form_on_encoded_paths() {
     }
 }
 
+/// M1（审查修复批）：并发 401 协商竞态——双并发请求各自吃到**同一
+/// nonce** 的 401 challenge（真形：时间基 nonce 的服务器在同窗口内对
+/// 所有 challenge 发同一 nonce，`digest_challenge_reuse_nonce` 旋钮回
+/// 放）时，无条件重置 Digest 会话会把 nc 归零——严格 nc 服务器上第二
+/// 个签名与第一个同 nc → 伪 `Unauthorized{false}`。修复后：同 nonce
+/// 的重复 challenge 保留现会话（nc 不归零），双并发双绿且 nc 序列
+/// [1, 2] 不重复。
+#[tokio::test]
+async fn concurrent_401s_with_the_same_nonce_keep_the_digest_session() {
+    let handle = spawn_stub(
+        seeded_root(),
+        digest_auth(Duration::from_secs(3600), true), // enforce_nc = true（严格 nc）
+        Knobs {
+            digest_challenge_reuse_nonce: true,
+            ..Knobs::default()
+        },
+        StubStyle::rclone(),
+    )
+    .await;
+    let driver = driver(&handle, &[("webdav_auth", "digest")]);
+
+    let (first, second) = tokio::join!(stat_file(&driver), stat_file(&driver));
+    first.expect("first concurrent stat must not be spuriously rejected");
+    second.expect("second concurrent stat must not be spuriously rejected");
+
+    // 全程同一 nonce（旋钮语义）+ nc 序列 [1, 2]（不归零不重复）。
+    let signed: Vec<(Option<String>, Option<u64>)> = handle
+        .requests()
+        .iter()
+        .filter_map(|request| {
+            request
+                .digest_nc
+                .map(|nc| (request.digest_nonce.clone(), Some(nc)))
+        })
+        .collect();
+    let nonces: Vec<&str> = signed
+        .iter()
+        .map(|(nonce, _)| nonce.as_deref().expect("signed nonce"))
+        .collect();
+    assert!(
+        nonces.windows(2).all(|pair| pair[0] == pair[1]),
+        "the knob serves one nonce to both challenges: {nonces:?}"
+    );
+    let ncs: Vec<u64> = signed.iter().map(|(_, nc)| nc.expect("nc")).collect();
+    assert_eq!(
+        ncs,
+        vec![1, 2],
+        "the repeated same-nonce challenge must keep the session (nc monotonic, no reset)"
+    );
+}
+
+/// M6（审查修复批）：单头并置多 challenge（RFC 7235 允许的
+/// `Basic realm="stub", Digest ...` 逗号并置单头形态）——并置头必须先
+/// 拆 scheme 段再逐段协商，否则按头整段解析会把并置的 Digest offer 整
+/// 个拒掉（明明可协商却误分类「凭据被拒」）。注入：
+/// `combined_basic_digest_challenge` 旋钮（首轮 401 携并置单头）。
+#[tokio::test]
+async fn combined_challenge_header_negotiates_digest() {
+    let handle = spawn_stub(
+        seeded_root(),
+        digest_auth(Duration::from_secs(3600), false),
+        Knobs {
+            combined_basic_digest_challenge: true,
+            ..Knobs::default()
+        },
+        StubStyle::rclone(),
+    )
+    .await;
+    let driver = driver(&handle, &[]); // auth=auto：Basic 预发 → 401 并置头 → Digest 协商
+    stat_file(&driver)
+        .await
+        .expect("the Digest offer inside the combined header must negotiate");
+    let requests = handle.requests();
+    assert_eq!(requests.len(), 2, "negotiated and resent exactly once");
+    assert!(
+        requests[1].digest_nc.is_some(),
+        "the resend is a signed Digest request: {:?}",
+        requests[1].auth
+    );
+}
+
 // --------------------------------------------------------- 重试白名单 ---
 
 /// §4.5-10：PROPFIND 在白名单内——503×2 后第 3 次成功（记录器 3 个请求）。

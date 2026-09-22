@@ -348,8 +348,11 @@ enum HrefClass {
 /// **容忍尾斜杠差异**：wire href 目录带尾斜杠、请求路径不带）。
 ///
 /// `base_path` 是**解码后**的基地址路径（百分号编码形态与解码 href
-/// 不可比——`%20` 与空格互不匹配）。
-fn classify_href(base_path: &str, dir: &RelPath, entry: &PropfindEntry) -> HrefClass {
+/// 不可比——`%20` 与空格互不匹配）。`is_collection` 是条目自带的
+/// resourcetype 投影（文件目标的 `list` → `Invalid` 判据）；失败成员
+/// 没有可采信的 resourcetype，调用方恒传 false（Target 臂只做映射，
+/// 不消费形态）。
+fn classify_href(base_path: &str, dir: &RelPath, href: &str, is_collection: bool) -> HrefClass {
     // 尾斜杠容忍的归一：剥尾斜杠、空串归一为根（"/" 剥完是 ""——
     // 卷根的 href 与请求路径必须仍然命中）。
     let normalize = |path: &str| {
@@ -370,9 +373,9 @@ fn classify_href(base_path: &str, dir: &RelPath, entry: &PropfindEntry) -> HrefC
     } else {
         format!("{base}/{}", dir.as_str())
     };
-    let href = normalize(&entry.href);
+    let href = normalize(href);
     if href == target_path {
-        return HrefClass::Target(entry.is_collection);
+        return HrefClass::Target(is_collection);
     }
     let prefix = if target_path == "/" {
         "/".to_string()
@@ -448,7 +451,7 @@ impl StorageDriver for WebdavDriver {
         let mut target_kind: Option<bool> = None;
         let mut entries: Vec<Entry> = Vec::new();
         for pe in &outcome.entries {
-            match classify_href(&base_decoded, dir, pe) {
+            match classify_href(&base_decoded, dir, &pe.href, pe.is_collection) {
                 HrefClass::Target(is_collection) => target_kind = Some(is_collection),
                 HrefClass::Skip => {}
                 HrefClass::Child(name) => {
@@ -468,6 +471,30 @@ impl StorageDriver for WebdavDriver {
                     };
                     entries.push(entry_from_propfind(&self.volume, &child, pe));
                 }
+            }
+        }
+        // M7：仅非 2xx 块的成员按成员映射，绝不静默消失——自成员失败
+        // → 内层 404 = NotFound（既有「目标缺席」语义）/ 其余 =
+        // Unavailable 带码；子成员失败 → 404 = 缺席（成员确已不在，
+        // 既有消失语义收窄到这一种），其余 = Unavailable（列表不完整
+        // 必须响亮——静默剔出会伪装成「文件不在」）。
+        for failed in &outcome.failed_members {
+            match classify_href(&base_decoded, dir, &failed.href, false) {
+                HrefClass::Target(_) => {
+                    return Err(crate::client::map_member_failure(failed.status));
+                }
+                HrefClass::Child(name) => {
+                    let reportable = is_addressable_name(&name)
+                        && !is_staging_artifact(&name)
+                        && failed.status != 404;
+                    if reportable {
+                        return Err(StorageError::Unavailable(format!(
+                            "webdav listing member failed (HTTP {}): {name}",
+                            failed.status
+                        )));
+                    }
+                }
+                HrefClass::Skip => {}
             }
         }
         match target_kind {
@@ -668,7 +695,7 @@ impl StorageDriver for WebdavDriver {
                     return None;
                 }
                 let win_end = (pos + READ_WINDOW).min(end);
-                match client.get_range(&url, Some((pos, win_end))).await {
+                match client.get_range(&url, (pos, win_end)).await {
                     Ok(Some(bytes)) => {
                         let consumed = bytes.len() as u64;
                         Some((Ok(bytes), Some((client, url, pos + consumed, end))))
@@ -715,6 +742,24 @@ impl StorageDriver for WebdavDriver {
             return Err(StorageError::Invalid); // 卷根不可作为上传目标
         }
         let seq = next_staging_seq();
+        // M2 调序：**先建 spool 再动远端**——stager 构造（tempfile）全部
+        // 成功后才执行 stash MOVE；否则 tempfile 失败会把旧对象遗留在
+        // list 过滤的 `.old` 上、final「消失」且无 stager 可 abort。（
+        // tempfile 失败本身依赖 OS temp 空间，测试面不可注入——顺序即
+        // 构造性保证。）
+        let mut stager = crate::stager::WebdavStager::new(
+            self.client.clone(),
+            self.volume.clone(),
+            self.vendor,
+            path.clone(),
+            None,
+            seq,
+            hint.size,
+        )?;
+        // stash 裁决在打开时（断言①覆盖写腿，sftp `.old` 判例）：目标
+        // 已存在（文件）→ 先 `MOVE final → .ckwd-*.old`——staging 窗口
+        // 内旧对象不可见，close 成功删 stash、abort 恢复；目标是目录 →
+        // `Invalid`（目录不可被文件覆盖写）。
         let stash_rel = match self.stat_entry(path).await {
             Err(StorageError::NotFound) => None,
             Ok(entry) if entry.kind == EntryKind::Dir => {
@@ -734,15 +779,10 @@ impl StorageDriver for WebdavDriver {
             }
             Err(other) => return Err(other),
         };
-        Ok(Box::new(crate::stager::WebdavStager::new(
-            self.client.clone(),
-            self.volume.clone(),
-            self.vendor,
-            path.clone(),
-            stash_rel,
-            seq,
-            hint.size,
-        )?))
+        if let Some(stash) = stash_rel {
+            stager.set_stash(stash);
+        }
+        Ok(Box::new(stager))
     }
 
     /// 卷配额：RFC 4331 `quota-*-bytes` PROPFIND best-effort，失败

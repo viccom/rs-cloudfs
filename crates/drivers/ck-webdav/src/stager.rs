@@ -112,6 +112,13 @@ impl WebdavStager {
         })
     }
 
+    /// 装入 stash 路径（M2 调序的配套缝：构造先行——spool 全部就绪
+    /// 后，驱动才执行 stash MOVE 并经此把 stash 交给暂存器；构造路径
+    /// 上的任何失败都发生在远端被动之前）。
+    pub(crate) fn set_stash(&mut self, stash: RelPath) {
+        self.stash_rel = Some(stash);
+    }
+
     /// `.part` 暂存件路径（命名协议见 [`crate::driver`] 的
     /// `staging_rel`；与 stash 同 seq——一个 stager 一个名族）。
     fn part_rel(&self) -> Result<RelPath, StorageError> {
@@ -300,14 +307,14 @@ impl UploadStager for WebdavStager {
         }
         // ④ stat 复核（size == written；不符 → Unavailable 不静默——
         //    stat_size_delta 注入面/服务端谎报的同型真实故障）。此时
-        //    提交链已走完（final 就位）——不 restore（会删掉已提交的
-        //    新版），只报异常。
+        //    提交链已走完（final 就位）。
         let pe = match stat_pe(&self.client, &self.final_rel).await {
             Ok(pe) => pe,
-            Err(error) => {
-                self.restore_scene().await;
-                return Err(error);
-            }
+            // 出错臂与下方尺寸不符臂同一裁决（H1）：提交已固化——restore
+            // 会把 stash 旧对象以 Overwrite:T 盖回已提交的新版（数据破
+            // 坏），且调用方收 Err 时新版实际在位。只如实上抛；stash 留
+            // 为 list 过滤的 `.ckwd-` 残件（与尺寸不符臂的善后形态一致）。
+            Err(error) => return Err(error),
         };
         let remote_size = pe.content_length.unwrap_or(0);
         if remote_size != self.written {

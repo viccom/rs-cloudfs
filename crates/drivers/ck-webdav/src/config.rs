@@ -90,8 +90,12 @@ pub struct WebdavParams {
 ///   集合语义的规范形态；`https://h` → `https://h/`）。
 fn normalize_base_url(value: &str) -> Result<Url, String> {
     let url = Url::parse(value).map_err(|error| {
+        // M4：不回显原文——失败的输入可能内嵌凭据（`https://user:pass@…`
+        // 的畸形变体在解析层即败），原文进错误链 = 凭据进日志（R3 面；
+        // core `redact_credential_values` 同纪律的驱动侧收口）。只报错
+        // 因 + 键名 + 期望形态。
         format!(
-            "webdav_url is not a valid URL: {value:?} ({error}); expected e.g. \
+            "webdav_url is not a valid URL ({error}); expected e.g. \
              https://nas.lan:5006/dav/"
         )
     })?;
@@ -112,12 +116,14 @@ fn normalize_base_url(value: &str) -> Result<Url, String> {
     // WD4 挂账①：userinfo 形态（`https://user:pass@host/`）会把凭据带
     // 进 SHOW 回显与 sync namespace（卷身份携带完整 base URL）——拒收
     // 并指路凭据键（core validate 是第一道漏斗，这里是第二道）。
+    // M4：不回显原文（同上——拒收信息本身带原文 = 密码进错误链）。
     if !url.username().is_empty() || url.password().is_some() {
-        return Err(format!(
-            "webdav_url must not embed credentials as userinfo (user:pass@host), got \
-             {value:?}: set webdav_username and webdav_password instead — the separate \
-             keys keep the credentials out of the volume URL"
-        ));
+        return Err(
+            "webdav_url must not embed credentials as userinfo (user:pass@host): set \
+             webdav_username and webdav_password instead — the separate keys keep the \
+             credentials out of the volume URL"
+                .to_string(),
+        );
     }
     if url.query().is_some() || url.fragment().is_some() {
         return Err(format!(

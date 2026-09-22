@@ -1641,6 +1641,185 @@ async fn slow_drip_delivers_full_body() {
     );
 }
 
+/// kill_propfinds：PROPFIND 专属连接杀——效果型写动词（PUT/MOVE）不
+/// 消耗计数，PROPFIND 头后 body 即断（H1「MOVE 固化后 stat 复核断连」
+/// 注入面的计数纪律）。
+#[tokio::test]
+async fn kill_propfinds_spares_write_verbs_and_breaks_propfind_bodies() {
+    let mut vfs = Vfs::new();
+    vfs.seed_file("/a.txt", b"x");
+    let knobs = Knobs {
+        kill_propfinds: std::sync::atomic::AtomicUsize::new(1),
+        ..Knobs::default()
+    };
+    let handle = spawn_stub(vfs, AuthMode::None, knobs, StubStyle::rclone()).await;
+    // PUT 不消耗计数：正常 201。
+    let response = client()
+        .put(url_of(&handle, "/b.txt"))
+        .body("y")
+        .send()
+        .await
+        .expect("PUT passes the PROPFIND-only kill");
+    assert_eq!(response.status().as_u16(), 201);
+    // PROPFIND：send 层即传输错误（body 首块即断）。
+    let result = client()
+        .request(method("PROPFIND"), url_of(&handle, "/a.txt"))
+        .header("depth", "0")
+        .send()
+        .await;
+    assert!(
+        transport_failed(result).await,
+        "the PROPFIND body must die on the first chunk"
+    );
+    // 计数耗尽后恢复 207。
+    let response = propfind(&handle, "/a.txt", "0").await;
+    assert_eq!(response.status().as_u16(), 207);
+}
+
+/// digest_challenge_reuse_nonce：并发 challenge 同 nonce 的真形回放
+///（M1 注入面）——连续两次无凭据请求的 challenge 携**同一** nonce；
+/// 缺省形态（旋钮关）每 challenge 铸新 nonce。
+#[tokio::test]
+async fn digest_challenge_reuse_nonce_serves_the_same_nonce() {
+    let vfs = seeded_tree();
+    let knobs = Knobs {
+        digest_challenge_reuse_nonce: true,
+        ..Knobs::default()
+    };
+    let handle = spawn_stub(
+        vfs,
+        digest_auth("webdavtest", Duration::from_secs(3600), false),
+        knobs,
+        StubStyle::rclone(),
+    )
+    .await;
+    let nonce_of = |www: &str| -> String {
+        let position = www.find("nonce=\"").expect("nonce param") + "nonce=\"".len();
+        let rest = &www[position..];
+        rest[..rest.find('"').expect("closing quote")].to_string()
+    };
+    let first = client()
+        .get(url_of(&handle, "/docs/"))
+        .send()
+        .await
+        .expect("first");
+    assert_eq!(first.status().as_u16(), 401);
+    let nonce1 = nonce_of(first.headers()["www-authenticate"].to_str().expect("ascii"));
+    let second = client()
+        .get(url_of(&handle, "/docs/"))
+        .send()
+        .await
+        .expect("second");
+    assert_eq!(second.status().as_u16(), 401);
+    let nonce2 = nonce_of(
+        second.headers()["www-authenticate"]
+            .to_str()
+            .expect("ascii"),
+    );
+    assert_eq!(
+        nonce1, nonce2,
+        "the reused challenge must carry the same nonce"
+    );
+    handle.shutdown().await;
+}
+
+/// served_bytes 计数流（M3 观测面）：无延迟路径（CountingStream）的
+/// 文件 GET 全量读完时，流出字节 = body 实长（如实累计）。
+#[tokio::test]
+async fn served_bytes_counts_streamed_file_bodies() {
+    let mut vfs = Vfs::new();
+    vfs.seed_file("/a.bin", vec![9u8; 200_000].as_slice());
+    let handle = spawn_stub(vfs, AuthMode::None, Knobs::default(), StubStyle::rclone()).await;
+    let response = client()
+        .get(url_of(&handle, "/a.bin"))
+        .send()
+        .await
+        .expect("get");
+    assert_eq!(response.status().as_u16(), 200);
+    let body = response.bytes().await.expect("body");
+    assert_eq!(body.len(), 200_000);
+    let served = handle
+        .knobs
+        .served_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert_eq!(served, 200_000, "the counter tracks the delivered body");
+    handle.shutdown().await;
+}
+
+/// combined_basic_digest_challenge：单头并置 challenge（M6 注入面）——
+/// 无凭据 401 的 WWW-Authenticate 头为 `Basic realm="stub", Digest ...`
+/// 并置单形，Digest 段可独立解析出 nonce。
+#[tokio::test]
+async fn combined_challenge_header_carries_basic_and_digest_in_one_value() {
+    let vfs = seeded_tree();
+    let knobs = Knobs {
+        combined_basic_digest_challenge: true,
+        ..Knobs::default()
+    };
+    let handle = spawn_stub(
+        vfs,
+        digest_auth("webdavtest", Duration::from_secs(3600), false),
+        knobs,
+        StubStyle::rclone(),
+    )
+    .await;
+    let response = client()
+        .get(url_of(&handle, "/docs/"))
+        .send()
+        .await
+        .expect("get");
+    assert_eq!(response.status().as_u16(), 401);
+    let www = response.headers()["www-authenticate"]
+        .to_str()
+        .expect("ascii header")
+        .to_string();
+    assert!(
+        www.starts_with(r#"Basic realm="stub", "#) && www.contains("Digest realm="),
+        "one header value carrying both schemes: {www}"
+    );
+    // Digest 段携带 nonce（可被逐段解析消费）。
+    let digest_segment = www
+        .split(r#"Basic realm="stub", "#)
+        .nth(1)
+        .expect("digest segment");
+    assert!(digest_segment.contains("nonce=\""), "{digest_segment}");
+    handle.shutdown().await;
+}
+
+/// member_500_once（M7 注入面，一次性）：下一个 PROPFIND 的文件自条
+/// 目改为「仅内层 500 块」的失败成员；第二次恢复 200 真形。
+#[tokio::test]
+async fn member_500_once_yields_a_500_only_propstat() {
+    let mut vfs = Vfs::new();
+    vfs.seed_file("/a.txt", b"x");
+    let knobs = Knobs {
+        member_500_once: true,
+        ..Knobs::default()
+    };
+    let handle = spawn_stub(vfs, AuthMode::None, knobs, StubStyle::rclone()).await;
+    let body = propfind(&handle, "/a.txt", "0")
+        .await
+        .text()
+        .await
+        .expect("body");
+    assert!(
+        body.contains("HTTP/1.1 500"),
+        "the member is a 500-only failure: {body}"
+    );
+    assert!(
+        !body.contains("200 OK"),
+        "no authoritative block may survive: {body}"
+    );
+    // 一次性：恢复 200 真形。
+    let body = propfind(&handle, "/a.txt", "0")
+        .await
+        .text()
+        .await
+        .expect("body");
+    assert!(body.contains("200 OK"), "{body}");
+    handle.shutdown().await;
+}
+
 // -------------------------------------------------------------- 记录器 ---
 
 /// 打码形态（scheme + 前 8 字符）、body_len、Digest nc/nonce 提取。

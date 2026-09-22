@@ -19,6 +19,8 @@
 //! 配套 [`is_addressable_name`]（K67 过滤纪律）：「list 产出即可寻址」
 //! ——`\`/`\0`/非 UTF-8 lossy 形态（U+FFFD）的名字不可见。
 
+use std::collections::HashMap;
+
 use quick_xml::escape::unescape;
 use quick_xml::events::Event;
 use quick_xml::name::QName;
@@ -74,14 +76,65 @@ fn decode_href(raw: &str) -> String {
     percent_decode_lossy(&unescaped)
 }
 
-/// prop 行是否可采信：propstat 状态行缺失（裸 prop 形态）或 2xx。
-fn row_is_authoritative(row: &PropRow) -> bool {
+/// propstat 状态行里的 HTTP 码（`HTTP/1.1 404 Not Found` → 404；缺失或
+/// 不可解析 → None——按权威行处置，与 [`row_is_authoritative`] 同判据）。
+fn row_status_code(row: &PropRow) -> Option<u16> {
     row.propstat_status
         .as_deref()
         .and_then(|status| status.split_whitespace().nth(1))
         .and_then(|code| code.parse::<u16>().ok())
+}
+
+/// prop 行是否可采信：propstat 状态行缺失（裸 prop 形态）或 2xx。
+fn row_is_authoritative(row: &PropRow) -> bool {
+    row_status_code(row)
         .map(|code| (200..300).contains(&code))
         .unwrap_or(true)
+}
+
+/// 仅非 2xx propstat 块的 response 成员（M7）：href + 首个非 2xx 状态
+/// 码。这些成员不进 [`entries`] 投影（既有纪律），但也不再静默消失
+/// ——调用方按成员映射（内层 404 → NotFound、其余 → Unavailable 带码）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) struct FailedMember {
+    pub href: String,
+    pub status: u16,
+}
+
+/// M7：逐 response href 扫描——没有任何权威行（2xx/缺状态行）的成员即
+/// 失败成员，状态取行序里首个非 2xx 码。href → 归属 `HashMap` 一次建
+/// 立（M5 同纪律：成员数万级时不做二次方扫描）；产出按首见序。
+pub(crate) fn failed_members(rows: &[PropRow]) -> Vec<FailedMember> {
+    let mut order: Vec<String> = Vec::new();
+    // href -> (有权威行?, 首个非 2xx 码)
+    let mut members: HashMap<String, (bool, Option<u16>)> = HashMap::new();
+    for row in rows {
+        let entry = members.entry(row.href.clone()).or_insert_with(|| {
+            order.push(row.href.clone());
+            (false, None)
+        });
+        match row_status_code(row) {
+            None => entry.0 = true,
+            Some(code) if (200..300).contains(&code) => entry.0 = true,
+            Some(code) => {
+                if entry.1.is_none() {
+                    entry.1 = Some(code);
+                }
+            }
+        }
+    }
+    order
+        .into_iter()
+        .filter_map(|href| match members.get(&href) {
+            Some((false, first_error)) => Some(FailedMember {
+                href,
+                // 失败成员必然至少有一行已解析的非 2xx 码（不可解析状
+                // 态行按权威行处置）；防御缺省不触发。
+                status: first_error.unwrap_or(500),
+            }),
+            _ => None,
+        })
+        .collect()
 }
 
 /// Text/CData 的公共下沉（三个汇聚槽：href / status / 当前 prop 文本）。
@@ -241,11 +294,16 @@ pub(crate) fn parse_multistatus(xml: &str) -> Result<Vec<PropRow>, String> {
 ///
 /// href 在 `</href>` 收尾时经 [`decode_href`] 解码（增强 ①）——
 /// `PropRow::href` 与 [`PropfindEntry::href`] 均为**解码后**形态。
+///
+/// M5：href → 输出索引的 `HashMap` 一次构建——万级文件目录上逐行
+/// `position()` 线性扫是 O(n²)（≈5×10⁸ 次比较，rebuild 面可观测劣
+/// 化）；投影序（首见序）与行为不变。
 pub(crate) fn entries(rows: &[PropRow]) -> Vec<PropfindEntry> {
     let mut out: Vec<PropfindEntry> = Vec::new();
+    let mut index_of: HashMap<&str, usize> = HashMap::new();
     for row in rows.iter().filter(|row| row_is_authoritative(row)) {
-        let index = match out.iter().position(|entry| entry.href == row.href) {
-            Some(index) => index,
+        let index = match index_of.get(row.href.as_str()) {
+            Some(index) => *index,
             None => {
                 out.push(PropfindEntry {
                     href: row.href.clone(),
@@ -255,6 +313,7 @@ pub(crate) fn entries(rows: &[PropRow]) -> Vec<PropfindEntry> {
                     quota_used_bytes: None,
                     quota_available_bytes: None,
                 });
+                index_of.insert(row.href.as_str(), out.len() - 1);
                 out.len() - 1
             }
         };

@@ -121,6 +121,68 @@ fn unquote(value: &str) -> String {
     }
 }
 
+/// 一条 `WWW-Authenticate` 头值里可能并置多个 challenge（RFC 7235 允许
+/// 单头形态：`Basic realm="x", Digest realm="y", nonce="n"`）——按
+/// **引号感知的顶层逗号**拆 scheme 段（M6）：逗号后的下一个 token 后随
+/// 空白（scheme 名形态 `token SP`）才算新段起点；`nonce="n"` 这类
+/// `token=` 参数形态与引号内逗号（`qop="auth,auth-int"`）都不分裂
+///（与 [`split_params`] 同纪律）。已知边界：参数带 BWS（`nonce = "n"`
+/// 等号周空格）会被误判为新段——RFC 挑战参数不发 BWS，主流服务器
+///（apache/nginx/rclone）实证均无。
+pub(crate) fn split_challenges(header: &str) -> Vec<String> {
+    match find_scheme_boundary(header) {
+        None => vec![header.trim().to_string()],
+        Some((head, tail)) => {
+            let mut out = vec![head.trim().to_string()];
+            out.extend(split_challenges(tail));
+            out
+        }
+    }
+}
+
+/// 第一个「新 scheme 段起点」的顶层逗号 → (前段, 逗号后的原文)。
+fn find_scheme_boundary(header: &str) -> Option<(&str, &str)> {
+    let mut in_quotes = false;
+    let mut escaped = false;
+    for (index, ch) in header.char_indices() {
+        if escaped {
+            escaped = false;
+            continue;
+        }
+        if in_quotes && ch == '\\' {
+            escaped = true;
+            continue;
+        }
+        if ch == '"' {
+            in_quotes = !in_quotes;
+            continue;
+        }
+        if ch == ',' && !in_quotes {
+            let rest = &header[index + 1..];
+            if starts_new_scheme(rest) {
+                return Some((&header[..index], rest));
+            }
+        }
+    }
+    None
+}
+
+/// 逗号后是否新 challenge 段起点：`token SP`（scheme 名后随空白）。
+fn starts_new_scheme(rest: &str) -> bool {
+    match rest.trim_start().split_once(char::is_whitespace) {
+        Some((token, _)) => is_token(token),
+        None => false, // 无空白 = `token=...` 参数形态（或裸 token 尾段）
+    }
+}
+
+/// RFC 7230 token 字符集（scheme 名的合法字符面）。
+fn is_token(token: &str) -> bool {
+    !token.is_empty()
+        && token
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || "!#$%&'*+-.^_`|~".contains(c))
+}
+
 /// 解析 `WWW-Authenticate` 头值：只认 Digest scheme（`Basic` 头不是
 /// challenge；NTLM/Negotiate 拒收给文案）。
 ///

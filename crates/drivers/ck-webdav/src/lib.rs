@@ -349,6 +349,12 @@ mod tests {
             error.contains("webdav_username") && error.contains("webdav_password"),
             "the refusal routes credentials to their keys: {error}"
         );
+        // M4（审查修复批）：拒收文案不回显原文——原文进错误链 = 嵌入
+        // 密码进日志（R3 面）。
+        assert!(
+            !error.contains("spike") && !error.contains("pw@"),
+            "the refusal must not echo the url (embedded credentials leak): {error}"
+        );
         // username-only userinfo（password 可缺省形态）同拒。
         let error = parse_from_map(&map(&[("webdav_url", "https://spike@nas.lan:5006/dav/")]))
             .err()
@@ -356,6 +362,18 @@ mod tests {
         assert!(
             error.contains("webdav_username"),
             "the refusal names the credential key: {error}"
+        );
+        assert!(
+            !error.contains("spike"),
+            "the refusal must not echo the username: {error}"
+        );
+        // 解析失败臂同纪律（畸形 URL 可能内嵌凭据——原文绝不进文案）。
+        let error = parse_from_map(&map(&[("webdav_url", "https://user:secret@:5006/")]))
+            .err()
+            .expect("parse failure");
+        assert!(
+            error.contains("webdav_url") && !error.contains("secret") && !error.contains("user:"),
+            "the parse failure must not echo the raw input: {error}"
         );
     }
 
@@ -688,6 +706,37 @@ mod tests {
         assert_eq!(challenge.qop.as_deref(), Some("auth"));
         assert!(challenge.stale, "stale=true after algorithm must be read");
         assert_eq!(challenge.opaque, None);
+    }
+
+    #[test]
+    fn auth_split_challenges_separates_schemes_but_keeps_params_intact() {
+        // M6（审查修复批）：单头并置双 challenge（RFC 7235 允许形态）
+        // 拆成两段——任务书样本逐字。
+        let segments = crate::auth::split_challenges(
+            r#"Basic realm="x", Digest realm="y", nonce="n", qop="auth""#,
+        );
+        assert_eq!(
+            segments,
+            vec![
+                r#"Basic realm="x""#,
+                r#"Digest realm="y", nonce="n", qop="auth""#,
+            ],
+            "scheme boundary splits; params stay with their challenge"
+        );
+        // realm 值内逗号不分裂（引号感知——与 split_params 同纪律）。
+        let single = crate::auth::split_challenges(r#"Digest realm="r, x", nonce="n""#);
+        assert_eq!(single, vec![r#"Digest realm="r, x", nonce="n""#]);
+        // 引号外参数逗号不分裂（后随 `token=` 参数形态 ≠ scheme 段起点）。
+        let single = crate::auth::split_challenges(r#"Digest realm="r", nonce="n", qop="auth""#);
+        assert_eq!(single, vec![r#"Digest realm="r", nonce="n", qop="auth""#]);
+        // 无逗号单 challenge 原样一段；裸 scheme 并置（无参数段）同拆。
+        let single = crate::auth::split_challenges(r#"Digest realm="r""#);
+        assert_eq!(single, vec![r#"Digest realm="r""#]);
+        let both = crate::auth::split_challenges(r#"Basic, Digest realm="r""#);
+        assert_eq!(both, vec!["Basic", r#"Digest realm="r""#]);
+        // 拆出的 Digest 段可被 parse_challenge 直接消费（协商链闭环）。
+        let challenge = crate::auth::parse_challenge(&segments[1]).expect("parses");
+        assert_eq!(challenge.nonce, "n");
     }
 
     #[test]
@@ -1124,6 +1173,39 @@ mod tests {
                 .expect("lenient")
                 .is_empty()
         );
+    }
+
+    #[test]
+    fn xml_large_listing_projects_in_first_seen_order() {
+        // M5（审查修复批）：entries() 的 href 索引化——500 条目目录的
+        // 投影正确性回归（性能不敏感；原 O(n²) position 扫描与此实现
+        // 行为同形，只差复杂度）。首见序、字段投影、href 解码全数核对。
+        const COUNT: usize = 500;
+        let mut body =
+            String::from(r#"<?xml version="1.0" encoding="utf-8"?><D:multistatus xmlns:D="DAV:">"#);
+        for i in 0..COUNT {
+            body.push_str(&format!(
+                concat!(
+                    r#"<D:response><D:href>/dav/file%20{i}.bin</D:href>"#,
+                    r#"<D:propstat><D:prop><D:resourcetype/>"#,
+                    r#"<D:getcontentlength>{i}</D:getcontentlength>"#,
+                    r#"<D:getlastmodified>Mon, 21 Sep 2026 10:51:05 GMT</D:getlastmodified>"#,
+                    r#"</D:prop><D:status>HTTP/1.1 200 OK</D:status></D:propstat></D:response>"#,
+                ),
+                i = i
+            ));
+        }
+        body.push_str("</D:multistatus>");
+        let entries = crate::xml::entries(&crate::xml::parse_multistatus(&body).expect("parses"));
+        assert_eq!(entries.len(), COUNT);
+        // 首见序 + 逐条投影（第 0 / 249 / 499 三点抽样 + href 解码抽查）。
+        assert_eq!(entries[0].href, "/dav/file 0.bin");
+        assert_eq!(entries[0].content_length, Some(0));
+        assert_eq!(entries[249].href, "/dav/file 249.bin");
+        assert_eq!(entries[249].content_length, Some(249));
+        assert_eq!(entries[499].href, "/dav/file 499.bin");
+        assert_eq!(entries[499].content_length, Some(499));
+        assert!(entries.iter().all(|entry| !entry.is_collection));
     }
 
     #[test]

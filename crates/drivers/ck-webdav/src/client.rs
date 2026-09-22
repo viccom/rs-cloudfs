@@ -45,10 +45,12 @@ use url::Url;
 
 use cloudkit_storage::StorageError;
 
-use crate::auth::{authorization_header, parse_challenge, rand_cnonce, AuthState, DigestSession};
+use crate::auth::{
+    authorization_header, parse_challenge, rand_cnonce, split_challenges, AuthState, DigestSession,
+};
 use crate::config::{AuthMode, WebdavParams};
 use crate::urls::collection_url;
-use crate::xml::{self, PropfindEntry};
+use crate::xml::{self, FailedMember, PropfindEntry};
 
 /// TCP/TLS 连接建立预算（分层之一；rs-f4ss 骨架同值）。
 pub(crate) const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
@@ -105,10 +107,13 @@ pub(crate) const QUOTA_BODY: &str = concat!(
 );
 
 /// PROPFIND 的结构化产出：multistatus 投影（驱动 stat/list/quota 三面
-/// 的公共载体；WD3 写面若需要成员级状态可在此扩展）。
+/// 的公共载体）。
 #[derive(Debug, Clone, PartialEq)]
 pub(crate) struct PropfindOutcome {
     pub entries: Vec<PropfindEntry>,
+    /// 仅非 2xx 块的 response 成员（M7）——不进 `entries`，但按成员映
+    /// 射浮现（[`map_member_failure`]），绝不静默消失。
+    pub failed_members: Vec<FailedMember>,
 }
 
 /// WebDAV 薄客户端：单 reqwest Client（池内并发，D6）+ 基地址 + 认证
@@ -353,13 +358,32 @@ impl WebdavClient {
             );
             return false;
         }
+        // M6：单头并置多 challenge（RFC 7235 允许的
+        // `Basic realm=..., Digest ...` 逗号并置形态）先按引号感知的顶
+        // 层逗号拆 scheme 段，再逐段解析——按头整段解析会把并置的
+        // Digest offer 整个拒掉（明明可协商却误分类「凭据被拒」）。
+        let segments: Vec<String> = challenges
+            .iter()
+            .flat_map(|value| split_challenges(value))
+            .collect();
         // 多 challenge 服务器上优先 Digest（首个可解析者）。
-        for challenge_value in &challenges {
+        for challenge_value in &segments {
             if let Ok(challenge) = parse_challenge(challenge_value) {
                 let stale = challenge.stale;
                 let realm = challenge.realm.clone();
                 let mut guard = self.auth.lock().await;
-                *guard = AuthState::Digest(DigestSession::from_challenge(&challenge));
+                // M1：同 nonce 的重复 challenge **保留现会话**——并发请求
+                // 各自吃到同一 nonce 的 401（时间基 nonce 服务器的真形）
+                // 时，无条件重置会把 nc 归零，严格 nc 服务器上第二个签名
+                // 与第一个同 nc → 伪凭据拒绝。仅 nonce 变化（或现状态非
+                // Digest）才整体重置。
+                let renegotiated = match &*guard {
+                    AuthState::Digest(session) if session.nonce == challenge.nonce => false,
+                    _ => {
+                        *guard = AuthState::Digest(DigestSession::from_challenge(&challenge));
+                        true
+                    }
+                };
                 drop(guard);
                 // realm/nonce 是服务器签发物，日志安全（模块文档纪律）。
                 tracing::info!(
@@ -367,12 +391,13 @@ impl WebdavClient {
                     verb,
                     stale,
                     realm,
-                    "negotiated a Digest session; resending exactly once"
+                    renegotiated,
+                    "Digest challenge accepted; resending exactly once"
                 );
                 return true;
             }
         }
-        if let Some(scheme) = unsupported_scheme_token(&challenges) {
+        if let Some(scheme) = unsupported_scheme_token(&segments) {
             self.record_rejection(RejectionReason::UnsupportedScheme(scheme.clone()));
             tracing::warn!(
                 target: "ck_webdav::client",
@@ -472,13 +497,14 @@ impl WebdavClient {
             .await?;
         let status = response.status();
         if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
+            let text = body_bounded(response).await;
             return Err(map_status(status, "PROPFIND", &diagnostic(&text, url)));
         }
         let text = response.text().await.map_err(map_transport)?;
         match xml::parse_multistatus(&text) {
             Ok(rows) => Ok(PropfindOutcome {
                 entries: xml::entries(&rows),
+                failed_members: xml::failed_members(&rows),
             }),
             Err(error) => Err(StorageError::Io(format!(
                 "webdav multistatus parse failed: {error}; body: {}",
@@ -530,7 +556,7 @@ impl WebdavClient {
     ) -> Result<PropfindEntry, StorageError> {
         let status = response.status();
         if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
+            let text = body_bounded(response).await;
             let mut diagnostic = diagnostic(&text, url);
             if let Some(location) = prior_location {
                 diagnostic = format!("Location: {location}; {diagnostic}");
@@ -544,6 +570,12 @@ impl WebdavClient {
                 snippet(&text)
             ))
         })?;
+        // M7：单成员 PROPFIND（Depth 0）的失败成员按成员映射——仅内层
+        // 非块 2xx 的成员不进 entries（既有纪律），但按真类浮现而不是
+        // 落进 NotFound 的兜底。
+        if let Some(failed) = xml::failed_members(&rows).first() {
+            return Err(map_member_failure(failed.status));
+        }
         xml::entries(&rows)
             .into_iter()
             .next()
@@ -553,23 +585,28 @@ impl WebdavClient {
     /// 窗口 GET → `Ok(Some(bytes))`；`Ok(None)` = 416（Range 不可满足
     /// ——复核归调用方：driver reader 的 stat 复核腿，§4.4）。
     ///
-    /// - `window = None` → 全量 GET（200 体即答案）；
-    /// - `Some((start, end_exclusive))` → `Range: bytes=start-{end-1}`；
-    ///   **206 校验**：`Content-Range` 的 rs/re 必须逐字段吻合请求
-    ///   （不吻合 → `Io` 带两侧值——§4.5-6）；**200 回退**（服务器无视
-    ///   Range——矩阵④）：body 覆盖请求区间 → 截断；不足 → `Io`；
+    /// - `window` 恒为半开区间 `(start, end_exclusive)`（M3：驱动 reader
+    ///   是唯一调用方，`None` 全量形态已随 transport 面改走窗口路径
+    ///   删除）；退化窗口（`end <= start`）→ 空答案；
+    /// - `Range: bytes=start-{end-1}`；**206 校验**：`Content-Range` 的
+    ///   rs/re 必须逐字段吻合请求（不吻合 → `Io` 带两侧值——§4.5-6）；
+    ///   **200 回退**（服务器无视 Range——矩阵④）：body 覆盖请求区间 →
+    ///   截断；不足 → `Io`；
+    /// - **读取封顶（M3）**：成功体至多读到窗口终点（206 = 窗长、200 =
+    ///   `end` 字节）即停——服务器多给的部分随连接放弃。apache 倒序
+    ///   Range 回 200 全量的真形上，这一条把读取量从「整个文件」钉到
+    ///   「窗口终点」，杜绝整文件进内存的 OOM 面；
     /// - GET 在重试白名单内（窗口间不跨窗重试——driver 文档注明）。
     pub(crate) async fn get_range(
         &self,
         url: &Url,
-        window: Option<(u64, u64)>,
+        window: (u64, u64),
     ) -> Result<Option<bytes::Bytes>, StorageError> {
+        let (start, end) = window;
         let mut headers: Vec<(&'static str, String)> = Vec::new();
-        if let Some((start, end)) = window {
+        if end > start {
             // 半开 → 闭区间头（RFC 9110 Range 形态）；退化窗口不发现。
-            if end > start {
-                headers.push(("range", format!("bytes={}-{}", start, end - 1)));
-            }
+            headers.push(("range", format!("bytes={}-{}", start, end - 1)));
         }
         let response = self
             .execute("GET", url, &headers, None, WINDOW_TIMEOUT)
@@ -580,22 +617,22 @@ impl WebdavClient {
             return Ok(None);
         }
         if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
+            let text = body_bounded(response).await;
             return Err(map_status(status, "GET", &diagnostic(&text, url)));
+        }
+        if end <= start {
+            drain_bounded(response).await;
+            return Ok(Some(bytes::Bytes::new()));
         }
         let content_range = response
             .headers()
             .get(reqwest::header::CONTENT_RANGE)
             .and_then(|value| value.to_str().ok())
             .map(str::to_string);
-        let bytes = response.bytes().await.map_err(map_transport)?;
-        let Some((start, end)) = window else {
-            return Ok(Some(bytes));
-        };
-        if end <= start {
-            return Ok(Some(bytes::Bytes::new()));
-        }
         if status == reqwest::StatusCode::PARTIAL_CONTENT {
+            // 206 体 = 恰好请求窗（封顶 = 窗长；多给即服务器撒谎——校验
+            // 腿如实报错）。
+            let bytes = read_capped(response, (end - start) as usize).await?;
             let actual = content_range.as_deref().and_then(parse_content_range);
             match actual {
                 Some((rs, re, _total)) if rs == start && re == end - 1 => {
@@ -618,7 +655,9 @@ impl WebdavClient {
                 ))),
             }
         } else {
-            // 200 族回退：body 覆盖请求区间 → 截断（§4.4；不足 → Io）。
+            // 200 族回退：body 自文件头起——封顶 = 窗口终点 `end`（覆盖
+            // 请求区间 → 截断，§4.4；不足 → Io）。
+            let bytes = read_capped(response, end as usize).await?;
             if (bytes.len() as u64) < end {
                 return Err(StorageError::Io(format!(
                     "webdav server ignored the Range and its {}-byte body does not cover the \
@@ -660,7 +699,7 @@ impl WebdavClient {
             .await?;
         let status = response.status();
         if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
+            let text = body_bounded(response).await;
             return Err(map_status(status, "PUT", &diagnostic(&text, url)));
         }
         drain_bounded(response).await;
@@ -702,7 +741,7 @@ impl WebdavClient {
             drain_bounded(response).await;
             return Ok(projected);
         }
-        let text = response.text().await.unwrap_or_default();
+        let text = body_bounded(response).await;
         Err(map_status(
             status,
             "OPTIONS",
@@ -730,7 +769,7 @@ impl WebdavClient {
             .await?;
         let status = response.status();
         if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
+            let text = body_bounded(response).await;
             if status == reqwest::StatusCode::CONFLICT {
                 return Ok(MkcolOutcome::ParentMissing);
             }
@@ -752,7 +791,7 @@ impl WebdavClient {
             .await?;
         let status = response.status();
         if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
+            let text = body_bounded(response).await;
             return Err(map_status(status, "DELETE", &diagnostic(&text, url)));
         }
         drain_bounded(response).await;
@@ -790,7 +829,7 @@ impl WebdavClient {
             .await?;
         let status = response.status();
         if !status.is_success() {
-            let text = response.text().await.unwrap_or_default();
+            let text = body_bounded(response).await;
             let diagnostic = diagnostic(&text, from);
             if status == reqwest::StatusCode::PRECONDITION_FAILED && !overwrite {
                 return Ok(MoveOutcome::PreconditionFailed { diagnostic });
@@ -1018,6 +1057,16 @@ pub(crate) fn map_transport(error: reqwest::Error) -> StorageError {
     }
 }
 
+/// M7 成员失败映射（§4.4「成员失败按成员映射」）：内层 404 →
+/// `NotFound`（既有语义——成员确不存在），其余非 2xx → `Unavailable`
+/// 带码（真类；折叠成 NotFound 会误导「路径不存在」的排查方向）。
+pub(crate) fn map_member_failure(status: u16) -> StorageError {
+    match status {
+        404 => StorageError::NotFound,
+        code => StorageError::Unavailable(format!("webdav PROPFIND member failed (HTTP {code})")),
+    }
+}
+
 /// HTTP 状态映射（§4.4 表——读写共用的通用行；MKCOL/MOVE/PUT 的 verb
 /// 专用行——MKCOL 405→Exists / MKCOL·MOVE 409·403·500 缺父处置 /
 /// MOVE 412 复核——在各动词方法内先行拦截，不经过本函数）。
@@ -1063,6 +1112,46 @@ async fn drain_bounded(mut response: reqwest::Response) {
             _ => break,
         }
     }
+}
+
+/// 错误面的有界读取（M3）：读至多 [`DRAIN_LIMIT`] 字节即封顶，超出部
+/// 分随连接放弃——错误页（含超大 HTML 错误体）从不无界缓冲。返回
+/// lossy UTF-8（[`diagnostic`] 的原料——`snippet` 在其后再截 200 字节
+/// 进载荷）；读错时以已收部分如实成文（对齐旧 `unwrap_or_default` 的
+/// 「不因诊断读失败吞原错误」行为）。
+async fn body_bounded(mut response: reqwest::Response) -> String {
+    let mut out: Vec<u8> = Vec::new();
+    while out.len() < DRAIN_LIMIT {
+        match response.chunk().await {
+            Ok(Some(chunk)) => {
+                let take = chunk.len().min(DRAIN_LIMIT - out.len());
+                out.extend_from_slice(&chunk[..take]);
+            }
+            _ => break,
+        }
+    }
+    String::from_utf8_lossy(&out).into_owned()
+}
+
+/// 成功体的封顶读取（M3）：读至多 `cap` 字节即止——服务器多给的部分
+/// 随连接放弃，读取量恒 ≤ `cap`，不随 body 实长膨胀（200-回退整读的
+/// OOM 面收口）。预分配取 `cap` 与 1 MiB 的较小者——`cap` 来自 stat
+/// 报告的窗口终点，服务器谎报大尺寸时不可据此预支内存。
+async fn read_capped(
+    mut response: reqwest::Response,
+    cap: usize,
+) -> Result<bytes::Bytes, StorageError> {
+    let mut out: Vec<u8> = Vec::with_capacity(cap.min(1024 * 1024));
+    while out.len() < cap {
+        match response.chunk().await.map_err(map_transport)? {
+            Some(chunk) => {
+                let take = chunk.len().min(cap - out.len());
+                out.extend_from_slice(&chunk[..take]);
+            }
+            None => break,
+        }
+    }
+    Ok(bytes::Bytes::from(out))
 }
 
 /// PROPFIND 深度（`0` = stat 语义，`1` = 列目录语义）。

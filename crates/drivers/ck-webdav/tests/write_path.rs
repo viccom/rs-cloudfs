@@ -740,3 +740,48 @@ async fn stash_move_also_carries_explicit_overwrite() {
     );
     stager.abort().await.expect("abort");
 }
+
+/// H1（审查修复批）：close ④ 的 stat 复核**出错**臂（区别于尺寸不符臂
+/// ——提交链已走完、MOVE 已固化）绝不 restore：stash 复位会把旧对象以
+/// Overwrite:T 盖回已提交的新版（数据破坏，与尺寸不符臂的既定裁决自相
+/// 矛盾）。注入：`kill_propfinds` 旋钮（PROPFIND 专属——close 链上的
+/// PUT/MOVE 不消耗），覆盖写腿（stash 在场）恰断在 stat 复核。断言：
+/// 错误如实上抛 + final 仍为**新写入字节**（stash 留为 `.ckwd-` 过滤残
+/// 件——与尺寸不符臂同一善后形态）。
+#[tokio::test]
+async fn stager_stat_recheck_error_does_not_restore_the_stash() {
+    let mut vfs = Vfs::new();
+    vfs.seed_file("/f.bin", b"old-committed-content");
+    let handle = plain(vfs).await;
+    let driver = driver(&handle);
+
+    let hint = WriteHint {
+        size: Some(21),
+        ..Default::default()
+    };
+    let mut stager = driver.writer(&rel("f.bin"), &hint).await.expect("writer");
+    stager.write(b"new-committed-content").await.expect("write");
+    // writer 打开已完成 stat 预检与 stash MOVE；close 链上 ensure_parents
+    // 在卷根短路（零 PROPFIND）——这批 PROPFIND 杀必然全部落在 ④ 的
+    // stat 复核上。4 枚 = 首发 + 3 次重试（PROPFIND 在重试白名单内、
+    // send 层断连会自愈——必须耗尽预算才算「复核出错」）。
+    handle
+        .knobs
+        .kill_propfinds
+        .store(4, std::sync::atomic::Ordering::SeqCst);
+    let error = stager
+        .close()
+        .await
+        .expect_err("the failed recheck must surface, not be swallowed");
+    assert!(
+        matches!(error, StorageError::Unavailable(_) | StorageError::Io(_)),
+        "{error:?}"
+    );
+    // 提交事实不动摇：final 仍是新写入的字节（错误臂 restore 会把旧对
+    // 象盖回来——数据破坏的本缺陷面）。
+    assert_eq!(
+        handle.take("/f.bin").as_deref(),
+        Some(b"new-committed-content".as_slice()),
+        "the committed new version must survive the failed recheck"
+    );
+}

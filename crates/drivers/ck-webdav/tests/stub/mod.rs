@@ -80,6 +80,9 @@ pub const MTIME_DIR: i64 = MTIME_SEED;
 const BODY_LIMIT: usize = 64 * 1024 * 1024;
 /// 慢滴流的块大小（旋钮只控延迟，块大小定值）。
 const DRIP_CHUNK: usize = 4096;
+/// 计数流的块大小（M3 served_bytes 观测面——块越小停读计数越贴近
+/// 客户端真实读取量）。
+const COUNT_CHUNK: usize = 64 * 1024;
 /// 目录条目内层 404 propstat 里 getcontentlength 的占位值：状态是 404 →
 /// 值语义无效，999 与 WD1 记录的 apache 真形样本同值（lib.rs 测试常量
 /// `APACHE_MULTISTATUS` 的 `<g0:getcontentlength>999</g0:getcontentlength>`）。
@@ -625,10 +628,37 @@ pub struct Knobs {
     /// 错凭据亦然）。probe 的「Alive = 认证通过」判定必须由真认证动词
     /// 复核，本旋钮在桩上回放该真形。
     pub options_unauthenticated: bool,
+    /// 一次性（启动快照，消费即复位）：下一个 PROPFIND 的**文件自条
+    /// 目**或（目录 Depth 1 列举的）**首个子成员**改为「仅内层 500 块」
+    /// 的失败成员——multistatus 里被列出但属性全数失败的真形（M7 注入
+    /// 面）。目录自条目不受影响。
+    pub member_500_once: bool,
+    /// Digest 服务器的 challenge 改为**单头并置**形态（M6 注入面）：
+    /// `Basic realm="stub", Digest realm=..., nonce=...`——RFC 7235 允许
+    /// 的并置真形。缺省关（纯 Digest 单 challenge——矩阵⑨桩形态）。
+    pub combined_basic_digest_challenge: bool,
+    /// 文件 GET（200 全量/206 窗口）的**实际流出字节**计数（M3 观测
+    /// 面）：客户端读多少（封顶读取 vs 全量整读）的可观测代理——读侧
+    /// 中途停读时 hyper 停止拉流，计数即停。恒开启（纯观察）。
+    pub served_bytes: AtomicUsize,
+    /// Digest challenge 复用最近签发的 nonce（M1 注入面）：真形 = 时间
+    /// 基 nonce 的服务器在同窗口内对**所有** challenge 发同一 nonce——
+    /// 并发请求各自吃到的 401 携同一 nonce。缺省关（每 challenge 铸新
+    /// nonce——矩阵⑨桩形态）。开启后 nonce 过期仍照常重铸（reuse 只在
+    /// 现存 nonce 未过期时生效）。
+    pub digest_challenge_reuse_nonce: bool,
+    /// PROPFIND 专属连接杀（H1 注入面）：计数大于 0 时逐个 PROPFIND 消耗
+    /// 一次「头已写、body 首块即断」。与 [`Knobs::kill_connections`]（全
+    /// 动词）的差别：效果型写动词（PUT/MOVE）不消耗本计数——「MOVE 固
+    /// 化之后的 stat 复核断连」只有 PROPFIND 专属计数才打得到（全动词
+    /// 计数会先被 close 链上的 PUT/MOVE 吃掉）。运行期可调（同
+    /// kill_connections）。
+    pub kill_propfinds: AtomicUsize,
 }
 
 /// 消耗型旋钮的运行副本（启动时从 [`Knobs`] 快照）。
 struct FaultLedger {
+    member_500: bool,
     transient_left: usize,
     transient_move_left: usize,
     rate_left: Option<(usize, Option<u64>)>,
@@ -698,6 +728,8 @@ struct Inner {
     vfs: Vfs,
     nonces: HashMap<String, NonceState>,
     nonce_counter: u64,
+    /// 最近签发的 nonce（M1 reuse 旋钮的复用源；过期移除后自然失效）。
+    last_nonce: Option<String>,
     requests: Vec<RecordedRequest>,
     ledger: FaultLedger,
 }
@@ -793,24 +825,26 @@ impl StubState {
                     .get(axum::http::header::AUTHORIZATION)
                     .and_then(|value| value.to_str().ok())
                     .unwrap_or("");
+                let reuse = self.knobs.digest_challenge_reuse_nonce;
+                let combine = self.knobs.combined_basic_digest_challenge;
                 let mut inner = self.lock();
                 if !authz.to_ascii_lowercase().starts_with("digest ") {
                     // 含 Basic 预发（D1 首轮）与空手请求：一律 Digest challenge。
-                    return Some(digest_challenge(&mut inner, realm, false));
+                    return Some(digest_challenge(&mut inner, realm, false, reuse, combine));
                 }
                 let params = parse_authorization_params(authz);
                 let Some(nonce) = params.get("nonce").cloned() else {
-                    return Some(digest_challenge(&mut inner, realm, false));
+                    return Some(digest_challenge(&mut inner, realm, false, reuse, combine));
                 };
                 let Some(nonce_state) = inner.nonces.get(&nonce).cloned() else {
                     // 未知 nonce：全新 challenge（不带 stale——凭据问题非过期）。
-                    return Some(digest_challenge(&mut inner, realm, false));
+                    return Some(digest_challenge(&mut inner, realm, false, reuse, combine));
                 };
                 if Instant::now().duration_since(nonce_state.issued) > *nonce_ttl {
                     inner.nonces.remove(&nonce);
                     // 矩阵⑨：apache 过期 → 401 + stale=true + 新 nonce。
                     let stale = *stale_after_expiry;
-                    return Some(digest_challenge(&mut inner, realm, stale));
+                    return Some(digest_challenge(&mut inner, realm, stale, reuse, combine));
                 }
                 // nc 单调纪律（enforce_nc=true 时；apache 真机不查——false）。
                 let nc = params
@@ -820,14 +854,16 @@ impl StubState {
                     if let (Some(nc), Some(high)) = (nc, nonce_state.nc_high) {
                         if nc <= high {
                             // nc 倒退/重放 = 凭据级拒绝（新 challenge 无 stale）。
-                            return Some(digest_challenge(&mut inner, realm, false));
+                            return Some(digest_challenge(
+                                &mut inner, realm, false, reuse, combine,
+                            ));
                         }
                     }
                 }
                 // response-uri 严格校验（apache 形态）：必须逐字节等于 wire
                 // 请求 URI（path+query）——「uri 未转义」缺陷的暴露面。
                 if params.get("uri").map(String::as_str) != Some(ctx.wire_uri.as_str()) {
-                    return Some(digest_challenge(&mut inner, realm, false));
+                    return Some(digest_challenge(&mut inner, realm, false, reuse, combine));
                 }
                 // RFC 7616 response 重算比对（qop 提供时 qop=auth 形态）。
                 let expected = digest_response(
@@ -846,7 +882,7 @@ impl StubState {
                     .is_some_and(|value| value.eq_ignore_ascii_case(&expected));
                 let user_ok = params.get("username").is_some_and(|value| value == user);
                 if !(response_ok && user_ok) {
-                    return Some(digest_challenge(&mut inner, realm, false));
+                    return Some(digest_challenge(&mut inner, realm, false, reuse, combine));
                 }
                 if let Some(nc) = nc {
                     if let Some(state) = inner.nonces.get_mut(&nonce) {
@@ -911,6 +947,15 @@ impl StubState {
                 // 文件收到 301 本身就是意外重定向。
                 let location = format!("{}/", href_encode(&ctx.canonical));
                 return Some(redirect_response(&location));
+            }
+        }
+        // PROPFIND 专属连接杀（H1 注入面）：PUT/MOVE 等写动词不消耗——
+        // 「MOVE 固化后的 stat 复核断连」的定向注入面。
+        if ctx.method.as_str() == "PROPFIND" {
+            let current = self.knobs.kill_propfinds.load(Ordering::Acquire);
+            if current > 0 {
+                self.knobs.kill_propfinds.fetch_sub(1, Ordering::AcqRel);
+                return Some(killed_response());
             }
         }
         let current = self.knobs.kill_connections.load(Ordering::Acquire);
@@ -989,6 +1034,12 @@ impl StubState {
             if !depth0 {
                 for (name, child_is_dir, length, mtime) in inner.vfs.children(&ctx.canonical) {
                     let child = format!("{}/{}", ctx.canonical.trim_end_matches('/'), name);
+                    // M7 旋钮（一次性）：首个子成员改为「仅内层 500 块」
+                    // 的失败成员——list 面的成员失败映射注入腿。
+                    if std::mem::take(&mut inner.ledger.member_500) {
+                        xml.push_str(&propfind_entry_failed(&href_of(&child, child_is_dir)));
+                        continue;
+                    }
                     xml.push_str(&propfind_entry(
                         self.style.ns,
                         &href_of(&child, child_is_dir),
@@ -1000,6 +1051,14 @@ impl StubState {
                 }
             }
         } else {
+            // M7 旋钮（一次性）：文件自条目改为「仅内层 500 块」的失败
+            // 成员——stat 面的成员失败映射注入腿。
+            if std::mem::take(&mut inner.ledger.member_500) {
+                let href = href_of(&ctx.canonical, false);
+                xml.push_str(&propfind_entry_failed(&href));
+                xml.push_str("</D:multistatus>");
+                return xml_response(StatusCode::MULTI_STATUS, &xml);
+            }
             // vfs 借用在块内收口（stat_size_delta.take() 要独占 mutable
             // 借用 inner——先拷出 length/mtime 两标量再动 ledger）。
             let (mut length, mtime) = {
@@ -1070,10 +1129,12 @@ impl StubState {
         let drip = self.knobs.slow_drip;
 
         if self.style.range_ignore || range_header.is_none() {
-            return file_response(bytes, &last_modified, drip, StatusCode::OK);
+            return file_response(bytes, &last_modified, drip, StatusCode::OK, &self.knobs);
         }
         match parse_range(range_header.as_deref().expect("checked above"), total) {
-            RangeOutcome::Full => file_response(bytes, &last_modified, drip, StatusCode::OK),
+            RangeOutcome::Full => {
+                file_response(bytes, &last_modified, drip, StatusCode::OK, &self.knobs)
+            }
             RangeOutcome::Partial(start, end_inclusive) => {
                 let slice = bytes[start as usize..=(end_inclusive as usize)].to_vec();
                 let builder = Response::builder()
@@ -1086,8 +1147,15 @@ impl StubState {
                     );
                 match drip {
                     // 慢滴流同样作用于 206 窗口（窗口读不卡死/超时面）。
-                    Some(delay) => builder.body(Body::from_stream(DripStream::new(slice, delay))),
-                    None => builder.body(Body::from(slice)),
+                    Some(delay) => builder.body(Body::from_stream(DripStream::new(
+                        slice,
+                        delay,
+                        Arc::clone(&self.knobs),
+                    ))),
+                    None => builder.body(Body::from_stream(CountingStream::new(
+                        slice,
+                        Arc::clone(&self.knobs),
+                    ))),
                 }
                 .unwrap()
             }
@@ -1344,22 +1412,55 @@ impl StubState {
 /// 生成并登记一个新 nonce（base64 形态，恒含 `+` 与 `=`——矩阵⑨真机
 /// 字符面：材料 = 计数器 8 字节 + [0x00, 0xFB]，0xFB 落在末组首字节
 ///（index 9 ≡ 0 mod 3）→ 首六位组 0xFB>>2 = 62 = `+`；10 字节 ≡ 1
-/// (mod 3) → `=` 填充）。
-fn digest_challenge(inner: &mut Inner, realm: &str, stale: bool) -> Response {
-    inner.nonce_counter += 1;
-    let mut material = inner.nonce_counter.to_le_bytes().to_vec();
-    material.extend_from_slice(&[0x00, 0xFB]);
-    let nonce = BASE64.encode(material);
-    inner.nonces.insert(
-        nonce.clone(),
-        NonceState {
-            issued: Instant::now(),
-            nc_high: None,
-        },
-    );
+/// (mod 3) → `=` 填充）。`reuse_last`（M1 旋钮）开启且现存 nonce 未过
+/// 期时复用最近签发的 nonce——并发 challenge 同 nonce 的真形回放。
+/// `combine_basic`（M6 旋钮）把 challenge 改为单头并置形态
+/// `Basic realm="stub", Digest ...`。
+#[allow(clippy::too_many_arguments)]
+fn digest_challenge(
+    inner: &mut Inner,
+    realm: &str,
+    stale: bool,
+    reuse_last: bool,
+    combine_basic: bool,
+) -> Response {
+    let nonce = if reuse_last {
+        inner
+            .last_nonce
+            .clone()
+            .filter(|nonce| inner.nonces.contains_key(nonce))
+    } else {
+        None
+    };
+    let nonce = match nonce {
+        Some(nonce) => nonce,
+        None => {
+            inner.nonce_counter += 1;
+            let mut material = inner.nonce_counter.to_le_bytes().to_vec();
+            material.extend_from_slice(&[0x00, 0xFB]);
+            let nonce = BASE64.encode(material);
+            inner.nonces.insert(
+                nonce.clone(),
+                NonceState {
+                    issued: Instant::now(),
+                    nc_high: None,
+                },
+            );
+            inner.last_nonce = Some(nonce.clone());
+            nonce
+        }
+    };
     // 形态照矩阵⑨记录：realm/nonce/algorithm=MD5/qop="auth"；
     // stale=true 位置不定（实测在 algorithm 后）——按实测位次回放。
-    let mut value = format!(r#"Digest realm="{realm}", nonce="{nonce}", algorithm=MD5"#);
+    // M6 旋钮：并置头形态（Basic 段在前——RFC 7235 单头多 challenge）。
+    let mut value = if combine_basic {
+        r#"Basic realm="stub", "#.to_string()
+    } else {
+        String::new()
+    };
+    value.push_str(&format!(
+        r#"Digest realm="{realm}", nonce="{nonce}", algorithm=MD5"#
+    ));
     if stale {
         value.push_str(", stale=true");
     }
@@ -1568,6 +1669,14 @@ fn propfind_entry(
     out
 }
 
+/// 失败成员的 response 形态（M7 旋钮载体）：仅一个非 2xx propstat 块
+/// ——成员「在 multistatus 里被列出但属性全数失败」的真形。
+fn propfind_entry_failed(href: &str) -> String {
+    format!(
+        "<D:response><D:href>{href}</D:href>         <D:propstat><D:prop><D:resourcetype/>         <D:getcontentlength>0</D:getcontentlength></D:prop>         <D:status>HTTP/1.1 500 Internal Server Error</D:status></D:propstat>         </D:response>"
+    )
+}
+
 fn xml_response(status: StatusCode, xml: &str) -> Response {
     Response::builder()
         .status(status)
@@ -1596,12 +1705,14 @@ fn options_response() -> Response {
         .unwrap()
 }
 
-/// 200 全量文件响应（慢滴流时按块延迟流出，否则一次性）。
+/// 200 全量文件响应（慢滴流时按块延迟流出；否则走计数流——M3
+/// served_bytes 观测面挂在无延迟路径上）。
 fn file_response(
     bytes: Vec<u8>,
     last_modified: &str,
     drip: Option<Duration>,
     status: StatusCode,
+    knobs: &Arc<Knobs>,
 ) -> Response {
     let builder = Response::builder()
         .status(status)
@@ -1609,10 +1720,19 @@ fn file_response(
         .header("last-modified", last_modified);
     if let Some(delay) = drip {
         builder
-            .body(Body::from_stream(DripStream::new(bytes, delay)))
+            .body(Body::from_stream(DripStream::new(
+                bytes,
+                delay,
+                Arc::clone(knobs),
+            )))
             .unwrap()
     } else {
-        builder.body(Body::from(bytes)).unwrap()
+        builder
+            .body(Body::from_stream(CountingStream::new(
+                bytes,
+                Arc::clone(knobs),
+            )))
+            .unwrap()
     }
 }
 
@@ -1722,15 +1842,19 @@ struct DripStream {
     pos: usize,
     delay: Duration,
     pending: Option<Pin<Box<tokio::time::Sleep>>>,
+    /// M3 served_bytes 观测面（限速路径同样计数——慢滴下服务端自限，
+    /// 计数贴近客户端真实读取量）。
+    knobs: Arc<Knobs>,
 }
 
 impl DripStream {
-    fn new(data: Vec<u8>, delay: Duration) -> DripStream {
+    fn new(data: Vec<u8>, delay: Duration, knobs: Arc<Knobs>) -> DripStream {
         DripStream {
             data: Bytes::from(data),
             pos: 0,
             delay,
             pending: None,
+            knobs,
         }
     }
 }
@@ -1752,7 +1876,47 @@ impl Stream for DripStream {
         let end = (this.pos + DRIP_CHUNK).min(this.data.len());
         let chunk = this.data.slice(this.pos..end);
         this.pos = end;
+        this.knobs
+            .served_bytes
+            .fetch_add(chunk.len(), Ordering::Relaxed);
         this.pending = None;
+        Poll::Ready(Some(Ok(chunk)))
+    }
+}
+
+/// 计数流（M3 观测面）：把 body 按固定块发出并累计**实际流出**的字节
+/// 数——客户端读多少（封顶读取 vs 全量整读）的可观测代理。客户端中途
+/// 停读时 hyper 停止拉流（body drop），计数即停在真实交付量附近（块
+/// 粒度以内）。
+struct CountingStream {
+    data: Bytes,
+    pos: usize,
+    knobs: Arc<Knobs>,
+}
+
+impl CountingStream {
+    fn new(data: Vec<u8>, knobs: Arc<Knobs>) -> CountingStream {
+        CountingStream {
+            data: Bytes::from(data),
+            pos: 0,
+            knobs,
+        }
+    }
+}
+
+impl Stream for CountingStream {
+    type Item = Result<Bytes, std::io::Error>;
+    fn poll_next(self: Pin<&mut Self>, _cx: &mut Context<'_>) -> Poll<Option<Self::Item>> {
+        let this = self.get_mut();
+        if this.pos >= this.data.len() {
+            return Poll::Ready(None);
+        }
+        let end = (this.pos + COUNT_CHUNK).min(this.data.len());
+        let chunk = this.data.slice(this.pos..end);
+        this.pos = end;
+        this.knobs
+            .served_bytes
+            .fetch_add(chunk.len(), Ordering::Relaxed);
         Poll::Ready(Some(Ok(chunk)))
     }
 }
@@ -1867,6 +2031,7 @@ pub async fn spawn_stub(vfs: Vfs, auth: AuthMode, knobs: Knobs, style: StubStyle
     let url = format!("http://{addr}/");
     let knobs = Arc::new(knobs);
     let ledger = FaultLedger {
+        member_500: knobs.member_500_once,
         transient_left: knobs.transient_5xx,
         transient_move_left: knobs.transient_5xx_move,
         rate_left: knobs.rate_limit_429,
@@ -1882,6 +2047,7 @@ pub async fn spawn_stub(vfs: Vfs, auth: AuthMode, knobs: Knobs, style: StubStyle
             vfs,
             nonces: HashMap::new(),
             nonce_counter: 0,
+            last_nonce: None,
             requests: Vec::new(),
             ledger,
         }),

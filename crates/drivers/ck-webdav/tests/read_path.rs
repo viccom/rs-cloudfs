@@ -445,6 +445,58 @@ async fn reader_falls_back_to_200_truncation_when_range_is_ignored() {
     );
 }
 
+/// M3（审查修复批）：200-回退读面**封顶**——服务器无视 Range 回 200
+/// 全量时，客户端至多读到窗口终点（`end` 字节），绝不把整个 body 读进
+/// 内存（apache 倒序 200 真形 × 大文件 = OOM 面）。桩的 `served_bytes`
+/// 计数流是客户端读取量的可观测代理；慢滴限速让服务端自限（loopback
+/// 缓冲不放大），封顶后 ≈ 窗口终点、整读缺陷 = 全量 12 MiB。
+#[tokio::test]
+async fn range_ignored_200_body_is_read_only_up_to_the_window_end() {
+    let total = 12 * 1024 * 1024;
+    let window_end = 2 * 1024 * 1024;
+    let mut vfs = Vfs::new();
+    vfs.seed_file("/f.bin", &pattern(total));
+    let style = StubStyle {
+        range_ignore: true,
+        ..StubStyle::rclone()
+    };
+    let knobs = Knobs {
+        // 限速（1ms/4KiB 块）把服务端交付率钉在客户端读取率附近——
+        // in-flight 缓冲不再掩盖读取量差（全量整读 ≈ 3s，封顶 ≈ 0.5s）。
+        slow_drip: Some(std::time::Duration::from_millis(1)),
+        ..Knobs::default()
+    };
+    let handle = spawn_stub(vfs, AuthMode::None, knobs, style).await;
+    let driver = driver(&handle);
+    let entry = driver.stat(&rel("f.bin")).await.expect("stat");
+
+    let bytes = collect(
+        driver
+            .reader(
+                &entry.id,
+                Some(Range::new(0, Some(window_end as u64)).expect("range")),
+            )
+            .await
+            .expect("reader"),
+    )
+    .await
+    .expect("window bytes");
+    assert_eq!(
+        bytes,
+        pattern(total)[..window_end],
+        "the 200 body is sliced to the window"
+    );
+    let served = handle
+        .knobs
+        .served_bytes
+        .load(std::sync::atomic::Ordering::Relaxed);
+    assert!(
+        served <= window_end + 2 * 1024 * 1024,
+        "the client must stop reading at the window end: served {served} bytes of a \
+         {total}-byte body for a {window_end}-byte window"
+    );
+}
+
 /// §4.4：416 → `Ok(None)` passthrough 的驱动面决策腿（reader 的 stat
 /// 复核）——并发收缩形态：reader() 的 stat 先行拿到旧尺寸，首窗 GET
 /// 前文件被替换为更短版本 → 416 → 复核 stat 见 offset ≥ 新尺寸 →
@@ -562,6 +614,69 @@ async fn killed_connections_self_heal_within_the_read_path() {
         total >= 3,
         "the two kills were retried away: {total} requests"
     );
+}
+
+/// M7（审查修复批）：207 内层**成员失败**不再静默消失——list 对失败
+/// 子成员（仅内层 500 块）回 `Unavailable` 带码并点名成员，而非把它悄
+/// 悄剔出列表（列表可以不全但必须响亮；内层 404 子成员仍按缺席处理
+/// ——成员确已不在，是唯一允许消失的形态）。注入：`member_500_once`
+/// 旋钮打在首个子成员（名字序确定）。
+#[tokio::test]
+async fn list_reports_a_failed_member_as_unavailable() {
+    let mut vfs = Vfs::new();
+    vfs.seed_dir("/docs");
+    vfs.seed_file("/docs/a.txt", b"x");
+    vfs.seed_file("/docs/b.txt", b"y");
+    let knobs = Knobs {
+        member_500_once: true,
+        ..Knobs::default()
+    };
+    let handle = spawn_stub(vfs, AuthMode::None, knobs, StubStyle::rclone()).await;
+    let driver = driver(&handle);
+
+    let error = driver
+        .list(&rel("docs"), Page::all())
+        .await
+        .expect_err("a failed member must surface, not vanish");
+    match error {
+        StorageError::Unavailable(message) => {
+            assert!(
+                message.contains("500"),
+                "the inner status rides along: {message}"
+            );
+            assert!(
+                message.contains("a.txt"),
+                "the failed member is named: {message}"
+            );
+        }
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
+}
+
+/// M7：stat 的单成员 PROPFIND（Depth 0）遇「仅内层 500」的自成员 →
+/// `Unavailable` 带码——真类（映射成 NotFound 会误导「路径不存在」的
+/// 排查方向）；内层 404 成员仍归 NotFound（既有语义，xml 面钉死）。
+#[tokio::test]
+async fn stat_maps_a_failed_member_to_unavailable_not_notfound() {
+    let mut vfs = Vfs::new();
+    vfs.seed_file("/docs/a.txt", b"x");
+    let knobs = Knobs {
+        member_500_once: true,
+        ..Knobs::default()
+    };
+    let handle = spawn_stub(vfs, AuthMode::None, knobs, StubStyle::rclone()).await;
+    let driver = driver(&handle);
+
+    let error = driver
+        .stat(&rel("docs/a.txt"))
+        .await
+        .expect_err("a failed member must surface as its true class");
+    match error {
+        StorageError::Unavailable(message) => {
+            assert!(message.contains("500"), "{message}");
+        }
+        other => panic!("expected Unavailable, got {other:?}"),
+    }
 }
 
 // ------------------------------------------------------------- quota ---
