@@ -83,7 +83,8 @@ pub enum WebdavProbe {
     TlsUntrusted { detail: String },
 }
 
-/// doctor 探活（WD4）：一轮 OPTIONS 的五态判定。
+/// doctor 探活（WD4）：一轮 OPTIONS 的五态判定 + 有凭据时的真认证动
+/// 词复核（WD5 真机补强，见下）。
 ///
 /// 编排（两腿——`webdav_accept_invalid_certs=false` 时先宽后严）：
 ///
@@ -91,13 +92,20 @@ pub enum WebdavProbe {
 ///    `Unauthorized` → ②凭据被拒（分类细节读自协商路径的实际记录，
 ///    [`client::RejectionReason`]）；其余传输失败 → ④不可达（网络
 ///    都不通，无 TLS 话题）。
-/// 2. **严格腿**（用户配置的真实校验姿态）：`accept_invalid_certs =
+/// 2. **认证复核腿**（WD5 真机揭出，rclone serve webdav 先例）：部分
+///    服务器对 OPTIONS 免认证（CORS preflight 语义——错凭据的 OPTIONS
+///    仍 200 + DAV/Allow 头），「Alive = 认证通过」不得只看 OPTIONS。
+///    有凭据时以真认证动词（PROPFIND Depth 0）复核：401 终局（协商已
+///    尽、分类已记录）→ ②；其余任何结局（403 禁读 / 404 路径缺 /
+///    2xx）都证明认证本身已过或可达性判定成立——保持原投影。匿名配
+///    置跳过本腿（③ 的分界只在配置）。
+/// 3. **严格腿**（用户配置的真实校验姿态）：`accept_invalid_certs =
 ///    true` 时与宽腿同一客户端，单轮定 ①/③/②；否则宽腿已证网络可
 ///    达，严格腿的连接类失败只能是证书校验 → ⑤（服务器在两腿之间
 ///    抖动的竞态窗接受为诊断误差——doctor 重跑即分辨）。
 ///
-/// ①/③ 的分界只在配置：有凭据 → ①（认证通过）；无凭据 → ③（匿名
-/// 可用）。
+/// ①/③ 的分界只在配置：有凭据 → ①（认证经复核通过）；无凭据 → ③
+/// （匿名可用）。
 ///
 /// 无外层 deadline——重试白名单 + connect 15s 界定单腿上限，调用方
 /// （CLI probe）按 baidu 先例加 45s 外墙。
@@ -137,6 +145,28 @@ pub async fn probe(params: &WebdavParams) -> WebdavProbe {
         WebdavProbe::CredentialsRejected { detail }
     }
 
+    /// 认证复核腿（编排第 2 步）：有凭据时以 PROPFIND Depth 0 复核「认
+    /// 证通过」；401 终局且协商路径留有分类记录 → ②凭据被拒，否则维持
+    /// OPTIONS 投影的 ①/③ 判定（403/404 等非认证类结局不抹杀 Alive）。
+    async fn verified_verdict(
+        params: &WebdavParams,
+        projected: (Option<String>, Option<String>),
+        client: &client::WebdavClient,
+    ) -> WebdavProbe {
+        if params.username.is_some() {
+            let base = client.base().clone();
+            if let Err(StorageError::Unauthorized { .. }) = client
+                .propfind(&base, client::Depth::Zero, client::ALLPROP_BODY)
+                .await
+            {
+                if client.last_rejection().is_some() {
+                    return rejection_detail(client);
+                }
+            }
+        }
+        alive_or_anonymous(params, projected)
+    }
+
     let strict = match client::WebdavClient::new(params) {
         Ok(client) => client,
         Err(error) => {
@@ -147,9 +177,9 @@ pub async fn probe(params: &WebdavParams) -> WebdavProbe {
     };
 
     if params.accept_invalid_certs {
-        // 用户配置已开洞：单轮 OPTIONS 即真实姿态。
+        // 用户配置已开洞：单轮 OPTIONS + 认证复核即真实姿态。
         return match strict.options_probe().await {
-            Ok(projected) => alive_or_anonymous(params, projected),
+            Ok(projected) => verified_verdict(params, projected, &strict).await,
             Err(StorageError::Unauthorized { .. }) => rejection_detail(&strict),
             Err(error) => WebdavProbe::Unreachable {
                 detail: error.to_string(),
@@ -175,7 +205,14 @@ pub async fn probe(params: &WebdavParams) -> WebdavProbe {
                 detail: error.to_string(),
             }
         }
-        Ok(_) => {}
+        Ok(projected) => {
+            // 认证复核在宽腿先行（凭据话题与证书校验无关）：错凭据在此
+            // 定论，不再进严格腿。
+            let verdict = verified_verdict(params, projected, &lenient).await;
+            if matches!(verdict, WebdavProbe::CredentialsRejected { .. }) {
+                return verdict;
+            }
+        }
     }
 
     // 严格腿：网络已证可达——连接类失败 = 证书校验（⑤）。

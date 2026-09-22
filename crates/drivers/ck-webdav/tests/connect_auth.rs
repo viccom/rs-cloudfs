@@ -564,7 +564,7 @@ async fn transport_connect_accepts_good_credentials_through_digest() {
 /// - `TlsUntrusted` 需要自签 https 服务器（桩是纯 http），离线不可达
 ///   ——该臂只由「宽校验探测成功 + 严格探测连接类失败」的编排保证，
 ///   归 WD5 真机腿（自签 fixture）。
-
+///
 /// 好凭据 + 追加键（probe 的参数直构——驱动无 params 访问器）。
 fn cred_params(handle: &StubHandle, extra: &[(&str, &str)]) -> WebdavParams {
     let mut all = vec![("webdav_username", "spike"), ("webdav_password", "pw")];
@@ -634,6 +634,39 @@ async fn doctor_probe_reports_rejected_credentials_with_the_reason() {
             );
         }
         other => panic!("wrong credentials must be CredentialsRejected, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn doctor_probe_rejects_credentials_even_when_options_is_auth_exempt() {
+    // WD5 真机揭出（rclone serve webdav）：部分服务器对 OPTIONS 免认证
+    //（CORS preflight 语义）——错凭据的 OPTIONS 仍 200 + DAV/Allow 头。
+    // probe 的「Alive = 认证通过」判定不得只依赖 OPTIONS：须以真认证动
+    // 词复核（PROPFIND），否则错配凭据的卷在 doctor 里显示为健康。
+    let handle = spawn_stub(
+        seeded_root(),
+        AuthMode::Basic {
+            user: "spike".to_string(),
+            pass: "pw".to_string(),
+        },
+        Knobs {
+            options_unauthenticated: true,
+            ..Knobs::default()
+        },
+        StubStyle::rclone(),
+    )
+    .await;
+    let probe = ck_webdav::probe(&params(
+        &handle.url,
+        &[("webdav_username", "spike"), ("webdav_password", "WRONG")],
+    ))
+    .await;
+    match &probe {
+        ck_webdav::WebdavProbe::CredentialsRejected { .. } => {}
+        other => panic!(
+            "wrong credentials on an OPTIONS-exempt server must still be \
+             CredentialsRejected, got {other:?}"
+        ),
     }
 }
 

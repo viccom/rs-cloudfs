@@ -2,7 +2,7 @@
 
 > 计划：`docs/plans/2026-09-17-webdav-driver.md` ｜ 需求口径：负责人 2026-09-17「按推荐方案执行；与既有 phase 同策略（计划+跟踪单+TDD）；编译可选；严格遵循项目规范与约束」；**批准：2026-09-21 负责人实施指令（全程自主执行，批次 WD0–WD5 顺延执行）**
 > 基线：main@eda60a7（workspace **1394/0/42**，ignored 42 = 真机/平台/真网类；编号漂移修正——立项裁决用 **K80/K81**，webdav 为**第 7 驱动**，见计划头部留痕）
-> 状态：**WD4 完成（2026-09-22）——WD5 待开工**
+> 状态：**WD5 完成（2026-09-22）——收口/审查批待开工**
 > worktree：`feat/webdav-driver`，独立 target（共享 CARGO_TARGET_DIR 双指纹既有教训）
 
 | 任务 | 内容 | 状态 | 完成情况 | 证据 |
@@ -12,9 +12,23 @@
 | WD2 | 手搓注入桩 + 客户端核心 + 读路径 | ✅ 2026-09-21 | WD2a 桩（1826 行：RFC 严格 + WD0 真形双 ns 风格整字节钉 + 服务端真实验证 RFC7616 + 10 故障旋钮 + 请求记录器）+ 33 自检；WD2b 客户端（认证状态机恰一次预算/重试白名单/动词读侧/错误映射）+ 读面（stat/list/reader 8MiB 窗口/quota 降级）+ transport_face connect/open；connect_auth 18 + read_path 17 + 纯函数 10 测试，红→绿留证 | 本批日志 |
 | WD3 | 写路径 stager + conformance | ✅ 2026-09-22 | client 写侧四动词（恒显式 Overwrite 构造性 bool/绝对 Destination/X-OC-Mtime 仅 nextcloud）+ mkdir stat 预检（rclone201 陷阱）/隐式建父/409 重试 + delete NotFound 恒定 + rename 412→重 stat Exists（K75-1）/缺父三态；stager 严格序（PUT .part→MOVE T→size 复核→清理）+ **断言①裁决=stash 协议上车**（红→绿留证）+ restore_scene + lost-ACK 两半边对账；**dav-server 参照桩揭真缺陷：stat 缺 Depth 头→dav-server 空回应→已修**（双桩制首功）；conformance ①–⑥⑧ 绿（⑦ RESUME 门控）+ error_table 取舍留档；write_path 20 测试 | 本批日志 |
 | WD4 | 装配接线 + 裁剪组合 | ✅ 2026-09-22 | 十三处生效路径走查全绿（走查表入批日志）；**挂账①销账**：userinfo 拒收双漏斗（core validate + 驱动 parse_from_map，TDD 红→绿）；doctor probe 真实现（`WebdavProbe` 五态 + `probe()` 两腿编排 + 渲染器纯函数五测 + D3 开洞离线 WARN + main.rs 接线，`TODO(wd4)` 销账）；twin 组合测试 `webdav_combo_dispatch.rs` 四测（M-I2 不误装配/env>file 装配链/namespace 离线推导/组合内成功路径）；rebuild `build_driver` offline 装配断言；裁剪五组合 clippy -D warnings 全过（顺手修 dispatch.rs axum 导入门 pan115 漏导 + pan115_combo clippy lint） | 本批日志 |
-| WD5 | WSL2 真机矩阵 | ⬜ | 双服务器（rclone 明文 Basic 全动词 + Apache Digest/PROPPATCH 腿）十腿矩阵：①上传回读逐字 ②Range 跨窗口 ③吞吐 128 MiB ④会话复用 ⑤覆盖写+staging 不可见+abort 恢复 ⑥外部文件可见 ⑦错误腿分类 ⑧digest 全链路 nc 真实递增 ⑨断线白名单自愈 ⑩拒绝腿可行动文案；可选自举冒烟腿（不作判据）；fixture 文档完备 | — |
+| WD5 | WSL2 真机矩阵 | ✅ 2026-09-22 | 十腿全绿 88.5s（双服务器：①多档尺寸逐字 ②Range 窗口+越界+钳制 ③吞吐 214.8↑/234.2↓ MiB/s ④20 次混合会话复用 ⑤覆盖写+stash 窗口真机形态记录+abort 恢复 ⑥外部文件即时可见（apache）+rclone 冷读真相 ⑦404/412/幂等分类 ⑧digest nc+stale 恢复 1.9ms ⑨断线 kill 75ms→Unavailable→自愈 508ms ⑩拒绝腿+probe 五态真机分类）；**真机揭出 probe 缺陷已修**（rclone OPTIONS 免认证——真认证动词复核腿+桩旋钮回放）+ **wsl 通道脚本纪律沉淀**；核空 0 残留 | 本批日志 |
 
 ## 批次日志
+
+### WD5（2026-09-22，主会话接手中断代理遗留，worktree feat/webdav-driver）
+
+**执行形态**：派发子代理被取消（LLM 限额族——本批两次），遗留 1227 行 live_matrix 草稿 + probe 修复半成品。主会话接手：核 diff（probe 真认证动词复核腿+桩 `options_unauthenticated` 旋钮，TDD 形态完好）→ 补跑十腿 → 修两处 wsl 通道脚本缺陷 → 全绿。
+
+**真机揭出并修复（非桩面瑕疵）**：
+1. **probe OPTIONS 免认证语义缺陷**（中断代理已修，主会话复核采纳）：rclone serve webdav 对 OPTIONS 免认证（CORS preflight 语义——错凭据的 OPTIONS 仍 200+DAV/Allow 头），probe「Alive=认证通过」判定失真；修复=有凭据时以真认证动词（PROPFIND Depth 0）复核，401 终局→CredentialsRejected；桩加 `options_unauthenticated` 旋钮回放真形+回归测试钉死（TDD 红→绿）。
+2. **wsl 通道脚本变形缺陷（测试基建级，两种假象形态）**：Rust `Command` 经 wsl.exe 传脚本会被 argv 重 join/重引号——①多行脚本新行折叠（赋值行被 `set -e` 吞→`$D` 空→外部文件静默落到 WSL 根 `/ext_a.bin` 而 wc 断言照常通过——腿⑥ list 空表的真因，经服务器侧残留取证+WSL 根核出卖）；②双引号形态变形（`test -d "$D"` 恒假 fail loud 后揭出）。修复=外部写脚本**单行+字面路径+零引号零变量**+`test -f` 尾守卫；残留清扫 `rm -rf {residue}`（find 多行输出回填）同族缺陷改 `$(...)` 命令替换单行。纪律入 fixture 文档「wsl 通道脚本纪律」节。
+
+**十腿终板**（/tmp/wd5-live3.log，88.5s）：①双服务器多档尺寸（0B…16MiB 跨窗）逐字 ✓ ②Range 4 窗+2 越界+1 钳制逐字 ✓ ③吞吐 214.8↑/234.2↓ MiB/s（128 MiB 回环）④20 次混合会话复用零失败 ✓ ⑤覆盖写+stash（**rclone 真机 mid-staging stat=NotFound——stash 协议真机实证**）+abort 恢复 ✓ ⑥外部文件 apache 即时可见+rclone 缓存窗记录/冷读真相 ✓ ⑦404→NotFound/412→Exists（双方原样）/mkdir-dup→Exists（rclone 201 陷阱对策真机复核）/mkdir-on-file→Exists ✓ ⑧digest nc 递增 5 请求+stale 恢复 1.9ms（401→stale→renegotiate→resend 全程）✓ ⑨断线 kill 75ms→outage Unavailable 9.6s→重启→首成功 508ms（1 次尝试）✓ ⑩错凭据双服务器 Unauthorized+坏 URL Unavailable+probe 五态真机分类 ✓。**核空**：三服务器根 e2e_webdav_*/.ckwd-* 零残留（测试内清扫+主会话独立 find 复核）；WSL 根调试残留（/ext_*.bin）已清。
+
+**验证**：workspace **1570/0/52**（1569+1 probe 回归；ignored 42+10=52 live 腿）；clippy/fmt/check_layers/scan_secrets 绿。回滚 = revert 本批 commit。
+
+**挂账**：①rclone 目录 MOVE 缓存窗维持（矩阵⑤既有——真机断言设计已避开）；②TLS 自签腿（doctor ⑤态离线无覆盖）——fixture 无 TLS 服务器，挂账至有 Nextcloud/自签 fixture；③Nextcloud 实服 X-OC-Mtime 维持挂账。
 
 ### WD4（2026-09-22，worktree feat/webdav-driver）
 

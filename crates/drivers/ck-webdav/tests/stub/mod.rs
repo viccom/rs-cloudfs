@@ -620,6 +620,11 @@ pub struct Knobs {
     /// 对**文件** PROPFIND 回 301 + Location（意外重定向的错误分类面；
     /// 目录不受影响）。
     pub unexpected_301: bool,
+    /// OPTIONS 免认证（WD5 真机对策旋钮：rclone serve webdav 的 CORS
+    /// preflight 语义——OPTIONS 不查凭据恒 200 + DAV/Allow 头，真机实证
+    /// 错凭据亦然）。probe 的「Alive = 认证通过」判定必须由真认证动词
+    /// 复核，本旋钮在桩上回放该真形。
+    pub options_unauthenticated: bool,
 }
 
 /// 消耗型旋钮的运行副本（启动时从 [`Knobs`] 快照）。
@@ -1785,8 +1790,12 @@ async fn dispatch(State(state): State<Arc<StubState>>, req: Request) -> Response
     };
     // 记录先于认证门：401/挑战轮数本身是断言面（矩阵⑨协商轮次）。
     state.record(&ctx.method, &ctx.wire_path, &ctx.headers, ctx.body.len());
-    if let Some(response) = state.auth_gate(&ctx) {
-        return response;
+    // WD5 旋钮：rclone 对 OPTIONS 免认证（CORS preflight）——认证门前放行。
+    let options_exempt = state.knobs.options_unauthenticated && ctx.method.as_str() == "OPTIONS";
+    if !options_exempt {
+        if let Some(response) = state.auth_gate(&ctx) {
+            return response;
+        }
     }
     if let Some(response) = state.fault_gate(&ctx) {
         return response;

@@ -116,3 +116,19 @@ digest 全链（challenge→207→nc 递增→stale→新 nonce 一次恢复）�
 - VM IP 变化：重取 `hostname -I` 更新 env。
 - 排错：`/var/log/apache2/webdav-spike-error.log`、`/tmp/webdav-spike-rclone.log`。
 - 清根（测试间隔离）：`rm -rf /srv/rclone-dav/* /srv/webdav-test/dav/* /srv/webdav-test/dav-stale/*`（root）。
+
+## WD5 真机矩阵运行（2026-09-22 实测全绿）
+
+```bash
+# Git Bash（Windows 侧；spike/live_matrix 代码内已 no_proxy）
+IP=$(wsl.exe -d Ubuntu-24.04 -- bash -c "hostname -I" | tr -d '\r\n\0' | awk '{print $1}')
+export CYDRIVE_WEBDAV_TEST_RCLONE_URL="http://$IP:8080/" \
+       CYDRIVE_WEBDAV_TEST_APACHE_URL="http://$IP:8081/dav/" \
+       CYDRIVE_WEBDAV_TEST_APACHE_STALE_URL="http://$IP:8081/dav-stale/" \
+       CYDRIVE_WEBDAV_TEST_USER=spike CYDRIVE_WEBDAV_TEST_PASS=<pw>
+cargo test -p ck-webdav --test live_matrix -- --ignored --test-threads=1 --nocapture
+```
+
+十腿全绿 88.5s（stamp 唯一名 + LCG 随机内容；收尾自动清扫并核空，测试内含腿⑨的 rclone 杀/起与全局残留清扫）。关键数字：吞吐 214.8↑/234.2↓ MiB/s（128 MiB 回环）；digest stale 恢复 1.9ms；断线自愈 kill 75ms→Unavailable 9.6s→重启后首成功 508ms（1 次尝试）；probe 五态真机分类全对（含 rclone OPTIONS 免认证语义——probe 需真认证动词复核，WD5 揭出并修复）。
+
+**wsl 通道脚本纪律（WD5 实证沉淀，测试代码内注释留档）**：Rust `Command` 经 wsl.exe 传多行/含双引号/含变量赋值的脚本会被 argv 重 join/重引号静默变形（曾致「文件静默落到 WSL 根 + wc 断言照常通过」与「`test -d "$D"` 恒假」两种假象）——一律**单行 + 字面路径 + 零引号零变量**，`test -f` 尾守卫 fail loud；多行输出（find 等）不得回填进后续脚本，用 `$(...)` 命令替换单行完成。
