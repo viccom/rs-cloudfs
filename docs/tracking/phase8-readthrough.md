@@ -2,20 +2,31 @@
 
 > 计划：`docs/plans/2026-09-22-readthrough-index.md` ｜ 需求口径：负责人 2026-09-22 拍板路线 C（B 为主 + A 最小集），三点要求：①先出详细可行方案与计划；②六后端+未来驱动共性提炼；③证明架构增强非破坏
 > 基线：main@86003a0（workspace **1602/0/52** + 五门禁绿；Phase 7 webdav 已合入并反向复核毕）
-> 状态：**RT0 计划落档（2026-09-22）——待开工**
+> 状态：**RT1 完成（2026-09-22）——RT2 进行中**
 > worktree：`feat/readthrough-index`，独立 target（共享 CARGO_TARGET_DIR 双指纹既有教训）
 > 编号：裁决 K83（待入 decisions）；批次 RT0–RT5 顺序执行，RT3 与 RT4 可并行派发
 
 | 任务 | 内容 | 状态 | 完成情况 | 证据 |
 |---|---|---|---|---|
 | RT0 | 方案+计划落档（无生产代码） | ✅ 2026-09-22 | 计划 `2026-09-22-readthrough-index.md`（requirement-analyzer 四段 + D1–D10 裁决 + 共性五件套 + RT1–RT5 任务分解 + 架构合规证明表）；本跟踪单；三路探查硬事实入计划 §1 | 本批日志 |
-| RT1 | L2 探针面 + L3 物化提取 | ⬜ 待开工 | — | — |
+| RT1 | L2 探针面 + L3 物化提取 | ✅ 2026-09-22 | `as_driver` 探针（trait 默认 None + 六宽面 transport_face 各一行；telegram 零变化）+ `materialize.rs`（`materialize_entry` 自 rebuild.rs:150-215 逐字段平移，K6/K11 形态保真 + `list_all_pages` 归集器）+ rebuild 改调；rebuild 既有 4 测试零漂移 | commit `834b4fa`；workspace **1607/0/52**（+5）；五门禁绿；批次日志 RT1 节 |
 | RT2 | readthrough 原语（read_dir_fresh/stat_fresh/reconcile/DirCache） | ⬜ 待开工 | — | — |
 | RT3 | 四消费面接线（网关/仪表盘/winfs） | ⬜ 待开工 | — | — |
 | RT4 | rebuild 三件套（续跑/上限/sweep） | ⬜ 待开工 | — | — |
 | RT5 | 真机矩阵 + 文档 + 收口（含深度审查批，K78 形态） | ⬜ 待开工 | — | — |
 
 ## 批次日志
+
+### RT1（2026-09-22，子代理实现 + 主会话审查）
+
+**完成**：commit `834b4fa`——①L2 探针 `CloudTransport::as_driver`（默认 None，`as_inbound`/`as_chat` 同款形态；六宽面 transport_face 字段名统一 `driver: Arc<XxxDriver>`，各 +1 行 `Some(self.driver.as_ref())`；GrammersTransport 未动=telegram 零变化）；②`materialize.rs` 新建（`materialize_entry` 平移保真：K6 非 i64 句柄→`Some(0)`、K11 单容器 chunk、coalesce 列留 NULL、词汇→行键 `/` 前缀约定；返回 `MaterializedRow = FileRecord` 供 read-through 消费；`list_all_pages` depth-1 全页归集 limit 512）；③rebuild.rs 删 `upsert_entry` 改调，outcome 计数留 rebuild 侧（时机语义与原版一致：物化成功才计）。
+
+**TDD 红绿证据**：三条红（`unresolved import cloudkit_core::materialize` / `no method named as_driver` ×2）→ 绿（materialize 3/0、types 21/0、rebuild 4/0 零漂移、六驱动 lib 全绿）。
+
+**适配说明（计划骨架→现实）**：`RelPath::parse`→`RelPath::new`；`EntryId::new(VolumeId, BackendHandle)`；「materialized row vanished」臂经 `RebuildError::from(DbError::from(QueryReturnedNoRows))` 发声（`DbError` 私有字段无法从 &str 构造、`RebuildError` 形状不变）；宽面 Some 腿钉在 ck-local transport_face 测试（可离线构造），余五驱动以 lib 测试+clippy 覆盖。
+
+**门禁**：workspace 1607/0/52（基线 1602+5）、clippy -D warnings、fmt --check、check_layers（16 manifests）、scan_secrets 全绿。
+
 
 ### RT0（2026-09-22，主会话）
 
@@ -31,6 +42,7 @@
 
 ## 风险与未覆盖（随批更新）
 
+- **ck-webdav conformance 偶发（RT1 观察，既有负载敏感）**：三次全量 `-j 4` 跑中一次 `conformance_suite_offline` 失败（loopback 临时端口参照桩），隔离复跑 8/8 绿、其后两次全量绿；本批对 ck-webdav 唯一改动是 conformance 不调用的 provided 方法，无因果——挂账观察，若复现考虑另立降并发/重试裁决
 - 加密卷 read-through 不做（D10，密文 size→明文换算不可靠）——挂账
 - api_files 全表视图新鲜度（D9）——挂账
 - ghost 行清理归 K4 delete-wiring 旧账——不扩 scope
