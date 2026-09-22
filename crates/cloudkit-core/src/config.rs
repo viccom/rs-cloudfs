@@ -2197,6 +2197,17 @@ impl CyDriveConfig {
                 )));
             }
             let authority = rest.split('/').next().unwrap_or_default();
+            // WD4 挂账①：userinfo 形态（`https://user:pass@host/`）会把
+            // 凭据带进 SHOW 回显与 sync namespace（卷身份携带完整 base
+            // URL）——第一道漏斗拒收并指路凭据键（驱动 parse_from_map
+            // 是第二道）。
+            if authority.contains('@') {
+                return Err(ConfigError::Invalid(format!(
+                    "webdav_url must not embed credentials as userinfo (user:pass@host), \
+                     got {url:?}: set webdav_username and webdav_password instead — the \
+                     separate keys keep the credentials out of the volume URL"
+                )));
+            }
             let host = authority.split(':').next().unwrap_or_default();
             if host.is_empty() {
                 return Err(ConfigError::Invalid(format!(

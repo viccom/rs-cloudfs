@@ -77,7 +77,6 @@ pub(crate) enum AuthState {
 /// 按不在双引号内的逗号切分 challenge 参数（引号内逗号不分裂——
 /// `qop="auth,auth-int"` 的天真 split 会碎成 `qop="auth` + `auth-int"`；
 /// 反斜杠转义感知）。
-// WD1a 骨架：经 parse_challenge 仅供测试直达——WD2 全链路接线
 fn split_params(input: &str) -> Vec<String> {
     let mut out = Vec::new();
     let mut current = String::new();
@@ -113,7 +112,6 @@ fn split_params(input: &str) -> Vec<String> {
 }
 
 /// 去包裹引号（`"value"` → `value`；无引号原样）。
-// WD1a 骨架：同上（split_params 的配套）
 fn unquote(value: &str) -> String {
     let value = value.trim();
     if value.len() >= 2 && value.starts_with('"') && value.ends_with('"') {
@@ -178,7 +176,6 @@ pub(crate) fn parse_challenge(header: &str) -> Result<Challenge, String> {
     Ok(challenge)
 }
 
-// WD1a 骨架：经 response_md5 仅供测试直达——WD2 接线
 fn md5_hex(input: &str) -> String {
     let mut hasher = Md5::new();
     hasher.update(input.as_bytes());

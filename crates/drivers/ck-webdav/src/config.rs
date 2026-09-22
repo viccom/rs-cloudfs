@@ -109,6 +109,16 @@ fn normalize_base_url(value: &str) -> Result<Url, String> {
              https://nas.lan:5006/dav/"
         ));
     }
+    // WD4 挂账①：userinfo 形态（`https://user:pass@host/`）会把凭据带
+    // 进 SHOW 回显与 sync namespace（卷身份携带完整 base URL）——拒收
+    // 并指路凭据键（core validate 是第一道漏斗，这里是第二道）。
+    if !url.username().is_empty() || url.password().is_some() {
+        return Err(format!(
+            "webdav_url must not embed credentials as userinfo (user:pass@host), got \
+             {value:?}: set webdav_username and webdav_password instead — the separate \
+             keys keep the credentials out of the volume URL"
+        ));
+    }
     if url.query().is_some() || url.fragment().is_some() {
         return Err(format!(
             "webdav_url must not carry a query or fragment: {value:?}; the share URL is a plain \

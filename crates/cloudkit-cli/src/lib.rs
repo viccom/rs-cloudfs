@@ -6149,6 +6149,39 @@ pub async fn sftp_backend_probe(cfg: &CyDriveConfig) -> ck_sftp::SftpProbe {
     ck_sftp::probe(&params).await
 }
 
+/// The webdav doctor probe leg (Phase 7 / WD4): assembles the driver
+/// params from config and runs [`ck_webdav::probe`] — one OPTIONS round
+/// with the D1 auth negotiation, classified into the five-state
+/// [`ck_webdav::WebdavProbe`] (the renderer is
+/// [`doctor::webdav_connectivity_check`]). Requires the `webdav` feature
+/// (the probe types live in the driver); a binary without it skips the
+/// dial-out leg (K31 shape, the baidu rule): no fake Unreachable.
+///
+/// Incomplete config never reaches the network (the sftp probe's rule);
+/// the whole probe is bounded by a 45s outer deadline (the baidu probe's
+/// wall) so a blackholed host cannot hang an interactive doctor run
+/// (the driver's own retry whitelist + 15s connect timeout bound one
+/// leg; the deadline bounds their sum).
+#[cfg(feature = "webdav")]
+pub async fn webdav_backend_probe(cfg: &CyDriveConfig) -> ck_webdav::WebdavProbe {
+    let params = match webdav_params(cfg) {
+        Ok(params) => params,
+        Err(error) => {
+            return ck_webdav::WebdavProbe::Unreachable {
+                detail: format!(
+                    "the webdav configuration is incomplete ({error}); set the webdav_* keys                      in config.toml and retry"
+                ),
+            }
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(45), ck_webdav::probe(&params)).await {
+        Ok(probe) => probe,
+        Err(_elapsed) => ck_webdav::WebdavProbe::Unreachable {
+            detail: "the probe did not finish within 45s (network path to the server?)".to_string(),
+        },
+    }
+}
+
 /// [`baidu_backend_probe`] with the endpoint set injected (tests point
 /// it at a loopback mock).
 #[cfg(feature = "baidu")]

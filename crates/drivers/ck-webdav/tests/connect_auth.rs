@@ -552,3 +552,122 @@ async fn transport_connect_accepts_good_credentials_through_digest() {
         "the probe is an OPTIONS round"
     );
 }
+
+// ------------------------------------------------------- doctor 探活 ---
+
+/// WD4：[`ck_webdav::probe`] 的行为面（doctor 五态的网络腿——判定文案
+/// 的纯函数面在 cloudkit-cli doctor 渲染器，真机腿归 WD5）。
+///
+/// 五态在桩上的可达性：
+/// - `Alive` / `ReachableNoAuth` / `CredentialsRejected` / `Unreachable`
+///   四态由桩直接钉死；
+/// - `TlsUntrusted` 需要自签 https 服务器（桩是纯 http），离线不可达
+///   ——该臂只由「宽校验探测成功 + 严格探测连接类失败」的编排保证，
+///   归 WD5 真机腿（自签 fixture）。
+
+/// 好凭据 + 追加键（probe 的参数直构——驱动无 params 访问器）。
+fn cred_params(handle: &StubHandle, extra: &[(&str, &str)]) -> WebdavParams {
+    let mut all = vec![("webdav_username", "spike"), ("webdav_password", "pw")];
+    all.extend_from_slice(extra);
+    params(&handle.url, &all)
+}
+
+#[tokio::test]
+async fn doctor_probe_reports_alive_with_dav_class_and_allow() {
+    let handle = spawn_stub(
+        seeded_root(),
+        AuthMode::Basic {
+            user: "spike".to_string(),
+            pass: "pw".to_string(),
+        },
+        Knobs::default(),
+        StubStyle::rclone(),
+    )
+    .await;
+    let probe = ck_webdav::probe(&cred_params(&handle, &[])).await;
+    match &probe {
+        ck_webdav::WebdavProbe::Alive { dav_class, allow } => {
+            assert_eq!(dav_class.as_deref(), Some("1"), "the stub's DAV class");
+            assert!(
+                allow.as_deref().is_some_and(|a| a.contains("PROPFIND")),
+                "the Allow summary carries the verb face: {allow:?}"
+            );
+        }
+        other => panic!("good credentials must be Alive, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn doctor_probe_reports_reachable_without_auth_when_anonymous_works() {
+    let handle = spawn_stub(
+        seeded_root(),
+        AuthMode::None,
+        Knobs::default(),
+        StubStyle::rclone(),
+    )
+    .await;
+    // 无凭据配置 + 服务器免认证 → 「可用但建议配置凭据」态。
+    let probe = ck_webdav::probe(&params(&handle.url, &[])).await;
+    assert!(
+        matches!(probe, ck_webdav::WebdavProbe::ReachableNoAuth),
+        "anonymous access must surface as ReachableNoAuth, got {probe:?}"
+    );
+}
+
+#[tokio::test]
+async fn doctor_probe_reports_rejected_credentials_with_the_reason() {
+    // Digest 协商后仍拒（错密码）——detail 携带 R3 通道的同一文案
+    // （键名指路）。
+    let handle = spawn_stub(
+        seeded_root(),
+        wrong_digest_auth(),
+        Knobs::default(),
+        StubStyle::rclone(),
+    )
+    .await;
+    let probe = ck_webdav::probe(&cred_params(&handle, &[])).await;
+    match &probe {
+        ck_webdav::WebdavProbe::CredentialsRejected { detail } => {
+            assert!(
+                detail.contains("webdav_username") && detail.contains("webdav_password"),
+                "the rejection names the credential keys: {detail}"
+            );
+        }
+        other => panic!("wrong credentials must be CredentialsRejected, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn doctor_probe_reports_basic_mode_refusal_as_rejected_too() {
+    // auth=basic 显式模式 + 服务器只收 Digest → Basic 拒细分（同样归
+    // CredentialsRejected，detail 区分形态）。
+    let handle = spawn_stub(
+        seeded_root(),
+        digest_auth(Duration::from_secs(3600), false),
+        Knobs::default(),
+        StubStyle::rclone(),
+    )
+    .await;
+    let probe = ck_webdav::probe(&cred_params(&handle, &[("webdav_auth", "basic")])).await;
+    match &probe {
+        ck_webdav::WebdavProbe::CredentialsRejected { detail } => {
+            assert!(
+                detail.contains("basic"),
+                "the Basic refusal is distinguishable: {detail}"
+            );
+        }
+        other => panic!("basic-mode refusal must be CredentialsRejected, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn doctor_probe_reports_an_unreachable_server() {
+    // 127.0.0.1:1 无监听——连接拒绝即刻发生。
+    let probe = ck_webdav::probe(&params("http://127.0.0.1:1/", &[])).await;
+    match &probe {
+        ck_webdav::WebdavProbe::Unreachable { detail } => {
+            assert!(!detail.is_empty(), "the detail carries the transport error");
+        }
+        other => panic!("a refused port must be Unreachable, got {other:?}"),
+    }
+}

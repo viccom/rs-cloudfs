@@ -97,7 +97,20 @@ impl WebdavDriver {
     /// 同步构造（不碰网络——reqwest 池惰性建连；pan123 `new` 同款
     /// 离线构造面）。卷身份 `webdav:<user>@<url>`（D6：同基地址同
     /// 账号同卷；user 缺省 `anonymous`）。
+    ///
+    /// D3 开洞 warn 在装配面一次性打出（WD4 从 `WebdavClient::new`
+    /// 挪来——doctor 探活的宽校验诊断客户端也建 client，warn 跟着
+    /// 用户配置走才不误导）。
     pub fn new(params: WebdavParams) -> Result<Self, StorageError> {
+        if params.accept_invalid_certs {
+            tracing::warn!(
+                target: "ck_webdav::driver",
+                url = %params.url,
+                "webdav_accept_invalid_certs is enabled: TLS certificates are NOT verified for \
+                 this volume (self-signed NAS escape hatch) — do not enable this on untrusted \
+                 networks"
+            );
+        }
         let user = params
             .username
             .clone()

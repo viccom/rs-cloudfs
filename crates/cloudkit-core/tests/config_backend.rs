@@ -1236,6 +1236,31 @@ fn webdav_url_must_be_http_with_a_host_and_no_query() {
     }
 }
 
+/// WD4 挂账①裁决：userinfo 形态（`https://user:pass@host/`）会把凭据
+/// 带进 SHOW 回显与 sync namespace（卷身份携带完整 base URL）——core
+/// validate 第一道漏斗拒收并指路凭据键（驱动 parse_from_map 是第二道）。
+#[test]
+fn webdav_url_must_not_embed_userinfo_credentials() {
+    for (label, url) in [
+        ("user:pass", "https://spike:pw@nas.lan:5006/dav/"),
+        ("username only", "https://spike@nas.lan:5006/dav/"),
+    ] {
+        let mut cfg = webdav_config();
+        cfg.webdav_url = Some(url.to_string());
+        let err = cfg
+            .validate()
+            .err()
+            .unwrap_or_else(|| panic!("{label} userinfo must be rejected"));
+        assert!(
+            matches!(&err, ConfigError::Invalid(msg)
+                     if msg.contains("webdav_url")
+                         && msg.contains("webdav_username")
+                         && msg.contains("webdav_password")),
+            "{label}: routes the credentials to their keys: {err:?}"
+        );
+    }
+}
+
 #[test]
 fn webdav_credentials_must_arrive_as_a_pair() {
     for (label, drop_username) in [("username only", true), ("password only", false)] {

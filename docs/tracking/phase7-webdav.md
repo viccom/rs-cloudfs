@@ -2,7 +2,7 @@
 
 > 计划：`docs/plans/2026-09-17-webdav-driver.md` ｜ 需求口径：负责人 2026-09-17「按推荐方案执行；与既有 phase 同策略（计划+跟踪单+TDD）；编译可选；严格遵循项目规范与约束」；**批准：2026-09-21 负责人实施指令（全程自主执行，批次 WD0–WD5 顺延执行）**
 > 基线：main@eda60a7（workspace **1394/0/42**，ignored 42 = 真机/平台/真网类；编号漂移修正——立项裁决用 **K80/K81**，webdav 为**第 7 驱动**，见计划头部留痕）
-> 状态：**WD3 完成（2026-09-22）——WD4 待开工**
+> 状态：**WD4 完成（2026-09-22）——WD5 待开工**
 > worktree：`feat/webdav-driver`，独立 target（共享 CARGO_TARGET_DIR 双指纹既有教训）
 
 | 任务 | 内容 | 状态 | 完成情况 | 证据 |
@@ -11,10 +11,28 @@
 | WD1 | 驱动骨架 + 配置接入（无真实网络） | ✅ 2026-09-21 | WD1a：`ck-webdav` 十文件 crate（config/urls/mtime/auth/xml 纯函数层 + client/driver/stager/transport_face 骨架；能力位 R4 逐位依据注码）；45 测试红（42 失败）→绿。WD1b：十三处接入 + **编译器揭出 3 处清单外**（CyDriveConfig 六字段/穷举 round-trip 测试/run_sync_command namespace 臂）全补；feature 三件套 + `compiled_drivers()` 第 7 行（六驱动输出逐字不变，pinned 测试零漂移）+ K31 文案 + twin 双臂 + doctor 骨架臂 + B-M1 env 路由 + web 前端四文件；16 文件 +1048/−25（−25 限 compiled_drivers 测试 cfg 守卫机械重写，pan123 先例） | 本批日志 |
 | WD2 | 手搓注入桩 + 客户端核心 + 读路径 | ✅ 2026-09-21 | WD2a 桩（1826 行：RFC 严格 + WD0 真形双 ns 风格整字节钉 + 服务端真实验证 RFC7616 + 10 故障旋钮 + 请求记录器）+ 33 自检；WD2b 客户端（认证状态机恰一次预算/重试白名单/动词读侧/错误映射）+ 读面（stat/list/reader 8MiB 窗口/quota 降级）+ transport_face connect/open；connect_auth 18 + read_path 17 + 纯函数 10 测试，红→绿留证 | 本批日志 |
 | WD3 | 写路径 stager + conformance | ✅ 2026-09-22 | client 写侧四动词（恒显式 Overwrite 构造性 bool/绝对 Destination/X-OC-Mtime 仅 nextcloud）+ mkdir stat 预检（rclone201 陷阱）/隐式建父/409 重试 + delete NotFound 恒定 + rename 412→重 stat Exists（K75-1）/缺父三态；stager 严格序（PUT .part→MOVE T→size 复核→清理）+ **断言①裁决=stash 协议上车**（红→绿留证）+ restore_scene + lost-ACK 两半边对账；**dav-server 参照桩揭真缺陷：stat 缺 Depth 头→dav-server 空回应→已修**（双桩制首功）；conformance ①–⑥⑧ 绿（⑦ RESUME 门控）+ error_table 取舍留档；write_path 20 测试 | 本批日志 |
-| WD4 | 装配接线 + 裁剪组合 | ⬜ | 十三处生效路径 + doctor probe（OPTIONS+auth 五态）+ web 表单/volumes.js/i18n/app.js+system.js 标签表（B-M4 别漏行）+ sync 门控 + `CYDRIVE_WEBDAV_PASSWORD` 入 with_env_overrides（B-M1）；裁剪组合构建（含 `not(baidu)+webdav` twin dispatch 测试，pan115_combo_dispatch 模式）+ K31 文案测试 | — |
+| WD4 | 装配接线 + 裁剪组合 | ✅ 2026-09-22 | 十三处生效路径走查全绿（走查表入批日志）；**挂账①销账**：userinfo 拒收双漏斗（core validate + 驱动 parse_from_map，TDD 红→绿）；doctor probe 真实现（`WebdavProbe` 五态 + `probe()` 两腿编排 + 渲染器纯函数五测 + D3 开洞离线 WARN + main.rs 接线，`TODO(wd4)` 销账）；twin 组合测试 `webdav_combo_dispatch.rs` 四测（M-I2 不误装配/env>file 装配链/namespace 离线推导/组合内成功路径）；rebuild `build_driver` offline 装配断言；裁剪五组合 clippy -D warnings 全过（顺手修 dispatch.rs axum 导入门 pan115 漏导 + pan115_combo clippy lint） | 本批日志 |
 | WD5 | WSL2 真机矩阵 | ⬜ | 双服务器（rclone 明文 Basic 全动词 + Apache Digest/PROPPATCH 腿）十腿矩阵：①上传回读逐字 ②Range 跨窗口 ③吞吐 128 MiB ④会话复用 ⑤覆盖写+staging 不可见+abort 恢复 ⑥外部文件可见 ⑦错误腿分类 ⑧digest 全链路 nc 真实递增 ⑨断线白名单自愈 ⑩拒绝腿可行动文案；可选自举冒烟腿（不作判据）；fixture 文档完备 | — |
 
 ## 批次日志
+
+### WD4（2026-09-22，worktree feat/webdav-driver）
+
+**完成**：装配生效路径复核收口 + doctor probe 真实现 + twin 组合测试 + 裁剪五组合。前次派发撞使用限额中断的遗留（userinfo 两测试红相位在工作树）本次先确认红再落实现。
+
+- **挂账①销账（userinfo 双漏斗，TDD 红→绿）**：core `validate()` Webdav 块 authority 含 `@` 即拒 + 驱动 `normalize_base_url` 的 `Url::username()/password()` 非空即拒——文案同形（键名指路 webdav_username/webdav_password，明示「凭据不进卷 URL」）；core 侧为第一道漏斗（无 url crate，authority 字符串判定），驱动侧为第二道（url crate 类型化判定）。两测试红（实测输出留证）→绿。
+- **doctor probe（`TODO(wd4)` 销账）**：驱动侧新增 `WebdavProbe` 五态枚举 + `probe()`（`WebdavProbe::Alive{dav_class,allow}`/`CredentialsRejected{detail}`/`ReachableNoAuth`/`Unreachable{detail}`/`TlsUntrusted{detail}`）——**两腿编排**：宽校验腿（诊断客户端，证书不校验）失败即定论（401→②读协商路径实记的分类；传输失败→④），网络证可达后跑严格腿，其连接类失败只能是证书校验→⑤（行为分类，零字符串信标）；`accept_invalid_certs=true` 时单腿。401 细分（缺凭据/Basic 拒/NTLM/协商后拒）经 `RejectionReason` 记录面（handle_401 决策表单一来源，`StorageError::Unauthorized` 无载荷契约不动——R3 双通道加第三投影）；detail 复用 R3 文案函数同源。CLI 侧 `webdav_backend_probe`（45s 外墙，baidu 先例）+ `webdav_connectivity_check` 渲染器（纯函数五态→五条可行动文案：①Ok 带 DAV/Allow 摘要 ②Fail 指凭据键 ③Warn 建议配凭据 ④Fail 带 URL/网络/代理清单 ⑤Warn 指路 accept_invalid_certs+安全提示——sftp HostKeyUnpinned 显式接受语义）。D3 离线 WARN 入 `backend_checks` Webdav 臂。`options()` 重构为 `options_probe()` 丢投影薄壳（transport connect 语义零漂移）；**D3 warn 从 `WebdavClient::new` 挪到 `WebdavDriver::new`**（探活诊断客户端不走装配面，warn 跟用户配置走才不误导）。
+- **测试取舍**：五态渲染=纯函数+dispatch.rs 单测钉字面（含两头缺席/头摘要断言）；驱动 probe 行为=connect_auth 五测桩上钉（Alive 带头投影/匿名/错密码 digest 拒/basic 模式拒/拒连）；**`TlsUntrusted` 桩不可达**（纯 http 桩无法产证书错误）——编排不变量由代码路径保证，真机自签腿归 WD5；doctor 既有形态无 `#[ignore]` 真机腿，webdav 同制（WD5 一起跑）。
+- **twin 组合测试**（`webdav_combo_dispatch.rs`，pan115 模式，`not(baidu)+webdav` 文件级门→默认构建编译为空）：①非 webdav 后端各拿各的 K31 文案且无 webdav 误装配痕迹（per-backend 细分 cfg）②组合内 webdav 卷装配成功路径（identity=sync_namespace=web_volume=`webdav:spike@http://127.0.0.1:1/dav/`）③env>file 装配链（文件半边缺失由 `CYDRIVE_WEBDAV_PASSWORD` 经 with_env_overrides 补齐→装配成功即证；env 清空→lone username 拒装配点名双键——M-I1 等价面，无 token 刷新态）④`run_sync_command` Webdav namespace 臂离线推导（死 sync 端点失败落 sync pass，错误链无 webdav 连接痕迹）。四组合实跑全绿（webdav / webdav,sftp / local,webdav,pan115 / sftp,pan123,webdav）+ pan115 twin 在第四组合 1/1。
+- **十三处走查**（处→生效证据）：①Backend::Webdav+as_str+is_sync_supported（`!matches!(Local|Sftp)` 天然含 webdav+文档段）✓ ②KNOWN_TOML_KEYS 六键（config.rs:118-123）✓ ③VOLUME_SCOPED_KEYS（:179-184）✓ ④SECRET_VALUED_KEYS webdav_password（:406）✓ ⑤LEGACY_REJECTED 六键+`legacy_json_rejects_all_new_keys` 测试✓ ⑥validate() 块（含本批 userinfo）+ config_backend 13 webdav 测试✓ ⑦Cargo.toml feature 三件套（:26/:33/:97）✓ ⑧ck-webdav crate+16 manifests check_layers✓ ⑨BackendTransport 五臂+build_webdav_transport+dispatch 单 match 臂✓ ⑩WEBDAV_DRIVER_REQUIRED+DRIVER_ROWS 第 7 行+`compiled_drivers_lists_the_feature_set_in_fixed_order` WD1b mirror 断言（webdav 末位/全七序/webdav-only）✓ ⑪build_driver 双臂（本批补 offline 装配+walk 拨号断言）+ doctor probe（本批真实现+main.rs 接线）✓ ⑫with_env_overrides CYDRIVE_WEBDAV_PASSWORD（config.rs:1816+测试）✓ ⑬web 四文件✓（下条）。
+- **web 四文件静态走查**：volumes.html radio `value="webdav"`+`vf-group-webdav` 六字段组（auth select auto/basic/digest、vendor select generic/nextcloud、certs checkbox+警示 hint，i18n 属性齐全）；volumes.js VF_CRED_GROUPS/VF_REQUIRED（仅 url 必填）/VF_STRINGS 五字符串键+certs checkbox 后端门控收集（846-852）/编辑预填（SHOW 回填+write-only 占位）；i18n.js 中英各 10 键对齐（179-188/450-459）；app.js:57+system.js:59 backend.webdav 标签表（B-M4 两处均在）。观察项（不修，P3 既有形态）：vfCollectPayload 收集全 VF_STRINGS 不按可见组过滤——跨后端误输键由服务端 validate 兜底，所有后端同型。
+- **裁剪五组合**（build+clippy --all-targets -D warnings，全过）：`local,baidu` / `webdav` / `webdav,sftp` / `local,webdav,pan115` / `sftp,pan123,webdav`。组合门揭出两处既有缺陷并修复：**dispatch.rs axum 导入门 pan115 漏导**（K74 pan115 mock 用 Router/get，门只盖 baidu|pan123——`local,webdav,pan115` 组合 E0433；门扩 pan115，get 门按 pan123 mock 自带 use 收敛为 baidu|pan115）+ **pan115_combo_dispatch.rs field_reassign_with_default**（文件级 cfg 使默认构建看不见它；结构体更新语法修）。
+- **能力横幅**：`transport_capabilities_line`（info 十位全列）在单卷 boot（lib.rs:663）与多卷 `build_volume_runtime`（lib.rs:2333）经 `transport.capabilities()` 通用打点——WebdavTransport caps 臂既有，webdav 零补线即获横幅（照先例格式=同一行）。
+- **auth.rs 三处「WD1a 骨架」陈旧注释清理**（挂账②尾款：WD2 已接线，函数实际在用、构建零告警；注释谎报状态）。
+
+**验证**：userinfo 两测试红（实测 `webdav_url_must_not... FAILED` / `config_rejects_userinfo... FAILED`）→绿；workspace **1569/0/42**（1558 基线+11：core 1+驱动 lib 1+connect_auth 5+dispatch 4；既有断言零漂移；组合 4 测试只在裁剪组合跑，四组合各 4/4+pan115 twin 1/1）；五组合 clippy -D warnings 全绿（E0460/E0464 陷阱预防性 `cargo clean -p` 后跑全量）；fmt/check_layers（16 manifests 7 drivers）/scan_secrets 绿。回滚 = revert 本批 commit。
+
+**挂账**：①`TlsUntrusted` 探活臂无离线覆盖（自签 https fixture 归 WD5）②doctor 探活对 `accept_invalid_certs=true` 卷不再细分证书态（已开洞=无校验失败可言，设计使然）③vfCollectPayload 跨组收集观察项（P3 既有，若立项修复应全后端一起）。
 
 ### WD3（2026-09-22，worktree feat/webdav-driver）
 
@@ -56,7 +74,7 @@
 
 **自主裁决（未询问）**：①factory 签名按仓库先例 `async fn factory(&WebdavParams) -> Result<Arc<WebdavDriver>, StorageError>`（指令模板与仓库形态冲突时从仓库）；②rand 0.10（workspace 无 [workspace.dependencies] 节，pan115 运行时先例）；③tempfile 为运行时依赖（stager 字段需要）；④`webdav_accept_invalid_certs` core 侧 `Option<bool>`（web 表单 bool 链 serde 兼容），宽容解析留驱动侧 map 面；⑤sync 门控零改写（文档+测试钉替代显式臂）；⑥`https:///dav/` 被 url crate 解析为 host="dav" —— 空 host 测试改用 `https://:5006/dav/` 真错误形态。回滚 = revert 本批 commit。
 
-**挂账（WD4/审查批裁决）**：①webdav_url 理论可含 userinfo（`https://u:p@h/`）——SHOW 回显与 sync namespace 泄漏面（SECRET 清单只含 webdav_password）；②WD1a 骨架 `#[allow(dead_code)] // WD1a 骨架` 锚 18 处（WD2 接线后移除）。
+**挂账（WD4/审查批裁决）**：①~~webdav_url 理论可含 userinfo——SHOW 回显与 sync namespace 泄漏面~~ **已销（WD4：双漏斗拒收，core validate + 驱动 parse_from_map，TDD 红→绿）**；②~~WD1a 骨架 `#[allow(dead_code)]` 锚 18 处~~ **已销（WD2 批移除 allow 属性；WD4 清理 auth.rs 残留 3 处陈旧注释）**。
 
 ### WD0（2026-09-21，worktree feat/webdav-driver）
 

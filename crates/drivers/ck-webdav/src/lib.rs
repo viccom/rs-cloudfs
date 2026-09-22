@@ -56,6 +56,138 @@ pub async fn factory(cfg: &WebdavParams) -> Result<Arc<WebdavDriver>, StorageErr
     Ok(Arc::new(WebdavDriver::new(cfg.clone())?))
 }
 
+// ------------------------------------------------------- doctor 探活 ---
+
+/// doctor 探活的五态判定（WD4；`cydrive doctor` 的 webdav 连通腿与
+/// 渲染器 [`crate`] 之外的 cloudkit-cli `doctor::webdav_connectivity_check`
+/// 共用此枚举——渲染是纯函数，网络腿在这里）。
+///
+/// 与 sftp `SftpProbe` / pan115 `Pan115Probe` 同形态：结构化判据住驱
+/// 动（CLI 侧无 HTTP 面），渲染器把每态映成一条可行动检查结果。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum WebdavProbe {
+    /// ①可达且认证通过（`dav_class` = DAV 头摘要、`allow` = Allow 头
+    /// 摘要——RFC 都不强制，缺席为 `None`，渲染照常 Ok）。
+    Alive {
+        dav_class: Option<String>,
+        allow: Option<String>,
+    },
+    /// ②可达但凭据被拒（401 协商已尽——`detail` 携带与 warn 通道同
+    /// 源的可行动文案：缺凭据 / Basic 拒 / NTLM / 协商后拒）。
+    CredentialsRejected { detail: String },
+    /// ③可达且无需认证（匿名可用——提示可配置凭据）。
+    ReachableNoAuth,
+    /// ④不可达（连接拒绝/超时/DNS——`detail` 保留传输错误原文）。
+    Unreachable { detail: String },
+    /// ⑤TLS 证书不可信（自签场景——网络可达、仅证书校验不过）。
+    TlsUntrusted { detail: String },
+}
+
+/// doctor 探活（WD4）：一轮 OPTIONS 的五态判定。
+///
+/// 编排（两腿——`webdav_accept_invalid_certs=false` 时先宽后严）：
+///
+/// 1. **宽校验腿**（证书不校验的诊断客户端）：失败即定论——
+///    `Unauthorized` → ②凭据被拒（分类细节读自协商路径的实际记录，
+///    [`client::RejectionReason`]）；其余传输失败 → ④不可达（网络
+///    都不通，无 TLS 话题）。
+/// 2. **严格腿**（用户配置的真实校验姿态）：`accept_invalid_certs =
+///    true` 时与宽腿同一客户端，单轮定 ①/③/②；否则宽腿已证网络可
+///    达，严格腿的连接类失败只能是证书校验 → ⑤（服务器在两腿之间
+///    抖动的竞态窗接受为诊断误差——doctor 重跑即分辨）。
+///
+/// ①/③ 的分界只在配置：有凭据 → ①（认证通过）；无凭据 → ③（匿名
+/// 可用）。
+///
+/// 无外层 deadline——重试白名单 + connect 15s 界定单腿上限，调用方
+/// （CLI probe）按 baidu 先例加 45s 外墙。
+pub async fn probe(params: &WebdavParams) -> WebdavProbe {
+    use client::RejectionReason;
+    use cloudkit_storage::StorageError;
+
+    /// 2xx 投影 → ①/③（有凭据 = 认证通过）。
+    fn alive_or_anonymous(
+        params: &WebdavParams,
+        projected: (Option<String>, Option<String>),
+    ) -> WebdavProbe {
+        if params.username.is_some() {
+            WebdavProbe::Alive {
+                dav_class: projected.0,
+                allow: projected.1,
+            }
+        } else {
+            WebdavProbe::ReachableNoAuth
+        }
+    }
+
+    /// 401 终局 → ②（detail = 与 warn 通道同源的单一来源文案）。
+    fn rejection_detail(client: &client::WebdavClient) -> WebdavProbe {
+        let detail = match client.last_rejection() {
+            Some(RejectionReason::MissingCredentials) => client::message_missing_credentials(),
+            Some(RejectionReason::BasicModeRefused { offered }) => {
+                client::message_basic_mode_refused(&offered)
+            }
+            Some(RejectionReason::UnsupportedScheme(scheme)) => {
+                client::message_unsupported_scheme(&scheme)
+            }
+            Some(RejectionReason::RejectedAfterNegotiation) | None => {
+                client::message_credentials_rejected()
+            }
+        };
+        WebdavProbe::CredentialsRejected { detail }
+    }
+
+    let strict = match client::WebdavClient::new(params) {
+        Ok(client) => client,
+        Err(error) => {
+            return WebdavProbe::Unreachable {
+                detail: error.to_string(),
+            }
+        }
+    };
+
+    if params.accept_invalid_certs {
+        // 用户配置已开洞：单轮 OPTIONS 即真实姿态。
+        return match strict.options_probe().await {
+            Ok(projected) => alive_or_anonymous(params, projected),
+            Err(StorageError::Unauthorized { .. }) => rejection_detail(&strict),
+            Err(error) => WebdavProbe::Unreachable {
+                detail: error.to_string(),
+            },
+        };
+    }
+
+    // 宽校验腿：证书不校验——失败即定论（网络不通没有 TLS 话题）。
+    let mut lenient_params = params.clone();
+    lenient_params.accept_invalid_certs = true;
+    let lenient = match client::WebdavClient::new(&lenient_params) {
+        Ok(client) => client,
+        Err(error) => {
+            return WebdavProbe::Unreachable {
+                detail: error.to_string(),
+            }
+        }
+    };
+    match lenient.options_probe().await {
+        Err(StorageError::Unauthorized { .. }) => return rejection_detail(&lenient),
+        Err(error) => {
+            return WebdavProbe::Unreachable {
+                detail: error.to_string(),
+            }
+        }
+        Ok(_) => {}
+    }
+
+    // 严格腿：网络已证可达——连接类失败 = 证书校验（⑤）。
+    match strict.options_probe().await {
+        Ok(projected) => alive_or_anonymous(params, projected),
+        Err(StorageError::Unauthorized { .. }) => rejection_detail(&strict),
+        Err(error) => WebdavProbe::TlsUntrusted {
+            detail: error.to_string(),
+        },
+    }
+}
+
 #[cfg(test)]
 // WebdavParams 故意不实现 Debug（R3——凭据不入日志），`expect_err` 在
 // Ok 侧无 Debug 的调用点上不可用；错误路径断言统一走 `.err().expect`。
@@ -163,6 +295,31 @@ mod tests {
                 "{error}"
             );
         }
+    }
+
+    #[test]
+    fn config_rejects_userinfo_embedded_credentials() {
+        // WD4 挂账①裁决：`https://user:pass@host/` 的 userinfo 形态会把
+        // 凭据带进 SHOW 回显与 sync namespace（卷身份携带完整 base
+        // URL——SECRET 清单只盖 webdav_password 键）。双漏斗拒收之一。
+        let error = parse_from_map(&map(&[(
+            "webdav_url",
+            "https://spike:pw@nas.lan:5006/dav/",
+        )]))
+        .err()
+        .expect("user:pass userinfo must refuse");
+        assert!(
+            error.contains("webdav_username") && error.contains("webdav_password"),
+            "the refusal routes credentials to their keys: {error}"
+        );
+        // username-only userinfo（password 可缺省形态）同拒。
+        let error = parse_from_map(&map(&[("webdav_url", "https://spike@nas.lan:5006/dav/")]))
+            .err()
+            .expect("username-only userinfo must refuse too");
+        assert!(
+            error.contains("webdav_username"),
+            "the refusal names the credential key: {error}"
+        );
     }
 
     #[test]

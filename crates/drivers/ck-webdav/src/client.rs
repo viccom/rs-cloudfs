@@ -135,24 +135,34 @@ pub(crate) struct WebdavClient {
     password: Option<String>,
     /// 认证协商状态（D1 状态机；nc 单调自守的单一来源）。
     auth: tokio::sync::Mutex<AuthState>,
+    /// 最近一次 401 终局的分类（[`RejectionReason`]——doctor 探活的投
+    /// 影面；`StorageError::Unauthorized` 无载荷契约不动，R3 双通道：
+    /// 文案在 warn 通道，分类在这里供 probe 读）。std Mutex：读写都
+    /// 不跨 await 的短临界区。
+    last_rejection: std::sync::Mutex<Option<RejectionReason>>,
+}
+
+/// 401 终局的分类（handle_401 决策表的记录版——单一来源：probe 读的
+/// 就是协商路径实际走过的分支，不重推）。
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum RejectionReason {
+    /// 未配置凭据遇 401。
+    MissingCredentials,
+    /// auth=basic 显式模式被拒（`offered` = 服务器的 challenge 列表）。
+    BasicModeRefused { offered: Vec<String> },
+    /// 服务器只要 NTLM/Negotiate（不支持）。
+    UnsupportedScheme(String),
+    /// Digest 协商 + 恰一次重发后仍拒。
+    RejectedAfterNegotiation,
 }
 
 impl WebdavClient {
     /// 构造（纯本地：建 reqwest Client，不碰网络——惰性连接归
-    /// reqwest 池）。
-    ///
-    /// `accept_invalid_certs = true` 时一次性 warn（D3 开洞必须可
-    /// 观察——doctor 与启动日志共用该通道）。
+    /// reqwest 池）。**不打 D3 warn**——warn 归
+    /// [`crate::driver::WebdavDriver::new`]（装配面一次性）：doctor
+    /// 探活的宽校验诊断客户端（`accept_invalid_certs=true`、与用户配
+    /// 置无关）也走这里，warn 在装配面才不误导。
     pub(crate) fn new(params: &WebdavParams) -> Result<Self, StorageError> {
-        if params.accept_invalid_certs {
-            tracing::warn!(
-                target: "ck_webdav::client",
-                url = %params.url,
-                "webdav_accept_invalid_certs is enabled: TLS certificates are NOT verified for \
-                 this volume (self-signed NAS escape hatch) — do not enable this on untrusted \
-                 networks"
-            );
-        }
         let http = reqwest::Client::builder()
             .connect_timeout(CONNECT_TIMEOUT)
             // 不自动跟随重定向：3xx 是错误分类面/驱动处理面（模块文档）。
@@ -169,7 +179,16 @@ impl WebdavClient {
             username: params.username.clone(),
             password: params.password.clone(),
             auth: tokio::sync::Mutex::new(AuthState::None),
+            last_rejection: std::sync::Mutex::new(None),
         })
+    }
+
+    /// 最近一次 401 终局的分类（短临界区；探活专读）。
+    pub(crate) fn last_rejection(&self) -> Option<RejectionReason> {
+        self.last_rejection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     /// 基地址（驱动侧 `join_path` 的锚）。
@@ -248,7 +267,9 @@ impl WebdavClient {
                 }
                 if auth_resent {
                     // 重发后的再 401 = 凭据被拒的终局（首 401 的分类文案
-                    // 已在 handle_401 留痕；这里补「重发后仍拒」的事实）。
+                    // 已在 handle_401 留痕；这里补「重发后仍拒」的事实
+                    // ——doctor 探活的分类投影同步记录）。
+                    self.record_rejection(RejectionReason::RejectedAfterNegotiation);
                     tracing::warn!(
                         target: "ck_webdav::client",
                         verb,
@@ -307,7 +328,10 @@ impl WebdavClient {
             .collect();
         drain_bounded(response).await;
 
+        // 每个无出路的分支先把分类记进 last_rejection（doctor 探活的投
+        // 影面）——文案与分类同源同步走。
         if self.username.is_none() || self.password.is_none() {
+            self.record_rejection(RejectionReason::MissingCredentials);
             tracing::warn!(
                 target: "ck_webdav::client",
                 verb,
@@ -318,6 +342,9 @@ impl WebdavClient {
             return false;
         }
         if self.auth_mode == AuthMode::Basic {
+            self.record_rejection(RejectionReason::BasicModeRefused {
+                offered: challenges.clone(),
+            });
             tracing::warn!(
                 target: "ck_webdav::client",
                 verb,
@@ -346,6 +373,7 @@ impl WebdavClient {
             }
         }
         if let Some(scheme) = unsupported_scheme_token(&challenges) {
+            self.record_rejection(RejectionReason::UnsupportedScheme(scheme.clone()));
             tracing::warn!(
                 target: "ck_webdav::client",
                 verb,
@@ -354,6 +382,7 @@ impl WebdavClient {
             );
             return false;
         }
+        self.record_rejection(RejectionReason::RejectedAfterNegotiation);
         tracing::warn!(
             target: "ck_webdav::client",
             verb,
@@ -361,6 +390,14 @@ impl WebdavClient {
             message_credentials_rejected()
         );
         false
+    }
+
+    /// 记录 401 终局分类（短临界区，不跨 await）。
+    fn record_rejection(&self, reason: RejectionReason) {
+        *self
+            .last_rejection
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(reason);
     }
 
     /// 请求签名（短临界区，锁不跨 await）：按当前 [`AuthState`] 产出
@@ -634,13 +671,36 @@ impl WebdavClient {
     /// `Ok(())`；非 2xx → [`map_status`]（认证失败以 Unauthorized 浮现
     /// ——transport 面 connect 的探活语义）。
     pub(crate) async fn options(&self) -> Result<(), StorageError> {
+        self.options_probe().await.map(|(_dav_class, _allow)| ())
+    }
+
+    /// OPTIONS 的**带投影形态**（WD4 doctor 探活专用）：2xx →
+    /// `(DAV 头, Allow 头)`（都可选——RFC 9110/4918 不强制服务器回
+    /// 这两个头）；非 2xx → [`map_status`]。[`Self::options`] 是它的
+    /// 丢投影薄壳（transport connect 语义零漂移）。
+    pub(crate) async fn options_probe(
+        &self,
+    ) -> Result<(Option<String>, Option<String>), StorageError> {
         let response = self
             .execute("OPTIONS", &self.base.clone(), &[], None, CONTROL_TIMEOUT)
             .await?;
         let status = response.status();
         if status.is_success() {
+            let projected = {
+                let headers = response.headers();
+                (
+                    headers
+                        .get("dav")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string),
+                    headers
+                        .get("allow")
+                        .and_then(|value| value.to_str().ok())
+                        .map(str::to_string),
+                )
+            };
             drain_bounded(response).await;
-            return Ok(());
+            return Ok(projected);
         }
         let text = response.text().await.unwrap_or_default();
         Err(map_status(

@@ -28,8 +28,10 @@ fn combo_spec() -> VolumeConfig {
 /// 而不是被 pan115 装配链吃掉后吐出 token/Invalid 类误导错误。
 #[tokio::test]
 async fn non_pan115_backends_refuse_with_their_own_driver_message() {
-    let mut settings = CyDriveConfig::default();
-    settings.backend = Backend::Baidu;
+    let settings = CyDriveConfig {
+        backend: Backend::Baidu,
+        ..CyDriveConfig::default()
+    };
     let spec = combo_spec();
     let mut run_options = cloudkit_cli::RunOptions::default();
     let home = std::path::Path::new(".");
