@@ -2,7 +2,7 @@
 
 > 计划：`docs/plans/2026-09-22-readthrough-index.md` ｜ 需求口径：负责人 2026-09-22 拍板路线 C（B 为主 + A 最小集），三点要求：①先出详细可行方案与计划；②六后端+未来驱动共性提炼；③证明架构增强非破坏
 > 基线：main@86003a0（workspace **1602/0/52** + 五门禁绿；Phase 7 webdav 已合入并反向复核毕）
-> 状态：**RT2 完成（2026-09-22）——RT3 进行中（RT4 排队串行）**
+> 状态：**RT3 完成（2026-09-22）——RT4 待开工（排队串行）**
 > worktree：`feat/readthrough-index`，独立 target（共享 CARGO_TARGET_DIR 双指纹既有教训）
 > 编号：裁决 K83（待入 decisions）；批次 RT0–RT5 顺序执行，RT3 与 RT4 可并行派发
 
@@ -11,11 +11,25 @@
 | RT0 | 方案+计划落档（无生产代码） | ✅ 2026-09-22 | 计划 `2026-09-22-readthrough-index.md`（requirement-analyzer 四段 + D1–D10 裁决 + 共性五件套 + RT1–RT5 任务分解 + 架构合规证明表）；本跟踪单；三路探查硬事实入计划 §1 | 本批日志 |
 | RT1 | L2 探针面 + L3 物化提取 | ✅ 2026-09-22 | `as_driver` 探针（trait 默认 None + 六宽面 transport_face 各一行；telegram 零变化）+ `materialize.rs`（`materialize_entry` 自 rebuild.rs:150-215 逐字段平移，K6/K11 形态保真 + `list_all_pages` 归集器）+ rebuild 改调；rebuild 既有 4 测试零漂移 | commit `834b4fa`；workspace **1607/0/52**（+5）；五门禁绿；批次日志 RT1 节 |
 | RT2 | readthrough 原语（read_dir_fresh/stat_fresh/reconcile/DirCache） | ✅ 2026-09-22 | `readthrough.rs`（DirCache：TTL 5s+with_ttl 缝/单飞闸+世代归并/就近失效；reconcile：upsert 侧 in-flight 豁免+双确认 prune+32 上限+NotFound 臂本层删除+stale-if-error）+ Vfs 两薄壳 + 写侧失效三调用点 + `VfsError::EncryptedInstance`；门序 D2 退化→D10 拒收；`sync::is_in_flight_row` 提取单点同源 | commit `aa47649`；readthrough 16/0、rebuild 4/0 零漂移、sync 27/0 零漂移；workspace **1623/0/52**；五门禁绿；批次日志 RT2 节 |
-| RT3 | 四消费面接线（网关/仪表盘/winfs） | ⬜ 待开工 | — | — |
+| RT3 | 四消费面接线（网关/仪表盘/winfs；bot 零改动） | ✅ 2026-09-22 | 三面只换数据获取函数：webdav `read_dir`/`metadata`/`open` 读臂改 `stat_fresh`/`read_dir_fresh`（存在性+is_dir 预检保留经 stat_fresh，NotFound/Forbidden 语义不变）；winfsp `dir_entries`（仅 marker=None 腿到达）改 `read_dir_fresh`，`meta_for`/`open_with_read` 经新 `resolve_row_fresh`（精确命中零网络 → stat_fresh → K45 大小写扫描；NotFound 不终判、其余错误传播；guard/miss 判定路径保持纯 db）；web `api_list` 改 `read_dir_fresh`（驱动 NotFound→404、其余错→500；窄面空目录存在性探针保留=A6；`api_files` 零改动 D9 且测试钉零 list；bot `/ls` 零改动 D2） | commit（RT3）；三包 153/0、winfsp 腿 118/0+1ign、workspace **1627/0/52**（+5=webdav 3+web 1+winfsp 腿 1）；五门禁绿；批次日志 RT3 节 |
 | RT4 | rebuild 三件套（续跑/上限/sweep） | ⬜ 待开工 | — | — |
 | RT5 | 真机矩阵 + 文档 + 收口（含深度审查批，K78 形态） | ⬜ 待开工 | — | — |
 
 ## 批次日志
+
+### RT3（2026-09-22，子代理实现）
+
+**完成**：三面接线（每处=换数据获取函数，零机制代码落消费面）——
+①**webdav**（`cloudkit-webdav/src/lib.rs`）：`read_dir` 的行预检 `self.row(&rel)?` → `vfs.stat_fresh().await`（保留原预检双语义：缺失→NotFound、文件→Forbidden；根跳过），列表 `db.list_dir` → `vfs.read_dir_fresh().await`（D5 每 PROPFIND 现查）；`metadata` 非根臂 → `stat_fresh`（根恒合成 RowMetaData::root 不动——stat_fresh 根在窄面退化臂会 NotFound，不能用于根）；`open` 读臂行获取 → `stat_fresh`（写臂/其余臂不动）；加密卷经 `vfs_err` 的 `EncryptedInstance→Forbidden`（RT2 已扩，D10 语义）。
+②**winfsp**（`cloudkit-winfsp/src/fs.rs`）：`dir_entries` 经 `bridge.block_on(vfs.read_dir_fresh(rel))`——它只被 `prepare_enumeration` 的 `marker=None` 臂调用，「仅首次枚举强制刷新」结构性成立，marker 协议逐字不变（面级测试钉：marker 续页零 list）；`meta_for`/`open_with_read` 行获取改走新私有 `resolve_row_fresh`（=精确 get_file 零网络快路径 → `bridge.block_on(stat_fresh)` → K45 大小写扫描下沉为共享 `scan_parent_insensitive`；stat_fresh 的 NotFound 不终判——FSD 大写形态在 K45 扫描仍可解，其余错误照 `fsp_error` 传播）；`resolve_row` 本体保持纯 db（`row`/`require_dir_parent`/`lookup_miss`/delete/rename 解析等 guard 路径零网络），K44 元数据网络空闲契约在窄面逐字保持（metadata.rs `assert_no_transport_calls` 全绿）。
+③**web**（`cloudkit-web/src/lib.rs`）：`api_list` 改 `volume.vfs.read_dir_fresh(&rel).await`（async handler 直持有 `Arc<Vfs>`，同形接入）；错误映射 NotFound→404「Directory not found」（原文案）、其余→500（绝不造空列表）；「空+无行→404」存在性探针保留——窄面退化臂的 `db.list_dir` 区分不了存在空目录与缺失（A6 零漂移），宽面根空盘 404 冻结语义同款保留；`api_files` 一字未动（D9），测试钉死其零 list 调用。
+④**bot `/ls` 零改动**（D2：telegram 窄面走退化臂）。
+
+**TDD 证据**：逐面先红后绿——红：webdav `readthrough_empty_db_propfind…`（`left: []` vs `["Documents","Photos","readme.txt"]`）+ `readthrough_keeps_the_read_dir_guards…`（NotFound vs Forbidden）+ `readthrough_open_read…`（`open a remote-only file: NotFound`）；winfsp `readthrough_empty_db_enumeration…`（`left: []`）；web `api_list_readthrough…`（404 vs 200）。绿：同用例全过 + 计数断言（webdav 2 视图=2 list；winfsp 枚举=1 list、marker 续页仍 1、open=+1 父重列；web api_list=1、api_files 后仍 1）。宽面 transport 替身按 RT2 `WideTransport<D>`+计数驱动形态逐面自铸（测试 helper 不跨 crate 复用）；`cloudkit-storage`+`async-trait` 以 **dev-dependencies** 落三包（生产图零变化，check_layers 16 manifests 复核）。
+
+**执行期自主裁决（未询问，可逆，回传说明）**：①webdav `read_dir` 保留「存在性+is_dir」预检但改经 stat_fresh（原 row() 预检的 NotFound/Forbidden 语义面级测试钉死）——代价：宽面冷路径（父窗过期或行缺失）多 1 次父重列，导航形（先列父再进子）稳态每视图恰 1 次 list，真机矩阵复核 Explorer 实际流量；②winfsp stat_fresh 的 NotFound 不终判而落 K45 扫描（大写形态不可被精确 NotFound 否决），EncryptedInstance/传输错传播（加密卷 open 面=ACCESS_DENIED 拒绝而非造空，D10）；③api_list 驱动 NotFound 与「空+无行」404 分立（原文案不动）。
+
+**门禁**：三包 `cargo test -p cloudkit-webdav -p cloudkit-web -p cloudkit-winfsp` **153/0**；winfsp 腿 `--features winfsp` **118/0**+1ign（117+1）；workspace `-j 4` **1627/0/52**（基线 1623+5）；clippy -D warnings / fmt --check / check_layers（16 manifests）/ scan_secrets 全绿。
 
 ### RT2（2026-09-22，子代理实现 + 主会话审查）
 
@@ -55,6 +69,8 @@
 
 ## 风险与未覆盖（随批更新）
 
+- **webdav read_dir 冷路径双 list**（RT3）：stat_fresh 预检在父 TTL 窗过期或行缺失时多一次父重列（导航形稳态每视图恰 1 次，面级测试钉 2 视图=2 list）；Explorer 实际流量归真机矩阵复核（RT5）
+- **winfsp resolve_row_fresh 的 NotFound 落 K45 扫描**（RT3）：精确 NotFound 不终判（大写形态保护）；加密+宽面卷 open 面=ACCESS_DENIED（D10 传播），Explorer 呈现待真机复核（RT2 既有挂账承接）
 - **DirCache flights/generations map 无上界**（RT2）：每目录一条小记录，百万目录卷 ≈ 数 MB 慢增长；计划未要求上界——真机矩阵后评估是否加 pan115 式 LRU
 - **EncryptedInstance 消费面映射（Forbidden/ACCESS_DENIED）**为 RT2 选定的保守类，RT3 接线后真机复核 Explorer 呈现
 - **门序执行期解读**：加密+窄面实例（telegram 加密卷）经 D2 门退化为 db 读（不物化即无 D10 危害），D10 拒收文案只对加密+宽面组合发声——rebuild 的 ensure_plaintext_instance 无差别拒，read-through 因退化臂安全而不需要同款无差别拒（收口审查批复核）

@@ -22,4 +22,9 @@ tracing = "0.1"
 tokio = { version = "1", features = ["fs", "io-util", "macros", "net", "rt", "sync"] }
 
 [dev-dependencies]
+# RT3 read-through face tests: the wide-face transport double exposes a
+# counting storage driver through the `as_driver` probe (D1) — the mock
+# driver and the trait live in L2, test-only (production graph unchanged).
+async-trait = "0.1"
+cloudkit-storage = { path = "../cloudkit-storage" }
 tempfile = "3"

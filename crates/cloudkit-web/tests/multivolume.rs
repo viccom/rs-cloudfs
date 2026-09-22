@@ -26,16 +26,24 @@
 use std::collections::BTreeSet;
 use std::net::SocketAddr;
 use std::path::Path;
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use cloudkit_core::cache::CacheManager;
 use cloudkit_core::database::{FileUpsert, MetaDatabase};
 use cloudkit_core::rel_path::RelPath;
 use cloudkit_core::transport::mock::MockTransport;
-use cloudkit_core::transport::{CloudTransport, UploadJob, UploadReceipt};
+use cloudkit_core::transport::{
+    ByteStream, CloudTransport, RemoteHandle, StorageError, UploadJob, UploadReceipt,
+};
 use cloudkit_core::upload_queue::RetryPolicy;
 use cloudkit_core::vfs::{Vfs, VfsConfig};
+use cloudkit_storage::{
+    Entry, EntryId, Listing, MockStorageDriver, Page, Quota, Range, RelPath as VolRel,
+    StorageDriver, UploadStager, VolumeId, WriteHint,
+};
 use cloudkit_web::{
     QuotaSnapshot, RegistryHandle, VolumeUiEntry, VolumeUiStatus, WebUiConfig, WebUiServer,
 };
@@ -1076,4 +1084,229 @@ async fn dynamically_inserted_volume_is_immediately_addressable() {
     assert_eq!(rows.len(), 2, "one row per volume: {rows:?}");
     assert_eq!(rows[0]["name"], "b", "boot volume keeps its position");
     assert_eq!(rows[1]["name"], "c", "the inserted volume appends");
+}
+
+// ------------------------------------- Phase 8 / RT3: read-through faces ---
+//
+// The A1 face-level scenario on the dashboard: an EMPTY index over a
+// STOCKED remote must answer `GET /api/list` with the remote content
+// (read-through, D5), land the rows in the `files` table, and cost
+// exactly one driver list per view (A3). `api_files` stays the index
+// view (D9): the full-table route must never grow a driver list. The
+// narrow-mock scenarios above pin the degraded (D2) arm; this section
+// casts the wide-face transport double (the same minimal `as_driver`
+// shape the core read-through tests use — test helpers do not cross
+// crates) over the storage mock.
+
+/// Counts `list` calls so the O(1)-per-view claim is asserted, not
+/// assumed.
+struct CountingDriver {
+    inner: Arc<MockStorageDriver>,
+    list_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl StorageDriver for CountingDriver {
+    fn volume(&self) -> &VolumeId {
+        self.inner.volume()
+    }
+
+    fn capabilities(&self) -> cloudkit_storage::Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn list(&self, dir: &VolRel, page: Page) -> Result<Listing, StorageError> {
+        self.list_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.list(dir, page).await
+    }
+
+    async fn stat(&self, path: &VolRel) -> Result<Entry, StorageError> {
+        self.inner.stat(path).await
+    }
+
+    async fn mkdir(&self, path: &VolRel) -> Result<(), StorageError> {
+        self.inner.mkdir(path).await
+    }
+
+    async fn delete(&self, id: &EntryId) -> Result<(), StorageError> {
+        self.inner.delete(id).await
+    }
+
+    async fn rename(&self, from: &VolRel, to: &VolRel) -> Result<(), StorageError> {
+        self.inner.rename(from, to).await
+    }
+
+    async fn reader(
+        &self,
+        id: &EntryId,
+        range: Option<Range>,
+    ) -> Result<cloudkit_storage::ByteStream, StorageError> {
+        self.inner.reader(id, range).await
+    }
+
+    async fn writer(
+        &self,
+        path: &VolRel,
+        hint: &WriteHint,
+    ) -> Result<Box<dyn UploadStager>, StorageError> {
+        self.inner.writer(path, hint).await
+    }
+
+    async fn quota(&self) -> Result<Quota, StorageError> {
+        self.inner.quota().await
+    }
+}
+
+/// Wide-face transport double: exposes the driver through the `as_driver`
+/// probe (D1); `capabilities` mirrors the driver's declaration (R4).
+struct WideTransport<D: StorageDriver> {
+    driver: D,
+}
+
+#[async_trait]
+impl<D: StorageDriver> CloudTransport for WideTransport<D> {
+    async fn connect(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    async fn upload(&self, _job: &UploadJob) -> Result<UploadReceipt, StorageError> {
+        Err(StorageError::Unsupported)
+    }
+
+    async fn open(&self, _file: &RemoteHandle) -> Result<ByteStream, StorageError> {
+        Err(StorageError::Unsupported)
+    }
+
+    async fn open_range(
+        &self,
+        _file: &RemoteHandle,
+        _off: u64,
+        _len: u64,
+    ) -> Result<ByteStream, StorageError> {
+        Err(StorageError::Unsupported)
+    }
+
+    async fn delete_remote(&self, _handle: &RemoteHandle) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported)
+    }
+
+    fn capabilities(&self) -> cloudkit_core::transport::Capabilities {
+        self.driver.capabilities()
+    }
+
+    fn as_driver(&self) -> Option<&dyn StorageDriver> {
+        Some(&self.driver)
+    }
+}
+
+/// A1 at the dashboard face: empty index + stocked remote → `GET
+/// /api/list` serves the remote content, materializes the rows, and
+/// costs exactly one driver list; `GET /api/files` stays the pure index
+/// view (D9) and never grows the list counter.
+#[tokio::test]
+async fn api_list_readthrough_serves_remote_content_on_an_empty_index() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = Arc::new(MetaDatabase::open(&dir.path().join("w.db")).expect("open volume db"));
+    let driver = Arc::new(MockStorageDriver::new(
+        VolumeId::parse("baidu:123456789").expect("volume id"),
+    ));
+    let list_calls = Arc::new(AtomicUsize::new(0));
+
+    // Stock the remote (storage-mock writer/mkdir); the index stays empty.
+    for name in ["Documents", "Photos"] {
+        driver
+            .mkdir(&VolRel::new(name).expect("seed dir path"))
+            .await
+            .expect("seed mkdir");
+    }
+    let hint = WriteHint {
+        size: Some(5),
+        ..Default::default()
+    };
+    let mut stager = driver
+        .writer(&VolRel::new("readme.txt").expect("seed path"), &hint)
+        .await
+        .expect("seed writer");
+    stager.write(b"hello").await.expect("seed write");
+    stager.close().await.expect("seed close");
+
+    let counting = CountingDriver {
+        inner: Arc::clone(&driver),
+        list_calls: Arc::clone(&list_calls),
+    };
+    let transport: Arc<dyn CloudTransport> = Arc::new(WideTransport { driver: counting });
+    let vfs = Arc::new(Vfs::new(
+        db.clone(),
+        CacheManager::new(dir.path().join("w-cache"), u64::MAX),
+        transport,
+        base_cfg(),
+    ));
+    let server = multi_server(vec![VolumeUiEntry {
+        name: "w".to_string(),
+        status: VolumeUiStatus::Running,
+        config: volume_cfg(
+            "local",
+            "W:",
+            "w",
+            0,
+            false,
+            Some("baidu:123456789"),
+            false,
+            None,
+        ),
+        vfs: Some(vfs),
+    }])
+    .await;
+    let addr = server.local_addr();
+
+    assert!(
+        db.list_dir("/").expect("db read").is_empty(),
+        "the index starts empty"
+    );
+
+    // The dashboard view of the root: the remote content, freshly listed.
+    let resp = send(
+        addr,
+        &request("GET", "/api/list?path=/&volume=w", addr, &[], ""),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 200, "read-through listing: {resp}");
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("json body");
+    let mut names: Vec<String> = body["entries"]
+        .as_array()
+        .expect("entries array")
+        .iter()
+        .map(|entry| entry["name"].as_str().expect("name key").to_string())
+        .collect();
+    names.sort();
+    assert_eq!(
+        names,
+        vec!["Documents", "Photos", "readme.txt"],
+        "the remote content on an empty index"
+    );
+    assert!(
+        db.get_file("/Documents")
+            .expect("db read")
+            .is_some_and(|row| row.is_dir),
+        "the directory row materialized"
+    );
+    assert!(
+        db.get_file("/readme.txt").expect("db read").is_some(),
+        "the file row materialized"
+    );
+    assert_eq!(
+        list_calls.load(Ordering::SeqCst),
+        1,
+        "the view costs exactly one driver list (A3)"
+    );
+
+    // D9: the full-table route stays the pure index view — it answers
+    // from the rows and never triggers a driver list.
+    let resp = send(addr, &request("GET", "/api/files?volume=w", addr, &[], "")).await;
+    assert_eq!(status_of(&resp), 200, "index view: {resp}");
+    assert_eq!(
+        list_calls.load(Ordering::SeqCst),
+        1,
+        "api_files never lists the backend (D9)"
+    );
 }

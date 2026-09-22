@@ -46,6 +46,11 @@ windows = { version = "0.61", optional = true, features = [
 ] }
 
 [dev-dependencies]
+# RT3 read-through face tests: the wide-face transport double exposes a
+# counting storage driver through the `as_driver` probe (D1) — the mock
+# driver and the trait live in L2, test-only (production graph unchanged).
+async-trait = "0.1"
+cloudkit-storage = { path = "../cloudkit-storage" }
 tempfile = "3"
 # The H4 probe captures the adapter's own tracing events (log-semantics
 # assertions) through a thread-local fmt subscriber with a buffer writer.

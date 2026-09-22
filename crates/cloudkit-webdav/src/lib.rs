@@ -4,8 +4,14 @@
 //! (WsgiDAV 4.3 dispatch semantics), pinned by the tests under
 //! `tests/fs_adapter.rs`:
 //!
-//! - metadata / listings answer straight off the SQLite rows (PROPFIND
-//!   never touches the network);
+//! - metadata / listings answer off the SQLite rows; the read faces
+//!   (`metadata` / `read_dir` / the `open` read arm) route their row
+//!   fetch through the read-through seam ([`Vfs::stat_fresh`] /
+//!   [`Vfs::read_dir_fresh`], Phase 8), so an authoritative wide face
+//!   (`authoritative_index` + a driver) revalidates against the backend
+//!   per view while the telegram-shaped narrow face degrades verbatim to
+//!   the db reads ("PROPFIND never touches the network" stays true for
+//!   every volume without the wide face);
 //! - reads dispatch by the K33 triple gate (SR1): a plaintext, non-zero
 //!   row on a transport that declares RANGE_READ streams through
 //!   [`RangeFile`] — bounded `open_range` windows (K34), never a
@@ -141,6 +147,12 @@ impl DavFileSystem for CyDriveFs {
             if options.read && !options.write {
                 // Read state: the row must be a file.
                 //
+                // The row comes off the read-through seam (Phase 8 /
+                // RT3): a miss re-lists the parent on an authoritative
+                // wide face, so a GET of a never-indexed file resolves
+                // without a rebuild; narrow faces degrade verbatim to
+                // the db read.
+                //
                 // K33 dispatch (SR1): a plaintext, non-zero row on a
                 // transport that declares RANGE_READ streams through
                 // [`RangeFile`] — bounded `open_range` windows, no
@@ -162,7 +174,7 @@ impl DavFileSystem for CyDriveFs {
                 // cached copy — pinned by the smoke tests
                 // `get_range_without_range_read_capability_still_slices`
                 // and `get_range_capability_off_hydrates_without_open_range`.
-                let row = self.row(&rel)?.ok_or(FsError::NotFound)?;
+                let row = self.vfs.stat_fresh(&rel).await.map_err(vfs_err)?;
                 if row.is_dir {
                     return Err(FsError::Forbidden);
                 }
@@ -233,15 +245,24 @@ impl DavFileSystem for CyDriveFs {
     ) -> FsFuture<'a, FsStream<Box<dyn DavDirEntry>>> {
         Box::pin(async move {
             let rel = dav_to_rel(path)?;
+            // Existence + is-a-directory pre-check through the read-through
+            // seam (Phase 8 / RT3): a missing path still answers NotFound
+            // (stat_fresh falls through the parent re-list to the driver
+            // stat) and a file path is still Forbidden — the original
+            // `row()` pre-check's semantics, now served fresh on wide
+            // faces. The root keeps its implicit existence (no row).
             if !rel.is_root() {
-                let row = self.row(&rel)?.ok_or(FsError::NotFound)?;
+                let row = self.vfs.stat_fresh(&rel).await.map_err(vfs_err)?;
                 if !row.is_dir {
                     return Err(FsError::Forbidden);
                 }
             }
+            // The listing itself: the read-through directory fetch (D5 —
+            // every PROPFIND revalidates the view on an authoritative wide
+            // face; narrow faces degrade verbatim to `db.list_dir`).
             // ReadDirMeta is an optimization hint only; entries always
             // carry full metadata (the DB row is already in hand).
-            let items = self.db.list_dir(rel.as_str()).map_err(db_err)?;
+            let items = self.vfs.read_dir_fresh(&rel).await.map_err(vfs_err)?;
             let entries: Vec<Box<dyn DavDirEntry>> = items
                 .iter()
                 .map(|row| {
@@ -264,7 +285,11 @@ impl DavFileSystem for CyDriveFs {
                 // synthesizes VirtualTelegramFolder("/")).
                 return Ok(Box::new(RowMetaData::root()) as Box<dyn DavMetaData>);
             }
-            let row = self.row(&rel)?.ok_or(FsError::NotFound)?;
+            // The row comes off the read-through seam (Phase 8 / RT3):
+            // row hit inside the parent's TTL window answers with zero
+            // network, a miss re-lists the parent (D6), narrow faces
+            // degrade verbatim to the db read.
+            let row = self.vfs.stat_fresh(&rel).await.map_err(vfs_err)?;
             Ok(Box::new(RowMetaData::from_row(&row)) as Box<dyn DavMetaData>)
         })
     }
