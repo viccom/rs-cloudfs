@@ -31,11 +31,13 @@ use cloudkit_cli::{
 use cloudkit_cli::BackendTransport;
 // Baidu-gated surface (FT2): the mock backend, the injected dispatch
 // seam and the driver trait only exist with the `baidu` feature.
-// Router is shared by the pan123 mock below (123-5：pan123-only 组合的
-// --all-targets clippy 面揭出——原 baidu-only 门在无 baidu 组合下漏导)。
-#[cfg(feature = "baidu")]
+// Router is shared by the pan115/pan123 mocks below (123-5：pan123-only
+// 组合的 --all-targets clippy 面揭出——原 baidu-only 门在无 baidu 组合
+// 下漏导；WD4：pan115 门同理漏导——K74 的 pan115 mock 用 Router，组
+// 合 local,webdav,pan115 的 --all-targets clippy 揭出，门扩三驱动)。
+#[cfg(any(feature = "baidu", feature = "pan115"))]
 use axum::routing::get;
-#[cfg(any(feature = "baidu", feature = "pan123"))]
+#[cfg(any(feature = "baidu", feature = "pan115", feature = "pan123"))]
 use axum::Router;
 #[cfg(feature = "baidu")]
 use ck_baidu::TokenStore;
@@ -875,4 +877,265 @@ async fn pan123_dead_probe(base: &str) -> ck_pan123::Pan123Probe {
         sessions_dir: None,
     };
     ck_pan123::probe(&params).await
+}
+
+// ------------------------------------------------------------- webdav -------
+//
+// Phase 7 / WD1b: the dispatch wiring over the WD1a skeleton — the
+// factory constructs OFFLINE (D6: the reqwest pool connects lazily),
+// so the with-driver arm needs no server; the verb faces stay
+// Unsupported placeholders until WD2/WD3 (asserted in ck-webdav's own
+// tests). The volume identity mirrors the WD1a driver:
+// `webdav:<user>@<normalized-base-url>`.
+
+/// A validate-clean webdav config (anonymous would also do — the pair
+/// shape exercises the identity's user segment).
+fn webdav_config() -> CyDriveConfig {
+    CyDriveConfig {
+        backend: Backend::Webdav,
+        webdav_url: Some("https://nas.lan:5006/dav".to_string()),
+        webdav_username: Some("spike".to_string()),
+        webdav_password: Some("pw".to_string()),
+        ..CyDriveConfig::default()
+    }
+}
+
+/// Without the driver: the K31 rebuild message — not an assembly attempt.
+#[cfg(not(feature = "webdav"))]
+#[tokio::test]
+async fn missing_webdav_driver_refuses_with_the_rebuild_message() {
+    let err = match build_backend_transport(&webdav_config()).await {
+        Ok(_) => panic!("a driver-less binary cannot assemble the webdav arm"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains(cloudkit_cli::WEBDAV_DRIVER_REQUIRED),
+        "the off-feature refusal is the K31 rebuild message: {message}"
+    );
+}
+
+/// With the driver: the dispatch assembles the WebdavTransport offline
+/// (D6 — no server, no network), the volume identity is
+/// `webdav:<user>@<base-url>` with the trailing slash the WD1a config
+/// layer normalises in, the capability face mirrors the StorageDriver
+/// bits (WD2b wiring — range_read/server_side_move/authoritative_index/
+/// remote_delete true, resume/multipart false), and the sync
+/// namespace is the raw volume id (the pan115/pan123 shape).
+#[cfg(feature = "webdav")]
+#[tokio::test]
+async fn webdav_key_builds_webdav_transport_offline() {
+    use cloudkit_cli::BackendTransport;
+    let cfg = webdav_config();
+    cfg.validate().expect("the test config validates");
+    let dispatched = build_backend_transport(&cfg)
+        .await
+        .expect("the webdav arm assembles offline (D6 lazy connect)");
+    assert!(matches!(dispatched, BackendTransport::Webdav(_)));
+    assert_eq!(
+        dispatched.volume(),
+        "webdav:spike@https://nas.lan:5006/dav/",
+        "the identity is <user>@<normalized-base-url>"
+    );
+    let caps = dispatched.caps();
+    assert!(
+        caps.range_read
+            && caps.server_side_move
+            && caps.authoritative_index
+            && caps.remote_delete
+            && !caps.resume
+            && !caps.multipart
+            && !caps.change_feed
+            && !caps.inbound
+            && !caps.chat
+            && !caps.rapid_upload,
+        "WD2b: the transport face mirrors the StorageDriver capability bits \
+         (got {caps:?})"
+    );
+    assert_eq!(
+        dispatched.sync_namespace_key(),
+        "webdav:spike@https://nas.lan:5006/dav/",
+        "the sync namespace is the raw volume id (the pan115/pan123 shape)"
+    );
+}
+
+/// With the driver but an invalid config: the assembly surfaces the
+/// driver-side parse error (the second gate — the core `validate` pass
+/// runs at load time in production; here the empty password reads as
+/// unset on the flatten, so the driver's map face sees a lone username
+/// and names BOTH keys), never a panic.
+#[cfg(feature = "webdav")]
+#[tokio::test]
+async fn webdav_assembly_surfaces_the_driver_parse_gate() {
+    let mut cfg = webdav_config();
+    cfg.webdav_password = Some(String::new()); // empty-means-unset on the flatten
+    let err = match build_backend_transport(&cfg).await {
+        Ok(_) => panic!("a lone username must refuse the webdav assembly"),
+        Err(err) => err,
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("webdav_username") && message.contains("webdav_password"),
+        "the driver gate names both keys: {message}"
+    );
+}
+
+/// WD4: the doctor's five-state verdict rendering — the pure function
+/// over [`ck_webdav::WebdavProbe`] (the network leg itself is the
+/// driver's `probe`, stub-pinned in ck-webdav's connect_auth suite; the
+/// live-matrix leg is WD5). Every state names its way out (K31 style);
+/// no credential material ever appears in the text.
+#[cfg(feature = "webdav")]
+#[test]
+fn webdav_connectivity_verdicts_cover_the_five_states() {
+    use ck_webdav::WebdavProbe;
+    use cloudkit_cli::doctor::{webdav_connectivity_check, CheckStatus};
+
+    // ① reachable + authenticated: reports the DAV class / Allow summary.
+    let alive = webdav_connectivity_check(&WebdavProbe::Alive {
+        dav_class: Some("1, 2".to_string()),
+        allow: Some("OPTIONS, GET, PUT, PROPFIND".to_string()),
+    });
+    assert_eq!(alive.status, CheckStatus::Ok, "{alive:?}");
+    assert!(
+        alive.detail.contains("1, 2") && alive.detail.contains("PROPFIND"),
+        "the Alive detail carries the DAV class and Allow summary: {}",
+        alive.detail
+    );
+    // Header-absent servers keep the Ok (RFC leaves both optional).
+    let alive_minimal = webdav_connectivity_check(&WebdavProbe::Alive {
+        dav_class: None,
+        allow: None,
+    });
+    assert_eq!(alive_minimal.status, CheckStatus::Ok, "{alive_minimal:?}");
+
+    // ② credentials rejected: Fail + the credential keys.
+    let rejected = webdav_connectivity_check(&WebdavProbe::CredentialsRejected {
+        detail: "webdav credentials were rejected".to_string(),
+    });
+    assert_eq!(rejected.status, CheckStatus::Fail, "{rejected:?}");
+    assert!(
+        rejected.detail.contains("webdav_username") && rejected.detail.contains("webdav_password"),
+        "the rejection points at the credential keys: {}",
+        rejected.detail
+    );
+
+    // ③ reachable without auth: usable, with the configure-credentials
+    // suggestion (a Warn, not a Fail — anonymous servers are legal).
+    let anonymous = webdav_connectivity_check(&WebdavProbe::ReachableNoAuth);
+    assert_eq!(anonymous.status, CheckStatus::Warn, "{anonymous:?}");
+    assert!(
+        anonymous.detail.contains("webdav_username"),
+        "the suggestion names the credential keys: {}",
+        anonymous.detail
+    );
+
+    // ④ unreachable: Fail + the URL / network / proxy checklist.
+    let unreachable = webdav_connectivity_check(&WebdavProbe::Unreachable {
+        detail: "connection refused".to_string(),
+    });
+    assert_eq!(unreachable.status, CheckStatus::Fail, "{unreachable:?}");
+    assert!(
+        unreachable.detail.contains("webdav_url")
+            && unreachable.detail.contains("connection refused"),
+        "the unreachable detail keeps the cause and names the checklist: {}",
+        unreachable.detail
+    );
+
+    // ⑤ TLS certificate problem: reachable-but-untrusted — the escape
+    // hatch key plus the security note (the explicit-accept Warn, the
+    // sftp HostKeyUnpinned semantic).
+    let tls = webdav_connectivity_check(&WebdavProbe::TlsUntrusted {
+        detail: "certificate validate failed".to_string(),
+    });
+    assert_eq!(tls.status, CheckStatus::Warn, "{tls:?}");
+    assert!(
+        tls.detail.contains("webdav_accept_invalid_certs") && tls.detail.contains("true"),
+        "the TLS state names the escape-hatch key: {}",
+        tls.detail
+    );
+    assert!(
+        tls.detail.contains("not verified") || tls.detail.contains("security"),
+        "the TLS state carries the risk note: {}",
+        tls.detail
+    );
+}
+
+/// The doctor probe over an incomplete config never dials: the flatten
+/// gate turns the missing URL into an Unreachable probe value naming the
+/// config (the validate pass gives the actionable verdict first, the
+/// sftp probe's rule).
+#[cfg(feature = "webdav")]
+#[tokio::test]
+async fn webdav_backend_probe_reports_an_incomplete_config_without_dialing() {
+    let mut cfg = webdav_config();
+    cfg.webdav_url = None;
+    let probe = cloudkit_cli::webdav_backend_probe(&cfg).await;
+    match probe {
+        ck_webdav::WebdavProbe::Unreachable { detail } => {
+            assert!(
+                detail.contains("webdav_url"),
+                "the config-incomplete detail names the key: {detail}"
+            );
+        }
+        other => panic!("an incomplete config must not dial, got {other:?}"),
+    }
+}
+
+/// The offline D3 leg: `webdav_accept_invalid_certs = true` earns its
+/// own WARN line (the hatch never hides); the default config stays clean.
+#[cfg(feature = "webdav")]
+#[test]
+fn webdav_accept_invalid_certs_earns_the_offline_tls_warning() {
+    use cloudkit_cli::doctor::CheckStatus;
+    let mut cfg = webdav_config();
+    cfg.webdav_accept_invalid_certs = Some(true);
+    let checks = cloudkit_cli::doctor::backend_checks(&cfg);
+    assert!(
+        checks.iter().any(|check| {
+            check.name == "webdav_accept_invalid_certs" && check.status == CheckStatus::Warn
+        }),
+        "the enabled hatch must surface as its own WARN: {checks:?}"
+    );
+    let clean = cloudkit_cli::doctor::backend_checks(&webdav_config());
+    assert!(
+        clean
+            .iter()
+            .all(|check| check.name != "webdav_accept_invalid_certs"),
+        "the default (strict TLS) config must stay clean: {clean:?}"
+    );
+}
+
+/// WD4: the rebuild face's `build_driver` webdav arm assembles OFFLINE
+/// (the factory constructs, D6) and the walk itself hits the network —
+/// against a refused port the failure is the webdav transport error
+/// after its retry budget, never a K31 refusal and never a panic. This
+/// is the StorageDriver-face twin of the transport-face offline
+/// assertion above (the pan123 dispatch.rs precedent's shape).
+#[cfg(feature = "webdav")]
+#[tokio::test]
+async fn rebuild_driver_arm_assembles_webdav_offline_and_the_walk_dials() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let cfg = CyDriveConfig {
+        backend: Backend::Webdav,
+        webdav_url: Some("http://127.0.0.1:1/dav".to_string()),
+        webdav_username: Some("spike".to_string()),
+        webdav_password: Some("pw".to_string()),
+        db_path: dir.path().join("meta.db").display().to_string(),
+        cache_path: dir.path().join("cache").display().to_string(),
+        ..CyDriveConfig::default()
+    };
+    let err = match cloudkit_cli::run_rebuild_command(&cfg).await {
+        Ok(_) => panic!("a walk against a refused port cannot succeed"),
+        Err(err) => err,
+    };
+    let message = format!("{err:#}");
+    assert!(
+        message.contains("webdav") && message.contains("127.0.0.1:1"),
+        "the walk failed on the webdav transport leg: {message}"
+    );
+    assert!(
+        !message.contains(cloudkit_cli::WEBDAV_DRIVER_REQUIRED),
+        "the driver is compiled in — no K31 refusal may appear: {message}"
+    );
 }

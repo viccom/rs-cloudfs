@@ -139,6 +139,16 @@ pub const PAN123_DRIVER_REQUIRED: &str = "this binary was built without the pan1
      `backend = \"baidu\"` / `backend = \"local\"` / `backend = \"sftp\"` / \
      `backend = \"pan115\"` in config.toml";
 
+/// The actionable message every webdav surface carries when the binary was
+/// built without the webdav driver (K31 shape, Phase 7 / WD1b — same form
+/// as the six driver constants above): name the rebuild command, then
+/// name the backend switch. Consumed by the WD1b dispatch arms; pinned by
+/// the off-feature test in `tests/dispatch.rs`.
+pub const WEBDAV_DRIVER_REQUIRED: &str = "this binary was built without the webdav driver; \
+     rebuild with `cargo build --features webdav`, or set `backend = \"telegram\"` / \
+     `backend = \"baidu\"` / `backend = \"local\"` / `backend = \"sftp\"` / \
+     `backend = \"pan115\"` / `backend = \"pan123\"` in config.toml";
+
 /// The driver list the binary was compiled with (K32,
 /// docs/plans/2026-09-09-driver-feature-gates.md) — the `(drivers: ...)`
 /// segment of the `--version` banner.
@@ -149,12 +159,12 @@ pub const PAN123_DRIVER_REQUIRED: &str = "this binary was built without the pan1
 /// `none` — adding a driver is one appended row (the SF0-era 3-tuple
 /// match would grow 2^n arms instead). Each row is still selected by the
 /// feature set at compile time (`cfg!` expands to a literal), in the
-/// fixed order telegram, baidu, local, sftp, pan115, pan123; onboarding
-/// the next driver (driver-onboarding §1) appends its row here. Pinned
-/// by `tests::compiled_drivers_lists_the_feature_set_in_fixed_order`
+/// fixed order telegram, baidu, local, sftp, pan115, pan123, webdav;
+/// onboarding the next driver (driver-onboarding §1) appends its row
+/// here. Pinned by `tests::compiled_drivers_lists_the_feature_set_in_fixed_order`
 /// (cfg-gated arms — one assertion per build; the 3-driver combinations'
 /// output is byte-identical to the pre-SF1 refactor, and the
-/// sftp/pan115/pan123 rows simply append to the fixed order).
+/// sftp/pan115/pan123/webdav rows simply append to the fixed order).
 pub fn compiled_drivers() -> String {
     const DRIVER_ROWS: &[(bool, &str)] = &[
         (cfg!(feature = "telegram"), "telegram"),
@@ -163,6 +173,7 @@ pub fn compiled_drivers() -> String {
         (cfg!(feature = "sftp"), "sftp"),
         (cfg!(feature = "pan115"), "pan115"),
         (cfg!(feature = "pan123"), "pan123"),
+        (cfg!(feature = "webdav"), "webdav"),
     ];
     let enabled: Vec<&str> = DRIVER_ROWS
         .iter()
@@ -4736,6 +4747,14 @@ pub async fn run_sync_command(cfg: &CyDriveConfig, secret: Option<&str>) -> Resu
             .await
             .context("connecting the pan123 backend to derive the sync namespace")?
             .sync_namespace_key(),
+        // Phase 7 / WD1b ruling: webdav joins the sync world like the
+        // pan115/pan123 cloud backends — the namespace key is the raw
+        // volume identity (`webdav:<user>@<base-url>`, offline-derived —
+        // D6: the transport constructs without connecting).
+        Backend::Webdav => build_backend_transport(cfg)
+            .await
+            .context("connecting the webdav backend to derive the sync namespace")?
+            .sync_namespace_key(),
     };
 
     let db = MetaDatabase::open(Path::new(&cfg.db_path))
@@ -5003,6 +5022,12 @@ pub enum BackendTransport {
     /// instead.
     #[cfg(feature = "pan123")]
     Pan123(Arc<ck_pan123::Pan123Transport>),
+    /// The webdav transport face over the factory-constructed driver
+    /// (Phase 7 / WD1b): requires the `webdav` feature — a binary
+    /// without the driver refuses with [`WEBDAV_DRIVER_REQUIRED`]
+    /// instead.
+    #[cfg(feature = "webdav")]
+    Webdav(Arc<ck_webdav::WebdavTransport>),
 }
 
 impl BackendTransport {
@@ -5020,6 +5045,8 @@ impl BackendTransport {
             BackendTransport::Pan115(t) => StorageDriver::volume(t.driver()).as_str(),
             #[cfg(feature = "pan123")]
             BackendTransport::Pan123(t) => StorageDriver::volume(t.driver()).as_str(),
+            #[cfg(feature = "webdav")]
+            BackendTransport::Webdav(t) => StorageDriver::volume(t.driver()).as_str(),
             // Every driver gated out: the enum is uninhabited — no
             // value can exist. The empty match over the dereferenced
             // place is the never-taken arm a reference scrutinee needs
@@ -5029,7 +5056,8 @@ impl BackendTransport {
                 feature = "local",
                 feature = "sftp",
                 feature = "pan115",
-                feature = "pan123"
+                feature = "pan123",
+                feature = "webdav"
             )))]
             _ => match *self {},
         }
@@ -5049,12 +5077,15 @@ impl BackendTransport {
             BackendTransport::Pan115(t) => CloudTransport::capabilities(t.as_ref()),
             #[cfg(feature = "pan123")]
             BackendTransport::Pan123(t) => CloudTransport::capabilities(t.as_ref()),
+            #[cfg(feature = "webdav")]
+            BackendTransport::Webdav(t) => CloudTransport::capabilities(t.as_ref()),
             #[cfg(not(any(
                 feature = "baidu",
                 feature = "local",
                 feature = "sftp",
                 feature = "pan115",
-                feature = "pan123"
+                feature = "pan123",
+                feature = "webdav"
             )))]
             _ => match *self {},
         }
@@ -5085,12 +5116,18 @@ impl BackendTransport {
             // the factory connects with the account uid).
             #[cfg(feature = "pan123")]
             BackendTransport::Pan123(_) => self.volume().to_string(),
+            // WD1b: baidu-style raw volume identity
+            // (`webdav:<user>@<base-url>` — offline-constructed, D6; the
+            // sync namespace refinement, if any, lands with WD4).
+            #[cfg(feature = "webdav")]
+            BackendTransport::Webdav(_) => self.volume().to_string(),
             #[cfg(not(any(
                 feature = "baidu",
                 feature = "local",
                 feature = "sftp",
                 feature = "pan115",
-                feature = "pan123"
+                feature = "pan123",
+                feature = "webdav"
             )))]
             _ => match *self {},
         }
@@ -5111,12 +5148,15 @@ impl BackendTransport {
             BackendTransport::Pan115(t) => t.clone() as Arc<dyn CloudTransport>,
             #[cfg(feature = "pan123")]
             BackendTransport::Pan123(t) => t.clone() as Arc<dyn CloudTransport>,
+            #[cfg(feature = "webdav")]
+            BackendTransport::Webdav(t) => t.clone() as Arc<dyn CloudTransport>,
             #[cfg(not(any(
                 feature = "baidu",
                 feature = "local",
                 feature = "sftp",
                 feature = "pan115",
-                feature = "pan123"
+                feature = "pan123",
+                feature = "webdav"
             )))]
             _ => match *self {},
         }
@@ -5193,12 +5233,32 @@ impl BackendTransport {
                     None
                 }
             },
+            // WD1b: the sftp shape — the WD1a driver's quota degrades to
+            // `total = None` (the RFC 4331 best-effort, appendix C ⑪), so
+            // the card renders unlimited by construction; a hard read
+            // failure only downgrades, never blocks the boot.
+            #[cfg(feature = "webdav")]
+            BackendTransport::Webdav(t) => match StorageDriver::quota(t.driver()).await {
+                Ok(quota) => Some(cloudkit_web::QuotaSnapshot {
+                    used: quota.used,
+                    total: quota.total,
+                }),
+                Err(error) => {
+                    tracing::warn!(
+                        %error,
+                        "webdav quota read failed; the dashboard storage card degrades to \
+                         unlimited"
+                    );
+                    None
+                }
+            },
             #[cfg(not(any(
                 feature = "baidu",
                 feature = "local",
                 feature = "sftp",
                 feature = "pan115",
-                feature = "pan123"
+                feature = "pan123",
+                feature = "webdav"
             )))]
             _ => match *self {},
         }
@@ -5449,6 +5509,57 @@ pub async fn build_pan123_transport_with_endpoints(
     )))
 }
 
+/// The `webdav_*` config-key flattening shared by the dispatch twins and
+/// [`build_driver`] (Phase 7 / WD1b). Credential resolution follows the
+/// same R3 chain as the other drivers — the credential key rides
+/// `with_env_overrides` on the single-volume load path (K28 / B-M1);
+/// reading env here would bypass the multi-volume isolation guarantee.
+#[cfg(feature = "webdav")]
+fn webdav_params(cfg: &CyDriveConfig) -> Result<ck_webdav::WebdavParams> {
+    // 展平为 map——非空值才入列（空串 = 未设置，与驱动侧
+    // empty-means-unset 语义对齐；WD1a 的 parse_from_map 吃
+    // `&HashMap<String, String>`，未知键在驱动侧再挡一道）。
+    fn push(map: &mut std::collections::HashMap<String, String>, key: &str, value: Option<&str>) {
+        if let Some(v) = value.filter(|v| !v.is_empty()) {
+            map.insert(key.to_string(), v.to_string());
+        }
+    }
+    let mut map = std::collections::HashMap::new();
+    push(&mut map, "webdav_url", cfg.webdav_url.as_deref());
+    push(&mut map, "webdav_username", cfg.webdav_username.as_deref());
+    // Credential keys arrive already env-resolved: CYDRIVE_WEBDAV_PASSWORD
+    // rides `with_env_overrides` on the single-volume load path (B-M1 —
+    // the multi-volume path never applies env overrides, so volume files
+    // can't bleed credentials across volumes).
+    push(&mut map, "webdav_password", cfg.webdav_password.as_deref());
+    push(&mut map, "webdav_auth", cfg.webdav_auth.as_deref());
+    push(&mut map, "webdav_vendor", cfg.webdav_vendor.as_deref());
+    if let Some(flag) = cfg.webdav_accept_invalid_certs {
+        map.insert("webdav_accept_invalid_certs".to_string(), flag.to_string());
+    }
+    ck_webdav::parse_from_map(&map)
+        .map_err(|error| anyhow::anyhow!("reading the webdav config keys: {error}"))
+}
+
+/// The webdav factory assembly shared by the dispatch twins and
+/// [`build_driver`] (composition-root R1 exemption: it may name drivers).
+/// `factory` only constructs — the reqwest pool connects lazily (D6), so
+/// this returns without touching the network; the first operation (or
+/// the transport `connect` probe, WD4) establishes the connection and
+/// the D1 auth negotiation. No K13 write-back store (no token rotation —
+/// the credentials are static) and no sessions dir (the WD1a stager
+/// spools through tempfile's own temp dir).
+#[cfg(feature = "webdav")]
+async fn build_webdav_transport(cfg: &CyDriveConfig) -> Result<BackendTransport> {
+    let params = webdav_params(cfg)?;
+    let driver = ck_webdav::factory(&params)
+        .await
+        .map_err(|error| anyhow::anyhow!("initialising the webdav backend: {error}"))?;
+    Ok(BackendTransport::Webdav(Arc::new(
+        ck_webdav::WebdavTransport::new(driver),
+    )))
+}
+
 /// The unified multi-volume backend dispatch (RV2 extraction shared by
 /// the main.rs boot loop and the runtime-volume dispatch): K13/K21 —
 /// token rotations write back into the volume's own file, upload
@@ -5498,6 +5609,12 @@ pub async fn dispatch_unified_backend_volume(
         }
         #[cfg(feature = "pan123")]
         Backend::Pan123 => build_pan123_transport_with(settings, Some(home)).await?,
+        // WD1b: the webdav assembly needs no per-volume injection (no
+        // token store, no sessions dir — the driver constructs offline,
+        // D6), so it rides the same single-volume helper both here and
+        // through `build_backend_transport`'s default arm.
+        #[cfg(feature = "webdav")]
+        Backend::Webdav => build_webdav_transport(settings).await?,
         _ => build_backend_transport(settings).await?,
     };
     run_options.sync_namespace = Some(dispatched.sync_namespace_key());
@@ -5678,6 +5795,19 @@ pub async fn build_backend_transport_with(
                 anyhow::bail!("{PAN123_DRIVER_REQUIRED}")
             }
         }
+        // Phase 7 / WD1b: the webdav factory assembly — construction
+        // only (D6 lazy connect), no store and no session dir to inject.
+        // Without the driver: the actionable rebuild message (K31).
+        Backend::Webdav => {
+            #[cfg(feature = "webdav")]
+            {
+                build_webdav_transport(cfg).await
+            }
+            #[cfg(not(feature = "webdav"))]
+            {
+                anyhow::bail!("{WEBDAV_DRIVER_REQUIRED}")
+            }
+        }
     }
 }
 
@@ -5759,6 +5889,19 @@ pub async fn build_backend_transport_with(cfg: &CyDriveConfig) -> Result<Backend
             #[cfg(not(feature = "pan123"))]
             {
                 anyhow::bail!("{PAN123_DRIVER_REQUIRED}")
+            }
+        }
+        // Phase 7 / WD1b: same assembly as the baidu-feature twin above
+        // (this no-baidu twin still carries the webdav arm when the
+        // `webdav` feature is on) — construction only, nothing injected.
+        Backend::Webdav => {
+            #[cfg(feature = "webdav")]
+            {
+                build_webdav_transport(cfg).await
+            }
+            #[cfg(not(feature = "webdav"))]
+            {
+                anyhow::bail!("{WEBDAV_DRIVER_REQUIRED}")
             }
         }
     }
@@ -5877,9 +6020,19 @@ impl ck_pan115::TokenStore for ConfigTokenStore {
 /// telegram (the proxy is a live setting there) or when no proxy is
 /// configured.
 pub fn proxy_ineffective_warning(cfg: &CyDriveConfig) -> Option<&'static str> {
-    let effective =
-        cfg.proxy_url.as_deref().is_some_and(|p| !p.is_empty()) && cfg.backend != Backend::Telegram;
-    effective.then_some(PROXY_DIRECT_BACKEND_NOTICE)
+    if cfg.backend == Backend::Telegram {
+        return None;
+    }
+    if cfg.proxy_url.as_deref().is_some_and(|p| !p.is_empty()) {
+        // webdav 刻意尊重系统代理 env（自备服务器 = 用户自己的网络路径），
+        // 「恒直连」声明对它不成立——专属文案避免误导排查方向
+        //（Phase 7 审查 M14；pan123 落地时的文案联动先例同族）。
+        if cfg.backend == Backend::Webdav {
+            return Some(WEBDAV_PROXY_NOTICE);
+        }
+        return Some(PROXY_DIRECT_BACKEND_NOTICE);
+    }
+    None
 }
 
 /// The K18 declaration text shared by the assembly log and doctor.
@@ -5887,6 +6040,14 @@ pub const PROXY_DIRECT_BACKEND_NOTICE: &str =
     "proxy_url is set but has no effect on this backend: baidu/local/sftp/pan115/pan123 always \
      connect directly (no_proxy + forced IPv4; the sftp transport has no proxy support); the \
      proxy only serves the telegram transport";
+
+/// The webdav variant (Phase 7 审查 M14): the config key is not read by the
+/// driver, but its client deliberately honors the standard proxy environment
+/// variables — the honest diagnosis names both halves.
+pub const WEBDAV_PROXY_NOTICE: &str =
+    "proxy_url is set but the webdav driver does not read this config key; it connects with the \
+     standard http_proxy/https_proxy environment variables instead (deliberate: user-provided \
+     servers ride the user's own network path)";
 
 /// K12: a local instance cannot run the metadata-sync task (the local
 /// root IS the source of truth); a `sync_url` on such an instance is a
@@ -6004,6 +6165,40 @@ pub async fn sftp_backend_probe(cfg: &CyDriveConfig) -> ck_sftp::SftpProbe {
         }
     };
     ck_sftp::probe(&params).await
+}
+
+/// The webdav doctor probe leg (Phase 7 / WD4): assembles the driver
+/// params from config and runs [`ck_webdav::probe`] — one OPTIONS round
+/// with the D1 auth negotiation, classified into the five-state
+/// [`ck_webdav::WebdavProbe`] (the renderer is
+/// [`doctor::webdav_connectivity_check`]). Requires the `webdav` feature
+/// (the probe types live in the driver); a binary without it skips the
+/// dial-out leg (K31 shape, the baidu rule): no fake Unreachable.
+///
+/// Incomplete config never reaches the network (the sftp probe's rule);
+/// the whole probe is bounded by a 45s outer deadline (the baidu probe's
+/// wall) so a blackholed host cannot hang an interactive doctor run
+/// (the driver's own retry whitelist + 15s connect timeout bound one
+/// leg; the deadline bounds their sum).
+#[cfg(feature = "webdav")]
+pub async fn webdav_backend_probe(cfg: &CyDriveConfig) -> ck_webdav::WebdavProbe {
+    let params = match webdav_params(cfg) {
+        Ok(params) => params,
+        Err(error) => {
+            return ck_webdav::WebdavProbe::Unreachable {
+                detail: format!(
+                    "the webdav configuration is incomplete ({error}); set the webdav_* keys \
+                     in config.toml and retry"
+                ),
+            }
+        }
+    };
+    match tokio::time::timeout(Duration::from_secs(45), ck_webdav::probe(&params)).await {
+        Ok(probe) => probe,
+        Err(_elapsed) => ck_webdav::WebdavProbe::Unreachable {
+            detail: "the probe did not finish within 45s (network path to the server?)".to_string(),
+        },
+    }
 }
 
 /// [`baidu_backend_probe`] with the endpoint set injected (tests point
@@ -6151,6 +6346,21 @@ async fn build_driver(cfg: &CyDriveConfig) -> Result<Arc<dyn StorageDriver>> {
         }
         #[cfg(not(feature = "pan123"))]
         Backend::Pan123 => anyhow::bail!("{PAN123_DRIVER_REQUIRED}"),
+        // Phase 7 / WD1b: the webdav factory assembly — the rebuild walk
+        // rides the same offline construction (D6; the walk's first list
+        // opens the pool). Without it: the actionable rebuild message
+        // (K31) — `rebuild` cannot walk a volume the binary cannot
+        // talk to.
+        #[cfg(feature = "webdav")]
+        Backend::Webdav => {
+            let params = webdav_params(cfg)?;
+            let driver = ck_webdav::factory(&params)
+                .await
+                .map_err(|error| anyhow::anyhow!("initialising the webdav backend: {error}"))?;
+            Ok(driver)
+        }
+        #[cfg(not(feature = "webdav"))]
+        Backend::Webdav => anyhow::bail!("{WEBDAV_DRIVER_REQUIRED}"),
     }
 }
 
@@ -7587,8 +7797,8 @@ mod tests {
         // arm is a cfg-gated literal — no runtime feature probing — so
         // exactly one assertion is compiled per build and it pins the
         // expected list for that feature combination: fixed order
-        // telegram, baidu, local, sftp, pan115, pan123; the all-off build
-        // reports `none`.
+        // telegram, baidu, local, sftp, pan115, pan123, webdav; the
+        // all-off build reports `none`.
         //
         // SF3 structure: the sftp row (appended after local, never
         // interleaved) is factored out of the literal pins — the
@@ -7596,15 +7806,27 @@ mod tests {
         // sftp assertions pin the suffix rule and the 4-driver list.
         // 115-1 mirror: the pan115 row strips the same way before the
         // sftp strip. 123-1 mirror: the pan123 row strips first of all —
-        // every pre-existing assertion is untouched.
+        // every pre-existing assertion is untouched. WD1b mirror: the
+        // webdav row strips first of all — the pan123 strip rewires to
+        // the webdav-stripped view and the pre-existing assertion values
+        // stay untouched (their cfg guards gain the mechanical
+        // `not(webdav)` the pan123 landing added to pan115's).
         let drivers = compiled_drivers();
+        let without_webdav: String = if cfg!(feature = "webdav") {
+            match drivers.strip_suffix(", webdav") {
+                Some(base) => base.to_string(),
+                None => "none".to_string(), // webdav is the only driver enabled
+            }
+        } else {
+            drivers.clone()
+        };
         let without_pan123: String = if cfg!(feature = "pan123") {
-            match drivers.strip_suffix(", pan123") {
+            match without_webdav.strip_suffix(", pan123") {
                 Some(base) => base.to_string(),
                 None => "none".to_string(), // pan123 is the only driver enabled
             }
         } else {
-            drivers.clone()
+            without_webdav.clone()
         };
         let without_pan115: String = if cfg!(feature = "pan115") {
             match without_pan123.strip_suffix(", pan115") {
@@ -7655,7 +7877,8 @@ mod tests {
             feature = "local",
             feature = "sftp",
             not(feature = "pan115"),
-            not(feature = "pan123")
+            not(feature = "pan123"),
+            not(feature = "webdav")
         ))]
         assert_eq!(drivers, "telegram, baidu, local, sftp");
         #[cfg(all(
@@ -7664,7 +7887,8 @@ mod tests {
             not(feature = "local"),
             feature = "sftp",
             not(feature = "pan115"),
-            not(feature = "pan123")
+            not(feature = "pan123"),
+            not(feature = "webdav")
         ))]
         assert_eq!(drivers, "sftp");
 
@@ -7683,7 +7907,8 @@ mod tests {
             feature = "local",
             feature = "sftp",
             feature = "pan115",
-            not(feature = "pan123")
+            not(feature = "pan123"),
+            not(feature = "webdav")
         ))]
         assert_eq!(drivers, "telegram, baidu, local, sftp, pan115");
         #[cfg(all(
@@ -7692,17 +7917,19 @@ mod tests {
             not(feature = "local"),
             not(feature = "sftp"),
             feature = "pan115",
-            not(feature = "pan123")
+            not(feature = "pan123"),
+            not(feature = "webdav")
         ))]
         assert_eq!(drivers, "pan115");
 
         // 123-1: the pan123 row is the same pure-append rule — last
-        // whenever on, the all-six build reads in the documented order,
-        // and the pan123-only build reports just the row.
+        // whenever on (under a webdav row, if that is on too), the
+        // all-six build reads in the documented order, and the
+        // pan123-only build reports just the row.
         #[cfg(feature = "pan123")]
         assert!(
-            drivers.ends_with("pan123"),
-            "pan123 must be the last row: {drivers}"
+            without_webdav.ends_with("pan123"),
+            "pan123 must be the last row under webdav: {drivers}"
         );
         #[cfg(all(
             feature = "telegram",
@@ -7710,7 +7937,8 @@ mod tests {
             feature = "local",
             feature = "sftp",
             feature = "pan115",
-            feature = "pan123"
+            feature = "pan123",
+            not(feature = "webdav")
         ))]
         assert_eq!(drivers, "telegram, baidu, local, sftp, pan115, pan123");
         #[cfg(all(
@@ -7719,9 +7947,42 @@ mod tests {
             not(feature = "local"),
             not(feature = "sftp"),
             not(feature = "pan115"),
-            feature = "pan123"
+            feature = "pan123",
+            not(feature = "webdav")
         ))]
         assert_eq!(drivers, "pan123");
+
+        // WD1b: the webdav row is the same pure-append rule — last
+        // whenever on, the all-seven build reads in the documented
+        // order, and the webdav-only build reports just the row.
+        #[cfg(feature = "webdav")]
+        assert!(
+            drivers.ends_with("webdav"),
+            "webdav must be the last row: {drivers}"
+        );
+        #[cfg(all(
+            feature = "telegram",
+            feature = "baidu",
+            feature = "local",
+            feature = "sftp",
+            feature = "pan115",
+            feature = "pan123",
+            feature = "webdav"
+        ))]
+        assert_eq!(
+            drivers,
+            "telegram, baidu, local, sftp, pan115, pan123, webdav"
+        );
+        #[cfg(all(
+            not(feature = "telegram"),
+            not(feature = "baidu"),
+            not(feature = "local"),
+            not(feature = "sftp"),
+            not(feature = "pan115"),
+            not(feature = "pan123"),
+            feature = "webdav"
+        ))]
+        assert_eq!(drivers, "webdav");
     }
 
     /// H1 (review fix): `take` used to find the position under one lock

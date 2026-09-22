@@ -51,6 +51,7 @@ const BAIDU_ENV_KEYS: &[&str] = &[
     "CYDRIVE_PAN115_ACCESS_TOKEN",
     "CYDRIVE_PAN115_REFRESH_TOKEN",
     "CYDRIVE_PAN123_TOKEN",
+    "CYDRIVE_WEBDAV_PASSWORD",
 ];
 
 /// Serialises env-touching tests (same precedent as `tests/config.rs`).
@@ -1055,4 +1056,395 @@ fn volume_file_accepts_the_pan123_key_group() {
     spec.settings
         .validate()
         .expect("the parsed volume settings validate");
+}
+
+// ------------------------------------------------- webdav keys (Phase 7 WD1b) ---
+//
+// Contract under test — three-place key sync (interfaces §4) for the
+// six `webdav_*` keys plus the `webdav` backend's cross-field rules
+// (the plan §4.2 table; core checks the string-level subset, the
+// driver's parse_from_map re-checks on its map face):
+//
+// - `backend = "webdav"` requires `webdav_url` set and non-empty, with
+//   an http(s) scheme, a non-empty host and no query/fragment (the
+//   sync_url minimal-authority precedent — no url crate in core).
+// - `webdav_username` / `webdav_password` arrive as a PAIR (only one
+//   set = invalid; both absent = anonymous access).
+// - `webdav_auth` ∈ {auto, basic, digest} and `webdav_vendor` ∈
+//   {generic, nextcloud} — lenient casing/whitespace, empty = unset.
+// - `webdav_accept_invalid_certs` is a typed bool (the serde parse is
+//   the value domain — no validate rule, the enable_encryption form).
+// - The telegram default triggers none of these rules — pre-Phase-7
+//   configs validate unchanged.
+
+/// A minimal valid webdav config: backend set + url + the credential
+/// pair (short dummy values — the scanner gate only matches 20+ char
+/// literals).
+fn webdav_config() -> CyDriveConfig {
+    CyDriveConfig {
+        backend: Backend::Webdav,
+        webdav_url: Some("https://nas.lan:5006/dav".to_string()),
+        webdav_username: Some("spike".to_string()),
+        webdav_password: Some("pw".to_string()),
+        ..CyDriveConfig::default()
+    }
+}
+
+#[test]
+fn webdav_defaults_are_unset_and_telegram_stays_inert() {
+    // The compatibility contract: a config that predates Phase 7 keeps
+    // validating — every webdav key defaults to None and the telegram
+    // backend fires no webdav rule even when webdav keys are dirty.
+    let cfg = CyDriveConfig::default();
+    assert_eq!(cfg.backend, Backend::Telegram, "default backend");
+    assert_eq!(cfg.webdav_url, None);
+    assert_eq!(cfg.webdav_username, None);
+    assert_eq!(cfg.webdav_password, None);
+    assert_eq!(cfg.webdav_auth, None);
+    assert_eq!(cfg.webdav_vendor, None);
+    assert_eq!(cfg.webdav_accept_invalid_certs, None);
+    cfg.validate().expect("default config still validates");
+
+    let dirty = CyDriveConfig {
+        webdav_url: Some("not a url".to_string()),
+        webdav_username: Some("only-username".to_string()),
+        webdav_auth: Some("ntlm".to_string()),
+        webdav_accept_invalid_certs: Some(true),
+        ..CyDriveConfig::default()
+    };
+    dirty
+        .validate()
+        .expect("the telegram backend ignores every webdav rule");
+}
+
+#[test]
+fn webdav_as_str_is_stable() {
+    assert_eq!(Backend::Webdav.as_str(), "webdav");
+}
+
+#[test]
+fn webdav_key_lists_carry_the_six_keys() {
+    use cloudkit_core::config::{KNOWN_TOML_KEYS, VOLUME_SCOPED_KEYS};
+    for key in [
+        "webdav_url",
+        "webdav_username",
+        "webdav_password",
+        "webdav_auth",
+        "webdav_vendor",
+        "webdav_accept_invalid_certs",
+    ] {
+        assert!(KNOWN_TOML_KEYS.contains(&key), "{key} rides config.toml");
+        assert!(
+            VOLUME_SCOPED_KEYS.contains(&key),
+            "{key} is volume-scoped (one share = one volume)"
+        );
+    }
+}
+
+#[test]
+fn load_toml_reads_all_webdav_keys() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        concat!(
+            "backend = \"webdav\"\n",
+            "webdav_url = \"https://nas.lan:5006/dav\"\n",
+            "webdav_username = \"spike\"\n",
+            "webdav_password = \"pw\"\n",
+            "webdav_auth = \"digest\"\n",
+            "webdav_vendor = \"nextcloud\"\n",
+            "webdav_accept_invalid_certs = true\n",
+        ),
+    )
+    .expect("write config.toml");
+
+    let cfg = CyDriveConfig::load_toml(&path).expect("config with webdav keys loads");
+    assert_eq!(cfg.backend, Backend::Webdav);
+    assert_eq!(cfg.webdav_url.as_deref(), Some("https://nas.lan:5006/dav"));
+    assert_eq!(cfg.webdav_username.as_deref(), Some("spike"));
+    assert_eq!(cfg.webdav_password.as_deref(), Some("pw"));
+    assert_eq!(cfg.webdav_auth.as_deref(), Some("digest"));
+    assert_eq!(cfg.webdav_vendor.as_deref(), Some("nextcloud"));
+    assert_eq!(cfg.webdav_accept_invalid_certs, Some(true));
+    cfg.validate().expect("complete webdav config validates");
+}
+
+#[test]
+fn toml_roundtrip_preserves_webdav_keys() {
+    let mut cfg = webdav_config();
+    cfg.webdav_auth = Some("digest".to_string());
+    cfg.webdav_vendor = Some("nextcloud".to_string());
+    cfg.webdav_accept_invalid_certs = Some(true);
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    cfg.save_toml(&path).expect("save");
+    let reloaded = CyDriveConfig::load_toml(&path).expect("reload");
+    assert_eq!(reloaded, cfg, "the webdav key group round-trips verbatim");
+}
+
+#[test]
+fn webdav_backend_requires_the_url() {
+    for (label, url) in [
+        ("absent", None),
+        ("empty", Some(String::new())),
+        ("blank", Some("   ".to_string())),
+    ] {
+        let mut cfg = webdav_config();
+        cfg.webdav_url = url;
+        let err = cfg
+            .validate()
+            .err()
+            .unwrap_or_else(|| panic!("{label} url must be invalid"));
+        assert!(
+            matches!(&err, ConfigError::Invalid(msg)
+                     if msg.contains("webdav_url") && msg.contains("http")),
+            "{label}: names the key and the expected shape: {err:?}"
+        );
+    }
+    // Anonymous access (no credentials) validates — the pair rule has a
+    // both-absent exit.
+    let mut anonymous = webdav_config();
+    anonymous.webdav_username = None;
+    anonymous.webdav_password = None;
+    anonymous
+        .validate()
+        .expect("anonymous access validates with just the url");
+}
+
+#[test]
+fn webdav_url_must_be_http_with_a_host_and_no_query() {
+    for (label, url, needle) in [
+        ("ftp scheme", "ftp://nas.lan/dav", "http"),
+        ("no scheme", "nas.lan:5006/dav", "http"),
+        ("empty host", "https://:5006/dav", "host"),
+        ("bare scheme", "https://", "host"),
+        ("query", "https://nas.lan/dav?x=1", "query"),
+        ("fragment", "https://nas.lan/dav#f", "query"),
+    ] {
+        let mut cfg = webdav_config();
+        cfg.webdav_url = Some(url.to_string());
+        let err = cfg
+            .validate()
+            .err()
+            .unwrap_or_else(|| panic!("{label} must be rejected"));
+        assert!(
+            matches!(&err, ConfigError::Invalid(msg)
+                     if msg.contains("webdav_url") && msg.contains(needle)),
+            "{label}: names webdav_url and {needle}: {err:?}"
+        );
+    }
+}
+
+/// WD4 挂账①裁决：userinfo 形态（`https://user:pass@host/`）会把凭据
+/// 带进 SHOW 回显与 sync namespace（卷身份携带完整 base URL）——core
+/// validate 第一道漏斗拒收并指路凭据键（驱动 parse_from_map 是第二道）。
+#[test]
+fn webdav_url_must_not_embed_userinfo_credentials() {
+    for (label, url) in [
+        ("user:pass", "https://spike:pw@nas.lan:5006/dav/"),
+        ("username only", "https://spike@nas.lan:5006/dav/"),
+    ] {
+        let mut cfg = webdav_config();
+        cfg.webdav_url = Some(url.to_string());
+        let err = cfg
+            .validate()
+            .err()
+            .unwrap_or_else(|| panic!("{label} userinfo must be rejected"));
+        assert!(
+            matches!(&err, ConfigError::Invalid(msg)
+                     if msg.contains("webdav_url")
+                         && msg.contains("webdav_username")
+                         && msg.contains("webdav_password")),
+            "{label}: routes the credentials to their keys: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn webdav_credentials_must_arrive_as_a_pair() {
+    for (label, drop_username) in [("username only", true), ("password only", false)] {
+        let mut cfg = webdav_config();
+        if drop_username {
+            cfg.webdav_username = None;
+        } else {
+            cfg.webdav_password = None;
+        }
+        let err = cfg
+            .validate()
+            .err()
+            .unwrap_or_else(|| panic!("{label} must be rejected"));
+        assert!(
+            matches!(&err, ConfigError::Invalid(msg)
+                     if msg.contains("webdav_username") && msg.contains("webdav_password")),
+            "{label}: names BOTH keys: {err:?}"
+        );
+    }
+    // An EMPTY value does not count as the pair's other half
+    // (empty-means-unset).
+    let mut cfg = webdav_config();
+    cfg.webdav_password = Some(String::new());
+    let err = cfg
+        .validate()
+        .expect_err("an empty password leaves a lone username");
+    assert!(
+        matches!(&err, ConfigError::Invalid(msg) if msg.contains("webdav_password")),
+        "{err:?}"
+    );
+}
+
+#[test]
+fn webdav_auth_and_vendor_enumerate_their_values_leniently() {
+    let mut bad_auth = webdav_config();
+    bad_auth.webdav_auth = Some("ntlm".to_string());
+    let err = bad_auth.validate().expect_err("ntlm rejected");
+    assert!(
+        matches!(&err, ConfigError::Invalid(msg)
+                 if msg.contains("webdav_auth") && msg.contains("auto, basic, digest")),
+        "lists the legal auth values: {err:?}"
+    );
+
+    let mut bad_vendor = webdav_config();
+    bad_vendor.webdav_vendor = Some("owncloud".to_string());
+    let err = bad_vendor.validate().expect_err("owncloud rejected");
+    assert!(
+        matches!(&err, ConfigError::Invalid(msg)
+                 if msg.contains("webdav_vendor") && msg.contains("generic, nextcloud")),
+        "lists the legal vendor values: {err:?}"
+    );
+
+    // Lenient casing/whitespace passes; empty reads as unset.
+    let mut lenient = webdav_config();
+    lenient.webdav_auth = Some("  Digest ".to_string());
+    lenient.webdav_vendor = Some("NextCloud".to_string());
+    lenient.validate().expect("lenient enum values validate");
+
+    let mut empty = webdav_config();
+    empty.webdav_auth = Some(String::new());
+    empty.webdav_vendor = Some(String::new());
+    empty.validate().expect("empty enum keys read as unset");
+}
+
+#[test]
+fn legacy_json_rejects_the_webdav_keys() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.json");
+    for key in [
+        "webdav_url",
+        "webdav_username",
+        "webdav_password",
+        "webdav_auth",
+        "webdav_vendor",
+        "webdav_accept_invalid_certs",
+    ] {
+        fs::write(
+            &path,
+            format!("{{\"bot_token\": \"t\", \"chat_id\": 1, \"{key}\": \"x\"}}"),
+        )
+        .expect("write legacy json");
+        let err = CyDriveConfig::load_legacy_json(&path)
+            .expect_err("legacy config.json must reject the webdav keys");
+        assert!(
+            matches!(err, ConfigError::Parse { ref message, .. } if message.contains(key)),
+            "expected Parse error naming {key}, got: {err:?}"
+        );
+    }
+}
+
+#[test]
+fn webdav_password_env_override_applies_and_empty_clears() {
+    let _guard = env_guard(); // clears CYDRIVE_WEBDAV_PASSWORD on drop too
+    let mut cfg = webdav_config();
+    cfg.webdav_password = None;
+    // A lone username would not validate, but with_env_overrides does
+    // not validate — the env value completes the pair at assembly time.
+    std::env::set_var("CYDRIVE_WEBDAV_PASSWORD", "env-password");
+    let overridden = cfg.clone().with_env_overrides();
+    assert_eq!(
+        overridden.webdav_password.as_deref(),
+        Some("env-password"),
+        "env > file for the webdav password"
+    );
+    overridden
+        .validate()
+        .expect("the env value completes the credential pair");
+
+    std::env::set_var("CYDRIVE_WEBDAV_PASSWORD", "");
+    let cleared = cfg.with_env_overrides();
+    assert_eq!(
+        cleared.webdav_password, None,
+        "a set-but-empty variable clears back to None"
+    );
+    std::env::remove_var("CYDRIVE_WEBDAV_PASSWORD");
+}
+
+#[test]
+fn volume_file_accepts_the_webdav_key_group() {
+    // The six keys are volume-scoped (K19 partition — a volume file
+    // carries its own share credentials); a minimal webdav volume file
+    // loads through the strict volume surface.
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("nas.toml");
+    fs::write(
+        &path,
+        concat!(
+            "backend = \"webdav\"\n",
+            "webdav_url = \"https://nas.lan:5006/dav\"\n",
+            "webdav_username = \"spike\"\n",
+            "webdav_password = \"pw\"\n",
+            "webdav_auth = \"digest\"\n",
+            "webdav_vendor = \"nextcloud\"\n",
+            "webdav_accept_invalid_certs = false\n",
+        ),
+    )
+    .expect("write volume file");
+
+    let spec = cloudkit_core::config::load_volume_config(&path)
+        .expect("a volume file carrying the webdav key group loads");
+    assert_eq!(spec.settings.backend, Backend::Webdav);
+    assert_eq!(
+        spec.settings.webdav_url.as_deref(),
+        Some("https://nas.lan:5006/dav")
+    );
+    spec.settings
+        .validate()
+        .expect("the parsed volume settings validate");
+}
+
+#[test]
+fn webdav_is_a_sync_participant_like_pan115_and_pan123() {
+    // Phase 7 / WD1b: the sync gate is open for webdav (the pan115/
+    // pan123 ruling; `is_sync_supported` uses the !matches! form, so no
+    // code arm was needed — this pin keeps it that way).
+    assert!(cloudkit_core::sync::is_sync_supported(&Backend::Webdav));
+    assert!(!cloudkit_core::sync::is_sync_supported(&Backend::Local));
+    assert!(!cloudkit_core::sync::is_sync_supported(&Backend::Sftp));
+}
+
+#[test]
+fn webdav_password_parse_errors_are_redacted() {
+    // R3 / M3 funnel: a broken-quote toml line for a SECRET_VALUED_KEYS
+    // member must not carry the value into the parse error (the WD1b
+    // addition of webdav_password rides the same redaction).
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.toml");
+    fs::write(
+        &path,
+        concat!(
+            "backend = \"webdav\"\n",
+            "webdav_url = \"https://nas.lan:5006/dav\"\n",
+            "webdav_password = \"broken-quote-value\n",
+        ),
+    )
+    .expect("write config.toml");
+    let err = CyDriveConfig::load_toml(&path).expect_err("the broken toml line must fail the load");
+    let message = err.to_string();
+    assert!(
+        message.contains("webdav_password"),
+        "the key name stays for diagnosis: {message}"
+    );
+    assert!(
+        !message.contains("broken-quote-value"),
+        "the credential VALUE never rides the error: {message}"
+    );
 }

@@ -544,6 +544,34 @@ pub fn backend_checks(cfg: &cloudkit_core::config::CyDriveConfig) -> Vec<CheckRe
                 });
             }
         }
+        // Phase 7 / WD4: the webdav offline checks — the K12 warning is
+        // a no-op (webdav participates in sync, the pan115/pan123
+        // ruling; kept for symmetry), and the D3 TLS-hatch warn makes a
+        // `webdav_accept_invalid_certs = true` volume declare its risk
+        // on every doctor pass (the assembly-time warn alone scrolls
+        // away). The connectivity leg — the D1 five-state verdicts — is
+        // [`webdav_connectivity_check`] over
+        // [`crate::webdav_backend_probe`], assembled separately in
+        // main.rs because it dials out.
+        Backend::Webdav => {
+            if let Some(warning) = crate::local_sync_unsupported_warning(cfg) {
+                results.push(CheckResult {
+                    name: "sync".to_string(),
+                    status: CheckStatus::Warn,
+                    detail: warning.to_string(),
+                });
+            }
+            if cfg.webdav_accept_invalid_certs == Some(true) {
+                results.push(CheckResult {
+                    name: "webdav_accept_invalid_certs".to_string(),
+                    status: CheckStatus::Warn,
+                    detail: "webdav_accept_invalid_certs is enabled: TLS certificates are \
+                             NOT verified for this volume (the self-signed escape hatch) — \
+                             keep this off untrusted networks"
+                        .to_string(),
+                });
+            }
+        }
     }
     results
 }
@@ -1050,6 +1078,87 @@ pub fn pan123_connectivity_check(probe: &ck_pan123::Pan123Probe) -> CheckResult 
             name: "pan123_connectivity".to_string(),
             status: CheckStatus::Fail,
             detail: format!("could not reach 123pan: {detail}"),
+        },
+    }
+}
+
+/// The webdav connectivity leg (Phase 7 / WD4): renders
+/// [`ck_webdav::WebdavProbe`]'s five-state verdict into one check
+/// result. The network leg lives in the driver (`ck_webdav::probe` —
+/// OPTIONS + the D1 auth negotiation); this is the pure renderer, so
+/// every state carries its actionable way out (K31 style) and no
+/// credential material ever reaches the text:
+///
+/// - ① `Alive` → **Ok**, reporting the `DAV:` class and `Allow:` summary
+///   (both headers optional per RFC — absent keeps the Ok);
+/// - ② `CredentialsRejected` → **Fail**, keeping the driver's
+///   same-source detail (missing credentials / Basic refused / NTLM /
+///   rejected-after-negotiation) and naming the credential keys;
+/// - ③ `ReachableNoAuth` → **Warn** (anonymous servers are legal) with
+///   the configure-credentials suggestion;
+/// - ④ `Unreachable` → **Fail**, keeping the transport cause plus the
+///   webdav_url / network / proxy checklist;
+/// - ⑤ `TlsUntrusted` → **Warn** (the explicit-accept semantic, the sftp
+///   HostKeyUnpinned precedent): reachable, the escape-hatch key named,
+///   the security note attached.
+///
+/// Feature-gated with the driver (K30 pattern): a binary without
+/// `webdav` skips the leg entirely (the main.rs call site).
+#[cfg(feature = "webdav")]
+pub fn webdav_connectivity_check(probe: &ck_webdav::WebdavProbe) -> CheckResult {
+    use ck_webdav::WebdavProbe;
+    let name = "webdav_connectivity".to_string();
+    match probe {
+        WebdavProbe::Alive { dav_class, allow } => {
+            // 头缺席的降级措辞（RFC 4918/9110 不强制两头——不因缺席翻脸）。
+            let dav = dav_class
+                .as_deref()
+                .map(str::to_string)
+                .unwrap_or_else(|| "none advertised".to_string());
+            let allow = allow
+                .as_deref()
+                .map(str::to_string)
+                .unwrap_or_else(|| "none advertised".to_string());
+            CheckResult {
+                name,
+                status: CheckStatus::Ok,
+                detail: format!("reachable and authenticated (DAV class: {dav}; allows: {allow})"),
+            }
+        }
+        WebdavProbe::CredentialsRejected { detail } => CheckResult {
+            name,
+            status: CheckStatus::Fail,
+            detail: format!(
+                "{detail} — check webdav_username and webdav_password in config.toml (or \
+                 the volume file)"
+            ),
+        },
+        WebdavProbe::ReachableNoAuth => CheckResult {
+            name,
+            status: CheckStatus::Warn,
+            detail: "reachable without authentication: the server allows anonymous access \
+                     — set webdav_username and webdav_password if this share is meant to \
+                     require them"
+                .to_string(),
+        },
+        WebdavProbe::Unreachable { detail } => CheckResult {
+            name,
+            status: CheckStatus::Fail,
+            detail: format!(
+                "cannot reach the server ({detail}) — check webdav_url, the network path \
+                 to it, and any proxy in front of the server"
+            ),
+        },
+        WebdavProbe::TlsUntrusted { detail } => CheckResult {
+            name,
+            status: CheckStatus::Warn,
+            detail: format!(
+                "the server is reachable but its TLS certificate failed validation \
+                 ({detail}); if it uses a self-signed certificate, set \
+                 webdav_accept_invalid_certs = true in the volume config — note this \
+                 disables certificate verification for the volume (a security risk on \
+                 untrusted networks)"
+            ),
         },
     }
 }

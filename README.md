@@ -11,7 +11,7 @@ L5 应用  cli │ webdav 网关 │ web 仪表盘 │ bot(telegram)
 L4 服务  上传队列 │ 同步引擎(+sync-server) │ LRU 缓存 │ 加密(v1 GCM/v2 分块 AEAD 流式，新卷默认 v2)
 L3 领域  VFS │ 元数据索引(SQLite) │ MetadataEvent 总线
 L2 抽象  StorageDriver trait + 能力位 + 错误分类学 + conformance kit
-L1 驱动  telegram │ baidu │ local │ sftp │ pan115 │ pan123 │ (未来: s3…)
+L1 驱动  telegram │ baidu │ local │ sftp │ pan115 │ pan123 │ webdav │ (未来: s3…)
 ```
 
 **新后端接入 = 实现一个驱动 + 过 conformance 套件，上层全部能力（挂载/仪表盘/同步/CLI）自动可用。**驱动分两类（[driver-onboarding §10](docs/standards/driver-onboarding.md)）：后端有「按路径枚举」面的走 `StorageDriver` 宽面 + conformance（baidu/local/sftp）；没有的走 `CloudTransport` 窄面（telegram 先例——远端是消息，bot 读历史被平台拒绝，索引只存在于本地 db + sync）。**两类在编译开关上完全平权**（见下文 feature 门控）。
@@ -33,15 +33,16 @@ L1 驱动  telegram │ baidu │ local │ sftp │ pan115 │ pan123 │ (未�
 | Phase 4 | ssh/sftp 存储驱动（russh 0.63 + russh-sftp 3.0，ring 后端；K59/K60） | ✅ 完成（SF1–SF4：conformance 八断言绿；WSL2 OpenSSH 真机矩阵 11/11，吞吐上行 140.5 / 下行 67.7 MiB/s；SF5 多连接增强明确销账） |
 | Phase 5 | 115 网盘存储驱动（ck-pan115：官方开放平台 device-code PKCE，K61/K62/K65/K69） | ✅ 完成（115-0…115-5：conformance 八断言绿 + 全装配接线；真机最小冒烟 3/3——上传回读逐字节 / Range 窗口逐字节 / 秒传同 fid 命中；完整矩阵列 `#[ignore]` 留证） |
 | Phase 6 | 123 网盘存储驱动（ck-pan123：web API 直裁 + web 身份合规 D5，K63/K64/K76/K77） | ✅ 完成（123-0…123-5：conformance 八断言绿 + 12 装配点 + 六组合裁剪零告警；真机矩阵 3/3 + E2E 5/5——上传回读逐字节 / Range 窗口 / 秒传 Reuse / 分片差集 resume / 加密 aead_v2 全栈 / WebDAV 双模式 / setup 向导 / doctor。删除 = 回收站语义（D2 trash）；**免费档每日下载流量 ≈10GiB**（会员消解；驱动 traffic 预检 + 5113/5114 人话指引）） |
+| Phase 7 | WebDAV 存储驱动（ck-webdav：自铸薄客户端 reqwest + quick-xml，K80/K81；通用挂载协议——rclone serve/Alist/Nextcloud/群晖/mod_dav 皆成后端） | ✅ 完成（WD0–WD5：双桩制（RFC 严格建模手搓桩 + dav-server 参照桩）conformance 八断言绿；WD0 双真机服务器 11 项怪癖矩阵钉死；WD5 双服务器十腿全绿——上传回读逐字/Range/吞吐 214.8↑234.2↓ MiB/s/digest stale 恢复/断线自愈/覆盖写 stash 真机实证； Basic 预发+Digest 协商恰一次、rclone MKCOL-201 陷阱对策、外部文件 authoritative_index 实证） |
 
 阶段计划与裁决：[docs/plans/2026-09-07-cloudfusion-foundation.md](docs/plans/2026-09-07-cloudfusion-foundation.md) ｜ 历史裁决：[docs/decisions.md](docs/decisions.md)
 
-## 快速开始（六后端：telegram / baidu / local / sftp / pan115 / pan123，`backend` 配置键分发）
+## 快速开始（七后端：telegram / baidu / local / sftp / pan115 / pan123 / webdav，`backend` 配置键分发）
 
 ```powershell
 cargo build --release
-./cydrive.exe setup     # 选后端：telegram(bot token/chat_id) / baidu(appkey+refresh_token) / local(根目录) / pan115·pan123(扫码或账密换发 token)
-./cydrive.exe doctor    # 体检（baidu：token 探活/直连声明；local：root 可写；sftp：连接探活+主机密钥指纹；pan115：开放平台连接探活；pan123：token 探活+每日流量余量）
+./cydrive.exe setup     # 选后端：telegram(bot token/chat_id) / baidu(appkey+refresh_token) / local(根目录) / pan115·pan123(扫码或账密换发 token) / webdav(url+凭据,无向导需求)
+./cydrive.exe doctor    # 体检（baidu：token 探活/直连声明；local：root 可写；sftp：连接探活+主机密钥指纹；pan115：开放平台连接探活；pan123：token 探活+每日流量余量；webdav：OPTIONS 探活+认证五态（含自签证书提示））
 ./cydrive.exe run       # WebDAV :8080 → 自动挂载（默认 Y:；config drive_letter 可改）｜ 仪表盘 :8088 ｜ ctrl+c 或 cydrive stop
 ```
 
@@ -50,21 +51,23 @@ local 实例：`backend = "local"` + `local_root = "<绝对路径>"`。
 sftp 实例：`backend = "sftp"` + `sftp_host` / `sftp_username` + 认证（`sftp_password` **或** `sftp_private_key_path`，可选 `sftp_private_key_passphrase`）；`sftp_port` 默认 22、`sftp_root` 默认 `/`。**首次连接必须先接受服务器主机密钥**：`cydrive doctor` 会打印服务器实际指纹（D2：未接受前驱动拒连，绝无静默 TOFU），把该值填进 `sftp_host_fingerprint` 即完成接受；指纹此后变更会被恒拒（MITM 信号）。凭据可经 env `CYDRIVE_SFTP_PASSWORD` / `CYDRIVE_SFTP_PRIVATE_KEY_PASSPHRASE` 覆盖文件值（单卷模式；多卷模式下与其他 `CYDRIVE_*` 一样被忽略——K28，见下文注意事项）。卷文件里的 `sftp_private_key_path` 相对路径锚定该卷 home 目录（K21，同 db/cache）。
 pan115 实例：`backend = "pan115"` + `pan115_token`（setup 向导扫码一次换发，refresh 自持）+ 可选 `pan115_root`（默认网盘根）。
 pan123 实例：`backend = "pan123"` + `pan123_token`（setup 向导扫码或账密换发；token 90 天、无 refresh，失效重扫）+ 可选 `pan123_root`（纯数字目录 id，默认根）。**删除进 123 回收站**（D2 语义，远端可恢复）；**免费档每日下载流量 ≈10GiB**——超额得 `RateLimited`（会员消解），`cydrive doctor` 显示当日余量。
+
+webdav 实例：`backend = "webdav"` + `webdav_url`（http(s) 完整 URL，**可含挂载子路径**——子路径即卷根；凭据不进 URL）+ `webdav_username`/`webdav_password`（成对；env `CYDRIVE_WEBDAV_PASSWORD` 可覆盖）；可选 `webdav_auth`（`auto` 缺省 = Basic 预发→401 Digest 协商恰一次 / `basic` / `digest`）、`webdav_vendor`（`generic` 缺省 / `nextcloud`——只影响 X-OC-Mtime 搭车）、`webdav_accept_invalid_certs`（缺省 false；自签 NAS 开洞，true 时启动 warn + doctor 提示）。mtime 只读真源（D2 修订：双 fixture 证 generic 服务器均不可真写）；删除即终删（WebDAV 无回收站）。
 **全参数示例配置**（凭据已脱敏占位，可用 `cydrive status` 验证解析）：单卷 [`examples/single-volume.example.toml`](examples/single-volume.example.toml)（单卷配置键全览，注释分组）；多卷 [`examples/multi-volume/`](examples/multi-volume/)（进程级 `config.example.toml` + 4 卷矩阵 `volumes/`：baidu-enc / baidu-plain / local-enc / local-plain——同后端多卷×加密开关，层次在文件布局：进程级键与卷级键分文件，见下节）。
 权威后端（baidu/local）冷启动可 `cydrive rebuild` 从后端重建索引（明文集；加密实例走 sync）。多卷模式下若实例在运行，rebuild 自动经控制通道转发为各卷的后台 `REBUILD <名>`（受理即回，进度看 `LIST` 的 `rebuilding` 标记；实例不在线则照旧离线重建）。
 新后端接入指南：[docs/standards/driver-onboarding.md](docs/standards/driver-onboarding.md)（conformance 套件 + 装配点 + E2E 拓扑）。
 
 ### 按需裁剪驱动（feature 门控）
 
-六个驱动都是可选依赖（feature：`telegram` / `baidu` / `local` / `sftp` / `pan115` / `pan123`，默认全开 = 默认构建行为不变）：
+七个驱动都是可选依赖（feature：`telegram` / `baidu` / `local` / `sftp` / `pan115` / `pan123` / `webdav`，默认全开 = 默认构建行为不变）：
 
 ```powershell
-cargo build --release                                              # 全量（默认六驱动）
+cargo build --release                                              # 全量（默认七驱动）
 cargo build --release --no-default-features --features local       # 纯本地
 cargo build --release --no-default-features --features local,baidu # 本地+百度
 ```
 
-缺驱动的二进制运行到对应表面时得到可行动报错（给出 rebuild 命令与 backend 改法，而非隐藏命令）；`cydrive --version` 显示本构建的驱动清单，如 `cydrive 0.10.0 (drivers: telegram, baidu, local, sftp, pan115, pan123)`，全关构建显示 `(drivers: none)`。裁剪掉 `sftp` 时整个 russh 协议栈都不进依赖图。
+缺驱动的二进制运行到对应表面时得到可行动报错（给出 rebuild 命令与 backend 改法，而非隐藏命令）；`cydrive --version` 显示本构建的驱动清单，如 `cydrive 0.10.0 (drivers: telegram, baidu, local, sftp, pan115, pan123, webdav)`，全关构建显示 `(drivers: none)`。裁剪掉 `sftp` 时整个 russh 协议栈都不进依赖图。
 
 **三平台构建**：Windows（原生，主力）/ Linux（原生，WSL2 实测含 sftp 真机连通）均可直接编译运行；macOS 编译面已验证（交叉工具链可出 Mach-O 二进制，挂载功能未实现、运行未实机验证，SDK 许可有灰色地带）——完整指南见 [docs/platform-builds.md](docs/platform-builds.md)（命令、实测数字、四个 macOS 交叉坑的解、坑速查表）。
 

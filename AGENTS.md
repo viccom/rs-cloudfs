@@ -1,7 +1,7 @@
 # rs-cloudfs — Agent 工作须知
 
 ## 项目信息
-- 项目：rs-cloudfs = rs-CyDrive × PrivateCloudFS 融合体——多云存储平台（统一存储抽象之上的 WebDAV 挂载/仪表盘/同步/CLI；后端：telegram / baidu / local / sftp（Phase 4 完成）/ pan115（Phase 5 完成，2026-09-16）/ **pan123（Phase 6 完成，2026-09-20）**，未来 s3）
+- 项目：rs-cloudfs = rs-CyDrive × PrivateCloudFS 融合体——多云存储平台（统一存储抽象之上的 WebDAV 挂载/仪表盘/同步/CLI；后端：telegram / baidu / local / sftp（Phase 4）/ pan115（Phase 5）/ pan123（Phase 6）/ **webdav（Phase 7 完成，2026-09-22）**，未来 s3）
 - 技术栈：Rust（edition 2021）/ tokio / axum / dav-server / rusqlite(bundled) / grammers(telegram) / hyper-rustls
 - **血统**：fork 自 rs-CyDrive（全 git 历史；remote `upstream-cydrive` 只读参照，禁止 push）；PrivateCloudFS（`E:\Go_codes\PrivateCloudFS`，Go）是设计参照系与踩坑情报源（情报附录在 multicloud 计划）
 - **北极星**：「一个稳定好用的程序」——重组已验证资产，不重写
@@ -13,7 +13,7 @@
 3. `docs/standards/code-style.md` / `interfaces.md` / `logging.md` / `documentation.md` / `driver-onboarding.md` —— 门禁与规范（driver-onboarding = 新驱动 PR 验收依据；**v1.1 §10 = transport-only 驱动类**——两班制只在驱动契约面：窄面 `CloudTransport`（telegram 先例，后端无按路径枚举面）vs 宽面 `StorageDriver`+conformance（baidu/local/sftp）；**编译开关面全驱动平权**）
 4. `docs/plans/2026-09-06-multicloud.md` —— 百度情报附录 A（端点/参数/errno/dlink/Range 实证）
 5. `docs/decisions.md` —— 历史裁决（自 rs-CyDrive 继承，继续追加）
-6. `docs/tracking/<phase>.md` —— 当前阶段任务跟踪单（最近：`phase6-pan123.md`——**六批次完成（2026-09-20 收口，K77）**，遗留挂账见其「风险与未覆盖」节；当前 = `phase7-webdav.md`——**Phase 7 webdav 驱动立项（2026-09-21，K80/K81），WD0–WD5 执行中**；**开工先读、每批收口更新**）
+6. `docs/tracking/<phase>.md` —— 当前阶段任务跟踪单（最近：`phase6-pan123.md`——**六批次完成（2026-09-20 收口，K77）**，遗留挂账见其「风险与未覆盖」节；当前 = `phase7-webdav.md`——**Phase 7 webdav 驱动完成（2026-09-22，WD0–WD5 + 收口）**，遗留挂账见其「风险与未覆盖」节；**开工先读、每批收口更新**）
 7. `docs/platform-builds.md` —— 三平台构建指南（Windows/Linux 原生 + macOS 交叉；实测数字与坑速查——**做平台相关构建/交叉编译前先读**）
 
 ## 当前阶段
@@ -42,9 +42,11 @@
 
 **Phase 7 立项（2026-09-21，K80+K81，批准令 = 负责人实施指令）**：webdav 驱动（第 7 驱动）——计划 `docs/plans/2026-09-17-webdav-driver.md` + 跟踪单 `docs/tracking/phase7-webdav.md`。**选型**：自铸薄异步客户端（reqwest + quick-xml——唯一新增 crates.io 直接依赖；骨架移植负责人自有 rs-f4ss + OpenList gowebdav 负面清单逐条正面修 + rclone webdav.go 怪癖情报；reqwest_dav 不采）；宽面 `StorageDriver`+`CloudTransport` 双面照 ck-sftp；组合根 K30 feature `webdav` 平权门控。**测试策略**：双桩制（手搓注入桩按 RFC 4918/7616 严格建模 + dav-server 参照桩——K74「桩照实现抄」防线）+ WD5 WSL2 双真机服务器（rclone serve webdav + Apache mod_dav 含 Digest），四实现交叉。D1–D6 拍板（Basic/Digest 协商、mtime best-effort 双 vendor、rustls+开洞键、vendor 显式两值、PUT(.part)+MOVE 固化、单连接池 8MiB 窗口）见 decisions K81。批次 WD0–WD5 顺序执行，worktree `feat/webdav-driver` 独立 target。
 
+**Phase 7 完成（2026-09-22，K80+K81+K82，worktree `feat/webdav-driver`，WD0–WD5 全落地）**：`ck-webdav` 驱动（第 7 驱动）——自铸薄客户端（reqwest 0.12 + quick-xml，唯一新增直接依赖）。**WD0** 双真机怪癖矩阵 11 项钉死（rclone MKCOL-已存在→201 幂等陷阱 / apache 集合无尾斜杠全动词 301 不执行 / rclone 目录 MOVE VFS 缓存不可见窗 ≈5min / 倒序 Range→200 全量 / digest stale=true 位置不定 / quota 双 404）+ **D2 修订**（generic 只读 mtime——预设降级路径触发：rclone 403 + apache dead-prop 假成功）。**WD1–3** 纯函数层（config 六键/URL 穿越防御/mtime 三格式/challenge 引号感知解析）→ 客户端（Basic 预发→Digest 协商恰一次/重试白名单/错误映射）→ 读面（stat/list 尾斜杠纪律/reader 8MiB 窗口+206 校验+200 截断）→ 写面（mkdir stat 预检对策 201 陷阱/stash 协议——断言①dav-server 参照桩裁决上车/lost-ACK 重放窗防线）。**双桩制首功（WD3）**：dav-server 参照桩揭出 stat 缺 Depth 头真缺陷（手搓桩宽收掩盖）。**WD4** 十三处接入生效 + doctor probe 五态 + userinfo 双漏斗拒收 + twin 组合测试 + 五组合裁剪零告警。**WD5** 双真机十腿全绿（吞吐 214.8↑/234.2↓ MiB/s 回环、digest stale 恢复、断线自愈、覆盖写 stash 真机实证、probe 五态真机分类）+ **真机揭出 probe OPTIONS 免认证缺陷已修**（rclone CORS preflight 语义——真认证动词复核）+ **wsl 通道脚本纪律沉淀**（Rust Command 经 wsl.exe 的 argv 重 join/重引号静默变形——单行+字面路径+零引号零变量+尾守卫，fixture 文档节）。挂账：rclone 目录 MOVE 缓存窗/TLS 自签腿/Nextcloud 实服 X-OC-Mtime（跟踪单终态总表）。
+
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 1394 测试（2026-09-21：K79 Low 收尾批——有价值 Low 全清偿：dydomain 域白名单/cid 解析显式报错/Retry-After 消费纪律统一/QR 双拼补漏/Envelope Debug 打码/测试根必填/LCG 64 位 + pan115 DlinkCache 上界顺带；既有断言零漂移；ignored 42 = 真机/平台/真网类，其中 sftp 真机矩阵 12 + pan115 live_matrix 6 + pan115_e2e 4 + pan123 live_matrix 3 + pan123_e2e 5）
+cargo test --workspace --no-fail-fast            # 1570 测试（2026-09-22：Phase 7 webdav 驱动落地——ck-webdav 七模块 + 双桩制 conformance + WSL2 双真机矩阵 10 腿全绿；既有断言零漂移；ignored 52 = 真机/平台/真网类，其中 webdav live_matrix 10 + sftp 真机矩阵 12 + pan115 live_matrix 6 + pan115_e2e 4 + pan123 live_matrix 3 + pan123_e2e 5）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo build -p cloudkit-cli --no-default-features --features local,baidu   # 驱动裁剪构建（K30 四 feature）；缺驱动构建运行期报可行动错误（K31 rebuild 指引），cydrive --version 显示驱动清单（K32）

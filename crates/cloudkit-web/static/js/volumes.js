@@ -42,6 +42,7 @@ const VOLUME_LABELS = {
     sftp: 'backend.sftp',
     pan115: 'backend.pan115',
     pan123: 'backend.pan123',
+    webdav: 'backend.webdav',
 };
 
 function backendDisplayName(backend) {
@@ -476,6 +477,7 @@ const VF_CRED_GROUPS = {
     sftp: 'vf-group-sftp',
     pan115: 'vf-group-pan115',
     pan123: 'vf-group-pan123',
+    webdav: 'vf-group-webdav',
 };
 
 // The starred requireds per backend (UX-level only — the CREATE command
@@ -489,6 +491,7 @@ const VF_REQUIRED = {
     sftp: ['vf-sftp-host', 'vf-sftp-username'],
     pan115: ['vf-pan115-access-token', 'vf-pan115-refresh-token'],
     pan123: ['vf-pan123-token'],
+    webdav: ['vf-webdav-url'],
 };
 
 // String fields: input id → payload key (collected only when non-empty —
@@ -515,6 +518,11 @@ const VF_STRINGS = {
     'vf-pan115-root': 'pan115_root',
     'vf-pan123-token': 'pan123_token',
     'vf-pan123-root': 'pan123_root',
+    'vf-webdav-url': 'webdav_url',
+    'vf-webdav-username': 'webdav_username',
+    'vf-webdav-password': 'webdav_password',
+    'vf-webdav-auth': 'webdav_auth',
+    'vf-webdav-vendor': 'webdav_vendor',
     'vf-enc-pass': 'encryption_password',
     'vf-sync-url': 'sync_url',
     'vf-sync-secret': 'sync_secret',
@@ -665,6 +673,10 @@ function vfPrefillEdit(config) {
         'vf-pan115-client-id': config.pan115_client_id,
         'vf-pan115-root': config.pan115_root,
         'vf-pan123-root': config.pan123_root,
+        'vf-webdav-url': config.webdav_url,
+        'vf-webdav-username': config.webdav_username,
+        'vf-webdav-auth': config.webdav_auth,
+        'vf-webdav-vendor': config.webdav_vendor,
     };
     for (const [id, value] of Object.entries(plain)) {
         const el = vfEl(id);
@@ -686,6 +698,7 @@ function vfPrefillEdit(config) {
         'vf-pan115-access-token': config.pan115_access_token,
         'vf-pan115-refresh-token': config.pan115_refresh_token,
         'vf-pan123-token': config.pan123_token,
+        'vf-webdav-password': config.webdav_password,
         'vf-enc-pass': config.encryption_password,
         'vf-sync-url': config.sync_url,
         'vf-sync-secret': config.sync_secret,
@@ -721,6 +734,9 @@ function vfPrefillEdit(config) {
     }
     const enabled = vfEl('vf-enabled');
     if (enabled) enabled.checked = config.enabled !== false;
+    // The webdav checkbox: absent key = the false default (strict TLS).
+    const webdavCerts = vfEl('vf-webdav-accept-invalid-certs');
+    if (webdavCerts) webdavCerts.checked = config.webdav_accept_invalid_certs === true;
     vfSwapCredentialGroups();
 }
 
@@ -827,6 +843,14 @@ function vfCollectPayload() {
     if (enabled) payload.enabled = enabled.checked;
     const enc = vfEl('vf-enc');
     if (enc) payload.enable_encryption = enc.checked;
+    // The webdav checkbox is backend-gated (unlike enabled/enc, which
+    // apply to every volume): a non-webdav volume must not carry webdav
+    // keys — unchecked/false writes the explicit false, matching the
+    // enabled/enc checkbox affordance.
+    const webdavCerts = vfEl('vf-webdav-accept-invalid-certs');
+    if (webdavCerts && vfBackend() === 'webdav') {
+        payload.webdav_accept_invalid_certs = webdavCerts.checked;
+    }
     const scheme = vfEl('vf-enc-scheme');
     // The key is written only when it differs from the config default
     // (aead_v2) — an absent key reads as the default on the backend.

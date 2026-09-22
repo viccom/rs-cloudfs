@@ -16,6 +16,7 @@ members = [
     "crates/drivers/ck-sftp",
     "crates/drivers/ck-pan115",
     "crates/drivers/ck-pan123",
+    "crates/drivers/ck-webdav",
 ]
 # Not a member on purpose: an external path dependency keeps rustc's
 # cap-lints=allow for upstream code (fmt/clippy gates stay ours), while
@@ -28,6 +29,7 @@ exclude = [
     "examples/baidu_spike",
     "examples/pan115_spike",
     "examples/pan123_spike",
+    "examples/webdav_spike",
 ]
 
 [workspace.package]

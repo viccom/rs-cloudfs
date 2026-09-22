@@ -1,0 +1,44 @@
+[package]
+name = "webdav-spike"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Phase 7 (WebDAV driver) WD0 spike — dual-server quirk matrix (rclone
+# serve webdav v1.60.1 with Basic auth + Apache mod_dav 2.4.58 with Digest
+# auth, including a 2s-nonce stale fixture on /dav-stale/). This crate is
+# EXCLUDED from the workspace on purpose (same as examples/baidu_spike,
+# pan115_spike and pan123_spike): it performs live network calls and must
+# never enter CI gates. Run manually:
+#   cargo run --manifest-path examples/webdav_spike/Cargo.toml --release -- matrix
+#   cargo run --manifest-path examples/webdav_spike/Cargo.toml --release -- cleanup
+#
+# Credential discipline (R3): nothing sensitive is committed. The one-off
+# local fixture credentials are read ONLY from env at runtime (missing
+# vars fail with an actionable message):
+#   WEBDAV_SPIKE_RCLONE_URL        http://<VM_IP>:8080/
+#   WEBDAV_SPIKE_APACHE_URL        http://<VM_IP>:8081/dav/
+#   WEBDAV_SPIKE_APACHE_STALE_URL  http://<VM_IP>:8081/dav-stale/
+#   WEBDAV_SPIKE_USER / WEBDAV_SPIKE_PASS
+# The password is never printed. Digest Authorization headers are printed
+# in full — they contain only hashes and server-issued nonces, never the
+# password. The reqwest Client is built with .no_proxy() because the local
+# http_proxy env var would hijack the direct VM-IP connection.
+
+[dependencies]
+anyhow = "1"
+# trait-only dep: reqwest's "stream" feature already pulls this exact
+# crate; declaring it lets the spike hand-write a futures Stream over
+# tokio mpsc::Receiver::poll_recv (tokio itself does not impl Stream).
+futures-core = "0.3"
+httpdate = "1"
+md-5 = "0.10"
+quick-xml = "0.37"
+rand = "0.8"
+# stream feature: reqwest::Body::wrap_stream for the chunked-PUT leg.
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "stream",
+] }
+# sync: mpsc Receiver as the wrap_stream source; time: stale-nonce sleep.
+tokio = { version = "1", features = ["rt-multi-thread", "macros", "sync", "time"] }

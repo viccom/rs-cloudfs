@@ -1,0 +1,74 @@
+[package]
+name = "ck-webdav"
+description = "WebDAV StorageDriver - read+write paths with commit-on-close stager and the conformance suite (Phase 7 / WD3; assembly WD4)"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[lints]
+workspace = true
+
+[dependencies]
+# StorageDriver/UploadStager 均为 #[async_trait] trait，实现侧必须使用
+# 同一宏（ck-sftp / ck-pan123 同款）。
+async-trait = "0.1"
+# 窗口 GET 帧类型（WD2 读路径的 Bytes 窗口）。
+bytes = "1"
+# L2 契约层是唯一 workspace 依赖——驱动 crate 禁依赖 cloudkit-core 与
+# 任何 L3+ crate（driver-onboarding §1 / R1，scripts/check_layers 拦截）。
+cloudkit-storage = { path = "../../cloudkit-storage" }
+# reader/upload 流的 Stream 组合子（ck-sftp 同款最小特性面；WD2 读路径
+# 接线）。
+futures-core = "0.3"
+futures-util = { version = "0.3", default-features = false }
+# Digest MD5 的 response 计算（auth.rs；baidu 分块 MD5 同 crate 同
+# 生态位）。
+md-5 = "0.10"
+# mtime IMF-fixdate 解析（mtime.rs；RFC850/asctime 两格式手写小解析
+# 器——ck-pan115 同款依赖）。
+httpdate = "1"
+# URL/Destination 构造与编码（urls.rs——附录 C ⑩「恒绝对 URI」的构造
+# 面与路径穿越防御）。
+url = "2"
+# digest cnonce 随机源（rand 0.10 线 = ck-pan115 运行时依赖同款，lock
+# 既有版本；`rand::rng()` 在默认特性面内）。
+rand = "0.10"
+# HTTP/WebDAV 动词面（rustls 禁 native-tls——ck-pan115/ck-pan123 同款
+# 特性面先例；WD2 加 stream 特性做窗口流）。
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+] }
+# multistatus 流式解析（本计划唯一新增 crates.io 直接依赖；版本对齐
+# WD0 spike 真机验证过的 0.37 线）。
+quick-xml = "0.37"
+# commit-on-close stager 的本地 spool（NamedTempFile——drop 自动清理；
+# 计划 §4.6。运行时依赖同时覆盖测试用法，无需 dev-dep 重复声明）。
+tempfile = "3"
+# auth 协商状态锁（tokio::sync::Mutex，401 协商跨 await——WD2 接线）
+# + spool 读写与退避等待（WD3）。
+tokio = { version = "1", features = ["rt", "io-util", "sync", "time", "fs"] }
+# 可行动文案与协商/自签告警日志（R3 双通道：StorageError 无载荷变体
+# 的诊断面）。
+tracing = "0.1"
+
+[dev-dependencies]
+# 手搓注入桩的进程内服务端（WD2a；axum 钉 0.8.9，ck-pan115 桩同款先例。
+# 只需 http1+tokio——桩不走 json/query 提取器，verbs 经 fallback 单点分发）。
+axum = { version = "=0.8.9", default-features = false, features = [
+    "http1",
+    "tokio",
+] }
+# 桩监听（net）+ #[tokio::test]（rt/macros）。
+tokio = { version = "1", features = ["rt", "macros", "net"] }
+# 桩侧 Basic 凭据校验 + Digest nonce 的 base64 形态（真机 nonce 含 =/+
+# 字符——矩阵⑨；0.22 已在 lock：ck-pan115 运行时依赖同线）。
+base64 = "0.22"
+# conformance 参照桩（WD3）：dav-server 与 cloudkit-webdav 同版 pin
+#（=0.11.0——计划 §6 风险表「版本漂移双版本」行）；hyper/http/
+# hyper-util 的装配面照抄其 server.rs（http1 server + TokioIo）。
+dav-server = "=0.11.0"
+http = "1"
+hyper = { version = "1", default-features = false, features = ["http1", "server"] }
+hyper-util = { version = "0.1", default-features = false, features = ["tokio"] }
+# conformance 套件的流消费（read_all 辅助）。
+futures-util = { version = "0.3", default-features = false }
