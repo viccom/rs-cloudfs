@@ -12,7 +12,8 @@
 //! - 核心面 [`CloudTransport`]：connect / upload / open / open_range /
 //!   delete_remote + [`CloudTransport::capabilities`]（必选，镜像
 //!   StorageDriver 的诚实声明要求）+ [`CloudTransport::as_inbound`] /
-//!   [`CloudTransport::as_chat`] 探测（provided 默认 `None`，
+//!   [`CloudTransport::as_chat`] / [`CloudTransport::as_driver`]
+//!   探测（provided 默认 `None`，
 //!   storage-only 后端免实现，**消费方探测绝不 panic**）；
 //! - 可选能力 trait：[`InboundCap`]（入站事件流，bot 收文件）、
 //!   [`ChatCap`]（对话式交互，bot 回复；默认实现返回
@@ -206,6 +207,15 @@ pub trait CloudTransport: Send + Sync {
     }
     /// 探测对话能力（默认无）；语义同 [`CloudTransport::as_inbound`]。
     fn as_chat(&self) -> Option<&dyn ChatCap> {
+        None
+    }
+    /// 探测**宽面**（[`crate::driver::StorageDriver`]——list/stat 面；
+    /// 默认无）。窄面（CloudTransport）刻意不含列表面（driver-onboarding
+    /// §10 两班制），本探针是类型擦除后取回宽面的唯一逃生门（Phase 8 /
+    /// D1：read-through 回源经它拿 `Arc<dyn StorageDriver>` 的借用形态）；
+    /// 语义同 [`CloudTransport::as_inbound`]：消费方拿 `None` 只降级
+    /// （如 telegram 卷逐字走本地 db 读），**绝不 panic**。
+    fn as_driver(&self) -> Option<&dyn crate::driver::StorageDriver> {
         None
     }
 }

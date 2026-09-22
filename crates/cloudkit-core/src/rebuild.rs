@@ -35,10 +35,10 @@
 //! carries `is_encrypted`/scheme — the full row semantics). See
 //! [`ensure_plaintext_instance`].
 
-use cloudkit_storage::{Entry, EntryKind, Page, PageCursor, RelPath, StorageDriver, StorageError};
+use cloudkit_storage::{EntryKind, Page, PageCursor, RelPath, StorageDriver, StorageError};
 
 use crate::config::CyDriveConfig;
-use crate::database::{DbError, FileUpsert, MetaDatabase};
+use crate::database::{DbError, MetaDatabase};
 
 /// Counters of one [`rebuild_from_backend`] pass, for CLI display.
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
@@ -128,13 +128,20 @@ fn rebuild_dir<'a>(
                     source,
                 })?;
             for entry in &listing.entries {
-                upsert_entry(db, entry, outcome)?;
+                // Phase 8 / D4: the Entry→row mapping moved verbatim to
+                // `materialize::materialize_entry` (rebuild and
+                // read-through share the single mapping); only the
+                // outcome counting stays on the rebuild side.
+                crate::materialize::materialize_entry(db, entry)?;
                 if entry.kind == EntryKind::Dir {
+                    outcome.dirs += 1;
                     // Depth-first after the directory row itself, so a
                     // parent always exists before its children. The
                     // recursion goes through this boxed future (E0733:
                     // a bare recursive async fn has an unbounded size).
                     rebuild_dir(driver, db, &entry.path, outcome).await?;
+                } else {
+                    outcome.files += 1;
                 }
             }
             match listing.next {
@@ -143,73 +150,4 @@ fn rebuild_dir<'a>(
             }
         }
     })
-}
-
-/// Upserts one backend entry as a `files` row (see the module doc for
-/// the row-shape contract).
-fn upsert_entry(
-    db: &MetaDatabase,
-    entry: &Entry,
-    outcome: &mut RebuildOutcome,
-) -> Result<(), RebuildError> {
-    // vocab (volume-relative, "docs/readme.md") → vpath row key
-    // ("/docs/readme.md"): the files table's rel_path convention every
-    // other writer uses.
-    let rel_path = format!("/{}", entry.path.as_str());
-    let name = entry.path.file_name().unwrap_or_default().to_string();
-    let parent_dir = match entry.path.parent() {
-        Some(parent) => format!("/{}", parent.as_str()),
-        None => "/".to_string(),
-    };
-    match entry.kind {
-        EntryKind::File => {
-            // msg_id = the handle: fs_id-shaped handles (baidu, mock)
-            // parse directly; path-shaped local handles cannot occupy
-            // the i64 column and degrade to the K6 0 placeholder.
-            let msg_id = entry.id.handle.as_str().parse::<i64>().unwrap_or(0);
-            let file_id = db.upsert_file(&FileUpsert {
-                rel_path,
-                name,
-                parent_dir,
-                size: entry.size as i64,
-                mtime: entry.mtime,
-                sha256: None,
-                is_dir: false,
-                telegram_msg_id: Some(msg_id),
-                is_uploaded: true,
-                is_cached: false,
-                is_encrypted: false,
-                chunk_count: 1,
-                mime_type: None,
-            })?;
-            // Single-container chunks row (K11): index 0 carrying the
-            // row's msg_id and the whole size — the exact shape an
-            // upload persist writes for a one-element receipt, so a
-            // rebuilt file is row/chunks-equivalent to a sync-copied
-            // one.
-            db.upsert_chunk(file_id, 0, msg_id, entry.size as i64, None)?;
-            outcome.files += 1;
-        }
-        EntryKind::Dir => {
-            // create_dir parity: zero-sized, zero chunks, NULL msg_id,
-            // born uploaded + cached.
-            db.upsert_file(&FileUpsert {
-                rel_path,
-                name,
-                parent_dir,
-                size: 0,
-                mtime: entry.mtime,
-                sha256: None,
-                is_dir: true,
-                telegram_msg_id: None,
-                is_uploaded: true,
-                is_cached: true,
-                is_encrypted: false,
-                chunk_count: 0,
-                mime_type: None,
-            })?;
-            outcome.dirs += 1;
-        }
-    }
-    Ok(())
 }
