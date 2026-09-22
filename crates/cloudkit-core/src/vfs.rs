@@ -112,13 +112,17 @@ pub enum VfsError {
          knows \"gcm\" and \"aead_v2\" (upgrade the instance that stored it)"
     )]
     UnsupportedEncryptionScheme { scheme: String, path: String },
-    /// Read-through refuses an encrypted instance (Phase 8 / D10,
-    /// rebuild's K11 gate parity): the backend only sees ciphertext
-    /// containers under plaintext names, so a materialized row would
-    /// mislabel encrypted payloads as plaintext (size = ciphertext, not
-    /// the R6 plaintext contract). The message points at `cydrive sync` —
-    /// the sync payload carries the encrypted row semantics
-    /// (is_encrypted/scheme) to the other instance.
+    /// Read-through's encrypted-instance marker (Phase 8 / D10, as
+    /// narrowed by the K83 adjudication — refuse materialization, not
+    /// reads): the backend only sees ciphertext containers under
+    /// plaintext names, so a materialized row would mislabel encrypted
+    /// payloads as plaintext (size = ciphertext, not the R6 plaintext
+    /// contract). The message points at `cydrive sync` — the sync
+    /// payload carries the encrypted row semantics (is_encrypted/scheme)
+    /// to the other instance. DEFENSIVE ARM ONLY: the read-through read
+    /// paths no longer produce this (encrypted instances degrade to the
+    /// db read instead); rebuild's refusal semantics exist independently
+    /// (`ensure_plaintext_instance`).
     #[error(
         "read-through refuses encrypted instances: the backend only sees ciphertext containers \
          under plaintext names, so a materialized row would mislabel encrypted payloads as \
@@ -1078,7 +1082,9 @@ impl Vfs {
         // Pending-upload guard (review H2 / plan F2): while the only
         // copy of the bytes sits in the cache tree, deleting the row
         // would orphan the upload. A vanished copy (ghost row) passes.
-        if !row.is_uploaded && self.local_copy_exists(rel) {
+        // Judged through the single-source helper (review L4) — the
+        // criterion cannot drift from sync/rebuild/read-through.
+        if self.is_in_flight_row(&row, rel) {
             return Err(VfsError::UploadPending(rel.as_str().to_string()));
         }
         // K4 ordering: remote first (when the backend supports it),
@@ -1156,6 +1162,16 @@ impl Vfs {
                 )))),
             },
         }
+    }
+
+    /// The in-flight upload judgement bound to this VFS's cache —
+    /// [`crate::sync::is_in_flight_row`] verbatim (pending row + local
+    /// copy on disk, decisions 2026-09-05 «later action wins»). The
+    /// delete guards' copy checks ([`Vfs::remove_file`], the WinFsp
+    /// rename guards) ride this single source, so the criterion cannot
+    /// drift between sites (review L4).
+    pub fn is_in_flight_row(&self, row: &FileRecord, rel: &RelPath) -> bool {
+        crate::sync::is_in_flight_row(Some(row), &self.cache, rel)
     }
 
     /// Whether a local cache copy of `rel` is currently on disk — a

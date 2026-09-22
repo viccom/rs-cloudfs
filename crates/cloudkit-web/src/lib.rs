@@ -2358,6 +2358,24 @@ async fn api_list(State(state): State<AppState>, request: Request) -> Response {
         Ok(rel) => rel,
         Err(_) => return error_json(StatusCode::BAD_REQUEST, "Invalid path"),
     };
+    // M5 (Phase 8 review, the gateway `read_dir` pre-check shape): push
+    // the path ITSELF through the read-through seam first. A depth-1
+    // listing of a directory can never see the directory's own row, so a
+    // deep jump into a remote-existing-but-empty directory left the index
+    // without it and the empty-index 404 below fired on a legitimate
+    // empty directory. `NotFound`/transport errors are absorbed here on
+    // purpose: a genuinely missing path and an upstream failure are both
+    // adjudicated by the listing that follows (`read_dir_fresh`'s
+    // NotFound arm / stale-if-error), so the response contract does not
+    // move. Root keeps its implicit existence (skipped, like every
+    // consumer). A file path keeps the listing semantics below — the
+    // route stays a pure listing, no new error mapping; the row the
+    // pre-check materialized merely extends the already-indexed-file
+    // 200-empty shape to a not-yet-indexed one (narrow faces are
+    // untouched: `stat_fresh` degrades verbatim, D2).
+    if !rel.is_root() {
+        let _ = volume.vfs.stat_fresh(&rel).await;
+    }
     let mut entries = match volume.vfs.read_dir_fresh(&rel).await {
         Ok(entries) => entries,
         Err(VfsError::NotFound(_)) => {

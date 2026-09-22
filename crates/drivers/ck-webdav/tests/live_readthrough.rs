@@ -706,7 +706,8 @@ async fn live_rt_04_a3_scale_bounded_backend_calls() {
 
 // ------------------------------------- 腿 05：A4 rebuild 续跑（真机） ---
 
-/// A4 续跑真机腿：真服务器 9 目录 200 条目树 + `max_entries = 40` →
+/// A4 续跑真机腿：真服务器 9 目录树（8 子目录 × 24 文件 = 192 文件，
+/// max_entries 口径另含 8 条目录行）+ `max_entries = 40` →
 /// 首趟 `EntriesBudget` 中断；**同 db rerun 直到完成**；access log 差分
 /// 钉死「全序列恰 9 次 list = 目录总数」——已完成目录绝不重扫（真机
 /// 形态的 A4 计数断言）；完成趟 sweep 后全树行落库。

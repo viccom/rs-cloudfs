@@ -13,7 +13,13 @@
 //!   有完成趟的并发调用直读 db，恰一次 list；
 //! - **物化**（D4）：[`crate::materialize::materialize_entry`] 唯一映射；
 //! - **删除双确认**（D7）：候选缺失行逐条 `driver.stat` 复核，NotFound
-//!   才删；单目录超限整批跳过；in-flight 行两侧豁免（D7/D10）；
+//!   才删；单目录超限整批跳过；in-flight 行两侧豁免（D7/D10，NotFound
+//!   臂同判据——审查批 M1）；驱动报目录不存在时同臂同样受候选上限约束
+//!   （M4）；
+//! - **拒物化、不拒读**（D10 经 K83 裁决收窄）：加密 + 宽面卷绝不回源
+//!   物化（密文 size 会错标行、破坏 AEAD 预算数学），但读面就地退化到
+//!   db 索引读（D2 同形臂）——加密卷读行为与 read-through 之前逐字一
+//!   致；rebuild 的拒收语义独立存在（`ensure_plaintext_instance`）；
 //! - **stale-if-error**（R2）：回源瞬态错绝不落 404，有旧行照常服务；
 //! - [`DirCache`]：TTL 窗（stat_fresh 快路径）+ 单飞闸 + 世代计数 +
 //!   写侧就近失效（pan115 先例）。
@@ -169,11 +175,14 @@ pub async fn read_dir_fresh(
     if !transport.capabilities().authoritative_index {
         return Ok(db.list_dir(dir.as_str())?);
     }
-    // D10 加密实例显式拒收（rebuild K11 闸门同款）：密文容器的尺寸是
-    // 密文尺寸，物化成行会破坏「size = 明文」契约与 AEAD 预算数学。
-    // 文案指路 cydrive sync（A7）。
+    // D10（K83 裁决收窄：拒物化、不拒读）：加密实例绝不回源物化——密
+    // 文容器的尺寸是密文尺寸，物化成行会破坏「size = 明文」契约与
+    // AEAD 预算数学——但读面不拒收，就地退化到 db 索引读（D2 同形臂：
+    // 不回源、不物化、不 prune、不 mark）。读行为与 read-through 之前
+    // 逐字一致（计划 §7「加密卷零变化」）；rebuild 的拒收语义独立存在
+    // （ensure_plaintext_instance 不受影响）。
     if encrypted_instance {
-        return Err(VfsError::EncryptedInstance);
+        return Ok(db.list_dir(dir.as_str())?);
     }
 
     let dir_str = dir.as_str();
@@ -216,8 +225,29 @@ pub async fn read_dir_fresh(
         // 由 rebuild sweep 清账，RT4）——然后回 NotFound。
         Err(StorageError::NotFound) => {
             let rows = db.list_dir(dir_str)?;
+            // in-flight 豁免（M1，与 upsert/prune 同一判据单点）：在途
+            // 上传行两侧永不触碰（D7「两侧永不触碰」的 NotFound 第三
+            // 面——目录层缺失不构成对在途行的删除信号）。
+            let candidates: Vec<&FileRecord> = rows
+                .iter()
+                .filter(|row| !row_in_flight(row, cache))
+                .collect();
+            if candidates.len() > PRUNE_CANDIDATE_CAP {
+                // M4（D7 上限同款）：千级行目录的首次探测若逐条确认，
+                // 会放大成 N 次串行 stat（winfsp 面放大为 FSD 挂起）—
+                // 整批跳过删除，直接回 NotFound；权威清账归 rebuild
+                // 完成趟 sweep。
+                tracing::warn!(
+                    dir = %dir,
+                    candidates = candidates.len(),
+                    cap = PRUNE_CANDIDATE_CAP,
+                    "driver reports the directory gone with too many local rows; \
+                     skipping the whole prune batch (suspected listing failure)"
+                );
+                return Err(VfsError::NotFound(dir_str.to_string()));
+            }
             let mut removed = 0usize;
-            for row in &rows {
+            for row in &candidates {
                 if delete_confirmed(driver, db, &row.rel_path).await? {
                     removed += 1;
                 }
@@ -340,10 +370,13 @@ pub async fn stat_fresh(
     if !transport.capabilities().authoritative_index {
         return degrade();
     }
-    // D10 加密实例显式拒收（read_dir_fresh 同款闸门，含根——拒绝先于
-    // 一切合成/回源，A7 零网络）。
+    // D10（K83 裁决收窄，read_dir_fresh 同款「拒物化、不拒读」）：加
+    // 密实例直接走 degrade 路径（db.get_file，无行 NotFound）——不回源
+    // 物化。加密臂先于根合成臂：根也照 degrade（无行 NotFound，无合
+    // 成；消费面的根语义由各自前置检查承担——webdav read_dir/metadata
+    // 与 winfsp meta_for 同形），不回源、不物化、不 mark。
     if encrypted_instance {
-        return Err(VfsError::EncryptedInstance);
+        return degrade();
     }
 
     // 根：恒存的目录，合成元数据（消费面 RowMetaData::root 同形：

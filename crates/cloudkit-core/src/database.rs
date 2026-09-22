@@ -774,6 +774,26 @@ impl MetaDatabase {
         Ok(deleted)
     }
 
+    /// The completion sweep's floor census (M3 / Phase 8 review): a
+    /// `(uploaded_total, sweep_candidates)` pair at this anchor — the
+    /// population the sweep's volume floor judges, read WITHOUT deleting
+    /// anything. `uploaded_total` counts every `is_uploaded = 1` row (the
+    /// sweep's whole population); `sweep_candidates` counts the rows the
+    /// sweep WOULD delete at this anchor (`updated_at` predating it).
+    pub fn sweep_census(&self, scan_started_at: f64) -> Result<(usize, usize), DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (total, candidates): (i64, i64) = conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM files WHERE is_uploaded = 1), \
+                    (SELECT COUNT(*) FROM files WHERE is_uploaded = 1 AND updated_at < ?1)",
+            params![scan_started_at],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((total as usize, candidates as usize))
+    }
+
     /// Clears the `is_cached` flag on every non-directory row that has it
     /// set **and is already uploaded**, returning the number of changed
     /// rows (the `cache clear` command's freed-flags count). Directory

@@ -911,8 +911,12 @@ impl CloudFs {
     }
 
     /// Opens one path's metadata: `get_file_info` and `read_directory`
-    /// then work off the returned handle alone. No read state and no
-    /// remote work (WF1's DLL-free seam, still used by enumerations).
+    /// then work off the returned handle alone. No read state is created
+    /// (WF1's DLL-free seam, still used by enumerations); the row lookup
+    /// rides the read-through seam (`meta_for` → `resolve_row_fresh`),
+    /// so a db miss may pay one parent re-list (D6) — remote work only
+    /// on a miss, never per call (review L3: the pre-read-through "no
+    /// remote work" claim no longer holds).
     pub fn open_handle(&self, rel: &RelPath) -> std::result::Result<Handle, FspError> {
         let meta = self.meta_for(rel)?;
         Ok(Handle::new(rel.clone(), meta, None))
@@ -1495,7 +1499,9 @@ impl CloudFs {
         // local rename flip the cache copy's spelling, and invalidate the
         // grace table (review H1).
         if from.as_str().to_lowercase() == to.as_str().to_lowercase() {
-            if !row.is_uploaded && self.vfs.local_copy_exists(&from) {
+            // The pending-upload guard rides the single-source helper
+            // (review L4 — same criterion as core `Vfs::remove_file`).
+            if self.vfs.is_in_flight_row(&row, &from) {
                 return Err(fsp_error(&VfsError::UploadPending(
                     from.as_str().to_string(),
                 )));
@@ -1516,7 +1522,8 @@ impl CloudFs {
             return Ok(());
         }
         self.require_dir_parent(to)?;
-        if !row.is_uploaded && self.vfs.local_copy_exists(&from) {
+        // Same single-source in-flight guard (review L4).
+        if self.vfs.is_in_flight_row(&row, &from) {
             return Err(fsp_error(&VfsError::UploadPending(
                 from.as_str().to_string(),
             )));

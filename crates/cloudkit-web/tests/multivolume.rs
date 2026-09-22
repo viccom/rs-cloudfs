@@ -1310,3 +1310,86 @@ async fn api_list_readthrough_serves_remote_content_on_an_empty_index() {
         "api_files never lists the backend (D9)"
     );
 }
+
+/// M5（Phase 8 审查批）：深跳进「远端存在但空」的目录 → 200 空列表而非
+/// 404——depth-1 列表永远看不见目录自身行，api_list 前置的 stat_fresh
+/// 预检把它物化（与网关 read_dir 同形；三面唯 web 曾缺这一步）。
+/// 对照腿：真缺失目录仍 404（列表的 NotFound 臂裁决，契约零变化）。
+#[tokio::test]
+async fn api_list_serves_a_remote_existing_empty_directory_on_a_deep_jump() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let db = Arc::new(MetaDatabase::open(&dir.path().join("w.db")).expect("open volume db"));
+    let driver = Arc::new(MockStorageDriver::new(
+        VolumeId::parse("baidu:123456789").expect("volume id"),
+    ));
+    let list_calls = Arc::new(AtomicUsize::new(0));
+
+    // 深跳目标：远端真实存在的空目录（mock mkdir 经 ensure_parents 建
+    // 全链），索引完全为空。
+    driver
+        .mkdir(&VolRel::new("l1/l2/empty").expect("seed dir path"))
+        .await
+        .expect("seed mkdir");
+
+    let counting = CountingDriver {
+        inner: Arc::clone(&driver),
+        list_calls: Arc::clone(&list_calls),
+    };
+    let transport: Arc<dyn CloudTransport> = Arc::new(WideTransport { driver: counting });
+    let vfs = Arc::new(Vfs::new(
+        db.clone(),
+        CacheManager::new(dir.path().join("w-cache"), u64::MAX),
+        transport,
+        base_cfg(),
+    ));
+    let server = multi_server(vec![VolumeUiEntry {
+        name: "w".to_string(),
+        status: VolumeUiStatus::Running,
+        config: volume_cfg(
+            "local",
+            "W:",
+            "w",
+            0,
+            false,
+            Some("baidu:123456789"),
+            false,
+            None,
+        ),
+        vfs: Some(vfs),
+    }])
+    .await;
+    let addr = server.local_addr();
+
+    let resp = send(
+        addr,
+        &request("GET", "/api/list?path=/l1/l2/empty&volume=w", addr, &[], ""),
+    )
+    .await;
+    assert_eq!(
+        status_of(&resp),
+        200,
+        "远端存在的空目录必须 200 空列表而非假 404，got: {resp}"
+    );
+    let body: serde_json::Value = serde_json::from_str(&body_of(&resp)).expect("json body");
+    assert!(
+        body["entries"]
+            .as_array()
+            .expect("entries array")
+            .is_empty(),
+        "空目录的列表就是空，got: {body}"
+    );
+    assert!(
+        db.get_file("/l1/l2/empty")
+            .expect("db read")
+            .is_some_and(|row| row.is_dir),
+        "stat_fresh 预检把目录自身行物化"
+    );
+
+    // 对照腿：真缺失目录仍 404（NotFound 臂语义不变）。
+    let resp = send(
+        addr,
+        &request("GET", "/api/list?path=/l1/l2/nope&volume=w", addr, &[], ""),
+    )
+    .await;
+    assert_eq!(status_of(&resp), 404, "真缺失仍 404，got: {resp}");
+}

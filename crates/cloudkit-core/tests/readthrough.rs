@@ -11,8 +11,11 @@
 //!   过期/缺行重列父目录恰一次（风暴归并）；仍无行 `driver.stat`
 //!   兜底；根恒存（合成元数据）；
 //! - in-flight 行（`is_uploaded = 0` 且本地副本在盘，sync.rs 判据单点
-//!   同源）两侧豁免（D7/D10）；
-//! - 加密实例显式拒收（D10，rebuild K11 闸门同款，文案指路 sync）；
+//!   同源）两侧豁免（D7/D10，含 NotFound 臂——M1）；
+//! - 加密实例「拒物化、不拒读」（D10 经 K83 裁决收窄）：加密 + 宽面卷
+//!   的读面绝不回源物化（密文 size 会错标行），但就地退化到 db 索引
+//!   读（D2 同形臂）——读行为与 read-through 之前逐字一致；rebuild 的
+//!   拒收语义独立存在（ensure_plaintext_instance）；
 //! - 写侧就近失效（pan115 先例）：commit_put / create_dir / remove_file
 //!   后撤父目录 TTL 窗。
 //!
@@ -149,9 +152,12 @@ impl StorageDriver for CountingDriver {
 }
 
 /// 宽面测试 transport：持有驱动并经 `as_driver` 探针暴露（D1 探针的
-/// 消费形态；capabilities 照驱动申报——R4 诚实同款）。
+/// 消费形态）；capabilities 照驱动申报（R4 诚实同款），`caps` 覆盖缝
+/// 服务 D2 第二臂的注入（M8：宽面在场但能力位未申报）。
 struct WideTransport<D: StorageDriver> {
     driver: D,
+    /// 能力位覆盖：`None` = 照驱动申报；`Some` = 测试注入的申报。
+    caps: Option<Capabilities>,
 }
 #[async_trait]
 impl<D: StorageDriver> CloudTransport for WideTransport<D> {
@@ -183,7 +189,7 @@ impl<D: StorageDriver> CloudTransport for WideTransport<D> {
     }
 
     fn capabilities(&self) -> Capabilities {
-        self.driver.capabilities()
+        self.caps.unwrap_or_else(|| self.driver.capabilities())
     }
 
     fn as_driver(&self) -> Option<&dyn StorageDriver> {
@@ -301,7 +307,10 @@ async fn wide_harness_cfg(encryption_password: Option<&str>) -> Harness {
     ));
     let shared = Arc::new(SharedCounters::default());
     let counting = CountingDriver::new(Arc::clone(&mock), Arc::clone(&shared));
-    let transport = Arc::new(WideTransport { driver: counting });
+    let transport = Arc::new(WideTransport {
+        driver: counting,
+        caps: None,
+    });
     let cache = CacheManager::new(cache_root.clone(), u64::MAX);
     let vfs = Arc::new(Vfs::new(
         Arc::clone(&db),
@@ -684,6 +693,7 @@ async fn a_lying_stat_ok_keeps_the_row() {
             inner: Arc::clone(&mock),
             lie: "docs/a.txt".to_string(),
         },
+        caps: None,
     });
     let vfs = Vfs::new(Arc::clone(&db), cache, transport, test_cfg(None));
 
@@ -788,6 +798,77 @@ async fn a_driver_not_found_prunes_the_local_layer_after_double_confirm() {
     assert!(
         h.db.get_file("/gone/sub/deep.txt").expect("read").is_some(),
         "更深层行留库——权威清账归 rebuild sweep（RT4）"
+    );
+}
+
+// 用例 14（M1）：NotFound 臂的 in-flight 豁免——驱动报目录不存在时，
+// pending 且本地副本在盘的行（在途上传）不得被双确认删除（D7「两侧永
+// 不触碰」的 NotFound 第三面，与 upsert/prune 同一判据单点）；普通行
+// 照常双确认删除。
+#[tokio::test]
+async fn a_driver_not_found_spares_in_flight_rows() {
+    let h = wide_harness().await;
+    seed_file(&h.mock, "gone/child.txt", b"c").await;
+    h.vfs
+        .read_dir_fresh(&RelPath::new("/gone").expect("gone"))
+        .await
+        .expect("materialize the layer");
+    // 在途形态：pending 行 + 本地副本在盘（用例 7 同款播种）。
+    seed_pending_row(&h.db, "/gone/wip.txt", 999);
+    seed_local_copy(&h, "/gone/wip.txt", b"local");
+
+    remote_delete(&h.mock, "gone").await;
+    let err = h
+        .vfs
+        .read_dir_fresh(&RelPath::new("/gone").expect("gone"))
+        .await
+        .expect_err("driver NotFound must surface");
+    assert!(
+        matches!(err, VfsError::NotFound(_)),
+        "驱动 NotFound 必须回 NotFound，got {err:?}"
+    );
+    assert!(
+        h.db.get_file("/gone/child.txt").expect("read").is_none(),
+        "普通行照常双确认删除"
+    );
+    assert!(
+        h.db.get_file("/gone/wip.txt").expect("read").is_some(),
+        "M1：在途行必须幸存——NotFound 臂与 upsert/prune 同判据豁免"
+    );
+}
+
+// 用例 15（M4）：NotFound 臂的候选上限（与 reconcile 的 PRUNE_CANDIDATE_CAP
+// 同款）——千级行目录的首次探测不得放大成 N 次串行确认 stat（winfsp 面
+// = FSD 挂起防线）：超限整批跳过删除，直接回 NotFound。
+#[tokio::test]
+async fn a_driver_not_found_with_an_oversized_row_batch_skips_the_prune_wholesale() {
+    let h = wide_harness().await;
+    // 40 行陈旧行直接落库，远端没有任何对应物（list 一上来即 NotFound）。
+    for i in 0..40 {
+        seed_uploaded_row(&h.db, &format!("/gone/stale{i}.txt"), 2000 + i as i64);
+    }
+
+    let err = h
+        .vfs
+        .read_dir_fresh(&RelPath::new("/gone").expect("gone"))
+        .await
+        .expect_err("driver NotFound must surface");
+    assert!(
+        matches!(err, VfsError::NotFound(_)),
+        "驱动 NotFound 必须回 NotFound，got {err:?}"
+    );
+    for i in 0..40 {
+        assert!(
+            h.db.get_file(&format!("/gone/stale{i}.txt"))
+                .expect("read")
+                .is_some(),
+            "M4：超限批整批跳过删除，行全部幸存（stale{i}）"
+        );
+    }
+    assert_eq!(
+        h.shared.stat_calls(),
+        0,
+        "M4：整批跳过——一个确认 stat 都不做（防 FSD 挂起放大）"
     );
 }
 
@@ -901,45 +982,164 @@ async fn concurrent_read_dir_fresh_collapses_into_exactly_one_list() {
     );
 }
 
-// 用例 12（D10 / A7 加密卷拒收）：加密实例的 read_dir_fresh / stat_fresh
-// 显式拒收（rebuild K11 闸门同款），文案可行动（指路 sync），零网络。
+// 用例 12（D10 经 K83 裁决收窄：「拒物化、不拒读」）：加密 + 宽面卷的
+// 读面绝不回源物化（密文容器的尺寸是密文尺寸，物化成行会破坏
+// 「size = 明文」契约与 AEAD 预算数学），但也不拒收——就地退化到 db
+// 索引读（D2 同形臂），读行为与 read-through 之前逐字一致（计划 §7
+// 「加密卷零变化」的兑现）。零网络：不回源、不物化、不 prune、不 mark。
 #[tokio::test]
-async fn encrypted_instances_refuse_readthrough_with_actionable_guidance() {
+async fn encrypted_instances_degrade_to_the_index_read_without_any_backend_calls() {
     let h = wide_harness_cfg(Some("pw")).await;
-    // 远端有货也不许碰：密文容器的 size 是密文尺寸，物化成行会破坏
-    // 「size = 明文」契约（D10）。
+    // 远端有货也不许碰、更不许物化。
     seed_dir(&h.mock, "docs").await;
     seed_file(&h.mock, "docs/a.txt", b"a").await;
+    // 索引里有行：读面照常服务索引视图。
+    seed_uploaded_row(&h.db, "/kept.txt", 11);
 
-    let dir_err = h
+    let rows = h
         .vfs
         .read_dir_fresh(&RelPath::root())
         .await
-        .expect_err("encrypted instance must refuse read_dir_fresh");
-    let message = dir_err.to_string();
-    assert!(
-        message.contains("sync"),
-        "拒收文案必须指路 cydrive sync，got: {message}"
+        .expect("encrypted instance degrades to the index read, it does not refuse");
+    assert_eq!(
+        rows.len(),
+        1,
+        "退化臂只回索引行——远端 docs 不得出现（零回源物化）"
     );
-    assert!(
-        message.contains("encrypt"),
-        "拒收文案必须点名加密为原因，got: {message}"
-    );
+    assert_eq!(rows[0].rel_path, "/kept.txt");
 
-    let stat_err = h
+    // 无行目录 → 空列表（db.list_dir 逐字退化，绝不 404）。
+    let empty = h
         .vfs
-        .stat_fresh(&RelPath::new("/docs/a.txt").expect("path"))
+        .read_dir_fresh(&RelPath::new("/nothing").expect("nothing"))
         .await
-        .expect_err("encrypted instance must refuse stat_fresh");
+        .expect("a rowless directory degrades to an empty listing");
+    assert!(empty.is_empty(), "无行目录回空列表，got {empty:?}");
+
+    // stat_fresh 同臂：有行 → 行；无行 → NotFound（根也照 degrade——
+    // 加密臂先于根合成臂，消费面的根语义由各自前置检查承担）。
+    let row = h
+        .vfs
+        .stat_fresh(&RelPath::new("/kept.txt").expect("kept"))
+        .await
+        .expect("degraded stat serves the indexed row");
+    assert_eq!(row.telegram_msg_id, Some(11));
+    let missing = h
+        .vfs
+        .stat_fresh(&RelPath::new("/missing.bin").expect("missing"))
+        .await
+        .expect_err("a rowless stat degrades to NotFound");
     assert!(
-        stat_err.to_string().contains("sync"),
-        "stat_fresh 同款拒收文案，got: {stat_err}"
+        matches!(missing, VfsError::NotFound(_)),
+        "无行 stat 退化 = NotFound，got {missing:?}"
+    );
+    let root = h.vfs.stat_fresh(&RelPath::root()).await;
+    assert!(
+        matches!(root, Err(VfsError::NotFound(_))),
+        "加密卷根照 degrade（无行 NotFound，无合成），got {root:?}"
     );
 
     assert_eq!(
         h.shared.list_calls(),
         0,
-        "A7：拒收必须发生在任何网络调用之前"
+        "拒物化：加密卷读面零 list（不回源、不物化、不 prune、不 mark）"
     );
-    assert_eq!(h.shared.stat_calls(), 0, "A7：零 driver.stat");
+    assert_eq!(h.shared.stat_calls(), 0, "加密卷读面零 driver.stat");
+}
+
+// 用例 16（M6）：stat_fresh 兜底 Ok 臂——父目录 list 瞬断（stale 臂吞
+// 掉，无旧行可服务）→ driver.stat 兜底物化命中返回行（深路径仍可寻
+// 址；R2「瞬态错绝不回 404」的兜底面收口）。
+#[tokio::test]
+async fn stat_fresh_falls_through_to_the_driver_stat_when_the_parent_list_fails() {
+    let h = wide_harness().await;
+    seed_file(&h.mock, "docs/deep/x.txt", b"x").await;
+
+    h.shared
+        .fail_next_list(StorageError::Unavailable("transient".to_string()));
+    let row = h
+        .vfs
+        .stat_fresh(&RelPath::new("/docs/deep/x.txt").expect("deep"))
+        .await
+        .expect("the stat fallback must still address the deep path");
+    assert_eq!(row.rel_path, "/docs/deep/x.txt");
+    assert_eq!(row.size, 1);
+    assert!(
+        h.db.get_file("/docs/deep/x.txt").expect("read").is_some(),
+        "兜底命中照常物化落库"
+    );
+    assert_eq!(
+        h.shared.list_calls(),
+        1,
+        "父目录 list 恰一次（瞬断被 stale 臂吞掉）"
+    );
+    assert_eq!(h.shared.stat_calls(), 1, "兜底 driver.stat 恰一次");
+}
+
+// 用例 17（M8 / D2 第二臂）：宽面在场但 `authoritative_index = false`
+// → 两入口零网络退化（能力位未申报权威索引，逐字 db 读——R4 能力诚
+// 实的可执行面）。caps 覆盖缝注入申报，驱动本申报权威位。
+#[tokio::test]
+async fn a_wide_face_without_the_authoritative_bit_degrades_with_zero_network() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = Arc::new(MetaDatabase::open(&dir.path().join("meta.db")).expect("open db"));
+    seed_uploaded_row(&db, "/kept.txt", 21);
+    // 远端有货也不许碰（能力位关 → 零回源）。
+    let mock = Arc::new(MockStorageDriver::new(
+        VolumeId::parse("baidu:123456789").expect("volume id"),
+    ));
+    seed_dir(&mock, "docs").await;
+    let shared = Arc::new(SharedCounters::default());
+    let counting = CountingDriver::new(Arc::clone(&mock), Arc::clone(&shared));
+    let transport = Arc::new(WideTransport {
+        driver: counting,
+        caps: Some(Capabilities {
+            authoritative_index: false,
+            ..Capabilities::default()
+        }),
+    });
+    let cache = CacheManager::new(dir.path().join("cache"), u64::MAX);
+    let vfs = Vfs::new(Arc::clone(&db), cache, transport, test_cfg(None));
+
+    let rows = vfs
+        .read_dir_fresh(&RelPath::root())
+        .await
+        .expect("degraded read_dir_fresh");
+    assert_eq!(rows.len(), 1, "退化臂只回索引行，远端 docs 不得出现");
+    assert_eq!(rows[0].rel_path, "/kept.txt");
+
+    let row = vfs
+        .stat_fresh(&RelPath::new("/kept.txt").expect("kept"))
+        .await
+        .expect("degraded stat");
+    assert_eq!(row.telegram_msg_id, Some(21));
+    let missing = vfs
+        .stat_fresh(&RelPath::new("/missing.bin").expect("missing"))
+        .await
+        .expect_err("a rowless degraded stat is NotFound");
+    assert!(matches!(missing, VfsError::NotFound(_)), "got {missing:?}");
+
+    assert_eq!(shared.list_calls(), 0, "D2 第二臂：零 list（零回源）");
+    assert_eq!(shared.stat_calls(), 0, "D2 第二臂：零 driver.stat");
+}
+
+// L2（审查批）：stat_fresh("/") 在宽面回合成根——根恒存（消费面
+// RowMetaData::root 同形：is_dir、0 尺寸、born uploaded+cached），零
+// 网络（不做父列表、不做 driver.stat）。
+#[tokio::test]
+async fn stat_fresh_root_serves_the_synthesized_record_on_a_wide_face() {
+    let h = wide_harness().await;
+    let root = h
+        .vfs
+        .stat_fresh(&RelPath::root())
+        .await
+        .expect("the root is constant");
+    assert!(root.is_dir, "根恒为目录");
+    assert_eq!(root.size, 0, "合成根 0 尺寸");
+    assert!(
+        root.is_uploaded && root.is_cached,
+        "合成根 born uploaded + cached"
+    );
+    assert_eq!(h.shared.list_calls(), 0, "根恒存：零网络");
+    assert_eq!(h.shared.stat_calls(), 0, "根恒存：零 driver.stat");
 }

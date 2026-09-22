@@ -47,7 +47,13 @@
 //!    materialized by any pass of the scan carry fresh `updated_at`
 //!    (the anchor persists across resumed passes, so early-pass rows
 //!    survive); in-flight rows (`is_uploaded = 0`) are excluded; and
-//!    an interrupted pass never reaches the sweep at all.
+//!    an interrupted pass never reaches the sweep at all. Terminology
+//!    (review L5): this module's *sweep-ghost* is an `is_uploaded = 1`
+//!    row whose backend object is gone — the sweep's only lawful
+//!    target; a *pending* row (`is_uploaded = 0`) is NEVER one —
+//!    in-flight (a live upload whose write-back revives it) and
+//!    ghost-pending (its cache copy already vanished, K4 semantics)
+//!    alike stay untouched.
 //!
 //! Plaintext-only semantics (K11): an instance with
 //! `enable_encryption = true` is refused before any listing — the
@@ -103,6 +109,14 @@ impl std::fmt::Display for RebuildInterrupted {
         }
     }
 }
+
+/// The completion sweep's volume floor (M3 / Phase 8 review): the sweep
+/// is only ever attempted when the uploaded population is at most this
+/// size, or the prune batch stays at or under half of it. Below the
+/// floor a full prune is still loud enough to be recoverable; above it a
+/// majority prune is treated as a silent listing failure (see the gate
+/// in [`rebuild_from_backend_with`]).
+const SWEEP_FLOOR_MIN_UPLOADED: usize = 100;
 
 /// Per-pass bounds of one rebuild walk (D8②). Defaults: 200 000 entries
 /// per pass, no wall-clock budget (the CLI injects the same 15 minutes
@@ -279,7 +293,27 @@ pub async fn rebuild_from_backend_with(
     // Completion (queue drained — only now, D8③): prune the rows the
     // whole scan never re-touched, then clear the checkpoint. An
     // interrupted pass returned above and reaches neither.
-    outcome.pruned = db.sweep_unseen(scan_started_at)?;
+    //
+    // M3 volume floor: when the prune batch would take more than half of
+    // a sizable index (>`SWEEP_FLOOR_MIN_UPLOADED` uploaded rows), the
+    // likelier explanation is a silently-empty listing-class failure (a
+    // lying driver — the K74 silent-misplacement precedent) than a mass
+    // remote deletion: abandon the ENTIRE sweep (zero rows deleted,
+    // chunks included) and say so in the log. The pass still completes
+    // and clears its checkpoint — the surviving rows are simply
+    // re-judged by the next completing scan.
+    let (uploaded, candidates) = db.sweep_census(scan_started_at)?;
+    if uploaded > SWEEP_FLOOR_MIN_UPLOADED && candidates * 2 > uploaded {
+        tracing::warn!(
+            uploaded,
+            candidates,
+            "completion sweep abandoned: the prune batch would take more than half of \
+             a sizable index — a silent backend listing failure is suspected, \
+             nothing was deleted"
+        );
+    } else {
+        outcome.pruned = db.sweep_unseen(scan_started_at)?;
+    }
     db.rebuild_state_clear()?;
     Ok(outcome)
 }

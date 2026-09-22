@@ -300,10 +300,16 @@ fn encrypted_instances_are_refused_with_sync_guidance() {
 
 /// list 调用计数的薄包装驱动（形态照 `readthrough.rs` 的
 /// `CountingDriver`——mock 本体无 list 计数，「续跑不重扫已完成目录」
-/// 的断言（A4）全靠它）。
+/// 的断言（A4）全靠它；per-dir 计数与页间停顿服务 M7 的 DeadlineStop
+/// 断言）。
 struct CountingDriver {
     inner: Arc<MockStorageDriver>,
     list_calls: AtomicUsize,
+    /// per-dir list 计数（M7：「该目录被重列」的断言面）。
+    per_dir: std::sync::Mutex<std::collections::HashMap<String, usize>>,
+    /// 每次 list 前的确定性停顿（M7：真实网络的页间耗时形态在此注入，
+    /// 让墙钟预算恰在页间耗尽）。
+    page_delay: Duration,
 }
 
 impl CountingDriver {
@@ -311,11 +317,23 @@ impl CountingDriver {
         Self {
             inner,
             list_calls: AtomicUsize::new(0),
+            per_dir: std::sync::Mutex::new(std::collections::HashMap::new()),
+            page_delay: Duration::ZERO,
         }
     }
 
     fn list_calls(&self) -> usize {
         self.list_calls.load(Ordering::SeqCst)
+    }
+
+    /// 某目录（卷相对）的累计 list 次数。
+    fn lists_of(&self, dir: &str) -> usize {
+        self.per_dir
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(dir)
+            .copied()
+            .unwrap_or(0)
     }
 }
 
@@ -331,6 +349,15 @@ impl StorageDriver for CountingDriver {
 
     async fn list(&self, dir: &RelPath, page: Page) -> Result<Listing, StorageError> {
         self.list_calls.fetch_add(1, Ordering::SeqCst);
+        *self
+            .per_dir
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .entry(dir.as_str().to_string())
+            .or_insert(0) += 1;
+        if !self.page_delay.is_zero() {
+            tokio::time::sleep(self.page_delay).await;
+        }
         self.inner.list(dir, page).await
     }
 
@@ -770,5 +797,154 @@ async fn a_time_budget_stop_leaves_everything_and_never_sweeps() {
         db.get_chunks_by_file_id(ghost).expect("read chunks").len(),
         1,
         "the stale row's chunk survives"
+    );
+}
+
+/// 5（M3 体量地板）：完成趟 sweep 的「静默空列表」防线——既有 uploaded
+/// 行 > 100 且待删候选超过其半时，放弃**整个** sweep（0 行删除，含
+/// chunks 级联），完成趟检查点照常清；幸存行由下一次完成趟重新裁决。
+#[tokio::test]
+async fn the_completion_sweep_abandons_a_majority_prune_on_a_sizable_index() {
+    let mock = seeded_driver(); // 全空后端——「驱动谎报空树」的故障形态
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = MetaDatabase::open(&dir.path().join("meta.db")).expect("open db");
+    let mut ids = Vec::new();
+    for i in 0..150 {
+        ids.push(seed_uploaded_row(
+            &db,
+            &format!("/old{i}.txt"),
+            3000 + i as i64,
+        ));
+    }
+
+    let outcome = rebuild_from_backend(&mock, &db, &RelPath::root())
+        .await
+        .expect("the completing pass answers");
+    assert_eq!(outcome.interrupted, None, "the pass completes");
+    assert_eq!(
+        outcome.pruned, 0,
+        "M3：候选(150) 超基数(150)之半 → 整个 sweep 放弃，零删除"
+    );
+    for (i, id) in ids.iter().enumerate() {
+        assert!(
+            db.get_file(&format!("/old{i}.txt"))
+                .expect("read row")
+                .is_some(),
+            "M3：行全保留（old{i}.txt）"
+        );
+        assert_eq!(
+            db.get_chunks_by_file_id(*id).expect("read chunks").len(),
+            1,
+            "M3：chunks 级联同样不发生（old{i}.txt）"
+        );
+    }
+    assert!(
+        db.rebuild_state_get("scan_started_at")
+            .expect("kv read")
+            .is_none(),
+        "完成趟检查点照常清（放弃 sweep 不改变趟的完成语义）"
+    );
+}
+
+/// 6（M7）：DeadlineStop 臂——多页目录（600 条目跨 2 页，页限 512）+
+/// 页间耗尽的微预算 → 页间中断（`interrupted = TimeBudget`，目录回持
+/// 久化队列）；rerun（预算放宽）**从头重列该目录**（页界语义：半列的
+/// 目录不算完成——首趟恰 1 页，二趟重列恰 2 页，per-dir 计数 1+2），
+/// 子树行最终齐全、完成趟照常收口。
+#[tokio::test]
+async fn a_mid_directory_deadline_stop_requeues_and_the_rerun_relists_the_directory() {
+    let mock = Arc::new(seeded_driver());
+    // big/：600 个文件 → 2 页（512 + 88）；根只含 big 目录行。
+    for i in 0..600 {
+        seed_file(&mock, &format!("big/f{i:03}.txt"), b"x").await;
+    }
+    // 页间停顿 60ms：预算 100ms 让首趟恰在 big 的第 1、2 页之间耗尽
+    // （根页检查 ~0ms < 100 ✓；big 页1检查 ~60ms < 100 ✓；页2检查
+    // ~120ms ≥ 100 → DeadlineStop）。两趟共用同一计数器（M7 断言面 =
+    // 该目录的跨趟累计 list 次数）。
+    let mut counting = CountingDriver::new(Arc::clone(&mock));
+    counting.page_delay = Duration::from_millis(60);
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = MetaDatabase::open(&dir.path().join("meta.db")).expect("open db");
+
+    // Pass 1：root 完成后 pop big，页间耗尽 → TimeBudget 中断。
+    let first = rebuild_from_backend_with(
+        &counting,
+        &db,
+        &RelPath::root(),
+        RebuildLimits {
+            max_entries: usize::MAX,
+            time_budget: Some(Duration::from_millis(100)),
+        },
+    )
+    .await
+    .expect("first pass");
+    assert_eq!(
+        first.interrupted,
+        Some(RebuildInterrupted::TimeBudget),
+        "预算必须在 big 的页间耗尽"
+    );
+    assert_eq!((first.files, first.dirs), (512, 1), "根 + big 页1 已物化");
+    assert_eq!(counting.lists_of(""), 1, "根恰列 1 次");
+    assert_eq!(
+        counting.lists_of("big"),
+        1,
+        "首趟 big 恰列 1 页（半列不算完成）"
+    );
+    // 检查点仍是「big 未列完」的形态：队列里留着 big（持久化语义）。
+    assert!(
+        db.rebuild_state_get("pending")
+            .expect("kv read")
+            .is_some_and(|raw| raw.contains("big")),
+        "the interrupted directory stays persisted on the queue"
+    );
+
+    // Pass 2：预算放宽 → big 从头重列（2 页）→ 完成趟收口。
+    let second = rebuild_from_backend_with(
+        &counting,
+        &db,
+        &RelPath::root(),
+        RebuildLimits {
+            max_entries: usize::MAX,
+            time_budget: None,
+        },
+    )
+    .await
+    .expect("second pass");
+    assert_eq!(second.interrupted, None, "续跑完成");
+    assert_eq!(
+        (second.files, second.dirs),
+        (600, 0),
+        "重列物化全部 600 条（前 512 幂等重 upsert）"
+    );
+    assert_eq!(
+        counting.lists_of("big"),
+        3,
+        "M7 核心：该目录被重列——首趟 1 页 + 二趟从头 2 页（页界重列语义）"
+    );
+    assert_eq!(
+        db.get_stats().expect("stats").total_files,
+        600,
+        "子树行最终齐全"
+    );
+    for probe in [
+        "big/f000.txt",
+        "big/f511.txt",
+        "big/f512.txt",
+        "big/f599.txt",
+    ] {
+        assert!(
+            db.get_file(&format!("/{probe}"))
+                .expect("read row")
+                .is_some(),
+            "{probe} must be indexed"
+        );
+    }
+    assert!(
+        db.rebuild_state_get("scan_started_at")
+            .expect("kv read")
+            .is_none(),
+        "完成趟检查点照常清"
     );
 }

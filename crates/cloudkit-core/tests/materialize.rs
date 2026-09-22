@@ -9,8 +9,11 @@
 //!    同 rel_path 冲突键归同一条行。
 
 use cloudkit_core::database::MetaDatabase;
-use cloudkit_core::materialize::{materialize_entry, MaterializedRow};
-use cloudkit_storage::{BackendHandle, Entry, EntryId, EntryKind, RelPath, VolumeId};
+use cloudkit_core::materialize::{list_all_pages, materialize_entry, MaterializedRow};
+use cloudkit_storage::{
+    BackendHandle, ByteStream, Capabilities, Entry, EntryId, EntryKind, Listing, Page, PageCursor,
+    Quota, Range, RelPath, StorageDriver, StorageError, UploadStager, VolumeId, WriteHint,
+};
 
 /// 构造一条后端条目（`handle` 形态即被测分叉：路径形 vs 数字形）。
 fn entry(path: &str, kind: EntryKind, handle: &str, size: u64) -> Entry {
@@ -71,9 +74,130 @@ fn re_materializing_bumps_updated_at_and_keeps_the_coalesce_columns() {
     std::thread::sleep(std::time::Duration::from_millis(5));
     let second = materialize_entry(&db, &e).expect("second materialize");
     assert!(
-        second.updated_at.unwrap() >= first.updated_at.unwrap(),
-        "重物化必须刷新 updated_at"
+        second.updated_at.unwrap() > first.updated_at.unwrap(),
+        "重物化必须**严格**刷新 updated_at（L1：>= 放过同一毫秒的假刷新）"
     );
     assert!(second.is_uploaded);
     assert_eq!(second.id, first.id, "rel_path 冲突键：同键归同一条行");
+}
+
+// ============================== M2（Phase 8 审查批）：分页归集双上限 ===
+
+/// 自指游标的故障驱动（M2 注入点）：`list` 恒回 `per_page` 条目 + 恒有
+/// 续读游标——读路径绝不允许被它挂死。
+struct CursorLoopDriver {
+    volume: VolumeId,
+    per_page: usize,
+}
+
+impl CursorLoopDriver {
+    fn new(per_page: usize) -> Self {
+        Self {
+            volume: VolumeId::parse("baidu:123456789").expect("volume id"),
+            per_page,
+        }
+    }
+
+    fn make_entry(&self, index: usize) -> Entry {
+        Entry {
+            id: EntryId::new(self.volume.clone(), BackendHandle::new(index.to_string())),
+            path: RelPath::new(&format!("loop/f{index}.txt")).expect("path"),
+            kind: EntryKind::File,
+            size: 1,
+            mtime: 1.0,
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl StorageDriver for CursorLoopDriver {
+    fn volume(&self) -> &VolumeId {
+        &self.volume
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::none()
+    }
+
+    async fn list(&self, _dir: &RelPath, _page: Page) -> Result<Listing, StorageError> {
+        Ok(Listing {
+            entries: (0..self.per_page).map(|i| self.make_entry(i)).collect(),
+            next: Some(PageCursor::Next("loop".to_string())),
+        })
+    }
+
+    async fn stat(&self, _path: &RelPath) -> Result<Entry, StorageError> {
+        Err(StorageError::Unsupported)
+    }
+
+    async fn mkdir(&self, _path: &RelPath) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported)
+    }
+
+    async fn delete(&self, _id: &EntryId) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported)
+    }
+
+    async fn rename(&self, _from: &RelPath, _to: &RelPath) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported)
+    }
+
+    async fn reader(
+        &self,
+        _id: &EntryId,
+        _range: Option<Range>,
+    ) -> Result<ByteStream, StorageError> {
+        Err(StorageError::Unsupported)
+    }
+
+    async fn writer(
+        &self,
+        _path: &RelPath,
+        _hint: &WriteHint,
+    ) -> Result<Box<dyn UploadStager>, StorageError> {
+        Err(StorageError::Unsupported)
+    }
+
+    async fn quota(&self) -> Result<Quota, StorageError> {
+        Err(StorageError::Unsupported)
+    }
+}
+
+// M2 红：恒 Some(next) 的自指游标必须在页数上限处报错返回（绝不挂死
+// 读路径 / winfsp FSD 线程），错误消息含目录与计数。
+#[tokio::test]
+async fn a_self_feeding_cursor_is_capped_by_the_page_limit_instead_of_hanging() {
+    let driver = CursorLoopDriver::new(0);
+    let dir = RelPath::new("docs").expect("dir");
+    let err = list_all_pages(&driver, &dir)
+        .await
+        .expect_err("the page cap must fire on a self-feeding cursor");
+    let message = err.to_string();
+    assert!(
+        message.contains("docs"),
+        "错误消息必须含目录，got: {message}"
+    );
+    assert!(
+        message.contains("1024") || message.contains("page"),
+        "错误消息必须点名页数上限，got: {message}"
+    );
+}
+
+// M2 红：小页大流的自指游标在条目上限处报错（页数上限不误触）。
+#[tokio::test]
+async fn an_endless_entry_stream_is_capped_by_the_entry_limit() {
+    let driver = CursorLoopDriver::new(128);
+    let dir = RelPath::new("docs").expect("dir");
+    let err = list_all_pages(&driver, &dir)
+        .await
+        .expect_err("the entry cap must fire on an endless entry stream");
+    let message = err.to_string();
+    assert!(
+        message.contains("docs"),
+        "错误消息必须含目录，got: {message}"
+    );
+    assert!(
+        message.contains("65536") || message.contains("entries"),
+        "错误消息必须点名条目上限，got: {message}"
+    );
 }
