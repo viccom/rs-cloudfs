@@ -3,6 +3,7 @@
 > **For Claude:** REQUIRED SUB-SKILL: Use executing-plans to implement this plan task-by-task.
 > **负责人批准令**：2026-09-22 负责人拍板路线 C（B 为主 + A 最小集），三点要求写进本计划：①先出详细可行方案与计划（本文件）；②机制必须提炼为六后端 + 未来驱动共享的共性行为（§3）；③必须证明是架构增强而非破坏（§7）。
 > **状态**：计划已写，待开工（批次 RT0–RT5 顺序执行，worktree `feat/readthrough-index` 独立 target——共享 CARGO_TARGET_DIR 双指纹既有教训）。
+> **修订（2026-09-23，负责人）**：D10 由「加密卷显式拒收」修订为「加密卷 read-through 放开」（B 方案：实例默认方案推定 + 密文尺寸确定性反推 + 读时方案回退回写）——原 D10 条文与推翻理由留痕于 §2 D10 行；§0 功能拆解/A7/§7/§8 同步修订。详见 decisions.md K84。
 > **编号**：裁决入 decisions.md 用 **K83**（K82 = Phase 7 合入批已占）；阶段命名 **Phase 8**；批次代号 **RT0–RT5**。
 
 **Goal:** 读路径从「本地 db 闸门（miss 即 404）」改为「按需逐层回源 + 物化缓存」（RaiDrive 式体验），rebuild 从「唯一索引手段」降级为「可续跑/有界/prune 的全量校对工具」。
@@ -26,7 +27,7 @@
 - [ ] L3 物化共性：`materialize.rs`（自 `rebuild.rs::upsert_entry` 提取的**唯一** Entry→行映射）+ `list_all_pages` 分页归集
 - [ ] L3 读穿原语：`readthrough.rs`——`read_dir_fresh`（逐层强制 revalidate）/`stat_fresh`（父目录 TTL 窗 + 深路径 1 次 list 兜底）/reconcile（upsert + stat 双确认 prune）/DirCache（TTL+单飞+就近失效）
 - [ ] L3 rebuild 校对工具化：迭代工作队列 + `rebuild_state` KV 表持久化续跑 + `max_entries` 总上限 + 完成趟 sweep prune（`updated_at < scan_started` 保护跨续跑）
-- [ ] 加密卷显式拒收（与 rebuild 同款闸门，文案指路 sync）
+- [ ] 加密卷 read-through 物化（D10 修订，2026-09-23）：实例默认方案推定 + 密文尺寸反推 + 读时方案回退回写；rebuild 加密闸（ensure_plaintext_instance）是否同批放开 = B 计划范围决策点（分析推荐同批，随 B 计划报批）
 
 #### 消费面任务（接线，非重写）
 - [ ] 网关 CyDriveFs：`metadata`/`read_dir`/`open` 读臂三处改调 `*_fresh`
@@ -74,7 +75,7 @@ WinFsp FSD 回调 ──block_on─▶ meta_for ─┘         │
 - [ ] A4（rebuild 续跑）：扫描中途中断 → rerun 不重扫已完成目录（`driver.list` 调用计数断言）；`max_entries` 到顶优雅停 + 明示「rerun to continue」
 - [ ] A5（rebuild sweep）：完整趟后只删「扫描期间未再触碰且 `is_uploaded=1`」的行；in-flight 行、本趟 upsert 行、跨续跑早趟 upsert 行全部无伤（红测试钉死）
 - [ ] A6（一致性）：六后端同一 Vfs seam 测试矩阵绿；telegram 卷全链路行为逐字不变（既有断言零漂移）
-- [ ] A7（加密卷）：显式拒收 + 可行动文案（指路 sync），不物化半错语义行
+- [ ] A7（加密卷，2026-09-23 修订）：两阶段协议真机验收——①新建路径流式加密上传 → 清本地索引 → ②逐层现查物化（行字段核验：明文尺寸=反推值、is_encrypted、方案）→ 下载流式解密逐字节通；混合方案卷读时回退且回写行；密钥/方案配置错 → 解密失败可行动报错（正常逻辑，不再整面拒读）
 - [ ] A8（门禁）：workspace 全绿 + clippy -D warnings + fmt + check_layers + scan_secrets + 裁剪组合构建绿
 
 ### 风险评估
@@ -122,7 +123,7 @@ WinFsp FSD 回调 ──block_on─▶ meta_for ─┘         │
 | **D7 删除 = stat 双确认**：候选缺失行逐条 `driver.stat`，NotFound 才删；单目录 >32 候选整批跳过删除+告警；`Err`/非 NotFound 一律保留；in-flight（`!is_uploaded && local_copy_exists`，sync.rs:579-580 原文）两侧永不触碰 | 单次观测的列表可能是谎报/残缺（AList 上游瞬断）；「瞬态错误绝不落永久状态」红线的删除面落地；权威批量清账归 rebuild sweep |
 | **D8 rebuild 三件套**：①迭代工作队列 + `rebuild_state` 持久化（每目录完成落盘）；②`RebuildTuning.max_entries`（默认 20 万/趟）+ 既有 15min 预算**同时补到离线路径**；③完成趟（队列清空）sweep：`DELETE FROM files WHERE is_uploaded=1 AND updated_at < scan_started_at`——`scan_started_at` 跨续跑持久（保护早趟 upsert 的行），chunks 级联删 | ①「rerun to continue」从口号变真；②总上限 = 负责人「100 万/1000 万」病灶的直接闸门；③零 files 列变更（updated_at 技巧），三重保护（is_uploaded/updated_at/仅完成趟） |
 | **D9 `api_files` 保持索引视图**，不做回源（全表 = 全树 = rebuild 语义）；文件浏览面 `api_list` 才接 read-through | 防止「全表 API」暗中变全树遍历；语义明示 |
-| **D10 加密卷显式拒收**（`ensure_plaintext_instance` 同款闸门 + 可行动文案指路 sync）；in-flight/ghost 行（`is_uploaded=0`）prune 侧永不删 | 远端是密文容器：list 给的 size 是密文尺寸，物化成行会破坏「size=明文」R6 契约与 AEAD 预算数学（rebuild.rs:30-36 注释原文同判）；ghost 归 K4 delete-wiring 旧账，不扩scope |
+| **D10 加密卷 read-through 放开（2026-09-23 修订，负责人推翻原「显式拒收」）**：物化行 = 实例当前方案推定 + 密文尺寸确定性反推（固定分块+定开销下单射可解）+ 读时 AEAD 首块失败回退另一方案并回写行；in-flight/ghost 行（`is_uploaded=0`）prune 侧永不删（此半句原样保留）。密钥/方案配置错 → 解密失败报错 = 正常逻辑 | 原 D10 =「加密卷显式拒收（`ensure_plaintext_instance` 同款闸门 + 文案指路 sync）；远端是密文容器，list 给的 size 是密文尺寸，物化成行会破坏 size=明文 R6 契约与 AEAD 预算数学」——信息论依据真实（清单确无明文尺寸/方案字段），但负责人 2026-09-23 裁定：文档是带理由的决策记录非宪法，缺口可解（尺寸反推 + 方案推定 + 读时回退；回退先于任何字节输出，AEAD 首块必暴露方案错误）。原 A7 拒收验收面随之改为两阶段协议。详见 decisions K84 |
 
 ---
 
@@ -492,7 +493,7 @@ RT1 → RT2（依赖 materialize+探针）→ RT3（依赖 readthrough 两入口
 | 锁纪律（RV1） | ✅ 自动满足 | 回源 IO 在 handler/回调本体（锁外）；DirCache 内部 `StdMutex` 短临界区 + 单飞 `tokio::sync::Mutex` 不跨表锁 |
 | K44 winfs 快照语义 | ✅ 保持 | `get_file_info` 零改动；回源只进 meta_for/dir_entries/open_with_read |
 | 上传队列/sync 语义 | ✅ 豁免保护 | in-flight 判定复用 sync.rs:579-580 原文；`upsert_file` 的 coalesce 列（sha256/msg_id/mime）天然不被物化冲掉 |
-| 行为变化面 | 仅两处，均增强 | ①读路径 miss 从 404 变回源（用户要的本体）；②rebuild 完成趟可 prune（D8③ 三重保护）——telegram 卷与加密卷零变化 |
+| 行为变化面 | 仅两处，均增强 | ①读路径 miss 从 404 变回源（用户要的本体）；②rebuild 完成趟可 prune（D8③ 三重保护）——telegram 卷零变化；加密卷读面零变化（H1 过渡态：拒物化不拒读），B 方案进一步放开加密物化属增强非破坏（K84——物化行字段与上传行同构是 B 的核心不变量，由 B 批测试钉死） |
 
 **破坏性变更纪律**（版本兼容纪律：pre-1.0 不做迁移）：`rebuild_state` 新表对旧库幂等（CREATE IF NOT EXISTS）；无旧数据迁移、无兼容分支。
 
@@ -500,7 +501,7 @@ RT1 → RT2（依赖 materialize+探针）→ RT3（依赖 readthrough 两入口
 
 ## 8. 挂账预登记（执行期如实增补）
 
-- 加密卷 read-through（需先解决密文 size→明文 size 的可靠换算或远端元数据面，D10 明确不做）
+- ~~加密卷 read-through~~ **已立项（2026-09-23，K84，B 方案）**：取「尺寸确定性反推 + 方案读时回退」路线；「远端元数据面（每目录 manifest 携明文尺寸+方案）」作为混合老卷的更优长期解保留挂账
 - api_files 全表视图的新鲜度（D9 保持索引视图；若需全树新鲜 = rebuild 语义，另议）
 - ghost 行（`is_uploaded=0` 且无本地副本）清理由 K4 delete-wiring 旧账统一处理
 - stat 的 TTL 窗值（5s）为实测定值，真机矩阵后可调（`with_ttl` 测试缝已留）
