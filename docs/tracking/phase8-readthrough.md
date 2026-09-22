@@ -102,6 +102,24 @@
 
 **自主裁决（未询问，可逆）**：①`read_dir_fresh` 每调用强制 revalidate（D5，RaiDrive 对等）而非 TTL 窗——胜在新鲜度与语义简明，代价是每视图 1 次 list（用户点赞的 J: 盘同款成本）；②stat TTL 窗定 5s（D6，实测定值，`with_ttl` 缝可调）；③删除双确认上限 32 条/目录（D7，超限整批跳过+告警）；④rebuild 单趟上限默认 20 万条目（D8，RebuildTuning 注入可调）；⑤api_files 保持索引视图（D9，防全表 API 暗变成全树遍历）；⑥加密卷 read-through 明确拒收（D10——list 报密文 size，物化即破坏「size=明文」R6 契约与 AEAD 预算数学；指路 sync）。回滚 = revert 本批 commit。
 
+### RT5b（2026-09-22，主会话直做——A1/A2 用户场景真机腿）
+
+**环境**：worktree 独立 release 构建（`cargo build -p cloudkit-cli --release --features winfsp`，2m32s）；运行目录 `target/release-rt/`（独立布置：config.toml 照负责人测试目录键位复制 + 追加 `mount_backend = "winfsp"`；volumes/webdav.toml 从负责人目录**复制**（凭据段原样、原文件未动一字）；全新 db = A1 空索引前置）。`cydrive run` 起，winfsp 挂 Y:，仪表盘 8486。
+
+**A1 PASS（零 rebuild 逐层即见）**：空 db 直接 `dir Y:` = 8 目录（123pan/baidu/cryptbaidu/local/天翼加密/天翼盘/移动云盘/移动加密区）与 J:（RaiDrive 同 AList 视图）一致；`dir Y:\123pan` 18 项与 J: **逐项 diff 完全一致**（初看差异系 head 截断假象——K74.3 教训复验：先核对观察完整性再下结论）。
+
+**A2 PASS（RaiDrive J: 增删 → Y: 重进一致）**：
+- 增腿：J: 建 `local/e2e_rt_a2_<stamp>/` + 2 文件 → Y: 父层枚举**即时见** stamp 目录（D5 强制刷新真机实证）；子层内容待 RaiDrive 异步推送收敛后经回源可见。
+- 删腿：J: 删 f2 → AList 真值收敛（8s 内）→ Y: 重进 stamp **只见 f1_keep**（stat 双确认 prune 生效，f2 行已清）；J: 删 stamp 目录 → Y: 父层重进 stamp 消失（父层 prune 同样生效）。AList 404 核空零残留。
+- 取证链（问题排查期三层证据）：updated_at 差分（枚举是否到达 Vfs）+ api_list 对照（Vfs 层正误）+ AList 直查 PROPFIND（远端真值）——期间确认 db 层/AList 层/Vfs 层全程正确，观察到的异常均为客户端缓存窗（见下）。
+
+**真机发现（入审查批评估）**：
+1. **RaiDrive 写入异步推送窗**（上游形态，非本机制缺陷）：J: 写文件后 RaiDrive 本地缓存可滞后数分钟才推送 AList（期间 J: 自身目录枚举都不显示）——「J: 增删 → Y: 一致」验收必须等 AList 真值收敛后判定，AList 直查是唯一可信收敛信号。
+2. **winfsp FSD 内核目录缓存延迟窗**（重要）：首次对某目录的枚举快照（含空结果）会被 FSD 内核缓存，后续枚举在缓存有效期内**不触发**适配层 `read_directory`（marker=None 强制刷新只在 FSD 真正发起枚举时生效）——实测延迟窗可达分钟级（stamp 子目录首次空枚举后数分钟内重试仍空，最终自动恢复）。api_list/webdav 网关面无此折扣（每 PROPFIND 现查）；winfsp 面「重进即刷新」的 D5 语义有 FSD 缓存折扣、**最终一致**成立。留审查批评估是否需要适配层主动失效或文档明示。
+3. 负例鉴识：过程中一次「找不到文件」形态实为 cmd 对路径解析失败的报错（header 显示「Y:\ 的目录」而非目标路径），与「空目录」同名不同因——排查时先看 dir 头部行分辨。
+
+**清理**：J: stamp 目录已删、AList 404 核空、实例 `cydrive stop` 干净退出（exit 0）、运行目录 `release-rt/` 为 worktree 内未跟踪产物不入库。
+
 ## 风险与未覆盖（随批更新）
 
 - **webdav read_dir 冷路径双 list**（RT3）：stat_fresh 预检在父 TTL 窗过期或行缺失时多一次父重列（导航形稳态每视图恰 1 次，面级测试钉 2 视图=2 list）；Explorer 实际流量归真机矩阵复核（RT5）
