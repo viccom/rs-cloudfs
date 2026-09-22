@@ -122,7 +122,8 @@
 
 ## 深度审查修复批（2026-09-22，合入前强制——K78 形态）
 
-三路并行审查（驱动模块精读/测试与桩面/集成装配面）+ 主会话门禁独立复跑；清单 = `phase7-review-findings.md`：**1 High + 15 Medium + ~25 Low**。清偿：H1（close ④ stat-Err 臂 restore_scene 覆盖已提交新版——数据破坏路径）+ 路1 M1–M7（并发 401 协商竞态/writer stash 悬置/无界读/config 文案回显密码/O(n²)/并置 challenge/207 成员静默消失）= Fix-A（`86e56ae`，主会话接手中断代理遗留 + OPTIONS 漏点补口）；路2 M8–M13（超时钉测/Range 头观测/416 两臂/403/206 负路径三行/映射尾部行）= Fix-B（`b81aefa`，测试面零行为变更）；路3 M14/M15 主会话直做（`96551df`）。逐项红→绿留证入 findings；残余挂账两项（M13③ 终局臂/M8 真触发腿）+ Low ~25 条挂账。终板 workspace **1602/0/52** + 五门禁绿。执行注记：clippy「瞬退」系 `-j` 旗标误放 `--` 后（rustc Unrecognized option）——非内存压力。
+三路并行审查（驱动模块精读/测试与桩面/集成装配面）+ 主会话门禁独立复跑；清单 = `phase7-review-findings.md`：**1 High + 15 Medium + ~25 Low**。清偿：H1（close ④ stat-Err 臂 restore_scene 覆盖已提交新版——数据破坏路径）+ 路1 M1–M7（并发 401 协商竞态/writer stash 悬置/无界读/config 文案回显密码/O(n²)/并置 challenge/207 成员静默消失）= Fix-A（`5920c93`，主会话接手中断代理遗留 + OPTIONS 漏点补口）；路2 M8–M13（超时钉测/Range 头观测/416 两臂/403/206 负路径三行/映射尾部行）= Fix-B（`9e2dc80`，测试面零行为变更）；路3 M14/M15 主会话直做（`ba3ad4b`）。逐项红→绿留证入 findings；残余挂账（M13③ 终局臂/M8 真触发腿/M2 无回归测试）+ Low ~25 条挂账。终板 workspace **1602/0/52** + 五门禁绿。执行注记：clippy「瞬退」系 `-j` 旗标误放 `--` 后（rustc Unrecognized option）——非内存压力。（哈希注记：原记 `86e56ae`/`b81aefa`/`96551df` 为凭据清理 filter-branch 重写前旧号，已更正——映射经 subject 逐字核对。）
+**反向复核（2026-09-22 合入后二次审查）**：16 项修复逐项**缺陷回注**实测——13 项测试转红（守卫有效，含 H1 数据破坏断言、M3 12MiB 整读、M12 三臂）；4 项回注仍绿 = 无守卫（M2 零测试/M5 只钉行为/M14/M15 文案断言过宽），M8 调用点靠 clippy 兜底，M4 漏网面经 url 解析层探针排除。五门禁复跑全绿（1602/0/52 + clippy/fmt/layers/secrets）。明细入 findings 头部「反向复核」段。
 
 ## 终态挂账总表（收口批 2026-09-22）
 

@@ -3,7 +3,9 @@
 > 审查形态：三路并行子代理（路1 驱动模块精读 / 路2 测试与桩面 / 路3 集成装配面）+ 主会话门禁独立复跑。
 > 审查基线：worktree `feat/webdav-driver` @ 4e6e2cf（WD0–WD5 + 收口批后）。
 > 汇总裁决：**1 High + 15 Medium + ~25 Low**；High 与全部 Medium 清偿（逐项 TDD 红→绿）后方合入；Low 挂账（K75 形态后续批裁决）。
-> **清偿终态（2026-09-22）**：H1 + M1–M13 = Fix-A/Fix-B 两批全清偿（commit `86e56ae`/`b81aefa`）；M14/M15 主会话直做（`96551df`）。终板 workspace **1602/0/52** + clippy/fmt/layers/secrets 全绿。残余挂账两项如实：M13③ rename「建父后仍 409」终局臂桩面不可确定性构造（以 409 缺父成功腿 + 父被占→Exists 腿覆盖 409 臂）；M8 慢服务器超时真触发腿（loopback 恒快于预算，挂账真机）。执行注记：本批多轮 clippy「瞬退」实为主会话把 `-j` 误放在 `--` 之后（rustc 报 Unrecognized option）——非内存压力，旗标改正即绿。
+> **清偿终态（2026-09-22）**：H1 + M1–M13 = Fix-A/Fix-B 两批全清偿（commit `5920c93`/`9e2dc80`）；M14/M15 主会话直做（`ba3ad4b`）。（注：本行原记的 `86e56ae`/`b81aefa`/`96551df` 是凭据泄漏历史重写 filter-branch **之前**的旧对象号，重写后失效，2026-09-22 复核时更正——三提交在新历史中内容不变，映射经 subject 逐字核对。）终板 workspace **1602/0/52** + clippy/fmt/layers/secrets 全绿。残余挂账如实：M13③ rename「建父后仍 409」终局臂桩面不可确定性构造（以 409 缺父成功腿 + 父被占→Exists 腿覆盖 409 臂）；M8 慢服务器超时真触发腿（loopback 恒快于预算，挂账真机）；**M2 无回归测试**（tempfile 构造失败不可注入——调序修复靠构造序保证，反向复核实证零测试观测该顺序）。执行注记：本批多轮 clippy「瞬退」实为主会话把 `-j` 误放在 `--` 之后（rustc 报 Unrecognized option）——非内存压力，旗标改正即绿。
+>
+> **反向复核（2026-09-22，合入后二次审查）**：方法 = 逐项把原缺陷**重新植入**实现再跑钉测，实证「测试真的会红」而非只读销账表。**16 项中 13 项有有效回归守卫**（H1 数据破坏断言/M1 伪拒绝/M3 12MiB 整读/M4 回显/M6 并置头/M7 list+stat 双臂/M9 Range 头 7 测/M10 增长臂/M11 403/M12 三臂/M13 507+429——植入后逐一红，含 1 项以挂起形态被 timeout 击杀）。**4 项植入后测试仍绿（无守卫）**：M2（无测试）、M5（钉行为不钉复杂度——`position()` 回退照绿，测试注释自认「性能不敏感」）、M14（webdav 专属 proxy 文案分支删除后 dispatch 22/22 绿）、M15（空格回退后 probe 测试仍绿——只断言 `contains("webdav_url")`）。M8 调用点 `.timeout()` 删除由 clippy `-D warnings`（unused variable）兜底而非测试。M4 漏网面实证排除：url crate 对带 userinfo 的空 host 形态在**解析层即 Err**（4 形态探针全 ERR），带凭据走不到 config.rs host-空臂的 `{value:?}` 回显。
 > 三路判定：路1「需修后合入」（H1 数据破坏路径）/ 路2「可合入（B+，缺口=回归检测面缺失）」/ 路3「需修后合入（仅文案级两处）」。
 
 ## High（1 条）
@@ -19,7 +21,7 @@
 | # | 发现 | 位置 | 修法 | 状态 |
 |---|---|---|---|---|
 | M1 | 并发 401 协商竞态：每次 401 无条件重置 Digest 会话（nc 归零）——同 nonce challenge 的严格 nc 服务器上双并发请求可产生重复 nc → 一次性伪 `Unauthorized{recoverable:false}`（apache「不查 nc」掩盖了此窗） | `client.rs:361-363` + `auth.rs:53-62` | handle_401 仅当 challenge nonce 与现会话不同（或现状态非 Digest）才重置；双并发 401 + 同 nonce 单测钉死 | ✅ 已修 |
-| M2 | writer() 在 stash MOVE 成功后、stager 构造（tempfile）失败时不上报不恢复——旧对象停在 list 过滤的 `.old`，final「消失」 | `driver.rs:723-745` | 先建 spool 再 stash（调换序），或构造失败臂复位 stash | ✅ 已修 |
+| M2 | writer() 在 stash MOVE 成功后、stager 构造（tempfile）失败时不上报不恢复——旧对象停在 list 过滤的 `.old`，final「消失」 | `driver.rs:723-745` | 先建 spool 再 stash（调换序），或构造失败臂复位 stash | ✅ 已修（**反向复核注记：无回归测试**——tempfile 失败桩面不可注入，`set_stash` 缝+构造序即构造性保证；挂账） |
 | M3 | 响应体全量无界缓冲：错误面 `text()/bytes()` 整读 + **200-回退读面整文件进内存**（apache 倒序 Range 200 全量真形 × 大文件 = OOM 面）；snippet 截断发生在全量读入之后 | `client.rs:475/478/533/540/583/591/663/705/730/751/793` | 错误体有界读（drain_bounded LIMIT 思路）；200-回退按 `end` 封顶/流式跳读；顺删 `window=None` 死路径（Low 第 4 条） | ✅ 已修 |
 | M4 | config 错误文案回显原始 `webdav_url` 值——userinfo 拒收信息本身把嵌入密码带进错误链/日志（R3 面；core `redact_credential_values` 同纪律的驱动侧绕过） | `config.rs:115-121/92-97`（消费点 `cli/lib.rs:5540-5541`） | 拒收文案不回显 `{value:?}` 原文（只指路键名） | ✅ 已修 |
 | M5 | xml `entries()` 二次方复杂度：每行 `position()` 线性扫——万级文件目录 ≈5×10⁸ 次比较（rebuild 面可观测劣化；pan115 11.7 万文件教训同型） | `xml.rs:247` | `HashMap<String, usize>` 索引 | ✅ 已修 |
@@ -42,7 +44,7 @@
 | # | 发现 | 位置 | 修法 | 状态 |
 |---|---|---|---|---|
 | M14 | `PROXY_DIRECT_BACKEND_NOTICE` 把 webdav 列进「恒直连」但驱动实际尊重系统代理 env（刻意不 no_proxy）——proxy_url + webdav 卷的排查方向误导（pan123 落地时更新过此文案，webdav 漏了） | `cli/lib.rs:6024-6030` | webdav 专属文案分支（「忽略 proxy_url 配置键，但尊重标准代理环境变量」） | ✅ 已修 |
-| M15 | `webdav_backend_probe` 配置不全 detail 带 ~22 个连续字面空格（多行字符串漏 `\` 续行——K75-3 同族病，doctor 用户可见） | `cli/lib.rs:6171` | 补续行符或折行重排 | 待修（主会话直做） |
+| M15 | `webdav_backend_probe` 配置不全 detail 带 ~22 个连续字面空格（多行字符串漏 `\` 续行——K75-3 同族病，doctor 用户可见） | `cli/lib.rs:6171` | 补续行符或折行重排 | ✅ 已修（`ba3ad4b`；**反向复核注记：无守卫**——空格回退后 probe 测试仍绿，只断言 `contains("webdav_url")`；fmt 亦不查字面量内部） |
 
 ## Low（~25 条，挂账不阻合入）
 
