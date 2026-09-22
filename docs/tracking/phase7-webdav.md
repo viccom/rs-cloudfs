@@ -2,7 +2,7 @@
 
 > 计划：`docs/plans/2026-09-17-webdav-driver.md` ｜ 需求口径：负责人 2026-09-17「按推荐方案执行；与既有 phase 同策略（计划+跟踪单+TDD）；编译可选；严格遵循项目规范与约束」；**批准：2026-09-21 负责人实施指令（全程自主执行，批次 WD0–WD5 顺延执行）**
 > 基线：main@eda60a7（workspace **1394/0/42**，ignored 42 = 真机/平台/真网类；编号漂移修正——立项裁决用 **K80/K81**，webdav 为**第 7 驱动**，见计划头部留痕）
-> 状态：**WD5 完成（2026-09-22）——收口/审查批待开工**
+> 状态：**六批次 + 收口完成（2026-09-22）——深度审查批进行中**
 > worktree：`feat/webdav-driver`，独立 target（共享 CARGO_TARGET_DIR 双指纹既有教训）
 
 | 任务 | 内容 | 状态 | 完成情况 | 证据 |
@@ -118,3 +118,16 @@
 - chunked PUT 普遍性：仅双样本（挂账维持，D5）
 - nextcloud vendor 路径（X-OC-Mtime）：fixture 无 Nextcloud 实例，未实证（零成本搭车，挂账）
 - 待 WD5：真实广域网链路形态与吞吐（WSL2 回环数字口径，sftp SF5 判例）
+
+
+## 终态挂账总表（收口批 2026-09-22）
+
+| # | 挂账 | 性质 | 出处 |
+|---|---|---|---|
+| 1 | rclone 目录 MOVE VFS 缓存不可见窗（≈5min；子项 404/500、窗内 DELETE 204 留残） | 服务器缓存行为非协议语义——驱动不做补偿；真机断言设计已避开 | WD0 附录 C ⑤/WD5 |
+| 2 | TLS 自签腿（doctor ⑤态真机验证） | fixture 无 TLS 服务器；`webdav_accept_invalid_certs` 离线路径已钉 | WD4/WD5 |
+| 3 | Nextcloud 实服 X-OC-Mtime 搭车 | fixture 无 Nextcloud；协议面零成本保留 | WD0 附录 C ② |
+| 4 | chunked PUT 快路径 | 双 fixture 接受但样本仅二；D5 维持 Content-Length 路线 | WD0 附录 C ③ |
+| 5 | stager close 整读 spool 进内存（Bytes PUT） | D5 最简实现；流式 file body 留真机吞吐批复核后议（stager 模块文档「已知上界」声明） | WD3 偏差 6 |
+| 6 | webdav_url userinfo 拒收的 core 侧判定是 authority 含 `@` 字符串判定（非 url crate 解析） | 第一道漏斗从严即可；驱动侧已用 url crate 精确判定 | WD4 |
+| 7 | rclone warm-cache 窗口的非确定性（同腿两轮一次隐藏一次可见） | 测试已改为「记录不预设」形态 | WD5 执行期 |
