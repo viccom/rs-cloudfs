@@ -1600,11 +1600,12 @@ impl RemoveTuning {
 /// R4's bounded-rebuild knobs (P2, `RebuildTuning`'s own row in
 /// [`RuntimeVolumeCommands`]): the whole background rebuild runs under
 /// `timeout` — an interrupted pass keeps its upserted rows (the rel_path
-/// conflict key makes the merge idempotent, a rerun continues where it
-/// stopped) — and the R5 checkpoint (instance identity + the shutdown
-/// gate + the drained queue) is audited every `checkpoint_interval`.
-/// Deliberately NOT config keys (可配性挂账): a struct injection keeps
-/// the surface at zero while the tests reach millisecond scale through
+/// conflict key makes the merge idempotent) and, since Phase 8 / D8①,
+/// its persisted cursor too, so a rerun continues where it stopped —
+/// and the R5 checkpoint (instance identity + the shutdown gate + the
+/// drained queue) is audited every `checkpoint_interval`. Deliberately
+/// NOT config keys (可配性挂账): a struct injection keeps the surface at
+/// zero while the tests reach millisecond scale through
 /// [`RebuildTuning::fast`].
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct RebuildTuning {
@@ -1612,6 +1613,12 @@ pub struct RebuildTuning {
     pub timeout: Duration,
     /// The R5 checkpoint cadence.
     pub checkpoint_interval: Duration,
+    /// The per-pass entry cap (Phase 8 / D8②) fed to the core walk
+    /// ([`rebuild::RebuildLimits::max_entries`]) — the graceful
+    /// total-size bound: a capped pass stops between directories, keeps
+    /// its persisted queue and reports the interrupted outcome ("rerun
+    /// to continue"); a rerun resumes from the cursor.
+    pub max_entries: usize,
 }
 
 impl Default for RebuildTuning {
@@ -1619,6 +1626,7 @@ impl Default for RebuildTuning {
         Self {
             timeout: Duration::from_secs(15 * 60),
             checkpoint_interval: Duration::from_secs(1),
+            max_entries: rebuild::RebuildLimits::default().max_entries,
         }
     }
 }
@@ -1629,6 +1637,19 @@ impl RebuildTuning {
         Self {
             timeout: Duration::from_millis(300),
             checkpoint_interval: Duration::from_millis(50),
+            max_entries: rebuild::RebuildLimits::default().max_entries,
+        }
+    }
+
+    /// The core-walk bounds this tuning describes (D8②): the entry cap
+    /// plus `time_budget` only when the caller has no supervisor of its
+    /// own — the offline pass (the 15-minute budget's offline
+    /// extension); the live executor passes `time_budget: None` because
+    /// the R4 supervision aborts there.
+    fn limits(&self, with_time_budget: bool) -> rebuild::RebuildLimits {
+        rebuild::RebuildLimits {
+            max_entries: self.max_entries,
+            time_budget: with_time_budget.then_some(self.timeout),
         }
     }
 }
@@ -1923,11 +1944,17 @@ pub async fn run_multi_with_transports_and_commands(
     let command_gate = Arc::new(tokio::sync::Mutex::new(()));
     // The P2 rebuild executor resolution: the injected seam or the
     // production `run_rebuild_command` closure (the same body the
-    // offline `cydrive rebuild` runs — K11 gate + db open + walk).
-    let rebuild_executor: RuntimeRebuild = commands.rebuild.clone().unwrap_or_else(|| {
-        Arc::new(|_name: &str, settings: &CyDriveConfig| {
+    // offline `cydrive rebuild` runs — K11 gate + db open + bounded
+    // walk). D8②: the entry cap flows in from the tuning; the wall
+    // clock stays the R4 supervision's business (this task's own
+    // deadline), so the core walk gets `time_budget: None`.
+    let rebuild_tuning = commands.rebuild_tuning;
+    let rebuild_executor: RuntimeRebuild = commands.rebuild.clone().unwrap_or_else(move || {
+        Arc::new(move |_name: &str, settings: &CyDriveConfig| {
             let settings = settings.clone();
-            Box::pin(async move { run_rebuild_command(&settings).await })
+            Box::pin(async move {
+                run_rebuild_command_with_limits(&settings, rebuild_tuning.limits(false)).await
+            })
         })
     });
     let command_surface = Arc::new(RuntimeVolumeControl {
@@ -4216,15 +4243,36 @@ impl RebuildTask {
             .remove(&self.name);
         let name = &self.name;
         match exit {
+            RebuildExit::Done(Ok(outcome)) if outcome.interrupted.is_some() => {
+                // D8②: a gracefully capped pass — distinct from every
+                // supervision abort (nothing was killed; the walk
+                // stopped itself and left its cursor on disk).
+                let reason = outcome.interrupted.unwrap();
+                println!(
+                    "Volume {name} rebuild interrupted: {} file row(s), {} directory row(s) \
+                     this pass; {reason} — rerun REBUILD to continue (the rows already \
+                     rebuilt are kept, the cursor is persisted).",
+                    outcome.files, outcome.dirs
+                );
+                tracing::warn!(
+                    volume = name,
+                    files = outcome.files,
+                    dirs = outcome.dirs,
+                    %reason,
+                    "background rebuild interrupted by its entry cap; the pass is resumable"
+                );
+            }
             RebuildExit::Done(Ok(outcome)) => {
                 println!(
-                    "Volume {name} rebuild finished: {} file row(s), {} directory row(s).",
-                    outcome.files, outcome.dirs
+                    "Volume {name} rebuild finished: {} file row(s), {} directory row(s); \
+                     {} stale row(s) pruned.",
+                    outcome.files, outcome.dirs, outcome.pruned
                 );
                 tracing::info!(
                     volume = name,
                     files = outcome.files,
                     dirs = outcome.dirs,
+                    pruned = outcome.pruned,
                     "background rebuild finished"
                 );
             }
@@ -4788,10 +4836,24 @@ pub const TELEGRAM_REBUILD_REFUSAL: &str =
 /// metadata db from the backend's authoritative index. Assembles the
 /// driver from the config's `backend` key ([`build_driver`]), then runs
 /// the shared gate + walk against the instance db (`db_path`, same
-/// discovery as every other subcommand).
+/// discovery as every other subcommand). Since Phase 8 / D8② the walk
+/// is bounded (entry cap + the 15-minute wall clock — the live path's
+/// budget extended to the offline path), and an interrupted pass
+/// reports `RebuildOutcome::interrupted` instead of failing.
 pub async fn run_rebuild_command(cfg: &CyDriveConfig) -> Result<rebuild::RebuildOutcome> {
+    run_rebuild_command_with_limits(cfg, RebuildTuning::default().limits(true)).await
+}
+
+/// [`run_rebuild_command`] with explicit per-pass bounds — the live
+/// background executor's entry (D8②: the entry cap flows in from the
+/// tuning; the wall clock stays the R4 supervision's business, so the
+/// caller passes `time_budget: None` there).
+async fn run_rebuild_command_with_limits(
+    cfg: &CyDriveConfig,
+    limits: rebuild::RebuildLimits,
+) -> Result<rebuild::RebuildOutcome> {
     let driver = build_driver(cfg).await?;
-    run_rebuild_with_driver(cfg, driver.as_ref()).await
+    run_rebuild_with_driver_and_limits(cfg, driver.as_ref(), limits).await
 }
 
 /// [`run_rebuild_command`] for the multi-volume mode (Phase 2.5): one
@@ -4830,10 +4892,23 @@ pub async fn run_rebuild_multi(
 /// (tests seed a `MockStorageDriver`; production feeds the
 /// backend-key assembly). Gates in order, all before any backend
 /// traffic: config validity, the telegram shadow-index refusal, the
-/// K11 plaintext-only gate; then the db open and the recursive walk.
+/// K11 plaintext-only gate; then the db open and the bounded walk
+/// (D8②: entry cap + the 15-minute budget — the offline path's
+/// extension of the live rebuild's budget).
 pub async fn run_rebuild_with_driver(
     cfg: &CyDriveConfig,
     driver: &dyn StorageDriver,
+) -> Result<rebuild::RebuildOutcome> {
+    run_rebuild_with_driver_and_limits(cfg, driver, RebuildTuning::default().limits(true)).await
+}
+
+/// [`run_rebuild_with_driver`] with explicit per-pass bounds — the D8②
+/// seam (core tests drive `rebuild_from_backend_with` directly; the
+/// CLI-level tests keep the default-bounded seam).
+async fn run_rebuild_with_driver_and_limits(
+    cfg: &CyDriveConfig,
+    driver: &dyn StorageDriver,
+    limits: rebuild::RebuildLimits,
 ) -> Result<rebuild::RebuildOutcome> {
     cfg.validate().context("invalid configuration")?;
     if cfg.backend == Backend::Telegram {
@@ -4844,7 +4919,7 @@ pub async fn run_rebuild_with_driver(
     rebuild::ensure_plaintext_instance(cfg)?;
     let db = MetaDatabase::open(Path::new(&cfg.db_path))
         .with_context(|| format!("opening metadata db {:?}", cfg.db_path))?;
-    rebuild::rebuild_from_backend(driver, &db, &cloudkit_storage::RelPath::root())
+    rebuild::rebuild_from_backend_with(driver, &db, &cloudkit_storage::RelPath::root(), limits)
         .await
         .context("rebuilding the index from the backend")
 }
@@ -8131,7 +8206,13 @@ mod tests {
                 rebuilds: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 rebuild_tuning: RebuildTuning::fast(),
                 rebuild: Arc::new(|_name: &str, _settings: &CyDriveConfig| {
-                    Box::pin(async { Ok(rebuild::RebuildOutcome { files: 0, dirs: 0 }) })
+                    Box::pin(async {
+                        Ok(rebuild::RebuildOutcome {
+                            files: 0,
+                            dirs: 0,
+                            ..Default::default()
+                        })
+                    })
                 }),
             }
         }

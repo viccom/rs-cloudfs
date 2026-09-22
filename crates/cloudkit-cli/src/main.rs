@@ -675,12 +675,24 @@ async fn rebuild_cmd() -> Result<()> {
     match discover_config_with_volumes().context("config discovery failed")? {
         DiscoveredConfig::Single(cfg) => {
             let outcome = cloudkit_cli::run_rebuild_command(&cfg).await?;
-            println!(
-                "rebuild complete: {} file row(s), {} directory row(s) rebuilt from the {} backend",
-                outcome.files,
-                outcome.dirs,
-                cfg.backend.as_str()
-            );
+            match outcome.interrupted {
+                // Phase 8 / D8②: the pass hit a bound before draining
+                // its queue — the checkpoint stays on disk, a rerun
+                // resumes from the cursor.
+                Some(reason) => println!(
+                    "rebuild interrupted: {} file row(s), {} directory row(s) this pass; \
+                     {reason} — rerun `cydrive rebuild` to resume from the persisted cursor",
+                    outcome.files, outcome.dirs
+                ),
+                None => println!(
+                    "rebuild complete: {} file row(s), {} directory row(s) rebuilt from the \
+                     {} backend; {} stale row(s) pruned",
+                    outcome.files,
+                    outcome.dirs,
+                    cfg.backend.as_str(),
+                    outcome.pruned
+                ),
+            }
         }
         DiscoveredConfig::Multi { process, volumes } => {
             // The P2 forward: a live instance owns these dbs — the
@@ -699,10 +711,19 @@ async fn rebuild_cmd() -> Result<()> {
             let reports = cloudkit_cli::run_rebuild_multi(&volumes).await?;
             for (name, result) in reports {
                 match result {
-                    Ok(outcome) => println!(
-                        "volume {name}: rebuilt {} file row(s), {} directory row(s)",
-                        outcome.files, outcome.dirs
-                    ),
+                    Ok(outcome) => match outcome.interrupted {
+                        Some(reason) => println!(
+                            "volume {name}: rebuild interrupted: {} file row(s), {} \
+                             directory row(s) this pass; {reason} — rerun `cydrive rebuild` \
+                             to resume from the persisted cursor",
+                            outcome.files, outcome.dirs
+                        ),
+                        None => println!(
+                            "volume {name}: rebuilt {} file row(s), {} directory row(s); \
+                             {} stale row(s) pruned",
+                            outcome.files, outcome.dirs, outcome.pruned
+                        ),
+                    },
                     Err(message) => println!("volume {name}: NOT rebuilt — {message}"),
                 }
             }

@@ -138,12 +138,15 @@ fn vocab_rel(path: &str) -> Result<VolRel, StorageError> {
 /// 物化映射的读穿侧错误面：[`materialize_entry`] 说的还是 rebuild 的
 /// 错误形状（D4 平移不动其契约），在此归一到 [`VfsError`]——`Db` 直
 /// 转；`List` 的载荷是驱动错误（R2 分类学）；`EncryptedInstance` 只
-/// 出自 K11 纯闸门（materialize 不产），防御臂归 `Invalid`。
+/// 出自 K11 纯闸门、`Serde` 只出自 rebuild 的检查点序列化（materialize
+/// 两者皆不产），防御臂归 `Invalid`。
 fn materialize(db: &MetaDatabase, entry: &Entry) -> Result<FileRecord, VfsError> {
     materialize_entry(db, entry).map_err(|error| match error {
         RebuildError::Db(db_error) => VfsError::Db(db_error),
         RebuildError::List { source, .. } => VfsError::Transport(source),
-        RebuildError::EncryptedInstance => VfsError::Transport(StorageError::Invalid),
+        RebuildError::EncryptedInstance | RebuildError::Serde(_) => {
+            VfsError::Transport(StorageError::Invalid)
+        }
     })
 }
 

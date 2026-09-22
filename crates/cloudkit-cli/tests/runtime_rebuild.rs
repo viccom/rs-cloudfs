@@ -276,7 +276,11 @@ fn rebuild_probe() -> (
                         break;
                     }
                 }
-                Ok(cloudkit_core::rebuild::RebuildOutcome { files: 1, dirs: 1 })
+                Ok(cloudkit_core::rebuild::RebuildOutcome {
+                    files: 1,
+                    dirs: 1,
+                    ..Default::default()
+                })
             })
         })
     };
@@ -894,6 +898,7 @@ async fn a_reassembled_volume_is_a_new_generation_and_the_running_rebuild_aborts
             rebuild_tuning: RebuildTuning {
                 timeout: Duration::from_secs(30),
                 checkpoint_interval: Duration::from_secs(5),
+                ..RebuildTuning::default()
             },
             ..RuntimeVolumeCommands::default()
         },
@@ -1020,6 +1025,7 @@ async fn uploads_resuming_mid_walk_interrupt_the_rebuild_recoverably() {
             rebuild_tuning: RebuildTuning {
                 timeout: Duration::from_secs(30),
                 checkpoint_interval: Duration::from_millis(50),
+                ..RebuildTuning::default()
             },
             ..RuntimeVolumeCommands::default()
         },
@@ -1129,6 +1135,7 @@ async fn concurrent_rebuilds_across_both_faces_serialize_one_accepts_one_refuses
             rebuild_tuning: RebuildTuning {
                 timeout: Duration::from_secs(30),
                 checkpoint_interval: Duration::from_millis(50),
+                ..RebuildTuning::default()
             },
             ..RuntimeVolumeCommands::default()
         },

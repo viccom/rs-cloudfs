@@ -28,10 +28,22 @@
 //! - Empty backend root: `Ok` with zero rows (a fresh app dir is a
 //!   legitimate state, not an error).
 
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
+use std::time::Duration;
+
+use async_trait::async_trait;
+
 use cloudkit_core::config::CyDriveConfig;
 use cloudkit_core::database::MetaDatabase;
-use cloudkit_core::rebuild::{ensure_plaintext_instance, rebuild_from_backend, RebuildOutcome};
-use cloudkit_storage::{MockStorageDriver, RelPath, StorageDriver, VolumeId, WriteHint};
+use cloudkit_core::rebuild::{
+    ensure_plaintext_instance, rebuild_from_backend, rebuild_from_backend_with, RebuildInterrupted,
+    RebuildLimits, RebuildOutcome,
+};
+use cloudkit_storage::{
+    BackendHandle, ByteStream, Capabilities, Entry, EntryId, Listing, MockStorageDriver, Page,
+    Quota, Range, RelPath, StorageDriver, StorageError, UploadStager, VolumeId, WriteHint,
+};
 
 // ------------------------------------------------------------- helpers ---
 
@@ -88,7 +100,11 @@ async fn rebuild_walks_the_backend_tree_into_db_rows() {
         .expect("rebuild walks the tree");
     assert_eq!(
         outcome,
-        RebuildOutcome { files: 3, dirs: 1 },
+        RebuildOutcome {
+            files: 3,
+            dirs: 1,
+            ..Default::default()
+        },
         "three files and the docs/ directory"
     );
 
@@ -154,8 +170,10 @@ async fn rebuild_upserts_over_stale_rows_and_reports_counts() {
     let db = MetaDatabase::open(&dir.path().join("meta.db")).expect("open db");
     // A stale pending row (crash-staged upload that never drained) and
     // a ghost row for a file the backend no longer has — the rebuild
-    // refreshes the first and leaves the second untouched (K11 scope:
-    // bootstrap rows from the backend, no pruning).
+    // refreshes the first; the second is the completion sweep's target
+    // (Phase 8 / D8③: the K11 no-pruning scope ended — a COMPLETING
+    // pass prunes uploaded rows the scan never re-touched, while the
+    // pending row is sweep-exempt by is_uploaded=0).
     let stale_id = db
         .upsert_file(&cloudkit_core::database::FileUpsert {
             rel_path: "/a.txt".to_string(),
@@ -220,9 +238,13 @@ async fn rebuild_upserts_over_stale_rows_and_reports_counts() {
     );
     assert_eq!(a_chunks[0].size, 3);
 
-    // Ghost row untouched (no pruning in K11).
-    let ghost = db.get_file("/ghost.txt").expect("read ghost").expect("row");
-    assert_eq!(ghost.telegram_msg_id, Some(555), "ghost row survives");
+    // Ghost row pruned by the completion sweep (D8③): uploaded,
+    // pre-scan (updated_at < the scan's anchor), absent from the
+    // backend — exactly the "seen by no pass of this scan" shape.
+    assert!(
+        db.get_file("/ghost.txt").expect("read ghost").is_none(),
+        "the ghost row is pruned by the completing pass"
+    );
 }
 
 #[tokio::test]
@@ -233,7 +255,14 @@ async fn rebuild_of_an_empty_backend_is_ok_with_zero_rows() {
     let outcome = rebuild_from_backend(&driver, &db, &RelPath::root())
         .await
         .expect("empty backend is a legitimate state");
-    assert_eq!(outcome, RebuildOutcome { files: 0, dirs: 0 });
+    assert_eq!(
+        outcome,
+        RebuildOutcome {
+            files: 0,
+            dirs: 0,
+            ..Default::default()
+        }
+    );
 }
 
 #[test]
@@ -260,4 +289,486 @@ fn encrypted_instances_are_refused_with_sync_guidance() {
     // Plaintext instances (the default) pass the gate.
     ensure_plaintext_instance(&CyDriveConfig::default())
         .expect("plaintext instance passes the gate");
+}
+
+// ============================================================== RT4 ===
+// Phase 8 / D8 三件套：迭代工作队列 + `rebuild_state` 持久化续跑 +
+// `max_entries` 总上限 + 完成趟 sweep prune（三重保护）。红测试先于实现
+// 写就；断言口径对齐计划 Task 4 与验收 A4/A5。
+
+// ------------------------------------------------- RT4 harness 裥料 ---
+
+/// list 调用计数的薄包装驱动（形态照 `readthrough.rs` 的
+/// `CountingDriver`——mock 本体无 list 计数，「续跑不重扫已完成目录」
+/// 的断言（A4）全靠它）。
+struct CountingDriver {
+    inner: Arc<MockStorageDriver>,
+    list_calls: AtomicUsize,
+}
+
+impl CountingDriver {
+    fn new(inner: Arc<MockStorageDriver>) -> Self {
+        Self {
+            inner,
+            list_calls: AtomicUsize::new(0),
+        }
+    }
+
+    fn list_calls(&self) -> usize {
+        self.list_calls.load(Ordering::SeqCst)
+    }
+}
+
+#[async_trait]
+impl StorageDriver for CountingDriver {
+    fn volume(&self) -> &VolumeId {
+        self.inner.volume()
+    }
+
+    fn capabilities(&self) -> Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn list(&self, dir: &RelPath, page: Page) -> Result<Listing, StorageError> {
+        self.list_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.list(dir, page).await
+    }
+
+    async fn stat(&self, path: &RelPath) -> Result<Entry, StorageError> {
+        self.inner.stat(path).await
+    }
+
+    async fn mkdir(&self, path: &RelPath) -> Result<(), StorageError> {
+        self.inner.mkdir(path).await
+    }
+
+    async fn delete(&self, id: &EntryId) -> Result<(), StorageError> {
+        self.inner.delete(id).await
+    }
+
+    async fn rename(&self, from: &RelPath, to: &RelPath) -> Result<(), StorageError> {
+        self.inner.rename(from, to).await
+    }
+
+    async fn reader(&self, id: &EntryId, range: Option<Range>) -> Result<ByteStream, StorageError> {
+        self.inner.reader(id, range).await
+    }
+
+    async fn writer(
+        &self,
+        path: &RelPath,
+        hint: &WriteHint,
+    ) -> Result<Box<dyn UploadStager>, StorageError> {
+        self.inner.writer(path, hint).await
+    }
+
+    async fn quota(&self) -> Result<Quota, StorageError> {
+        self.inner.quota().await
+    }
+}
+
+// `CountingDriver` 的 BackendHandle 进口仅服务 trait 签名的可读性；钉
+// 一处使用避免 unused 导入（reader 不展开句柄构造）。
+#[allow(dead_code)]
+fn _handle_type_witness(_: BackendHandle) {}
+
+/// A deterministic multi-directory tree: 10 root files plus five
+/// directories `d1..d5` with 10 files each — 6 listable directories,
+/// 65 entries, 60 file rows.
+async fn seed_wide_tree(driver: &MockStorageDriver) {
+    for i in 0..10 {
+        seed_file(driver, &format!("f{i}.txt"), b"x").await;
+    }
+    for d in 1..=5 {
+        for i in 0..10 {
+            seed_file(driver, &format!("d{d}/f{i}.txt"), b"x").await;
+        }
+    }
+}
+
+/// Seeds one pre-scan UPLOADED row (`is_uploaded = 1`) with its K11
+/// single-container chunk — the shape a completed rebuild or an upload
+/// persist leaves behind. `updated_at` lands before any later scan's
+/// start time, i.e. the exact "seen by a previous scan?" candidate the
+/// completion sweep judges.
+fn seed_uploaded_row(db: &MetaDatabase, path: &str, msg_id: i64) -> i64 {
+    let (parent, name) = match path.rfind('/') {
+        Some(0) => ("/", &path[1..]),
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => ("/", path),
+    };
+    let id = db
+        .upsert_file(&cloudkit_core::database::FileUpsert {
+            rel_path: path.to_string(),
+            name: name.to_string(),
+            parent_dir: parent.to_string(),
+            size: 1,
+            mtime: 1.0,
+            sha256: None,
+            is_dir: false,
+            telegram_msg_id: Some(msg_id),
+            is_uploaded: true,
+            is_cached: false,
+            is_encrypted: false,
+            chunk_count: 1,
+            mime_type: None,
+        })
+        .expect("seed uploaded row");
+    db.upsert_chunk(id, 0, msg_id, 1, None).expect("seed chunk");
+    id
+}
+
+/// A pre-scan PENDING row (`is_uploaded = 0`) — the in-flight shape the
+/// sweep must never touch (D8③ protection d / D10).
+fn seed_pending_row(db: &MetaDatabase, path: &str) {
+    let (parent, name) = match path.rfind('/') {
+        Some(0) => ("/", &path[1..]),
+        Some(i) => (&path[..i], &path[i + 1..]),
+        None => ("/", path),
+    };
+    db.upsert_file(&cloudkit_core::database::FileUpsert {
+        rel_path: path.to_string(),
+        name: name.to_string(),
+        parent_dir: parent.to_string(),
+        size: 1,
+        mtime: 1.0,
+        sha256: None,
+        is_dir: false,
+        telegram_msg_id: None,
+        is_uploaded: false,
+        is_cached: true,
+        is_encrypted: false,
+        chunk_count: 1,
+        mime_type: None,
+    })
+    .expect("seed pending row");
+}
+
+/// 1. 续跑（A4）：max_entries=50 的首趟在完成 root+d1..d4（55 条 ≥ 50）
+///    后优雅停，d5 留在持久化队列；二趟从游标继续恰补 1 次 list——
+///    总 list 次数 = 可列目录数（6），无任何已完成目录被重扫。
+#[tokio::test]
+async fn an_interrupted_pass_resumes_without_relisting_completed_directories() {
+    let mock = Arc::new(seeded_driver());
+    seed_wide_tree(&mock).await;
+    let driver = CountingDriver::new(Arc::clone(&mock));
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = MetaDatabase::open(&dir.path().join("meta.db")).expect("open db");
+    let limits = RebuildLimits {
+        max_entries: 50,
+        time_budget: None,
+    };
+
+    // Pass 1: root (15 entries: 10 files + 5 dir rows) then d1..d4 (40)
+    // → 55 ≥ 50 → stops with d5 still pending.
+    let first = rebuild_from_backend_with(&driver, &db, &RelPath::root(), limits)
+        .await
+        .expect("first pass");
+    assert_eq!(
+        first.interrupted,
+        Some(RebuildInterrupted::EntriesBudget),
+        "the pass stops gracefully on the entry cap"
+    );
+    assert_eq!((first.files, first.dirs), (50, 5), "root + d1..d4 walked");
+    assert_eq!(
+        driver.list_calls(),
+        5,
+        "root and d1..d4 listed; d5 still pending"
+    );
+    // The checkpoint survives on disk (D8①).
+    assert!(
+        db.rebuild_state_get("scan_started_at")
+            .expect("kv read")
+            .is_some(),
+        "the scan anchor is persisted by the first pass"
+    );
+    assert!(
+        db.rebuild_state_get("pending").expect("kv read").is_some(),
+        "the remaining queue is persisted"
+    );
+
+    // Pass 2: resumes from the persisted cursor — exactly ONE new list.
+    let second = rebuild_from_backend_with(&driver, &db, &RelPath::root(), limits)
+        .await
+        .expect("second pass");
+    assert_eq!(
+        second.interrupted, None,
+        "the resumed pass drains the queue and completes"
+    );
+    assert_eq!(
+        (second.files, second.dirs),
+        (10, 0),
+        "only d5's files materialize in the resumed pass"
+    );
+    assert_eq!(
+        driver.list_calls(),
+        6,
+        "total lists = listable directories: no completed directory re-listed"
+    );
+    // The full tree is indexed exactly once.
+    for d in 1..=5 {
+        for i in 0..10 {
+            assert!(
+                db.get_file(&format!("/d{d}/f{i}.txt"))
+                    .expect("read row")
+                    .is_some(),
+                "d{d}/f{i}.txt must be indexed"
+            );
+        }
+    }
+    assert!(db.get_file("/f0.txt").expect("read row").is_some());
+    // Completion cleared the checkpoint (all three keys).
+    for key in ["pending", "scan_started_at", "entries_done"] {
+        assert!(
+            db.rebuild_state_get(key).expect("kv read").is_none(),
+            "key {key:?} must be cleared by the completing pass"
+        );
+    }
+}
+
+/// 2. 总上限（A4）：中断态的 outcome 明示「entries budget ran out;
+///    rerun to continue」；未完成趟绝不 sweep——预先播种的 stale 行
+///    （含 chunks）原样幸存，检查点三键仍在。
+#[tokio::test]
+async fn an_entry_budget_stop_reports_rerun_and_never_sweeps() {
+    let mock = seeded_driver();
+    // Backend: a.txt + d1/b.txt — a pass capped at 1 entry finishes root
+    // (2 entries ≥ 1) and stops with d1 pending.
+    seed_file(&mock, "a.txt", b"a").await;
+    seed_file(&mock, "d1/b.txt", b"b").await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = MetaDatabase::open(&dir.path().join("meta.db")).expect("open db");
+    // A pre-scan uploaded row for a path the backend no longer carries:
+    // a COMPLETING pass would prune it — the interrupted pass must leave
+    // it (and its chunks) untouched.
+    let ghost = seed_uploaded_row(&db, "/gone.txt", 555);
+    let limits = RebuildLimits {
+        max_entries: 1,
+        time_budget: None,
+    };
+
+    let first = rebuild_from_backend_with(&mock, &db, &RelPath::root(), limits)
+        .await
+        .expect("first pass");
+    assert_eq!(first.interrupted, Some(RebuildInterrupted::EntriesBudget));
+    let reason = first.interrupted.unwrap().to_string();
+    assert!(
+        reason.contains("entries budget ran out"),
+        "the interruption must name its budget, got: {reason}"
+    );
+    assert!(
+        reason.contains("rerun to continue"),
+        "the interruption must carry the rerun semantics, got: {reason}"
+    );
+    // The checkpoint is on disk for the rerun.
+    assert!(
+        db.rebuild_state_get("pending").expect("kv read").is_some(),
+        "d1 stays queued"
+    );
+    assert!(
+        db.rebuild_state_get("scan_started_at")
+            .expect("kv read")
+            .is_some(),
+        "the anchor is kept for the rerun"
+    );
+    // An incomplete pass NEVER sweeps.
+    assert!(
+        db.get_file("/gone.txt").expect("read row").is_some(),
+        "the stale row survives an interrupted pass"
+    );
+    assert_eq!(
+        db.get_chunks_by_file_id(ghost).expect("read chunks").len(),
+        1,
+        "the stale row's chunk survives too"
+    );
+}
+
+/// 3. sweep 三重保护（A5）：完成趟只删「扫描期间未再触碰且
+///    is_uploaded=1」的行——(a) 扫描前存在且远端已删 → 行删 +
+///    chunks 级联清空；(b) 本趟物化的行 → 保留；(d) in-flight 行
+///    （is_uploaded=0）→ 保留。
+#[tokio::test]
+async fn the_completion_sweep_prunes_unseen_rows_and_honors_the_protections() {
+    let mock = seeded_driver();
+    seed_file(&mock, "a.txt", b"a").await;
+    seed_file(&mock, "d1/x.txt", b"x").await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = MetaDatabase::open(&dir.path().join("meta.db")).expect("open db");
+    // (a) pre-scan uploaded row, remote-deleted → the sweep's target.
+    let gone = seed_uploaded_row(&db, "/gone.txt", 555);
+    // (d) pre-scan in-flight row → sweep-exempt by is_uploaded=0.
+    seed_pending_row(&db, "/pending.bin");
+
+    let outcome = rebuild_from_backend(&mock, &db, &RelPath::root())
+        .await
+        .expect("completing pass");
+    assert_eq!(outcome.interrupted, None, "the pass completes");
+
+    // (a) pruned, with its chunks cascaded away.
+    assert!(
+        db.get_file("/gone.txt").expect("read row").is_none(),
+        "the remote-deleted row is pruned by the completion sweep"
+    );
+    assert!(
+        db.get_chunks_by_file_id(gone)
+            .expect("read chunks")
+            .is_empty(),
+        "chunks cascade with the swept row"
+    );
+    assert!(
+        outcome.pruned >= 1,
+        "the outcome reports the sweep's deletion count, got {}",
+        outcome.pruned
+    );
+
+    // (b) rows upserted by this very pass survive.
+    let a = db.get_file("/a.txt").expect("read row").expect("row");
+    assert!(a.is_uploaded, "the freshly materialized row is intact");
+    assert!(
+        db.get_file("/d1/x.txt").expect("read row").is_some(),
+        "nested fresh rows survive"
+    );
+
+    // (d) the in-flight row survives.
+    let pending = db.get_file("/pending.bin").expect("read row").expect("row");
+    assert!(
+        !pending.is_uploaded,
+        "the in-flight row is untouched by the sweep"
+    );
+
+    // Completion cleared the checkpoint.
+    assert!(
+        db.rebuild_state_get("scan_started_at")
+            .expect("kv read")
+            .is_none(),
+        "the anchor is cleared once the sweep ran"
+    );
+}
+
+/// 3c. 跨续跑早趟物化的行 → 保留（scan_started_at 从首趟持久，绝不在
+///     续跑时重置——本条即防回归：若续跑重置锚点，早趟行的 updated_at
+///     会落在「未见」侧而被误删）。
+#[tokio::test]
+async fn early_pass_rows_survive_the_completion_sweep_after_a_resume() {
+    let mock = Arc::new(seeded_driver());
+    // Initial backend: one root file + d1 with 5 files. Root's listing
+    // carries exactly 2 entries (f0 + the d1 dir row), so the 2-entry
+    // cap stops pass 1 right after root with d1 still pending.
+    seed_file(&mock, "f0.txt", b"0").await;
+    for i in 0..5 {
+        seed_file(&mock, &format!("d1/f{i}.txt"), b"x").await;
+    }
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = MetaDatabase::open(&dir.path().join("meta.db")).expect("open db");
+    let counting = CountingDriver::new(Arc::clone(&mock));
+    let first = rebuild_from_backend_with(
+        &counting,
+        &db,
+        &RelPath::root(),
+        RebuildLimits {
+            max_entries: 2,
+            time_budget: None,
+        },
+    )
+    .await
+    .expect("first pass");
+    assert_eq!(first.interrupted, Some(RebuildInterrupted::EntriesBudget));
+    // The early-pass rows exist now (updated_at = pass-1 time).
+    assert!(db.get_file("/f0.txt").expect("read row").is_some());
+    assert!(db.get_file("/d1").expect("read row").is_some());
+
+    // The remote grows mid-scan: d1 gains a subdirectory.
+    seed_file(&mock, "d1/sub/deep.txt", b"d").await;
+
+    // Pass 2 gets a fresh (larger) budget — the rerun shape — and
+    // completes, which runs the sweep against pass 1's persisted anchor.
+    let second = rebuild_from_backend_with(
+        &counting,
+        &db,
+        &RelPath::root(),
+        RebuildLimits {
+            max_entries: 100,
+            time_budget: None,
+        },
+    )
+    .await
+    .expect("second pass");
+    assert_eq!(second.interrupted, None, "the resumed pass completes");
+    assert!(
+        db.get_file("/f0.txt").expect("read row").is_some(),
+        "the early-pass file row survives the sweep"
+    );
+    assert!(
+        db.get_file("/d1").expect("read row").is_some(),
+        "the early-pass directory row survives the sweep"
+    );
+    assert!(
+        db.get_file("/d1/sub/deep.txt").expect("read row").is_some(),
+        "the mid-scan remote addition is indexed"
+    );
+    assert!(
+        db.rebuild_state_get("scan_started_at")
+            .expect("kv read")
+            .is_none(),
+        "the completed scan clears its anchor"
+    );
+}
+
+/// 4. 未完成趟（时间预算中断）→ 绝不 sweep：零预算的趟在第一个目录
+///    边界即停（确定性，无需睡眠），队列照播、stale 行带 chunks 幸存。
+#[tokio::test]
+async fn a_time_budget_stop_leaves_everything_and_never_sweeps() {
+    let mock = seeded_driver();
+    seed_file(&mock, "a.txt", b"a").await;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = MetaDatabase::open(&dir.path().join("meta.db")).expect("open db");
+    let ghost = seed_uploaded_row(&db, "/gone.txt", 555);
+
+    // A zero wall-clock budget: the deadline is already elapsed at the
+    // first directory boundary — deterministic, no sleeping.
+    let outcome = rebuild_from_backend_with(
+        &mock,
+        &db,
+        &RelPath::root(),
+        RebuildLimits {
+            max_entries: usize::MAX,
+            time_budget: Some(Duration::ZERO),
+        },
+    )
+    .await
+    .expect("the pass answers");
+    assert_eq!(outcome.interrupted, Some(RebuildInterrupted::TimeBudget));
+    assert_eq!(
+        (outcome.files, outcome.dirs),
+        (0, 0),
+        "nothing was processed"
+    );
+    let reason = outcome.interrupted.unwrap().to_string();
+    assert!(
+        reason.contains("time budget ran out"),
+        "the interruption must name its budget, got: {reason}"
+    );
+    assert!(
+        reason.contains("rerun to continue"),
+        "the interruption must carry the rerun semantics, got: {reason}"
+    );
+    // The seeded queue is the checkpoint; nothing was swept.
+    assert!(
+        db.rebuild_state_get("pending").expect("kv read").is_some(),
+        "the queue stays persisted for the rerun"
+    );
+    assert!(
+        db.get_file("/gone.txt").expect("read row").is_some(),
+        "an incomplete pass never sweeps"
+    );
+    assert_eq!(
+        db.get_chunks_by_file_id(ghost).expect("read chunks").len(),
+        1,
+        "the stale row's chunk survives"
+    );
 }
