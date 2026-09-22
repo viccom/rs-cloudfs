@@ -16,7 +16,7 @@ L1 驱动  telegram │ baidu │ local │ sftp │ pan115 │ pan123 │ webda
 
 **新后端接入 = 实现一个驱动 + 过 conformance 套件，上层全部能力（挂载/仪表盘/同步/CLI）自动可用。**驱动分两类（[driver-onboarding §10](docs/standards/driver-onboarding.md)）：后端有「按路径枚举」面的走 `StorageDriver` 宽面 + conformance（baidu/local/sftp）；没有的走 `CloudTransport` 窄面（telegram 先例——远端是消息，bot 读历史被平台拒绝，索引只存在于本地 db + sync）。**两类在编译开关上完全平权**（见下文 feature 门控）。
 
-## 状态（2026-09-20）
+## 状态（2026-09-23）
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
@@ -34,6 +34,7 @@ L1 驱动  telegram │ baidu │ local │ sftp │ pan115 │ pan123 │ webda
 | Phase 5 | 115 网盘存储驱动（ck-pan115：官方开放平台 device-code PKCE，K61/K62/K65/K69） | ✅ 完成（115-0…115-5：conformance 八断言绿 + 全装配接线；真机最小冒烟 3/3——上传回读逐字节 / Range 窗口逐字节 / 秒传同 fid 命中；完整矩阵列 `#[ignore]` 留证） |
 | Phase 6 | 123 网盘存储驱动（ck-pan123：web API 直裁 + web 身份合规 D5，K63/K64/K76/K77） | ✅ 完成（123-0…123-5：conformance 八断言绿 + 12 装配点 + 六组合裁剪零告警；真机矩阵 3/3 + E2E 5/5——上传回读逐字节 / Range 窗口 / 秒传 Reuse / 分片差集 resume / 加密 aead_v2 全栈 / WebDAV 双模式 / setup 向导 / doctor。删除 = 回收站语义（D2 trash）；**免费档每日下载流量 ≈10GiB**（会员消解；驱动 traffic 预检 + 5113/5114 人话指引）） |
 | Phase 7 | WebDAV 存储驱动（ck-webdav：自铸薄客户端 reqwest + quick-xml，K80/K81；通用挂载协议——rclone serve/Alist/Nextcloud/群晖/mod_dav 皆成后端） | ✅ 完成（WD0–WD5：双桩制（RFC 严格建模手搓桩 + dav-server 参照桩）conformance 八断言绿；WD0 双真机服务器 11 项怪癖矩阵钉死；WD5 双服务器十腿全绿——上传回读逐字/Range/吞吐 214.8↑234.2↓ MiB/s/digest stale 恢复/断线自愈/覆盖写 stash 真机实证； Basic 预发+Digest 协商恰一次、rclone MKCOL-201 陷阱对策、外部文件 authoritative_index 实证） |
+| Phase 8 | read-through 按需逐层索引（K83；访问哪层回源哪层 + 物化缓存，rebuild 降级为可续跑/有界/会 prune 的全量校对工具） | ✅ 完成（RT0–RT5 + 合入前审查批 1H+7M+6L 清偿；机制五件套全在 L2/L3 共性面——六宽面驱动零代码接入，新驱动义务入 [driver-onboarding §11](docs/standards/driver-onboarding.md)；四消费面只换数据获取函数；webdav 真机矩阵 7/7（access log 差分精确计数）+ sftp/local 冒烟 + A1/A2 用户场景真机腿；加密卷读面零变化、不物化） |
 
 阶段计划与裁决：[docs/plans/2026-09-07-cloudfusion-foundation.md](docs/plans/2026-09-07-cloudfusion-foundation.md) ｜ 历史裁决：[docs/decisions.md](docs/decisions.md)
 
@@ -55,7 +56,9 @@ pan123 实例：`backend = "pan123"` + `pan123_token`（setup 向导扫码或账
 webdav 实例：`backend = "webdav"` + `webdav_url`（http(s) 完整 URL，**可含挂载子路径**——子路径即卷根；凭据不进 URL）+ `webdav_username`/`webdav_password`（成对；env `CYDRIVE_WEBDAV_PASSWORD` 可覆盖）；可选 `webdav_auth`（`auto` 缺省 = Basic 预发→401 Digest 协商恰一次 / `basic` / `digest`）、`webdav_vendor`（`generic` 缺省 / `nextcloud`——只影响 X-OC-Mtime 搭车）、`webdav_accept_invalid_certs`（缺省 false；自签 NAS 开洞，true 时启动 warn + doctor 提示）。mtime 只读真源（D2 修订：双 fixture 证 generic 服务器均不可真写）；删除即终删（WebDAV 无回收站）。
 **全参数示例配置**（凭据已脱敏占位，可用 `cydrive status` 验证解析）：单卷 [`examples/single-volume.example.toml`](examples/single-volume.example.toml)（单卷配置键全览，注释分组）；多卷 [`examples/multi-volume/`](examples/multi-volume/)（进程级 `config.example.toml` + 4 卷矩阵 `volumes/`：baidu-enc / baidu-plain / local-enc / local-plain——同后端多卷×加密开关，层次在文件布局：进程级键与卷级键分文件，见下节）。
 权威后端（baidu/local）冷启动可 `cydrive rebuild` 从后端重建索引（明文集；加密实例走 sync）。多卷模式下若实例在运行，rebuild 自动经控制通道转发为各卷的后台 `REBUILD <名>`（受理即回，进度看 `LIST` 的 `rebuilding` 标记；实例不在线则照旧离线重建）。
-新后端接入指南：[docs/standards/driver-onboarding.md](docs/standards/driver-onboarding.md)（conformance 套件 + 装配点 + E2E 拓扑）。
+
+**按需索引（read-through，Phase 8）**：权威后端（local/baidu/sftp/pan115/pan123/webdav 六驱动）的读路径不再以本地索引为闸门——访问哪层回源哪层：目录枚举每视图向远端现查并落库缓存（`Vfs::read_dir_fresh`），单文件查询走 5s TTL 缓存窗、miss 或过期时回源物化（`Vfs::stat_fresh`）；WebDAV 网关、仪表盘、WinFsp 盘符三面共用，外部改动（直接写后端/他机改动）重进目录即可见（WinFsp 面受 FSD 内核目录缓存影响，分钟级最终一致）。`cydrive rebuild` 相应降级为全量校对工具：进度落盘可中断续跑、单趟有条目上限、完成趟会 prune 远端已删除的陈旧行——不再是日常读取的索引前置。加密卷读面零变化：只读既有索引、**永不回源物化**（密文 size 语义保护），索引维护照旧走 `cydrive sync`；telegram 窄面卷读行为不变。
+新后端接入指南：[docs/standards/driver-onboarding.md](docs/standards/driver-onboarding.md)（conformance 套件 + 装配点 + E2E 拓扑；未来驱动零行 read-through 代码自动获得按需索引，见其 §11）。
 
 ### 按需裁剪驱动（feature 门控）
 

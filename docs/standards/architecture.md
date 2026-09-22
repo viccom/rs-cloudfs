@@ -42,7 +42,7 @@ L0 基础    http(代理/IPv4/连接池) / keyring / logging / config
 ## 3. 关键架构机制（对应设计文档 D1–D10）
 
 - **VolumeId**（D6）：`EntryId = (VolumeId, BackendHandle)`；v1 单卷运行，ID 格式从第一天带卷——多卷挂载时代 L3+ 零返工；
-- **影子/权威索引**（D4）：驱动声明 `AUTHORITATIVE_INDEX` 能力；VFS 解析顺序 = 本地 db → (权威)后端 → (影子)sync；bootstrap 双路径；
+- **影子/权威索引**（D4）：驱动声明 `AUTHORITATIVE_INDEX` 能力；VFS 解析顺序 = 本地 db → (权威)后端 → (影子)sync——**前两跳已落地（Phase 8 read-through，`cloudkit-core::readthrough`：miss/TTL 过期经驱动回源物化；影子索引后端维持 sync）**；bootstrap 双路径；
 - **MetadataEvent 总线**（D8）：db update_hook 单点门铃，含 volume 维度；sync/未来订阅者从这里拿变更，**禁止任何「手工埋点」回归**（rs-CyDrive 0.7.2 教训）；
 - **加密装饰器**（D7）：v1 GCM（兼容冻结）+ v2 分块 AEAD（流式+随机访问）；scheme 是 Entry 元数据，读路径按 scheme 分发；
 - **conformance kit**（D9）：驱动过套件 = 上层能力自动可用；新驱动 PR 必附套件通过证据。

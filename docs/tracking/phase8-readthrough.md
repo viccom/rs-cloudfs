@@ -2,9 +2,9 @@
 
 > 计划：`docs/plans/2026-09-22-readthrough-index.md` ｜ 需求口径：负责人 2026-09-22 拍板路线 C（B 为主 + A 最小集），三点要求：①先出详细可行方案与计划；②六后端+未来驱动共性提炼；③证明架构增强非破坏
 > 基线：main@86003a0（workspace **1602/0/52** + 五门禁绿；Phase 7 webdav 已合入并反向复核毕）
-> 状态：**RT5 测试批完成（2026-09-22）——剩余：文档联动（README/AGENTS/driver-onboarding/architecture）+ decisions K83 入档 + 深度审查批（K78 形态）**
+> 状态：**Phase 8 全批次完成（2026-09-23，RT0–RT5 + 审查修复批 `4e78b3d` + 文档批 RT5d），待合入**
 > worktree：`feat/readthrough-index`，独立 target（共享 CARGO_TARGET_DIR 双指纹既有教训）
-> 编号：裁决 K83（待入 decisions）；批次 RT0–RT5 顺序执行，RT3 与 RT4 可并行派发
+> 编号：裁决 K83（已入档 decisions.md 2026-09-23）；批次 RT0–RT5 顺序执行，RT3 与 RT4 可并行派发
 
 | 任务 | 内容 | 状态 | 完成情况 | 证据 |
 |---|---|---|---|---|
@@ -13,7 +13,7 @@
 | RT2 | readthrough 原语（read_dir_fresh/stat_fresh/reconcile/DirCache） | ✅ 2026-09-22 | `readthrough.rs`（DirCache：TTL 5s+with_ttl 缝/单飞闸+世代归并/就近失效；reconcile：upsert 侧 in-flight 豁免+双确认 prune+32 上限+NotFound 臂本层删除+stale-if-error）+ Vfs 两薄壳 + 写侧失效三调用点 + `VfsError::EncryptedInstance`；门序 D2 退化→D10 拒收；`sync::is_in_flight_row` 提取单点同源 | commit `aa47649`；readthrough 16/0、rebuild 4/0 零漂移、sync 27/0 零漂移；workspace **1623/0/52**；五门禁绿；批次日志 RT2 节 |
 | RT3 | 四消费面接线（网关/仪表盘/winfs；bot 零改动） | ✅ 2026-09-22 | 三面只换数据获取函数：webdav `read_dir`/`metadata`/`open` 读臂改 `stat_fresh`/`read_dir_fresh`（存在性+is_dir 预检保留经 stat_fresh，NotFound/Forbidden 语义不变）；winfsp `dir_entries`（仅 marker=None 腿到达）改 `read_dir_fresh`，`meta_for`/`open_with_read` 经新 `resolve_row_fresh`（精确命中零网络 → stat_fresh → K45 大小写扫描；NotFound 不终判、其余错误传播；guard/miss 判定路径保持纯 db）；web `api_list` 改 `read_dir_fresh`（驱动 NotFound→404、其余错→500；窄面空目录存在性探针保留=A6；`api_files` 零改动 D9 且测试钉零 list；bot `/ls` 零改动 D2） | commit `2d00c64`；三包 153/0、winfsp 腿 118/0+1ign、workspace **1627/0/52**（+5=webdav 3+web 1+winfsp 腿 1）；五门禁绿；批次日志 RT3 节 |
 | RT4 | rebuild 三件套（续跑/上限/sweep） | ✅ 2026-09-22 | D8①②③ 全落地：database.rs 新 `rebuild_state(key,value)` KV 表（sync_mirror 同先例，零 files DDL）+ `rebuild_state_get/set/clear` + `sweep_unseen`（is_uploaded=1 且 updated_at<锚点；chunks 同事务显式级联照 delete_file 先例）；rebuild.rs boxed 递归改显式 VecDeque 工作队列 + 每目录完成落盘（pending JSON 队列/scan_started_at 首趟锚点续跑复用/entries_done 累计）+ `RebuildLimits`（max_entries 缺省 20 万/趟、目录粒度检查不重扫已完成目录）+ `RebuildOutcome` 扩 `pruned`+`interrupted: Option<EntriesBudget/TimeBudget>`（Display 含 rerun to continue）+ 完成趟才 sweep 后清检查点；cli `RebuildTuning.max_entries` + 离线路径补 15min 预算（limits(true)）+ 活实例执行器喂 max_entries（time_budget=None 留 R4 监督）+ 三入口文案（main 单/多卷 + RebuildTask Done 臂按 interrupted 分叉）；既有 4 测试：2 处 RebuildOutcome 字面量 ..Default::default() 编译适配 + ghost 行断言按 D8③ 新契约改（唯一语义变更）| commit 见批次日志；rebuild **9/0**（+5）、readthrough 16/0 零漂移、cli rebuild 3/0 + runtime_rebuild 10/0；workspace **1632/0/52**；五门禁绿；批次日志 RT4 节 |
-| RT5 | 真机矩阵 + 文档 + 收口（含深度审查批，K78 形态） | 🔄 测试批完成（2026-09-22）；README/AGENTS/driver-onboarding/architecture 文档联动 + decisions K83 入档 + 深度审查批待收口 | 真机矩阵腿全落地：`ck-webdav tests/live_readthrough.rs` 七腿（A1 apache 外部真值+rclone 双形态 / A2 删除双确认 prune / A2 新增 D5 即时 / A3 千级条目 2 页 PROPFIND+TTL 零网络+深跳 1 list——**apache access log 差分精确计数** / A4 max_entries 断趟→rerun 完成趟 9 PROPFIND=目录数零重扫+sweep pruned=0+全树落库 / AList 真实场景（负责人实例，env 注入，前缀目录纪律+清扫核空）/ 全局残留核空）+ `ck-local tests/readthrough_smoke.rs` 非 ignored 共性冒烟（外部真值四形态全链）+ `ck-sftp tests/live_readthrough.rs` ignored 共性冒烟（OpenSSH 真机全链）；L1→L3 dev-dep 三处（check_layers 机械面通过，字面张力见批次日志）；workspace **1633/0/60**（+1 非 ignored +8 ignored）；五门禁绿；真机 webdav **7/7 零残留**、sftp **1/1**（0.85s）、local 1/1 | commit 见批次日志；批次日志 RT5 节 |
+| RT5 | 真机矩阵 + 文档 + 收口（含深度审查批，K78 形态） | ✅ 全批次完成（2026-09-23）——真机矩阵 7+1+1 腿 + A1/A2 用户场景（RT5b）+ 审查修复批 `4e78b3d`（RT5c）+ 文档批（RT5d） | 真机矩阵腿全落地：`ck-webdav tests/live_readthrough.rs` 七腿（A1 apache 外部真值+rclone 双形态 / A2 删除双确认 prune / A2 新增 D5 即时 / A3 千级条目 2 页 PROPFIND+TTL 零网络+深跳 1 list——**apache access log 差分精确计数** / A4 max_entries 断趟→rerun 完成趟 9 PROPFIND=目录数零重扫+sweep pruned=0+全树落库 / AList 真实场景（负责人实例，env 注入，前缀目录纪律+清扫核空）/ 全局残留核空）+ `ck-local tests/readthrough_smoke.rs` 非 ignored 共性冒烟（外部真值四形态全链）+ `ck-sftp tests/live_readthrough.rs` ignored 共性冒烟（OpenSSH 真机全链）；L1→L3 dev-dep 三处（check_layers 机械面通过，例外句已入 driver-onboarding §1，RT5d）；**收口**：真机 webdav **7/7 零残留**、sftp **1/1**（0.85s）、local 1/1；A1/A2 用户场景真机腿 PASS（RT5b：空索引零 rebuild 逐层即见与 J: 逐项 diff 一致；RaiDrive J: 增删 → Y: 重进一致——FSD 缓存窗/RaiDrive 推送窗两发现入档）；审查修复批 `4e78b3d`（RT5c：1H+7M+6L 清偿）；文档批 RT5d（五门禁终跑 1643/0/60 + 七组合 clippy + 六处文档联动 + K83 入档） | commit 见批次日志；批次日志 RT5/RT5b/RT5c/RT5d 节 |
 
 ## 批次日志
 
@@ -34,7 +34,7 @@
 
 **TDD/验证证据**：workspace **1633/0/60**（基线 1632 +1 非 ignored（ck-local 冒烟）+8 ignored（webdav 7 + sftp 1））；webdav live_readthrough 真机 **7/7**（11.2s，`--test-threads=1`，收尾零残留核空通过）；sftp 腿 **1/1**（0.85s）；五门禁绿（clippy -D warnings / fmt --check / check_layers 16 manifests / scan_secrets / workspace）；AList 凭据只经 env（生产卷 toml 读键位结构，值不落任何文件/日志/报告）。
 
-**RT5 剩余（待收口）**：README/AGENTS 计数与机制说明、driver-onboarding §1 dev-dep 例外句 + §11 未来驱动共性义务、architecture.md 解析顺序「已落地」、decisions.md K83 入档、裁剪组合构建、深度审查批（K78 形态）。
+**~~RT5 剩余（待收口）~~ 已全部收口**：README/AGENTS 计数与机制说明、driver-onboarding §1 dev-dep 例外句（**已补**，v1.2）+ §11 未来驱动共性义务（**已增**）、architecture.md 解析顺序「已落地」（**已改注**）、decisions.md K83 入档（**已落**）、裁剪组合构建（**RT5d 七组合零告警**）、深度审查批（**RT5c 清偿**）。
 
 ### RT4（2026-09-22，子代理实现）
 
@@ -120,16 +120,65 @@
 
 **清理**：J: stamp 目录已删、AList 404 核空、实例 `cydrive stop` 干净退出（exit 0）、运行目录 `release-rt/` 为 worktree 内未跟踪产物不入库。
 
-## 风险与未覆盖（随批更新）
+### RT5c 审查修复批（2026-09-23，commit `4e78b3d`）
 
-- **webdav read_dir 冷路径双 list**（RT3）：stat_fresh 预检在父 TTL 窗过期或行缺失时多一次父重列（导航形稳态每视图恰 1 次，面级测试钉 2 视图=2 list）；Explorer 实际流量归真机矩阵复核（RT5）
-- **winfsp resolve_row_fresh 的 NotFound 落 K45 扫描**（RT3）：精确 NotFound 不终判（大写形态保护）；加密+宽面卷 open 面=ACCESS_DENIED（D10 传播），Explorer 呈现待真机复核（RT2 既有挂账承接）
-- **DirCache flights/generations map 无上界**（RT2）：每目录一条小记录，百万目录卷 ≈ 数 MB 慢增长；计划未要求上界——真机矩阵后评估是否加 pan115 式 LRU
-- **EncryptedInstance 消费面映射（Forbidden/ACCESS_DENIED）**为 RT2 选定的保守类，RT3 接线后真机复核 Explorer 呈现
-- **门序执行期解读**：加密+窄面实例（telegram 加密卷）经 D2 门退化为 db 读（不物化即无 D10 危害），D10 拒收文案只对加密+宽面组合发声——rebuild 的 ensure_plaintext_instance 无差别拒，read-through 因退化臂安全而不需要同款无差别拒（收口审查批复核）
-- **ck-webdav conformance 偶发（RT1 观察，既有负载敏感）**：三次全量 `-j 4` 跑中一次 `conformance_suite_offline` 失败（loopback 临时端口参照桩），隔离复跑 8/8 绿、其后两次全量绿；本批对 ck-webdav 唯一改动是 conformance 不调用的 provided 方法，无因果——挂账观察，若复现考虑另立降并发/重试裁决
-- 加密卷 read-through 不做（D10，密文 size→明文换算不可靠）——挂账
-- api_files 全表视图新鲜度（D9）——挂账
-- ghost 行清理归 K4 delete-wiring 旧账——不扩 scope
-- stat TTL 窗 5s = 实测定值，真机后可调
-- 待 RT5：真实广域网链路形态（WSL2 回环数字口径，sftp SF5 判例）
+**审查**：基线 `720e49c` 三路并行（A 驱动核心 / B 测试桩面 / C 消费面接线，全部只读精读 + 现场实跑）→ findings 落档 `9caae06`（`phase8-review-findings.md`）→ **1 High + 7 Medium + 6 Low 顺手修全 TDD 清偿**：
+
+- **H1（A/C 同根）**：D10 收窄「**拒物化、不拒读**」（K83.2 入档）——加密+宽面卷门臂改退化 db 读（`read_dir_fresh → db.list_dir`、`stat_fresh → degrade`），重写用例 12（`encrypted_instances_refuse…` → `encrypted_instances_degrade…`：播种 db 行 + 断言零网络返回行）+ 用例 9 邻面回归
+- **M1** NotFound 臂补 in-flight 过滤（pending 行幸存用例）；**M2** `list_all_pages` 页数+条目双上限（假驱动无限 cursor → 超限 Err）；**M3** sweep 体量地板（候选 >50% 且基数 >100 放弃 sweep，行保留）；**M4** NotFound 臂 prune 沿用 `PRUNE_CANDIDATE_CAP`=32；**M5** api_list 前置 `stat_fresh`（深跳空目录 200 空列表，三消费面预检语义对齐）；**M6** stat 兜底 Ok 臂测试（fail_next_list + stat 命中）；**M7** rebuild DeadlineStop 页间中断续跑测试；**M8** `authoritative_index=false` 门臂零网络退化用例
+- **L1–L6 顺手修**：materialize updated_at 断言 `>=`→`>`；root_record 补测试；open_handle 注释漂移更正；vfs 三处 in-flight 判据收编 `is_in_flight_row` helper；rebuild 模块文档 ghost 术语辨析；腿 05 注释 200→192
+- 挂账 9（L7–L15）+ 裁决不修 3 未动（findings 权威）→ 终态总表见本单「风险与未覆盖」
+
+**终态**：workspace **1643/0/60**（1633→1643，+10 测试；ignored 60 不变）；12 文件 +797/−56。
+
+### RT5d 文档批（2026-09-23，本批——收口）
+
+- **五门禁终跑实测**：`cargo test --workspace --no-fail-fast -j 4` = **1643 passed / 0 failed / 60 ignored**（184 suites，EXIT=0；ck-webdav conformance 本次无偶发）；`cargo clippy --workspace --all-targets -j 4 -- -D warnings` 绿（EXIT=0）；`cargo fmt --all -- --check` 绿；`check_layers` **16 manifests（7 driver crates）** 无 R1 违例；`scan_secrets` 全树零命中；winfsp 腿复跑 **118/0 + 1 ign**（EXIT=0，RT3 计数核实）
+- **七组合裁剪 clippy**（`cargo clippy -p cloudkit-cli --no-default-features --features <name> -- -D warnings`）逐一实测**零告警**：telegram / baidu / local / sftp / pan115 / pan123 / webdav 全 EXIT=0
+- **文档联动六处**：README（read-through 机制段 + 状态表 Phase 8 行 + 头部日期）；AGENTS（测试计数 1643/60 + winfsp 腿 118 + 「当前阶段」顶部 Phase 8 完成块 + 必读⑥当前指针 phase8-readthrough.md）；driver-onboarding **v1.2**（§1 末尾 dev-dependency 例外句 + 新增 §11 未来驱动共性义务）；architecture §3 D4 条目改注「已落地（Phase 8）」并指路 `cloudkit-core::readthrough`；decisions.md **K83** 入档（K83.1–K83.5）；本单终态（状态行/RT5 行收口/本节/挂账总表）
+- 提交：`docs(phase8)` 单 commit（六文档，无代码改动）
+
+## 风险与未覆盖——终态挂账总表（2026-09-23 RT5d 收口）
+
+> 权威处置记录 = `docs/tracking/phase8-review-findings.md`（审查 findings 全文与查证）；本表为合并终态视图。
+
+### 一、审查 findings 挂账（L7–L15）
+
+| # | 内容 | 状态/出路 |
+|---|---|---|
+| L7 | DirCache flights/generations map 无驱逐（每目录一条小记录，百万目录卷 ≈ 数 MB 慢增长） | 挂账——**LRU 上界评估**：真实体量数据出现再议 pan115 式 LRU（K73 M-S5 先例），当前不设上界 |
+| L8 | 跨进程 rebuild 共享检查点无互斥 | 挂账——模块文档已明示同卷单写者；多写者需求出现再议文件锁 |
+| L9 | NTP 回步窗 sweep 误删（`updated_at` 锚点为墙钟） | 挂账——罕见运维事件；read-through 回源可自愈 |
+| L10 | NotFound 负缓存缺失（重复视图重复付费） | 挂账——优化类，语义正确性不受影响 |
+| L11 | 网关适配器自写 db 路径不失效（rmcollection/MOVE 直写 db） | 挂账——D6 stat TTL 5s 容忍面内 |
+| L12 | 真机删除腿缺确认计数断言 | 挂账——离线 5a 用例已钉双确认语义 |
+| L13 | 页界 512 双处硬编码（materialize `list_all_pages` 与驱动分页 limit） | 挂账——常量收编属小清理 |
+| L14 | AList 腿失败路径清理缺 Drop guard | 挂账——腿 07 全局核空兜底 + 人工清法（删 `/_e2e_readthrough_*` 前缀） |
+| L15 | TTL 缝测试 50ms 窗偏窄（CI 慢机抖动） | 挂账——提宽即可，非正确性问题 |
+
+### 二、RT 批既有风险维持（findings L16/L17 转记）
+
+- **webdav read_dir 冷路径双 list**（RT3→findings L16）：stat_fresh 预检在父 TTL 窗过期或行缺失时多一次父重列（导航形稳态每视图恰 1 次，面级测试钉 2 视图=2 list）——维持挂账
+- **web Refresh 不呈现 interrupted 态**（findings L17）：rebuild 断趟后按钮无「rerun to continue」呈现——非回归，体验类挂账
+
+### 三、收口批追加
+
+- **winfsp FSD 缓存窗 `dir_info_timeout` 真机探针**（findings C 路建议 + RT5b 真机发现①）：成本最低的真修候选，下批——当前文档明示「winfsp 面重进即刷新有 FSD 缓存折扣、分钟级最终一致」
+- **真网加密腿（pan115/pan123 e2e）重跑——挂负责人真机窗口**（K83.5）：H1 修复改变加密+宽面卷读语义（拒收→退化读）；桩面反证已钉（用例 12 重写），真网腿未重跑前 Phase 5/6 加密 e2e 的既有通过记录对应旧门序
+
+### 四、裁决不修（3 条，查证支撑，findings 权威）
+
+1. 后端最终一致性窗（persist_success 后 list/stat 视图滞后 → 双确认 NotFound → 行删）——「读你的写」模型下低概率 + persist 自愈，接受残余
+2. webdav 根 open 语义微变（NotFound→Forbidden）——Explorer 不触碰 GET 集合的边角
+3. web 面 `EncryptedInstance→500` 映射——H1 修复后读路径无发射点，match 扩展保留为防御臂
+
+### 五、观察类（原风险节余项，逐条终态注记）
+
+- ~~门序执行期解读（加密+窄面退化 vs rebuild 无差别拒）~~ **已核（K83.2 裁决收口）**：加密+宽面同走退化臂，机制面统一；rebuild 的 `ensure_plaintext_instance` 无差别拒维持不变（rebuild 语义与本裁决独立）
+- ~~winfsp resolve_row_fresh 的 NotFound 落 K45 扫描~~ RT5b A1/A2 真机走查覆盖（Explorer/cmd 实读正常），观察关闭
+- **ck-webdav conformance 偶发**（RT1 观察，loopback 临时端口参照桩负载敏感）：本次终跑 184 suites 全绿未复现——维持观察，若复现考虑另立降并发/重试裁决
+- **加密卷 read-through**：D10 原文「不做」经 K83.2 收窄为**拒物化、不拒读**——物化面维持不做（密文 size→明文换算不可靠），读面退化到 db 索引
+- api_files 全表视图新鲜度（D9 保持索引视图）——挂账预登记维持
+- ghost 行（`is_uploaded=0` 且无本地副本）清理归 K4 delete-wiring 旧账——不扩 scope
+- stat TTL 窗 5s = 实测定值（`with_ttl` 缝可调），维持
+- 真实广域网链路形态（本矩阵为 WSL2 回环口径，sftp SF5 判例）——随真机窗口
