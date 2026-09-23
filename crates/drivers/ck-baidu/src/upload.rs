@@ -463,15 +463,21 @@ impl BaiduStager {
     /// 部分声明会话在 create 必然被拒，故定型先于装备）。
     ///
     /// 0 字节特形（[`EMPTY_MD5`] 文档）：空载荷新增空串 MD5 声明块——
-    /// 服务端拒空数组 block_list（errno=2）且视该块免传。定型只在数据
-    /// 终态发生且此刻 `drained` 恒为 0（到齐路径先定型后 drain），缓冲
-    /// 为空即全文件为空。
+    /// 服务端拒空数组 block_list（errno=2）且视该块免传。空缓冲分支以
+    /// `drained == 0` 守卫（Phase 8-B β-1）：close 的兜底复调可能在到齐
+    /// 路径 drain 完满块**之后**到达（hinted 整块文件——size 恰 4MiB
+    /// 整数倍，缓冲已空而文件非空），此刻分片列表已终态，追加 EMPTY 块
+    /// 即多余声明；`drained == 0` 的空缓冲才是真 0 字节文件。
     fn finalize_tail(&mut self) {
         if self.tail_included || self.rapid_fs_id.is_some() {
             return;
         }
         if self.buffer.is_empty() {
-            self.block_md5.push(EMPTY_MD5.to_string());
+            // drained>0 = 到齐路径已 drain 完满块（整块文件），block_md5
+            // 已是终态，不追加 0 字节声明块；drained==0 才是全文件 0 字节。
+            if self.drained == 0 {
+                self.block_md5.push(EMPTY_MD5.to_string());
+            }
             self.tail_included = true;
             return;
         }
@@ -642,7 +648,8 @@ impl UploadStager for BaiduStager {
         }
         // 0 字节兜底（wire 真形）：write 从未触发到齐路径的 hinted 空件
         // 腿（writer 打开即 close）也要带 `[EMPTY_MD5]` 声明；其余形态
-        // finalize_tail 幂等早退（tail_included / 秒传腿）。
+        // 幂等早退或无害复调（tail_included / 秒传腿 / 整块文件 drain 后
+        // 空缓冲——β-1 `drained == 0` 守卫不追加多余声明块）。
         self.finalize_tail();
         // 统一收尾：兜底装备（空文件 write([]) 从未触发到齐路径/防御）→
         // 查缺补传含尾块 →（秒传腿短路）。
@@ -971,4 +978,110 @@ fn part_slice(data: &Bytes, idx: u64) -> Bytes {
     let start = (idx as usize) * CHUNK;
     let end = ((idx as usize) + 1) * CHUNK;
     data.slice(start..end.min(data.len()))
+}
+
+#[cfg(test)]
+mod tests {
+    //! β-1（Phase 8-B 审查修复批）：close 的 [`BaiduStager::finalize_tail`]
+    //! 兜底复调对 **hinted 整块文件**（size 恰 4MiB 整数倍）的状态机钉死。
+    //!
+    //! 缺陷形态：到齐路径 drain 完满块后 `buffer` 清空而 `tail_included`
+    //! 仍 false，close（K85.7 无条件兜底）复调 `finalize_tail` 走进空缓冲
+    //! 分支给 `block_md5` 追加多余 [`EMPTY_MD5`]。该多余块当前被三重巧合
+    //! 吸收（收尾循环免传跳过 / create 用 `session_blocks` 快照 / 会话表
+    //! 只在分片成功后落盘）——**无任何 wire 可见症状**，唯一可观测面即
+    //! stager 内态，故用 white-box 单测钉死（集成面的 wire 契约另由
+    //! `tests/upload_form_bytes.rs` 的整块文件 block_list 断言钉住）。
+
+    use super::*;
+
+    /// 构造只驱动 `finalize_tail` 所需内态的 stager（该函数纯本地，不触
+    /// 网络——client/会话表/句柄缓存等字段占位即可）。
+    fn stager_with(
+        buffer: Vec<u8>,
+        drained: u64,
+        block_md5: Vec<String>,
+        tail_included: bool,
+    ) -> BaiduStager {
+        let params = crate::BaiduParams {
+            access_token: Some("test-access".to_string()),
+            refresh_token: Some("test-refresh".to_string()),
+            ..Default::default()
+        };
+        BaiduStager {
+            client: Arc::new(BaiduClient::new(&params).expect("占位 client")),
+            volume: VolumeId::new("baidu", "1400000001").expect("volume id"),
+            root: "/apps/cloudfs".to_string(),
+            rel: RelPath::new("f.bin").expect("rel path"),
+            abs: "/apps/cloudfs/f.bin".to_string(),
+            hinted_size: Some(drained * CHUNK as u64 + buffer.len() as u64),
+            sessions: SessionStore::new(None),
+            buffer,
+            written: drained * CHUNK as u64,
+            drained,
+            block_md5,
+            tail_included,
+            uploadid: Some("mock-upload-1".to_string()),
+            session_blocks: Vec::new(),
+            done: BTreeSet::new(),
+            probe_pending: false,
+            rapid_fs_id: None,
+            handles: Arc::new(HandleCache::new()),
+        }
+    }
+
+    /// β-1 主断言（红→绿）：hinted 整块文件到齐路径 drain 完满块后的
+    /// close 复调**不得**追加 0 字节声明块——block_list 恰 2 个真实分片
+    /// md5。
+    #[test]
+    fn exact_multiple_after_drain_appends_no_empty_md5_block() {
+        let m0 = md5_hex(b"block-0");
+        let m1 = md5_hex(b"block-1");
+        let mut st = stager_with(Vec::new(), 2, vec![m0.clone(), m1.clone()], false);
+        st.finalize_tail();
+        assert_eq!(
+            st.block_md5,
+            vec![m0, m1],
+            "整块文件 drain 后（drained=2）close 复调不得追加 EMPTY_MD5 声明块"
+        );
+        assert!(st.tail_included, "数据终态的幂等标记应定型");
+    }
+
+    /// 真 0 字节文件腿（空缓冲且 drained 恒 0）不受守卫影响：仍声明
+    /// 恰 `[EMPTY_MD5]`，且幂等（复调不重复追加）。
+    #[test]
+    fn zero_byte_file_still_declares_single_empty_md5_block() {
+        let mut st = stager_with(Vec::new(), 0, Vec::new(), false);
+        st.finalize_tail();
+        assert_eq!(st.block_md5, vec![EMPTY_MD5.to_string()]);
+        assert!(st.tail_included);
+        st.finalize_tail();
+        assert_eq!(
+            st.block_md5,
+            vec![EMPTY_MD5.to_string()],
+            "finalize_tail 幂等：复调不重复追加"
+        );
+    }
+
+    /// 留尾块腿不受守卫影响：缓冲非整倍数时仍定型尾块 md5。
+    #[test]
+    fn tail_block_still_finalized_for_partial_buffer() {
+        let tail = b"tail-bytes";
+        let mut st = stager_with(tail.to_vec(), 0, Vec::new(), false);
+        st.finalize_tail();
+        assert_eq!(st.block_md5, vec![md5_hex(tail)]);
+        assert!(st.tail_included);
+    }
+
+    /// 非 hinted 整块腿（close 时缓冲未清——全量在手）不受守卫影响：
+    /// 整倍数缓冲不产尾块、也不追加 EMPTY 声明块。
+    #[test]
+    fn full_multiple_buffer_finalizes_no_extra_block() {
+        let buf = vec![7u8; 2 * CHUNK];
+        let m0 = md5_hex(&buf[..CHUNK]);
+        let m1 = md5_hex(&buf[CHUNK..]);
+        let mut st = stager_with(buf, 0, vec![m0.clone(), m1.clone()], false);
+        st.finalize_tail();
+        assert_eq!(st.block_md5, vec![m0, m1]);
+    }
 }

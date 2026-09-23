@@ -68,7 +68,7 @@ use axum::routing::get;
 use axum::Json;
 use serde_json::{json, Value};
 
-use ck_baidu::{BaiduParams, TokenStore, EMPTY_MD5};
+use ck_baidu::{BaiduParams, TokenStore};
 
 // ---------------------------------------------------------------------------
 // 路径与常量（断言与编排用）
@@ -101,6 +101,12 @@ pub const MOCK_DLINK_TTL_SECS: i64 = 600;
 /// 会话死亡注入的 error_code（mock 建模码，刻意避开全部已映射真实码族
 /// ——驱动探活语义只判「error_code != 0」，不应绑定具体码值）。
 pub const MOCK_DEAD_SESSION_ERROR_CODE: i64 = 91001;
+/// 空串 MD5——0 字节上传 block_list 的声明值（2026-09-23 真网探针钉死
+/// 的服务端真值）。**独立字面量，刻意不引用驱动导出的
+/// `ck_baidu::EMPTY_MD5` 常量**（Phase 8-B β-2 解耦）：桩按服务端语义
+/// 建模，免传判据若引用实现常量，常量值漂移时桩+实现+断言三者同漂
+/// 全绿——独立声明让漂移可被检出。
+pub const EMPTY_STRING_MD5: &str = "d41d8cd98f00b204e9800998ecf8427e";
 
 // ---------------------------------------------------------------------------
 // 状态模型
@@ -958,7 +964,7 @@ fn create_file_finish(state: &Shared, form: &[(String, String)], path: &str) -> 
     // 服务端真形例外（2026-09-23 真网实测）：0 字节声明的唯一块
     // `[EMPTY_MD5]` 免分片校验——无 superfile2 可传，precreate 声明即
     // 视为在位（满块恒 4MiB、尾块恒 1..4MiB-1，空串 MD5 只能出自 0 字节）。
-    let zero_byte_only = blocks.len() == 1 && blocks[0] == EMPTY_MD5;
+    let zero_byte_only = blocks.len() == 1 && blocks[0] == EMPTY_STRING_MD5;
     if !zero_byte_only {
         for (idx, want) in blocks.iter().enumerate() {
             match session.parts.get(&(idx as i64)) {
