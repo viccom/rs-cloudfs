@@ -574,6 +574,90 @@ impl MetaDatabase {
         Ok(id)
     }
 
+    /// Inserts or updates a row **materialized from the backend's
+    /// authoritative index** (Phase 8-B / B3 `upsert_materialized`).
+    ///
+    /// Same column set as [`MetaDatabase::upsert_file_scheme`], but the
+    /// ON CONFLICT set preserves the row's cipher truth — a listing only
+    /// ever fills *absent* truth, it never overwrites it (B1, the
+    /// anti-oscillation rule; `upsert_file`'s unconditional
+    /// `is_encrypted`/`size` overwrite is exactly the write it must not
+    /// repeat):
+    ///
+    /// - `is_encrypted` — an existing `1` survives
+    ///   (`CASE WHEN files.is_encrypted=1 THEN 1 ELSE excluded.* END`):
+    ///   a plaintext instance's relist never downgrades a legacy
+    ///   encrypted row; the guess (excluded) applies only where no truth
+    ///   exists;
+    /// - `encryption_scheme` — preserved verbatim while
+    ///   `files.is_encrypted=1`; written only when `files.is_encrypted=0`
+    ///   (truth established for the first time);
+    /// - `size` — `excluded.size` **is** the caller's derived value: the
+    ///   Rust side (`materialize_entry`) reads the existing row first and
+    ///   closed-form-derives the plaintext length under the *preserved*
+    ///   scheme — this is the plan's `?derived` parameter (SQL never runs
+    ///   the back-solve itself; INSERT and CONFLICT take the same value);
+    /// - everything else follows [`MetaDatabase::upsert_file`] (coalesce
+    ///   on the read-cold columns); `updated_at` refreshes (sweep
+    ///   immunity, D8③).
+    ///
+    /// Sole caller: [`crate::materialize::materialize_entry`] — the one
+    /// Entry→row mapping shared by read-through and rebuild (D4).
+    pub fn upsert_materialized(
+        &self,
+        entry: &FileUpsert,
+        encryption_scheme: &str,
+    ) -> Result<i64, DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = now();
+        let id = conn.query_row(
+            "INSERT INTO files (
+                rel_path, name, parent_dir, size, mtime, sha256, is_dir,
+                telegram_msg_id, is_uploaded, is_cached, is_encrypted, chunk_count, mime_type,
+                encryption_scheme, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            ON CONFLICT(rel_path) DO UPDATE SET
+                name=excluded.name,
+                parent_dir=excluded.parent_dir,
+                size=excluded.size,
+                mtime=excluded.mtime,
+                sha256=coalesce(excluded.sha256, files.sha256),
+                telegram_msg_id=coalesce(excluded.telegram_msg_id, files.telegram_msg_id),
+                is_uploaded=excluded.is_uploaded,
+                is_cached=excluded.is_cached,
+                is_encrypted=CASE WHEN files.is_encrypted=1 THEN 1 ELSE excluded.is_encrypted END,
+                chunk_count=excluded.chunk_count,
+                mime_type=coalesce(excluded.mime_type, files.mime_type),
+                encryption_scheme=CASE WHEN files.is_encrypted=1 THEN files.encryption_scheme
+                                       ELSE excluded.encryption_scheme END,
+                updated_at=excluded.updated_at
+            RETURNING id",
+            params![
+                entry.rel_path,
+                entry.name,
+                entry.parent_dir,
+                entry.size,
+                entry.mtime,
+                entry.sha256,
+                entry.is_dir as i64,
+                entry.telegram_msg_id,
+                entry.is_uploaded as i64,
+                entry.is_cached as i64,
+                entry.is_encrypted as i64,
+                entry.chunk_count,
+                entry.mime_type,
+                encryption_scheme,
+                now,
+                now,
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(id)
+    }
+
     /// Flips the `is_cached` flag of the row with primary key `id` and
     /// touches NOTHING else — hydrate/eviction's cache-flag bookkeeping
     /// (P3 snapshot write-back race fix: those paths used to rebuild the

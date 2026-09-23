@@ -874,10 +874,9 @@ impl Vfs {
             self.transport.as_ref(),
             &self.cache,
             &self.dir_cache,
-            // D10 加密实例判定（rebuild K11 闸门的 Vfs 侧同源形态：
-            // enable_encryption ⇔ 配置了密码——commit_put 的
-            // is_encrypted 判据同款）。
-            self.cfg.encryption_password.is_some(),
+            // cipher 上下文（Phase 8-B EB1）：与上传行 vfs.rs:500 同源判据
+            //（密码在 = 加密实例 + cfg.encryption_scheme）。
+            Some(crate::materialize::CipherCtx::from_cfg(&self.cfg)),
             dir,
         )
         .await
@@ -893,8 +892,8 @@ impl Vfs {
             self.transport.as_ref(),
             &self.cache,
             &self.dir_cache,
-            // D10 加密实例判定（read_dir_fresh 同款）。
-            self.cfg.encryption_password.is_some(),
+            // cipher 上下文（read_dir_fresh 同款，Phase 8-B EB1）。
+            Some(crate::materialize::CipherCtx::from_cfg(&self.cfg)),
             rel,
         )
         .await

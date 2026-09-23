@@ -16,10 +16,11 @@
 //!   才删；单目录超限整批跳过；in-flight 行两侧豁免（D7/D10，NotFound
 //!   臂同判据——审查批 M1）；驱动报目录不存在时同臂同样受候选上限约束
 //!   （M4）；
-//! - **拒物化、不拒读**（D10 经 K83 裁决收窄）：加密 + 宽面卷绝不回源
-//!   物化（密文 size 会错标行、破坏 AEAD 预算数学），但读面就地退化到
-//!   db 索引读（D2 同形臂）——加密卷读行为与 read-through 之前逐字一
-//!   致；rebuild 的拒收语义独立存在（`ensure_plaintext_instance`）；
+//! - **cipher 真相物化**（D10 经 K84/B1–B4 修订，Phase 8-B EB1）：加密 +
+//!   宽面卷与明文卷**同路**回源物化——cipher 上下文（[`CipherCtx`]，与
+//!   上传行同源判据）随调用传入，既有行 `is_encrypted`/scheme 真相永不
+//!   被列举猜测回退、尺寸按真相方案闭式反推（H1 的加密退化臂已删）；
+//!   rebuild 的拒收语义独立存在（`ensure_plaintext_instance`，EB3 放开）；
 //! - **stale-if-error**（R2）：回源瞬态错绝不落 404，有旧行照常服务；
 //! - [`DirCache`]：TTL 窗（stat_fresh 快路径）+ 单飞闸 + 世代计数 +
 //!   写侧就近失效（pan115 先例）。
@@ -32,7 +33,7 @@ use cloudkit_storage::{Entry, RelPath as VolRel, StorageDriver, StorageError};
 
 use crate::cache::CacheManager;
 use crate::database::{FileRecord, MetaDatabase};
-use crate::materialize::{list_all_pages, materialize_entry};
+use crate::materialize::{list_all_pages, materialize_entry, CipherCtx};
 use crate::rebuild::RebuildError;
 use crate::rel_path::RelPath;
 use crate::transport::CloudTransport;
@@ -146,8 +147,12 @@ fn vocab_rel(path: &str) -> Result<VolRel, StorageError> {
 /// 转；`List` 的载荷是驱动错误（R2 分类学）；`EncryptedInstance` 只
 /// 出自 K11 纯闸门、`Serde` 只出自 rebuild 的检查点序列化（materialize
 /// 两者皆不产），防御臂归 `Invalid`。
-fn materialize(db: &MetaDatabase, entry: &Entry) -> Result<FileRecord, VfsError> {
-    materialize_entry(db, entry).map_err(|error| match error {
+fn materialize(
+    db: &MetaDatabase,
+    entry: &Entry,
+    cipher: Option<&CipherCtx>,
+) -> Result<FileRecord, VfsError> {
+    materialize_entry(db, entry, cipher).map_err(|error| match error {
         RebuildError::Db(db_error) => VfsError::Db(db_error),
         RebuildError::List { source, .. } => VfsError::Transport(source),
         RebuildError::EncryptedInstance | RebuildError::Serde(_) => {
@@ -164,7 +169,7 @@ pub async fn read_dir_fresh(
     transport: &dyn CloudTransport,
     cache: &CacheManager,
     dir_cache: &DirCache,
-    encrypted_instance: bool,
+    cipher: Option<CipherCtx>,
     dir: &RelPath,
 ) -> Result<Vec<FileRecord>, VfsError> {
     // D2 门：宽面不在场 → 逐字退化（telegram 零行为变化，A6）。
@@ -175,15 +180,9 @@ pub async fn read_dir_fresh(
     if !transport.capabilities().authoritative_index {
         return Ok(db.list_dir(dir.as_str())?);
     }
-    // D10（K83 裁决收窄：拒物化、不拒读）：加密实例绝不回源物化——密
-    // 文容器的尺寸是密文尺寸，物化成行会破坏「size = 明文」契约与
-    // AEAD 预算数学——但读面不拒收，就地退化到 db 索引读（D2 同形臂：
-    // 不回源、不物化、不 prune、不 mark）。读行为与 read-through 之前
-    // 逐字一致（计划 §7「加密卷零变化」）；rebuild 的拒收语义独立存在
-    // （ensure_plaintext_instance 不受影响）。
-    if encrypted_instance {
-        return Ok(db.list_dir(dir.as_str())?);
-    }
+    // （H1 加密退化臂已删，Phase 8-B EB1 / K84：加密实例与明文卷同路
+    // 回源物化，cipher 真相语义由 `materialize_entry` 承担——B1 三层优先
+    // + B3 保留集 + 尺寸闭式反推；窄面 telegram 仍被上面的 D2 门接住。）
 
     let dir_str = dir.as_str();
     let arrived = dir_cache.generation(dir_str);
@@ -214,7 +213,7 @@ pub async fn read_dir_fresh(
                     );
                     continue;
                 }
-                materialize(db, entry)?;
+                materialize(db, entry, cipher.as_ref())?;
             }
             reconcile_dir(db, driver, cache, dir, &entries).await?;
             dir_cache.mark(dir_str);
@@ -356,7 +355,7 @@ pub async fn stat_fresh(
     transport: &dyn CloudTransport,
     cache: &CacheManager,
     dir_cache: &DirCache,
-    encrypted_instance: bool,
+    cipher: Option<CipherCtx>,
     rel: &RelPath,
 ) -> Result<FileRecord, VfsError> {
     // D2 门：不过 → db.get_file 逐字退化（今日行为）。
@@ -370,14 +369,9 @@ pub async fn stat_fresh(
     if !transport.capabilities().authoritative_index {
         return degrade();
     }
-    // D10（K83 裁决收窄，read_dir_fresh 同款「拒物化、不拒读」）：加
-    // 密实例直接走 degrade 路径（db.get_file，无行 NotFound）——不回源
-    // 物化。加密臂先于根合成臂：根也照 degrade（无行 NotFound，无合
-    // 成；消费面的根语义由各自前置检查承担——webdav read_dir/metadata
-    // 与 winfsp meta_for 同形），不回源、不物化、不 mark。
-    if encrypted_instance {
-        return degrade();
-    }
+    // （H1 加密退化臂已删，Phase 8-B EB1 / K84：加密实例与明文卷同路
+    // ——根照常合成、缺行照常回源物化，cipher 真相语义在 materialize
+    // 缝内承担。）
 
     // 根：恒存的目录，合成元数据（消费面 RowMetaData::root 同形：
     // 0 尺寸 / mtime 0 / 无 etag 素材）。
@@ -394,7 +388,7 @@ pub async fn stat_fresh(
     }
     // D6 风暴归并：重列父目录恰一次。回源错误在此容忍——最终结果由下
     // 面的 driver.stat 兜底决定（绝不因瞬态错回 404，R2）。
-    let _ = read_dir_fresh(db, transport, cache, dir_cache, encrypted_instance, &parent).await;
+    let _ = read_dir_fresh(db, transport, cache, dir_cache, cipher, &parent).await;
     if let Some(row) = db.get_file(rel.as_str())? {
         return Ok(row);
     }
@@ -402,7 +396,7 @@ pub async fn stat_fresh(
     // 到不了这里，无 in-flight 可伤；直接物化。
     match driver.stat(&vocab_rel(rel.as_str())?).await {
         Ok(entry) => {
-            materialize(db, &entry)?;
+            materialize(db, &entry, cipher.as_ref())?;
             db.get_file(rel.as_str())?
                 .ok_or_else(|| VfsError::NotFound(rel.as_str().to_string()))
         }

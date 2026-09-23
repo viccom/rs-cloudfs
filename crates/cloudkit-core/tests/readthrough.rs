@@ -12,10 +12,11 @@
 //!   兜底；根恒存（合成元数据）；
 //! - in-flight 行（`is_uploaded = 0` 且本地副本在盘，sync.rs 判据单点
 //!   同源）两侧豁免（D7/D10，含 NotFound 臂——M1）；
-//! - 加密实例「拒物化、不拒读」（D10 经 K83 裁决收窄）：加密 + 宽面卷
-//!   的读面绝不回源物化（密文 size 会错标行），但就地退化到 db 索引
-//!   读（D2 同形臂）——读行为与 read-through 之前逐字一致；rebuild 的
-//!   拒收语义独立存在（ensure_plaintext_instance）；
+//! - 加密实例 cipher 真相物化（D10 经 K84/B1–B4 修订，Phase 8-B）：加密 +
+//!   宽面卷与明文卷同路回源物化——cipher 初值只填空，既有行
+//!   is_encrypted/scheme 真相永不被列举猜测回退，尺寸按真相方案闭式反推
+//!   （用例 12）；rebuild 的拒收语义独立存在（ensure_plaintext_instance，
+//!   EB3 放开）；
 //! - 写侧就近失效（pan115 先例）：commit_put / create_dir / remove_file
 //!   后撤父目录 TTL 窗。
 //!
@@ -982,69 +983,64 @@ async fn concurrent_read_dir_fresh_collapses_into_exactly_one_list() {
     );
 }
 
-// 用例 12（D10 经 K83 裁决收窄：「拒物化、不拒读」）：加密 + 宽面卷的
-// 读面绝不回源物化（密文容器的尺寸是密文尺寸，物化成行会破坏
-// 「size = 明文」契约与 AEAD 预算数学），但也不拒收——就地退化到 db
-// 索引读（D2 同形臂），读行为与 read-through 之前逐字一致（计划 §7
-// 「加密卷零变化」的兑现）。零网络：不回源、不物化、不 prune、不 mark。
+// 用例 12（D10→K84 修订，Phase 8-B EB1；计划明文授权的断言变更）：加密
+// + 宽面实例 read_dir_fresh **回源物化**——与明文卷同路（恰一次回源
+// list），cipher 真相语义落库（B1+B3+B4：初值只填空、尺寸按真相方案闭式
+// 反推、列举期零内容嗅探）。本用例替换原「拒物化、不拒读」的 H1 退化臂
+// 用例（EB1 删臂后该语义已不存在）。
 #[tokio::test]
-async fn encrypted_instances_degrade_to_the_index_read_without_any_backend_calls() {
-    let h = wide_harness_cfg(Some("pw")).await;
-    // 远端有货也不许碰、更不许物化。
+async fn encrypted_instances_read_through_and_materialize_cipher_truth() {
+    let h = wide_harness_cfg(Some("pw")).await; // 密码在 → 加密实例；scheme = aead_v2
+                                                // 远端两个真值对象：一个 60B 的 v2 容器形（34B 头 + 10B 明文 + 16B tag
+                                                // → 闭式反推 10B）+ 一个目录。
     seed_dir(&h.mock, "docs").await;
-    seed_file(&h.mock, "docs/a.txt", b"a").await;
-    // 索引里有行：读面照常服务索引视图。
+    seed_file(&h.mock, "kept.txt", &[0u8; 60]).await;
+    // 索引里既有 kept.txt 的明文行（is_encrypted = 0，「无 cipher 真相」
+    // → 回源时用 ctx 初值填空）。
     seed_uploaded_row(&h.db, "/kept.txt", 11);
 
     let rows = h
         .vfs
         .read_dir_fresh(&RelPath::root())
         .await
-        .expect("encrypted instance degrades to the index read, it does not refuse");
-    assert_eq!(
-        rows.len(),
-        1,
-        "退化臂只回索引行——远端 docs 不得出现（零回源物化）"
-    );
-    assert_eq!(rows[0].rel_path, "/kept.txt");
-
-    // 无行目录 → 空列表（db.list_dir 逐字退化，绝不 404）。
-    let empty = h
-        .vfs
-        .read_dir_fresh(&RelPath::new("/nothing").expect("nothing"))
-        .await
-        .expect("a rowless directory degrades to an empty listing");
-    assert!(empty.is_empty(), "无行目录回空列表，got {empty:?}");
-
-    // stat_fresh 同臂：有行 → 行；无行 → NotFound（根也照 degrade——
-    // 加密臂先于根合成臂，消费面的根语义由各自前置检查承担）。
-    let row = h
-        .vfs
-        .stat_fresh(&RelPath::new("/kept.txt").expect("kept"))
-        .await
-        .expect("degraded stat serves the indexed row");
-    assert_eq!(row.telegram_msg_id, Some(11));
-    let missing = h
-        .vfs
-        .stat_fresh(&RelPath::new("/missing.bin").expect("missing"))
-        .await
-        .expect_err("a rowless stat degrades to NotFound");
-    assert!(
-        matches!(missing, VfsError::NotFound(_)),
-        "无行 stat 退化 = NotFound，got {missing:?}"
-    );
-    let root = h.vfs.stat_fresh(&RelPath::root()).await;
-    assert!(
-        matches!(root, Err(VfsError::NotFound(_))),
-        "加密卷根照 degrade（无行 NotFound，无合成），got {root:?}"
-    );
-
+        .expect("encrypted instances read through like plaintext ones");
+    // 与明文卷同路：恰一次回源 list（原 H1 退化臂 = 0 次）。
     assert_eq!(
         h.shared.list_calls(),
-        0,
-        "拒物化：加密卷读面零 list（不回源、不物化、不 prune、不 mark）"
+        1,
+        "加密 + 宽面：恰一次回源 list（回源物化，非索引退化）"
     );
-    assert_eq!(h.shared.stat_calls(), 0, "加密卷读面零 driver.stat");
+
+    // File 行：cipher 真相语义落库（is_encrypted/scheme = ctx 初值，size
+    // = 60B 容器按 aead_v2 闭式反推的 10B 明文）。
+    let kept =
+        h.db.get_file("/kept.txt")
+            .expect("read")
+            .expect("materialized row");
+    assert!(kept.is_encrypted, "行落库 is_encrypted=true（ctx 初值）");
+    assert_eq!(
+        kept.encryption_scheme,
+        cloudkit_core::config::SCHEME_AEAD_V2,
+        "无既有真相 → ctx 初值 scheme"
+    );
+    assert_eq!(
+        kept.size, 10,
+        "尺寸按真相方案闭式反推（60B 密文容器 → 10B 明文）"
+    );
+
+    // Dir 行恒明文（目录行永不明文化）。
+    let docs =
+        h.db.get_file("/docs")
+            .expect("read")
+            .expect("dir row materialized");
+    assert!(!docs.is_encrypted, "目录行 is_encrypted 恒 false");
+
+    // 列表面含回源物化的远端条目。
+    assert!(
+        rows.iter().any(|r| r.rel_path == "/docs"),
+        "回源物化条目进入列表，got {:?}",
+        rows.iter().map(|r| &r.rel_path).collect::<Vec<_>>()
+    );
 }
 
 // 用例 16（M6）：stat_fresh 兜底 Ok 臂——父目录 list 瞬断（stale 臂吞

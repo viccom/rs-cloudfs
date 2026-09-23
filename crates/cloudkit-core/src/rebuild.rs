@@ -218,6 +218,24 @@ pub async fn rebuild_from_backend_with(
     root: &RelPath,
     limits: RebuildLimits,
 ) -> Result<RebuildOutcome, RebuildError> {
+    // 缺省 cipher = None（禁用，「走旧路」——`materialize_entry` 的逐字
+    // 旧行为）；Phase 8-B EB3 接生产 cfg 后加密实例经
+    // [`rebuild_from_backend_with_ctx`] 走同一 B3 物化真相语义。
+    rebuild_from_backend_with_ctx(driver, db, root, limits, None).await
+}
+
+/// [`rebuild_from_backend_with`] with an explicit cipher context (Phase
+/// 8-B EB1 seam): `None` = the verbatim pre-cipher road above; `Some(ctx)`
+/// = the read-through cipher-truth materialization (B1+B3) for every file
+/// row. The K11 `ensure_plaintext_instance` gate still sits at the CLI
+/// call sites until EB3 — this batch only lets the walk carry the context.
+pub async fn rebuild_from_backend_with_ctx(
+    driver: &dyn StorageDriver,
+    db: &MetaDatabase,
+    root: &RelPath,
+    limits: RebuildLimits,
+    cipher: Option<crate::materialize::CipherCtx>,
+) -> Result<RebuildOutcome, RebuildError> {
     let mut outcome = RebuildOutcome::default();
     let deadline = limits.time_budget.map(|budget| Instant::now() + budget);
 
@@ -263,7 +281,7 @@ pub async fn rebuild_from_backend_with(
             outcome.interrupted = Some(RebuildInterrupted::TimeBudget);
             return Ok(outcome);
         }
-        match walk_one_dir(driver, db, &dir, deadline, &mut outcome).await? {
+        match walk_one_dir(driver, db, &dir, deadline, &mut outcome, cipher.as_ref()).await? {
             DirWalk::Completed { children, entries } => {
                 // Depth-first after the directory row itself, so a
                 // parent always exists before its children (the
@@ -341,6 +359,7 @@ fn walk_one_dir<'a>(
     dir: &'a RelPath,
     deadline: Option<Instant>,
     outcome: &'a mut RebuildOutcome,
+    cipher: Option<&'a crate::materialize::CipherCtx>,
 ) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<DirWalk, RebuildError>> + Send + 'a>>
 {
     Box::pin(async move {
@@ -362,8 +381,9 @@ fn walk_one_dir<'a>(
                 // Phase 8 / D4: the Entry→row mapping moved verbatim to
                 // `materialize::materialize_entry` (rebuild and
                 // read-through share the single mapping); only the
-                // outcome counting stays on the rebuild side.
-                crate::materialize::materialize_entry(db, entry)?;
+                // outcome counting stays on the rebuild side. The cipher
+                // context rides the same seam (Phase 8-B EB1).
+                crate::materialize::materialize_entry(db, entry, cipher)?;
                 entries += 1;
                 if entry.kind == EntryKind::Dir {
                     outcome.dirs += 1;
