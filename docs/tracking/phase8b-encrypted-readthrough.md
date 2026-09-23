@@ -224,7 +224,7 @@
 - **ck-local**：`store_bytes` → `LocalStager::write(empty)+close`（`tokio::fs::write_all(&[])` 合法 + `metadata().len()==0` 匹配 `hinted_size=0`）——既有绿测 `transport_face.rs::upload_empty_file_roundtrip`（0 字节上传 + open 回空）直接钉；
 - **ck-sftp**：`SftpStager::close` 的 `hinted == written` 在空件时 0==0 通过，远端 size 复核 0==0 通过（该驱动的「0 字节上传 bug 唯一持久修复」正是这条复核）——无 0 字节拒绝臂；
 - **ck-webdav**：`client.put` 空 `Bytes` 合法（`put_timeout(0)=CONTROL_TIMEOUT`）+ stager 的 `hinted != written`（0==0）与 ④stat 复核（`remote_size == written` 0==0）通过；
-- **ck-baidu**：`data.chunks(4MiB)` 对空切片得空 block_list（合法）；**残余风险如实录**：空 block_list 的 precreate/create 未在本桩面覆盖，真机未实测（见风险节）；
+- **ck-baidu**：`data.chunks(4MiB)` 对空切片得空 block_list（~~合法；残余风险如实录：空 block_list 的 precreate/create 未在本桩面覆盖，真机未实测~~ **→ 已证伪并修复（K85.7，2026-09-23）**：空数组 block_list 被服务端 **errno=2** 恒拒，真形 = `[EMPTY_MD5]` 空串 MD5（主会话活 token 真网三步探针定形），桩面已按真形补钉、驱动已修——见下「baidu 0 字节 wire 真形修复」批次日志与 decisions K85.7；真网复验腿挂主会话挂载实例重传）；
 - **ck-pan115**：`size(0) <= part_size` → 单分片 `put_object_path` 对空 spool 发合法空 PutObject；`finish_entry` 的 size 复核 0==0 通过；
 - **ck-pan123**：既有绿测 `write_path.rs::empty_file_roundtrips_via_a_single_empty_part`（恰 1 次 empty part PUT + complete + 回读空）直接钉——**唯一有专门空件测试的驱动**。
 结论：无需驱动侧改动，放行条件成立。
@@ -286,3 +286,31 @@
 - 测试根 `CYDRIVE_SFTP_TEST_ROOT` 必填（K79.6）；本腿未设 `CYDRIVE_SFTP_TEST_PASSWORD`（走 `KEY_PATH` 私钥形态——D1 两形态之一，密码形态由既有 live_matrix 覆盖）。
 
 **提交**：`test(sftp): 加密 read-through 两阶段真机腿（Phase 8-B 验收延伸）`。
+
+### baidu 0 字节 wire 真形修复（2026-09-23，实现子代理，worktree feat/readthrough-index）
+
+**背景**：K85.6 把 0 字节闸收窄到「影子索引才跳过」后，baidu 真网首跑揭出：明文 0 字节行到达 `ck-baidu` 后构造 `block_md5=[]`，precreate 序列化为**空数组** block_list——服务端**恒拒 errno=2**（`Unavailable` 可重试 ×5 耗尽 → 行降级，权威后端 0 字节文件不落盘，恰是 K85.6 要治的「文件名消失」形态）。mock 桩不校验 block_list 形态故桩面全绿——「桩照服务端真形建模」防线缺口的镜像（桩照实现抄的第四例）。
+
+**主会话真网探针定形（活 token，MSYS_NO_PATHCONV curl 三步全通）**：0 字节文件 precreate 的 `block_list=["d41d8cd98f00b204e9800998ecf8427e"]`（**空串 MD5，非空数组**）→ errno=0 + return_type=1 + uploadid；**无 superfile2**（无分片可传）；create **原样重申**同形（31363 约束同款）→ errno=0 + fs_id，真网落盘/list 可见核验通过。
+
+**落地件**（6 文件，TDD 先红后绿）：
+1. **红**：`tests/upload_form_bytes.rs` 空件测试改按服务端真形断言（precreate 恰 `[EMPTY_MD5]` + create 同形重申 + 零 superfile2）——红证：驱动实发 `"[]"`（`参数 block_list=["d41d…"] 应恰出现一次：[… ("block_list", "[]")]` left: 0 right: 1）；
+2. **桩补钉**：`tests/common/mod.rs` mock precreate 空数组 block_list → **errno=2**（真形建模）；create 对 `[EMPTY_MD5]` 唯一块免分片校验（满块恒 4MiB、尾块恒 1..4MiB−1，空串 MD5 只能出自 0 字节）——第二红证：`transport_face::upload_empty_file_roundtrip` `Unavailable("baidu errno=2: ")`（与真网缺陷形态同款，双路径实证缺陷面）；
+3. **绿**：`src/upload.rs` 定 `pub const EMPTY_MD5`（lib.rs 导出供测试引用），0 字节构造点改单元素声明——stager 路径 `finalize_tail` 空缓冲分支 + `close` 无条件调 `finalize_tail`（补「writer 打开即 close」的 hinted 空件腿）+ transport 整文件路径 `upload_whole_file` 空数据分支；上传循环免传跳过三处（`finalize_and_upload_remaining` 查缺补传 / `upload_whole_file` 探活 find / 差集 missing filter）；
+4. **文档联动**：`upload.rs` 模块头新增「0 字节 wire 真形」节、`api.rs` precreate 文档改「0 字节 = 恰 `[EMPTY_MD5]` 一元素」、`transport_face.rs` 空件用例注释同步。
+
+**零涉及证明**：加密路径零改动（加密空件容器 44/50B 非零载荷走既有三步曲——sftp 真机腿 `empty=50` 已真机验证该形态）；非 baidu 驱动零涉及（diff 只触 ck-baidu 六文件）；影子索引跳过臂零改动（`upload_queue` 影子臂 `zero_byte_job_still_skips_a_shadow_index_transport` 零漂移绿）。
+
+**红→绿证据（真实输出尾部）**：
+- 红 1：`assertion left == right failed: 参数 block_list=["d41d8cd98f00b204e9800998ecf8427e"] 应恰出现一次：[("path", "/apps/cloudfs/empty.bin"), …, ("block_list", "[]")] — left: 0 right: 1`；
+- 红 2：`panicked at transport_face.rs:224: upload: Unavailable("baidu errno=2: ")`；
+- 绿：`upload_form_bytes` **4 passed**（含新 `empty_upload_declares_empty_string_md5_block_list_without_superfile2`）；ck-baidu 全套 **50 passed / 0 failed / 3 ignored**（conformance 2 + transport_face 8 + upload_resume 8 全零漂移）。
+
+**门禁（本批终跑）**：`upload_queue` 0 字节四臂 **4/4**（正臂/影子臂/加密正反臂）；`zero_byte_authoritative_e2e` **1/1**；`cargo test --workspace --no-fail-fast -j 4` → **passed=1662, failed=0, ignored=62**（187 suites；与本分支基线同数——baidu 桩面 +1 测试系改名改写非新增计数口径差异如实录：原 1 测试改写 + 断言扩 create 腿，总数不变）；clippy 全目标零告警；FMT_OK；check_layers OK（16 manifests）；scan_secrets OK（零命中）。
+
+**风险与未覆盖（本批增量）**：
+- **真网复验挂主会话**：活 token 真网三步探针已定形（curl 全通 + 落盘核验），但驱动修复后的**端到端真网重传**（挂载实例 0 字节写入 → baidu 落盘）待主会话实测——本批按任务边界不跑真网。
+- errno=2 未入 `map_errno` 映射表（仍走 `_` → `Unavailable` 可重试）：修复后驱动不再发出该形态，映射表不加防御臂（真网若再现 errno=2 即新事实再议）。
+- 桩的 errno=2 建模按「空数组/缺字段同拒」从严——真网对缺字段形态的响应未探（驱动从不发缺字段形态，无消费面）。
+
+**提交**：`fix(baidu): 0 字节上传 wire 真形——block_list=[空串MD5] 替代空数组（真网 errno=2 实测，Phase 8-B）`。

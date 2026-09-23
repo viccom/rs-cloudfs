@@ -26,6 +26,16 @@
 //! - **无 hint.size**：全缓冲至 close（close 时 size=实际字节，precreate
 //!   全量）——真实调用面（WebDAV PUT / CLI copy）均带 Content-Length。
 //!
+//! ## 0 字节 wire 真形（2026-09-23 主会话活 token 真网探针，Phase 8-B）
+//!
+//! size=0 的会话形态：precreate 声明 `block_list=[EMPTY_MD5]`（空串
+//! MD5；**空数组 → errno=2** 真网实测）→ 零 superfile2（无分片可传，
+//! 服务端视声明块在位）→ create 原样重申同形。落点：[`finalize_tail`]
+//! 空缓冲分支（stager 流式路径，两处定型调用点覆盖 hinted/无承诺与
+//! 「打开即 close」）+ [`upload_whole_file`] 空数据构造分支（transport
+//! 整文件路径）+ 上传循环的 EMPTY_MD5 免传跳过。加密空件不经此路
+//! （容器 44/50B 非零载荷，正常三步曲）。
+//!
 //! ## 串行上传取舍（write 同步落定的代价）
 //!
 //! **到齐的 write() 返回时，全部满块必须已上传完成**（superfile2
@@ -84,6 +94,13 @@ use crate::driver::HandleCache;
 
 /// 分片尺寸（4MiB；spike §2/§6——上/下载统一有界边界）。
 pub(crate) const CHUNK: usize = 4 * 1024 * 1024;
+
+/// 0 字节块的 MD5 = 空串 MD5，服务端拒绝空数组 block_list（2026-09-23
+/// 真网 errno=2 实测）。0 字节上传的 precreate/create 必须声明
+/// `block_list=[EMPTY_MD5]`（真网三步探针钉死：precreate errno=0 +
+/// return_type=1 → 零 superfile2 → create 原样重申 → 落盘可见）；
+/// 服务端视该块免传（无分片可传），驱动侧同步跳过 superfile2。
+pub const EMPTY_MD5: &str = "d41d8cd98f00b204e9800998ecf8427e";
 
 /// transport 面整文件上传的并发 worker 数（B3b；PCFS api.go:440-479 的
 /// 4 并发吞吐形态——stager 流式路径不并发的取舍见模块文档「串行上传
@@ -444,8 +461,18 @@ impl BaiduStager {
     /// 尾块定型（数据终态时：hinted 到齐或无承诺 close）。定型后
     /// `block_md5` 即最终**全量**形态——precreate 一次性锁定（31363：
     /// 部分声明会话在 create 必然被拒，故定型先于装备）。
+    ///
+    /// 0 字节特形（[`EMPTY_MD5`] 文档）：空载荷新增空串 MD5 声明块——
+    /// 服务端拒空数组 block_list（errno=2）且视该块免传。定型只在数据
+    /// 终态发生且此刻 `drained` 恒为 0（到齐路径先定型后 drain），缓冲
+    /// 为空即全文件为空。
     fn finalize_tail(&mut self) {
         if self.tail_included || self.rapid_fs_id.is_some() {
+            return;
+        }
+        if self.buffer.is_empty() {
+            self.block_md5.push(EMPTY_MD5.to_string());
+            self.tail_included = true;
             return;
         }
         let avail = self.buffer.len() / CHUNK;
@@ -546,6 +573,12 @@ impl BaiduStager {
                     seq += 1;
                     continue; // 位图命中（write 已传满块）：零流量复用
                 }
+                if self.block_md5[seq as usize] == EMPTY_MD5 {
+                    // 0 字节声明块：服务端免传（precreate 声明即在位，
+                    // 2026-09-23 真网真形）——零 superfile2 直接收尾。
+                    seq += 1;
+                    continue;
+                }
                 let start = (seq - self.drained) as usize * CHUNK;
                 let end = (start + CHUNK).min(self.buffer.len());
                 let data = Bytes::copy_from_slice(&self.buffer[start..end]);
@@ -606,8 +639,11 @@ impl UploadStager for BaiduStager {
         // block_md5，装备与上传由统一收尾循环承担。
         if self.hinted_size.is_none() {
             self.compute_full_block_md5s();
-            self.finalize_tail();
         }
+        // 0 字节兜底（wire 真形）：write 从未触发到齐路径的 hinted 空件
+        // 腿（writer 打开即 close）也要带 `[EMPTY_MD5]` 声明；其余形态
+        // finalize_tail 幂等早退（tail_included / 秒传腿）。
+        self.finalize_tail();
         // 统一收尾：兜底装备（空文件 write([]) 从未触发到齐路径/防御）→
         // 查缺补传含尾块 →（秒传腿短路）。
         self.finalize_and_upload_remaining().await?;
@@ -772,7 +808,13 @@ pub(crate) async fn upload_whole_file(
     }
     let abs = abs_of(root, rel);
     let size = data.len() as u64;
-    let block_md5: Vec<String> = data.chunks(CHUNK).map(md5_hex).collect();
+    // 0 字节 wire 真形（2026-09-23 真网实测，[`EMPTY_MD5`] 文档）：
+    // `[EMPTY_MD5]` 替代空数组（errno=2）；该块免传（下方探活/差集过滤）。
+    let block_md5: Vec<String> = if data.is_empty() {
+        vec![EMPTY_MD5.to_string()]
+    } else {
+        data.chunks(CHUNK).map(md5_hex).collect()
+    };
 
     // 路一：会话表命中 → 全量 md5 一致才复用（整文件在手，比对全量
     // 列表——比 stager 的前缀比对更严）；不一致 → 作废重建。
@@ -788,9 +830,12 @@ pub(crate) async fn upload_whole_file(
         }
     }
 
-    // 探活（仅恢复会话且有缺失分片；首个缺失分片串行上传，stager 语义）。
+    // 探活（仅恢复会话且有缺失分片；首个缺失分片串行上传，stager 语义；
+    // EMPTY_MD5 免传块不参与探活——无数据可发）。
     if let Some(uid) = uploadid.clone() {
-        if let Some(probe_idx) = (0..block_md5.len() as u64).find(|i| !done.contains(i)) {
+        if let Some(probe_idx) = (0..block_md5.len() as u64)
+            .find(|i| !done.contains(i) && block_md5[*i as usize] != EMPTY_MD5)
+        {
             let part = part_slice(&data, probe_idx);
             match client
                 .superfile2(&client.pcs_base, &abs, &uid, probe_idx, part)
@@ -830,9 +875,10 @@ pub(crate) async fn upload_whole_file(
     }
 
     let uploadid = uploadid.expect("装备后必有权柄");
-    // 缺失分片并发上传（Semaphore 有界；每分片完成即位图落盘）。
+    // 缺失分片并发上传（Semaphore 有界；每分片完成即位图落盘；EMPTY_MD5
+    // 免传块服务端视为在位，不列缺失）。
     let missing: Vec<u64> = (0..block_md5.len() as u64)
-        .filter(|i| !done.contains(i))
+        .filter(|i| !done.contains(i) && block_md5[*i as usize] != EMPTY_MD5)
         .collect();
     if !missing.is_empty() {
         let done_shared = Arc::new(Mutex::new(done));

@@ -13,7 +13,9 @@
 //! - **create**：spike api.rs:332-370 + PCFS api.go:581-587——form 恰六字段
 //!   `path,size,isdir=0,rtype,uploadid,block_list`；
 //! - **block_list** 形态：`["<md5hex>",...]`——分片 MD5 按 **4MiB 边界对
-//!   内容**计算（测试逐片对账），非全文件 MD5；
+//!   内容**计算（测试逐片对账），非全文件 MD5；**0 字节特形**：恰
+//!   `[EMPTY_MD5]`（空串 MD5）——空数组被服务端拒绝（2026-09-23 真网
+//!   errno=2 实测，见 [`ck_baidu::EMPTY_MD5`] 文档）；
 //! - **precreate/create 的 block_list 一致性**（真网 31363 实证钉死，
 //!   2026-09-08 返工）：precreate 一次性锁定全量 block_list，create 的
 //!   block_list 必须**原样重申** precreate 会话锁定的声明（两者值相等
@@ -23,7 +25,7 @@ mod common;
 
 use std::sync::Arc;
 
-use ck_baidu::{factory, BaiduDriver};
+use ck_baidu::{factory, BaiduDriver, EMPTY_MD5};
 use cloudkit_storage::{EntryKind, RelPath, StorageDriver, WriteHint};
 
 use common::{
@@ -249,10 +251,13 @@ async fn create_posts_exact_six_field_form_with_precreate_uploadid_and_blocks() 
 }
 
 #[tokio::test]
-async fn empty_upload_uses_empty_block_list_without_superfile2() {
+async fn empty_upload_declares_empty_string_md5_block_list_without_superfile2() {
     let (mock, driver) = setup().await;
-    // 空文件：block_list=[]（0 分片）、superfile2 零调用、create 直接收尾
-    // （conformance ① n=0 腿的 wire 形态钉死）。
+    // 空文件 wire 真形（2026-09-23 主会话活 token 真网三步探针钉死）：
+    // precreate 的 block_list 恰 `[EMPTY_MD5]`（空串 MD5；**空数组 →
+    // errno=2**，2026-09-23 真网实测）→ 零 superfile2（无分片可传）→
+    // create 原样重申同形（31363 约束同款）。conformance ① n=0 腿的
+    // wire 形态钉死。
     let path = RelPath::new("empty.bin").expect("rel path");
     let hint = WriteHint {
         size: Some(0),
@@ -269,21 +274,40 @@ async fn empty_upload_uses_empty_block_list_without_superfile2() {
     assert_eq!(
         mock.superfile2_records().len(),
         0,
-        "0 分片 → superfile2 零调用"
+        "0 分片可传 → superfile2 零调用（真网真形：precreate 声明即视为在位）"
     );
+
+    let expected_blocks: &str = &format!("[\"{EMPTY_MD5}\"]");
     let recorded = mock.recorded();
     let reqs: Vec<_> = filter_recorded(&recorded, "POST", XPAN_FILE, &["method=precreate"]);
     assert_eq!(reqs.len(), 1, "precreate 恰一次");
-    let form = parse_urlencoded(&reqs[0].body);
     assert_exact_pairs(
-        &form,
+        &parse_urlencoded(&reqs[0].body),
         &[
             ("path", format!("{MOCK_ROOT}/empty.bin").as_str()),
             ("size", "0"),
             ("isdir", "0"),
             ("autoinit", "1"),
             ("rtype", "3"),
-            ("block_list", "[]"),
+            ("block_list", expected_blocks),
+        ],
+    );
+
+    // create 原样重申（isdir=0 腿与 mkdir 的 create 以 body 区分）。
+    let creates: Vec<_> = filter_recorded(&recorded, "POST", XPAN_FILE, &["method=create"])
+        .into_iter()
+        .filter(|r| r.body.contains("isdir=0"))
+        .collect();
+    assert_eq!(creates.len(), 1, "create（文件腿）恰一次");
+    assert_exact_pairs(
+        &parse_urlencoded(&creates[0].body),
+        &[
+            ("path", format!("{MOCK_ROOT}/empty.bin").as_str()),
+            ("size", "0"),
+            ("isdir", "0"),
+            ("rtype", "3"),
+            ("uploadid", mock.uploadids()[0].as_str()),
+            ("block_list", expected_blocks),
         ],
     );
 }

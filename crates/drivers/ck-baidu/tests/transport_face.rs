@@ -215,7 +215,8 @@ async fn open_range_half_open_window() {
     assert!(got.is_empty(), "start>=size 空流");
 }
 
-/// 空文件：block_list 空 + 零分片 + create 直接收尾。
+/// 空文件：block_list=`[EMPTY_MD5]`（0 字节 wire 真形，2026-09-23 真网
+/// errno=2 实测）+ 零分片 + create 直接收尾。
 #[tokio::test]
 async fn upload_empty_file_roundtrip() {
     let (_mock, transport) = setup().await;
