@@ -48,6 +48,8 @@ cargo build --release
 ./cydrive.exe run       # WebDAV :8485 → 自动挂载（默认 Y:；config drive_letter 可改）｜ 仪表盘 :8486 ｜ ctrl+c 或 cydrive stop
 ```
 
+**零配置开箱**：在没有任何配置文件的目录直接 `run`——程序自动生成最小配置并打开仪表盘（http://127.0.0.1:8486），在「＋ 添加卷」里建好第一个存储卷即可用；有配置文件的目录行为不变。
+
 baidu 实例最小配置（config.toml）：`backend = "baidu"` + `baidu_app_key/baidu_app_secret/baidu_refresh_token`（或 env `CYDRIVE_BAIDU_*`，access_token 缺省由 refresh 换取）；`baidu_root` 默认 `/apps/cloudfs`。
 local 实例：`backend = "local"` + `local_root = "<绝对路径>"`。
 sftp 实例：`backend = "sftp"` + `sftp_host` / `sftp_username` + 认证（`sftp_password` **或** `sftp_private_key_path`，可选 `sftp_private_key_passphrase`）；`sftp_port` 默认 22、`sftp_root` 默认 `/`。**首次连接必须先接受服务器主机密钥**：`cydrive doctor` 会打印服务器实际指纹（D2：未接受前驱动拒连，绝无静默 TOFU），把该值填进 `sftp_host_fingerprint` 即完成接受；指纹此后变更会被恒拒（MITM 信号）。凭据可经 env `CYDRIVE_SFTP_PASSWORD` / `CYDRIVE_SFTP_PRIVATE_KEY_PASSPHRASE` 覆盖文件值（单卷模式；多卷模式下与其他 `CYDRIVE_*` 一样被忽略——K28，见下文注意事项）。卷文件里的 `sftp_private_key_path` 相对路径锚定该卷 home 目录（K21，同 db/cache）。
