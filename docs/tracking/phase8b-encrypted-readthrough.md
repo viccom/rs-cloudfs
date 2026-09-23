@@ -2,7 +2,7 @@
 
 > 计划：`docs/plans/2026-09-23-encrypted-readthrough.md` ｜ 批准链：负责人 2026-09-23 三点指示 → K84 立项（D10 修订留痕）→ 深度分析五环 + 计划 §0 八项代码查证 → 计划落档
 > 基线：`feat/readthrough-index`@77a58cc（Phase 8 RT0–RT5+审查批+文档批已落，workspace 1643/0/60 五门禁绿，**待合入**）
-> 状态：**计划已批准（B1–B6 随批生效）——EB1 完成（2026-09-23，五红→绿 + 七门禁绿）；EB2 完成（2026-09-23，五红→绿 + 六门禁绿）；EB3 完成（2026-09-23，四红→绿 + 六门禁绿）；EB4 待开工**
+> 状态：**Phase 8-B 全批次完成（EB1–EB4），待合入**（EB1 2026-09-23 五红→绿+七门禁绿；EB2 五红→绿+六门禁绿+审查回派二红→绿；EB3 四红→绿+六门禁绿；EB4 两阶段验收三腿+Contract-6 修复+真网重跑+web 同步+K85 收口+五门禁与七组合终跑全绿——详见批次日志 EB4 与风险终态总表）
 > worktree：`feat/readthrough-index`（与 Phase 8 同一支，连续批次）；独立 target
 > 编号：执行记录入 decisions 用 **K85**；批次 **EB1–EB4**
 
@@ -12,7 +12,7 @@
 | EB1 | cipher 真相物化（B1+B3+B4：保留语义 upsert + 闭式反推 + 去 H1 退化臂） | ✅ 2026-09-23 | 五红→绿全留证（用例 12 断言红 / T1 编译红 / T2 防御臂断言红 / T4 降级断言红 / T3 尺寸断言红）；`upsert_materialized` 保留集 + `CipherCtx` + `plaintext_len_from_container` 闭式 + readthrough 双签名换 cipher + Vfs 两薄壳同源 ctx + rebuild `_with_ctx` 缝；七门禁绿（workspace **1647/0**、clippy/fmt/layers/secrets 零告警）；既有断言零漂移（rebuild 11、readthrough 其余 20、materialize 既有 5） | 本批日志 EB1 |
 | EB2 | 首读内容校验与回写（B2+B6：容器头/本地长度权威 + 定向 UPDATE + 双假说文案） | ✅ 2026-09-23 | 五红→绿全留证（流臂错行红 panic / hydrate size 红 2500≠5000 / gcm 改判红 `Crypto(AuthFailed)` / B6 红回 Stream / 面级红 145904≠150000）+ **审查回派 K84.2 双试二红→绿**（红4 改通路级红 admission 回 Err / 红6 新增红同 Err）；`fix_cipher_columns` 定向三列 + `first_read_admit`（34B 头读→magic/闭式交叉→回写→带窗构造，B4 零额外往返；无 magic → Hydrate 转 K84.2 双试）+ hydrate **双向**改判（gcm 臂遇 magic→v2 / v2 臂无 magic→试 v1 自愈回写 gcm）+ 解密后本地长度回写 + B6 双文案（挂 `Crypto` 模板与 `UnsupportedEncryptionScheme` 扩展，变体零动）+ 网关行重读传导；六门禁绿（workspace **1653/0/60**、clippy/fmt/layers/secrets 零告警）；既有断言零漂移（含 web_e2e 15d gcm 零窗口、vfs 916/979 `Crypto(_)`、fs 35、vfs_open_read 18） | 本批日志 EB2 + 审查回派 |
 | EB3 | rebuild 闸放开（B5：ensure_plaintext_instance 删 + 测试翻转 + help 文案） | ✅ 2026-09-23 | 四红→绿全留证（红1 生产缝加密用例被闸拒 panic / 红2 R6 加密臂 K11 文本 panic / 红3 集成腿经生产缝被闸拒 panic / 红4 core 旧测试编译红 E0432 unresolved `ensure_plaintext_instance`——闸没了它失败）；两闸删（cli :4010 活受理 + :4919 离线缝）+ `ensure_plaintext_instance` 函数与 `RebuildError::EncryptedInstance` 变体全删（唯一额外引用 = readthrough match 臂，同批收敛 Serde 单臂）+ 生产 cipher 接线（共享执行缝恒 `Some(CipherCtx::from_cfg(&vfs_config(cfg)))`，活/离线/多卷三路同缝）+ K11 模块文档/vfs 注释/模块预告句残留清零 + help 文案改写实跑；六门禁绿（workspace **1654/0/60**=基线+集成腿、clippy/fmt/layers/secrets 零告警、help 实跑）；既有断言零漂移（core rebuild 其余 10、telegram 用例、CONFIGS encrypted 标记全不动） | 本批日志 EB3 |
-| EB4 | 两阶段验收（离线 CI 三腿）+ 真网加密腿重跑 + 文档收口（K85）+ 五门禁终跑 | ⬜ 待批开工 | — | — |
+| EB4 | 两阶段验收（离线 CI 三腿）+ 真网加密腿重跑 + 文档收口（K85）+ 五门禁终跑 | ✅ 2026-09-23 | 离线三腿（新 `cloudkit-cli/tests/encrypted_readthrough_e2e.rs`，非 ignored）：腿1 两阶段协议**揭真缺陷红**（`row /empty.bin materialized: 2 row(s) present`——Contract 6 让加密空件不落远端）→ 修复后绿（物化三边界 size 精确 + hydrate 逐字节 + Range 三窗口流式逐字节）；腿2 混合方案首读自愈**首跑即绿**（4994 错猜 → admission 不拒 → hydrate 双试 → 回写 gcm/5000 → 读通）；腿3 rebuild 同构对账**首跑即绿**（上传行↔重建行 cipher 字段逐项相等 + 读通）；红→绿修复 = **Contract-6 加密空件例外**（`upload_queue::process_job` 闸：加密+密码+`authoritative_index` 放行容器上传，stale 守卫先行；正反两臂新单测——正臂先红 `left:0 right:1` → 绿、反臂闸精度回归哨；upload_queue 全套 28/28）。**真网加密腿**（K84.4，有界纪律）：pan123 **2/2 绿**（aead_v2 全栈 + WebDAV 明/密双轮，收尾核空）；pan115 腿1 绿（vfs aead_v2 全栈）、腿2 `Unauthorized` → 一轮 probe-refresh `40140120 refresh_token 无效` → **挂负责人真机窗口**。**web 前端同步**（EB3 报告项⑥并入，主会话裁可）：四处收窄仅 telegram + pin 测试 `rebuild_controls_gate_on_telegram_only_after_phase8b` 五断言先红（`volumes_page.rs:639`）→ 改后绿；cloudkit-web 全套 90/0。**文档收口四件套**：decisions **K85**（K85.1–K85.5，含 plan A 关闭=拒绝 + `remote_handle_for` 注释改关闭声明）/ README 机制段与状态表 / AGENTS Phase 8-B 块与计数 / 本单终态。**五门禁+七组合终跑**：workspace **1660/0/60**（186 suites，+6 = 三腿 3 + 单测 2 + pin 1）、clippy 全目标零告警、FMT_OK、check_layers OK、scan_secrets 零命中、七组合裁剪 clippy 全 Finished 零告警 | 本批日志 EB4 |
 
 ## 批次日志
 
@@ -58,12 +58,17 @@
 - `cargo fmt --all && cargo fmt --all -- --check` → FMT_OK（3 文件格式化后复跑三定向套件 9/21/11 仍绿）；
 - `scripts/check_layers` → OK（16 manifests，零 R1 违例）；`scripts/scan_secrets` → OK（零命中）。
 
-## 风险与未覆盖（随批更新）
+## 风险与未覆盖 —— 终态挂账总表（EB4 收口，随批更新到此为止）
 
-- v1 无 magic 残余歧义（B6：加密码晚于存量明文 + 索引丢 + 配置=gcm）——文案+sync 双出路，远期 manifest 挂账延续
-- 首次 PROPFIND 在「初值猜错未首读」窗口显示初值尺寸（一次性自愈，EB2 注明接受残余）
-- 真网加密腿依赖 token 可用性（K77 轮换纪律）；离线三腿已覆盖机制本体
-- Phase 8 主链（RT0–RT5+审查批）仍为**待合入**态——EB 批同分支叠加，合入指令到时一并处理
+| # | 挂账 | 状态/出路 |
+|---|---|---|
+| 1 | **B6 v1 无 magic 残余歧义**（给存量明文卷新加密码 + 索引丢 + 配置=gcm → 明文被猜成 v1 密文） | 双假说文案（`Crypto` 模板条件后缀 + `UnsupportedEncryptionScheme` 扩展，含 `cydrive sync` 关键词）+ sync 行级真相出路；远期 = 远端 manifest（Phase 8 挂账延续）；绝不静默吐密文 |
+| 2 | **无 chunks 形态不做首读校验**（row-id 回退形态无 ct 分母——生产加密行不产生） | EB2 如实挂账：该形态逐字今日行为，非容器在首窗仍 `Unavailable` 响亮失败，但 Content-Length 修正不在覆盖内 |
+| 3 | **首次 PROPFIND 初值窗口**（「配置初值猜错 + 未首读」时显示初值尺寸） | 接受残余（EB2 注明）：一次性、首读后自愈（B2 回写先于字节出门） |
+| 4 | **真网加密腿结果**（K84.4 验收项，有界纪律处置） | pan123 **2/2 绿**（aead_v2 全栈 + WebDAV 明/密双轮，收尾核空）；pan115 腿1 绿、**腿2 挂负责人真机窗口**（盘上 refresh 被腿1 内存刷轮换且 e2e `token_store=None` 不回写 → probe-refresh `40140120` 一轮失败 → 恢复需真人扫码重发 token；离线三腿已覆盖机制本体） |
+| 5 | **web_e2e 15d 与 gcm 分流裁决指针** | EB2 裁决①（gcm 行账目自洽性分流——不自洽才付 34B 头读）**维持现状**，主会话已批；详见 EB2 批次日志裁决① |
+| 6 | **Contract-6 明文空件同款观察（EB4 新发现，未修待裁决）** | 明文 0 字节行在 authoritative 后端同样不落远端、索引丢失后文件名消失——Phase 8 既有行为，不在 EB4 授权范围；加密侧已修（EB4 红→绿），明文侧行为变更需负责人裁决（牵动 MiniRedir 空 PUT 语义与 `zero_byte_job_skips_transport` 既有契约） |
+| 7 | Phase 8 主链（RT0–RT5+审查批）与 Phase 8-B（EB1–EB4）同分支叠加，均**待合入** | 合入指令到时一并处理；worktree `feat/readthrough-index` 独立 target |
 
 ### EB2（2026-09-23，实现子代理，worktree feat/readthrough-index）
 
@@ -161,6 +166,52 @@
 - help 实跑：`cargo run -q -p cloudkit-cli -- rebuild --help` → 输出新句「Encrypted volumes rebuild the same way: rows carry per-file cipher truth and first-read validation repairs any wrong guess」（无 "refused" 残句）。
 
 **风险与未覆盖（EB3 增量，随批更新）**：
-- **web 前端门控/文案未同步**（报告项⑥）：i18n `volumes.note.refresh_encrypted` 双语 + volumes.js `v.encrypted` 静默注 + app.js `row.encrypted` 按钮禁用 + `index.rebuild_unsupported` "(telegram/encrypted)"——B5 后后端已收、web UI 仍隐藏按钮且文案失真；计划 Files 外、指定扫描模式未命中，本批未改，待 EB4/负责人裁决。
-- README「加密卷永不回源物化」机制段 = EB4 文档收口范围（本批按计划分工未动）。
-- 真网 pan115/pan123 加密 e2e 重跑仍挂负责人真机窗口（EB4 验收项）。
+- **web 前端门控/文案未同步**（报告项⑥）：i18n `volumes.note.refresh_encrypted` 双语 + volumes.js `v.encrypted` 静默注 + app.js `row.encrypted` 按钮禁用 + `index.rebuild_unsupported` "(telegram/encrypted)"——B5 后后端已收、web UI 仍隐藏按钮且文案失真；计划 Files 外、指定扫描模式未命中，本批未改。**→ EB4 已收口**（四处收窄仅 telegram + pin 五断言红→绿，见 EB4 批次日志 C 节）。
+- README「加密卷永不回源物化」机制段 = EB4 文档收口范围（本批按计划分工未动）。**→ EB4 已收口**（终态语义四件套之②）。
+- 真网 pan115/pan123 加密 e2e 重跑仍挂负责人真机窗口（EB4 验收项）。**→ EB4 已处置**（pan123 2/2 绿；pan115 腿1 绿、腿2 refresh 失效挂账——终态总表第 4 行）。
+
+### EB4（2026-09-23，收口批：两阶段验收 + 真网重跑 + web 同步 + 文档 + 终跑）
+
+**A. 离线两阶段验收三腿**（新 `crates/cloudkit-cli/tests/encrypted_readthrough_e2e.rs`，非 ignored 进常规 CI；local 驱动 + TempDir 后端 + 实例密码，真 crypto 全链零网络；内容 64 位 LCG 按轮钟表种子——K72/K77.6 纪律）：
+
+**红→绿真实输出（按执行序）**：
+- 首跑**编译零红**（一次通过——harness 照 pan115_e2e/rebuild.rs 形态，API 面全部命中）；**腿2、腿3 首跑即绿**（协议面的红证据在前批：EB1 五红 / EB2 五红+回派二红 / EB3 四红——本腿只承担 e2e 级协议验收，不伪造红）；
+- **腿1 红（真缺陷）**：`panicked … row /empty.bin materialized: 2 row(s) present`——阶段① 三上传 drain 成功（`[leg1] stage 1: three encrypted uploads drained`），阶段② 全新 db 物化只见 2 行（exact + docs），**空件不在远端**。根因 = Contract 6「0-byte uploads never touch the remote」对加密空件同样生效：0 明文字节的 v2 容器（50B）是真实载荷，跳过后端永久缺文件——索引丢失后名字从 read-through/rebuild 视野消失（负责人两阶段协议的空件边界直接揭穿）；
+- **单测红（同缺陷闸正臂）**：新 `encrypted_zero_byte_row_still_uploads_its_container` → `assertion left == right failed … left: 0 right: 1`（`stream_upload_calls()` 零调用）；反臂 `encrypted_zero_byte_keeps_the_skip_on_a_shadow_index_backend` **先即绿**（默认 mock `authoritative_index=false` 保持跳过——闸的精度基线）；
+- **修复（生产代码，超出计划 Task 4 Files——按「修 bug 先写重现测试再修」TDD 授权与验收硬要求执行，如实入档 K85.5）**：`upload_queue::process_job` 的 Contract-6 臂重构——stale 空 PUT 守卫**先行**（加密/明文共用，superseded 语义不动）→ 闸 `row.is_encrypted && cfg.encryption_password.is_some() && transport.capabilities().authoritative_index` 才放行穿透到既有 v1 staging / v2 流式路径（cipher_job 重算分块计划，enqueued 零计划永不达 transport）；telegram（影子索引）与明文行逐字保持原契约（Python parity / MiniRedir 语义）；`vfs.rs commit_put` 零计划注释同步；
+- **修后绿**：e2e **3 passed; 0 failed**（腿1 含物化三边界 size 精确断言 `empty=0 / exact=1048576 / cross=1060921` + hydrate 逐字节 + 整窗 + Range 三窗口（头/跨 1MiB 容器块边界/尾）流式逐字节）；`upload_queue` **28 passed; 0 failed**（新 2 + 既有 26 含 `zero_byte_job_skips_transport`/stale 双守卫零漂移）；敏感面中检 `cloudkit-core + cloudkit-webdav + cloudkit-web` 全 0 failed（Explorer 空 PUT 占位守卫、webdav smoke 合同 6 腿零漂移）；
+- 执行期**测试自身一处修**（非产品缺陷）：腿1 中窗越界 `range end index 1114112 out of range for slice of length 1060921`——cross 文件仅 1MiB+12345，128KiB 中窗放不进跨界后余量 → 改 `64KiB + CROSS_TAIL` 止于 EOF（跨界断言保留）。
+- **腿3 与 EB3 集成腿的去重说明**（计划允许如实去重/协议面差异保留）：EB3 `cli/tests/rebuild.rs::encrypted_local_volume_rebuilds_and_reads_through` = 手搓容器种子 + 生产缝 `run_rebuild_with_driver`；本腿协议面差异三点保留——①后端内容来自**真实加密上传路径**（非手搓 fs::write）②wipe 前**捕获上传行 truth、wipe 后对账**（上传行 ≡ 重建行 cipher 字段逐项同构——rebuild 与现查同轨的 e2e 级钉）③直调 `rebuild_from_backend_with_ctx`（生产 `CipherCtx::from_cfg(vfs_config(cfg))` 形态）+ 嵌套目录全树 walk。
+
+**B. 真网加密腿重跑**（`#[ignore]` + `--test-threads=1 --nocapture`；凭据只经 env、从 `E:\GitHub\rs-CyDrive\test\` 读入 shell 变量——值零落 argv/日志/回传）：
+- **pan123 2/2 绿**：`pan123_vfs_aead_v2_full_stack_roundtrip`（行 uploaded/encrypted/aead_v2/size=1572864 + hydrate 1572864B 逐字节 + 跨块窗口 + 远端密文核验 1572930B=+66B 容器开销）+ `pan123_webdav_roundtrip_plain_and_encrypted`（明轮 GET 262144B 逐字 → 密轮 GET 262144B 逐字 → 双删核空 `remote cleaned`），28.5s，K79.6 测试根 `CYDRIVE_PAN123_TEST_ROOT=64409220`（`e2e_pan123_root_3800`）必填在案；
+- **pan115 腿1 绿**：`pan115_vfs_aead_v2_full_stack_roundtrip` 同五断言全过 + 远端核空；
+- **pan115 腿2 挂账（有界纪律处置，如实不谎报）**：`pan115_webdav_roundtrip_plain_and_encrypted` 首连 `Unauthorized { recoverable: true }`——环境事实：盘上 access 七天前取得（7200s 窗早已过），**腿1 的驱动 connect 已在内存中完成 refresh 并把盘上 refresh_token 轮换失效**，而 e2e `token_store=None` 不回写；按纪律执行**一轮** `pan115-spike probe-refresh`（探测+刷新工具，K74.1 形态）→ `refreshToken: rejected http=200 state=0 code=40140120 errno=40140120 message=refresh_token 无效` → 恢复需真人扫码重发（超有界纪律，不死磕）→ **挂账「pan115 webdav 加密轮待负责人真机窗口（先 probe-refresh 轮换落盘再跑，K74.1 操作序）」**。操作教训入档：真网多腿连跑前应**先** probe-refresh 轮换落盘再跑（e2e 内存刷不回写——K74.1「先轮换落盘」的次序价值本批反向实证）。
+
+**C. web 前端同步（EB3 报告项⑥并入，主会话裁可）**：
+- **先查测试**：`cloudkit-web` 三测试文件无任何钉 JS 门控/文案的断言（`configs_endpoint_parses_the_sparse_rebuild_markers` 只钉后端 `encrypted` 稀疏标记 JSON——后端标记保留不动）→ 无既有断言需同步；本批**新增** Rust 级内容 pin `rebuild_controls_gate_on_telegram_only_after_phase8b`（i18n 双语 narrowing + 死键删除 + volumes.js/app.js 门控收窄共五断言）；
+- **pin 红**：`panicked at crates\cloudkit-web\tests\volumes_page.rs:639`（首断言——i18n 仍含 `(telegram/encrypted)`）→ **四处编辑** → 绿；
+- **前后对照**：
+
+| 位置 | 改前 | 改后 |
+|---|---|---|
+| `i18n.js:59` EN `index.rebuild_unsupported` | `…no backend to walk (telegram/encrypted)…` | `…no backend to walk (telegram)…` |
+| `i18n.js:330` ZH 同键 | `…（telegram/加密卷）…` | `…（telegram）…` |
+| `i18n.js:142/413` `volumes.note.refresh_encrypted` 双语 | 「Refresh refuses encrypted instances…」/「加密实例拒绝刷新…」 | **键删除**（两语言，B5 后失真且无消费者） |
+| `volumes.js refreshControl` | `if (v.encrypted)` → 静默 note + 失真 tooltip；函数注释述 K11 加密拒 | **分支删除**，注释改写 B5 终态（加密卷同式可刷；telegram 唯一静默注） |
+| `app.js:271` | `row.backend === 'telegram' \|\| row.encrypted` 禁用 Rebuild | `row.backend === 'telegram'`（仅 telegram 禁用） |
+
+- **clippy 当场修 2**：pin 测试 `redundant_locals`（closure 内 `let addr = addr` → 直捕）+ e2e 头注释 `doc_lazy_continuation`（行首 `+` 被解析为列表标记 → 改顿号连接）；
+- **测试情况**：pin 红→绿（五断言）；`cargo test -p cloudkit-web` 全套 **90 passed / 0 failed**（含 web_e2e 32、multivolume 16、volumes_page 41——15d gcm 既有断言零漂移）。
+
+**D. 文档收口四件套**：① `docs/decisions.md` 末尾 **K85**（K85.1 四批总述+终态数字 / K85.2 两处计划自修含缺口发现过程 / K85.3 plan A 关闭=拒绝+`remote_handle_for` 注释改关闭声明 / K85.4 B5 同批+web 反分裂 / K85.5 残余与挂账如实录）；② `README.md` 四处（Phase 8-B 状态行新增+Phase 8 行尾标注、rebuild 段去「加密实例走 sync」、机制段换终态语义「加密卷与明文卷同构 read-through」、/volumes Actions 列仅 telegram）；③ `AGENTS.md` 当前阶段顶部 Phase 8-B 完成块 + 计数行 1643→**1660**；④ 本单状态行/EB4 行/EB4 批次日志/风险节改**终态挂账总表**（七行）+ EB3 增量三项标注收口。
+
+**E. 五门禁 + 七组合终跑**（全部编辑完成后终态复跑，真实输出）：
+- `cargo test --workspace --no-fail-fast -j 4` → **TOTAL passed: 1660, failed: 0, ignored: 60, suites: 186**，exit 0（基线 1654 + 新 6；ignored 60 不变——零新增 `#[ignore]`）；
+- `cargo clippy --workspace --all-targets -j 4 -- -D warnings` → `Finished dev profile … in 11.78s` 零告警；
+- `cargo fmt --all -- --check` → **FMT_OK**；
+- `scripts/check_layers` → `OK - 16 manifests checked (7 driver crate(s)), no R1 violations`；
+- `scripts/scan_secrets` → `OK - no pattern matches [full tree]`；
+- 七组合裁剪 clippy（全量之后跑，双指纹纪律）→ telegram/baidu/local/sftp/pan115/pan123/webdav **七行全部 `Finished dev profile` 零告警**。
+
+**提交**：`test(phase8b): 两阶段验收三腿 + Contract-6 加密空件例外 + 真网加密腿重跑 + web 门控收窄（EB4）` 与 `docs(phase8b): K85 收口——README/AGENTS/跟踪单终态（EB4）`。
