@@ -52,6 +52,7 @@ use cloudkit_core::credentials::{
 };
 use cloudkit_core::database::MetaDatabase;
 use cloudkit_core::inbound::spawn_inbound_worker;
+use cloudkit_core::materialize::CipherCtx;
 use cloudkit_core::rebuild;
 use cloudkit_core::rel_path::RelPath;
 use cloudkit_core::sync::{namespace_key, sync_once, SyncOutcome};
@@ -3954,10 +3955,11 @@ impl RuntimeVolumeControl {
     /// `REBUILD <name>` (web volume management P2, plan §1.3 R1–R6):
     /// the gates run SYNCHRONOUSLY — a volume must be registered and
     /// running (its live VFS answers the queue read), no rebuild may
-    /// already be in flight (R1), an encrypted volume is refused with
-    /// the K11 sync guidance and a telegram volume with the
-    /// shadow-index refusal (R6 — both actionable, neither background
-    /// work), and the upload queue must be drained (R2 — the same
+    /// already be in flight (R1), a telegram volume is refused with
+    /// the shadow-index refusal (R6 — actionable, never background
+    /// work; encrypted volumes are accepted since Phase 8-B B5 — the
+    /// walk carries the production cipher context), and the upload
+    /// queue must be drained (R2 — the same
     /// `outstanding()` the REMOVE drain judges by). Everything past
     /// the gates is ACCEPTED, not executed: the marker goes up, the
     /// background task spawns (R3), and the reply is immediate — the
@@ -4000,15 +4002,14 @@ impl RuntimeVolumeControl {
                 format_start_clock(started)
             );
         }
-        // R6's synchronous gates, in the offline rebuild's own order
-        // (telegram first, then the K11 plaintext gate) — with the
-        // same texts, so the two surfaces cannot drift.
+        // R6's synchronous gate: the telegram shadow-index refusal —
+        // the same text the offline path prints, so the two surfaces
+        // cannot drift. (The K11 plaintext gate is gone: Phase 8-B B5
+        // accepts encrypted volumes — the walk behind the acceptance
+        // seam carries the production cipher context.)
         let settings = &runtime.spec().settings;
         if settings.backend == Backend::Telegram {
             return format!("ERR: {TELEGRAM_REBUILD_REFUSAL}\n");
-        }
-        if let Err(error) = rebuild::ensure_plaintext_instance(settings) {
-            return format!("ERR: {error}\n");
         }
         // R2: the drained-queue threshold (H2's `outstanding()`, the
         // same observable the REMOVE drain waits on).
@@ -4891,10 +4892,12 @@ pub async fn run_rebuild_multi(
 /// [`run_rebuild_command`] with the driver injected — the test seam
 /// (tests seed a `MockStorageDriver`; production feeds the
 /// backend-key assembly). Gates in order, all before any backend
-/// traffic: config validity, the telegram shadow-index refusal, the
-/// K11 plaintext-only gate; then the db open and the bounded walk
-/// (D8②: entry cap + the 15-minute budget — the offline path's
-/// extension of the live rebuild's budget).
+/// traffic: config validity and the telegram shadow-index refusal;
+/// then the db open and the bounded walk (D8②: entry cap + the
+/// 15-minute budget — the offline path's extension of the live
+/// rebuild's budget). The walk carries the production cipher context
+/// (Phase 8-B B5): encrypted instances materialize cipher-truth rows
+/// through the same `materialize_entry` mapping read-through uses.
 pub async fn run_rebuild_with_driver(
     cfg: &CyDriveConfig,
     driver: &dyn StorageDriver,
@@ -4914,14 +4917,25 @@ async fn run_rebuild_with_driver_and_limits(
     if cfg.backend == Backend::Telegram {
         anyhow::bail!("{TELEGRAM_REBUILD_REFUSAL}");
     }
-    // No context wrapper: RebuildError::EncryptedInstance's Display IS
-    // the actionable message (sync guidance) — a context would bury it.
-    rebuild::ensure_plaintext_instance(cfg)?;
+    // Phase 8-B B5: the walk carries the production cipher context —
+    // built exactly as the Vfs thin shells build theirs (`vfs_config`
+    // maps the CyDriveConfig, `from_cfg` reads password-present +
+    // configured scheme), so rebuild and read-through share one truth
+    // semantics: encrypted rows land cipher-correct (B1/B3) and an
+    // existing `is_encrypted=1` row is never downgraded by a listing
+    // (T4's invariant, now true for rebuild too).
+    let cipher = Some(CipherCtx::from_cfg(&vfs_config(cfg)));
     let db = MetaDatabase::open(Path::new(&cfg.db_path))
         .with_context(|| format!("opening metadata db {:?}", cfg.db_path))?;
-    rebuild::rebuild_from_backend_with(driver, &db, &cloudkit_storage::RelPath::root(), limits)
-        .await
-        .context("rebuilding the index from the backend")
+    rebuild::rebuild_from_backend_with_ctx(
+        driver,
+        &db,
+        &cloudkit_storage::RelPath::root(),
+        limits,
+        cipher,
+    )
+    .await
+    .context("rebuilding the index from the backend")
 }
 
 /// The P2 CLI forward: when a multi-volume instance is LIVE in this

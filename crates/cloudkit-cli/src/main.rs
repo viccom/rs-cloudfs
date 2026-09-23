@@ -145,7 +145,8 @@ enum Command {
     /// Rebuild this instance's metadata DB from the backend's
     /// authoritative index (baidu / local backends; the instance db at
     /// the current working directory is rebuilt in place). Encrypted
-    /// instances are refused — use `cydrive sync` for those.
+    /// volumes rebuild the same way: rows carry per-file cipher truth
+    /// and first-read validation repairs any wrong guess.
     Rebuild,
     /// Diagnose the local installation: config, DB, cache, ports, and
     /// the Windows WebClient registry/service state.

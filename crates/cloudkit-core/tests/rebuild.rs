@@ -18,13 +18,12 @@
 //!   one single-container `chunks` row (index 0, the row's msg_id, the
 //!   whole size, no sha — K11 bookkeeping parity with an upload
 //!   persist's one-element receipt); directory rows write none.
-//! - Plaintext-only semantics (K11): an instance with
-//!   `enable_encryption = true` is refused up front with an actionable
-//!   error pointing at `cydrive sync` — the backend only sees
-//!   ciphertext containers under plaintext names, so a rebuilt row
-//!   would mislabel encrypted payloads as plaintext. The gate is a
-//!   pure config check (`ensure_plaintext_instance`), the CLI layer
-//!   calls it before anything else.
+//! - Encrypted instances (Phase 8-B / B5): rebuild accepts them — the
+//!   walk carries a `CipherCtx` into `rebuild_from_backend_with_ctx`
+//!   and every file row lands cipher truth (flag, config scheme,
+//!   plaintext size closed-form back-solved from the container
+//!   length); plaintext instances keep the verbatim three-parameter
+//!   road (raw backend size, no cipher flag).
 //! - Empty backend root: `Ok` with zero rows (a fresh app dir is a
 //!   legitimate state, not an error).
 
@@ -37,8 +36,8 @@ use async_trait::async_trait;
 use cloudkit_core::config::CyDriveConfig;
 use cloudkit_core::database::MetaDatabase;
 use cloudkit_core::rebuild::{
-    ensure_plaintext_instance, rebuild_from_backend, rebuild_from_backend_with, RebuildInterrupted,
-    RebuildLimits, RebuildOutcome,
+    rebuild_from_backend, rebuild_from_backend_with, rebuild_from_backend_with_ctx,
+    RebuildInterrupted, RebuildLimits, RebuildOutcome,
 };
 use cloudkit_storage::{
     BackendHandle, ByteStream, Capabilities, Entry, EntryId, Listing, MockStorageDriver, Page,
@@ -265,30 +264,112 @@ async fn rebuild_of_an_empty_backend_is_ok_with_zero_rows() {
     );
 }
 
-#[test]
-fn encrypted_instances_are_refused_with_sync_guidance() {
-    // A mock config with encryption on: the pure gate refuses with an
-    // actionable message pointing at cydrive sync (K11 plaintext-only).
+/// B5 (EB3) 翻转：加密实例（`CyDriveConfig` 带密码 + 方案）不再被拒——
+/// 携带生产判据构造的 `CipherCtx`（`from_cfg`：密码在 + 配置方案）走
+/// `rebuild_from_backend_with_ctx` 全树，文件行落 cipher 真相
+/// （`is_encrypted=true`、scheme=配置值、size=闭式反推明文长），
+/// chunk 保留容器长；明文实例调用既有三参入口行为逐字不变
+/// （raw 后端长、无 cipher 旗）。
+#[tokio::test]
+async fn encrypted_instances_rebuild_with_cipher_truth() {
+    // Backend: a real v2 container under a plaintext name (crypto fresh).
+    let driver = seeded_driver();
+    let plain = b"encrypted payload behind a plaintext name";
+    let container = cloudkit_core::crypto::AeadV2::new().encrypt("pw", plain);
+    seed_file(&driver, "secret.bin", &container).await;
+    let container_len = container.len() as i64;
+
+    // The encrypted instance: password + scheme on the CyDriveConfig.
     let encrypted = CyDriveConfig {
         enable_encryption: true,
         encryption_password: Some("pw".to_string()),
         ..CyDriveConfig::default()
     };
-    let err =
-        ensure_plaintext_instance(&encrypted).expect_err("encrypted instance must be refused");
-    let message = err.to_string();
     assert!(
-        message.contains("sync"),
-        "the refusal must point at cydrive sync, got: {message}"
+        !matches!(
+            encrypted.encryption_scheme.as_str(),
+            cloudkit_core::config::SCHEME_GCM
+        ),
+        "seed sanity: default scheme is aead_v2 (matches AeadV2::new() containers)"
     );
-    assert!(
-        message.contains("encrypt"),
-        "the refusal must name encryption as the reason, got: {message}"
+    // 最小适配（判据照 `CipherCtx::from_cfg`）：core 测试侧就地构造
+    // from_cfg 所需的 VfsConfig 两字段——密码过 enable 门控（AND 语义，
+    // 与 cli `vfs_config` 同源）+ 方案直通。
+    let ctx = cloudkit_core::materialize::CipherCtx::from_cfg(&cloudkit_core::vfs::VfsConfig {
+        encryption_password: if encrypted.enable_encryption {
+            encrypted.encryption_password.clone()
+        } else {
+            None
+        },
+        encryption_scheme: encrypted.encryption_scheme,
+        ..cloudkit_core::vfs::VfsConfig::default()
+    });
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let db = MetaDatabase::open(&dir.path().join("meta.db")).expect("open db");
+    let outcome = rebuild_from_backend_with_ctx(
+        &driver,
+        &db,
+        &RelPath::root(),
+        RebuildLimits::default(),
+        Some(ctx),
+    )
+    .await
+    .expect("encrypted instance rebuilds — B5 removed the K11 refusal");
+    assert_eq!(
+        outcome,
+        RebuildOutcome {
+            files: 1,
+            dirs: 0,
+            ..Default::default()
+        },
+        "one backend file walked"
     );
 
-    // Plaintext instances (the default) pass the gate.
-    ensure_plaintext_instance(&CyDriveConfig::default())
-        .expect("plaintext instance passes the gate");
+    // The file row carries cipher truth end to end.
+    let row = db
+        .get_file("/secret.bin")
+        .expect("read row")
+        .expect("row exists");
+    assert!(row.is_encrypted, "cipher flag from the instance config");
+    assert_eq!(
+        row.encryption_scheme,
+        encrypted.encryption_scheme.as_str(),
+        "scheme = the configured value"
+    );
+    assert_eq!(
+        row.size,
+        plain.len() as i64,
+        "size = closed-form back-solve of the container length"
+    );
+    let chunks = db.get_chunks_by_file_id(row.id).expect("read chunks");
+    assert_eq!(chunks.len(), 1, "one single-container chunk row");
+    assert_eq!(
+        chunks[0].size, container_len,
+        "the chunk keeps the backend container length"
+    );
+
+    // Plaintext instance through the existing three-parameter entry:
+    // verbatim pre-cipher behavior — the same container bytes are read
+    // as raw backend length, no cipher flag, no back-solve.
+    let dir_plain = tempfile::tempdir().expect("tempdir");
+    let db_plain = MetaDatabase::open(&dir_plain.path().join("meta.db")).expect("open db");
+    let plain_outcome = rebuild_from_backend(&driver, &db_plain, &RelPath::root())
+        .await
+        .expect("plaintext instance walks through the three-parameter entry");
+    assert_eq!(plain_outcome.files, 1, "same backend, one file");
+    let plain_row = db_plain
+        .get_file("/secret.bin")
+        .expect("read row")
+        .expect("row exists");
+    assert!(
+        !plain_row.is_encrypted,
+        "three-parameter entry stays verbatim: no cipher flag"
+    );
+    assert_eq!(
+        plain_row.size, container_len,
+        "three-parameter entry stays verbatim: raw backend length, no back-solve"
+    );
 }
 
 // ============================================================== RT4 ===

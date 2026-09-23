@@ -15,8 +15,8 @@
 //! - 加密实例 cipher 真相物化（D10 经 K84/B1–B4 修订，Phase 8-B）：加密 +
 //!   宽面卷与明文卷同路回源物化——cipher 初值只填空，既有行
 //!   is_encrypted/scheme 真相永不被列举猜测回退，尺寸按真相方案闭式反推
-//!   （用例 12）；rebuild 的拒收语义独立存在（ensure_plaintext_instance，
-//!   EB3 放开）；
+//!   （用例 12）；rebuild 侧同语义（EB3 已放开拒收闸——两侧同走
+//!   materialize 真相语义）；
 //! - 写侧就近失效（pan115 先例）：commit_put / create_dir / remove_file
 //!   后撤父目录 TTL 窗。
 //!

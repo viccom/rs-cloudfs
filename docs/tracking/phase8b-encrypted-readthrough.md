@@ -2,7 +2,7 @@
 
 > 计划：`docs/plans/2026-09-23-encrypted-readthrough.md` ｜ 批准链：负责人 2026-09-23 三点指示 → K84 立项（D10 修订留痕）→ 深度分析五环 + 计划 §0 八项代码查证 → 计划落档
 > 基线：`feat/readthrough-index`@77a58cc（Phase 8 RT0–RT5+审查批+文档批已落，workspace 1643/0/60 五门禁绿，**待合入**）
-> 状态：**计划已批准（B1–B6 随批生效）——EB1 完成（2026-09-23，五红→绿 + 七门禁绿）；EB2 完成（2026-09-23，五红→绿 + 六门禁绿）；EB3 待开工**
+> 状态：**计划已批准（B1–B6 随批生效）——EB1 完成（2026-09-23，五红→绿 + 七门禁绿）；EB2 完成（2026-09-23，五红→绿 + 六门禁绿）；EB3 完成（2026-09-23，四红→绿 + 六门禁绿）；EB4 待开工**
 > worktree：`feat/readthrough-index`（与 Phase 8 同一支，连续批次）；独立 target
 > 编号：执行记录入 decisions 用 **K85**；批次 **EB1–EB4**
 
@@ -11,7 +11,7 @@
 | EB0 | 计划期八项代码查证（随计划完成） | ✅ 2026-09-23 | 计划 §0 八条：upsert 冲突集覆盖 cipher 列 / AeadV2::new() 默认分块无配置缝 / RowMetaData.len 承重 / K47 流式分流 / chunks 仅取消息 id / sha256 读面零引用 / 闸两点位+help 文案 / plan A pending 出口 | 计划 §0（本批日志） |
 | EB1 | cipher 真相物化（B1+B3+B4：保留语义 upsert + 闭式反推 + 去 H1 退化臂） | ✅ 2026-09-23 | 五红→绿全留证（用例 12 断言红 / T1 编译红 / T2 防御臂断言红 / T4 降级断言红 / T3 尺寸断言红）；`upsert_materialized` 保留集 + `CipherCtx` + `plaintext_len_from_container` 闭式 + readthrough 双签名换 cipher + Vfs 两薄壳同源 ctx + rebuild `_with_ctx` 缝；七门禁绿（workspace **1647/0**、clippy/fmt/layers/secrets 零告警）；既有断言零漂移（rebuild 11、readthrough 其余 20、materialize 既有 5） | 本批日志 EB1 |
 | EB2 | 首读内容校验与回写（B2+B6：容器头/本地长度权威 + 定向 UPDATE + 双假说文案） | ✅ 2026-09-23 | 五红→绿全留证（流臂错行红 panic / hydrate size 红 2500≠5000 / gcm 改判红 `Crypto(AuthFailed)` / B6 红回 Stream / 面级红 145904≠150000）+ **审查回派 K84.2 双试二红→绿**（红4 改通路级红 admission 回 Err / 红6 新增红同 Err）；`fix_cipher_columns` 定向三列 + `first_read_admit`（34B 头读→magic/闭式交叉→回写→带窗构造，B4 零额外往返；无 magic → Hydrate 转 K84.2 双试）+ hydrate **双向**改判（gcm 臂遇 magic→v2 / v2 臂无 magic→试 v1 自愈回写 gcm）+ 解密后本地长度回写 + B6 双文案（挂 `Crypto` 模板与 `UnsupportedEncryptionScheme` 扩展，变体零动）+ 网关行重读传导；六门禁绿（workspace **1653/0/60**、clippy/fmt/layers/secrets 零告警）；既有断言零漂移（含 web_e2e 15d gcm 零窗口、vfs 916/979 `Crypto(_)`、fs 35、vfs_open_read 18） | 本批日志 EB2 + 审查回派 |
-| EB3 | rebuild 闸放开（B5：ensure_plaintext_instance 删 + 测试翻转 + help 文案） | ⬜ 待批开工 | — | — |
+| EB3 | rebuild 闸放开（B5：ensure_plaintext_instance 删 + 测试翻转 + help 文案） | ✅ 2026-09-23 | 四红→绿全留证（红1 生产缝加密用例被闸拒 panic / 红2 R6 加密臂 K11 文本 panic / 红3 集成腿经生产缝被闸拒 panic / 红4 core 旧测试编译红 E0432 unresolved `ensure_plaintext_instance`——闸没了它失败）；两闸删（cli :4010 活受理 + :4919 离线缝）+ `ensure_plaintext_instance` 函数与 `RebuildError::EncryptedInstance` 变体全删（唯一额外引用 = readthrough match 臂，同批收敛 Serde 单臂）+ 生产 cipher 接线（共享执行缝恒 `Some(CipherCtx::from_cfg(&vfs_config(cfg)))`，活/离线/多卷三路同缝）+ K11 模块文档/vfs 注释/模块预告句残留清零 + help 文案改写实跑；六门禁绿（workspace **1654/0/60**=基线+集成腿、clippy/fmt/layers/secrets 零告警、help 实跑）；既有断言零漂移（core rebuild 其余 10、telegram 用例、CONFIGS encrypted 标记全不动） | 本批日志 EB3 |
 | EB4 | 两阶段验收（离线 CI 三腿）+ 真网加密腿重跑 + 文档收口（K85）+ 五门禁终跑 | ⬜ 待批开工 | — | — |
 
 ## 批次日志
@@ -128,3 +128,39 @@
 - `cargo clippy --workspace --all-targets -j 4 -- -D warnings` → Finished 零告警；
 - `cargo fmt --all && cargo fmt --all -- --check` → FMT_OK；
 - `scripts/check_layers` → OK（16 manifests，零 R1）；`scripts/scan_secrets` → OK（零命中）。
+
+### EB3（2026-09-23，worktree feat/readthrough-index）
+
+**TDD 四组红→绿（真实输出，按执行序）**：
+- 红1（cli 生产缝加密用例——闸先红）：`encrypted_instance_rebuilds_with_cipher_truth_rows` → `panicked … encrypted instance rebuilds through the production seam (B5): rebuild refuses encrypted instances: the backend only sees ciphertext containers … use `cydrive sync` instead …`；接线后绿 = cli rebuild **4 passed**（含翻转用例 + 集成腿）。
+- 红2（R6 控制通道加密臂——闸先红）：`rebuild_scope_gates_refuse_synchronously` → `panicked … the encrypted volume is accepted (B5): ERR: rebuild refuses encrypted instances …`；绿 = **1 passed**。
+- 红3（集成腿——真 local 卷经生产缝，闸先红）：`encrypted_local_volume_rebuilds_and_reads_through` → `panicked … encrypted local volume rebuilds through the production seam (B5): rebuild refuses encrypted instances …`；绿 = 4/4 一并转绿（空件 ct=50→size 0、目录行明文、K47 流式/hydrate 双臂读通均过）。
+- 红4（core 旧测试——闸没了它失败，编译红）：删 `ensure_plaintext_instance` 后 `cargo test -p cloudkit-core --test rebuild` → `error[E0432]: unresolved import cloudkit_core::rebuild::ensure_plaintext_instance … no 'ensure_plaintext_instance' in 'rebuild'`；翻转为 `encrypted_instances_rebuild_with_cipher_truth`（加密实例 → `_with_ctx` 成功 + is_encrypted/scheme/闭式 size/chunk=容器长；明文实例三参入口逐字不变 = raw 后端长无旗）→ rebuild **11 passed**（翻转 1 + 其余 10 零漂移）。
+
+**落地件**：
+1. **cli lib.rs**：`:4010` 活受理闸删（R6 注释同步为 telegram 单闸）+ `:4919` 离线缝闸删 + **生产 cipher 接线** = `Some(CipherCtx::from_cfg(&vfs_config(cfg)))` 落 `run_rebuild_with_driver_and_limits`；`rebuild_volume` / `run_rebuild_with_driver` doc 同步。
+2. **core rebuild.rs**：`ensure_plaintext_instance` 函数 + `RebuildError::EncryptedInstance` 变体**全删**（非挂注释——见裁决②）+ K11 模块文档加密拒收段改写为「加密卷同走 materialize 真相语义（Phase 8-B / B5）」+ `_with` / `_with_ctx` doc 更新；`walk_one_dir` 的 cipher 缝 EB1 已接（本批把生产 cfg 接上即通）。
+3. **main.rs help**：`Encrypted instances are refused — use cydrive sync for those.` → `Encrypted volumes rebuild the same way: rows carry per-file cipher truth and first-read validation repairs any wrong guess.`（`cargo run -q -p cloudkit-cli -- rebuild --help` 实跑输出已核）。
+4. **残留清零（代码面）**：core tests/readthrough.rs 模块预告句、runtime_rebuild R6 doc、rebuild.rs `_with_ctx` doc 中的函数名引用全部收敛；终扫 `rg "ensure_plaintext"` 在 `crates/` 下**零命中**。
+
+**执行期自主裁决（如实入档）**：
+- **① cipher 构造点收敛为单一共享执行缝**：任务书列两调用点，但活实例 `:4010` 是纯受理闸（不执行 walk）——活路径 walk 经 RuntimeRebuild 缺省闭包（`run_rebuild_command_with_limits`）汇入离线同一缝。故 cipher 只在 `run_rebuild_with_driver_and_limits` 构造一次即覆盖三路（离线 `cydrive rebuild` / 活 `REBUILD` 后台 / 多卷 `run_rebuild_multi`），形态 `Some(CipherCtx::from_cfg(&vfs_config(cfg)))`：判据与 Vfs 薄壳**同源**（`vfs_config` 的 enable 门控 + `from_cfg` 读密码在/方案），**恒传 Some**——明文实例 `ctx.enabled=false` 走 B1 保留语义（与现查逐字一致，T4 不变量对 rebuild 同样成立），不走「明文 None / 加密 Some」的分裂形态。
+- **② `RebuildError::EncryptedInstance` 全删而非挂注释**：编译现实 = 唯一额外引用是 readthrough.rs 的 match 臂（本就在计划 Files 内，同步收敛为 `Serde` 单臂）+ cli 闸旁注释（随闸删除），无其他消费者 → 全删成立。**`VfsError::EncryptedInstance` 是另一枚举**（防御臂、webdav:1018/winfsp:39 match 消费）——保留变体，仅清除其 doc 中的 `ensure_plaintext_instance` 引用。
+- **③ R6 测试重构（断言原文保留 + 结构确定化）**：注入 `rebuild_probe` parking seam + `RebuildTuning::fast()`——原 default executor 下 REBUILD enc 接受即真跑 walk，受理面断言被后台不确定性污染；seam 化后 OK/标记/STOP 中止全确定。臂序调整为 telegram/ghost/malformed 先行 →「refusals accepted nothing」断言保持字面真 → 再接受 enc（OK + 标记 + `until(calls==1)` 防受理/执行竞态）→ STOP 后关停拒 + `until(cancelled)` 见证 R5 中止。telegram/CONFIGS encrypted/usage/停机断言**原文保留**。
+- **④ 集成腿落 `cloudkit-cli/tests/rebuild.rs`（非 core）**：R1 禁 core 依赖 driver——真 local 卷（TempDir 后端 + 现造 v2 容器 + LocalTransport 读通）只能在 composition root；`#[cfg(feature = "local")]` 门控（dispatch.rs 先例）。经**生产缝** `run_rebuild_with_driver` 进入（内部即 `rebuild_from_backend_with_ctx` + 生产 cipher 构造），红→绿真实覆盖 EB3 接线本体（直调 `_with_ctx` 则 EB1 已绿、无红）。
+- **⑤ help 文案不含内部批次编号（B1/B2）**：匹配既有 clap help 纯用户向风格（既有 help 无内部编号），语义句保留「per-file cipher truth + first-read validation repairs any wrong guess」。
+- **⑥ 残留扫描分类**：`crates/` 代码面清零；docs 命中（plans 2026-09-22/23、decisions K84.4、tracking web-volume-management P2 行、phase8-readthrough 过渡态注记）= **历史档案不改写**。**报告项（本批未改）**：web 前端同类文案/门控——i18n `volumes.note.refresh_encrypted`（双语）+ volumes.js `v.encrypted` 静默注 + app.js `row.encrypted` 按钮禁用 + `index.rebuild_unsupported` "(telegram/encrypted)"——指定扫描模式（大小写敏感）未命中、计划 Task 3 Files 未列；语义上 B5 后后端已收、web UI 仍隐藏按钮且「refuses」文案失真，**建议 EB4 文档收口或单独小批同步**（详见回传风险节）。
+
+**门禁证据**（全绿）：
+- core 定向：`cargo test -p cloudkit-core --test rebuild --test encrypted_read --test readthrough --test materialize` → **11 / 5 / 21 / 9 passed，0 failed**；
+- `cargo test -p cloudkit-cli` → 全套 0 failed（首跑命中已知 **E0786 mmap / os error 1455 页面文件太小** 陷阱 → 按 AGENTS 纪律 `cargo clean -p cloudkit-cli` 定向清（8811 文件 / 16.5GiB）+ `-j 2` 重跑转绿）；
+- `cargo test --workspace --no-fail-fast -j 4` → **TOTAL passed: 1654, failed: 0, ignored: 60**（185 suites；基线 1653 + 集成腿 1，零新增 ignored），exit 0；
+- `cargo clippy --workspace --all-targets -j 4 -- -D warnings` → Finished 零告警；
+- `cargo fmt --all && cargo fmt --all -- --check` → FMT_OK（两测试文件被格式化，复验通过）；
+- `scripts/check_layers` → OK（16 manifests，零 R1）；`scripts/scan_secrets` → OK（零命中）；
+- help 实跑：`cargo run -q -p cloudkit-cli -- rebuild --help` → 输出新句「Encrypted volumes rebuild the same way: rows carry per-file cipher truth and first-read validation repairs any wrong guess」（无 "refused" 残句）。
+
+**风险与未覆盖（EB3 增量，随批更新）**：
+- **web 前端门控/文案未同步**（报告项⑥）：i18n `volumes.note.refresh_encrypted` 双语 + volumes.js `v.encrypted` 静默注 + app.js `row.encrypted` 按钮禁用 + `index.rebuild_unsupported` "(telegram/encrypted)"——B5 后后端已收、web UI 仍隐藏按钮且文案失真；计划 Files 外、指定扫描模式未命中，本批未改，待 EB4/负责人裁决。
+- README「加密卷永不回源物化」机制段 = EB4 文档收口范围（本批按计划分工未动）。
+- 真网 pan115/pan123 加密 e2e 重跑仍挂负责人真机窗口（EB4 验收项）。

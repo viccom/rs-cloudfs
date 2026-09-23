@@ -139,10 +139,10 @@ pub enum VfsError {
     /// payloads as plaintext (size = ciphertext, not the R6 plaintext
     /// contract). The message points at `cydrive sync` — the sync
     /// payload carries the encrypted row semantics (is_encrypted/scheme)
-    /// to the other instance. DEFENSIVE ARM ONLY: the read-through read
-    /// paths no longer produce this (encrypted instances degrade to the
-    /// db read instead); rebuild's refusal semantics exist independently
-    /// (`ensure_plaintext_instance`).
+    /// to the other instance. DEFENSIVE ARM ONLY: no producer remains —
+    /// read-through materializes cipher truth for encrypted instances
+    /// (Phase 8-B / B1) and rebuild accepts them too (B5); consumers
+    /// keep the match arm for shape completeness.
     #[error(
         "read-through refuses encrypted instances: the backend only sees ciphertext containers \
          under plaintext names, so a materialized row would mislabel encrypted payloads as \

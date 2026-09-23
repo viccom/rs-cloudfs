@@ -55,20 +55,26 @@
 //!    ghost-pending (its cache copy already vanished, K4 semantics)
 //!    alike stay untouched.
 //!
-//! Plaintext-only semantics (K11): an instance with
-//! `enable_encryption = true` is refused before any listing — the
-//! backend only sees ciphertext containers under plaintext names, so a
-//! rebuilt row would mislabel encrypted payloads as plaintext. Encrypted
-//! multi-instance cold starts go through `cydrive sync` (the payload
-//! carries `is_encrypted`/scheme — the full row semantics). See
-//! [`ensure_plaintext_instance`].
+//! Encrypted-instance semantics (Phase 8-B / B5): rebuild no longer
+//! refuses `enable_encryption` instances — the caller passes the
+//! production [`CipherCtx`](crate::materialize::CipherCtx) into
+//! [`rebuild_from_backend_with_ctx`] and every file row materializes
+//! cipher truth exactly as read-through does: `is_encrypted`/scheme
+//! from the instance config as the fill-only guess (B1 three-layer
+//! truth — an existing row's cipher truth is never overwritten), the
+//! plaintext size closed-form back-solved from the container length,
+//! and any wrong guess repaired by first-read validation (B2) before
+//! bytes are served. The production CLI seams build that context with
+//! `CipherCtx::from_cfg` over the same `vfs_config` mapping the Vfs
+//! thin shells consume — one judgment, two surfaces. The telegram
+//! backend stays refused at the CLI (`TELEGRAM_REBUILD_REFUSAL`) —
+//! transport-only, no list face: its shadow index IS the db.
 
 use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use cloudkit_storage::{EntryKind, Page, PageCursor, RelPath, StorageDriver, StorageError};
 
-use crate::config::CyDriveConfig;
 use crate::database::{DbError, MetaDatabase};
 
 /// Counters of one [`rebuild_from_backend`] pass, for CLI display.
@@ -163,33 +169,11 @@ pub enum RebuildError {
         #[source]
         source: StorageError,
     },
-    /// The instance carries client-side encryption: rebuild is refused
-    /// (K11 plaintext-only). The message points at `cydrive sync`.
-    #[error(
-        "rebuild refuses encrypted instances: the backend only sees ciphertext containers \
-         under plaintext names, so a rebuilt row would mislabel encrypted payloads as \
-         plaintext; use `cydrive sync` instead — the sync payload carries the encrypted \
-         row semantics (is_encrypted/scheme) to the other instance (sync_url / \
-         CYDRIVE_SYNC_URL)"
-    )]
-    EncryptedInstance,
     /// A rebuild checkpoint could not be serialized (unobserved in
     /// practice — `RelPath`/counts are JSON-trivial; surfaced rather
     /// than unwrapped).
     #[error("rebuild checkpoint serialization failed: {0}")]
     Serde(#[from] serde_json::Error),
-}
-
-/// The K11 plaintext-only gate: `Ok` unless `enable_encryption` is on.
-/// Pure — the CLI calls it before building any driver, and the tests
-/// pin the actionable sync guidance in the [`RebuildError::EncryptedInstance`]
-/// message.
-pub fn ensure_plaintext_instance(cfg: &CyDriveConfig) -> Result<(), RebuildError> {
-    if cfg.enable_encryption {
-        Err(RebuildError::EncryptedInstance)
-    } else {
-        Ok(())
-    }
 }
 
 /// Walks the backend tree from `root` and upserts one row per entry
@@ -218,17 +202,20 @@ pub async fn rebuild_from_backend_with(
     root: &RelPath,
     limits: RebuildLimits,
 ) -> Result<RebuildOutcome, RebuildError> {
-    // 缺省 cipher = None（禁用，「走旧路」——`materialize_entry` 的逐字
-    // 旧行为）；Phase 8-B EB3 接生产 cfg 后加密实例经
-    // [`rebuild_from_backend_with_ctx`] 走同一 B3 物化真相语义。
+    // 缺省 cipher = None：直调方（core 测试 / webdav live 腿）保持逐字
+    // 旧路；生产 CLI 缝经 [`rebuild_from_backend_with_ctx`] 传真实构造
+    // 的 `CipherCtx`（Phase 8-B EB3：密码在 + 配置方案，判据照
+    // `CipherCtx::from_cfg`，与 Vfs 薄壳同源）。
     rebuild_from_backend_with_ctx(driver, db, root, limits, None).await
 }
 
 /// [`rebuild_from_backend_with`] with an explicit cipher context (Phase
-/// 8-B EB1 seam): `None` = the verbatim pre-cipher road above; `Some(ctx)`
-/// = the read-through cipher-truth materialization (B1+B3) for every file
-/// row. The K11 `ensure_plaintext_instance` gate still sits at the CLI
-/// call sites until EB3 — this batch only lets the walk carry the context.
+/// 8-B EB1 seam, wired by EB3): `None` = the verbatim pre-cipher road
+/// above (direct callers/tests); `Some(ctx)` = the read-through
+/// cipher-truth materialization (B1+B3) for every file row. The
+/// production CLI seams build the context from the instance config —
+/// `CipherCtx::from_cfg` over the `vfs_config` mapping — so rebuild and
+/// read-through share one truth semantics.
 pub async fn rebuild_from_backend_with_ctx(
     driver: &dyn StorageDriver,
     db: &MetaDatabase,
