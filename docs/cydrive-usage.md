@@ -6,8 +6,8 @@
 
 cydrive 把一个 Telegram bot 对话变成**无限云盘**：
 
-- **WebDAV 服务**（默认 `127.0.0.1:8080`）→ Windows 资源管理器直接挂成 `Y:` 盘，或 Linux 经 davfs2 挂载；
-- **Web 仪表盘**（默认 `127.0.0.1:8088`）→ 浏览器上传/下载/删除/看队列；
+- **WebDAV 服务**（默认 `127.0.0.1:8485`）→ Windows 资源管理器直接挂成 `Y:` 盘，或 Linux 经 davfs2 挂载；
+- **Web 仪表盘**（默认 `127.0.0.1:8486`）→ 浏览器上传/下载/删除/看队列；
 - **Bot 命令** → 在 Telegram 对话里 `/stats` `/ls` `/get` …；
 - **CLI** → push/pull 大文件、缓存管理、体检、元数据多机同步。
 
@@ -63,7 +63,7 @@ your-dir/
 
 ### 4.2 仪表盘
 
-浏览器开 `http://127.0.0.1:8088`：文件列表、上传（单次上限 1900MB，受理即回、后台传）、下载、删除、队列/统计。API 同路径：`/api/files` `/api/stats` `/api/list?path=` `/api/upload` `/api/delete` `/api/download`（支持 Range）/`/api/queue`。
+浏览器开 `http://127.0.0.1:8486`：文件列表、上传（单次上限 1900MB，受理即回、后台传）、下载、删除、队列/统计。API 同路径：`/api/files` `/api/stats` `/api/list?path=` `/api/upload` `/api/delete` `/api/download`（支持 Range）/`/api/queue`。
 
 ### 4.3 大文件走 CLI（绕开一切上传限制）
 
@@ -96,8 +96,8 @@ your-dir/
 | `api_id` / `api_hash` | 内置 | Telegram 应用凭据，一般不动 |
 | `proxy_url` | 无 | SOCKS5 代理，如 `socks5://127.0.0.1:7897`；留空清除 |
 | `storage_path` / `cache_path` / `db_path` | `./Telegram_Drive` `./Telegram_Cache` `./cydrive_meta.db` | 路径布局 |
-| `webdav_host` / `webdav_port` | `127.0.0.1` / `8080` | WebDAV 监听 |
-| `web_ui_host` / `web_ui_port` | `127.0.0.1` / `8088` | 仪表盘监听；`enable_web_ui = false` 可关 |
+| `webdav_host` / `webdav_port` | `127.0.0.1` / `8485` | WebDAV 监听 |
+| `web_ui_host` / `web_ui_port` | `127.0.0.1` / `8486` | 仪表盘监听；`enable_web_ui = false` 可关 |
 | `allow_remote_admin` | `false` | 仪表盘绑非回环地址（如 `0.0.0.0`）时是否放开卷管理写操作（卸载/启用/禁用/新增/编辑/删除）；不设=远程只读（写路由 403 并提示本键） |
 | `drive_letter` | `Y:` | Windows 挂载盘符 |
 | `auto_mount_drive` | `true` | run 时自动挂载、stop 时自动卸载 |

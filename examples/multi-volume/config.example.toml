@@ -13,9 +13,9 @@ volumes_dir = "volumes"          # 相对/绝对均可；设了它 = 多卷模�
 
 # ── 服务端口（进程共享一个 WebDAV/dashboard；卷在 /vol/<name> 下）─────────
 webdav_host = "127.0.0.1"
-webdav_port = 8485               # 默认 8080
+webdav_port = 8485               # 默认 8485
 web_ui_host = "127.0.0.1"
-web_ui_port = 8486               # 默认 8088
+web_ui_port = 8486               # 默认 8486
 enable_web_ui = true
 
 # ── 挂载形态（进程级：管本进程所有卷的挂载方式）───────────────────────────

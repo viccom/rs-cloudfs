@@ -19,7 +19,7 @@
    - 门 B（boot 期，cli crate）：`crates/cloudkit-cli/src/lib.rs:1877-1884` `runtimes.is_empty()` → `no_enabled_volumes_message`（lib.rs:2259）bail。
 3. **无配置现状**：`discover_config_with_volumes_and_store` 尾部（lib.rs:7691-7694）bail `"no config found in the current directory…"`。**该函数本身不改**——bootstrap 在 main.rs `run()` 里先于 discovery 探测。
 4. **进程级 config.toml 无渲染函数**；唯一生成先例 = `crates/cloudkit-cli/src/setup.rs:803-813` 手写常量 `MULTI_PROCESS_TOML`（volumes_dir=volumes、webdav 8080、web 8088、enable_web_ui=true，刻意不用 `save_toml`——全量铺设卷键过不了混装 guard `ensure_no_volume_keys_in_process`，config.rs:1075）。init 模板对齐此形态 + `write_config_atomically`（config.rs:923，K58 H3）落盘。
-5. **默认端口 = webdav 8080 / web UI 8088**（config.rs:1479-1481 Default impl；setup --multi 模板同值）。⚠️ 修正：先前会话对负责人说的「8485/8486」是负责人自配值，非程序默认。**init 用 8088。**
+5. **默认端口（FR0 后经负责人裁决改为）= webdav 8485 / web UI 8486**（原 Default impl 与 setup --multi 模板为 8080/8088，负责人 2026-09-23 指令「默认端口改为 8485/8486」——Default/模板/文档/测试钉随批改齐；8485/8486 原系负责人自配值，自此升为程序默认）。**init 模板用 8486。**
 6. **web 多卷装配已是「空注册表可起」**：`bind_multi_web_ui`（lib.rs:2208-2249）enable_web_ui on + 空注册表正常 bind（HostAllowlist 从 bound addr 派生，非 loopback 写路由 403——K58 H5 现成）；`bind_multi_webdav`（lib.rs:2286）空卷集直接 None（8080 不 bind，零冲突面）。`/volumes` 路由注册在 cloudkit-web/src/lib.rs:582。
 7. **前端空态已有**：`volumes.js` `renderVolumesTable`（:193-213）零卷渲染 `volumes.empty` 文案 + 「＋ 添加卷」按钮 → `openVolumeForm('create')` → `POST /api/volumes`（:899）→ 成功刷新。**init 模式零新前端面**，只改空态文案为引导语（i18n.js en :126 / zh :396）。
 8. **测试缝先例**：`tests/multivolume_config.rs`（chdir+tempdir+`InMemoryStore` 直测 discovery）；`tests/run_e2e.rs`（tempdir + 预连接 MockTransport + `webdav_port = 0` 进程内 boot 全栈；场景 5「空目录 discovery 报错」测的是 discover 函数本身——bootstrap 在 main.rs 层，**该既有测试不受影响**）；`tests/runtime_rebuild.rs`（直调 `run_multi_with_transports_and_commands`——签名变更需同步其调用点）；`tests/volumes_page.rs`（`RegistryHandle::new(vec![])` 起路由 + 源码文本 pin）。
@@ -29,9 +29,9 @@
 ## 设计裁决（D1–D6，随计划批准生效）
 
 - **D1 触发条件**：`run` 子命令 + cwd 无 config.toml 且无 config.json。其余子命令（status/stop/rebuild/…）在无配置目录维持既有报错。
-- **D2 生成物**：手写模板常量 `FIRST_RUN_PROCESS_TOML`（volumes_dir/webdav 8080/web 8088/enable_web_ui/auto_mount_drive + 头注释声明「首次运行生成；卷经 Web 界面添加」）经 `write_config_atomically` 落 config.toml + `create_dir_all("volumes")`。**已有配置文件时恒不触碰**（探测在前，生成在后，无覆盖路径）。
+- **D2 生成物**：手写模板常量 `FIRST_RUN_PROCESS_TOML`（volumes_dir/webdav 8485/web 8486/enable_web_ui/auto_mount_drive + 头注释声明「首次运行生成；卷经 Web 界面添加」）经 `write_config_atomically` 落 config.toml + `create_dir_all("volumes")`。**已有配置文件时恒不触碰**（探测在前，生成在后，无覆盖路径）。
 - **D3 init 模式放行的两道门**：新 discovery 变体 `discover_first_run_config()`（载入刚生成的 config.toml → 混装 guard → validate → 直接返回 `Multi { volumes: vec![] }`，**绕过门 A 但不改 `discover_volumes`/既有 discover 函数**）；`run_multi_with_transports_and_commands` 增 `first_run: bool` 参数（门 B 改 `runtimes.is_empty() && !first_run` 时 bail；first_run 时空注册表继续 → webdav None → web bind 空注册表 → 控制通道 `LIST` 回 `OK: 0 volume(s)`）。既有调用点（main.rs:1084、runtime_rebuild.rs、run_e2e 若有）一律补 `false`——**行为零变化，签名机械更新**。
-- **D4 引导呈现**：控制台 info! 横幅（已生成配置 + 请打开 http://127.0.0.1:8088）；web bind 成功后自动开浏览器（`open_browser` 新函数，失败仅 warn 不致命；Windows `cmd /c start` + CREATE_NO_WINDOW，unix `xdg-open`）；前端空态文案改引导语（en/zh 双语）。
+- **D4 引导呈现**：控制台 info! 横幅（已生成配置 + 请打开 http://127.0.0.1:8486）；web bind 成功后自动开浏览器（`open_browser` 新函数，失败仅 warn 不致命；Windows `cmd /c start` + CREATE_NO_WINDOW，unix `xdg-open`）；前端空态文案改引导语（en/zh 双语）。
 - **D5 单卷臂不涉 init**：生成的配置带 volumes_dir → 恒 Multi；Single 臂零触碰。
 - **D6 安全面**：bind 恒 loopback（模板写死 127.0.0.1）；`allow_remote_admin` 缺省 false（非 loopback 写路由 403 既有）；凭据经 CREATE 表单落卷文件（write-only/脱敏既有纪律）。端口被占 → 既有 bind 失败路径（多卷臂 K22 降级 error! + 实例继续跑；控制台横幅已先提示 URL，bind 失败时 warn 指路编辑 config.toml）。
 
@@ -40,7 +40,7 @@
 | 标准 | 验证 |
 |---|---|
 | 有配置路径零变化 | 既有全量断言零漂移 + multivolume_config/run_e2e 既有用例原样绿 |
-| 无配置 → bootstrap → init boot → web 可建卷 | 新 e2e 腿：空 tempdir → bootstrap → `run_multi_with_transports_and_commands(first_run=true)` 空卷注入 → web GET /volumes 200 → POST /api/volumes 建卷（web 测试缝）→ 卷文件落盘 |
+| 无配置 → bootstrap → init boot → web 可建卷（web 端口 8486）| 新 e2e 腿：空 tempdir → bootstrap → `run_multi_with_transports_and_commands(first_run=true)` 空卷注入 → web GET /volumes 200 → POST /api/volumes 建卷（web 测试缝）→ 卷文件落盘 |
 | 两道门放行的精确性 | 门 A：`discover_first_run_config` 单测（含「已有配置时 bootstrap 不触发」反臂）；门 B：first_run=true 空卷 boot 绿 + first_run=false 空卷 bail 既有文案钉 |
 | 生成物合法性 | 模板文本 pin（键集合/端口/头注释）+ `load_toml_with_keys` 解析回读断言 |
 | 门禁 | 每批五门禁 + 收口 baidu/telegram 组合 clippy |

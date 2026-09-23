@@ -806,10 +806,10 @@ const MULTI_PROCESS_TOML: &str = "\
 volumes_dir = \"volumes\"
 
 webdav_host = \"127.0.0.1\"
-webdav_port = 8080
+webdav_port = 8485
 enable_web_ui = true
 web_ui_host = \"127.0.0.1\"
-web_ui_port = 8088
+web_ui_port = 8486
 ";
 
 /// The example volume file of the multi-volume skeleton: the local
