@@ -377,15 +377,19 @@ async fn gcm_labelled_v2_content_redispatches() {
     );
 }
 
-/// 4.（B6 文案钉）行标 aead_v2、内容非容器（无 magic 且非 v1 可辨）→
-///    `open_read` 返回**单一可行动 Err**：双假说（密钥/方案配置错，或
-///    实为明文/异期方案）+ `cydrive sync` 指路；**绝不返回原文密文字
-///    节**（Err 而非 Stream；缓存树零落盘；远端只付一次 34B 头读）。
+/// 4.（B6 文案钉，**通路级**——审查回派改义）行标 aead_v2、内容无
+///    magic **且 v1 形失败**（K84.2 同份密文双试的 v2→v1 方向：34B 头
+///    试不出 v1——v1 tag 在文件尾，admission 先转 hydrate 拿全量）→
+///    `open_read` 回 `Hydrate` 零字节（admission 只付一次 34B 头读、
+///    尚无全量 open、无 Stream）→ hydrate 双试失败 → **最终 Err 含
+///    `cydrive sync`**（双假说：密钥/方案配置错，或实为明文/异期方案）
+///    + 缓存树零残留——**绝不返回原文密文字节**。
 #[tokio::test]
 async fn v2_labelled_non_container_fails_actionably() {
     let (_dir, db, cache, cache_root, mock) = test_env().await;
 
-    // 内容非容器：一段明文样字节（≥34B，头读拿得到完整窗口）。
+    // 内容非容器且 v1 解不开：一段明文样字节（≥44B 使其过 v1 的
+    // 长度闸、撞 GCM AuthFailed——「v1 形失败」的前提）。
     let not_a_container = pattern(96);
     assert_ne!(
         &not_a_container[..8],
@@ -418,10 +422,30 @@ async fn v2_labelled_non_container_fails_actionably() {
     let vfs = build_vfs(&db, cache, &mock, test_cfg(Some("pw")));
     let rel = RelPath::new("/liar.bin").expect("valid rel path");
 
-    // B6：不猜、不吐密文——非容器内容必须响亮失败（Err 而非 Stream）。
-    let err = match vfs.open_read(&rel).await {
+    // admission：34B 头试不出 v1 → 零字节的 Hydrate 信号（K84.2），
+    // 而非直出 Err 卡死（winfsp 直通面由此进 hydrate 双试）。
+    let StreamSource::Hydrate = vfs
+        .open_read(&rel)
+        .await
+        .expect("非容器内容的 admission 不做内容级判决")
+    else {
+        panic!("aead_v2 标签 + 无 magic 必须转 Hydrate（K84.2 双试方向），绝不直接流式/卡 Err");
+    };
+    // admission 面：恰一次 34B 头读、零全量 open、零 Stream 字节。
+    assert_eq!(
+        mock.open_range_calls(),
+        vec![(0, 34)],
+        "admission 只付一次有界 34B 头读"
+    );
+    assert!(
+        mock.open_calls().is_empty(),
+        "admission 零全量 open（v1 判决留给 hydrate 的同一份内容）"
+    );
+
+    // 通路级 B6：hydrate 双试失败 → 最终 Err 含 cydrive sync。
+    let err = match vfs.hydrate(&rel).await {
         Err(error) => error,
-        Ok(_) => panic!("B6：非容器内容必须响亮失败，绝不返回 Stream/字节"),
+        Ok(_) => panic!("无 magic 且 v1 形失败的内容必须响亮失败，绝不吐字节"),
     };
     let message = err.to_string();
     assert!(
@@ -429,25 +453,16 @@ async fn v2_labelled_non_container_fails_actionably() {
         "B6 文案必须指路 cydrive sync，got: {message}"
     );
     assert!(
-        message.contains("gcm") && message.contains("aead_v2"),
-        "B6 双假说挂在方案分发面上（文案含两个已知方案名）， got: {message}"
+        message.contains("plaintext") && message.contains("scheme configuration"),
+        "B6 双假说（实为明文/异期方案 vs 密钥/方案配置错）必须在文案里，got: {message}"
     );
-    // 绝无字节返回：Err 而非 Stream/字节；远端只付一次 34B 头读。
-    assert!(
-        mock.open_calls().is_empty(),
-        "非容器内容绝不触发全量 open（不吐密文）"
-    );
-    assert_eq!(
-        mock.open_range_calls(),
-        vec![(0, 34)],
-        "B6 判定只付一次有界 34B 头读"
-    );
-    // 缓存树零落盘（无密文/明文残留）。
+    // 绝无字节返回：hydrate 失败不落盘，远端只付 admission 头读 +
+    // hydrate 本职的全量 open（内部解密试验，字节从未出门）。
     let mut all_files = Vec::new();
     collect_files(&cache_root, &mut all_files);
     assert!(
         all_files.is_empty(),
-        "失败的首读不留任何缓存残留: {all_files:?}"
+        "失败的双试不留任何缓存残留（密文/明文都不落盘）: {all_files:?}"
     );
     // 行不被回写（真值不可知——B6：不猜）。
     let row = db
@@ -462,6 +477,81 @@ async fn v2_labelled_non_container_fails_actionably() {
         row.size,
         not_a_container.len() as i64,
         "非容器内容真值不可知——size 不回写"
+    );
+    assert!(
+        !row.is_cached,
+        "失败的 hydrate 绝不置位 is_cached（否则下次命中脏路）"
+    );
+}
+
+/// 6.（K84.2 同份密文双试——v2→v1 方向钉）行标 aead_v2、远端**真 v1
+///    容器**（混合期典型：配置已切 aead_v2、老文件是 v1、索引已丢按
+///    配置猜错标签）→ `open_read` 回 `Ok(Hydrate)`（钉 winfsp 直通面
+///    不再卡 Err）→ hydrate 同份密文双试 v1 **成功自愈**：读通逐字节
+///    + 行回写 scheme=`gcm`、size=`ct−44` 真值（零额外下载——同一份
+///    内容 hydrate 一次拿全）。
+#[tokio::test]
+async fn v2_labelled_v1_container_dual_trial_self_heals() {
+    let (_dir, db, cache, _cache_root, mock) = test_env().await;
+
+    // 远端真 v1 容器（冻结格式：16B 盐 + 12B nonce + 密文 + 16B tag，
+    // 无 magic）。
+    let plain = pattern(700);
+    let ct = cloudkit_crypto::v1::encrypt("pw", &plain);
+    assert_eq!(ct.len(), plain.len() + 44, "seed sanity: v1 容器开销 44B");
+    let receipt = seed_remote(&mock, "/old-v1.bin", &ct, 1, ct.len() as u64).await;
+
+    // 行按配置猜成 aead_v2、size 也猜错（索引已丢的混合期形状）。
+    let guessed_size = (plain.len() / 2) as i64;
+    let file_id = seed_encrypted_row(
+        &db,
+        "/old-v1.bin",
+        guessed_size,
+        receipt.first_msg_id,
+        SCHEME_AEAD_V2,
+    );
+    seed_container_chunk(&db, file_id, receipt.first_msg_id, ct.len() as i64);
+
+    let vfs = build_vfs(&db, cache, &mock, test_cfg(Some("pw")));
+    let rel = RelPath::new("/old-v1.bin").expect("valid rel path");
+
+    // open_read：aead_v2 标签 + 无 magic → Hydrate（K84.2——34B 头试
+    // 不出 v1，先拿全量再判；绝不 Err 卡死、绝不直接流式）。
+    let StreamSource::Hydrate = vfs
+        .open_read(&rel)
+        .await
+        .expect("v1 内容在 aead_v2 标签下必须拿到 Hydrate 信号")
+    else {
+        panic!("aead_v2 + 无 magic 必须转 Hydrate（K84.2 双试），不得流式");
+    };
+
+    // hydrate 双试 v1 成功 → 读通 + 行回写 gcm/真值。
+    let path = vfs
+        .hydrate(&rel)
+        .await
+        .expect("同份密文双试 v1 成功自愈（K84.2：方案猜错由读时回退兜底）");
+    assert_eq!(
+        fs::read(&path).expect("read hydrated"),
+        plain,
+        "双试 v1 读出的明文逐字节"
+    );
+    let row = db
+        .get_file("/old-v1.bin")
+        .expect("db read")
+        .expect("row exists");
+    assert_eq!(
+        row.encryption_scheme, SCHEME_GCM,
+        "回写 scheme = v1 真值 gcm（K84.2 双试自愈）"
+    );
+    assert_eq!(
+        row.size,
+        ct.len() as i64 - 44,
+        "回写 size = v1 闭式真值（ct − 44 = 明文长）"
+    );
+    assert_eq!(
+        row.sha256.as_deref(),
+        Some(SHA_SENTINEL),
+        "定向 UPDATE 不碰 coalesce 列"
     );
 }
 

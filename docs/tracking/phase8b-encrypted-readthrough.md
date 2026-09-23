@@ -10,7 +10,7 @@
 |---|---|---|---|---|
 | EB0 | 计划期八项代码查证（随计划完成） | ✅ 2026-09-23 | 计划 §0 八条：upsert 冲突集覆盖 cipher 列 / AeadV2::new() 默认分块无配置缝 / RowMetaData.len 承重 / K47 流式分流 / chunks 仅取消息 id / sha256 读面零引用 / 闸两点位+help 文案 / plan A pending 出口 | 计划 §0（本批日志） |
 | EB1 | cipher 真相物化（B1+B3+B4：保留语义 upsert + 闭式反推 + 去 H1 退化臂） | ✅ 2026-09-23 | 五红→绿全留证（用例 12 断言红 / T1 编译红 / T2 防御臂断言红 / T4 降级断言红 / T3 尺寸断言红）；`upsert_materialized` 保留集 + `CipherCtx` + `plaintext_len_from_container` 闭式 + readthrough 双签名换 cipher + Vfs 两薄壳同源 ctx + rebuild `_with_ctx` 缝；七门禁绿（workspace **1647/0**、clippy/fmt/layers/secrets 零告警）；既有断言零漂移（rebuild 11、readthrough 其余 20、materialize 既有 5） | 本批日志 EB1 |
-| EB2 | 首读内容校验与回写（B2+B6：容器头/本地长度权威 + 定向 UPDATE + 双假说文案） | ✅ 2026-09-23 | 五红→绿全留证（流臂错行红 panic / hydrate size 红 2500≠5000 / gcm 改判红 `Crypto(AuthFailed)` / B6 红回 Stream / 面级红 145904≠150000）；`fix_cipher_columns` 定向三列 + `first_read_admit`（34B 头读→magic/闭式交叉→回写→带窗构造，B4 零额外往返）+ hydrate magic 先行改判 + 解密后本地长度回写 + B6 双文案（流臂挂 `UnsupportedEncryptionScheme` 扩展 / hydrate 解密失败改 `Crypto` 模板保变体）+ 网关行重读传导；六门禁绿（workspace **1652/0/60**、clippy/fmt/layers/secrets 零告警）；既有断言零漂移（含 web_e2e 15d gcm 零窗口、vfs 916/979 `Crypto(_)`、fs 35、vfs_open_read 18） | 本批日志 EB2 |
+| EB2 | 首读内容校验与回写（B2+B6：容器头/本地长度权威 + 定向 UPDATE + 双假说文案） | ✅ 2026-09-23 | 五红→绿全留证（流臂错行红 panic / hydrate size 红 2500≠5000 / gcm 改判红 `Crypto(AuthFailed)` / B6 红回 Stream / 面级红 145904≠150000）+ **审查回派 K84.2 双试二红→绿**（红4 改通路级红 admission 回 Err / 红6 新增红同 Err）；`fix_cipher_columns` 定向三列 + `first_read_admit`（34B 头读→magic/闭式交叉→回写→带窗构造，B4 零额外往返；无 magic → Hydrate 转 K84.2 双试）+ hydrate **双向**改判（gcm 臂遇 magic→v2 / v2 臂无 magic→试 v1 自愈回写 gcm）+ 解密后本地长度回写 + B6 双文案（挂 `Crypto` 模板与 `UnsupportedEncryptionScheme` 扩展，变体零动）+ 网关行重读传导；六门禁绿（workspace **1653/0/60**、clippy/fmt/layers/secrets 零告警）；既有断言零漂移（含 web_e2e 15d gcm 零窗口、vfs 916/979 `Crypto(_)`、fs 35、vfs_open_read 18） | 本批日志 EB2 + 审查回派 |
 | EB3 | rebuild 闸放开（B5：ensure_plaintext_instance 删 + 测试翻转 + help 文案） | ⬜ 待批开工 | — | — |
 | EB4 | 两阶段验收（离线 CI 三腿）+ 真网加密腿重跑 + 文档收口（K85）+ 五门禁终跑 | ⬜ 待批开工 | — | — |
 
@@ -90,8 +90,8 @@
 - 执行期既有套件立功一次：materialize T2 在 `plaintext_len_with_chunk` 初版（`checked_sub` 防溢出不防负值）下红 `left: -10 right: 40` → 改显式 `body < V2_TAG` 下界守卫 → T2 绿（零漂移套件抓到实现回归）。
 
 **执行期自主裁决（如实入档，B1–B6 逐条不违背）**：
-- **① gcm 行头读分流判据（计划红1 × 既有 web_e2e 15d 的互斥解）**：红1 要求「gcm 标签 + chunks + v2 内容 → open_read 流式回写」，既有 `web_e2e::download_encrypted_row_hydrates_through_full_open` 要求「gcm 行（v1 内容 + chunks）零 open_range」——两者除**内容**外形状全同，而「先读内容才能知道内容」本身破坏零 I/O 断言：无条件头读必炸其一（零漂移与红1 二选一的死锁）。解 = **行账目自洽性分流**：gcm 行仅当 `plaintext_len_from_container(ct, gcm) != row.size`（标签/尺寸/容器长三方矛盾=行形状坏了）才付费 34B 头读（红1 播种 `size=plain/2` 走此臂——计划骨架只定「size=错」未定错法）；自洽 gcm 行（v1 生产常态 size=明文、ct=size+44）零内容读按标签走 hydrate，内容歧义由 **B2 hydrate 条款**（magic 先行改判 + 解密失败 B6 文案，红3 钉）接管——B2 两条臂各司其职，红1/红3 与 15d/测试13 全部同时成立。aead_v2 与未知标签行有 chunks 即恒校验（B6「先于任何字节」/ 无法分发则内容定分发）。**代价如实**：混合方案里「size 恰按 gcm 闭式自洽、内容实为 v2」的行在 range 面走 hydrate 改判而非流式自愈（读通与回写不损，仅不流式）——与 B2 hydrate 条款同向。
-- **② 流臂 B6 文案落点 = `UnsupportedEncryptionScheme` 扩展**（计划明示的两选项之一）：扩出「标签与字节不匹配——双假说：密钥/方案配置错，或实为明文/异期方案；run `cydrive sync`」，**逐字保留** `unknown_scheme_hydrate_fails_with_an_actionable_error` 钉住的三要素（方案名 + `gcm` + `aead_v2`）；变体不动（R2）。
+- **① gcm 行头读分流判据（计划红1 × 既有 web_e2e 15d 的互斥解）**：红1 要求「gcm 标签 + chunks + v2 内容 → open_read 流式回写」，既有 `web_e2e::download_encrypted_row_hydrates_through_full_open` 要求「gcm 行（v1 内容 + chunks）零 open_range」——两者除**内容**外形状全同，而「先读内容才能知道内容」本身破坏零 I/O 断言：无条件头读必炸其一（零漂移与红1 二选一的死锁）。解 = **行账目自洽性分流**：gcm 行仅当 `plaintext_len_from_container(ct, gcm) != row.size`（标签/尺寸/容器长三方矛盾=行形状坏了）才付费 34B 头读（红1 播种 `size=plain/2` 走此臂——计划骨架只定「size=错」未定错法）；自洽 gcm 行（v1 生产常态 size=明文、ct=size+44）零内容读按标签走 hydrate，内容歧义由 **B2 hydrate 条款**（magic 先行改判 + 解密失败 B6 文案，红3 钉）接管——B2 两条臂各司其职，红1/红3 与 15d/测试13 全部同时成立。aead_v2 与未知标签行有 chunks 即恒校验（B6「先于任何字节」/ 无法分发则内容定分发）。**代价如实**：混合方案里「size 恰按 gcm 闭式自洽、内容实为 v2」的行在 range 面走 hydrate 改判而非流式自愈（读通与回写不损，仅不流式）——与 B2 hydrate 条款同向。**主会话已批（EB2 审查）**：逐案推演无漏洞——自洽但内容实为 v2 的 gcm 行由红3 机制（hydrate 先行 magic）自愈为 v2 后下次即可流式；15d 断言零改动 = 零漂移纪律保住，维持现状。
+- **② 流臂 B6 文案落点 = `UnsupportedEncryptionScheme` 扩展**（计划明示的两选项之一）：扩出「标签与字节不匹配——双假说：密钥/方案配置错，或实为明文/异期方案；run `cydrive sync`」，**逐字保留** `unknown_scheme_hydrate_fails_with_an_actionable_error` 钉住的三要素（方案名 + `gcm` + `aead_v2`）；变体不动（R2）。**EB2 审查回派后注**：K84.2 使流臂对无 magic 内容改回 `Hydrate`（见回派小节 a），该扩展文案自回派起只挂**未知标签分发臂**（hydrate `unknown` 分支）——文案与变体保留，触发面收窄。
 - **③ hydrate gcm 解密失败 B6 文案 = 改 `VfsError::Crypto` 模板、变体零动**：`vfs.rs` 916/979 两测试钉死 `matches!(…, Err(VfsError::Crypto(_)))`（错密码/损坏密文两形态）→ 该面上「换变体」即漂移、「逐点改文案」在 `Crypto(#[from] CryptoError)` tuple 变体上无机制 → 唯一保分类路径 = 模板扩展（条件式后缀：「若密码与方案配置皆对，则字节实为明文/异期容器——run `cydrive sync`」；对确凿错密码读来仍是原语义）——「改文案不改分类」的字面兑现。同一后缀顺带覆盖 webdav `if let Ok` 吞掉流臂 B6 后 hydrate 腿的 `BadMagic` 文案（残余：webdav 面 B6 经 hydrate 腿措辞出口；winfsp 不吞错、直出流臂原文案）。
 - **④ 网关行重读补进 `webdav/src/lib.rs`**（计划 Files 未列、红5 隐含要求）：`open_read` Stream 臂与 hydrate 臂返回后 `self.row(&rel)?.unwrap_or(row)` 重读一次——`RowMetaData::from_row`（Content-Length/K35 承重）取回写**后**的真值；行并发消失保留原快照。无回写时重读=同值，既有 fs/web 断言零漂移。web 下载面（`streaming_download_response` 用 open_read 返回的 `total_size`）与 winfsp（直用 `total_size`）由构造已传导，未动。
 - **红1 断言增补（非骨架项）**：admission 恰一次 `(0,34)` + `sha256/msg_id` coalesce 原值保留——B4 零往返与「定向 UPDATE」的直接钉，骨架「回写（scheme/size 对）+ coalesce 列未动」的可执行化。
@@ -104,3 +104,27 @@
 - `cargo clippy --workspace --all-targets -j 4 -- -D warnings` → Finished 零告警（一处 doc 列表续行缩进当场修）；
 - `cargo fmt --all && cargo fmt --all -- --check` → FMT_OK（格式化后全量 workspace 复跑仍 1652/0）；
 - `scripts/check_layers` → OK（16 manifests，零 R1 违例）；`scripts/scan_secrets` → OK（零命中）。
+
+### EB2 审查回派（2026-09-23，同 worktree，K84.2 双试方向补齐）
+
+**审查结论**：EB2 主体通过（workspace 1652/0、五门禁绿、fix_cipher_columns/头权威交叉/webdav 行重读都对）；裁决①（gcm 自洽分流）**批准，维持现状**（批准句已补进上方裁决①）；回派一个必补缺口——
+
+**K84.2 缺口（审查发现）**：计划红 4 原文「内容无 magic **且 v1 形失败** → Err」预设先试 v1、成功则自愈；负责人批准的 K84.2「方案猜错由读时回退兜底（同份密文本地双试，零额外下载）→ 回写行」——而 EB2 主体的 `first_read_admit` 对「行标 aead_v2 + 无 magic」**直接 Err**，跳过了试：混合期场景（配置已切 aead_v2、老文件是 v1、索引已丢按配置猜成 v2）卡死在 admission，v1 解密一试即知且可回写自愈；附带 winfsp 直通面（不吞 open_read 错）也随之直出 Err 卡死。
+
+**修法（B2/B6 框架内，裁决不动）**：
+- **a) `first_read_admit` 无 magic 臂**：行标 aead_v2 的 `Err(UnsupportedEncryptionScheme)` 改 **`Ok(StreamSource::Hydrate)`**——34B 头本就试不出 v1（v1 tag 在文件尾，全量内容只有 hydrate 拿得到）；Hydrate 信号零字节、admission 不做内容级判决也不回写，「绝不返回字节」语义不破，最终成败由 hydrate 裁决；gcm/未知标签路径不变（本就 Hydrate）。
+- **b) hydrate v2 臂补反向双试**（对称于已落的 gcm 臂 magic 先行）：staged **有 magic** → `hydrate_v2`（既有路）；**无 magic → 试 `crypto::decrypt`（v1）** → 成功：按明文落盘收尾 + `dispatched_scheme = gcm` → 既有回写条件（标签 aead_v2 ≠ gcm）触发 `fix_cipher_columns(id, gcm, 本地明文长度)` **自愈**（size = ct−44 真值）→ set_cached_flag 照常；失败 → `VfsError::Crypto`（B6 文案落点：**沿用已扩的 Crypto 模板**——条件式双假说后缀含 `cydrive sync`，分类零动，staged 由外层失败清理路径回收零残留）。
+- **c) 测试**：红 4 按计划原文真义改通路级（admission 断 `Ok(Hydrate)` + 恰一次 (0,34) 零全量 open；随后 hydrate 断**最终 Err 含 `cydrive sync`** + 双假说关键词 + 缓存树零残留 + 行不回写 + `is_cached` 不置位）；新增**红 6（K84.2 双试钉）**：行标 aead_v2 + 远端真 v1 容器（`v1::encrypt` 现造）→ `open_read` 回 `Ok(Hydrate)`（钉 winfsp 直通面不卡死）→ hydrate 读通逐字节 + 行回写 `scheme=gcm`、`size=ct−44` + coalesce 列保留。
+- **d) 零漂移**：red1（gcm 不一致臂）路径未动；15d/916/979/fs/vfs_open_read 复跑全绿（下）。
+
+**红→绿真实输出**：
+- 红 4（改后）：`panicked … 非容器内容的 admission 不做内容级判决: UnsupportedEncryptionScheme { scheme: "aead_v2", path: "/liar.bin" }`（主体实现回 Err——按新断言红）；
+- 红 6：`panicked … v1 内容在 aead_v2 标签下必须拿到 Hydrate 信号: UnsupportedEncryptionScheme { scheme: "aead_v2", path: "/old-v1.bin" }`；
+- 绿：`encrypted_read` **5 passed; 0 failed**（红1/2/3/5 零漂移 + 红4改/红6 双绿）。
+
+**门禁证据**（回派后全绿）：
+- 定向：`readthrough 21 / materialize 9 / rebuild 11 / fs_adapter 35 / web_e2e 32` + 敏感面（`vfs_open_read 18 / vfs 23 / vfs_aead_v2 4 / vfs_encrypted_budget 3 / enc_stream 8 / database 14`）全 0 failed；
+- `cargo test --workspace --no-fail-fast -j 4` → **passed=1653, failed=0, ignored=60**（1652 + 红6），exit 0；
+- `cargo clippy --workspace --all-targets -j 4 -- -D warnings` → Finished 零告警；
+- `cargo fmt --all && cargo fmt --all -- --check` → FMT_OK；
+- `scripts/check_layers` → OK（16 manifests，零 R1）；`scripts/scan_secrets` → OK（零命中）。

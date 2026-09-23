@@ -671,8 +671,9 @@ impl Vfs {
             // buffering, the staging file feeds the decryptor chunk by
             // chunk), and an unknown scheme fails with an actionable
             // error instead of guessing.
-            // 本臂实际分发所依的方案（Phase 8-B EB2 回写用：gcm 臂遇
-            // magic 改判后 = aead_v2，其余 = 行标签）。
+            // 本臂实际分发所依的方案（Phase 8-B EB2 回写用）：gcm 臂遇
+            // magic 改判 = aead_v2；aead_v2 臂无 magic 双试 v1 成功 =
+            // gcm；其余 = 行标签。
             let mut dispatched_scheme: &str = row.encryption_scheme.as_str();
             if row.is_encrypted {
                 let password = self
@@ -694,7 +695,27 @@ impl Vfs {
                         }
                     }
                     crate::config::SCHEME_AEAD_V2 => {
-                        hydrate_v2(password, &staged, &local)?;
+                        // K84.2 反向双试（对称于 gcm 臂的 magic 先行，
+                        // 审查回派）：无 magic → 试 v1——同份密文零额外
+                        // 下载，方案猜错（混合期：配置已切 aead_v2、老
+                        // 文件是 v1、索引已丢按配置猜错标签）由读时回退
+                        // 自愈回写；有 magic 走 v2 流式解密（既有路）。
+                        if staged_has_v2_magic(&staged)? {
+                            hydrate_v2(password, &staged, &local)?;
+                        } else {
+                            match crypto::decrypt(password, &std::fs::read(&staged)?) {
+                                Ok(plaintext) => {
+                                    write_atomic(&local, &plaintext)?;
+                                    dispatched_scheme = crate::config::SCHEME_GCM;
+                                }
+                                // 无 magic 且 v1 形失败（B6 歧义不可消）：
+                                // 双假说 + `cydrive sync` 文案挂在既有
+                                // 解密失败面 `VfsError::Crypto` 的扩展
+                                // 模板上——分类不动，staged 由外层失败
+                                // 清理路径回收（零残留）。
+                                Err(error) => return Err(VfsError::Crypto(error)),
+                            }
+                        }
                     }
                     unknown => {
                         return Err(VfsError::UnsupportedEncryptionScheme {
@@ -848,13 +869,16 @@ impl Vfs {
     ///   rows (the container length), a **first-read content validation**
     ///   runs before the admission decision — `CKCRYPT2` magic repairs a
     ///   wrong `scheme`/`size` row to the container truth (then streams
-    ///   on the true `plain_len`), a labelled-`aead_v2` row without magic
-    ///   fails with the B6 actionable error (never ciphertext bytes);
-    /// - everything else — `gcm` content the header does not vouch for
-    ///   (v1 whole-file AEAD can never be range-sliced; dispatch to
-    ///   hydrate, whose magic-first re-dispatch owns the mixed-scheme
-    ///   case), unknown schemes, chunk-less legacy rows, range-incapable
-    ///   transports and 0-byte rows — answers `Hydrate`.
+    ///   on the true `plain_len`); a labelled-`aead_v2` row without
+    ///   magic answers `Hydrate` (K84.2: a 34-byte header cannot
+    ///   disprove v1 — the tag lives at the file tail, so hydrate's
+    ///   same-ciphertext dual trial owns the verdict, never ciphertext
+    ///   bytes);
+    /// - everything else — content the header does not vouch for (v1
+    ///   whole-file AEAD can never be range-sliced; dispatch to hydrate,
+    ///   whose magic-first re-dispatch and dual trial own the
+    ///   mixed-scheme case), unknown schemes, chunk-less legacy rows,
+    ///   range-incapable transports and 0-byte rows — answers `Hydrate`.
     ///
     /// Cache-first (WF0 / K42): ahead of the admission split, a row whose
     /// cached copy exists on disk routes to `Hydrate` — the hydrate arm
@@ -979,9 +1003,12 @@ impl Vfs {
     ///    分块反推交叉核对，头权威）→ 行 scheme/size 与真值不符 →
     ///    [`MetaDatabase::fix_cipher_columns`] 定向回写 + **用真值
     ///    plain_len 继续流式**；
-    /// 3. 行标 aead_v2 而内容**无 magic** → B6：不猜、不吐密文——真值
-    ///    不可知故**不回写**，返回可行动 Err（双假说 + `cydrive sync`
-    ///    出路，挂既有 `UnsupportedEncryptionScheme` 分发面）；
+    /// 3. 行标 aead_v2 而内容**无 magic** → **K84.2 转 `Hydrate`**
+    ///    （审查回派）：34B 头试不出 v1——v1 tag 在文件尾，全量内容只有
+    ///    hydrate 拿得到；Hydrate 信号零字节，最终成败由 hydrate 的
+    ///    **同份密文双试**裁决（v1 成功 = 方案猜错自愈回写 gcm；失败 =
+    ///    B6 双假说 + `cydrive sync` 文案挂在既有解密失败面）——绝不
+    ///    返回密文字节的语义不破，真值不可知故 admission 也不回写；
     /// 4. 非 aead_v2 标签 + 无 magic → v1/明文歧义留给 hydrate 臂
     ///    （其 magic 先行改判与解密失败文案接手）→ `Hydrate`。
     async fn first_read_admit(
@@ -1005,15 +1032,12 @@ impl Vfs {
 
         let is_container = header.len() >= MAGIC.len() && header[..MAGIC.len()] == MAGIC;
         if !is_container {
-            if row.encryption_scheme == crate::config::SCHEME_AEAD_V2 {
-                // B6：行标 v2、内容非容器——响亮失败、零字节、不回写。
-                return Err(VfsError::UnsupportedEncryptionScheme {
-                    scheme: row.encryption_scheme.clone(),
-                    path: row.rel_path.clone(),
-                });
-            }
-            // gcm/未知标签 + 无 magic：v1（无 magic 是冻结格式）或明文
-            // ——交 hydrate 臂（magic 先行改判 + 解密失败 B6 文案）。
+            // 无 magic 的所有标签统一交 hydrate（K84.2 同份密文双试，
+            // 审查回派）：34B 头**试不出 v1**——v1 tag 在文件尾，全量
+            // 内容只有 hydrate 拿得到；Hydrate 信号零字节、admission
+            // 不做内容级判决也不回写。hydrate 侧按标签双试：aead_v2
+            // 臂「无 magic → 试 v1」（成功自愈回写 / 失败 B6 文案），
+            // gcm 臂 magic 先行改判，未知标签沿既有可行动 Err。
             return Ok(StreamSource::Hydrate);
         }
 
