@@ -2405,3 +2405,30 @@ async fn destroy_route_body_and_family_gates() {
         "actionable error: {body}"
     );
 }
+
+/// Web 首启引导（FR2）：零卷空态文案是**引导语**——首启用户（无配置
+/// bootstrap 进 init 模式，注册表为空）看到的不再是纯陈述，而是指向
+/// 「＋ 添加卷」动作的指路文案。双语键对称；旧纯陈述文案删除。
+#[tokio::test]
+async fn empty_volume_state_copy_points_at_add_volume() {
+    let server = multi_server(vec![]).await;
+    let addr = server.local_addr();
+    let resp = send(addr, &request("GET", "/static/js/i18n.js", addr, &[])).await;
+    assert_eq!(status_of(&resp), 200);
+    let i18n = body_of(&resp);
+
+    assert!(
+        i18n.contains("No volumes yet — use ＋ Add Volume above to create your first one."),
+        "EN empty state must point at the Add Volume action"
+    );
+    assert!(
+        i18n.contains("尚无存储卷——点击上方「＋ 添加卷」创建第一个卷。"),
+        "ZH empty state must point at the Add Volume action"
+    );
+    assert!(
+        !i18n.contains("No volume files are configured on this instance.")
+            && !i18n.contains("本实例未配置任何卷文件。"),
+        "the old statement-only copy is gone"
+    );
+    server.shutdown().await;
+}
