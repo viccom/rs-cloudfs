@@ -498,8 +498,11 @@ impl Vfs {
         size: u64,
         mtime: f64,
     ) -> Result<(), VfsError> {
-        // 0-byte rows carry a zero chunk plan (the queue never touches
-        // the transport for them); otherwise ceil(len / chunk_size) >= 1.
+        // 0-byte rows carry a zero chunk plan (the queue skips the
+        // transport for them — Contract 6; the EB4 exception: an
+        // encrypted row on an authoritative backend falls through to its
+        // container upload and the worker re-plans over the ciphertext);
+        // otherwise ceil(len / chunk_size) >= 1.
         let chunk_count = if size == 0 {
             0
         } else {
@@ -799,8 +802,12 @@ impl Vfs {
     /// pulls every part document in full, so u64::MAX is a pure
     /// pass-through with zero extra I/O). Plaintext rows keep the
     /// row-size budget unchanged. Alternative semantics (row size
-    /// stores the ciphertext length — plan A) recorded in decisions.md
-    /// as pending-owner-review.
+    /// stores the ciphertext length — plan A) were **closed as
+    /// REJECTED** at Phase 8-B EB4 (decisions K85.3): row size stays
+    /// plaintext — the gateway's `RowMetaData.len` feeds HTTP
+    /// Content-Length/PROPFIND (plan §0.5), R6 keeps size=plaintext,
+    /// and mixed-scheme size truth is repaired by first-read
+    /// validation (B2) instead.
     fn remote_handle_for(
         &self,
         rel: &RelPath,

@@ -644,7 +644,15 @@ async fn process_job(
     // digest is well-defined (Python parity).
     let sha256 = precompute_sha256(&job);
 
-    // Contract 6: 0-byte uploads never touch the remote.
+    // Contract 6: 0-byte uploads never touch the remote — with ONE
+    // exception (Phase 8-B EB4): an encrypted 0-byte row on an
+    // authoritative-index backend still has a REAL container to store
+    // (v1 44 B / v2 50 B). Skipping it would make the file vanish from
+    // the backend the moment the local index is lost — the two-stage
+    // read-through protocol must still see it (EB4 leg 1's empty-file
+    // edge). Shadow-index backends (telegram) keep the skip: their
+    // remote is not the index (no list face), and Python's "no empty
+    // message" parity stands.
     if job.size == 0 {
         // MiniRedir's small-file chain opens with an empty PUT artifact
         // (empty PUT → LOCK → full PUT). When that artifact's job is
@@ -657,7 +665,8 @@ async fn process_job(
         // remote stayed empty). The row above is read fresh, so `row.size`
         // is the current truth: a 0-byte job over a non-empty row is a
         // stale artifact — skip it entirely; the superseding job owns the
-        // outcome.
+        // outcome. (Both arms below: an encrypted row superseded by a
+        // full PUT skips the same way.)
         if row.size != 0 {
             tracing::debug!(
                 rel_path = %job.rel_path,
@@ -676,21 +685,32 @@ async fn process_job(
             bump(&stats.degraded);
             return;
         }
-        match persist_zero_byte(db, &row, sha256) {
-            Ok(()) => {
-                delete_local_copy(&job.local_path);
-                bump(&stats.succeeded);
+        let encrypted_container_is_payload = row.is_encrypted
+            && cfg.encryption_password.is_some()
+            && transport.capabilities().authoritative_index;
+        if !encrypted_container_is_payload {
+            match persist_zero_byte(db, &row, sha256) {
+                Ok(()) => {
+                    delete_local_copy(&job.local_path);
+                    bump(&stats.succeeded);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        rel_path = %job.rel_path,
+                        %error,
+                        "0-byte persist failed; degrading"
+                    );
+                    bump(&stats.degraded);
+                }
             }
-            Err(error) => {
-                tracing::warn!(
-                    rel_path = %job.rel_path,
-                    %error,
-                    "0-byte persist failed; degrading"
-                );
-                bump(&stats.degraded);
-            }
+            return;
         }
-        return;
+        // Fall through (the exception): the container the staging/stream
+        // path below produces IS this row's payload — 44 B (v1) or 50 B
+        // (v2) of real bytes an authoritative remote must hold. The
+        // chunk plan is re-derived over the ciphertext in both arms
+        // (staged job / `upload_v2_stream`'s cipher job), so the zero
+        // plan `commit_put` enqueued never reaches the transport.
     }
 
     // Encrypted staging: required only when the row is flagged encrypted

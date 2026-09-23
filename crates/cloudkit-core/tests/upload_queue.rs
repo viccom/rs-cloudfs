@@ -1463,3 +1463,97 @@ async fn panicking_upload_degrades_and_keeps_the_worker_alive() {
         "panic lands in exactly one terminal counter; the queue fully drains"
     );
 }
+
+// ------------------------------------- Contract 6 × 加密空件（EB4） ---
+
+/// Phase 8-B EB4：**加密空件在 authoritative 后端仍有容器要送**——0
+/// 明文字节的 v2 容器是 50 B 真实载荷，Contract 6 的「不触远端」跳过
+/// 会让文件在索引丢失后从 read-through 视野消失（两阶段协议腿 1 的
+/// 空件边界）。正臂钉：authoritative + 加密行 → `upload_stream` 恰一
+/// 次、容器 50 B、行以明文 size=0 落 uploaded、chunk 记容器长。
+#[tokio::test]
+async fn encrypted_zero_byte_row_still_uploads_its_container() {
+    let caps = Capabilities {
+        range_read: true,
+        authoritative_index: true,
+        ..Capabilities::none()
+    };
+    let mock0 = MockTransport::builder().capabilities(caps).build();
+    let (_dir, db, cache, mock) = test_env_with_mock(mock0).await;
+    let local = seed_encrypted_pending(&db, &cache, "/empty.enc", b"", 0);
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    // 生产缺省方案（AeadV2）——加密空件走 v2 流式容器。
+    let mut cfg = test_cfg(64);
+    cfg.encryption_password = Some("pw".to_string());
+    let handle = spawn_queue(db.clone(), transport, cfg);
+
+    handle
+        .enqueue(job_for(&cache, "/empty.enc", 0, 0, 64))
+        .await
+        .expect("enqueue");
+    handle.shutdown().await;
+
+    let streams = mock.stream_upload_calls();
+    assert_eq!(
+        streams.len(),
+        1,
+        "an encrypted 0-byte row on an authoritative backend must send its container"
+    );
+    assert_eq!(
+        streams[0].size, 50,
+        "v2 empty container = 34B header + 16B tag"
+    );
+    assert!(
+        mock.upload_calls().is_empty(),
+        "the v2 container rides the stream face"
+    );
+
+    let row = db
+        .get_file("/empty.enc")
+        .expect("db read")
+        .expect("row exists");
+    assert!(row.is_uploaded, "counts as uploaded");
+    assert!(row.is_encrypted, "cipher flag kept");
+    assert_eq!(row.size, 0, "row keeps the plaintext size");
+    assert_eq!(row.chunk_count, 1, "one single-container chunk receipt");
+    let chunks = db.get_chunks_by_file_id(row.id).expect("chunks");
+    assert_eq!(chunks.len(), 1, "one receipt chunk row");
+    assert_eq!(chunks[0].size, 50, "the chunk carries the container length");
+    assert!(
+        !local.exists(),
+        "the plaintext cache copy is consumed on success"
+    );
+    assert_eq!(handle.stats().succeeded, 1);
+}
+
+/// 反臂（闸的精度）：**非 authoritative（telegram 影子索引）+ 加密空件
+/// 保持 Contract 6 跳过**——远端不是索引，Python「不发空消息」parity
+/// 不动。回归哨：例外不得放宽到影子索引后端。
+#[tokio::test]
+async fn encrypted_zero_byte_keeps_the_skip_on_a_shadow_index_backend() {
+    // 默认 mock caps：authoritative_index = false（窄面形态）。
+    let (_dir, db, cache, mock) = test_env().await;
+    let _local = seed_encrypted_pending(&db, &cache, "/empty.enc", b"", 0);
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let mut cfg = test_cfg(64);
+    cfg.encryption_password = Some("pw".to_string());
+    let handle = spawn_queue(db.clone(), transport, cfg);
+
+    handle
+        .enqueue(job_for(&cache, "/empty.enc", 0, 0, 64))
+        .await
+        .expect("enqueue");
+    handle.shutdown().await;
+
+    assert!(
+        mock.stream_upload_calls().is_empty(),
+        "shadow index: the stream face is never called"
+    );
+    assert!(mock.upload_calls().is_empty(), "…nor the plain face");
+    let row = db
+        .get_file("/empty.enc")
+        .expect("db read")
+        .expect("row exists");
+    assert!(row.is_uploaded, "Contract 6 still counts it uploaded");
+    assert_eq!(handle.stats().succeeded, 1);
+}

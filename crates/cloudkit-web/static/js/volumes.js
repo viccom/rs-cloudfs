@@ -325,21 +325,17 @@ function deleteControl(v, lock) {
     `;
 }
 
-// The Refresh control (P6): a button on every running volume whose
-// index the backend can rebuild (plaintext local/baidu), a muted note
-// where it cannot — telegram's db IS its index (the shadow index; the
-// guidance is `cydrive sync`) and an encrypted volume's backend only
-// sees ciphertext containers (K11; the guidance is `cydrive sync`, the
-// sync payload carries the encrypted row semantics). While the row's
-// `rebuilding` marker is up (the poll's live state), the button renders
-// in its busy shape — disabled, spinning — until the background pass
-// settles.
+// The Refresh control (P6, narrowed by Phase 8-B B5): a button on every
+// running volume whose index the backend can rebuild — encrypted
+// volumes included since EB3 (rows carry per-file cipher truth and the
+// walk shares the read-through materialization). The one muted note is
+// telegram: its db IS its index (the shadow index; the guidance is
+// `cydrive sync`). While the row's `rebuilding` marker is up (the
+// poll's live state), the button renders in its busy shape — disabled,
+// spinning — until the background pass settles.
 function refreshControl(v, name, lock) {
     if (v.backend === 'telegram') {
         return `<span class="volume-note" data-note="refresh-unsupported" title="${t('volumes.note.refresh_telegram')}"><i class="fa-solid fa-rotate"></i></span>`;
-    }
-    if (v.encrypted) {
-        return `<span class="volume-note" data-note="refresh-unsupported" title="${t('volumes.note.refresh_encrypted')}"><i class="fa-solid fa-rotate"></i></span>`;
     }
     const busy = v.rebuilding === true || lock !== '';
     return `
