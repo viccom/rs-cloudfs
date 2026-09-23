@@ -477,7 +477,7 @@ fn apply_wizard_fills_fields_and_normalizes_letter() {
     assert_eq!(cfg.chat_id, 42);
     assert_eq!(cfg.drive_letter, "Y:", "letter normalized");
     // Everything else keeps the incoming (default) values.
-    assert_eq!(cfg.webdav_port, 8080);
+    assert_eq!(cfg.webdav_port, 8485);
     assert_eq!(cfg.webdav_host, "127.0.0.1");
     assert!(cfg.is_configured(), "wizard output counts as configured");
 }

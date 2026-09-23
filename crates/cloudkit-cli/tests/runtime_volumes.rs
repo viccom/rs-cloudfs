@@ -145,7 +145,7 @@ async fn boot_with_commands(
         .zip(mocks)
         .map(|(spec, mock)| (spec, RunOptions::default(), mock as Arc<dyn CloudTransport>))
         .collect();
-    run_multi_with_transports_and_commands(&cfg, injections, commands)
+    run_multi_with_transports_and_commands(&cfg, injections, commands, false)
         .await
         .expect("multi-volume boot with runtime commands")
 }

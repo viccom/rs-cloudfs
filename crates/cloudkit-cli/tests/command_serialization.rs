@@ -171,6 +171,7 @@ async fn boot(cfg: CyDriveConfig, dispatch: VolumeTransportDispatch) -> MultiVol
             remove_tuning: hold_tuning(),
             ..RuntimeVolumeCommands::default()
         },
+        false,
     )
     .await
     .expect("multi-volume boot")

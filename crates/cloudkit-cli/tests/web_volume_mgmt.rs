@@ -346,6 +346,7 @@ async fn web_seam_serves_config_and_follows_the_registry() {
             remove_tuning: RemoveTuning::fast(),
             ..RuntimeVolumeCommands::default()
         },
+        false,
     )
     .await
     .expect("boot with the command surface");
@@ -468,6 +469,7 @@ async fn web_write_routes_drive_the_real_command_surface() {
             remove_tuning: RemoveTuning::fast(),
             ..RuntimeVolumeCommands::default()
         },
+        false,
     )
     .await
     .expect("boot with the command surface");
@@ -617,6 +619,7 @@ async fn web_create_route_drives_the_real_command_surface() {
             remove_tuning: RemoveTuning::fast(),
             ..RuntimeVolumeCommands::default()
         },
+        false,
     )
     .await
     .expect("boot with the command surface");
@@ -720,6 +723,7 @@ async fn web_update_route_drives_the_real_command_surface() {
             remove_tuning: RemoveTuning::fast(),
             ..RuntimeVolumeCommands::default()
         },
+        false,
     )
     .await
     .expect("boot with the command surface");
@@ -826,6 +830,7 @@ async fn web_destroy_route_drives_the_real_command_surface() {
             remove_tuning: RemoveTuning::fast(),
             ..RuntimeVolumeCommands::default()
         },
+        false,
     )
     .await
     .expect("boot with the command surface");

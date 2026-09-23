@@ -125,7 +125,7 @@ async fn boot(
         .zip(mocks)
         .map(|(spec, mock)| (spec, RunOptions::default(), mock as Arc<dyn CloudTransport>))
         .collect();
-    let handle = run_multi_with_transports_and_commands(&cfg, injections, commands)
+    let handle = run_multi_with_transports_and_commands(&cfg, injections, commands, false)
         .await
         .expect("multi-volume boot with runtime commands");
     let addr = read_control_addr(&process_config()).expect("control address");
@@ -472,6 +472,7 @@ async fn destroy_confirm_drain_refusal_keeps_the_file_and_the_volume() {
             remove_tuning: RemoveTuning::fast(),
             ..RuntimeVolumeCommands::default()
         },
+        false,
     )
     .await
     .expect("boot");

@@ -1774,8 +1774,13 @@ pub async fn run_multi_with_transports(
     process_cfg: &CyDriveConfig,
     volumes: Vec<(VolumeConfig, RunOptions, Arc<dyn CloudTransport>)>,
 ) -> Result<MultiVolumeHandle> {
-    run_multi_with_transports_and_commands(process_cfg, volumes, RuntimeVolumeCommands::default())
-        .await
+    run_multi_with_transports_and_commands(
+        process_cfg,
+        volumes,
+        RuntimeVolumeCommands::default(),
+        false,
+    )
+    .await
 }
 
 /// [`run_multi_with_transports`] with the runtime-volume command surface
@@ -1815,10 +1820,23 @@ pub async fn run_multi_with_transports(
 /// one queue — the handler's own single-permit gate (K58-FB), with
 /// each execution detached from its caller's wait (a route budget that
 /// elapses abandons the REPLY, never the command).
+///
+/// `first_run` (web first-run bootstrap FR1 / D3) marks the init mode a
+/// `cydrive run` enters right after [`bootstrap_first_run_cwd`]
+/// generated a fresh configuration: with it, gate B (the
+/// no-enabled-volumes refusal) lets the EMPTY assembly through — the
+/// dashboard binds the empty registry so the first volume can be added
+/// through the web UI, the WebDAV listener stays unbound (the empty
+/// face set is a structural `None`), and the control channel answers
+/// `LIST` with zero volumes. On the bound dashboard a first run also
+/// opens the system browser at the dashboard address (suppressed with
+/// the `CYDRIVE_NO_OPEN_BROWSER` env var; a failed bind only warns —
+/// edit config.toml and run again).
 pub async fn run_multi_with_transports_and_commands(
     process_cfg: &CyDriveConfig,
     volumes: Vec<(VolumeConfig, RunOptions, Arc<dyn CloudTransport>)>,
     commands: RuntimeVolumeCommands,
+    first_run: bool,
 ) -> Result<MultiVolumeHandle> {
     // The double-start guard (see the single-volume call site): refuse a
     // second boot over a live instance before touching any volume.
@@ -1874,7 +1892,7 @@ pub async fn run_multi_with_transports_and_commands(
         }
     }
 
-    if runtimes.is_empty() {
+    if runtimes.is_empty() && !first_run {
         // Review M4: reachable since RV0 — every volume file disabled.
         // The assembly entry main.rs boots through IS the actionable
         // face (the skip itself is only an info line in the log), so
@@ -1883,7 +1901,12 @@ pub async fn run_multi_with_transports_and_commands(
         anyhow::bail!("{}", no_enabled_volumes_message(process_cfg));
     }
     let registry = RegistryHandle::new(runtimes);
-    if registry.all_failed() {
+    // The all-failed gate reads `all` — over an EMPTY registry that is
+    // vacuously true, so it is only meaningful when something actually
+    // assembled. The first-run boot reaches here with an empty registry
+    // BY DESIGN (gate B above let it through); every other empty
+    // assembly bailed one branch earlier.
+    if !registry.volumes().is_empty() && registry.all_failed() {
         anyhow::bail!(
             "every volume failed to assemble ({}): {} — fix the reported volume \
              configurations and run again",
@@ -1894,6 +1917,19 @@ pub async fn run_multi_with_transports_and_commands(
                 .map(|(name, status)| format!("{name}={}", status.as_str()))
                 .collect::<Vec<_>>()
                 .join(", ")
+        );
+    }
+    if first_run && registry.status_list().is_empty() {
+        // The first-run init banner (D4): the configuration was just
+        // generated and nothing serves yet — point at the dashboard the
+        // boot is about to bind. The URL names the configured address
+        // (the template pins 127.0.0.1:8486); the actual bound address
+        // is announced by the boot's own web-UI line and the browser
+        // opens there.
+        tracing::info!(
+            url = %format!("http://{}:{}", process_cfg.web_ui_host, process_cfg.web_ui_port),
+            "first run: no volumes yet — add your first volume through the web \
+             dashboard's volumes page (the ＋ Add Volume button)"
         );
     }
 
@@ -2061,6 +2097,29 @@ pub async fn run_multi_with_transports_and_commands(
     )
     .await;
     let web_ui_addr = web_ui.as_ref().map(WebUiServer::local_addr);
+    // First-run browser hand-off (D4): on a freshly generated config the
+    // dashboard IS the product — open it at the ACTUAL bound address once
+    // the bind succeeded. The env kill-switch is the headless-server exit
+    // (a server has no browser to open) and keeps automated boots (the
+    // offline test suite) browser-free; the spawn is fire-and-forget and
+    // deliberately carries NO behavioral assertion anywhere (a spawn side
+    // effect — only its compilation on both platforms is gated). A
+    // degraded bind warns instead: the init banner already named the URL,
+    // but nothing answers there — editing config.toml and rerunning is
+    // the way out.
+    if first_run {
+        match &web_ui {
+            Some(server) if std::env::var_os("CYDRIVE_NO_OPEN_BROWSER").is_none() => {
+                open_browser(&format!("http://{}", server.local_addr()));
+            }
+            Some(_) => {}
+            None => tracing::warn!(
+                "first run: the web dashboard did not bind — edit config.toml \
+                 (web_ui_host / web_ui_port) and run `cydrive run` again; the \
+                 volume-management UI lives there"
+            ),
+        }
+    }
 
     // Per-volume mounts (K27 + K40): only volumes that EXPLICITLY set a
     // drive_letter claim a mount (the parsed default letter is a
@@ -7692,6 +7751,126 @@ pub fn discover_config_with_volumes_and_store(
         "no config found in the current directory: write a config.toml (or a legacy \
          Python config.json) with bot_token and chat_id, then run cydrive again"
     )
+}
+
+// --------------------------- web first-run bootstrap (FR1, D1–D4) ---
+
+/// The first-run process `config.toml` (web first-run plan FR1 / D2):
+/// hand-written like the setup skeleton ([`crate::setup`]'s
+/// `MULTI_PROCESS_TOML`) — `save_toml` would pave every defaulted
+/// volume-scoped key and fail its own K19 mixing guard. Ports are the
+/// program defaults (8485 WebDAV / 8486 web UI, 负责人 2026-09-23
+/// 裁决); `auto_mount_drive` is process-scoped so the guard accepts it.
+/// The file text is pinned byte for byte by
+/// `tests/multivolume_config.rs::first_run_template_pin_keys_ports_and_header`.
+const FIRST_RUN_PROCESS_TOML: &str = "\
+# cydrive process config — generated on first run: no config.toml or
+# config.json was found in this directory, so this minimal configuration
+# was written and the instance started so a first volume can be added
+# through the web dashboard. Process-level keys only — each volume's own
+# settings live in volumes/<name>.toml.
+volumes_dir = \"volumes\"
+
+webdav_host = \"127.0.0.1\"
+webdav_port = 8485
+enable_web_ui = true
+web_ui_host = \"127.0.0.1\"
+web_ui_port = 8486
+auto_mount_drive = true
+";
+
+/// The `run` bootstrap probe (web first-run plan FR1 / D1+D2): in a
+/// working directory with NEITHER `config.toml` NOR a legacy
+/// `config.json`, generate the minimal init configuration — the
+/// [`FIRST_RUN_PROCESS_TOML`] template through the one atomic-write
+/// primitive ([`cloudkit_core::config::write_config_atomically`], K58-H3)
+/// plus the empty `volumes/` directory it points at — and return `true`
+/// so the caller enters first-run mode. An existing configuration of
+/// EITHER shape disables the bootstrap entirely (`Ok(false)`): the probe
+/// runs before anything is written, so there is no overwrite path —
+/// a configured boot is byte-for-byte untouched.
+///
+/// Errors are the write/mkdir failures only; a *parse* failure of a
+/// pre-existing config is the ordinary discovery's business.
+pub fn bootstrap_first_run_cwd() -> Result<bool> {
+    if Path::new("config.toml").exists() || Path::new("config.json").exists() {
+        return Ok(false);
+    }
+    cloudkit_core::config::write_config_atomically(
+        Path::new("config.toml"),
+        FIRST_RUN_PROCESS_TOML,
+    )
+    .context("writing the first-run config.toml")?;
+    std::fs::create_dir_all("volumes").context("creating the volumes directory")?;
+    tracing::info!(
+        "first run: no configuration found — generated a minimal config.toml; \
+         add your first volume through the web dashboard"
+    );
+    Ok(true)
+}
+
+/// The first-run discovery (web first-run plan FR1 / D3): load the
+/// config.toml [`bootstrap_first_run_cwd`] just wrote through the SAME
+/// funnel the ordinary multi-volume discovery uses — parse with raw-key
+/// capture, the K19 mixing guard, validate — then return
+/// [`DiscoveredConfig::Multi`] with an EMPTY volume manifest. The empty
+/// manifest is the point: the ordinary discovery's volume load (core's
+/// `discover_volumes`) refuses an empty volumes directory (gate A), and
+/// the first-run boot must boot INTO the empty state the web UI exists
+/// to fill. This variant changes nothing in core and nothing in the
+/// ordinary functions beside it — it is only ever called on the file
+/// the bootstrap just generated (which always carries `volumes_dir`).
+pub fn discover_first_run_config() -> Result<DiscoveredConfig> {
+    let toml_path = Path::new("config.toml");
+    let (cfg, raw_keys) = CyDriveConfig::load_toml_with_keys(toml_path)
+        .with_context(|| format!("loading {}", toml_path.display()))?;
+    cloudkit_core::config::ensure_no_volume_keys_in_process(&raw_keys)
+        .context("the generated config.toml mixes process- and volume-scoped keys")?;
+    cfg.validate()
+        .context("invalid process-level configuration")?;
+    Ok(DiscoveredConfig::Multi {
+        process: cfg,
+        volumes: Vec::new(),
+    })
+}
+
+/// Opens the system browser at `url` (web first-run plan FR1 / D4) —
+/// fire-and-forget: the child is spawned detached from the boot flow and
+/// never waited on, so a spawn failure is only a `tracing::warn` (a
+/// headless machine must not fail its boot over a missing browser; the
+/// init banner already printed the URL). The function body carries NO
+/// behavioral test anywhere — asserting a spawn side effect would need a
+/// real browser on every test machine; both cfg arms are instead kept
+/// compilable on the other platform by the workspace gates (the R5
+/// cross-platform red line), and the production caller is suppressed in
+/// tests via `CYDRIVE_NO_OPEN_BROWSER`.
+fn open_browser(url: &str) {
+    #[cfg(unix)]
+    {
+        match std::process::Command::new("xdg-open").arg(url).spawn() {
+            Ok(_child) => tracing::info!(%url, "opening the dashboard in the browser"),
+            Err(error) => {
+                tracing::warn!(%url, %error, "could not open a browser (xdg-open)")
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW: the `start` shim must not flash a console.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // `start`'s first quoted argument is the new window's TITLE —
+        // the empty string keeps the URL itself from being parsed as one.
+        let result = std::process::Command::new("cmd")
+            .args(["/c", "start", "", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+        match result {
+            Ok(_child) => tracing::info!(%url, "opening the dashboard in the browser"),
+            Err(error) => tracing::warn!(%url, %error, "could not open a browser (start)"),
+        }
+    }
 }
 
 /// The `migrate` subcommand body (M5): import a legacy Python

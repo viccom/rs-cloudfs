@@ -16,7 +16,8 @@ use std::path::{Path, PathBuf};
 use std::sync::{Mutex, MutexGuard};
 
 use cloudkit_cli::{
-    discover_config_with_store, discover_config_with_volumes_and_store, DiscoveredConfig,
+    bootstrap_first_run_cwd, discover_config_with_store, discover_config_with_volumes_and_store,
+    discover_first_run_config, DiscoveredConfig,
 };
 use cloudkit_core::config::Backend;
 use cloudkit_core::credentials::InMemoryStore;
@@ -224,5 +225,144 @@ fn discover_multi_surfaces_drive_letter_conflicts() {
     assert!(
         message.contains("drive_letter"),
         "error must name drive_letter: {message}"
+    );
+}
+
+// ------------------- web first-run bootstrap (FR1: red 1/2/5) ---
+
+/// The pinned first-run template (web first-run plan FR1 / D2): the pin
+/// is byte-exact, so any template drift fails this test and the author
+/// consciously re-pins. Header declares the first run; ports 8485/8486
+/// are the program defaults (负责人 2026-09-23 裁决); `auto_mount_drive`
+/// is process-scoped so the K19 mixing guard accepts it.
+const FIRST_RUN_TEMPLATE_PIN: &str = "\
+# cydrive process config — generated on first run: no config.toml or
+# config.json was found in this directory, so this minimal configuration
+# was written and the instance started so a first volume can be added
+# through the web dashboard. Process-level keys only — each volume's own
+# settings live in volumes/<name>.toml.
+volumes_dir = \"volumes\"
+
+webdav_host = \"127.0.0.1\"
+webdav_port = 8485
+enable_web_ui = true
+web_ui_host = \"127.0.0.1\"
+web_ui_port = 8486
+auto_mount_drive = true
+";
+
+/// RED 1 (happy arm): in an empty cwd the bootstrap generates the
+/// minimal init config (every key, the 8485/8486 ports and the
+/// "first run" header) and creates the `volumes/` directory.
+#[test]
+fn bootstrap_first_run_generates_minimal_config_in_an_empty_dir() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = chdir(dir.path());
+
+    let generated = bootstrap_first_run_cwd().expect("first-run bootstrap");
+    assert!(generated, "an empty cwd must generate the config");
+
+    let text = fs::read_to_string("config.toml").expect("config.toml exists");
+    for needle in [
+        "volumes_dir = \"volumes\"",
+        "webdav_host = \"127.0.0.1\"",
+        "webdav_port = 8485",
+        "enable_web_ui = true",
+        "web_ui_host = \"127.0.0.1\"",
+        "web_ui_port = 8486",
+        "auto_mount_drive = true",
+        "first run",
+    ] {
+        assert!(text.contains(needle), "template carries `{needle}`: {text}");
+    }
+    assert!(
+        Path::new("volumes").is_dir(),
+        "the volumes directory is created"
+    );
+}
+
+/// RED 1 (guard arm): an existing `config.toml` (or a legacy
+/// `config.json`) disables the bootstrap — the probe runs first, so an
+/// existing configuration is byte-identical after the call.
+#[test]
+fn bootstrap_first_run_never_touches_an_existing_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let existing = "bot_token = \"123456:ABC-DEF\"\nchat_id = 123456789\n";
+    write_file(&dir.path().join("config.toml"), existing);
+    let _guard = chdir(dir.path());
+
+    let generated = bootstrap_first_run_cwd().expect("bootstrap probe");
+    assert!(
+        !generated,
+        "an existing config.toml must disable the bootstrap"
+    );
+    assert_eq!(
+        fs::read_to_string("config.toml").expect("read back"),
+        existing,
+        "the existing file stays byte-identical"
+    );
+    assert!(
+        !Path::new("volumes").exists(),
+        "no volumes directory appears over an existing config"
+    );
+}
+
+/// RED 1 (guard arm, legacy shape): a legacy Python `config.json` alone
+/// also disables the bootstrap — nothing is generated over it.
+#[test]
+fn bootstrap_first_run_respects_a_legacy_json_config() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    write_file(
+        &dir.path().join("config.json"),
+        r#"{ "bot_token": "1:x", "chat_id": 1 }"#,
+    );
+    let _guard = chdir(dir.path());
+
+    let generated = bootstrap_first_run_cwd().expect("bootstrap probe");
+    assert!(!generated, "a legacy config.json disables the bootstrap");
+    assert!(
+        !Path::new("config.toml").exists(),
+        "no config.toml is generated over a legacy config"
+    );
+    assert!(!Path::new("volumes").exists());
+}
+
+/// RED 2: right after the bootstrap, the first-run discovery loads the
+/// generated config.toml (mixing guard + validate) and returns
+/// `Multi` with an EMPTY volume manifest — gate A (the empty
+/// volumes-directory error) is bypassed without touching core.
+#[test]
+fn discover_first_run_returns_multi_with_empty_volumes() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = chdir(dir.path());
+    bootstrap_first_run_cwd().expect("bootstrap");
+
+    let discovered = discover_first_run_config().expect("first-run discovery");
+    match discovered {
+        DiscoveredConfig::Multi { process, volumes } => {
+            assert!(volumes.is_empty(), "no volumes exist yet: {volumes:?}");
+            assert_eq!(process.volumes_dir.as_deref(), Some("volumes"));
+            assert_eq!(process.webdav_port, 8485);
+            assert_eq!(process.web_ui_port, 8486);
+            assert!(process.enable_web_ui);
+            assert!(process.auto_mount_drive);
+        }
+        DiscoveredConfig::Single(_) => {
+            panic!("the first-run config carries volumes_dir — Multi it is")
+        }
+    }
+}
+
+/// RED 5: the generated file is the pinned template, byte for byte.
+#[test]
+fn first_run_template_pin_keys_ports_and_header() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let _guard = chdir(dir.path());
+    bootstrap_first_run_cwd().expect("bootstrap");
+
+    let text = fs::read_to_string("config.toml").expect("config.toml");
+    assert_eq!(
+        text, FIRST_RUN_TEMPLATE_PIN,
+        "the first-run template is pinned byte for byte"
     );
 }

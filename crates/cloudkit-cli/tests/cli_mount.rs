@@ -10,12 +10,12 @@ use cloudkit_cli::{default_mount_url, resolve_mount_params, resolve_unmount_lett
 use cloudkit_core::config::CyDriveConfig;
 
 /// The default URL is glued straight from the config's WebDAV host/port:
-/// `http://127.0.0.1:8080` on defaults, reflecting overrides verbatim.
+/// `http://127.0.0.1:8485` on defaults, reflecting overrides verbatim.
 #[test]
 fn default_mount_url_from_config() {
     assert_eq!(
         default_mount_url(&CyDriveConfig::default()),
-        "http://127.0.0.1:8080"
+        "http://127.0.0.1:8485"
     );
 
     let cfg = CyDriveConfig {
@@ -30,7 +30,7 @@ fn default_mount_url_from_config() {
 /// `drive_letter` and glued WebDAV URL.
 #[test]
 fn resolve_mount_params_flags_over_config() {
-    let cfg = CyDriveConfig::default(); // drive_letter "Y:", port 8080
+    let cfg = CyDriveConfig::default(); // drive_letter "Y:", port 8485
 
     let (letter, url) = resolve_mount_params(
         &cfg,
@@ -42,7 +42,7 @@ fn resolve_mount_params_flags_over_config() {
 
     let (letter, url) = resolve_mount_params(&cfg, None, None);
     assert_eq!(letter, "Y:");
-    assert_eq!(url, "http://127.0.0.1:8080");
+    assert_eq!(url, "http://127.0.0.1:8485");
 }
 
 /// `unmount` resolves its letter the same way: flag first, config second.
