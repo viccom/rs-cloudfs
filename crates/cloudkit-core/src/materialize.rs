@@ -82,29 +82,17 @@ pub fn plaintext_len_from_container(ct: i64, scheme: &str) -> i64 {
         }
         ct - V1_OVERHEAD
     } else if scheme == crate::config::SCHEME_AEAD_V2 {
-        let body = ct - V2_HEADER;
-        if body < V2_TAG {
-            tracing::warn!(
-                ct,
-                scheme,
-                "ciphertext shorter than the v2 header + tag; \
-                 returning the raw length (first-read validation will repair)"
-            );
-            return ct;
+        match plaintext_len_with_chunk(ct, V2_CHUNK) {
+            Some(plain) => plain,
+            None => {
+                tracing::warn!(
+                    ct,
+                    "v2 container structure violated (first-read validation will repair); \
+                     returning the raw length"
+                );
+                ct
+            }
         }
-        let stride = V2_CHUNK + V2_TAG;
-        let n_minus_1 = (body - V2_TAG) / stride;
-        let last = (body - V2_TAG) % stride;
-        if last > V2_CHUNK {
-            tracing::warn!(
-                ct,
-                last,
-                "derived final chunk exceeds the container chunk size; \
-                 returning the raw length (first-read validation will repair)"
-            );
-            return ct;
-        }
-        n_minus_1 * V2_CHUNK + last
     } else {
         tracing::warn!(
             scheme,
@@ -114,6 +102,30 @@ pub fn plaintext_len_from_container(ct: i64, scheme: &str) -> i64 {
         );
         ct
     }
+}
+
+/// v2 闭式反推的**结构敏感**核心（Phase 8-B EB2 / B2 首读校验用）：给定
+/// 密文总长 `ct` 与**容器头自述的分块大小** `chunk`（头内真值参数——
+/// `AeadV2Window` 解析所得，权威于应用默认 1MiB），返回明文长度；
+/// 结构违例（短于 34B 头 + 16B tag、尾块超 chunk 上界）返回 `None`
+/// ——调用方**不回写**（[`plaintext_len_from_container`] 的防御臂则按
+/// 既有契约保守回 `ct`，供列举期使用，两者语义刻意不同）。
+pub fn plaintext_len_with_chunk(ct: i64, chunk: i64) -> Option<i64> {
+    let body = ct - V2_HEADER;
+    if body < V2_TAG {
+        return None;
+    }
+    if chunk <= 0 {
+        return None;
+    }
+    let payload = body - V2_TAG;
+    let stride = chunk + V2_TAG;
+    let n_minus_1 = payload / stride;
+    let last = payload % stride;
+    if last > chunk {
+        return None;
+    }
+    Some(n_minus_1 * chunk + last)
 }
 
 /// `list_all_pages` 的页数上限（M2 / Phase 8 审查批）：自指游标的故障

@@ -184,6 +184,11 @@ impl DavFileSystem for CyDriveFs {
                     transport,
                 }) = self.vfs.open_read(&rel).await
                 {
+                    // B2 首读回写传导（Phase 8-B EB2）：`open_read` 的容器
+                    // 头校验可能已定向回写行的 cipher 列——重新读一次行，
+                    // `metadata()`（Content-Length/K35 承重面）才拿得到
+                    // 真值；行消失（并发删除）时保留原快照。
+                    let row = self.row(&rel)?.unwrap_or(row);
                     return Ok(Box::new(RangeFile::new(
                         handle,
                         total_size,
@@ -193,6 +198,8 @@ impl DavFileSystem for CyDriveFs {
                     )) as Box<dyn DavFile>);
                 }
                 let local = self.vfs.hydrate(&rel).await.map_err(vfs_err)?;
+                // hydrate 臂的解密后真值回写同上传导（EB2 同源重读）。
+                let row = self.row(&rel)?.unwrap_or(row);
                 let file = tokio::fs::File::open(&local).await.map_err(io_err)?;
                 return Ok(Box::new(HydratedFile {
                     file,

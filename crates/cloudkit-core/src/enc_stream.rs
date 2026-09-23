@@ -105,6 +105,32 @@ impl DecryptingTransport {
         }
     }
 
+    /// [`Self::new`] with the container window **already derived** by the
+    /// caller's first-read validation（Phase 8-B EB2 / B2）：`Vfs::open_read`
+    /// pulls the 34-byte header ahead of any response byte, validates the
+    /// magic, repairs the row and hands the parsed window over — so the
+    /// header read + PBKDF2 derivation that this wrapper would otherwise
+    /// run on its first `open_range` happen **exactly once** (B4:
+    /// validation attaches to the same read, zero extra round trips; the
+    /// `OnceLock` falls straight through to the seeded window).
+    pub fn new_with_window(
+        inner: Arc<dyn CloudTransport>,
+        handle: RemoteHandle,
+        plain_len: u64,
+        password: String,
+        window: Arc<AeadV2Window>,
+    ) -> Self {
+        let lock = OnceLock::new();
+        let _seeded = lock.set(window);
+        Self {
+            inner,
+            handle,
+            plain_len,
+            password,
+            window: lock,
+        }
+    }
+
     /// Pulls the container header once, parses it and derives the key
     /// once (PBKDF2). Structural failures (bad magic, guardrail violations,
     /// short header) are actionable [`StorageError::Unavailable`]s.

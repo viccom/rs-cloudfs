@@ -684,6 +684,40 @@ impl MetaDatabase {
         Ok(())
     }
 
+    /// First-read cipher-truth repair（Phase 8-B EB2 / B2）：定向 UPDATE
+    /// **只动** `encryption_scheme` / `size` / `updated_at` 三列。
+    ///
+    /// 触发点（校验先于任何字节/Content-Length 出门）：`open_read` 流臂
+    /// 的容器头校验（内容 magic + ct 闭式 → 真值）与 `hydrate` 解密完成
+    /// 后的本地明文长度核对（含 gcm 标签遇 `CKCRYPT2` 改判）。语义边界：
+    ///
+    /// - **绝不碰 coalesce 列**（sha256/telegram_msg_id/mime）与
+    ///   mtime/is_cached 等任何其它列——同 `set_cached_flag` 的
+    ///   「定向列写、永不整行回写」纪律（P3 快照回写竞态同源防线）；
+    /// - `updated_at` 照刷：sweep 免疫（D8③——首读修正过的行不被
+    ///   完成趟 prune 误删）；
+    /// - **doorbell 不压制**：size/scheme 是 sync 载荷列——修正是真相，
+    ///   files 表 chokepoint hook 照响（对端经 sync 拿到回写后的真值）；
+    /// - 幂等：同值重写无副作用；affected-rows 0 = 行并发消失，按
+    ///   `set_cached_flag` 先例作良性 `Ok`。
+    pub fn fix_cipher_columns(
+        &self,
+        id: i64,
+        encryption_scheme: &str,
+        size: i64,
+    ) -> Result<(), DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "UPDATE files SET encryption_scheme = ?1, size = ?2, updated_at = ?3 \
+             WHERE id = ?4",
+            params![encryption_scheme, size, now(), id],
+        )?;
+        Ok(())
+    }
+
     /// Looks up a single row by its unique virtual path.
     pub fn get_file(&self, rel_path: &str) -> Result<Option<FileRecord>, DbError> {
         let conn = self

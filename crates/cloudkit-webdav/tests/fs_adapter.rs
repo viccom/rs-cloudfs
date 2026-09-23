@@ -2001,3 +2001,76 @@ async fn readthrough_open_read_serves_a_remote_only_file() {
         "the materialized row carries the remote size"
     );
 }
+
+/// 6i（Phase 8-B EB2 面级）：错 size 的 aead_v2 加密行 → GET 面
+/// `metadata()`（= Content-Length 的来源，K35 承重面）与**实发字节数**
+/// 一致——`open_read` 的首读修正必须传导到网关（RangeFile 构造时的
+/// RowMetaData 取自回写**之后**的行）。
+///
+/// 接受残余（计划 §6）：首次 PROPFIND 在「猜错 + 未首读」窗口仍显示
+/// 初值尺寸——一次性，首读后自愈；本钉钉的是 GET 面首读即修正。
+#[tokio::test]
+async fn wrong_size_encrypted_row_repairs_content_length_before_the_get() {
+    let (_dir, db, _cache_root, mock, _vfs, fs) = test_env_with_password(u64::MAX, "pw").await;
+
+    let plain_len = 150_000usize;
+    let plaintext = pattern(plain_len);
+    let container = cloudkit_core::crypto::AeadV2::new().encrypt("pw", &plaintext);
+    let container_len = container.len() as u64;
+    let receipt = seed_remote(&mock, "/wrong-size.bin", &container, 1, container_len).await;
+
+    // 错 size 行（真值 − 4096）：scheme 标签正确、只 size 错。
+    let wrong = plain_len as i64 - 4096;
+    let rel = RelPath::new("/wrong-size.bin").expect("valid rel path");
+    let file_id = db
+        .upsert_file_scheme(
+            &FileUpsert {
+                size: wrong,
+                telegram_msg_id: Some(receipt.first_msg_id),
+                is_encrypted: true,
+                ..shape_upsert(&rel, false, wrong, 1_700_000_123.0)
+            },
+            "aead_v2",
+        )
+        .expect("seed wrong-size aead_v2 row");
+    db.upsert_chunk(file_id, 0, receipt.first_msg_id, container_len as i64, None)
+        .expect("seed container chunk (ct 来源)");
+
+    let fs = fs.with_stream_window(4096);
+    let mut file = fs
+        .open(
+            &DavPath::new("/wrong-size.bin").expect("path"),
+            read_options(),
+        )
+        .await
+        .expect("open the wrong-size encrypted row");
+    let meta = file.metadata().await.expect("file metadata");
+    assert_eq!(
+        meta.len(),
+        plain_len as u64,
+        "Content-Length = 首读修正后的明文真值（非播种初值）"
+    );
+
+    // 实发字节数 = Content-Length，且逐字节 = 明文。
+    let mut body = Vec::new();
+    loop {
+        let frame = file.read_bytes(1 << 20).await.expect("body frame read");
+        if frame.is_empty() {
+            break;
+        }
+        body.extend_from_slice(&frame);
+    }
+    assert_eq!(
+        body.len() as u64,
+        meta.len(),
+        "Content-Length 与实际发字节数一致（首读修正传导到网关）"
+    );
+    assert_eq!(body, plaintext, "GET 体逐字节 = 明文");
+
+    // 行侧同步回写（db 真值）。
+    let row = db
+        .get_file("/wrong-size.bin")
+        .expect("db read")
+        .expect("row exists");
+    assert_eq!(row.size, plain_len as i64, "行 size 已按首读真值回写");
+}
