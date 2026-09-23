@@ -2,7 +2,7 @@
 
 > 计划：`docs/plans/2026-09-23-encrypted-readthrough.md` ｜ 批准链：负责人 2026-09-23 三点指示 → K84 立项（D10 修订留痕）→ 深度分析五环 + 计划 §0 八项代码查证 → 计划落档
 > 基线：`feat/readthrough-index`@77a58cc（Phase 8 RT0–RT5+审查批+文档批已落，workspace 1643/0/60 五门禁绿，**待合入**）
-> 状态：**Phase 8-B 全批次完成（EB1–EB4），待合入**（EB1 2026-09-23 五红→绿+七门禁绿；EB2 五红→绿+六门禁绿+审查回派二红→绿；EB3 四红→绿+六门禁绿；EB4 两阶段验收三腿+Contract-6 修复+真网重跑+web 同步+K85 收口+五门禁与七组合终跑全绿——详见批次日志 EB4 与风险终态总表）
+> 状态：**Phase 8-B 全批次完成（EB1–EB4）+ sftp 加密真机腿（2026-09-23，负责人提供 172.27.199.30），待合入**（EB1 2026-09-23 五红→绿+七门禁绿；EB2 五红→绿+六门禁绿+审查回派二红→绿；EB3 四红→绿+六门禁绿；EB4 两阶段验收三腿+Contract-6 修复+真网重跑+web 同步+K85 收口+五门禁与七组合终跑全绿；**K85.6 修复批 + sftp 加密真机两腿全绿（加密模式首落 sftp），无产品缺陷**——详见批次日志 EB4/K85.6 与「sftp 加密真机腿」节）
 > worktree：`feat/readthrough-index`（与 Phase 8 同一支，连续批次）；独立 target
 > 编号：执行记录入 decisions 用 **K85**；批次 **EB1–EB4**
 
@@ -241,3 +241,48 @@
 - 绿：`upload_queue` **29/29**；`zero_byte_authoritative_e2e` **1/1**；`encrypted_read` 5 / `materialize` 9 / `readthrough` 21 / `rebuild` 11 / `encrypted_readthrough_e2e` 3 全 0 failed（既有断言零漂移）。
 
 **提交**：`fix(upload): 明文 0 字节在权威后端落真实对象——Contract 6 收窄至影子索引后端（K85.6）`。
+
+### sftp 加密真机腿（2026-09-23，负责人提供 172.27.199.30）
+
+**背景**：EB4 的两阶段加密验收落在离线 local/TempDir（`cloudkit-cli/tests/encrypted_readthrough_e2e.rs` 三腿）与真网 pan115/pan123 上；sftp 是**唯一宽面驱动尚无加密真机覆盖**者。负责人 2026-09-23 提供真机 sftp 服务器（`root@172.27.199.30:22`，测试根 `/srv/cydrive-rt-enc`，ED25519 指纹 `SHA256:mpap…IeQ` 已由主会话明文腿钉过），本条把 EB4 腿 1 / 腿 2 的协议语义搬到真 sftp 上——**加密模式首次落到 sftp 驱动**。
+
+**形态**：`crates/drivers/ck-sftp/tests/live_readthrough.rs` 追加两腿（同文件的 `#[ignore]` 真机纪律、env helper、stamp 唯一名、K72/K77.6 按轮随机 LCG 载荷、收尾核空全部复用）：
+
+| 腿 | 内容 | 结果 |
+|---|---|---|
+| `live_encrypted_readthrough_smoke` | 三阶段：①加密实例（aead_v2 + 按轮唯一密码）经真 sftp + 上传队列写三边界文件（空件 / 恰 1MiB / 跨块 1MiB+12345，嵌套 `docs/sub`）→ drop Vfs 切阶段 → **全新空 db** 逐层 `read_dir_fresh` 现查物化 → 尺寸闭式精确 + `stat_fresh` 深跳 + hydrate/流式逐字节 → 驱动侧递归清理核空 | **绿**（8.1s） |
+| `live_encrypted_mixed_scheme_self_heals` | 远端预置真 v1(gcm) 容器（`crypto::encrypt` 现造后经驱动直传，不经 Vfs）→ 实例 cfg=aead_v2 + 全新 db 按配置猜错标签 → 首读 admission 回 `Hydrate`（K84.2）→ hydrate 双试自愈回写 `scheme=gcm`、`size=ct−44` → 读通逐字节 | **绿** |
+
+**真机证据（`--ignored --test-threads=1 --nocapture` 尾部实跑）**：
+- 腿 1：`[encl1] remote containers: empty=50 exact=1048626 cross=1060987 (bytes)` → `[encl1] stage 2: materialized from an empty db — empty=0 exact=1048576 cross=1060921` → `[encl1] hydrate: empty + 1MiB byte-exact through real-sftp decrypt` → `[encl1] open_read: full window + two range windows byte-exact (aead_v2 streaming)` → `[SUMMARY] rt5-enc sftp|3 encrypted uploads on real sftp (remote ct 50/1048626 /1060987)|empty db materialized 0/1048576/1060921 byte-exact|hydrate + range stream decrypt byte-exact|workdir recursively removed and verified gone`；
+- 腿 2：`[encl2] dual-try self-heal on real sftp: scheme aead_v2→gcm, size 4994→5000, byte-exact` → `[SUMMARY] rt5-enc-scheme sftp|v1 container seeded remotely (5044B)|empty db guessed aead_v2/4994|admission Hydrate|dual-try healed gcm/5000, byte-exact|workdir removed and verified gone`；
+- 合跑：`test result: ok. 3 passed; 0 failed; 0 ignored`（明文腿 1 + 加密腿 2，`live_readthrough` 套件 3 腿）。
+
+**尺寸闭式对账（远端容器长 ↔ 行反推明文长，互为交叉验证）**：
+
+| 文件 | 远端 v2 容器 | 行 `size`（闭式反推） | 关系 |
+|---|---|---|---|
+| 空件 | 50 B | 0 | `34 + 16`（头 + 单空块 tag） |
+| 恰 1MiB | 1 048 626 B | 1 048 576 | `34 + 1MiB + 16`（头 + 一满块 + tag） |
+| 跨块 | 1 060 987 B | 1 060 921 | `34 + (1MiB+16) + (12345+16)`（头 + 满块 + 短尾块） |
+
+**读通方式**：空件与恰 1MiB 走 **hydrate 全量**（`open_read` 对空件回 `Hydrate`——K47 `size>0` 门；1MiB 在 cache 冷态亦 hydrate）逐字节等于原明文；跨块 1 060 921 B 走 **aead_v2 流式**（真 sftp 申报 `range_read=true`）——整窗 + 头窗 `(0,+64KiB)` + 跨 1MiB 容器块边界窗 `(1MiB−64KiB,+64KiB+12345 止于 EOF)` 三读逐字节，K35 `total_size` = 闭式反推明文长。**两种方式都断言了**（任务给的「或至少 hydrate」为下限，本条双覆盖）。
+
+**混合方案腿取舍**：**未降级**——实现成本低（`cloudkit_core::crypto::encrypt` 现造 5 044 B v1 容器 + `driver.writer` 直传，两处调用照 EB4 腿 2），故按完整形态落地并真机反证（离线 `encrypted_read` 已有 5 测试钉机制，本条额外覆盖真 sftp 的 hydrate 腿与远端 v1 容器）。
+
+**执行期揭出并修复的测试侧问题（非产品缺陷）**：
+1. `Vfs::create_dir` 只写本地行、不建远端，且要求父行已在——真机工作目录全新，直建嵌套 `docs/sub` 行报 `ParentMissing`。修法 = 远端目录树先经**驱动 `mkdir`** 落盘，再用**逐层 `read_dir_fresh`** 物化本地行（比手写父链更贴近真实使用，顺带覆盖空索引实例下新目录的可见性）。
+2. **失败路径清理的 Drop guard 形态修正（实测钉住）**：初版在 `Drop` 里用 `Handle::try_current()` 判据 + 新 runtime `block_on`——`#[tokio::test]` 的 panic unwind 就发生在 **runtime 线程**上，`try_current()` 恒有值且嵌套 `block_on` 会 panic，guard 实测**完全没生效**（注入 panic 探针后远端残留 3 项）。改为**独立 OS 线程**（`std::thread::spawn`）内建一次性 runtime 跑 `remove_tree`，主线程 `join` 等收尾——注入探针复验：残留从 3 项降到 1 项（仅剩两腿共享的 `sf4rt` 前缀容器目录，与明文腿同形态），**guard 生效**。正常路径显式 cleanup 先行 + `disarm()` → Drop 变 no-op，零额外成本。
+
+**真机揭出的产品缺陷**：**无**——加密 read-through 全链（容器上传/空件 50B 真落远端/空索引物化闭式尺寸/首读容器校验/流式解密/混合方案双试自愈）在 sftp 上首跑即全绿，与 local/pan123 行为一致。这同时**真机复核了 K85.6 的加密空件例外**（`empty=50` 断言直接钉「0 明文字节的 50B v2 容器真在远端」，Contract-6 跳过对加密卷不成立）。
+
+**门禁（本批终跑）**：`cargo test -p ck-sftp` **68 passed / 0 failed**（`live_readthrough` 3 ignored）；`cargo test --workspace --no-fail-fast -j 4` → **passed=1662, failed=0, ignored=62, suites=187**（基线 1660/0/60 + 新 2 `#[ignore]`），exit 0；clippy 全目标零告警；FMT_OK；check_layers OK（16 manifests）；scan_secrets OK（零命中）。
+
+**远端清理核对**：两腿各自显式 `remove_tree` + `stat` 核空（`NotFound` 断言）；跑完 `/srv/cydrive-rt-enc` 仅余两腿共享的 `sf4rt` 前缀容器目录（明文腿同形态，`rmdir` 后 **0 项**——`[find] REMOTE_EMPTY` 实测）。
+
+**风险与未覆盖（本批增量）**：
+- 断线重连/跨会话 resume 的加密形态未在本腿覆盖（sftp 驱动无 resume 能力位，会话自愈由 live_matrix 腿⑩与 write_path 桩测试覆盖；加密只是多一层本地容器变换，不改变连接语义）。
+- 真机为局域网环回（~ms RTT），**公网高延迟下的 hydrate 300s 预算**未实测（本腿 hydrate_timeout 放宽到 300s；环回使该值宽松，公网需按 E-5 预算另行核）。
+- 测试根 `CYDRIVE_SFTP_TEST_ROOT` 必填（K79.6）；本腿未设 `CYDRIVE_SFTP_TEST_PASSWORD`（走 `KEY_PATH` 私钥形态——D1 两形态之一，密码形态由既有 live_matrix 覆盖）。
+
+**提交**：`test(sftp): 加密 read-through 两阶段真机腿（Phase 8-B 验收延伸）`。
