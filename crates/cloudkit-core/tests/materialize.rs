@@ -15,7 +15,8 @@
 use cloudkit_core::config::{SCHEME_AEAD_V2, SCHEME_GCM};
 use cloudkit_core::database::{FileUpsert, MetaDatabase};
 use cloudkit_core::materialize::{
-    list_all_pages, materialize_entry, plaintext_len_from_container, CipherCtx, MaterializedRow,
+    list_all_pages, materialize_entry, plaintext_len_from_container, plaintext_len_with_chunk,
+    CipherCtx, MaterializedRow,
 };
 use cloudkit_storage::{
     BackendHandle, ByteStream, Capabilities, Entry, EntryId, EntryKind, Listing, Page, PageCursor,
@@ -323,6 +324,118 @@ fn relisting_never_downgrades_a_corrected_encrypted_row() {
     assert_eq!(again.encryption_scheme, SCHEME_GCM, "第二拍 scheme 仍 gcm");
     assert_eq!(again.size, 9, "第二拍 size 仍真值");
     assert!(again.is_encrypted, "第二拍仍标加密");
+}
+
+// T5（Phase 8-B 审查批 / 钉测补齐）：`upsert_materialized` 的 ON CONFLICT
+// CASE 保留集**直接**钉在 SQL 面上——不经 `materialize_entry` 的 Rust 侧
+// 读-改写（那层会先把既有真相读出来再喂对值，把 SQL 兜底掩盖掉）。
+// 变异杀手段：把 CASE 删掉改回 `excluded` 直写（对齐 `upsert_file` 的
+// 无条件覆盖）本测试必红——并发写窗内（Rust 读-改写之外）SQL 侧是
+// 「列举永不降级 cipher 真相」的唯一防线。
+#[test]
+fn upsert_materialized_conflict_preserves_the_cipher_truth_columns() {
+    let (_dir, db) = db();
+    // 播种：首读修正后的 legacy 加密行（is_encrypted=1、scheme=gcm、
+    // size=9）。
+    db.upsert_file_scheme(
+        &FileUpsert {
+            rel_path: "/case.bin".to_string(),
+            name: "case.bin".to_string(),
+            parent_dir: "/".to_string(),
+            size: 9,
+            mtime: 1_700_000_000.0,
+            sha256: None,
+            is_dir: false,
+            telegram_msg_id: Some(3),
+            is_uploaded: true,
+            is_cached: false,
+            is_encrypted: true,
+            chunk_count: 1,
+            mime_type: None,
+        },
+        SCHEME_GCM,
+    )
+    .expect("seed legacy encrypted row");
+
+    // 冲突臂直写：绕过 materialize_entry 的 Rust 面，**故意**送一个
+    // 明文形状 + 另一方案的载荷（模拟并发窗内的最坏写者——若 SQL 不
+    // 兜底，这发写入就会把 cipher 真相冲掉）。
+    let id = db
+        .upsert_materialized(
+            &FileUpsert {
+                rel_path: "/case.bin".to_string(),
+                name: "case.bin".to_string(),
+                parent_dir: "/".to_string(),
+                size: 500,
+                mtime: 1_700_000_000.0,
+                sha256: None,
+                is_dir: false,
+                telegram_msg_id: Some(4),
+                is_uploaded: true,
+                is_cached: false,
+                is_encrypted: false,
+                chunk_count: 1,
+                mime_type: None,
+            },
+            SCHEME_AEAD_V2,
+        )
+        .expect("conflicting materialized upsert");
+
+    let row = db
+        .get_file("/case.bin")
+        .expect("db read")
+        .expect("row exists");
+    assert_eq!(row.id, id, "冲突键归同一条行");
+    assert!(
+        row.is_encrypted,
+        "is_encrypted=1 经 CASE 保留——excluded 的 false 不得落地"
+    );
+    assert_eq!(
+        row.encryption_scheme, SCHEME_GCM,
+        "scheme 经 CASE 保留——excluded 的 aead_v2 不得落地"
+    );
+    assert_eq!(
+        row.size, 500,
+        "size = excluded（调用方派生值，按设计可写——B1 的 ?derived 语义）"
+    );
+}
+
+// T6（Phase 8-B 审查批 / 钉测补齐）：非默认分块的「头权威」差分——
+// `AeadV2::with_chunk_size(64*1024)` 造出的真容器，其密文长只有代入
+// **头内真值分块**的 `plaintext_len_with_chunk` 才反推得回明文长；
+// 恒按默认 1MiB 分块反推的 `plaintext_len_from_container` 对非默认分
+// 块必然算错。这是 `first_read_admit` 头权威分支（头参数 > 应用默认）
+// 的存在意义：没有它，非默认分块容器在列举/首读修正里永远拿错尺寸。
+#[test]
+fn header_chunk_size_wins_over_the_default_backsolve_for_non_default_containers() {
+    const CHUNK: usize = 64 * 1024; // = MIN_CHUNK_SIZE，合法非默认分块
+    let scheme = cloudkit_crypto::AeadV2::with_chunk_size(CHUNK)
+        .expect("64 KiB is the minimum legal chunk size");
+    // 100_000 = 65536 + 34464：恰跨两块（非默认分块的多块形态）。
+    let plain: Vec<u8> = (0..100_000usize).map(|i| (i % 251) as u8).collect();
+    let ct = scheme.encrypt("pw", &plain);
+    let ct_len = ct.len() as i64;
+
+    // 头参数代入：34 + (65536+16) + (34464+16) → 恰回明文长。
+    assert_eq!(
+        plaintext_len_with_chunk(ct_len, CHUNK as i64),
+        Some(plain.len() as i64),
+        "头内真值分块代入闭式 → 精确明文长"
+    );
+    // 默认 1MiB 分块反推：同一 ct 按单块尾算 → 必然 ≠ 明文长
+    //（100_000 明文 + 32B 尾块 tag 混进「尾块明文」——默认闭式无法
+    // 区分，把 tag 计成明文）。差分成立 = 头权威分支不可删。
+    let default_backsolve = plaintext_len_from_container(ct_len, SCHEME_AEAD_V2);
+    assert_ne!(
+        default_backsolve,
+        plain.len() as i64,
+        "默认 1MiB 反推对非默认分块必然算错（头权威分支的存在意义）"
+    );
+    assert_eq!(
+        default_backsolve,
+        ct_len - 34 - 16,
+        "seed sanity: 默认闭式把两块当一块单尾（尾块长含 32B tag 误差）"
+    );
 }
 
 // ============================== M2（Phase 8 审查批）：分页归集双上限 ===

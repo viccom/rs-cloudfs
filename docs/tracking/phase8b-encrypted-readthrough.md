@@ -58,6 +58,12 @@
 - `cargo fmt --all && cargo fmt --all -- --check` → FMT_OK（3 文件格式化后复跑三定向套件 9/21/11 仍绿）；
 - `scripts/check_layers` → OK（16 manifests，零 R1 违例）；`scripts/scan_secrets` → OK（零命中）。
 
+## 合入前深度审查批（K78 形态，2026-09-23，K86）
+
+- 三路：主会话精读核心正确性链（materialize/database/vfs/enc_stream/readthrough/rebuild/upload_queue/baidu 生产 diff 逐行）+ A 测试面子代理 + B 集成装配驱动面子代理（均只读 + 现场实跑）。总判 **0 High / 4 Medium / 6 Low / 3 Info**——逐条销账表 = `phase8b-review-findings.md`；decisions K86。
+- **修复批（TDD，三子代理并行，文件面不重叠）**：M1 SQL CASE 直接钉测（变异杀实证）/ M2 非默认分块头权威差分 + 流式自愈腿 / M4 webdav 0 字节全链 stub 腿 / L1 baidu `finalize_tail` 补 `drained == 0` 守卫（K85.7 隐性回归，white-box 红→绿 + wire 契约钉）/ L2+L3 超短与结构违例边界钉测 / L4 桩常量解耦（独立字面量 `EMPTY_STRING_MD5`）。
+- **挂账（并入下方总表）**：M3 pan115 0 字节真机探针 / L5 并发双首读 / L6 web 文本 pin 残余 / I1 pan123 0 字节真机 / **L7 webdav write_path 两条既有 flake（非本批引入，stash 基线复现）**。
+
 ## 风险与未覆盖 —— 终态挂账总表（EB4 收口，随批更新到此为止）
 
 | # | 挂账 | 状态/出路 |
@@ -69,6 +75,9 @@
 | 5 | **web_e2e 15d 与 gcm 分流裁决指针** | EB2 裁决①（gcm 行账目自洽性分流——不自洽才付 34B 头读）**维持现状**，主会话已批；详见 EB2 批次日志裁决① |
 | 6 | ~~**Contract-6 明文空件同款观察（EB4 新发现，未修待裁决）**~~ **已修（K85.6，2026-09-23，负责人裁决「事2 修」）** | 明文 0 字节行在 authoritative 后端同样不落远端、索引丢失后文件名消失——原为 EB4 挂账；**负责人 2026-09-23 裁决为修**（EB4 遗留观察处置），与加密侧同批收口：0 字节闸收窄为「**影子索引后端才跳过**」，权威后端明文/加密都落真实对象（明文 = 真 0 字节对象 + `zero_byte_plain_job` 单片计划；telegram parity 与 MiniRedir stale 守卫一字不动）。三红→绿：单测正臂（`calls.len() left:0 right:1`）+ 影子臂回归哨 + e2e 可见性腿（远端 0 字节对象 + wipe db 后 `read_dir_fresh` 可见）；契约同步 = 原 `zero_byte_job_skips_transport` 拆正/影子两臂、EB4 加密正反臂注释标注新闸形态。裁决全文见 decisions **K85.6**；批次日志见下「K85.6 修复批」 |
 | 7 | Phase 8 主链（RT0–RT5+审查批）与 Phase 8-B（EB1–EB4）同分支叠加，均**待合入** | 合入指令到时一并处理；worktree `feat/readthrough-index` 独立 target |
+| 8 | **K86 审查批挂账**：pan115 `upload_init(file_size=0)` 服务端接受度**真机探针**（K85.6 后权威后端 0 字节真实起链；百度 errno=2 已证此类特形真实可能）+ pan123 0 字节真机同批 | 挂负责人真机窗口（与上表 #4 pan115 token 重授权同窗口）；离线面：六宽面 0 字节路径逐一追踪无一产生破损会话，local/sftp/baidu(+K85.7)/webdav(γ 腿) 已有钉测 |
+| 9 | **K86 审查批挂账（小）**：同文件并发双首读幂等无测试（L5）/ web 门控钉测为源码文本 pin（L6，无 JS harness 前提下最强钉法） | 均低风险知情残余；JS harness 建立后 L6 升级为行为 pin |
+| 10 | **K86 审查批新发现：ck-webdav `write_path` 两条既有 flake（非本批引入——γ 批 stash 基线复现）**：`put_insufficient_storage_maps_to_io_with_the_code`（507 重传腿 size 复核时序敏感，2/38 轮）/ `stager_lost_ack_on_move_resumes_as_committed`（lost-ACK 恢复腿偶发传输错误，1/20 轮） | 挂专门批查根因（或与并行构建负载相关）；新 0 字节钉测在全部约 38 轮含失败轮 100% 通过 |
 
 ### EB2（2026-09-23，实现子代理，worktree feat/readthrough-index）
 

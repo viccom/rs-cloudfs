@@ -555,6 +555,241 @@ async fn v2_labelled_v1_container_dual_trial_self_heals() {
     );
 }
 
+/// 7.（Phase 8-B 审查批 / 钉测补齐·头权威自愈）远端是**非默认分块**
+///    （64KiB，`AeadV2::with_chunk_size` 造的真容器）+ 行标 aead_v2 但
+///    size 是**默认 1MiB 闭式**算出的错值 → admission 头读拿到头内真值
+///    分块，`plaintext_len_with_chunk` 反推回真明文长（默认闭式必然算
+///    错——T6 的差分在此通路上兑现）→ `total_size == 真实明文长` +
+///    `fix_cipher_columns` 回写真值（scheme 仍 aead_v2）+ 流式窗口逐字
+///    节 = 明文（DecryptingTransport 按头分块走多块布局）。
+#[tokio::test]
+async fn non_default_chunk_container_self_heals_through_the_stream_arm() {
+    let (_dir, db, cache, _cache_root, mock) = test_env().await;
+
+    // 100_000 = 65536 + 34464：跨两块的非默认分块容器。
+    let plain = pattern(100_000);
+    let scheme = cloudkit_crypto::AeadV2::with_chunk_size(64 * 1024)
+        .expect("64 KiB is the minimum legal chunk size");
+    let ct = scheme.encrypt("pw", &plain);
+    let receipt = seed_remote(&mock, "/wide.bin", &ct, 1, ct.len() as u64).await;
+
+    // 行 size = 默认 1MiB 闭式的错值（列举期只能按默认分块反推——正是
+    // 头权威分支要修的账目错）。
+    let wrong_size =
+        cloudkit_core::materialize::plaintext_len_from_container(ct.len() as i64, SCHEME_AEAD_V2);
+    assert_ne!(
+        wrong_size,
+        plain.len() as i64,
+        "seed sanity: 默认闭式对非默认分块必然算错"
+    );
+    let file_id = seed_encrypted_row(
+        &db,
+        "/wide.bin",
+        wrong_size,
+        receipt.first_msg_id,
+        SCHEME_AEAD_V2,
+    );
+    seed_container_chunk(&db, file_id, receipt.first_msg_id, ct.len() as i64);
+
+    let vfs = build_vfs(&db, cache, &mock, test_cfg(Some("pw")));
+    let rel = RelPath::new("/wide.bin").expect("valid rel path");
+
+    let StreamSource::Stream {
+        handle,
+        total_size,
+        transport,
+    } = vfs
+        .open_read(&rel)
+        .await
+        .expect("非默认分块容器按头权威修正后必须进流式臂")
+    else {
+        panic!("a range-capable aead_v2 row over a real container must stream");
+    };
+
+    // 头权威：total_size = 头分块闭式的真明文长，不是行里的默认闭式错值。
+    assert_eq!(
+        total_size,
+        plain.len() as u64,
+        "头内 64KiB 分块代入闭式 → 真值明文长（头权威，非行错值 {wrong_size}）"
+    );
+    // admission 的有界头读在场（后续为流式窗口的密文 span 读）。
+    assert_eq!(
+        mock.open_range_calls().first(),
+        Some(&(0, 34)),
+        "admission 恰先付一次 34B 头读（头参数由此而来）"
+    );
+
+    // 流式窗口逐字节 = 明文（窗口按头分块多块布局走）。
+    let window = drain(
+        transport
+            .open_range(&handle, 0, total_size)
+            .await
+            .expect("open encrypted window"),
+    )
+    .await
+    .expect("window bytes");
+    assert_eq!(window, plain, "流式窗口逐字节 = 明文");
+
+    // 行已回写真值；scheme 本就正确不动（仍 aead_v2）。
+    let row = db
+        .get_file("/wide.bin")
+        .expect("db read")
+        .expect("row exists");
+    assert_eq!(
+        row.encryption_scheme, SCHEME_AEAD_V2,
+        "scheme 标签正确——回写不动（仍 aead_v2）"
+    );
+    assert_eq!(
+        row.size,
+        plain.len() as i64,
+        "回写 size = 头分块闭式真值（默认闭式错值被修）"
+    );
+    assert_eq!(
+        row.sha256.as_deref(),
+        Some(SHA_SENTINEL),
+        "定向 UPDATE 不碰 coalesce 列"
+    );
+}
+
+/// 8a.（Phase 8-B 审查批 / 钉测补齐·超短边界）远端仅 10B 任意内容 +
+///    行标 aead_v2（size 10）+ chunks 行：admission 的 34B 头读**读短**
+///    （10 < 34）但足以判 8B magic——无 magic → `Ok(Hydrate)`（K84.2，
+///    admission 不做内容级判决）；随后 hydrate 双试（无 magic → 试 v1）
+///    因 10B 连 v1 的 44B 开销闸都过不了而失败 → B6 双假说文案含
+///    `cydrive sync`（绝不吐原文密文字节）。
+#[tokio::test]
+async fn ultra_short_content_routes_to_hydrate_then_fails_actionably() {
+    let (_dir, db, cache, _cache_root, mock) = test_env().await;
+
+    let tiny = pattern(10);
+    assert_ne!(
+        &tiny[..8],
+        cloudkit_crypto::v2::MAGIC.as_slice(),
+        "seed sanity: 内容无 CKCRYPT2 magic"
+    );
+    let receipt = seed_remote(&mock, "/tiny.bin", &tiny, 1, tiny.len() as u64).await;
+
+    let file_id = seed_encrypted_row(
+        &db,
+        "/tiny.bin",
+        tiny.len() as i64,
+        receipt.first_msg_id,
+        SCHEME_AEAD_V2,
+    );
+    seed_container_chunk(&db, file_id, receipt.first_msg_id, tiny.len() as i64);
+
+    let vfs = build_vfs(&db, cache, &mock, test_cfg(Some("pw")));
+    let rel = RelPath::new("/tiny.bin").expect("valid rel path");
+
+    // admission：34B 头读短（10B 到手）→ 仍够判 magic → Hydrate。
+    let StreamSource::Hydrate = vfs
+        .open_read(&rel)
+        .await
+        .expect("超短非容器内容的 admission 不做内容级判决（读短不是错误）")
+    else {
+        panic!("10B 无 magic 内容必须转 Hydrate，绝不流式/卡 Err");
+    };
+    assert_eq!(
+        mock.open_range_calls(),
+        vec![(0, 34)],
+        "admission 只付一次有界 34B 头读（读短不加读）"
+    );
+
+    // hydrate 双试失败：10B 过不了 v1 的 44B 开销闸 → B6 双假说文案。
+    let err = match vfs.hydrate(&rel).await {
+        Err(error) => error,
+        Ok(_) => panic!("10B 超短内容必须响亮失败，绝不吐字节"),
+    };
+    let message = err.to_string();
+    assert!(
+        message.contains("cydrive sync"),
+        "B6 文案必须指路 cydrive sync，got: {message}"
+    );
+}
+
+/// 8b.（Phase 8-B 审查批 / 钉测补齐·结构违例臂）「有 CKCRYPT2 magic
+///    但 ct 与头分块参数矛盾」的形态：真容器头 + 截断 body（远端只剩
+///    34B 头，chunks 之和 34 < 头声称的最小结构 34+16）+ 错标签 gcm
+///    行 → admission 头解析成功、`plaintext_len_with_chunk` 返回 None
+///    （derived=None 分支）→ **回写 scheme=aead_v2 但保留 row.size**
+///    （`true_size = derived.unwrap_or(row.size)`）→ 返回流式；窗口数
+///    学随后**响亮报错**（span 读短——"encrypted span short"），绝不
+///    静默返回明文字节。
+#[tokio::test]
+async fn header_contradicting_container_keeps_row_size_and_fails_loudly() {
+    let (_dir, db, cache, _cache_root, mock) = test_env().await;
+
+    // 真容器只留 34B 头（body 全截）——头可解析、body 结构与头矛盾。
+    let scheme = cloudkit_crypto::AeadV2::with_chunk_size(64 * 1024)
+        .expect("64 KiB is the minimum legal chunk size");
+    let full = scheme.encrypt("pw", &pattern(2_000));
+    let truncated = &full[..cloudkit_crypto::v2::HEADER_SIZE];
+    assert_eq!(truncated.len(), 34, "seed sanity: 只剩 34B 头");
+    let receipt = seed_remote(&mock, "/stub.bin", truncated, 1, truncated.len() as u64).await;
+
+    // 错标签 gcm + 错 size 500（ct=34 按 gcm 闭式反推 34 ≠ 500 → 账目
+    // 矛盾进校验；gcm ≠ aead_v2 也保证 fix_cipher_columns 的回写臂触发）。
+    let wrong_size = 500;
+    let file_id = seed_encrypted_row(
+        &db,
+        "/stub.bin",
+        wrong_size,
+        receipt.first_msg_id,
+        SCHEME_GCM,
+    );
+    seed_container_chunk(&db, file_id, receipt.first_msg_id, truncated.len() as i64);
+
+    let vfs = build_vfs(&db, cache, &mock, test_cfg(Some("pw")));
+    let rel = RelPath::new("/stub.bin").expect("valid rel path");
+
+    let StreamSource::Stream {
+        handle,
+        total_size,
+        transport,
+    } = vfs
+        .open_read(&rel)
+        .await
+        .expect("头可解析的结构违例：admission 修正标签后继续流式（错账在窗口数学处响亮报错）")
+    else {
+        panic!("a parseable-header structure violation must stay in the stream arm");
+    };
+
+    // derived=None → true_size = row.size（保留，不猜）。
+    assert_eq!(
+        total_size, wrong_size as u64,
+        "结构违例真值不可推——total_size 沿保留的 row.size"
+    );
+
+    // 行回写：scheme → aead_v2（头 magic 是权威），size 保留原值。
+    let row = db
+        .get_file("/stub.bin")
+        .expect("db read")
+        .expect("row exists");
+    assert_eq!(
+        row.encryption_scheme, SCHEME_AEAD_V2,
+        "回写 scheme = aead_v2（magic 权威）"
+    );
+    assert_eq!(
+        row.size, wrong_size,
+        "derived=None 分支保留 row.size（真值不可推不猜）"
+    );
+
+    // 窗口读：span [34, 34+516) 对 34B 对象读短 → 响亮 Err（非静默字节）。
+    let err = drain(
+        transport
+            .open_range(&handle, 0, total_size)
+            .await
+            .expect("open_range itself stays Ok（错误在帧上）"),
+    )
+    .await
+    .expect_err("截断容器必须响亮报错，绝不静默返回明文字节");
+    let message = err.to_string();
+    assert!(
+        message.contains("encrypted span short"),
+        "错误必须点名容器读短（截断），got: {message}"
+    );
+}
+
 /// Recursively collects files under `root`（缓存残留断言用）。
 fn collect_files(dir: &Path, out: &mut Vec<PathBuf>) {
     let Ok(entries) = fs::read_dir(dir) else {

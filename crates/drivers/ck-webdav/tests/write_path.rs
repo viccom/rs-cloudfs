@@ -14,6 +14,7 @@
 //! | rename 5xx 且父在 → 不映射 Exists（源原位） | K75-1 |
 //! | rename 缺父 → 隐式建父重试 | 矩阵⑤ |
 //! | stager 提交链（PUT .part → MOVE T → size 复核） | §4.6 |
+//! | stager 0 字节上传全链（空体 PUT + MOVE 固化 + 回读空） | §4.6 / K85.6 |
 //! | 覆盖写 stash（staging 窗口旧对象不可见/abort 恢复） | §4.6 / 断言① |
 //! | 超承诺 write → Invalid | sftp hint 契约 |
 //! | size 复核不符 → Unavailable 不静默 | §4.6 / stat_size_delta |
@@ -26,8 +27,9 @@ mod stub;
 use std::collections::HashMap;
 
 use cloudkit_storage::{
-    EntryKind, Page, PageCursor, RelPath, StorageDriver, StorageError, WriteHint,
+    ByteStream, EntryKind, Page, PageCursor, RelPath, StorageDriver, StorageError, WriteHint,
 };
+use futures_util::StreamExt;
 use stub::{spawn_stub, Knobs, RecordedRequest, StubHandle, StubStyle, Vfs, MTIME_SEED};
 
 use ck_webdav::{parse_from_map, WebdavDriver, WebdavParams};
@@ -86,6 +88,16 @@ async fn upload_bytes(
     let mut stager = driver.writer(path, &hint).await?;
     stager.write(data).await?;
     stager.close().await
+}
+
+/// 逐字节收集一条 ByteStream（回读面断言用——read_path 同款消费面）。
+async fn collect(stream: ByteStream) -> Result<Vec<u8>, StorageError> {
+    let mut stream = stream;
+    let mut out = Vec::new();
+    while let Some(frame) = stream.next().await {
+        out.extend_from_slice(&frame?);
+    }
+    Ok(out)
 }
 
 // ------------------------------------------------------------- mkdir ---
@@ -570,6 +582,66 @@ async fn stager_commits_via_part_then_move() {
     assert!(
         requests_of(&handle, "PROPPATCH").is_empty(),
         "generic vendor never issues PROPPATCH (D2)"
+    );
+}
+
+/// K85.6（Phase 8-B）characterization：0 字节上传走完整提交链——hint
+/// size=0 → write 空 → close：PUT `.part` 携**空体**（body_len=0）→
+/// MOVE 固化恰一次 → size 复核 0==0 吻合（`content_length.unwrap_or(0)`
+/// 面）→ Entry size=0；回读空流；不留 staging 残留。sftp 的
+/// `writer_empty_upload_roundtrip` 同构腿（各 crate 独立同名）。
+#[tokio::test]
+async fn writer_empty_upload_roundtrip() {
+    let handle = plain(Vfs::new()).await;
+    let driver = driver(&handle);
+
+    let hint = WriteHint {
+        size: Some(0),
+        ..Default::default()
+    };
+    let mut stager = driver
+        .writer(&rel("empty.bin"), &hint)
+        .await
+        .expect("writer");
+    stager.write(b"").await.expect("empty write");
+    let entry = stager.close().await.expect("close");
+    assert_eq!(entry.kind, EntryKind::File);
+    assert_eq!(entry.size, 0);
+    assert_eq!(entry.path, rel("empty.bin"));
+
+    // 提交链形态与既有腿一致：恰一次空体 PUT 落 `.part` + 恰一次 MOVE
+    // 固化（Overwrite:T → final）。
+    let puts = requests_of(&handle, "PUT");
+    assert_eq!(puts.len(), 1, "exactly one PUT");
+    assert_eq!(puts[0].body_len, 0, "the 0-byte upload PUTs an empty body");
+    assert!(
+        puts[0].path.contains(".ckwd-") && puts[0].path.ends_with(".part"),
+        "PUT must target the staging part file: {}",
+        puts[0].path
+    );
+    let moves = requests_of(&handle, "MOVE");
+    assert_eq!(moves.len(), 1, "exactly one MOVE");
+    assert_eq!(moves[0].overwrite.as_deref(), Some("T"));
+    assert!(
+        moves[0]
+            .destination
+            .as_deref()
+            .is_some_and(|destination| destination.ends_with("/empty.bin")),
+        "lands on final: {:?}",
+        moves[0].destination
+    );
+
+    // 回读面：reader 读回空（stat-first 见 0 长度 → 空流）。
+    let bytes = collect(driver.reader(&entry.id, None).await.expect("reader"))
+        .await
+        .expect("empty read-back");
+    assert!(bytes.is_empty());
+
+    // VFS 终态：final 是真实 0 字节对象，`.ckwd-` 暂存件零残留。
+    assert_eq!(handle.take("/empty.bin"), Some(Vec::new()));
+    assert!(
+        !handle.snapshot().keys().any(|path| path.contains(".ckwd-")),
+        "no part/old residue after close"
     );
 }
 
