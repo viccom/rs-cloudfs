@@ -765,17 +765,22 @@ impl CloudFs {
             .clone()
     }
 
-    /// Lists one directory off the rows (dirs first, then name-ascending
-    /// — the db's Python-parity order).
+    /// Lists one directory off the read-through seam (Phase 8 / RT3).
+    ///
+    /// Reached only from [`Self::prepare_enumeration`]'s `marker = None`
+    /// arm — the one forced refresh per enumeration (D5); the marker
+    /// continuation answers from the DirBuffer snapshot (K44: zero
+    /// further lists inside an enumeration). Narrow faces degrade
+    /// verbatim to the db listing; an authoritative wide face revalidates
+    /// against the backend exactly once here.
     ///
     /// K44: the whole listing carries its stat data; the FSD never has to
     /// ask again per entry.
     pub fn dir_entries(&self, rel: &RelPath) -> std::result::Result<Vec<DirEntry>, FspError> {
         let rows = self
-            .vfs
-            .db()
-            .list_dir(rel.as_str())
-            .map_err(|error| fsp_error(&VfsError::Db(error)))?;
+            .bridge
+            .block_on(self.vfs.read_dir_fresh(rel))
+            .map_err(|error| fsp_error(&error))?;
         Ok(rows.iter().map(DirEntry::from_record).collect())
     }
 
@@ -803,11 +808,16 @@ impl CloudFs {
 
     /// Resolves the stat block for one path (the root is implicit — no
     /// `files` row exists for `/`).
+    ///
+    /// The row lookup rides the read-through seam (Phase 8 / RT3,
+    /// [`Self::resolve_row_fresh`]): a never-indexed path resolves via
+    /// one parent re-list on an authoritative wide face; every guard and
+    /// miss-verdict path stays pure db.
     fn meta_for(&self, rel: &RelPath) -> std::result::Result<Meta, FspError> {
         if rel.is_root() {
             return Ok(Meta::root());
         }
-        self.resolve_row(rel)?
+        self.resolve_row_fresh(rel)?
             .as_ref()
             .map(Meta::from_record)
             .ok_or_else(|| self.lookup_miss(rel))
@@ -821,6 +831,11 @@ impl CloudFs {
     /// lookup goes through here. An ambiguous parent (two rows
     /// differing only by case) keeps the exact-miss result rather than
     /// guessing.
+    ///
+    /// Pure db reads — the guard and miss-verdict paths (`row`,
+    /// `require_dir_parent`, `lookup_miss`, delete/rename resolution)
+    /// never pay a read-through. The open faces use
+    /// [`Self::resolve_row_fresh`].
     fn resolve_row(&self, rel: &RelPath) -> std::result::Result<Option<FileRecord>, FspError> {
         let db = self.vfs.db();
         if let Some(record) = db
@@ -832,6 +847,49 @@ impl CloudFs {
         if rel.is_root() {
             return Ok(None);
         }
+        self.scan_parent_insensitive(rel)
+    }
+
+    /// The open faces' row lookup (`meta_for` → open/get_security_by_name,
+    /// and `open_with_read`): the exact db row first (zero network, the
+    /// K44 fast path), then the read-through seam ([`Vfs::stat_fresh`] —
+    /// a miss re-lists the parent once, D6, so a never-indexed path
+    /// resolves without a rebuild), then the K45 case-insensitive scan
+    /// over the freshly materialized parent rows. Narrow faces degrade
+    /// verbatim to the db reads.
+    fn resolve_row_fresh(
+        &self,
+        rel: &RelPath,
+    ) -> std::result::Result<Option<FileRecord>, FspError> {
+        let db = self.vfs.db();
+        if let Some(record) = db
+            .get_file(rel.as_str())
+            .map_err(|error| fsp_error(&VfsError::Db(error)))?
+        {
+            return Ok(Some(record));
+        }
+        if rel.is_root() {
+            return Ok(None);
+        }
+        match self.bridge.block_on(self.vfs.stat_fresh(rel)) {
+            Ok(record) => return Ok(Some(record)),
+            // An exact NotFound is not final under Windows case
+            // semantics — the FSD may have handed us an upcased spelling
+            // (K45); the scan below still gets its chance, now over the
+            // freshly re-listed parent rows.
+            Err(VfsError::NotFound(_)) => {}
+            Err(error) => return Err(fsp_error(&error)),
+        }
+        self.scan_parent_insensitive(rel)
+    }
+
+    /// The case-insensitive parent scan (the K45 fallback half of
+    /// [`Self::resolve_row`] / [`Self::resolve_row_fresh`]).
+    fn scan_parent_insensitive(
+        &self,
+        rel: &RelPath,
+    ) -> std::result::Result<Option<FileRecord>, FspError> {
+        let db = self.vfs.db();
         let parent_dir = rel
             .parent()
             .map(|parent| parent.as_str().to_string())
@@ -853,8 +911,12 @@ impl CloudFs {
     }
 
     /// Opens one path's metadata: `get_file_info` and `read_directory`
-    /// then work off the returned handle alone. No read state and no
-    /// remote work (WF1's DLL-free seam, still used by enumerations).
+    /// then work off the returned handle alone. No read state is created
+    /// (WF1's DLL-free seam, still used by enumerations); the row lookup
+    /// rides the read-through seam (`meta_for` → `resolve_row_fresh`),
+    /// so a db miss may pay one parent re-list (D6) — remote work only
+    /// on a miss, never per call (review L3: the pre-read-through "no
+    /// remote work" claim no longer holds).
     pub fn open_handle(&self, rel: &RelPath) -> std::result::Result<Handle, FspError> {
         let meta = self.meta_for(rel)?;
         Ok(Handle::new(rel.clone(), meta, None))
@@ -884,9 +946,12 @@ impl CloudFs {
         // Resolve to the canonical spelling up front (case-insensitive
         // Windows semantics): the read state, grace key and cleanup
         // commit all key off the handle's rel, so they must never carry
-        // a caller's case variant.
+        // a caller's case variant. The lookup rides the read-through
+        // seam (Phase 8 / RT3): a db miss re-lists the parent once (D6)
+        // before the K45 scan, so a never-indexed file opens without a
+        // rebuild.
         let record = self
-            .resolve_row(rel)?
+            .resolve_row_fresh(rel)?
             .ok_or_else(|| self.lookup_miss(rel))?;
         // Review H2: a db row's rel_path is only ever canonical when it
         // came from an in-tree writer; external/legacy writers (the
@@ -1434,7 +1499,9 @@ impl CloudFs {
         // local rename flip the cache copy's spelling, and invalidate the
         // grace table (review H1).
         if from.as_str().to_lowercase() == to.as_str().to_lowercase() {
-            if !row.is_uploaded && self.vfs.local_copy_exists(&from) {
+            // The pending-upload guard rides the single-source helper
+            // (review L4 — same criterion as core `Vfs::remove_file`).
+            if self.vfs.is_in_flight_row(&row, &from) {
                 return Err(fsp_error(&VfsError::UploadPending(
                     from.as_str().to_string(),
                 )));
@@ -1455,7 +1522,8 @@ impl CloudFs {
             return Ok(());
         }
         self.require_dir_parent(to)?;
-        if !row.is_uploaded && self.vfs.local_copy_exists(&from) {
+        // Same single-source in-flight guard (review L4).
+        if self.vfs.is_in_flight_row(&row, &from) {
             return Err(fsp_error(&VfsError::UploadPending(
                 from.as_str().to_string(),
             )));

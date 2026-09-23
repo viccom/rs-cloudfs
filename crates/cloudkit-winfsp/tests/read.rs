@@ -38,7 +38,7 @@ use cloudkit_core::database::{FileUpsert, MetaDatabase};
 use cloudkit_core::rel_path::RelPath;
 use cloudkit_core::transport::mock::{MockTransport, OpenRangeAction};
 use cloudkit_core::transport::{
-    Capabilities, CloudTransport, StorageError, UploadJob, UploadReceipt,
+    ByteStream, Capabilities, CloudTransport, RemoteHandle, StorageError, UploadJob, UploadReceipt,
 };
 use cloudkit_core::upload_queue::RetryPolicy;
 use cloudkit_core::vfs::{Vfs, VfsConfig};
@@ -876,3 +876,280 @@ const _: () = assert!(
     cloudkit_winfsp::fs::MAX_STREAM_WINDOW > cloudkit_winfsp::reader::DEFAULT_READ_WINDOW,
     "the ceiling must not constrain the production default"
 );
+
+// ------------------------------------- Phase 8 / RT3: read-through faces ---
+//
+// The A1 face-level scenario on the FSD face: an EMPTY local index over a
+// STOCKED remote must serve the enumeration from the remote (marker=None
+// is the one forced refresh, D5), materialize the rows, and cost exactly
+// one driver list per view (A3). The narrow-mock harness above pins the
+// degraded (D2) arm; this section casts the wide-face transport double
+// (the same minimal `as_driver` shape the core read-through tests use —
+// test helpers do not cross crates) over the storage mock.
+
+use std::sync::atomic::{AtomicUsize, Ordering};
+
+use async_trait::async_trait;
+
+use cloudkit_storage::{
+    Entry, EntryId, Listing, MockStorageDriver, Page, Quota, Range, RelPath as VolRel,
+    StorageDriver, UploadStager, VolumeId, WriteHint,
+};
+
+/// Counts `list` calls so the O(1)-per-view claim is asserted, not
+/// assumed.
+struct CountingDriver {
+    inner: Arc<MockStorageDriver>,
+    list_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl StorageDriver for CountingDriver {
+    fn volume(&self) -> &VolumeId {
+        self.inner.volume()
+    }
+
+    fn capabilities(&self) -> cloudkit_storage::Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn list(&self, dir: &VolRel, page: Page) -> Result<Listing, StorageError> {
+        self.list_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.list(dir, page).await
+    }
+
+    async fn stat(&self, path: &VolRel) -> Result<Entry, StorageError> {
+        self.inner.stat(path).await
+    }
+
+    async fn mkdir(&self, path: &VolRel) -> Result<(), StorageError> {
+        self.inner.mkdir(path).await
+    }
+
+    async fn delete(&self, id: &EntryId) -> Result<(), StorageError> {
+        self.inner.delete(id).await
+    }
+
+    async fn rename(&self, from: &VolRel, to: &VolRel) -> Result<(), StorageError> {
+        self.inner.rename(from, to).await
+    }
+
+    async fn reader(
+        &self,
+        id: &EntryId,
+        range: Option<Range>,
+    ) -> Result<cloudkit_storage::ByteStream, StorageError> {
+        self.inner.reader(id, range).await
+    }
+
+    async fn writer(
+        &self,
+        path: &VolRel,
+        hint: &WriteHint,
+    ) -> Result<Box<dyn UploadStager>, StorageError> {
+        self.inner.writer(path, hint).await
+    }
+
+    async fn quota(&self) -> Result<Quota, StorageError> {
+        self.inner.quota().await
+    }
+}
+
+/// Wide-face transport double: exposes the driver through the `as_driver`
+/// probe (D1); `capabilities` mirrors the driver's declaration (R4).
+struct WideTransport<D: StorageDriver> {
+    driver: D,
+}
+
+#[async_trait]
+impl<D: StorageDriver> CloudTransport for WideTransport<D> {
+    async fn connect(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    async fn upload(&self, _job: &UploadJob) -> Result<UploadReceipt, StorageError> {
+        Err(StorageError::Unsupported)
+    }
+
+    async fn open(&self, _file: &RemoteHandle) -> Result<ByteStream, StorageError> {
+        Err(StorageError::Unsupported)
+    }
+
+    async fn open_range(
+        &self,
+        _file: &RemoteHandle,
+        _off: u64,
+        _len: u64,
+    ) -> Result<ByteStream, StorageError> {
+        Err(StorageError::Unsupported)
+    }
+
+    async fn delete_remote(&self, _handle: &RemoteHandle) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported)
+    }
+
+    fn capabilities(&self) -> cloudkit_core::transport::Capabilities {
+        self.driver.capabilities()
+    }
+
+    fn as_driver(&self) -> Option<&dyn StorageDriver> {
+        Some(&self.driver)
+    }
+}
+
+/// Wide-face harness: real SQLite + cache tree + the counting storage
+/// mock behind the wide transport + Vfs + the adapter under test. The
+/// "remote" is seeded through `driver`; the `files` index starts EMPTY.
+struct WideHarness {
+    _dir: tempfile::TempDir,
+    db: Arc<MetaDatabase>,
+    driver: Arc<MockStorageDriver>,
+    list_calls: Arc<AtomicUsize>,
+    fs: CloudFs,
+    rt: tokio::runtime::Runtime,
+}
+
+impl WideHarness {
+    fn new() -> Self {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .build()
+            .expect("test runtime");
+        let dir = tempfile::tempdir().expect("temp dir");
+        let cache_root = dir.path().join("cache");
+        let db = Arc::new(MetaDatabase::open(&dir.path().join("meta.db")).expect("open temp db"));
+        let cache = CacheManager::new(cache_root, 1 << 30);
+        let driver = Arc::new(MockStorageDriver::new(
+            VolumeId::parse("baidu:123456789").expect("volume id"),
+        ));
+        let list_calls = Arc::new(AtomicUsize::new(0));
+        let counting = CountingDriver {
+            inner: Arc::clone(&driver),
+            list_calls: Arc::clone(&list_calls),
+        };
+        let transport: Arc<dyn CloudTransport> = Arc::new(WideTransport { driver: counting });
+        // Vfs::new spawns its upload queue: a runtime must be in scope.
+        let _guard = rt.enter();
+        let vfs = Arc::new(Vfs::new(db.clone(), cache, transport, test_cfg(None)));
+        let fs = CloudFs::new(vfs, rt.handle().clone(), "cydrive-test");
+        Self {
+            _dir: dir,
+            db,
+            driver,
+            list_calls,
+            fs,
+            rt,
+        }
+    }
+
+    /// Seeds one file onto the storage-mock remote (writer + write +
+    /// close; the mock creates parent directories implicitly).
+    fn seed_wide_file(&self, path: &str, data: &[u8]) {
+        self.rt.block_on(async {
+            let rel = VolRel::new(path).expect("seed path");
+            let hint = WriteHint {
+                size: Some(data.len() as u64),
+                ..Default::default()
+            };
+            let mut stager = self.driver.writer(&rel, &hint).await.expect("seed writer");
+            stager.write(data).await.expect("seed write");
+            stager.close().await.expect("seed close");
+        });
+    }
+
+    /// Seeds one directory onto the storage-mock remote.
+    fn seed_wide_dir(&self, path: &str) {
+        self.rt.block_on(async {
+            self.driver
+                .mkdir(&VolRel::new(path).expect("seed dir path"))
+                .await
+                .expect("seed mkdir");
+        });
+    }
+
+    /// The FSD `open` callback, with the create/open response going to a
+    /// scratch `OpenFileInfo` (same shape as the narrow harness above).
+    fn open(&self, name: &str) -> winfsp::Result<Handle> {
+        let wide = fsd_path(name);
+        let mut info: OpenFileInfo = unsafe { std::mem::zeroed() };
+        self.fs
+            .open(U16CStr::from_slice(&wide).expect("name"), 0, 0, &mut info)
+    }
+}
+
+/// A1 at the FSD face: empty index + stocked remote → the marker=None
+/// enumeration serves the remote content and materializes the rows
+/// (exactly one list), the marker continuation stays snapshot-based
+/// (K44: zero further lists), and the open face resolves a remote-only
+/// file through one parent re-list (D6).
+#[test]
+fn readthrough_empty_db_enumeration_serves_the_remote_content() {
+    let h = WideHarness::new();
+    h.seed_wide_dir("Documents");
+    h.seed_wide_dir("Photos");
+    h.seed_wide_file("readme.txt", b"hello");
+    h.seed_wide_file("Documents/note.txt", b"12345");
+
+    assert!(
+        h.db.list_dir("/").expect("db read").is_empty(),
+        "the index starts empty"
+    );
+
+    // Fresh enumeration (marker=None): the one forced refresh.
+    let handle = h.fs.open_handle(&RelPath::root()).expect("root handle");
+    let entries =
+        h.fs.prepare_enumeration(&handle, true)
+            .expect("fresh enumeration")
+            .expect("marker=None returns entries");
+    let names: Vec<&str> = entries.iter().map(|entry| entry.name.as_str()).collect();
+    assert_eq!(
+        names,
+        vec!["Documents", "Photos", "readme.txt"],
+        "dirs first, then name-ascending — the remote content on an empty index"
+    );
+    assert_eq!(
+        h.list_calls.load(Ordering::SeqCst),
+        1,
+        "the fresh enumeration costs exactly one driver list"
+    );
+
+    // Marker continuation: the buffer already holds the listing — the
+    // K44 snapshot semantics keep the protocol verbatim (no re-list).
+    assert!(
+        h.fs.prepare_enumeration(&handle, false)
+            .expect("marker continuation")
+            .is_none(),
+        "the marker continuation answers None (snapshot stays)"
+    );
+    assert_eq!(
+        h.list_calls.load(Ordering::SeqCst),
+        1,
+        "the marker continuation never re-lists (K44)"
+    );
+
+    // The rows materialized.
+    assert!(
+        h.db.get_file("/Documents")
+            .expect("db read")
+            .is_some_and(|row| row.is_dir),
+        "the directory row materialized"
+    );
+    assert!(
+        h.db.get_file("/readme.txt").expect("db read").is_some(),
+        "the file row materialized"
+    );
+
+    // The open face resolves a remote-only file: exact db miss → one
+    // parent re-list (D6) → row → open.
+    let opened = h
+        .open("\\Documents\\note.txt")
+        .expect("open a remote-only file");
+    assert!(!opened.is_dir());
+    assert_eq!(opened.meta().size, 5, "the row carries the remote size");
+    assert_eq!(
+        h.list_calls.load(Ordering::SeqCst),
+        2,
+        "the open costs exactly one parent re-list — O(1) per layer"
+    );
+}

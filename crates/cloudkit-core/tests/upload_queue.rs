@@ -507,11 +507,74 @@ async fn consecutive_failures_degrade_and_stop_retrying() {
     );
 }
 
-/// 10. 0-byte job: the transport is never called (contract: 0-byte
-///     uploads skip the remote); the row is persisted as success without
-///     a msg id and the empty local file is removed.
+/// 10. 0-byte job on an **authoritative-index** backend: the empty
+///     object IS this row's payload, so it must reach the remote
+///     (K85.6 revision of Contract 6). The row is persisted as success
+///     with the receipt's byte count (0) and the empty local file is
+///     removed.
+///
+///     Contract revision evidence (project owner ruling 2026-09-23,
+///     disposition of the EB4/K85.5 carried observation): an
+///     authoritative backend's remote IS the index — a 0-byte row that
+///     never lands leaves the file invisible to read-through/rebuild
+///     once the local index is lost. Only shadow-index backends (their
+///     remote is not enumerable, e.g. telegram) keep the skip; that arm
+///     is pinned by `zero_byte_job_still_skips_a_shadow_index_transport`
+///     below (previously this single test asserted the skip on the
+///     default mock, i.e. the shadow shape).
 #[tokio::test]
-async fn zero_byte_job_skips_transport() {
+async fn zero_byte_job_uploads_to_an_authoritative_backend() {
+    let caps = Capabilities {
+        range_read: true,
+        authoritative_index: true,
+        ..Capabilities::none()
+    };
+    let mock0 = MockTransport::builder().capabilities(caps).build();
+    let (_dir, db, cache, mock) = test_env_with_mock(mock0).await;
+    let local = seed_pending(&db, &cache, "/empty.txt", b"", 0);
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let handle = spawn_queue(db.clone(), transport, test_cfg(64));
+
+    handle
+        .enqueue(job_for(&cache, "/empty.txt", 0, 0, 64))
+        .await
+        .expect("enqueue");
+    handle.shutdown().await;
+
+    let calls = mock.upload_calls();
+    assert_eq!(
+        calls.len(),
+        1,
+        "a 0-byte row on an authoritative backend must land a real remote object"
+    );
+    assert_eq!(calls[0].size, 0, "the remote object is a 0-byte payload");
+    assert!(
+        mock.message(1).is_some_and(|bytes| bytes.is_empty()),
+        "the remote object exists and holds exactly 0 bytes"
+    );
+    let row = db
+        .get_file("/empty.txt")
+        .expect("db read")
+        .expect("row exists");
+    assert!(row.is_uploaded, "counts as uploaded");
+    assert_eq!(
+        row.telegram_msg_id,
+        Some(1),
+        "identified by the real receipt"
+    );
+    assert_eq!(row.size, 0, "a plaintext 0-byte object stays size 0");
+    assert!(!local.exists(), "empty local copy consumed on success");
+    assert_eq!(handle.stats().succeeded, 1);
+}
+
+/// 10b. Regression guard for the Contract-6 revision **precision**: a
+///      shadow-index backend (default mock caps =
+///      `authoritative_index: false`, the telegram transport shape) must
+///      still skip the transport on a 0-byte job — its remote is not the
+///      index, and Python's "no empty message" parity stands. The ruling
+///      widens the gate to authoritative backends only.
+#[tokio::test]
+async fn zero_byte_job_still_skips_a_shadow_index_transport() {
     let (_dir, db, cache, mock) = test_env().await;
     let local = seed_pending(&db, &cache, "/empty.txt", b"", 0);
     let transport: Arc<dyn CloudTransport> = mock.clone();
@@ -523,12 +586,22 @@ async fn zero_byte_job_skips_transport() {
         .expect("enqueue");
     handle.shutdown().await;
 
-    assert!(mock.upload_calls().is_empty(), "transport never called");
+    assert!(
+        mock.upload_calls().is_empty(),
+        "shadow index (telegram shape): the transport is never called"
+    );
+    assert!(
+        mock.stream_upload_calls().is_empty(),
+        "…nor the stream face"
+    );
     let row = db
         .get_file("/empty.txt")
         .expect("db read")
         .expect("row exists");
-    assert!(row.is_uploaded, "0-byte counts as uploaded");
+    assert!(
+        row.is_uploaded,
+        "0-byte counts as uploaded without a remote msg"
+    );
     assert_eq!(row.telegram_msg_id, None);
     assert_eq!(row.chunk_count, 0, "row chunk_count kept");
     assert!(!local.exists(), "empty local copy deleted");
@@ -1462,4 +1535,100 @@ async fn panicking_upload_degrades_and_keeps_the_worker_alive() {
         },
         "panic lands in exactly one terminal counter; the queue fully drains"
     );
+}
+
+// ---------------- Contract 6（K85.6 修订）× 加密空件（EB4） ---
+
+/// Phase 8-B EB4 / K85.6：**加密空件在 authoritative 后端有容器要送**——
+/// 0 明文字节的 v2 容器是 50 B 真实载荷，Contract 6 的「不触远端」跳过
+/// 会让文件在索引丢失后从 read-through 视野消失（两阶段协议腿 1 的
+/// 空件边界）。正臂钉：authoritative + 加密行 → `upload_stream` 恰一
+/// 次、容器 50 B、行以明文 size=0 落 uploaded、chunk 记容器长。
+/// （K85.6 把闸从「加密」放宽到「authoritative 即放行」——本臂语义
+/// 不变，仍是加密容器走流式面。）
+#[tokio::test]
+async fn encrypted_zero_byte_row_still_uploads_its_container() {
+    let caps = Capabilities {
+        range_read: true,
+        authoritative_index: true,
+        ..Capabilities::none()
+    };
+    let mock0 = MockTransport::builder().capabilities(caps).build();
+    let (_dir, db, cache, mock) = test_env_with_mock(mock0).await;
+    let local = seed_encrypted_pending(&db, &cache, "/empty.enc", b"", 0);
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    // 生产缺省方案（AeadV2）——加密空件走 v2 流式容器。
+    let mut cfg = test_cfg(64);
+    cfg.encryption_password = Some("pw".to_string());
+    let handle = spawn_queue(db.clone(), transport, cfg);
+
+    handle
+        .enqueue(job_for(&cache, "/empty.enc", 0, 0, 64))
+        .await
+        .expect("enqueue");
+    handle.shutdown().await;
+
+    let streams = mock.stream_upload_calls();
+    assert_eq!(
+        streams.len(),
+        1,
+        "an encrypted 0-byte row on an authoritative backend must send its container"
+    );
+    assert_eq!(
+        streams[0].size, 50,
+        "v2 empty container = 34B header + 16B tag"
+    );
+    assert!(
+        mock.upload_calls().is_empty(),
+        "the v2 container rides the stream face"
+    );
+
+    let row = db
+        .get_file("/empty.enc")
+        .expect("db read")
+        .expect("row exists");
+    assert!(row.is_uploaded, "counts as uploaded");
+    assert!(row.is_encrypted, "cipher flag kept");
+    assert_eq!(row.size, 0, "row keeps the plaintext size");
+    assert_eq!(row.chunk_count, 1, "one single-container chunk receipt");
+    let chunks = db.get_chunks_by_file_id(row.id).expect("chunks");
+    assert_eq!(chunks.len(), 1, "one receipt chunk row");
+    assert_eq!(chunks[0].size, 50, "the chunk carries the container length");
+    assert!(
+        !local.exists(),
+        "the plaintext cache copy is consumed on success"
+    );
+    assert_eq!(handle.stats().succeeded, 1);
+}
+
+/// 反臂（闸的精度，K85.6）：**非 authoritative（telegram 影子索引）+
+/// 加密空件保持 Contract 6 跳过**——远端不是索引，Python「不发空消息」
+/// parity 不动。回归哨：放行不得放宽到影子索引后端。
+#[tokio::test]
+async fn encrypted_zero_byte_keeps_the_skip_on_a_shadow_index_backend() {
+    // 默认 mock caps：authoritative_index = false（窄面形态）。
+    let (_dir, db, cache, mock) = test_env().await;
+    let _local = seed_encrypted_pending(&db, &cache, "/empty.enc", b"", 0);
+    let transport: Arc<dyn CloudTransport> = mock.clone();
+    let mut cfg = test_cfg(64);
+    cfg.encryption_password = Some("pw".to_string());
+    let handle = spawn_queue(db.clone(), transport, cfg);
+
+    handle
+        .enqueue(job_for(&cache, "/empty.enc", 0, 0, 64))
+        .await
+        .expect("enqueue");
+    handle.shutdown().await;
+
+    assert!(
+        mock.stream_upload_calls().is_empty(),
+        "shadow index: the stream face is never called"
+    );
+    assert!(mock.upload_calls().is_empty(), "…nor the plain face");
+    let row = db
+        .get_file("/empty.enc")
+        .expect("db read")
+        .expect("row exists");
+    assert!(row.is_uploaded, "Contract 6 still counts it uploaded");
+    assert_eq!(handle.stats().succeeded, 1);
 }

@@ -101,17 +101,55 @@ pub enum VfsError {
     #[error("transport error: {0}")]
     Transport(#[from] StorageError),
     /// Decryption failed.
-    #[error("crypto error: {0}")]
+    ///
+    /// B6 双假说文案（Phase 8-B EB2，**改文案不改分类**——变体与
+    /// `#[from]` 形态不动）：解密失败本身分不清「密钥/方案配置错」与
+    /// 「该文件实为明文/异期容器」（v1 无 magic 是冻结格式的代价），
+    /// 条件式措辞把第二假说与 `cydrive sync` 出路挂在**既有解密失败
+    /// 错误面**上；对确凿的错密码/损坏载荷（前提条件不成立）读来仍
+    /// 是原语义。
+    #[error(
+        "crypto error: {0} — if the password and the scheme configuration are both right, \
+         the stored bytes may be plaintext or an other-era container; \
+         run `cydrive sync` for the per-file truth"
+    )]
     Crypto(#[from] CryptoError),
     /// The row's `encryption_scheme` names a scheme this build does not
     /// know — the read path cannot dispatch. A newer build encrypted
     /// this file; the message names the stored value and both schemes
     /// this build understands so the operator can act.
+    ///
+    /// Phase 8-B EB2 / B6：同一分发面同时承接「行标签 aead_v2 但内容
+    /// 非容器」的首读校验失败——文案扩出双假说（密钥/方案配置错，
+    /// 或实为明文/异期方案）与 `cydrive sync` 出路；变体不动（R2
+    /// 分类学不动，新文案挂既有变体），rot13 场景原有的「方案名 +
+    /// 两个已知方案」可行动要素逐字保留。
     #[error(
         "unsupported encryption scheme {scheme:?} on {path}: this build \
-         knows \"gcm\" and \"aead_v2\" (upgrade the instance that stored it)"
+         knows \"gcm\" and \"aead_v2\" (upgrade the instance that stored it), or the row's \
+         scheme label does not match the stored bytes — double hypothesis: wrong \
+         password/scheme configuration, or the file is actually plaintext or an other-era \
+         container; run `cydrive sync` for the per-file truth"
     )]
     UnsupportedEncryptionScheme { scheme: String, path: String },
+    /// Read-through's encrypted-instance marker (Phase 8 / D10, as
+    /// narrowed by the K83 adjudication — refuse materialization, not
+    /// reads): the backend only sees ciphertext containers under
+    /// plaintext names, so a materialized row would mislabel encrypted
+    /// payloads as plaintext (size = ciphertext, not the R6 plaintext
+    /// contract). The message points at `cydrive sync` — the sync
+    /// payload carries the encrypted row semantics (is_encrypted/scheme)
+    /// to the other instance. DEFENSIVE ARM ONLY: no producer remains —
+    /// read-through materializes cipher truth for encrypted instances
+    /// (Phase 8-B / B1) and rebuild accepts them too (B5); consumers
+    /// keep the match arm for shape completeness.
+    #[error(
+        "read-through refuses encrypted instances: the backend only sees ciphertext containers \
+         under plaintext names, so a materialized row would mislabel encrypted payloads as \
+         plaintext; use `cydrive sync` instead — the sync payload carries the encrypted row \
+         semantics (is_encrypted / scheme) to the other instance"
+    )]
+    EncryptedInstance,
     /// Local file I/O failed.
     #[error("io error: {0}")]
     Io(#[from] std::io::Error),
@@ -215,6 +253,23 @@ fn write_atomic(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
     let staged = tmp_sibling(target);
     std::fs::write(&staged, bytes)?;
     std::fs::rename(&staged, target)
+}
+
+/// 头 8B 是否为 `CKCRYPT2` magic（Phase 8-B EB2 / B2 hydrate 臂）：
+/// gcm 分发**先看头再 v1 decrypt**——v1 头 16B 是随机盐，magic 检查零
+/// 成本且是内容真值的权威信号；短于 8B 的暂存文件无从谈起 magic。
+fn staged_has_v2_magic(path: &Path) -> std::io::Result<bool> {
+    use std::io::Read;
+    let mut file = std::fs::File::open(path)?;
+    let mut buf = [0u8; 8];
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        match file.read(&mut buf[filled..])? {
+            0 => break,
+            read => filled += read,
+        }
+    }
+    Ok(filled == buf.len() && buf == cloudkit_crypto::v2::MAGIC)
 }
 
 /// Sibling staging path of the plaintext-under-decryption: the full file
@@ -336,6 +391,10 @@ pub struct Vfs {
     transport: Arc<dyn CloudTransport>,
     cfg: VfsConfig,
     queue: UploadQueueHandle,
+    /// Read-through 的目录级缓存状态（Phase 8 / RT2）：TTL 窗 + 单飞闸
+    /// + 世代计数；纯进程内运行态，无构造参数（见
+    ///   [`Vfs::read_dir_fresh`]）。
+    dir_cache: crate::readthrough::DirCache,
 }
 
 impl Vfs {
@@ -366,6 +425,7 @@ impl Vfs {
             transport,
             cfg,
             queue,
+            dir_cache: crate::readthrough::DirCache::new(),
         }
     }
 
@@ -438,8 +498,12 @@ impl Vfs {
         size: u64,
         mtime: f64,
     ) -> Result<(), VfsError> {
-        // 0-byte rows carry a zero chunk plan (the queue never touches
-        // the transport for them); otherwise ceil(len / chunk_size) >= 1.
+        // 0-byte rows carry a zero chunk plan (K85.6: only a shadow-index
+        // backend skips the transport for them; an authoritative backend
+        // falls through to its real payload — a plaintext 0-byte object or
+        // an encrypted container — and the worker re-plans the empty
+        // object's single-chunk plan / the ciphertext chunk split before
+        // the transport sees it); otherwise ceil(len / chunk_size) >= 1.
         let chunk_count = if size == 0 {
             0
         } else {
@@ -495,6 +559,10 @@ impl Vfs {
             })
             .await
             .map_err(map_queue_error)?;
+        // Write-side read-through invalidation (Phase 8 / RT2): the
+        // pending row is in; the parent's fast-path window must go so the
+        // next stat_fresh re-lists (the row itself is in the db either way).
+        self.invalidate_dir_cache(rel);
         // No manual doorbell here anymore: the pending-row upsert above
         // already rang it through the db-layer files hook (the chokepoint).
         Ok(())
@@ -607,6 +675,10 @@ impl Vfs {
             // buffering, the staging file feeds the decryptor chunk by
             // chunk), and an unknown scheme fails with an actionable
             // error instead of guessing.
+            // 本臂实际分发所依的方案（Phase 8-B EB2 回写用）：gcm 臂遇
+            // magic 改判 = aead_v2；aead_v2 臂无 magic 双试 v1 成功 =
+            // gcm；其余 = 行标签。
+            let mut dispatched_scheme: &str = row.encryption_scheme.as_str();
             if row.is_encrypted {
                 let password = self
                     .cfg
@@ -615,11 +687,39 @@ impl Vfs {
                     .ok_or(VfsError::MissingPassword)?;
                 match row.encryption_scheme.as_str() {
                     crate::config::SCHEME_GCM => {
-                        let plaintext = crypto::decrypt(password, &std::fs::read(&staged)?)?;
-                        write_atomic(&local, &plaintext)?;
+                        // B2：gcm 臂先看暂存文件头 8B 再 v1 decrypt——
+                        // 行标 gcm 而内容是 `CKCRYPT2` 容器（混合方案/
+                        // 配置猜错）时改判 v2，绝不拿 v1 去解它。
+                        if staged_has_v2_magic(&staged)? {
+                            hydrate_v2(password, &staged, &local)?;
+                            dispatched_scheme = crate::config::SCHEME_AEAD_V2;
+                        } else {
+                            let plaintext = crypto::decrypt(password, &std::fs::read(&staged)?)?;
+                            write_atomic(&local, &plaintext)?;
+                        }
                     }
                     crate::config::SCHEME_AEAD_V2 => {
-                        hydrate_v2(password, &staged, &local)?;
+                        // K84.2 反向双试（对称于 gcm 臂的 magic 先行，
+                        // 审查回派）：无 magic → 试 v1——同份密文零额外
+                        // 下载，方案猜错（混合期：配置已切 aead_v2、老
+                        // 文件是 v1、索引已丢按配置猜错标签）由读时回退
+                        // 自愈回写；有 magic 走 v2 流式解密（既有路）。
+                        if staged_has_v2_magic(&staged)? {
+                            hydrate_v2(password, &staged, &local)?;
+                        } else {
+                            match crypto::decrypt(password, &std::fs::read(&staged)?) {
+                                Ok(plaintext) => {
+                                    write_atomic(&local, &plaintext)?;
+                                    dispatched_scheme = crate::config::SCHEME_GCM;
+                                }
+                                // 无 magic 且 v1 形失败（B6 歧义不可消）：
+                                // 双假说 + `cydrive sync` 文案挂在既有
+                                // 解密失败面 `VfsError::Crypto` 的扩展
+                                // 模板上——分类不动，staged 由外层失败
+                                // 清理路径回收（零残留）。
+                                Err(error) => return Err(VfsError::Crypto(error)),
+                            }
+                        }
                     }
                     unknown => {
                         return Err(VfsError::UnsupportedEncryptionScheme {
@@ -630,6 +730,18 @@ impl Vfs {
                 }
             } else {
                 std::fs::rename(&staged, &local)?;
+            }
+
+            // B2 hydrate 臂真值回写（解密**完成后**、`set_cached_flag`
+            // 前）：本地明文文件长度 = 内容真值，与行 size 不符（或改判
+            // 改了 scheme）→ 定向 UPDATE 三列。明文臂无密文反推歧义，
+            // 不参与（远端长度即行长度的既有契约）。
+            if row.is_encrypted {
+                let true_size = std::fs::metadata(&local)?.len() as i64;
+                if true_size != row.size || dispatched_scheme != row.encryption_scheme.as_str() {
+                    self.db
+                        .fix_cipher_columns(row.id, dispatched_scheme, true_size)?;
+                }
             }
 
             // is_cached-only flip — targeted column write, never a
@@ -691,8 +803,12 @@ impl Vfs {
     /// pulls every part document in full, so u64::MAX is a pure
     /// pass-through with zero extra I/O). Plaintext rows keep the
     /// row-size budget unchanged. Alternative semantics (row size
-    /// stores the ciphertext length — plan A) recorded in decisions.md
-    /// as pending-owner-review.
+    /// stores the ciphertext length — plan A) were **closed as
+    /// REJECTED** at Phase 8-B EB4 (decisions K85.3): row size stays
+    /// plaintext — the gateway's `RowMetaData.len` feeds HTTP
+    /// Content-Length/PROPFIND (plan §0.5), R6 keeps size=plaintext,
+    /// and mixed-scheme size truth is repaired by first-read
+    /// validation (B2) instead.
     fn remote_handle_for(
         &self,
         rel: &RelPath,
@@ -753,15 +869,24 @@ impl Vfs {
     ///
     /// - plaintext rows stream when the transport declares `range_read`
     ///   and the size is non-zero;
-    /// - encrypted rows stream only in the K47 shape: `aead_v2` scheme +
-    ///   `range_read` + non-zero size — through a
+    /// - encrypted rows stream in the K47 shape: `range_read` + a
+    ///   container the first read can vouch for — through a
     ///   [`DecryptingTransport`] wrapper with `total_size` = the
     ///   plaintext row size (K35; the handle itself keeps the u64::MAX
-    ///   ciphertext sentinel);
-    /// - everything else — `gcm` (v1 whole-file AEAD can never be
-    ///   range-sliced), unknown schemes (dispatch belongs to the hydrate
-    ///   path with its actionable error), range-incapable transports and
-    ///   0-byte rows — answers `Hydrate`.
+    ///   ciphertext sentinel). Phase 8-B B2: when the row carries chunk
+    ///   rows (the container length), a **first-read content validation**
+    ///   runs before the admission decision — `CKCRYPT2` magic repairs a
+    ///   wrong `scheme`/`size` row to the container truth (then streams
+    ///   on the true `plain_len`); a labelled-`aead_v2` row without
+    ///   magic answers `Hydrate` (K84.2: a 34-byte header cannot
+    ///   disprove v1 — the tag lives at the file tail, so hydrate's
+    ///   same-ciphertext dual trial owns the verdict, never ciphertext
+    ///   bytes);
+    /// - everything else — content the header does not vouch for (v1
+    ///   whole-file AEAD can never be range-sliced; dispatch to hydrate,
+    ///   whose magic-first re-dispatch and dual trial own the
+    ///   mixed-scheme case), unknown schemes, chunk-less legacy rows,
+    ///   range-incapable transports and 0-byte rows — answers `Hydrate`.
     ///
     /// Cache-first (WF0 / K42): ahead of the admission split, a row whose
     /// cached copy exists on disk routes to `Hydrate` — the hydrate arm
@@ -796,23 +921,20 @@ impl Vfs {
         }
         // K33+K47 admission split (R-5 + encrypted range streaming).
         let range_capable = self.transport.capabilities().range_read;
-        if row.is_encrypted {
-            let streamable = row.encryption_scheme == crate::config::SCHEME_AEAD_V2
-                && range_capable
-                && row.size > 0;
-            if !streamable {
+        if !row.is_encrypted {
+            if !range_capable || row.size == 0 {
                 return Ok(StreamSource::Hydrate);
             }
-        } else if !range_capable || row.size == 0 {
-            return Ok(StreamSource::Hydrate);
-        }
-        let handle = self.remote_handle_for(rel, &row, HandlePolicy::Read)?;
-        if !row.is_encrypted {
+            let handle = self.remote_handle_for(rel, &row, HandlePolicy::Read)?;
             return Ok(StreamSource::Stream {
                 total_size: handle.total_size,
                 handle,
                 transport: Arc::clone(&self.transport),
             });
+        }
+        // 加密行：range 能力是流式臂的先决（缺了连头读都无处安放）。
+        if !range_capable {
+            return Ok(StreamSource::Hydrate);
         }
         // K47 encrypted stream arm: the password gate above guarantees
         // the configured password; an absent value here is unreachable
@@ -822,6 +944,47 @@ impl Vfs {
             Some(password) => password,
             None => return Err(VfsError::MissingPassword),
         };
+        let handle = self.remote_handle_for(rel, &row, HandlePolicy::Read)?;
+        // B2 首读内容校验的分流（有 ct 才有交叉核对的分母——chunks 行按
+        // 密文边界记录，upload persist / materialize / sync 三方同源）：
+        //
+        // - `aead_v2` 标签：恒校验——行声称容器，B6 要求容器内容**先于
+        //   任何字节**得到核验；
+        // - 未知标签：恒校验——本 build 无法分发，内容定分发；
+        // - `gcm` 标签：**仅账目自相矛盾时**校验——ct 按 v1 闭式反推的
+        //   明文长 ≠ 行 size（标签、尺寸、容器长三方对不上 = 行形状
+        //   坏了，B2 内容权威出手）；自洽 gcm 行（v1 冻结生产的常态：
+        //   size=明文、ct=size+44）零内容读按标签走 hydrate——其内容
+        //   歧义（v1 无 magic / 混合方案）由 hydrate 臂的 magic 先行改判
+        //   与解密失败 B6 文案接管（B2 hydrate 条款，红测试 3 钉）；
+        // - 无 chunk 行（row-id 回退形态，生产加密行不产生）：无 ct 分母
+        //   → 逐字今日行为。
+        let chunks = self.db.get_chunks_by_file_id(row.id)?;
+        if !chunks.is_empty() {
+            let ct: i64 = chunks.iter().map(|chunk| chunk.size).sum();
+            let needs_content_check = match row.encryption_scheme.as_str() {
+                crate::config::SCHEME_GCM => {
+                    // 自洽（ct 按 v1 闭式反推 == 行 size）→ 零内容读；
+                    // 矛盾 → B2 内容权威出手。
+                    crate::materialize::plaintext_len_from_container(ct, crate::config::SCHEME_GCM)
+                        != row.size
+                }
+                // aead_v2（B6 先于字节核验容器）与未知标签（本 build
+                // 无法分发，内容定分发）恒校验。
+                _ => true,
+            };
+            if needs_content_check {
+                return self
+                    .first_read_admit(&handle, &row, &chunks, &password)
+                    .await;
+            }
+            // 自洽 gcm 行：零内容读，按标签分发（逐字今日 K47 行为）。
+            return Ok(StreamSource::Hydrate);
+        }
+        // 无 ct 的遗留形态：K47 按行标签分发（逐字今日行为）。
+        if row.encryption_scheme != crate::config::SCHEME_AEAD_V2 || row.size == 0 {
+            return Ok(StreamSource::Hydrate);
+        }
         let plain_len = row.size.max(0) as u64;
         let transport: Arc<dyn CloudTransport> = Arc::new(DecryptingTransport::new(
             Arc::clone(&self.transport),
@@ -834,6 +997,160 @@ impl Vfs {
             handle,
             transport,
         })
+    }
+
+    /// B2 首读内容校验与回写（Phase 8-B EB2）——**先于任何字节/
+    /// Content-Length 出门**，在 `open_read` 返回前完成：
+    ///
+    /// 1. 一次有界 34B 头读（`DecryptingTransport` 首窗本就要做的那一
+    ///    读，提前到 admission——**零额外往返**；解析出的窗口直接喂给
+    ///    [`DecryptingTransport::new_with_window`]，KDF 也只做一次）；
+    /// 2. 内容是唯一权威：头 8B == `CKCRYPT2` → 头内真值参数（分块）与
+    ///    `chunks` 行之和（ct 总长）代入闭式（与
+    ///    [`crate::materialize::plaintext_len_from_container`] 的默认
+    ///    分块反推交叉核对，头权威）→ 行 scheme/size 与真值不符 →
+    ///    [`MetaDatabase::fix_cipher_columns`] 定向回写 + **用真值
+    ///    plain_len 继续流式**；
+    /// 3. 行标 aead_v2 而内容**无 magic** → **K84.2 转 `Hydrate`**
+    ///    （审查回派）：34B 头试不出 v1——v1 tag 在文件尾，全量内容只有
+    ///    hydrate 拿得到；Hydrate 信号零字节，最终成败由 hydrate 的
+    ///    **同份密文双试**裁决（v1 成功 = 方案猜错自愈回写 gcm；失败 =
+    ///    B6 双假说 + `cydrive sync` 文案挂在既有解密失败面）——绝不
+    ///    返回密文字节的语义不破，真值不可知故 admission 也不回写；
+    /// 4. 非 aead_v2 标签 + 无 magic → v1/明文歧义留给 hydrate 臂
+    ///    （其 magic 先行改判与解密失败文案接手）→ `Hydrate`。
+    async fn first_read_admit(
+        &self,
+        handle: &RemoteHandle,
+        row: &FileRecord,
+        chunks: &[crate::database::ChunkRecord],
+        password: &str,
+    ) -> Result<StreamSource, VfsError> {
+        use cloudkit_crypto::v2::{AeadV2Window, HEADER_SIZE, MAGIC};
+
+        // 一次有界头读（B4：与 DecryptingTransport 首窗同一读，仅提前）。
+        let mut header = Vec::with_capacity(HEADER_SIZE);
+        let mut stream = self
+            .transport
+            .open_range(handle, 0, HEADER_SIZE as u64)
+            .await?;
+        while let Some(frame) = stream.next().await {
+            header.extend_from_slice(&frame?);
+        }
+
+        let is_container = header.len() >= MAGIC.len() && header[..MAGIC.len()] == MAGIC;
+        if !is_container {
+            // 无 magic 的所有标签统一交 hydrate（K84.2 同份密文双试，
+            // 审查回派）：34B 头**试不出 v1**——v1 tag 在文件尾，全量
+            // 内容只有 hydrate 拿得到；Hydrate 信号零字节、admission
+            // 不做内容级判决也不回写。hydrate 侧按标签双试：aead_v2
+            // 臂「无 magic → 试 v1」（成功自愈回写 / 失败 B6 文案），
+            // gcm 臂 magic 先行改判，未知标签沿既有可行动 Err。
+            return Ok(StreamSource::Hydrate);
+        }
+
+        // 解析 + KDF（喂给下方 DecryptingTransport，恰一次）。
+        let window = Arc::new(AeadV2Window::open(password, &header).map_err(VfsError::Crypto)?);
+
+        // ct 总长 = chunks 行之和（密文边界三方同源）；头内分块参数代入
+        // 闭式得真值 plain_len，并与应用默认分块的反推交叉核对（头权威）。
+        let ct: i64 = chunks.iter().map(|chunk| chunk.size).sum();
+        let header_chunk = window.chunk_size() as i64;
+        let derived = crate::materialize::plaintext_len_with_chunk(ct, header_chunk);
+        let default_backsolve =
+            crate::materialize::plaintext_len_from_container(ct, crate::config::SCHEME_AEAD_V2);
+        match derived {
+            Some(true_size) if true_size != default_backsolve => {
+                tracing::info!(
+                    path = %row.rel_path,
+                    header_chunk,
+                    true_size,
+                    default_backsolve,
+                    "container header carries a non-default chunk size; \
+                     the header wins over the default-chunk back-solve"
+                );
+            }
+            None => {
+                tracing::warn!(
+                    path = %row.rel_path,
+                    ct,
+                    header_chunk,
+                    "container length inconsistent with its header; \
+                     repairing the scheme only, keeping the row size"
+                );
+            }
+            Some(_) => {}
+        }
+        let true_size = derived.unwrap_or(row.size);
+        if row.encryption_scheme != crate::config::SCHEME_AEAD_V2 || row.size != true_size {
+            self.db
+                .fix_cipher_columns(row.id, crate::config::SCHEME_AEAD_V2, true_size)?;
+        }
+        if true_size == 0 {
+            // 真值空件：无窗口可流——回 hydrate 的 0 臂出空文件。
+            return Ok(StreamSource::Hydrate);
+        }
+
+        let plain_len = true_size.max(0) as u64;
+        let transport: Arc<dyn CloudTransport> = Arc::new(DecryptingTransport::new_with_window(
+            Arc::clone(&self.transport),
+            handle.clone(),
+            plain_len,
+            password.to_string(),
+            window,
+        ));
+        Ok(StreamSource::Stream {
+            total_size: plain_len,
+            handle: handle.clone(),
+            transport,
+        })
+    }
+
+    /// Read-through 目录列表（Phase 8 / RT2，D3/D5）：宽面权威卷每次调
+    /// 用现查后端并调和本地行（RaiDrive 对等体验——每视图一次现查）；
+    /// 门不过的卷（telegram 窄面 / 能力位未申报）逐字退化为
+    /// [`MetaDatabase::list_dir`]（D2，零行为变化）。机制本体在
+    /// [`crate::readthrough`]。
+    pub async fn read_dir_fresh(&self, dir: &RelPath) -> Result<Vec<FileRecord>, VfsError> {
+        crate::readthrough::read_dir_fresh(
+            &self.db,
+            self.transport.as_ref(),
+            &self.cache,
+            &self.dir_cache,
+            // cipher 上下文（Phase 8-B EB1）：与上传行 vfs.rs:500 同源判据
+            //（密码在 = 加密实例 + cfg.encryption_scheme）。
+            Some(crate::materialize::CipherCtx::from_cfg(&self.cfg)),
+            dir,
+        )
+        .await
+    }
+
+    /// Read-through 单路径 stat（Phase 8 / RT2，D6）：父目录 TTL 窗
+    /// （5s）内行命中零网络直出；过期/缺行重列父目录恰一次（Explorer
+    /// 的 stat 风暴归并），仍无行再 `driver.stat` 兜底。根恒存（合成
+    /// 元数据，消费面同形）。门不过的卷逐字退化为 [`MetaDatabase::get_file`]。
+    pub async fn stat_fresh(&self, rel: &RelPath) -> Result<FileRecord, VfsError> {
+        crate::readthrough::stat_fresh(
+            &self.db,
+            self.transport.as_ref(),
+            &self.cache,
+            &self.dir_cache,
+            // cipher 上下文（read_dir_fresh 同款，Phase 8-B EB1）。
+            Some(crate::materialize::CipherCtx::from_cfg(&self.cfg)),
+            rel,
+        )
+        .await
+    }
+
+    /// 写侧就近失效（pan115 先例；Phase 8 / RT2）：本侧增删落库后撤父
+    /// 目录的 TTL 窗，下一次 [`Vfs::stat_fresh`] 强制重列。D5 的
+    /// `read_dir_fresh` 本就每调必列，失效是快路径的双保险。
+    fn invalidate_dir_cache(&self, rel: &RelPath) {
+        let parent = rel
+            .parent()
+            .map(|parent| parent.as_str().to_string())
+            .unwrap_or_else(|| "/".to_string());
+        self.dir_cache.invalidate(&parent);
     }
 
     /// Snapshot of the upload queue counters.
@@ -972,6 +1289,9 @@ impl Vfs {
             chunk_count: 0,
             mime_type: None,
         })?;
+        // Write-side read-through invalidation (Phase 8 / RT2): the new
+        // directory row is in; revoke the parent's fast-path window.
+        self.invalidate_dir_cache(rel);
         // No manual doorbell: the directory row upsert above rang it
         // through the db-layer files hook.
         Ok(())
@@ -1004,13 +1324,19 @@ impl Vfs {
         // Pending-upload guard (review H2 / plan F2): while the only
         // copy of the bytes sits in the cache tree, deleting the row
         // would orphan the upload. A vanished copy (ghost row) passes.
-        if !row.is_uploaded && self.local_copy_exists(rel) {
+        // Judged through the single-source helper (review L4) — the
+        // criterion cannot drift from sync/rebuild/read-through.
+        if self.is_in_flight_row(&row, rel) {
             return Err(VfsError::UploadPending(rel.as_str().to_string()));
         }
         // K4 ordering: remote first (when the backend supports it),
         // local state only after the remote side is gone.
         self.delete_remote_gated(rel, &row).await?;
         self.db.delete_file(rel.as_str())?;
+        // Write-side read-through invalidation (Phase 8 / RT2): the row is
+        // gone; revoke the parent's fast-path window so the next stat does
+        // not serve the dead path from it.
+        self.invalidate_dir_cache(rel);
         // The cached copy goes too; a missing copy is the normal
         // not-cached case, and other removal errors never fail the call.
         if let Err(error) = tokio::fs::remove_file(self.cache.local_path(rel)).await {
@@ -1078,6 +1404,16 @@ impl Vfs {
                 )))),
             },
         }
+    }
+
+    /// The in-flight upload judgement bound to this VFS's cache —
+    /// [`crate::sync::is_in_flight_row`] verbatim (pending row + local
+    /// copy on disk, decisions 2026-09-05 «later action wins»). The
+    /// delete guards' copy checks ([`Vfs::remove_file`], the WinFsp
+    /// rename guards) ride this single source, so the criterion cannot
+    /// drift between sites (review L4).
+    pub fn is_in_flight_row(&self, row: &FileRecord, rel: &RelPath) -> bool {
+        crate::sync::is_in_flight_row(Some(row), &self.cache, rel)
     }
 
     /// Whether a local cache copy of `rel` is currently on disk — a

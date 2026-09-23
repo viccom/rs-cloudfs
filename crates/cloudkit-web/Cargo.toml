@@ -32,4 +32,9 @@ thiserror = "2"
 tokio = { version = "1", features = ["io-util", "net", "rt", "sync", "time"] }
 
 [dev-dependencies]
+# RT3 read-through face tests: the wide-face transport double exposes a
+# counting storage driver through the `as_driver` probe (D1) — the mock
+# driver and the trait live in L2, test-only (production graph unchanged).
+async-trait = "0.1"
+cloudkit-storage = { path = "../cloudkit-storage" }
 tempfile = "3"

@@ -627,6 +627,7 @@ version = "0.10.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "cloudkit-core",
  "cloudkit-storage",
  "futures-core",
  "futures-util",
@@ -687,6 +688,7 @@ version = "0.10.0"
 dependencies = [
  "async-trait",
  "bytes",
+ "cloudkit-core",
  "cloudkit-storage",
  "futures-core",
  "futures-util",
@@ -723,6 +725,7 @@ dependencies = [
  "axum",
  "base64 0.22.1",
  "bytes",
+ "cloudkit-core",
  "cloudkit-storage",
  "dav-server",
  "futures-core",
@@ -920,9 +923,11 @@ dependencies = [
 name = "cloudkit-web"
 version = "0.10.0"
 dependencies = [
+ "async-trait",
  "axum",
  "bytes",
  "cloudkit-core",
+ "cloudkit-storage",
  "futures-core",
  "mime_guess",
  "rust-embed",
@@ -936,8 +941,10 @@ dependencies = [
 name = "cloudkit-webdav"
 version = "0.10.0"
 dependencies = [
+ "async-trait",
  "bytes",
  "cloudkit-core",
+ "cloudkit-storage",
  "dav-server",
  "futures-util",
  "http",
@@ -953,7 +960,9 @@ dependencies = [
 name = "cloudkit-winfsp"
 version = "0.10.0"
 dependencies = [
+ "async-trait",
  "cloudkit-core",
+ "cloudkit-storage",
  "futures-util",
  "tempfile",
  "tokio",

@@ -21,7 +21,9 @@
 //! `files.encryption_scheme` column (Batch E / E-4) is added by a
 //! pragma-guarded `ALTER TABLE` in the same separate-batch spirit,
 //! `NOT NULL DEFAULT 'gcm'` so pre-existing rows and Python-shaped
-//! INSERTs keep their exact pre-E-4 behavior.
+//! INSERTs keep their exact pre-E-4 behavior. The `rebuild_state` KV
+//! table (Phase 8 / D8①, the resumable-rebuild checkpoint) follows the
+//! same additive precedent.
 
 use std::path::Path;
 use std::sync::atomic::{AtomicBool, Ordering};
@@ -325,6 +327,21 @@ impl MetaDatabase {
                 client_id TEXT NOT NULL
             );",
         )?;
+        // Rust-added `rebuild_state` KV table (Phase 8 / D8①, the
+        // resumable-rebuild checkpoint): purely additive `IF NOT EXISTS`
+        // in its own batch (`sync_mirror` precedent), so the contract
+        // DDL above stays byte-identical. Three keys, all owned by
+        // `crate::rebuild`: `pending` (the remaining directory queue, a
+        // JSON array), `scan_started_at` (the FIRST pass's start time —
+        // reused, never reset, on a resumed pass; the completion sweep's
+        // protection anchor) and `entries_done` (the cumulative
+        // materialized count).
+        conn.execute_batch(
+            "CREATE TABLE IF NOT EXISTS rebuild_state (
+                key TEXT PRIMARY KEY,
+                value TEXT
+            );",
+        )?;
         // Rust-added `files.encryption_scheme` column (Batch E / E-4, red
         // line R6 additive schema): the Python-contract DDL batch above
         // stays byte-identical, so the column lands here as a separate
@@ -557,6 +574,90 @@ impl MetaDatabase {
         Ok(id)
     }
 
+    /// Inserts or updates a row **materialized from the backend's
+    /// authoritative index** (Phase 8-B / B3 `upsert_materialized`).
+    ///
+    /// Same column set as [`MetaDatabase::upsert_file_scheme`], but the
+    /// ON CONFLICT set preserves the row's cipher truth — a listing only
+    /// ever fills *absent* truth, it never overwrites it (B1, the
+    /// anti-oscillation rule; `upsert_file`'s unconditional
+    /// `is_encrypted`/`size` overwrite is exactly the write it must not
+    /// repeat):
+    ///
+    /// - `is_encrypted` — an existing `1` survives
+    ///   (`CASE WHEN files.is_encrypted=1 THEN 1 ELSE excluded.* END`):
+    ///   a plaintext instance's relist never downgrades a legacy
+    ///   encrypted row; the guess (excluded) applies only where no truth
+    ///   exists;
+    /// - `encryption_scheme` — preserved verbatim while
+    ///   `files.is_encrypted=1`; written only when `files.is_encrypted=0`
+    ///   (truth established for the first time);
+    /// - `size` — `excluded.size` **is** the caller's derived value: the
+    ///   Rust side (`materialize_entry`) reads the existing row first and
+    ///   closed-form-derives the plaintext length under the *preserved*
+    ///   scheme — this is the plan's `?derived` parameter (SQL never runs
+    ///   the back-solve itself; INSERT and CONFLICT take the same value);
+    /// - everything else follows [`MetaDatabase::upsert_file`] (coalesce
+    ///   on the read-cold columns); `updated_at` refreshes (sweep
+    ///   immunity, D8③).
+    ///
+    /// Sole caller: [`crate::materialize::materialize_entry`] — the one
+    /// Entry→row mapping shared by read-through and rebuild (D4).
+    pub fn upsert_materialized(
+        &self,
+        entry: &FileUpsert,
+        encryption_scheme: &str,
+    ) -> Result<i64, DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let now = now();
+        let id = conn.query_row(
+            "INSERT INTO files (
+                rel_path, name, parent_dir, size, mtime, sha256, is_dir,
+                telegram_msg_id, is_uploaded, is_cached, is_encrypted, chunk_count, mime_type,
+                encryption_scheme, created_at, updated_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)
+            ON CONFLICT(rel_path) DO UPDATE SET
+                name=excluded.name,
+                parent_dir=excluded.parent_dir,
+                size=excluded.size,
+                mtime=excluded.mtime,
+                sha256=coalesce(excluded.sha256, files.sha256),
+                telegram_msg_id=coalesce(excluded.telegram_msg_id, files.telegram_msg_id),
+                is_uploaded=excluded.is_uploaded,
+                is_cached=excluded.is_cached,
+                is_encrypted=CASE WHEN files.is_encrypted=1 THEN 1 ELSE excluded.is_encrypted END,
+                chunk_count=excluded.chunk_count,
+                mime_type=coalesce(excluded.mime_type, files.mime_type),
+                encryption_scheme=CASE WHEN files.is_encrypted=1 THEN files.encryption_scheme
+                                       ELSE excluded.encryption_scheme END,
+                updated_at=excluded.updated_at
+            RETURNING id",
+            params![
+                entry.rel_path,
+                entry.name,
+                entry.parent_dir,
+                entry.size,
+                entry.mtime,
+                entry.sha256,
+                entry.is_dir as i64,
+                entry.telegram_msg_id,
+                entry.is_uploaded as i64,
+                entry.is_cached as i64,
+                entry.is_encrypted as i64,
+                entry.chunk_count,
+                entry.mime_type,
+                encryption_scheme,
+                now,
+                now,
+            ],
+            |row| row.get(0),
+        )?;
+        Ok(id)
+    }
+
     /// Flips the `is_cached` flag of the row with primary key `id` and
     /// touches NOTHING else — hydrate/eviction's cache-flag bookkeeping
     /// (P3 snapshot write-back race fix: those paths used to rebuild the
@@ -579,6 +680,40 @@ impl MetaDatabase {
         conn.execute(
             "UPDATE files SET is_cached = ?1 WHERE id = ?2",
             params![is_cached as i64, id],
+        )?;
+        Ok(())
+    }
+
+    /// First-read cipher-truth repair（Phase 8-B EB2 / B2）：定向 UPDATE
+    /// **只动** `encryption_scheme` / `size` / `updated_at` 三列。
+    ///
+    /// 触发点（校验先于任何字节/Content-Length 出门）：`open_read` 流臂
+    /// 的容器头校验（内容 magic + ct 闭式 → 真值）与 `hydrate` 解密完成
+    /// 后的本地明文长度核对（含 gcm 标签遇 `CKCRYPT2` 改判）。语义边界：
+    ///
+    /// - **绝不碰 coalesce 列**（sha256/telegram_msg_id/mime）与
+    ///   mtime/is_cached 等任何其它列——同 `set_cached_flag` 的
+    ///   「定向列写、永不整行回写」纪律（P3 快照回写竞态同源防线）；
+    /// - `updated_at` 照刷：sweep 免疫（D8③——首读修正过的行不被
+    ///   完成趟 prune 误删）；
+    /// - **doorbell 不压制**：size/scheme 是 sync 载荷列——修正是真相，
+    ///   files 表 chokepoint hook 照响（对端经 sync 拿到回写后的真值）；
+    /// - 幂等：同值重写无副作用；affected-rows 0 = 行并发消失，按
+    ///   `set_cached_flag` 先例作良性 `Ok`。
+    pub fn fix_cipher_columns(
+        &self,
+        id: i64,
+        encryption_scheme: &str,
+        size: i64,
+    ) -> Result<(), DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "UPDATE files SET encryption_scheme = ?1, size = ?2, updated_at = ?3 \
+             WHERE id = ?4",
+            params![encryption_scheme, size, now(), id],
         )?;
         Ok(())
     }
@@ -717,6 +852,64 @@ impl MetaDatabase {
         tx.execute("DELETE FROM files WHERE rel_path = ?1", [rel_path])?;
         tx.commit()?;
         Ok(())
+    }
+
+    /// The Phase 8 / D8③ completion sweep: deletes every UPLOADED row
+    /// the finished scan did not re-touch (`updated_at` older than the
+    /// scan's persisted `scan_started_at`) and, in the same transaction,
+    /// those rows' `chunks` rows — the explicit child delete of
+    /// [`MetaDatabase::delete_file`] (not FK-cascade reliance, so older
+    /// databases and pragma variations behave identically). Returns the
+    /// number of `files` rows deleted.
+    ///
+    /// The three D8 protections this predicate buys:
+    /// 1. rows upserted during ANY pass of the scan — this one or an
+    ///    earlier resumed one — carry `updated_at ≥ scan_started_at`
+    ///    (the anchor is persisted by the first pass and reused, never
+    ///    reset) and survive;
+    /// 2. in-flight rows (`is_uploaded = 0`) are excluded outright;
+    /// 3. `rebuild` calls this only after its work queue has drained —
+    ///    an interrupted pass never reaches it.
+    ///
+    /// Rows with a `NULL` `updated_at` compare as `NULL < x` = unknown
+    /// and are conservatively kept.
+    pub fn sweep_unseen(&self, scan_started_at: f64) -> Result<usize, DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let tx = conn.unchecked_transaction()?;
+        tx.execute(
+            "DELETE FROM chunks WHERE file_id IN \
+             (SELECT id FROM files WHERE is_uploaded = 1 AND updated_at < ?1)",
+            params![scan_started_at],
+        )?;
+        let deleted = tx.execute(
+            "DELETE FROM files WHERE is_uploaded = 1 AND updated_at < ?1",
+            params![scan_started_at],
+        )?;
+        tx.commit()?;
+        Ok(deleted)
+    }
+
+    /// The completion sweep's floor census (M3 / Phase 8 review): a
+    /// `(uploaded_total, sweep_candidates)` pair at this anchor — the
+    /// population the sweep's volume floor judges, read WITHOUT deleting
+    /// anything. `uploaded_total` counts every `is_uploaded = 1` row (the
+    /// sweep's whole population); `sweep_candidates` counts the rows the
+    /// sweep WOULD delete at this anchor (`updated_at` predating it).
+    pub fn sweep_census(&self, scan_started_at: f64) -> Result<(usize, usize), DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        let (total, candidates): (i64, i64) = conn.query_row(
+            "SELECT (SELECT COUNT(*) FROM files WHERE is_uploaded = 1), \
+                    (SELECT COUNT(*) FROM files WHERE is_uploaded = 1 AND updated_at < ?1)",
+            params![scan_started_at],
+            |row| Ok((row.get(0)?, row.get(1)?)),
+        )?;
+        Ok((total as usize, candidates as usize))
     }
 
     /// Clears the `is_cached` flag on every non-directory row that has it
@@ -971,6 +1164,54 @@ impl MetaDatabase {
             [&id],
         )?;
         Ok(id)
+    }
+
+    // -------------------------------------------------- rebuild_state ---
+    //
+    // Phase 8 / D8①: the resumable-rebuild checkpoint (see the table's
+    // DDL comment in [`MetaDatabase::open`]). The KV surface mirrors the
+    // `sync_mirror` trio's shape; every writer and reader lives in
+    // `crate::rebuild` — nothing else owns these keys.
+
+    /// Reads one `rebuild_state` value (`None` when the key is absent).
+    pub fn rebuild_state_get(&self, key: &str) -> Result<Option<String>, DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        Ok(conn
+            .query_row(
+                "SELECT value FROM rebuild_state WHERE key = ?1",
+                [key],
+                |row| row.get(0),
+            )
+            .optional()?)
+    }
+
+    /// Upserts one `rebuild_state` value.
+    pub fn rebuild_state_set(&self, key: &str, value: &str) -> Result<(), DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute(
+            "INSERT INTO rebuild_state (key, value) VALUES (?1, ?2)
+            ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+            params![key, value],
+        )?;
+        Ok(())
+    }
+
+    /// Clears every `rebuild_state` key — the completing pass's
+    /// checkout. The table only ever holds the rebuild checkpoint, so a
+    /// blanket delete is the precise inverse of the three writes.
+    pub fn rebuild_state_clear(&self) -> Result<(), DbError> {
+        let conn = self
+            .conn
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        conn.execute("DELETE FROM rebuild_state", [])?;
+        Ok(())
     }
 }
 

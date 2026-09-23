@@ -40,6 +40,8 @@ use cloudkit_storage::StorageError;
 pub use driver::BaiduDriver;
 pub use oauth::TokenStore;
 pub use transport_face::BaiduTransport;
+// 0 字节 wire 真形常量（upload.rs 定义；测试/桩按服务端真形断言引用）。
+pub use upload::EMPTY_MD5;
 
 /// 生产 API base（pan.baidu.com；spike api.rs:12 同值）。
 pub const DEFAULT_API_BASE: &str = "https://pan.baidu.com";

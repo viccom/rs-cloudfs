@@ -611,6 +611,66 @@ async fn static_tree_serves_the_volumes_script() {
     );
 }
 
+/// Phase 8-B EB4 (B5 反分裂): since EB3 the backend accepts REBUILD on
+/// encrypted volumes — the web UI must stop hiding/disabling those
+/// controls (gate narrows to telegram only) and the "refuses encrypted"
+/// copy must go. Content pins over the served scripts (no JS harness
+/// exists; these are the assertions): all five assertions are RED until
+/// the four static-file spots are synced.
+#[tokio::test]
+async fn rebuild_controls_gate_on_telegram_only_after_phase8b() {
+    let dir = tempfile::tempdir().expect("temp dir");
+    let entry = volume_env(dir.path(), "a", "local", idle_mock().await).await;
+    let server = multi_server(vec![entry]).await;
+    let addr = server.local_addr();
+
+    let fetch = |path: &'static str| async move {
+        let resp = send(addr, &request("GET", path, addr, &[])).await;
+        assert_eq!(status_of(&resp), 200, "{path} serves: {resp}");
+        body_of(&resp)
+    };
+
+    // i18n (both languages): the rebuild tooltip names telegram only,
+    // and the dead "refresh refuses encrypted" key is gone.
+    let i18n = fetch("/static/js/i18n.js").await;
+    assert!(
+        !i18n.contains("(telegram/encrypted)"),
+        "EN rebuild tooltip narrowed to telegram: {i18n}"
+    );
+    assert!(
+        !i18n.contains("telegram/加密卷"),
+        "ZH rebuild tooltip narrowed to telegram: {i18n}"
+    );
+    assert!(
+        i18n.contains("(telegram):") && i18n.contains("（telegram）"),
+        "both languages keep the narrowed (telegram) spelling: {i18n}"
+    );
+    assert!(
+        !i18n.contains("refresh_encrypted")
+            && !i18n.contains("Refresh refuses encrypted")
+            && !i18n.contains("加密实例拒绝刷新"),
+        "the misleading encrypted-refresh note key is gone: {i18n}"
+    );
+
+    // volumes.js: the Refresh control no longer mutes encrypted rows.
+    let volumes_js = fetch("/static/js/volumes.js").await;
+    assert!(
+        !volumes_js.contains("v.encrypted"),
+        "encrypted volumes render the real Refresh button: {volumes_js}"
+    );
+    assert!(
+        volumes_js.contains("v.backend === 'telegram'"),
+        "the telegram gate itself stays: {volumes_js}"
+    );
+
+    // app.js: the index rebuild button is disabled for telegram only.
+    let app_js = fetch("/static/js/app.js").await;
+    assert!(
+        !app_js.contains("row.encrypted"),
+        "encrypted rows no longer disable the rebuild button: {app_js}"
+    );
+}
+
 /// The i18n/layout batch (2026-09-13 UX follow-up): the `/volumes` page
 /// carries the `data-i18n` hooks and the dual-segment language pill,
 /// loads `i18n.js` before its page script, anchors the bottom page

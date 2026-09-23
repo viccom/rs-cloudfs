@@ -276,7 +276,11 @@ fn rebuild_probe() -> (
                         break;
                     }
                 }
-                Ok(cloudkit_core::rebuild::RebuildOutcome { files: 1, dirs: 1 })
+                Ok(cloudkit_core::rebuild::RebuildOutcome {
+                    files: 1,
+                    dirs: 1,
+                    ..Default::default()
+                })
             })
         })
     };
@@ -677,11 +681,12 @@ async fn rebuild_aborts_when_the_shutdown_gate_fires() {
 // ------------------------------------------------------------- 5. R6 ---
 
 /// The synchronous scope gates (all BEFORE acceptance, all
-/// actionable): an encrypted volume gets the K11 sync guidance
-/// verbatim, a telegram volume the shadow-index refusal, an unknown
-/// name the LIST pointer, the malformed shapes the usage line — and
-/// once the stop gate has fired, REBUILD joins the mutating family's
-/// shutdown refusal.
+/// actionable): an encrypted volume is now ACCEPTED — its walk carries
+/// the production cipher context (Phase 8-B / B5 — the K11 plaintext
+/// gate is gone), while a telegram volume still gets the shadow-index
+/// refusal, an unknown name the LIST pointer, the malformed shapes the
+/// usage line — and once the stop gate has fired, REBUILD joins the
+/// mutating family's shutdown refusal.
 #[tokio::test]
 async fn rebuild_scope_gates_refuse_synchronously() {
     let dir = tempfile::tempdir().expect("tempdir");
@@ -696,28 +701,20 @@ async fn rebuild_scope_gates_refuse_synchronously() {
     write_file(&dir.path().join("volumes").join("t.toml"), &telegram_toml());
     let _guard = chdir(dir.path());
 
-    let (handle, _specs) = boot(process_config(), RuntimeVolumeCommands::default()).await;
+    // The parking seam keeps the accepted encrypted rebuild observable
+    // (the walk itself runs behind the production executor in real life;
+    // the gate under test is the synchronous acceptance at the handler).
+    let (seam, probe, _entered) = rebuild_probe();
+    let (handle, _specs) = boot(
+        process_config(),
+        RuntimeVolumeCommands {
+            rebuild: Some(seam),
+            rebuild_tuning: RebuildTuning::fast(),
+            ..RuntimeVolumeCommands::default()
+        },
+    )
+    .await;
     let addr = control_addr();
-
-    // The encrypted refusal: the K11 text verbatim (sync guidance).
-    let reply = send_cmd(addr, "REBUILD enc").await;
-    assert!(
-        reply.starts_with("ERR:") && reply.contains("rebuild refuses encrypted instances"),
-        "the K11 refusal text: {reply}"
-    );
-    assert!(
-        reply.contains("`cydrive sync`"),
-        "the refusal points at sync: {reply}"
-    );
-    // The file's encryption is visible on the config face (the web
-    // button gating's data source).
-    let reply = send_cmd(addr, "CONFIGS").await;
-    assert!(
-        reply
-            .lines()
-            .any(|line| line.starts_with("enc local enabled=true running encrypted")),
-        "CONFIGS marks the encrypted volume: {reply}"
-    );
 
     // The telegram refusal (the shadow-index wording).
     let reply = send_cmd(addr, "REBUILD t").await;
@@ -746,11 +743,39 @@ async fn rebuild_scope_gates_refuse_synchronously() {
         );
     }
 
-    // Nothing was accepted: no marker anywhere.
+    // None of the refusals was accepted: no marker anywhere yet.
     let reply = send_cmd(addr, "LIST").await;
     assert!(
         !reply.contains("rebuilding"),
         "the refusals accepted nothing: {reply}"
+    );
+
+    // The file's encryption is visible on the config face (the web
+    // button gating's data source).
+    let reply = send_cmd(addr, "CONFIGS").await;
+    assert!(
+        reply
+            .lines()
+            .any(|line| line.starts_with("enc local enabled=true running encrypted")),
+        "CONFIGS marks the encrypted volume: {reply}"
+    );
+
+    // B5 (EB3): the encrypted volume is accepted synchronously — no
+    // K11 refusal anymore — and the accepted walk marks LIST.
+    let reply = send_cmd(addr, "REBUILD enc").await;
+    assert!(
+        reply.starts_with("OK:") && reply.contains("rebuild of `enc` started in background"),
+        "the encrypted volume is accepted (B5): {reply}"
+    );
+    assert!(
+        list_shows_rebuilding(addr, "enc", true).await,
+        "the accepted encrypted rebuild marks LIST"
+    );
+    // The seam call races the marker (acceptance inserts the marker
+    // before the spawned task invokes the executor) — poll, don't race.
+    assert!(
+        until(&probe, |probe| probe.calls() == 1).await,
+        "the seam ran the accepted rebuild"
     );
 
     // H1: after the stop gate fires, REBUILD joins the mutating
@@ -763,6 +788,12 @@ async fn rebuild_scope_gates_refuse_synchronously() {
         "REBUILD after the gate is refused: {reply}"
     );
 
+    // The supervisor aborts the parked body on the fired gate (R5) —
+    // the same witness the dedicated abort test pins.
+    assert!(
+        until(&probe, |probe| probe.cancelled()).await,
+        "the shutdown checkpoint aborted the parked body"
+    );
     timeout(Duration::from_secs(30), handle.shutdown())
         .await
         .expect("shutdown completes")
@@ -894,6 +925,7 @@ async fn a_reassembled_volume_is_a_new_generation_and_the_running_rebuild_aborts
             rebuild_tuning: RebuildTuning {
                 timeout: Duration::from_secs(30),
                 checkpoint_interval: Duration::from_secs(5),
+                ..RebuildTuning::default()
             },
             ..RuntimeVolumeCommands::default()
         },
@@ -1020,6 +1052,7 @@ async fn uploads_resuming_mid_walk_interrupt_the_rebuild_recoverably() {
             rebuild_tuning: RebuildTuning {
                 timeout: Duration::from_secs(30),
                 checkpoint_interval: Duration::from_millis(50),
+                ..RebuildTuning::default()
             },
             ..RuntimeVolumeCommands::default()
         },
@@ -1129,6 +1162,7 @@ async fn concurrent_rebuilds_across_both_faces_serialize_one_accepts_one_refuses
             rebuild_tuning: RebuildTuning {
                 timeout: Duration::from_secs(30),
                 checkpoint_interval: Duration::from_millis(50),
+                ..RebuildTuning::default()
             },
             ..RuntimeVolumeCommands::default()
         },

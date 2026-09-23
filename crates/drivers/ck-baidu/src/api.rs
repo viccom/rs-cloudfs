@@ -308,7 +308,10 @@ pub(crate) struct PrecreateOutcome {
 ///
 /// - **rtype=3**（K10 覆盖语义——spike 用 1 是冲突重命名，本驱动明确改 3；
 ///   真机复核归 `tests/real_machine.rs` rtype3 用例）；
-/// - `block_list` = 分片 md5 hex 的 JSON 数组字符串（空文件 `[]`）；
+/// - `block_list` = 分片 md5 hex 的 JSON 数组字符串；**0 字节 = 恰
+///   `[upload::EMPTY_MD5]` 一元素**（空串 MD5）——空数组被服务端拒绝
+///   （errno=2，2026-09-23 真网实测），构造点在 upload.rs 的数据终态
+///   定型处（调用方恒传全量列表，本函数不改写）；
 /// - **会话锁定语义**（真网 31363 实证，2026-09-08）：precreate 一次性
 ///   锁定 `(path,size,block_list)`——调用方必须传**全量**列表（到齐/
 ///   数据终态才 precreate，见 upload.rs「到齐即传」），create 必须原样

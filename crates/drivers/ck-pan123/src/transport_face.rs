@@ -209,6 +209,13 @@ impl CloudTransport for Pan123Transport {
         caps.remote_delete = true;
         caps
     }
+
+    /// 探针（Phase 8 / D1）：宽面在此——transport 薄壳与 StorageDriver
+    /// 装配共享同一 `Arc<Pan123Driver>`，read-through 回源经本探针取回
+    /// list/stat 宽面。
+    fn as_driver(&self) -> Option<&dyn StorageDriver> {
+        Some(self.driver.as_ref())
+    }
 }
 
 /// K6 receipt 形态：msg_id 恒 0 占位（不语义化，local/ck-pan115 同款）。

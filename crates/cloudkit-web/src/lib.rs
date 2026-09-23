@@ -2329,6 +2329,15 @@ fn normalize_list_path(raw: &str) -> Option<String> {
 /// neither, so it 404s under the same rule until anything exists).
 /// Multi-volume mode routes by `?volume=` (K23) — the path validation
 /// keeps its frozen order ahead of the volume resolution.
+///
+/// The listing rides the read-through seam (Phase 8 / RT3): an
+/// authoritative wide face revalidates the view against the backend per
+/// call (D5) and materializes what it saw, so an empty index serves the
+/// remote content without a rebuild; narrow faces degrade verbatim to
+/// the db read. The driver's NotFound (a genuinely absent directory) is
+/// the same 404 as before; any other transport failure is a 500 — never
+/// a fabricated emptiness. `api_files` deliberately stays the pure index
+/// view (D9).
 async fn api_list(State(state): State<AppState>, request: Request) -> Response {
     let query = request.uri().query().unwrap_or("");
     let path = match query_param(query, "path") {
@@ -2343,10 +2352,41 @@ async fn api_list(State(state): State<AppState>, request: Request) -> Response {
         Err(response) => return response,
     };
     let db = volume.vfs.db();
-    let mut entries = match db.list_dir(&path) {
+    // Already validated by `normalize_list_path`; the parse here is the
+    // vocabulary-typed handle the VFS seam takes.
+    let rel = match RelPath::new(&path) {
+        Ok(rel) => rel,
+        Err(_) => return error_json(StatusCode::BAD_REQUEST, "Invalid path"),
+    };
+    // M5 (Phase 8 review, the gateway `read_dir` pre-check shape): push
+    // the path ITSELF through the read-through seam first. A depth-1
+    // listing of a directory can never see the directory's own row, so a
+    // deep jump into a remote-existing-but-empty directory left the index
+    // without it and the empty-index 404 below fired on a legitimate
+    // empty directory. `NotFound`/transport errors are absorbed here on
+    // purpose: a genuinely missing path and an upstream failure are both
+    // adjudicated by the listing that follows (`read_dir_fresh`'s
+    // NotFound arm / stale-if-error), so the response contract does not
+    // move. Root keeps its implicit existence (skipped, like every
+    // consumer). A file path keeps the listing semantics below — the
+    // route stays a pure listing, no new error mapping; the row the
+    // pre-check materialized merely extends the already-indexed-file
+    // 200-empty shape to a not-yet-indexed one (narrow faces are
+    // untouched: `stat_fresh` degrades verbatim, D2).
+    if !rel.is_root() {
+        let _ = volume.vfs.stat_fresh(&rel).await;
+    }
+    let mut entries = match volume.vfs.read_dir_fresh(&rel).await {
         Ok(entries) => entries,
+        Err(VfsError::NotFound(_)) => {
+            return error_json(StatusCode::NOT_FOUND, "Directory not found");
+        }
         Err(error) => return error_json(StatusCode::INTERNAL_SERVER_ERROR, error.to_string()),
     };
+    // Degrade-arm existence semantics (D2/A6): the narrow-face return is
+    // `db.list_dir`, which cannot distinguish an existing-but-empty
+    // directory from a missing one — the original row probe stays, and on
+    // the wide face it keeps the fully-empty-drive root 404 frozen.
     if entries.is_empty() && db.get_file(&path).ok().flatten().is_none() {
         return error_json(StatusCode::NOT_FOUND, "Directory not found");
     }

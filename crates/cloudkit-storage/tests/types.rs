@@ -3,6 +3,7 @@
 use std::str::FromStr;
 use std::time::Duration;
 
+use cloudkit_storage::transport::CloudTransport;
 use cloudkit_storage::{
     BackendHandle, Capabilities, EntryId, EntryKind, Page, PageCursor, Quota, Range, RelPath,
     StorageError, VolumeId, WriteHint,
@@ -326,4 +327,19 @@ fn storage_error_equality_and_display() {
 fn entry_kind_serde_lowercase() {
     assert_eq!(serde_json::to_string(&EntryKind::File).unwrap(), "\"file\"");
     assert_eq!(serde_json::to_string(&EntryKind::Dir).unwrap(), "\"dir\"");
+}
+
+// --- CloudTransport::as_driver probe（Phase 8 / D1）-----------------------------
+
+/// 探针默认形态（[`CloudTransport::as_inbound`] 同款先例）：窄面
+/// transport（telegram 形态）默认不持有宽面——消费方拿 `None` 只降级，
+/// 绝不 panic。宽面 `Some` 腿由各驱动 crate 的 transport_face 测试钉
+/// （ck-local `as_driver_probe_reports_the_wide_face`）。
+#[test]
+fn as_driver_probe_defaults_to_none_and_reports_the_wide_face() {
+    let t = cloudkit_storage::transport::mock::MockTransport::builder().build();
+    assert!(
+        t.as_driver().is_none(),
+        "窄面 transport 默认不持有宽面（telegram 零变化）"
+    );
 }

@@ -267,6 +267,13 @@ impl CloudTransport for BaiduTransport {
         caps.remote_delete = true;
         caps
     }
+
+    /// 探针（Phase 8 / D1）：宽面在此——transport 薄壳与 StorageDriver
+    /// 装配共享同一 `Arc<BaiduDriver>`，read-through 回源经本探针取回
+    /// list/stat 宽面。
+    fn as_driver(&self) -> Option<&dyn StorageDriver> {
+        Some(self.driver.as_ref())
+    }
 }
 
 impl BaiduTransport {

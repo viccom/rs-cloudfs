@@ -1,6 +1,6 @@
 # 驱动接入手册（Driver Onboarding）
 
-> 状态：v1.1（2026-09-14 增补 §10 transport-only 驱动类；v1.0 = 2026-09-08 Phase 2 前置任务）｜ 强制级别：新驱动 PR 的验收依据
+> 状态：v1.2（2026-09-23 增补 §11 未来驱动共性义务；v1.1 = 2026-09-14 增补 §10 transport-only 驱动类；v1.0 = 2026-09-08 Phase 2 前置任务）｜ 强制级别：新驱动 PR 的验收依据
 > 来源：foundation §5 Phase 2 前置任务（红队 H4：无手册则「端到端硬验收」无判定依据）；PCFS 四驱动实证 + 其坑清单（decisions 2026-09-08 PCFS 研究）；spike 报告百度参数
 > 上游标准：[architecture.md](architecture.md)（红线/分层）、[interfaces.md](interfaces.md)（StorageDriver 契约/conformance 八断言）、[code-style.md](code-style.md)（门禁/TDD）
 
@@ -12,6 +12,8 @@
 - 模块建议（参照 ck-telegram）：`transport.rs`（协议适配）/`client.rs` 或 `api.rs`（HTTP/协议面）/`oauth.rs`（鉴权状态机，如适用）/`lib.rs`（导出 + 工厂函数）。
 - 二进制不许出现在驱动 crate（bin 只在 cloudkit-cli / cloudkit-sync-server）。
 - **组合根 feature 门控三件套（K30，telegram/baidu/local 先例）**：新驱动接入时在 `crates/cloudkit-cli/Cargo.toml` 声明 optional 依赖（`ck-<name> = { path = ..., optional = true }`）+ 同名 feature（`<name> = ["dep:ck-<name>"]`）+ `default` 追加 `<name>`；并在 `crates/cloudkit-cli/src/lib.rs` 补 K31 文案常量 `<NAME>_DRIVER_REQUIRED`（三段式：缺驱动声明 + rebuild 命令 + backend 改法）与 K32 `compiled_drivers()` 清单臂（顺序固定追加 + cfg 门控断言测试）。裁剪组合随 CI feature 矩阵腿验收（ci.yml `features` job：clippy×单驱动子集 + workspace `--no-default-features` test）。
+
+**dev-dependency 例外（Phase 8，K83）**：驱动 crate 的 `[dev-dependencies]` 允许 `cloudkit-core`（L3）用于集成测试（read-through 共性冒烟先例：ck-local `readthrough_smoke.rs`、ck-sftp `live_readthrough.rs`）——`check_layers` 只查生产依赖边；生产依赖图的禁令不变（驱动运行时仍只依赖 cloudkit-storage）。
 
 ## 2. StorageDriver 实现义务（D1/§2 契约摘要）
 
@@ -113,3 +115,15 @@
 - [ ] transport 面契约测试（`ck-telegram/tests/` 先例：contract / adapter / stream_reader）
 - [ ] 连接路径有 deadline 界 + 失败人话指引（`connect_with_deadline` 先例——网络阻塞的静默挂起是真机事故教训）
 - [ ] 文档联动：README 状态表 / AGENTS 计数 / 本节如需修订
+
+## 11. 未来驱动的共性义务（read-through，Phase 8；2026-09-23 增补）
+
+新驱动（s3 等）**零行 read-through 代码**即自动获得按需逐层索引（读路径 miss/TTL 过期自动回源物化）——机制五件（探针/门/物化/reconcile/两入口）全在 L2/L3 共性面，驱动侧只是三个既有义务的自然延伸：
+
+1. **实现 `StorageDriver` 九方法**（§2）——conformance 八断言已要求；list depth-1/字典序稳定/NotFound vs 空表即 read-through 的回源契约，无额外语义；
+2. **transport_face 持 `Arc<驱动>` 并给 `as_driver` 一行探针**：`fn as_driver(&self) -> Option<&dyn StorageDriver> { Some(self.driver.as_ref()) }`（六宽面驱动同款先例；缺省实现 = None，探针是窄面到宽面的唯一通道）；
+3. **Capabilities 诚实声明 `authoritative_index`**（R4）——该能力位自 Phase 8 起是 read-through 回源门的真实判据：声明了却撒谎 = 按需索引不生效，诚实成为可执行约束。
+
+机制锚点（勿在驱动内复刻）：探针 `CloudTransport::as_driver`（cloudkit-storage）；门 + reconcile + 两入口 = `cloudkit-core::readthrough`（`read_dir_fresh`/`stat_fresh`）；物化 = `cloudkit-core::materialize::materialize_entry`（唯一 Entry→行映射，rebuild 与 read-through 共用）。
+
+**§10 transport-only 驱动天然豁免**：窄面无宽面可探（`as_driver` 恒 None），read-through 门退化为纯 db 读——telegram 卷读行为不变（设计事实照旧，不是欠债）。

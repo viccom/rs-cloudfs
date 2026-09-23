@@ -32,3 +32,7 @@ tempfile = "3"
 # conformance_suite! 宏展开的 #[tokio::test] 需要 rt + macros
 # （cloudkit-storage lib.rs 宏文档明示消费 crate 自带）。
 tokio = { version = "1", features = ["rt", "macros"] }
+# Phase 8 RT5 readthrough_smoke：共性冒烟腿需要真 Vfs/MetaDatabase（L3）
+# 打真 local 驱动——**仅测试图**的 L1→L3 dev 边（生产依赖图不变，理由
+# 与裁决记录同 ck-webdav dev-dep 注释；scripts/check_layers 机械面通过）。
+cloudkit-core = { path = "../../cloudkit-core" }

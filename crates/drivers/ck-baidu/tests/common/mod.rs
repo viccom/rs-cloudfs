@@ -46,6 +46,14 @@
 //!   `<原名>_<时间戳>`（mock 时钟换算 `%Y%m%d_%H%M%S`）空副本目录——
 //!   真网实证非 -8。由此「未预检」的驱动实现（直接 create 已存在层）在
 //!   离线测试即可被 `entry_count_with_prefix` 检出（ghost 副本观测面）。
+//!
+//! Phase 8-B 0 字节 wire 真形补钉（2026-09-23，主会话活 token 真网探针
+//! ——「桩照服务端真形建模」防线）：
+//!
+//! - **precreate 空数组 block_list → errno=2**（真网实测：0 字节发 `[]`
+//!   恒拒且可重试耗尽；正确形态 = `[EMPTY_MD5]` 空串 MD5）；
+//! - **create 对 `[EMPTY_MD5]` 唯一块声明免分片校验**（真网真形：0 字节
+//!   无 superfile2 可传，precreate 声明即视为在位）→ 组装零字节入树。
 
 #![allow(dead_code)] // 三个测试二进制各自编译本模块，未用到的访问器按二进制豁免
 
@@ -93,6 +101,12 @@ pub const MOCK_DLINK_TTL_SECS: i64 = 600;
 /// 会话死亡注入的 error_code（mock 建模码，刻意避开全部已映射真实码族
 /// ——驱动探活语义只判「error_code != 0」，不应绑定具体码值）。
 pub const MOCK_DEAD_SESSION_ERROR_CODE: i64 = 91001;
+/// 空串 MD5——0 字节上传 block_list 的声明值（2026-09-23 真网探针钉死
+/// 的服务端真值）。**独立字面量，刻意不引用驱动导出的
+/// `ck_baidu::EMPTY_MD5` 常量**（Phase 8-B β-2 解耦）：桩按服务端语义
+/// 建模，免传判据若引用实现常量，常量值漂移时桩+实现+断言三者同漂
+/// 全绿——独立声明让漂移可被检出。
+pub const EMPTY_STRING_MD5: &str = "d41d8cd98f00b204e9800998ecf8427e";
 
 // ---------------------------------------------------------------------------
 // 状态模型
@@ -821,6 +835,12 @@ async fn xpan_file(
             let block_md5: Vec<String> = fp("block_list")
                 .and_then(|v| serde_json::from_str::<Vec<String>>(&v).ok())
                 .unwrap_or_default();
+            // 服务端真形建模（2026-09-23 主会话活 token 真网实测）：空数组
+            // block_list 恒拒 errno=2（0 字节明文首跑 ×5 重试降级的缺陷
+            // 现场）——0 字节必须声明 `[EMPTY_MD5]`（空串 MD5）。
+            if block_md5.is_empty() {
+                return errno_json(2);
+            }
             let mut st = state.lock().unwrap();
             // 秒传腿：return_type=2 + fs_id 直接收尾（树内生成哨兵内容条目
             // ——秒传语义=云端已有同内容对象，内容不来自本次上传）。
@@ -941,10 +961,16 @@ fn create_file_finish(state: &Shared, form: &[(String, String)], path: &str) -> 
         return errno_json(31363);
     }
     // 齐全性 + 逐片 md5 比对（分片索引 0..n 齐且内容 md5 与声明一致）。
-    for (idx, want) in blocks.iter().enumerate() {
-        match session.parts.get(&(idx as i64)) {
-            Some(part) if md5_hex(part) == *want => {}
-            _ => return errno_json(10), // 缺片（spike §3.3 实证）/ 分片内容不符
+    // 服务端真形例外（2026-09-23 真网实测）：0 字节声明的唯一块
+    // `[EMPTY_MD5]` 免分片校验——无 superfile2 可传，precreate 声明即
+    // 视为在位（满块恒 4MiB、尾块恒 1..4MiB-1，空串 MD5 只能出自 0 字节）。
+    let zero_byte_only = blocks.len() == 1 && blocks[0] == EMPTY_STRING_MD5;
+    if !zero_byte_only {
+        for (idx, want) in blocks.iter().enumerate() {
+            match session.parts.get(&(idx as i64)) {
+                Some(part) if md5_hex(part) == *want => {}
+                _ => return errno_json(10), // 缺片（spike §3.3 实证）/ 分片内容不符
+            }
         }
     }
     if session.size != size || session.path != path {
@@ -952,7 +978,10 @@ fn create_file_finish(state: &Shared, form: &[(String, String)], path: &str) -> 
     }
     let mut content = Vec::with_capacity(size.max(0) as usize);
     for idx in 0..blocks.len() as i64 {
-        content.extend_from_slice(&session.parts[&idx]);
+        // 0 字节免传块无 parts 记录（上面已免校验）——贡献零字节。
+        if let Some(part) = session.parts.get(&idx) {
+            content.extend_from_slice(part);
+        }
     }
     // rtype=3 覆盖：同名条目移除（新 fs_id）+ 旧 blob 清理；K10 语义——
     // 绝不生成 `_2026…` 冲突重命名副本（rtype=1 行为，mock 不建模）。

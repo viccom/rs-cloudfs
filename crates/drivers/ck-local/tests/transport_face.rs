@@ -318,3 +318,15 @@ async fn factory_bootstraps_transport() {
     );
     let _v: &VolumeId = transport.driver().volume();
 }
+
+/// 探针（Phase 8 / D1）：宽面 transport 经 `as_driver` 取回 StorageDriver
+/// 宽面——read-through 回源的类型擦除逃生门；窄面默认 None 的对偶腿钉
+/// 在 cloudkit-storage `tests/types.rs`。
+#[test]
+fn as_driver_probe_reports_the_wide_face() {
+    let (_root, transport) = setup();
+    let driver = transport
+        .as_driver()
+        .expect("local transport 必须持有宽面驱动");
+    assert_eq!(driver.volume().scheme(), "local", "取回的是 local 宽面驱动");
+}

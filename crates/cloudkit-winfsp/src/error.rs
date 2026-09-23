@@ -32,6 +32,11 @@ pub fn ntstatus_for(error: &VfsError) -> NTSTATUS {
         VfsError::Exists(_) => STATUS_OBJECT_NAME_COLLISION,
         VfsError::IsDirectory(_) => STATUS_FILE_IS_A_DIRECTORY,
         VfsError::MissingPassword => STATUS_ACCESS_DENIED,
+        // Read-through's encrypted-instance refusal (Phase 8 / D10): a
+        // policy refusal like MissingPassword — the instance must use
+        // `cydrive sync`, not the mount, so ACCESS_DENIED (the code
+        // Explorer surfaces with a refusal) rather than an I/O fault.
+        VfsError::EncryptedInstance => STATUS_ACCESS_DENIED,
         VfsError::ParentMissing(_) => STATUS_OBJECT_PATH_NOT_FOUND,
         // "The file is in use": the bytes exist only locally until the
         // upload lands, so a delete/open is a sharing problem, not a

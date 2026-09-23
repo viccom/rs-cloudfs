@@ -52,6 +52,12 @@ tokio = { version = "1", features = ["rt", "io-util", "sync", "time", "fs"] }
 tracing = "0.1"
 
 [dev-dependencies]
+# Phase 8 RT5 live_readthrough：read-through 真机腿需要真 Vfs/MetaDatabase/
+# rebuild（L3）打真驱动——**仅测试图**的 L1→L3 dev 边（生产依赖图不变：
+# 驱动运行时仍只允许 cloudkit-storage，driver-onboarding §1 的运行时
+# 约束不动）；RT5 任务单指定 scripts/check_layers 为裁决面，dev-only 边
+# 不落 R1 正则（2026-09-22 跑证通过；字面张力记批次报告/跟踪单）。
+cloudkit-core = { path = "../../cloudkit-core" }
 # 手搓注入桩的进程内服务端（WD2a；axum 钉 0.8.9，ck-pan115 桩同款先例。
 # 只需 http1+tokio——桩不走 json/query 提取器，verbs 经 fallback 单点分发）。
 axum = { version = "=0.8.9", default-features = false, features = [

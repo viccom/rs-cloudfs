@@ -51,3 +51,8 @@ rand = "0.10"
 # SF2 桩：私钥形态认证测试的临时密钥文件（lock 既有，ck-local dev-dep
 # 同版本先例）。
 tempfile = "3"
+# Phase 8 RT5 live_readthrough：sftp 共性冒烟腿需要真 Vfs/MetaDatabase
+# （L3）打真 sftp 驱动——**仅测试图**的 L1→L3 dev 边（生产依赖图不变，
+# 理由与裁决记录同 ck-webdav dev-dep 注释；scripts/check_layers 机械面
+# 通过）。tempfile 供夹具状态目录（驱动根外）。
+cloudkit-core = { path = "../../cloudkit-core" }

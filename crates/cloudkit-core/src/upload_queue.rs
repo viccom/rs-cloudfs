@@ -644,7 +644,18 @@ async fn process_job(
     // digest is well-defined (Python parity).
     let sha256 = precompute_sha256(&job);
 
-    // Contract 6: 0-byte uploads never touch the remote.
+    // Contract 6 (narrowed by K85.6, project owner 2026-09-23): 0-byte
+    // uploads skip the remote ONLY on a **shadow-index** backend. On an
+    // **authoritative-index** backend the remote IS the index, so a
+    // 0-byte row always has a real payload to store and must land it —
+    // encrypted (a 44 B / 50 B container, the Phase 8-B EB4 case) or
+    // plaintext (a genuine 0-byte object). Skipping it would make the
+    // file vanish from the backend the moment the local index is lost:
+    // read-through/rebuild can no longer enumerate it (EB4 leg 1 first
+    // exposed the encrypted half; K85.6's ruling fixed the plaintext
+    // half it carried as an observation). Shadow-index backends
+    // (telegram) keep the skip — their remote is not the index (no list
+    // face) and Python's "no empty message" parity stands.
     if job.size == 0 {
         // MiniRedir's small-file chain opens with an empty PUT artifact
         // (empty PUT → LOCK → full PUT). When that artifact's job is
@@ -657,7 +668,8 @@ async fn process_job(
         // remote stayed empty). The row above is read fresh, so `row.size`
         // is the current truth: a 0-byte job over a non-empty row is a
         // stale artifact — skip it entirely; the superseding job owns the
-        // outcome.
+        // outcome. (Both arms below: an encrypted row superseded by a
+        // full PUT skips the same way.)
         if row.size != 0 {
             tracing::debug!(
                 rel_path = %job.rel_path,
@@ -676,21 +688,33 @@ async fn process_job(
             bump(&stats.degraded);
             return;
         }
-        match persist_zero_byte(db, &row, sha256) {
-            Ok(()) => {
-                delete_local_copy(&job.local_path);
-                bump(&stats.succeeded);
+        let authoritative_payload = transport.capabilities().authoritative_index;
+        if !authoritative_payload {
+            match persist_zero_byte(db, &row, sha256) {
+                Ok(()) => {
+                    delete_local_copy(&job.local_path);
+                    bump(&stats.succeeded);
+                }
+                Err(error) => {
+                    tracing::warn!(
+                        rel_path = %job.rel_path,
+                        %error,
+                        "0-byte persist failed; degrading"
+                    );
+                    bump(&stats.degraded);
+                }
             }
-            Err(error) => {
-                tracing::warn!(
-                    rel_path = %job.rel_path,
-                    %error,
-                    "0-byte persist failed; degrading"
-                );
-                bump(&stats.degraded);
-            }
+            return;
         }
-        return;
+        // Fall through (the authoritative arm): the staging/stream path
+        // below produces this row's REAL payload — 44 B (v1) or 50 B
+        // (v2) of ciphertext for an encrypted row, or a genuine 0-byte
+        // object for a plaintext one (all six wide drivers' writer
+        // faces accept an empty close — ck-pan123 ride-along
+        // `empty_file_roundtrips_via_a_single_empty_part`). The chunk
+        // plan is re-derived over the payload in the encrypted arms
+        // (staged job / `upload_v2_stream`'s cipher job), so the zero
+        // plan `commit_put` enqueued never reaches the transport.
     }
 
     // Encrypted staging: required only when the row is flagged encrypted
@@ -703,6 +727,18 @@ async fn process_job(
         && cfg.encryption_scheme == crate::config::EncryptionScheme::AeadV2;
     let mut staged: Option<StagedUpload> = None;
     let mut enc_tmp = EncTempGuard(None);
+    // K85.6 plaintext arm: a 0-byte job arrives with a zero chunk plan
+    // (`commit_put` plans 0 chunks for size 0), but the wide drivers
+    // report a single-chunk receipt for an empty object (ck-local
+    // `chunk_msg_ids: vec![0]`; ck-pan123's green
+    // `empty_file_roundtrips_via_a_single_empty_part`), so the
+    // transport's plan check must see one. The encrypted arms re-plan
+    // inside their own staging/stream step; this effective job carries
+    // the plaintext arm's one-chunk plan.
+    let zero_byte_plain_job = UploadJob {
+        chunk_count: 1,
+        ..job.clone()
+    };
 
     let mut consecutive_failures = 0u32;
     loop {
@@ -760,7 +796,15 @@ async fn process_job(
                 .expect("use_v2 implies a password");
             upload_v2_stream(transport, &job, password).await
         } else {
-            let target = staged.as_ref().map(|s| &s.job).unwrap_or(&job);
+            // Zero-byte plaintext on an authoritative backend rides the
+            // one-chunk effective plan (`zero_byte_plain_job`); every
+            // other job goes to the transport as-is.
+            let plain = if job.size == 0 {
+                &zero_byte_plain_job
+            } else {
+                &job
+            };
+            let target = staged.as_ref().map(|s| &s.job).unwrap_or(plain);
             transport
                 .upload(target)
                 .await

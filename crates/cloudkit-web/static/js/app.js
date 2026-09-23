@@ -268,7 +268,7 @@ function updateRebuildButton() {
         btn.setAttribute('data-i18n-title', key);
         btn.title = t(key);
     };
-    if (row.backend === 'telegram' || row.encrypted) {
+    if (row.backend === 'telegram') {
         btn.disabled = true;
         if (icon) icon.classList.remove('fa-spin');
         setTitle('index.rebuild_unsupported');

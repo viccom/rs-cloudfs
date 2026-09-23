@@ -13,9 +13,11 @@
 
 use std::fs;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 use std::time::Duration;
 
+use async_trait::async_trait;
 use dav_server::davpath::DavPath;
 use dav_server::fs::{DavFileSystem, FsError, OpenOptions};
 use futures_util::StreamExt;
@@ -24,9 +26,15 @@ use cloudkit_core::cache::CacheManager;
 use cloudkit_core::database::{FileUpsert, MetaDatabase};
 use cloudkit_core::rel_path::RelPath;
 use cloudkit_core::transport::mock::MockTransport;
-use cloudkit_core::transport::{CloudTransport, StorageError, UploadJob, UploadReceipt};
+use cloudkit_core::transport::{
+    ByteStream, CloudTransport, RemoteHandle, StorageError, UploadJob, UploadReceipt,
+};
 use cloudkit_core::upload_queue::RetryPolicy;
 use cloudkit_core::vfs::{Vfs, VfsConfig};
+use cloudkit_storage::{
+    Entry, EntryId, Listing, MockStorageDriver, Page, Quota, Range, RelPath as VolRel,
+    StorageDriver, UploadStager, VolumeId, WriteHint,
+};
 use cloudkit_webdav::CyDriveFs;
 
 /// The virtual 10 TB quota from compat contract 6 (Python
@@ -1663,4 +1671,406 @@ async fn remove_file_pending_upload_forbidden() {
         db.get_file("/ghost.bin").expect("db read").is_none(),
         "the ghost row is gone"
     );
+}
+
+// ------------------------------------- Phase 8 / RT3: read-through faces ---
+//
+// The A1 face-level scenario: an EMPTY local index over a STOCKED remote
+// must answer PROPFIND with the remote content (read-through, D5), land
+// the rows in the `files` table, and cost exactly one driver list per
+// view (A3). The narrow-mock harness above pins the degraded (D2) arm;
+// these tests cast the wide-face transport double (the same minimal
+// `as_driver` shape the core read-through tests use — test helpers do
+// not cross crates) over the storage mock.
+
+/// Counts `list` calls so the O(1)-per-view claim is asserted, not
+/// assumed.
+struct CountingDriver {
+    inner: Arc<MockStorageDriver>,
+    list_calls: Arc<AtomicUsize>,
+}
+
+#[async_trait]
+impl StorageDriver for CountingDriver {
+    fn volume(&self) -> &VolumeId {
+        self.inner.volume()
+    }
+
+    fn capabilities(&self) -> cloudkit_storage::Capabilities {
+        self.inner.capabilities()
+    }
+
+    async fn list(&self, dir: &VolRel, page: Page) -> Result<Listing, StorageError> {
+        self.list_calls.fetch_add(1, Ordering::SeqCst);
+        self.inner.list(dir, page).await
+    }
+
+    async fn stat(&self, path: &VolRel) -> Result<Entry, StorageError> {
+        self.inner.stat(path).await
+    }
+
+    async fn mkdir(&self, path: &VolRel) -> Result<(), StorageError> {
+        self.inner.mkdir(path).await
+    }
+
+    async fn delete(&self, id: &EntryId) -> Result<(), StorageError> {
+        self.inner.delete(id).await
+    }
+
+    async fn rename(&self, from: &VolRel, to: &VolRel) -> Result<(), StorageError> {
+        self.inner.rename(from, to).await
+    }
+
+    async fn reader(
+        &self,
+        id: &EntryId,
+        range: Option<Range>,
+    ) -> Result<cloudkit_storage::ByteStream, StorageError> {
+        self.inner.reader(id, range).await
+    }
+
+    async fn writer(
+        &self,
+        path: &VolRel,
+        hint: &WriteHint,
+    ) -> Result<Box<dyn UploadStager>, StorageError> {
+        self.inner.writer(path, hint).await
+    }
+
+    async fn quota(&self) -> Result<Quota, StorageError> {
+        self.inner.quota().await
+    }
+}
+
+/// Wide-face transport double: exposes the driver through the `as_driver`
+/// probe (D1); `capabilities` mirrors the driver's declaration (R4).
+struct WideTransport<D: StorageDriver> {
+    driver: D,
+}
+
+#[async_trait]
+impl<D: StorageDriver> CloudTransport for WideTransport<D> {
+    async fn connect(&self) -> Result<(), StorageError> {
+        Ok(())
+    }
+
+    async fn upload(&self, _job: &UploadJob) -> Result<UploadReceipt, StorageError> {
+        Err(StorageError::Unsupported)
+    }
+
+    async fn open(&self, _file: &RemoteHandle) -> Result<ByteStream, StorageError> {
+        Err(StorageError::Unsupported)
+    }
+
+    async fn open_range(
+        &self,
+        _file: &RemoteHandle,
+        _off: u64,
+        _len: u64,
+    ) -> Result<ByteStream, StorageError> {
+        Err(StorageError::Unsupported)
+    }
+
+    async fn delete_remote(&self, _handle: &RemoteHandle) -> Result<(), StorageError> {
+        Err(StorageError::Unsupported)
+    }
+
+    fn capabilities(&self) -> cloudkit_core::transport::Capabilities {
+        self.driver.capabilities()
+    }
+
+    fn as_driver(&self) -> Option<&dyn StorageDriver> {
+        Some(&self.driver)
+    }
+}
+
+/// Wide-face environment: real SQLite + cache tree + a wide transport
+/// over the counting storage mock + Vfs + the adapter under test. The
+/// "remote" is seeded through `driver` (storage-mock writer/mkdir); the
+/// `files` index starts EMPTY.
+struct WideEnv {
+    _dir: tempfile::TempDir,
+    db: Arc<MetaDatabase>,
+    driver: Arc<MockStorageDriver>,
+    list_calls: Arc<AtomicUsize>,
+    fs: CyDriveFs,
+}
+
+async fn wide_env() -> WideEnv {
+    let dir = tempfile::tempdir().expect("create temp dir");
+    let db = Arc::new(MetaDatabase::open(&dir.path().join("meta.db")).expect("open temp db"));
+    let cache = CacheManager::new(dir.path().join("cache"), u64::MAX);
+    let driver = Arc::new(MockStorageDriver::new(
+        VolumeId::parse("baidu:123456789").expect("volume id"),
+    ));
+    let list_calls = Arc::new(AtomicUsize::new(0));
+    let counting = CountingDriver {
+        inner: Arc::clone(&driver),
+        list_calls: Arc::clone(&list_calls),
+    };
+    let transport: Arc<dyn CloudTransport> = Arc::new(WideTransport { driver: counting });
+    let vfs = Arc::new(Vfs::new(db.clone(), cache, transport, test_cfg()));
+    let fs = CyDriveFs::new(
+        vfs.clone(),
+        db.clone(),
+        CacheManager::new(dir.path().join("cache"), u64::MAX),
+    );
+    WideEnv {
+        _dir: dir,
+        db,
+        driver,
+        list_calls,
+        fs,
+    }
+}
+
+/// Seeds one file onto the storage-mock remote (writer + write + close).
+async fn seed_wide_file(driver: &MockStorageDriver, path: &str, data: &[u8]) {
+    let rel = VolRel::new(path).expect("seed path");
+    let hint = WriteHint {
+        size: Some(data.len() as u64),
+        ..Default::default()
+    };
+    let mut stager = driver.writer(&rel, &hint).await.expect("seed writer");
+    stager.write(data).await.expect("seed write");
+    stager.close().await.expect("seed close");
+}
+
+/// Seeds one directory onto the storage-mock remote.
+async fn seed_wide_dir(driver: &MockStorageDriver, path: &str) {
+    driver
+        .mkdir(&VolRel::new(path).expect("seed dir path"))
+        .await
+        .expect("seed mkdir");
+}
+
+/// Collects a directory stream into the names a PROPFIND served.
+async fn collect_names(
+    stream: dav_server::fs::FsStream<Box<dyn dav_server::fs::DavDirEntry>>,
+) -> Vec<String> {
+    let entries: Vec<_> = stream.map(|entry| entry.expect("entry")).collect().await;
+    entries
+        .iter()
+        .map(|entry| String::from_utf8(entry.name()).expect("utf8 name"))
+        .collect()
+}
+
+/// A1 at the gateway face: empty index + stocked remote → PROPFIND
+/// (metadata + read_dir) serves the remote content, materializes the
+/// rows, and costs exactly one driver list per view (A3 / D5).
+#[tokio::test]
+async fn readthrough_empty_db_propfind_serves_the_remote_content() {
+    let env = wide_env().await;
+    seed_wide_dir(&env.driver, "Documents").await;
+    seed_wide_dir(&env.driver, "Photos").await;
+    seed_wide_file(&env.driver, "readme.txt", b"hello").await;
+    seed_wide_file(&env.driver, "Documents/note.txt", b"12345").await;
+
+    assert!(
+        env.db.list_dir("/").expect("db read").is_empty(),
+        "the index starts empty"
+    );
+
+    // Root view: metadata synthesizes the root (no network), read_dir
+    // lists off the remote.
+    let root_meta = env
+        .fs
+        .metadata(&DavPath::new("/").expect("path"))
+        .await
+        .expect("root metadata");
+    assert!(root_meta.is_dir());
+    let names = collect_names(
+        env.fs
+            .read_dir(
+                &DavPath::new("/").expect("path"),
+                dav_server::fs::ReadDirMeta::Data,
+            )
+            .await
+            .expect("root listing"),
+    )
+    .await;
+    assert_eq!(
+        names,
+        vec!["Documents", "Photos", "readme.txt"],
+        "dirs first, then name-ascending — the remote content on an empty index"
+    );
+    assert!(
+        env.db
+            .get_file("/Documents")
+            .expect("db read")
+            .is_some_and(|row| row.is_dir),
+        "the directory row materialized"
+    );
+    assert!(
+        env.db.get_file("/readme.txt").expect("db read").is_some(),
+        "the file row materialized"
+    );
+    assert_eq!(
+        env.list_calls.load(Ordering::SeqCst),
+        1,
+        "the root view costs exactly one driver list"
+    );
+
+    // Navigation into /Documents (the Explorer shape: metadata + list).
+    let meta = env
+        .fs
+        .metadata(&DavPath::new("/Documents").expect("path"))
+        .await
+        .expect("dir metadata");
+    assert!(meta.is_dir());
+    let names = collect_names(
+        env.fs
+            .read_dir(
+                &DavPath::new("/Documents").expect("path"),
+                dav_server::fs::ReadDirMeta::Data,
+            )
+            .await
+            .expect("sub listing"),
+    )
+    .await;
+    assert_eq!(names, vec!["note.txt"], "the child layer serves too");
+    assert!(
+        env.db
+            .get_file("/Documents/note.txt")
+            .expect("db read")
+            .is_some(),
+        "the child row materialized"
+    );
+    assert_eq!(
+        env.list_calls.load(Ordering::SeqCst),
+        2,
+        "each view costs exactly one list — O(1) per layer, never a tree walk"
+    );
+}
+
+/// The pre-list guards keep their semantics on the wide face: PROPFIND
+/// of a file is Forbidden, of a path the driver reports gone is NotFound
+/// (the original `row()` pre-check's meaning, now answered through
+/// `stat_fresh`).
+#[tokio::test]
+async fn readthrough_keeps_the_read_dir_guards_on_the_wide_face() {
+    let env = wide_env().await;
+    seed_wide_file(&env.driver, "plain.txt", b"x").await;
+
+    match env
+        .fs
+        .read_dir(
+            &DavPath::new("/plain.txt").expect("path"),
+            dav_server::fs::ReadDirMeta::Data,
+        )
+        .await
+    {
+        Err(e) => assert_eq!(e, FsError::Forbidden),
+        Ok(_) => panic!("expected Forbidden from read_dir on a file"),
+    }
+
+    match env
+        .fs
+        .read_dir(
+            &DavPath::new("/nope").expect("path"),
+            dav_server::fs::ReadDirMeta::Data,
+        )
+        .await
+    {
+        Err(e) => assert_eq!(e, FsError::NotFound),
+        Ok(_) => panic!("expected NotFound from read_dir on a missing path"),
+    }
+}
+
+/// GET (open read) on a file that exists only on the remote: the row
+/// materializes through `stat_fresh` and the streaming arm opens off the
+/// materialized row (Content-Length parity, K35).
+#[tokio::test]
+async fn readthrough_open_read_serves_a_remote_only_file() {
+    let env = wide_env().await;
+    seed_wide_file(&env.driver, "docs/note.txt", b"12345").await;
+
+    let mut file = env
+        .fs
+        .open(
+            &DavPath::new("/docs/note.txt").expect("path"),
+            read_options(),
+        )
+        .await
+        .expect("open a remote-only file");
+    let meta = file.metadata().await.expect("file metadata");
+    assert!(!meta.is_dir());
+    assert_eq!(
+        meta.len(),
+        5,
+        "the materialized row carries the remote size"
+    );
+}
+
+/// 6i（Phase 8-B EB2 面级）：错 size 的 aead_v2 加密行 → GET 面
+/// `metadata()`（= Content-Length 的来源，K35 承重面）与**实发字节数**
+/// 一致——`open_read` 的首读修正必须传导到网关（RangeFile 构造时的
+/// RowMetaData 取自回写**之后**的行）。
+///
+/// 接受残余（计划 §6）：首次 PROPFIND 在「猜错 + 未首读」窗口仍显示
+/// 初值尺寸——一次性，首读后自愈；本钉钉的是 GET 面首读即修正。
+#[tokio::test]
+async fn wrong_size_encrypted_row_repairs_content_length_before_the_get() {
+    let (_dir, db, _cache_root, mock, _vfs, fs) = test_env_with_password(u64::MAX, "pw").await;
+
+    let plain_len = 150_000usize;
+    let plaintext = pattern(plain_len);
+    let container = cloudkit_core::crypto::AeadV2::new().encrypt("pw", &plaintext);
+    let container_len = container.len() as u64;
+    let receipt = seed_remote(&mock, "/wrong-size.bin", &container, 1, container_len).await;
+
+    // 错 size 行（真值 − 4096）：scheme 标签正确、只 size 错。
+    let wrong = plain_len as i64 - 4096;
+    let rel = RelPath::new("/wrong-size.bin").expect("valid rel path");
+    let file_id = db
+        .upsert_file_scheme(
+            &FileUpsert {
+                size: wrong,
+                telegram_msg_id: Some(receipt.first_msg_id),
+                is_encrypted: true,
+                ..shape_upsert(&rel, false, wrong, 1_700_000_123.0)
+            },
+            "aead_v2",
+        )
+        .expect("seed wrong-size aead_v2 row");
+    db.upsert_chunk(file_id, 0, receipt.first_msg_id, container_len as i64, None)
+        .expect("seed container chunk (ct 来源)");
+
+    let fs = fs.with_stream_window(4096);
+    let mut file = fs
+        .open(
+            &DavPath::new("/wrong-size.bin").expect("path"),
+            read_options(),
+        )
+        .await
+        .expect("open the wrong-size encrypted row");
+    let meta = file.metadata().await.expect("file metadata");
+    assert_eq!(
+        meta.len(),
+        plain_len as u64,
+        "Content-Length = 首读修正后的明文真值（非播种初值）"
+    );
+
+    // 实发字节数 = Content-Length，且逐字节 = 明文。
+    let mut body = Vec::new();
+    loop {
+        let frame = file.read_bytes(1 << 20).await.expect("body frame read");
+        if frame.is_empty() {
+            break;
+        }
+        body.extend_from_slice(&frame);
+    }
+    assert_eq!(
+        body.len() as u64,
+        meta.len(),
+        "Content-Length 与实际发字节数一致（首读修正传导到网关）"
+    );
+    assert_eq!(body, plaintext, "GET 体逐字节 = 明文");
+
+    // 行侧同步回写（db 真值）。
+    let row = db
+        .get_file("/wrong-size.bin")
+        .expect("db read")
+        .expect("row exists");
+    assert_eq!(row.size, plain_len as i64, "行 size 已按首读真值回写");
 }

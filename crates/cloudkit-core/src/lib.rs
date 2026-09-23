@@ -16,6 +16,8 @@ pub mod database;
 pub mod enc_stream;
 pub mod inbound;
 pub mod logging;
+pub mod materialize;
+pub mod readthrough;
 pub mod rebuild;
 pub mod rel_path;
 pub mod sync;
