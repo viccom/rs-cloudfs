@@ -67,7 +67,7 @@
 | 3 | **首次 PROPFIND 初值窗口**（「配置初值猜错 + 未首读」时显示初值尺寸） | 接受残余（EB2 注明）：一次性、首读后自愈（B2 回写先于字节出门） |
 | 4 | **真网加密腿结果**（K84.4 验收项，有界纪律处置） | pan123 **2/2 绿**（aead_v2 全栈 + WebDAV 明/密双轮，收尾核空）；pan115 腿1 绿、**腿2 挂负责人真机窗口**（盘上 refresh 被腿1 内存刷轮换且 e2e `token_store=None` 不回写 → probe-refresh `40140120` 一轮失败 → 恢复需真人扫码重发 token；离线三腿已覆盖机制本体） |
 | 5 | **web_e2e 15d 与 gcm 分流裁决指针** | EB2 裁决①（gcm 行账目自洽性分流——不自洽才付 34B 头读）**维持现状**，主会话已批；详见 EB2 批次日志裁决① |
-| 6 | **Contract-6 明文空件同款观察（EB4 新发现，未修待裁决）** | 明文 0 字节行在 authoritative 后端同样不落远端、索引丢失后文件名消失——Phase 8 既有行为，不在 EB4 授权范围；加密侧已修（EB4 红→绿），明文侧行为变更需负责人裁决（牵动 MiniRedir 空 PUT 语义与 `zero_byte_job_skips_transport` 既有契约） |
+| 6 | ~~**Contract-6 明文空件同款观察（EB4 新发现，未修待裁决）**~~ **已修（K85.6，2026-09-23，负责人裁决「事2 修」）** | 明文 0 字节行在 authoritative 后端同样不落远端、索引丢失后文件名消失——原为 EB4 挂账；**负责人 2026-09-23 裁决为修**（EB4 遗留观察处置），与加密侧同批收口：0 字节闸收窄为「**影子索引后端才跳过**」，权威后端明文/加密都落真实对象（明文 = 真 0 字节对象 + `zero_byte_plain_job` 单片计划；telegram parity 与 MiniRedir stale 守卫一字不动）。三红→绿：单测正臂（`calls.len() left:0 right:1`）+ 影子臂回归哨 + e2e 可见性腿（远端 0 字节对象 + wipe db 后 `read_dir_fresh` 可见）；契约同步 = 原 `zero_byte_job_skips_transport` 拆正/影子两臂、EB4 加密正反臂注释标注新闸形态。裁决全文见 decisions **K85.6**；批次日志见下「K85.6 修复批」 |
 | 7 | Phase 8 主链（RT0–RT5+审查批）与 Phase 8-B（EB1–EB4）同分支叠加，均**待合入** | 合入指令到时一并处理；worktree `feat/readthrough-index` 独立 target |
 
 ### EB2（2026-09-23，实现子代理，worktree feat/readthrough-index）
@@ -215,3 +215,29 @@
 - 七组合裁剪 clippy（全量之后跑，双指纹纪律）→ telegram/baidu/local/sftp/pan115/pan123/webdav **七行全部 `Finished dev profile` 零告警**。
 
 **提交**：`test(phase8b): 两阶段验收三腿 + Contract-6 加密空件例外 + 真网加密腿重跑 + web 门控收窄（EB4）` 与 `docs(phase8b): K85 收口——README/AGENTS/跟踪单终态（EB4）`。
+
+### K85.6 修复批（2026-09-23，实现子代理，worktree feat/readthrough-index）
+
+**授权**：负责人 2026-09-23 明示「事2 修」——EB4/K85.5 挂账的「明文 0 字节在权威后端不落远端」由观察转为修复。契约修订范围 = `upload_queue::process_job` 的 0 字节闸（见 decisions K85.6）。
+
+**先查后做（宽面驱动 0 字节 writer/stager 语义核对，任务要求的「务必核对」项）**：六宽面驱动的 writer 面对 0 字节**均产生合法远端对象**，逐驱动证据：
+- **ck-local**：`store_bytes` → `LocalStager::write(empty)+close`（`tokio::fs::write_all(&[])` 合法 + `metadata().len()==0` 匹配 `hinted_size=0`）——既有绿测 `transport_face.rs::upload_empty_file_roundtrip`（0 字节上传 + open 回空）直接钉；
+- **ck-sftp**：`SftpStager::close` 的 `hinted == written` 在空件时 0==0 通过，远端 size 复核 0==0 通过（该驱动的「0 字节上传 bug 唯一持久修复」正是这条复核）——无 0 字节拒绝臂；
+- **ck-webdav**：`client.put` 空 `Bytes` 合法（`put_timeout(0)=CONTROL_TIMEOUT`）+ stager 的 `hinted != written`（0==0）与 ④stat 复核（`remote_size == written` 0==0）通过；
+- **ck-baidu**：`data.chunks(4MiB)` 对空切片得空 block_list（合法）；**残余风险如实录**：空 block_list 的 precreate/create 未在本桩面覆盖，真机未实测（见风险节）；
+- **ck-pan115**：`size(0) <= part_size` → 单分片 `put_object_path` 对空 spool 发合法空 PutObject；`finish_entry` 的 size 复核 0==0 通过；
+- **ck-pan123**：既有绿测 `write_path.rs::empty_file_roundtrips_via_a_single_empty_part`（恰 1 次 empty part PUT + complete + 回读空）直接钉——**唯一有专门空件测试的驱动**。
+结论：无需驱动侧改动，放行条件成立。
+
+**落地件**（生产 1 文件 + 测试 3 文件 + 文档 2 文件）：
+1. **`upload_queue.rs`**：0 字节闸 `encrypted_container_is_payload = row.is_encrypted && password.is_some() && authoritative_index` → **`authoritative_payload = transport.capabilities().authoritative_index`**（加密不再必需）；新增 `zero_byte_plain_job`（`chunk_count: 1`）——0 字节明文的 `commit_put` 计划是零分片，而各驱动对空对象回报**单片 receipt**，故明文臂把单片有效计划传给 transport（加密臂本就各自在 staging/stream 步重 plan，语义不动）；Contract 6 注释改写为「0 字节不触远端**仅限影子索引后端**；权威后端落真实对象——明文 0 字节对象与加密容器同为可枚举载荷」；stale 空 PUT 守卫（`row.size != 0` → degraded）一字未动。
+2. **`cloudkit-core/tests/upload_queue.rs`**：原 `zero_byte_job_skips_transport`（默认 mock = 影子形态却断言跳过）**拆为两臂**——`zero_byte_job_uploads_to_an_authoritative_backend`（正臂：`authoritative_index=true`，钉上传恰一次 + `mock.message(1)` 存在且空 + 行 uploaded/size 0/msg_id=1 + 本地副本删）、`zero_byte_job_still_skips_a_shadow_index_transport`（影子臂：原断言语义逐字保留 + 补 stream 面零调用）；EB4 加密正反臂语义不变，仅注释标注 K85.6 新闸形态。
+3. **`cloudkit-cli/tests/zero_byte_authoritative_e2e.rs`**（新，非 ignored）：明文实例 + local 驱动——0 字节上传排空 → **远端核验**（后台目录确有该对象且长 0）→ wipe db → `read_dir_fresh` → **该文件在物化列表中出现**（缺陷的用户可见形态）+ 非空对照同现。
+
+**三红→绿真实输出（红=修复前实跑）**：
+- 红 a（`upload_queue.rs::zero_byte_job_uploads_to_an_authoritative_backend`）：`assertion left == right failed: a 0-byte row on an authoritative backend must land a real remote object — left: 0 right: 1`（上传零次）→ 绿；
+- 红 c（`zero_byte_authoritative_e2e.rs`）：`panicked … the 0-byte object must exist on an authoritative backend (Contract 6 skip would leave it remote-absent)`（后端目录无该对象）→ 绿；
+- 红（实现期中间态，如实录）：放宽闸后首次跑正臂红 `left: 3 right: 1`——mock 的 `finish_upload` 对空文件按 **1 chunk** 计，而 job 的零分片计划不匹配 → `Unavailable` → 3 次重试后降级；这正是「零计划不得到达 transport」的实证，补 `zero_byte_plain_job` 后绿；
+- 绿：`upload_queue` **29/29**；`zero_byte_authoritative_e2e` **1/1**；`encrypted_read` 5 / `materialize` 9 / `readthrough` 21 / `rebuild` 11 / `encrypted_readthrough_e2e` 3 全 0 failed（既有断言零漂移）。
+
+**提交**：`fix(upload): 明文 0 字节在权威后端落真实对象——Contract 6 收窄至影子索引后端（K85.6）`。

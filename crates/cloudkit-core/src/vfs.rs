@@ -498,11 +498,12 @@ impl Vfs {
         size: u64,
         mtime: f64,
     ) -> Result<(), VfsError> {
-        // 0-byte rows carry a zero chunk plan (the queue skips the
-        // transport for them — Contract 6; the EB4 exception: an
-        // encrypted row on an authoritative backend falls through to its
-        // container upload and the worker re-plans over the ciphertext);
-        // otherwise ceil(len / chunk_size) >= 1.
+        // 0-byte rows carry a zero chunk plan (K85.6: only a shadow-index
+        // backend skips the transport for them; an authoritative backend
+        // falls through to its real payload — a plaintext 0-byte object or
+        // an encrypted container — and the worker re-plans the empty
+        // object's single-chunk plan / the ciphertext chunk split before
+        // the transport sees it); otherwise ceil(len / chunk_size) >= 1.
         let chunk_count = if size == 0 {
             0
         } else {
