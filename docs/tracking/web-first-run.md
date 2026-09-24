@@ -24,6 +24,10 @@
 - **FR2 空态文案**：`volumes.empty` en/zh 改引导语（指向「＋ 添加卷」）+ 新 pin 测试 `empty_volume_state_copy_points_at_add_volume`（fetch i18n.js 断言新文案在/旧文案删），红→绿，volumes_page **42/0**。commit `bb56349`。
 - 注：首次派发的 FR1/FR2 代理在探查期撞平台 5 小时限额（22:05:06 重置）零残留；FR2 改由主会话直做（≤10 行），FR1 重派。
 
+## 负责人验收三调整批（2026-09-24）
+
+- ① `run --no-open-browser`（clap flag → 进程内置 CYDRIVE_NO_OPEN_BROWSER）；② 建卷表单加密默认 aead_v2（前端预选 gcm 修正 + 编辑预填映射翻转 + pin 测试，stash 红→绿）；③ **MountBackend 默认全局翻 winfsp + 删除 net use 回落**（choose_mount_backend/mount 三臂/单卷 mount 命令臂 + MountedBackend::WebDavFallback 变体删除 + mount_backend.rs 钉测翻转 + 模板删冗余键 + doctor/examples/README 文案）。config_mount_backend.rs 默认钉补翻（d5227fc，首轮漏网单文件套件）。真机冒烟：`--no-open-browser` 下 bootstrap → 建带盘符 Z: 卷 200（winfsp 挂载）→ Get-PSDrive 在 → DESTROY 200 → 盘符消失 → 日志零浏览器打开记录。workspace **1683/0/62**。
+
 ## 负责人实测揭红修复批（2026-09-24）
 
 - **修复①（`762d08f`）**：首启空注册表**不绑 8485 WebDAV 监听器** → 运行时加带盘符卷的挂载（默认 net use 后端）无端点 → 回滚。修 = `bind_multi_webdav(…, first_run)` 首启绑空注册表（RV1 投影动态接新卷）；钉测 = first_run boot 断言 `webdav_addr().is_some()`（红→绿）。顺带修空注册表 `all_failed()` 空真皮。
