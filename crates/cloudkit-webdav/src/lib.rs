@@ -308,6 +308,12 @@ impl DavFileSystem for CyDriveFs {
                 return Err(FsError::Exists);
             }
             self.require_dir_parent(&rel)?;
+            // **远端先行**（BUG 3 修复，pan123 真机 e2e 2026-09-24）：宽面
+            // 后端上目录必须先落远端——失败/已存在则本地行不写（修复前只
+            // upsert 本地行并标 `is_uploaded: true` 的假声明，MKCOL 报 201
+            // 而远端无此目录）。无宽面的影子索引后端（telegram）如实降级
+            // 为 no-op，行为与修复前逐字一致。
+            self.vfs.mkdir_remote_for_row(&rel).await.map_err(vfs_err)?;
             let parent_dir = match rel.parent() {
                 Some(parent) => parent.as_str().to_string(),
                 None => "/".to_string(),
@@ -434,14 +440,26 @@ impl DavFileSystem for CyDriveFs {
                 if dest.is_dir || row.is_dir {
                     return Err(FsError::Exists);
                 }
+                // 覆盖臂的远端删除同样先行（dest 行即将消失——若远端
+                // 对象留着会成孤儿，rebuild 会把它复活）。
+                self.vfs.delete_remote_for_row(&to).await.map_err(vfs_err)?;
                 self.db.delete_file(to.as_str()).map_err(db_err)?;
                 let dest_local = self.cache.local_path(&to);
                 if dest_local.exists() {
                     let _ = std::fs::remove_file(&dest_local);
                 }
             }
+            // **远端先行**（Phase 7 真机 e2e 必修项）：宽面 + 单侧 move
+            // 声明的后端上，远端对象必须先动——失败则本地行原样保留
+            // （远端与本地绝不分裂）。无宽面的影子索引后端（telegram）
+            // 如实降级为 no-op，行为与修复前逐字一致。
+            self.vfs
+                .rename_remote_for_row(&from, &to)
+                .await
+                .map_err(vfs_err)?;
             // Rows move in place (ids and chunk linkage preserved); the
-            // remote keeps its messages — no re-upload, no delete.
+            // remote move above already happened (or was truthfully
+            // skipped on a face with no per-path objects).
             self.db
                 .rename_path(from.as_str(), to.as_str())
                 .map_err(db_err)?;
