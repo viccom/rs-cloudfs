@@ -101,7 +101,79 @@ flake 一次（L7 已记录的两个 pre-existing flake 之一，与改动无关
 
 两处远端均已清理回负责人原始内容；实例已停。
 
-## 未覆盖
+## winfsp 盘符面追修批（2026-09-24 深夜，BUG 2/3 类残留）
+
+负责人问询「baidu/sftp/webdav 是否存在最近审查发现的 BUG」→ 复核结论：
+**驱动面与 WebDAV 服务面（8485/8486）干净，但盘符挂载面（winfsp——
+Explorer 主用面）BUG 2/3 类缺陷仍在**。修复批 861c33c/285f32c 只碰了
+cloudkit-core/cloudkit-webdav；本批补齐 FSD 面（对一切宽面后端成立：
+baidu/sftp/webdav/pan115/pan123/local；telegram 窄面为正确降级）。
+
+### 缺陷（复核确证）
+
+- `fs.rs::rename_entry` 三臂（普通 / 覆盖 / 大小写改名）都只调
+  `db.rename_path`，从不调 `rename_remote_for_row`；覆盖臂的
+  `db.delete_file(to)` 也无远端删除先行——Explorer F2 = 同款假成功
+  （本地行走、远端留旧路径，rebuild 后回退）。删除路径无此问题
+  （`delete_entry` 早有 `delete_remote_for_row` 先行 + `bridge.block_on`
+  先例——修复可行性由它证明，非新增机制）。
+- `fs.rs::prepare_create` 目录腿走 core `Vfs::create_dir`（同步签名，
+  只写本地行 + `is_uploaded: true` 假声明）——「新建文件夹刷新后消失」
+  同款。
+
+### 修复（fs.rs 四处，与 WebDAV 适配器逐臂同构）
+
+| 臂 | 改动 |
+|---|---|
+| 普通改名 | `bridge.block_on(rename_remote_for_row)` 先于 `db.rename_path`；失败保行（Unavailable→EIO+error! 日志） |
+| 覆盖改名 | dest 的 `delete_remote_for_row` 先于 `db.delete_file`（防远端孤儿） |
+| 大小写改名 | 同普通臂——大小写翻转落到远端（rebuild 不再回退拼写） |
+| 目录创建 | `require_dir_parent`（保 ParentMissing 序，防远端孤儿）→ `mkdir_remote_for_row`（远端已有时 Exists→`STATUS_OBJECT_NAME_COLLISION`）→ core `create_dir` |
+
+### TDD 证据（红→绿，`cloudkit-winfsp/tests/wide_mutations.rs`）
+
+宽面桩镜像生产 transport_face 形态（`delete_remote` = 句柄映射后
+`driver.delete`，能力位镜像驱动声明 + `remote_delete`——不照实现抄）：
+
+- `rename_on_a_wide_face_moves_the_remote_object`——红
+  （`the remote object must be gone from the old path`）→ 绿
+- `rename_overwrite_on_a_wide_face_replaces_the_remote_destination`——
+  红（`the source must be gone from the remote`；旧远端目标 3B 留存）→ 绿
+- `case_only_rename_on_a_wide_face_flips_the_remote_spelling`——红
+  （`the old spelling must be gone`）→ 绿
+- `explorer_new_folder_on_a_wide_face_creates_the_remote_directory`——
+  红（`NotFound`）→ 绿
+- `explorer_new_folder_collides_when_the_remote_already_has_it`——红
+  （假成功返回 Ok）→ 绿（COLLISION 且零行写入）
+
+5/5 红（失败原因逐臂精确对应缺陷）→ 5/5 绿，断言零漂移。
+
+### 门禁（实跑）
+
+- winfsp 特性腿 **123/0/1**（+5；窄面 118 测试全绿——降级臂零漂移）
+- workspace **1700/0/62**（基线零漂移——winfsp 改动全在特性门内）
+- clippy（winfsp+feature 与 workspace 两跑）绿 / fmt 绿 / check_layers 绿
+  / scan_secrets 绿
+
+### 观察项销账（复核后不修）
+
+CLI `cydrive push` 祖先目录行（cli/lib.rs:4657 走 core `create_dir`，
+同假声明形态）：**五宽面驱动上传腿均 `ensure_parents` 自愈**（baidu
+upload.rs:357/693、pan115 upload.rs:825、pan123 upload.rs:824、sftp
+K75-3 `create_dir_all`、webdav stager.rs:231）——行声明随上传落地变真；
+上传失败中断的孤儿行由 read-through 剪除，无用户可见危害。挂账不修。
+
+### 未覆盖
+
+- **winfsp 面真机腿**（Explorer F2 / 新建文件夹于真卷）未跑——桩级
+  5 测试钉死；同一 `bridge.block_on` + 远端先行机制在删除路径已过
+  RV3 真机矩阵。
+- **大小写改名 × 大小写不敏感远端服务器**（webdav 后端指向
+  case-insensitive remote 时 MOVE `Overwrite:F` 可能 412）：WebDAV
+  适配器面同语义已随车（无大小写特判），真机 fixture（rclone/apache
+  on Linux）均大小写敏感，未构造不敏感腿。
+
+## 未覆盖（原批遗留）
 
 - **BUG 1 的跨卷 Destination 拒绝**：单测覆盖「跨卷前缀不剥」，但真机未
   构造「MOVE 到另一卷」用例（客户端一般不这么发）。

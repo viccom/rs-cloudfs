@@ -49,12 +49,12 @@
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 1683 测试（2026-09-24：web 首启引导 K87（无配置 bootstrap + init 模式零卷放行 + 空态引导文案 + 端口默认 8485/8486）；既有断言零漂移；ignored 62 = 真机/平台/真网类，其中 webdav live_readthrough 7 + webdav live_matrix 10 + sftp 真机矩阵 12 + sftp live_readthrough 3 + pan115 live_matrix 6 + pan115_e2e 4 + pan123 live_matrix 3 + pan123_e2e 5）
+cargo test --workspace --no-fail-fast            # 1700 测试（2026-09-24：winfsp 盘符面 BUG2/3 类追修（rename 三臂/目录创建接远端先行，wide_mutations 5 测试在 winfsp 特性腿）+ L2 共享件抽取 + WebDAV 面修复批累计；既有断言零漂移；ignored 62 = 真机/平台/真网类，其中 webdav live_readthrough 7 + webdav live_matrix 10 + sftp 真机矩阵 12 + sftp live_readthrough 3 + pan115 live_matrix 6 + pan115_e2e 4 + pan123 live_matrix 3 + pan123_e2e 5）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo build -p cloudkit-cli --no-default-features --features local,baidu   # 驱动裁剪构建（K30 四 feature）；缺驱动构建运行期报可行动错误（K31 rebuild 指引），cydrive --version 显示驱动清单（K32）
 LIBCLANG_PATH=D:/Python312/Lib/site-packages/clang/native cargo build -p cloudkit-cli --no-default-features --features sftp,winfsp --profile release-min   # 尺寸优化档（K68）：strip+fat LTO+单编译单元；opt-level=3 与 panic=unwind 不动（catch_unwind 防护依赖）；18M→15M，PDB 仍生成可回溯
-LIBCLANG_PATH=D:/Python312/Lib/site-packages/clang/native cargo test -p cloudkit-winfsp --features winfsp   # winfsp 腿（118 测试 + ignored 1 = 真机挂载；RT3 read-through 接线后 +1；需 libclang+MSVC，见已知陷阱）
+LIBCLANG_PATH=D:/Python312/Lib/site-packages/clang/native cargo test -p cloudkit-winfsp --features winfsp   # winfsp 腿（123 测试 + ignored 1 = 真机挂载；BUG2/3 类追修补宽面远端先行钉子 +5；需 libclang+MSVC，见已知陷阱）
 scripts/check_layers                             # R1 层依赖门禁（CI 同款；动 Cargo.toml 依赖后必跑）
 scripts/scan_secrets                             # R3 秘密扫描门禁（CI 同款；本地模式=全树扫描）
 ```

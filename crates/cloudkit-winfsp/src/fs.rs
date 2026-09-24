@@ -1118,6 +1118,20 @@ impl CloudFs {
         }
         match intent.kind {
             CreateKind::Directory => {
+                // 父目录行门（BUG 3 修复的前置序——与 WebDAV 适配器
+                // create_dir 同序：先本地父行，再远端 mkdir，最后写行；
+                // 顺序颠倒会让远端建了目录而本地 create_dir 报
+                // ParentMissing，留下远端孤儿目录）。
+                self.require_dir_parent(rel)?;
+                // **远端先行**（BUG 3 修复，winfsp 面）：修复前只写本地
+                // 行（`is_uploaded: true` 假声明），Explorer 新建文件夹
+                // 报成功而远端无此目录，read-through reconcile 随后把
+                // 「消失的文件夹」剪除。远端已有时 `Exists` 上抛映射
+                // STATUS_OBJECT_NAME_COLLISION——沿用远端既有目录才是
+                // 真态。窄面后端逐字 no-op。
+                self.bridge
+                    .block_on(self.vfs.mkdir_remote_for_row(rel))
+                    .map_err(|error| fsp_error(&error))?;
                 self.vfs
                     .create_dir(rel)
                     .map_err(|error| fsp_error(&error))?;
@@ -1506,6 +1520,12 @@ impl CloudFs {
                     from.as_str().to_string(),
                 )));
             }
+            // 远端先行（BUG 2 修复，winfsp 面——与 WebDAV 适配器 rename
+            // 同一契约）：大小写翻转同样要落到远端，否则 rebuild 后回退
+            // 旧拼写。窄面后端在此逐字 no-op。
+            self.bridge
+                .block_on(self.vfs.rename_remote_for_row(&from, to))
+                .map_err(|error| fsp_error(&error))?;
             self.vfs
                 .db()
                 .rename_path(from.as_str(), to.as_str())
@@ -1540,6 +1560,12 @@ impl CloudFs {
                 if !replace_if_exists || (!dest.is_uploaded && self.vfs.local_copy_exists(to)) {
                     return Err(STATUS_OBJECT_NAME_COLLISION.into());
                 }
+                // 覆盖臂的远端删除同样先行（BUG 2 修复，winfsp 面——
+                // WebDAV 适配器 rename 同款）：dest 行即将消失，远端对象
+                // 留着会成孤儿，rebuild 会把它复活。
+                self.bridge
+                    .block_on(self.vfs.delete_remote_for_row(to))
+                    .map_err(|error| fsp_error(&error))?;
                 self.vfs
                     .db()
                     .delete_file(to.as_str())
@@ -1550,6 +1576,14 @@ impl CloudFs {
                 }
             }
         }
+        // **远端先行**（BUG 2 修复，winfsp 面）：宽面 + 单侧 move 声明
+        // 的后端上，远端对象必须先动——失败则本地行原样保留（远端与
+        // 本地绝不分裂，错误文案带路径与「行未动」声明）。无宽面的
+        // 影子索引后端（telegram/mock）如实降级为 no-op，行为与修复前
+        // 逐字一致。
+        self.bridge
+            .block_on(self.vfs.rename_remote_for_row(&from, to))
+            .map_err(|error| fsp_error(&error))?;
         self.vfs
             .db()
             .rename_path(from.as_str(), to.as_str())
