@@ -24,6 +24,13 @@
 - **FR2 空态文案**：`volumes.empty` en/zh 改引导语（指向「＋ 添加卷」）+ 新 pin 测试 `empty_volume_state_copy_points_at_add_volume`（fetch i18n.js 断言新文案在/旧文案删），红→绿，volumes_page **42/0**。commit `bb56349`。
 - 注：首次派发的 FR1/FR2 代理在探查期撞平台 5 小时限额（22:05:06 重置）零残留；FR2 改由主会话直做（≤10 行），FR1 重派。
 
+## 负责人实测揭红修复批（2026-09-24）
+
+- **修复①（`762d08f`）**：首启空注册表**不绑 8485 WebDAV 监听器** → 运行时加带盘符卷的挂载（默认 net use 后端）无端点 → 回滚。修 = `bind_multi_webdav(…, first_run)` 首启绑空注册表（RV1 投影动态接新卷）；钉测 = first_run boot 断言 `webdav_addr().is_some()`（红→绿）。顺带修空注册表 `all_failed()` 空真皮。
+- **修复②（`21315a1`）**：默认 `mount_backend=webdav`（net use/WebClient）在未跑 `cydrive fix-reg` 的机器上报**系统错误 67**（net use → 找不到网络名）→ 同样回滚。修 = 首启模板显式 `mount_backend = "winfsp"`（本机 in-process FSD，开箱即挂；老配置用户不受影响，仍可 `fix-reg` 一劳永逸）。模板逐字节 pin 同步（红→绿）。
+- **端到端真机冒烟（修复后 release exe）**：空目录 bootstrap → POST 建带盘符 Z: 的 webdav 卷 → **200 "running; mounted Z: via winfsp"** → `Get-PSDrive Z` 在 → DESTROY confirm → 200 卸载 + 文件删 + 盘符消失。全链闭环。
+- 冒烟方法论教训（第三次）：常驻实例 stdout **绝不接 `| head` 管道**（破管 panic 假 409）；`&&` 链尾 `&` 会把整链后台化（验证跑在编译前）。
+
 ## 终态（FR3 收口，2026-09-23）
 
 - **workspace 1682/0/62**（-j 2；workspace 冷构建遇 K73 内存陷阱 os error 1455 一次，降并发定向 clean 后过）+ clippy/fmt/check_layers/scan_secrets 绿 + baidu/telegram 组合 clippy 绿。
