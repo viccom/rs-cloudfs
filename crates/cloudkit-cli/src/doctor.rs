@@ -354,9 +354,10 @@ pub fn webclient_checks() -> Vec<CheckResult> {
 }
 
 /// The WinFsp installation checks (Phase 3 / WF4, K40): a **Warn** — never
-/// a Fail — when WinFsp is absent, because the default `mount_backend =
-/// "webdav"` needs nothing installed and the winfsp request degrades
-/// visibly instead of refusing to start. The detection is a pure
+/// a Fail — when WinFsp is absent, because the default `mount_backend`
+/// is now `"winfsp"` and an unavailable runtime means drive letters do
+/// not mount (no net use fallback) — the check surfaces that before the
+/// boot does. The detection is a pure
 /// registry + file read ([`cloudkit_platform::windows::winfsp_install`]),
 /// so it needs no `winfsp` feature, no DLL load and no SDK — and it is
 /// exactly the information the operator needs *before* setting

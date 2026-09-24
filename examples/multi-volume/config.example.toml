@@ -19,5 +19,5 @@ web_ui_port = 8486               # 默认 8486
 enable_web_ui = true
 
 # ── 挂载形态（进程级：管本进程所有卷的挂载方式）───────────────────────────
-mount_backend = "winfsp"         # 默认 "webdav"；winfsp 需 --features winfsp 构建 + WinFsp 运行时
+mount_backend = "winfsp"         # 默认 "winfsp"（模板不写此键即缺省）；"webdav"（net use）为显式回退
 auto_mount_drive = true          # 进程级总闸：false 则所有卷都不自动挂载

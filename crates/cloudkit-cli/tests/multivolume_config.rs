@@ -249,11 +249,6 @@ enable_web_ui = true
 web_ui_host = \"127.0.0.1\"
 web_ui_port = 8486
 auto_mount_drive = true
-
-# WinFsp mounts drive letters in-process — the net use (WebClient)
-# backend needs a one-time elevated `cydrive fix-reg` on fresh machines
-# and would fail the FIRST volume's claim with system error 67.
-mount_backend = \"winfsp\"
 ";
 
 /// RED 1 (happy arm): in an empty cwd the bootstrap generates the
@@ -276,7 +271,6 @@ fn bootstrap_first_run_generates_minimal_config_in_an_empty_dir() {
         "web_ui_host = \"127.0.0.1\"",
         "web_ui_port = 8486",
         "auto_mount_drive = true",
-        "mount_backend = \"winfsp\"",
         "first run",
     ] {
         assert!(text.contains(needle), "template carries `{needle}`: {text}");

@@ -15,28 +15,33 @@
 //! gate instead.
 
 use cloudkit_cli::{
-    choose_mount_backend, single_volume_winfsp_note, winfsp_capability, winfsp_fallback_notice,
+    choose_mount_backend, single_volume_winfsp_note, winfsp_capability, winfsp_unavailable_notice,
     winfsp_unmount_note, winfsp_unmount_step, MountBackendDecision, MountedBackend,
     WinFspCapability, WinfspUnmountStep, WINFSP_FEATURE_REQUIRED,
 };
 use cloudkit_core::config::{CyDriveConfig, MountBackend};
 
 /// The default config asks for nothing new: the WebDAV mapping, exactly
-/// as every pre-Phase-3 build did.
+/// 负责人 2026-09-24 裁决: the default backend is winfsp, and an
+/// unavailable winfsp runtime does NOT fall back to webdav.
 #[test]
-fn default_config_chooses_the_webdav_mapping() {
-    assert_eq!(
-        choose_mount_backend(
-            CyDriveConfig::default().mount_backend,
-            &WinFspCapability::NotCompiled
-        ),
-        MountBackendDecision::WebDav,
-        "the default backend is webdav, whatever the winfsp situation"
-    );
+fn default_config_chooses_winfsp_and_never_falls_back() {
+    match choose_mount_backend(
+        CyDriveConfig::default().mount_backend,
+        &WinFspCapability::NotCompiled,
+    ) {
+        MountBackendDecision::WinfspUnavailable(reason) => {
+            assert!(
+                reason.contains("--features winfsp"),
+                "the default (winfsp) without the feature answers unavailable with the                  rebuild hint, got: {reason}"
+            );
+        }
+        other => panic!("the default must not fall back to webdav, got: {other:?}"),
+    }
     assert_eq!(
         choose_mount_backend(MountBackend::Webdav, &WinFspCapability::Ready),
         MountBackendDecision::WebDav,
-        "an explicit webdav request is never upgraded"
+        "an explicit webdav request is honoured verbatim"
     );
 }
 
@@ -53,9 +58,9 @@ fn a_ready_runtime_mounts_through_winfsp() {
 /// binary has no feature — the message must name the rebuild command, the
 /// config key, and the fallback that is actually happening.
 #[test]
-fn a_missing_feature_degrades_with_the_rebuild_hint() {
+fn a_missing_feature_answers_unavailable_with_the_rebuild_hint() {
     match choose_mount_backend(MountBackend::Winfsp, &WinFspCapability::NotCompiled) {
-        MountBackendDecision::WebDavFallback(reason) => {
+        MountBackendDecision::WinfspUnavailable(reason) => {
             assert!(
                 reason.contains("--features winfsp"),
                 "the reason names the rebuild feature, got: {reason}"
@@ -70,24 +75,25 @@ fn a_missing_feature_degrades_with_the_rebuild_hint() {
             );
             assert!(
                 reason.contains("webdav"),
-                "the reason names the fallback that is happening, got: {reason}"
+                "the reason names the explicit webdav opt-out, got: {reason}"
             );
         }
-        other => panic!("expected a webdav fallback, got {other:?}"),
+        other => panic!("expected an unavailable verdict, got {other:?}"),
     }
 }
 
-/// An installed-but-unusable runtime degrades too, carrying the runtime's
-/// own reason (the WinFsp detection's string — actionable by construction).
+/// An installed-but-unusable runtime answers unavailable too, carrying the
+/// runtime's own reason (the WinFsp detection's string — actionable by
+/// construction). No webdav fallback (负责人 2026-09-24 裁决).
 #[test]
-fn an_unusable_runtime_degrades_with_its_reason() {
+fn an_unusable_runtime_answers_unavailable_with_its_reason() {
     let capability =
         WinFspCapability::Unavailable("WinFsp is not installed (no InstallDir)".into());
     match choose_mount_backend(MountBackend::Winfsp, &capability) {
-        MountBackendDecision::WebDavFallback(reason) => {
+        MountBackendDecision::WinfspUnavailable(reason) => {
             assert_eq!(reason, "WinFsp is not installed (no InstallDir)");
         }
-        other => panic!("expected a webdav fallback, got {other:?}"),
+        other => panic!("expected an unavailable verdict, got {other:?}"),
     }
 }
 
@@ -97,15 +103,15 @@ fn an_unusable_runtime_degrades_with_its_reason() {
 fn decisions_render_as_banner_labels() {
     assert_eq!(MountBackendDecision::WebDav.label(), "webdav");
     assert_eq!(MountBackendDecision::WinFsp.label(), "winfsp");
-    let degraded = MountBackendDecision::WebDavFallback("no runtime".to_string());
-    let label = degraded.label();
+    let unavailable = MountBackendDecision::WinfspUnavailable("no runtime".to_string());
+    let label = unavailable.label();
     assert!(
-        label.starts_with("webdav ("),
-        "the degraded label leads with the backend that runs, got: {label}"
+        label.starts_with("winfsp ("),
+        "the unavailable label leads with the requested backend, got: {label}"
     );
     assert!(
         label.contains("no runtime"),
-        "the degraded label carries the reason, got: {label}"
+        "the unavailable label carries the reason, got: {label}"
     );
 }
 
@@ -115,33 +121,28 @@ fn mounted_backends_render_per_volume() {
     assert_eq!(MountedBackend::WinFsp.as_str(), "winfsp");
     assert_eq!(MountedBackend::WebDav.as_str(), "webdav");
     assert_eq!(MountedBackend::WinFsp.label(), "winfsp");
-    let fallback = MountedBackend::WebDavFallback {
-        reason: "not compiled in".to_string(),
-    };
-    assert_eq!(fallback.as_str(), "webdav");
-    assert_eq!(fallback.label(), "webdav (fallback: not compiled in)");
 }
 
-/// The K40 notice printed (and logged at error level) when the whole
-/// winfsp arm degrades: backend, reason, and the fact that nothing is
-/// blocked.
+/// The notice printed (and logged at error level) when the winfsp arm is
+/// unavailable: backend, reason, the fact that letters are simply not
+/// mounted, and the two ways up (install WinFsp / opt into webdav).
 #[test]
-fn the_fallback_notice_says_what_happened_and_why() {
-    let notice = winfsp_fallback_notice("WinFsp is not installed");
+fn the_unavailable_notice_says_what_happened_and_the_ways_up() {
+    let notice = winfsp_unavailable_notice("WinFsp is not installed");
     assert!(
         notice.contains("winfsp") && notice.contains("WinFsp is not installed"),
         "the notice names the backend and the reason, got: {notice}"
     );
     assert!(
         notice.contains("WebDAV") || notice.contains("webdav"),
-        "the notice names the fallback, got: {notice}"
+        "the notice says drive letters are not mounted, got: {notice}"
     );
     assert!(
-        notice.contains("continuing") || notice.contains("nothing"),
-        "the notice says the boot is not blocked, got: {notice}"
+        notice.contains("mount_backend") && notice.contains("stay reachable"),
+        "the notice names the explicit webdav opt-in and reachability, got: {notice}"
     );
     // The feature-less build's notice carries the same rebuild hint.
-    let notice = winfsp_fallback_notice(WINFSP_FEATURE_REQUIRED);
+    let notice = winfsp_unavailable_notice(WINFSP_FEATURE_REQUIRED);
     assert!(notice.contains("--features winfsp"), "got: {notice}");
 }
 
@@ -178,6 +179,11 @@ fn the_capability_of_this_build_is_coherent() {
 fn winfsp_unmount_is_explained_not_pretended() {
     let mut cfg = CyDriveConfig::default();
     assert!(
+        winfsp_unmount_note(&cfg).is_some(),
+        "the default (winfsp) instance gets the unmount-lifetime explanation"
+    );
+    cfg.mount_backend = MountBackend::Webdav;
+    assert!(
         winfsp_unmount_note(&cfg).is_none(),
         "the WebDAV mapping IS cross-process: nothing to explain"
     );
@@ -203,9 +209,17 @@ fn winfsp_unmount_is_explained_not_pretended() {
 #[test]
 fn single_volume_winfsp_request_is_an_explicit_note() {
     let mut cfg = CyDriveConfig::default();
+    // The default IS winfsp now (负责人 2026-09-24 裁决), so a default
+    // single-volume config gets the scope note; an EXPLICIT webdav
+    // request is the quiet one.
+    assert!(
+        single_volume_winfsp_note(&cfg).is_some(),
+        "the default (winfsp) single-volume config carries the scope note"
+    );
+    cfg.mount_backend = MountBackend::Webdav;
     assert!(
         single_volume_winfsp_note(&cfg).is_none(),
-        "the webdav default needs no note"
+        "an explicit webdav request needs no note"
     );
     cfg.mount_backend = MountBackend::Winfsp;
     let note = single_volume_winfsp_note(&cfg).expect("a winfsp request must be answered");

@@ -6803,7 +6803,7 @@ pub enum MountBackendDecision {
     WebDav,
     /// `mount_backend = "winfsp"` was asked for and cannot be honoured;
     /// the reason is user-facing and the WebDAV mapping runs instead.
-    WebDavFallback(String),
+    WinfspUnavailable(String),
 }
 
 impl MountBackendDecision {
@@ -6818,8 +6818,8 @@ impl MountBackendDecision {
         match self {
             MountBackendDecision::WinFsp => "winfsp".to_string(),
             MountBackendDecision::WebDav => "webdav".to_string(),
-            MountBackendDecision::WebDavFallback(reason) => {
-                format!("webdav (winfsp unavailable: {reason})")
+            MountBackendDecision::WinfspUnavailable(reason) => {
+                format!("winfsp (unavailable: {reason})")
             }
         }
     }
@@ -6864,9 +6864,11 @@ impl MountedBackend {
     }
 }
 
-/// K40's pure decision: the config's request against what this
-/// build/machine can do. `webdav` is never upgraded; `winfsp` lands on
-/// WebDAV (with a reason) whenever it cannot run.
+/// The pure decision: the config's request against what this
+/// build/machine can do. `webdav` is never upgraded; a `winfsp` request
+/// that cannot run does NOT fall back to webdav (负责人 2026-09-24 裁决) —
+/// it answers [`MountBackendDecision::WinfspUnavailable`] with the reason
+/// and the volume stays reachable without a drive letter.
 pub fn choose_mount_backend(
     backend: MountBackend,
     capability: &WinFspCapability,
@@ -6876,10 +6878,10 @@ pub fn choose_mount_backend(
         MountBackend::Winfsp => match capability {
             WinFspCapability::Ready => MountBackendDecision::WinFsp,
             WinFspCapability::NotCompiled => {
-                MountBackendDecision::WebDavFallback(WINFSP_FEATURE_REQUIRED.to_string())
+                MountBackendDecision::WinfspUnavailable(WINFSP_FEATURE_REQUIRED.to_string())
             }
             WinFspCapability::Unavailable(reason) => {
-                MountBackendDecision::WebDavFallback(reason.clone())
+                MountBackendDecision::WinfspUnavailable(reason.clone())
             }
         },
     }
@@ -6908,13 +6910,14 @@ pub fn winfsp_capability() -> WinFspCapability {
     WinFspCapability::NotCompiled
 }
 
-/// The one-line notice a degraded winfsp boot prints (and logs at error
-/// level) before the WebDAV mapping takes over: the backend, the reason,
-/// the fallback that runs and the fact that nothing was blocked.
-pub fn winfsp_fallback_notice(reason: &str) -> String {
+/// The one-line notice an unavailable-winfsp boot prints (and logs at error
+/// level): the backend, the reason, the fact that drive letters are simply
+/// not mounted, and the two ways up.
+pub fn winfsp_unavailable_notice(reason: &str) -> String {
     format!(
-        "winfsp mount backend unavailable ({reason}); falling back to the WebDAV drive \
-         mapping (net use) — nothing is blocked, and the volumes stay reachable"
+        "winfsp mount backend unavailable ({reason}); drive letters are not mounted (no \
+         mapping (net use) - install the WinFsp runtime, or set mount_backend =
+         \"webdav\" in config.toml to opt into it. The volumes stay reachable"
     )
 }
 
@@ -7152,27 +7155,20 @@ async fn mount_volumes_if_configured(plan: &MountPlan<'_>) -> VolumeMounts {
                 ),
                 ..VolumeMounts::default()
             },
-            // K40's visible degradation: error log + printed notice, then
-            // the same WebDAV pass, annotated per volume.
-            MountBackendDecision::WebDavFallback(reason) => {
+            // No net use fallback (负责人 2026-09-24 裁决): an unavailable
+            // winfsp backend means the drive letters simply do not mount —
+            // the volumes keep running and stay reachable through the
+            // dashboard / WebDAV endpoints, and the notice names the two
+            // ways up (install WinFsp, or opt into webdav explicitly).
+            MountBackendDecision::WinfspUnavailable(reason) => {
                 tracing::error!(
                     backend = "winfsp",
                     %reason,
-                    "the winfsp mount backend is unavailable; falling back to the WebDAV \
-                     drive mapping (K40 — visible degradation, the boot continues)"
+                    "the winfsp mount backend is unavailable; drive letters are not \
+                     mounted (no net use fallback) — the volumes stay reachable"
                 );
-                println!("{}", winfsp_fallback_notice(&reason));
-                VolumeMounts {
-                    mounted: mount_claims_via_webdav(
-                        plan.process_cfg,
-                        plan.claims,
-                        plan.webdav_available,
-                        |_| MountedBackend::WebDavFallback {
-                            reason: reason.clone(),
-                        },
-                    ),
-                    ..VolumeMounts::default()
-                }
+                println!("{}", winfsp_unavailable_notice(&reason));
+                VolumeMounts::default()
             }
             MountBackendDecision::WinFsp => mount_claims_via_winfsp(plan).await,
         }
@@ -7290,69 +7286,44 @@ async fn mount_claims_via_winfsp(plan: &MountPlan<'_>) -> VolumeMounts {
                     "winfsp mounting failed; falling back to the WebDAV drive mapping (K40)"
                 );
                 println!("winfsp mounting FAILED for volume {name} ({error}).");
-                // An occupied letter is the one failure where the WebDAV
-                // arm must NOT run: `mount_drive` clears the letter first
-                // (`net use /delete`), which would take over whatever
-                // holds it. Everything else falls back per claim.
-                if !matches!(error, MountError::LetterInUse { .. }) {
-                    if plan.webdav_available {
-                        println!("Falling back to the WebDAV drive mapping for volume {name}.");
-                        mounted.extend(mount_claims_via_webdav(
-                            plan.process_cfg,
-                            std::slice::from_ref(&(name.clone(), letter.clone())),
-                            plan.webdav_available,
-                            |_| MountedBackend::WebDavFallback {
-                                reason: format!("winfsp mounting failed: {error}"),
-                            },
-                        ));
-                    } else {
-                        println!(
-                            "No fallback for volume {name}: the WebDAV listener is not bound."
-                        );
-                    }
-                }
+                // No net use fallback: it would also hide an occupied letter
+                // (the webdav mapping clears the letter first, taking over
+                // whatever holds it). The volume stays reachable without the
+                // letter; webdav is an explicit config opt-in.
+                println!(
+                    "The volume stays reachable at {} without a drive letter - fix the                      cause (letter in use? WinFsp runtime?) or set mount_backend =                      \"webdav\" in config.toml to opt into the net use mapping.",
+                    volume_mount_url(plan.process_cfg, name)
+                );
             }
             Err(error) => {
                 tracing::error!(
                     volume = %name,
                     %error,
-                    "the winfsp mount task failed to complete; falling back to the WebDAV \
-                     drive mapping when the letter state allows (K40)"
+                    "the winfsp mount task failed to complete; no net use fallback - the \
+                     volume stays reachable without a drive letter"
                 );
                 println!("winfsp mount task FAILED for volume {name} ({error}).");
-                // A join failure means the mount task itself panicked, so
-                // there is no typed verdict about the letter — unlike the
-                // Ok(Err) arm, where `MountError::LetterInUse` is exactly
-                // the one outcome that must NOT fall back (the WebDAV
-                // mapping clears the letter first, taking over whatever
-                // holds it). The same carve-out, decided by a read-only
-                // occupancy probe instead: a letter that currently answers
-                // on anything (foreign mapping, someone else's volume, an
-                // orphan of the panicking mount) is left alone.
+                // A join failure means the mount task itself panicked: no
+                // typed verdict about the letter exists, so a read-only
+                // occupancy probe decides the WARNING's wording - a letter
+                // that currently answers on anything (foreign mapping,
+                // someone else's volume, an orphan of the panicking mount)
+                // is called out by name and never touched.
                 let letter_taken = cloudkit_platform::windows::used_drive_letters()
                     .iter()
                     .any(|used| used.eq_ignore_ascii_case(letter));
                 if letter_taken {
                     println!(
-                        "No WebDAV fallback for volume {name}: the drive letter {letter} is \
-                         already in use and the failed mount task left no typed verdict \
-                         about it — the letter is left alone. The volume stays reachable \
-                         at {}.",
-                        volume_mount_url(plan.process_cfg, name)
+                        "The drive letter {letter} is already in use and the failed mount \
+                         task left no typed verdict about it - the letter is left alone."
                     );
-                } else if plan.webdav_available {
-                    println!("Falling back to the WebDAV drive mapping for volume {name}.");
-                    mounted.extend(mount_claims_via_webdav(
-                        plan.process_cfg,
-                        std::slice::from_ref(&(name.clone(), letter.clone())),
-                        plan.webdav_available,
-                        |_| MountedBackend::WebDavFallback {
-                            reason: format!("winfsp mount task failed: {error}"),
-                        },
-                    ));
-                } else {
-                    println!("No fallback for volume {name}: the WebDAV listener is not bound.");
                 }
+                println!(
+                    "The volume stays reachable at {} without a drive letter - fix the \
+                     cause or set mount_backend = \"webdav\" in config.toml to opt into \
+                     the net use mapping.",
+                    volume_mount_url(plan.process_cfg, name)
+                );
             }
         }
     }
@@ -7772,6 +7743,8 @@ pub fn discover_config_with_volumes_and_store(
 /// volume-scoped key and fail its own K19 mixing guard. Ports are the
 /// program defaults (8485 WebDAV / 8486 web UI, 负责人 2026-09-23
 /// 裁决); `auto_mount_drive` is process-scoped so the guard accepts it.
+/// `mount_backend` is deliberately ABSENT: the global default is winfsp
+/// (负责人 2026-09-24 裁决) and an absent key reads as that default.
 /// The file text is pinned byte for byte by
 /// `tests/multivolume_config.rs::first_run_template_pin_keys_ports_and_header`.
 const FIRST_RUN_PROCESS_TOML: &str = "\
@@ -7788,11 +7761,6 @@ enable_web_ui = true
 web_ui_host = \"127.0.0.1\"
 web_ui_port = 8486
 auto_mount_drive = true
-
-# WinFsp mounts drive letters in-process — the net use (WebClient)
-# backend needs a one-time elevated `cydrive fix-reg` on fresh machines
-# and would fail the FIRST volume's claim with system error 67.
-mount_backend = \"winfsp\"
 ";
 
 /// The `run` bootstrap probe (web first-run plan FR1 / D1+D2): in a

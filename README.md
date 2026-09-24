@@ -94,7 +94,7 @@ cargo build --release --no-default-features --features local,baidu # 本地+百�
 把存储卷挂成**本地文件系统语义盘符**（Win32_LogicalDisk `FileSystem="cydrive"`），绕开 WebDAV 重定向器的整文件缓存税——764MB 视频 open 从 net use 的 55.4s 降到 7-11ms，随机拖动按 4MiB 窗口拉取（冷 seek ~0.3s/跳、缓存热 ~2ms）。
 
 - **前置条件**：安装 [WinFsp 运行时](https://winfsp.dev/)。未安装（或二进制未编译 winfsp feature）时自动回退 webdav/net use 挂载（error 日志 + 横幅声明 + 逐卷 fallback 标注，绝不拒启）；`cydrive doctor` 含 WinFsp 检测项。
-- **开启方式**：config.toml 进程级键 `mount_backend = "winfsp"`（默认 `"webdav"`，行为不变；多卷模式下各卷盘符统一走该后端）。
+- **开启方式**：默认即 `"winfsp"`（2026-09-24 起，盘符进程内挂载开箱即用；不回落 net use——缺 WinFsp 时卷保持 WebDAV/仪表盘可达并提示）。显式 `"webdav"`（net use）需一次管理员 `cydrive fix-reg`。
 - **构建**：`cargo build -p cloudkit-cli --features winfsp`（feature 默认关；需 MSVC 工具链 + libclang——winfsp-sys 的 bindgen 依赖）。
 - **许可注意**：该 feature 引入 GPL-3.0 的 winfsp-rs（无 FLOSS 例外）——默认构建零 winfsp 依赖、不受影响；`--features winfsp` 产物当前仅私有分发（K38）。
 - **当前形态**：读 = 4MiB 窗口流式 + 缓存命中本地直供；写 = staged 临时文件，关闭句柄时提交入既有上传队列（上传排空前 rename/delete 会被短暂拒绝——防孤立唯一副本，与 webdav 面同语义）。
