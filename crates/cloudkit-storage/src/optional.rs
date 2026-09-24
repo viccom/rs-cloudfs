@@ -30,7 +30,11 @@ pub trait TokenEvents: Send + Sync {
 
 /// 秒传（D1 可选 trait #2）：由内容指纹直接落盘，消费 [`WriteHint`]。
 ///
-/// 仅在能力位 `RAPID_UPLOAD` 声明后由消费方探测使用。
+/// **本 trait 是可选的暴露面，不是能力位 `rapid_upload` 的实现义务**：
+/// 位为真只表示后端有原生去重原语。服务端自动去重的后端（baidu/115/123）
+/// 秒传发生在 `writer`/`close` 链内，无需调用方探测，故「声明位为真而不
+/// 接本 trait」是合法形态（三个驱动的现状）。仅当驱动希望额外支持「调用方
+/// 主动按 hash 探测」时才接本 trait。消费方按位降级，trait 缺席不得 panic。
 #[async_trait]
 pub trait RapidUpload: StorageDriver {
     /// 尝试按 `hint`（size + 明文哈希）秒传。

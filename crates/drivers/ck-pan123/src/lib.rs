@@ -9,7 +9,7 @@
 //! 类）+ 顶层与字段双拼解析、dydomain 动态域名 + 粘性 fallback、web
 //! 身份头（D5：无安卓头、无签名）。
 //!
-//! ## 批次边界（123-3 = 写路径）
+//! ## 批次边界（123-1…123-5 全批次完成，2026-09-20）
 //!
 //! - 认证/分类/域名面（123-1）：TDD 钉死（`tests/oauth_state_machine.rs`
 //!   / `tests/errno_mapping.rs` / `tests/api_client.rs`）；123-2 扩充
@@ -23,8 +23,10 @@
 //!   `RapidUpload` 可选 trait **不接**（无驱动先例——秒传由服务端
 //!   `Reuse` 自动完成，`WriteHint` 仅观察面；driver-onboarding §2.9
 //!   可选项）；
-//! - conformance + 12 装配点 123-4、真机矩阵 123-5——cli dispatch 臂
-//!   仍占位，没有装配路径触达驱动。
+//! - conformance + 12 装配点（123-4）：离线八断言全绿；真机矩阵
+//!   （123-5）上传回读 / Range / 秒传 / 多分片 / 加密全栈 / WebDAV
+//!   双模式全过——`cloudkit-cli` 的 dispatch 臂经
+//!   [`Pan123Driver::connect`] 生产可达。
 //!
 //! 层位置：只依赖 cloudkit-storage（L2）与外部 crate
 //! （driver-onboarding §1）；禁依赖 cloudkit-core 及任何 L3+ crate（R1）。
@@ -183,10 +185,10 @@ impl Pan123Driver {
     /// 缺失 → `Invalid`——core `validate()` 的第一道门之外，这里是
     /// 驱动侧的第二道）。
     ///
-    /// **VolumeId 骨架占位**：`pan123:pending`——真值 `pan123:<uid>`
+    /// **VolumeId 离线形态**：`pan123:pending`——真值 `pan123:<uid>`
     /// （uid 取自 `/b/api/user/info` 的 `UID`）由 [`Pan123Driver::connect`]
-    /// 确定（baidu factory connect 取 uid 先例）。123-1 无任何装配路径
-    /// 触达本驱动（dispatch 占位臂），占位身份不进生产。
+    /// 确定（baidu factory connect 取 uid 先例）。生产装配恒走 `connect`，
+    /// 占位身份只在离线测试与 conformance 桩中复用。
     pub fn new(params: Pan123Params) -> Result<Self, StorageError> {
         let Some(token) = &params.token else {
             return Err(StorageError::Invalid);
@@ -797,6 +799,25 @@ fn classify_probe_error(error: StorageError) -> Pan123Probe {
 mod tests {
     use super::*;
     use cloudkit_storage::{RelPath, StorageDriver, WriteHint};
+
+    /// 文档与实现一致性守卫（R4 的可读面）：驱动的对外说明不得残留
+    /// 「未接线/占位」类完成态声明——123-5 起九方法全接线、装配面
+    /// 经 [`Pan123Driver::connect`] 生产可达。
+    ///
+    /// 钉的是「审查者读到的注记与代码事实一致」（pan115 同款守卫，
+    /// 该处曾因残留注记导致误判 R4）。
+    #[test]
+    fn docs_do_not_claim_placeholder_status() {
+        const SOURCE: &str = include_str!("lib.rs");
+        // 只扫 #[cfg(test)] 之前的部分：断言消息自身逐字含这些串。
+        let body = SOURCE.split("#[cfg(test)]").next().unwrap_or_default();
+        for stale in ["仍占位", "没有装配路径触达", "占位臂"] {
+            assert!(
+                !body.contains(stale),
+                "crate 文档残留陈旧完成态声明 {stale:?}——代码已全接线，须改成既成事实"
+            );
+        }
+    }
 
     fn pair(key: &str, value: &str) -> (String, String) {
         (key.to_string(), value.to_string())

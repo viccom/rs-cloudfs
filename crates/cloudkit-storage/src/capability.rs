@@ -23,8 +23,17 @@ pub struct Capabilities {
     /// rename 是后端单侧操作（O(1) move，无重传）。未声明时 rename 允许
     /// 降级为 copy+delete（存在中间可见态）。
     pub server_side_move: bool,
-    /// 秒传（由内容指纹直接落盘）——配套可选 trait
-    /// [`crate::optional::RapidUpload`] 消费 [`crate::vocab::WriteHint`]。
+    /// 秒传：后端具备「由内容指纹直接落盘」的原生去重能力。
+    ///
+    /// **本位描述后端的原生能力，不强制驱动暴露
+    /// [`crate::optional::RapidUpload`]**——两者正交：位为真表示后端有此
+    /// 原语，trait 是「调用方主动按 hash 探测」的可选暴露面。服务端自动
+    /// 去重的后端（baidu `return_type=2` / 115 `pre_sha1` / 123 `Reuse`）
+    /// 声明位为真可不接 trait——秒传在 `writer`/`close` 链内自动发生，
+    /// 调用方无需探测；`WriteHint.content_hash` 在这类驱动里是可选加速
+    /// 提示而非必需输入。
+    ///
+    /// 消费方纪律：**按位降级，绝不因 trait 缺席而 panic**（interfaces §1）。
     pub rapid_upload: bool,
     /// 权威索引：后端 list 即真相（baidu/115/123/local）→ 新机器
     /// bootstrap = 列目录重建 db；telegram 为影子索引（D4）。
