@@ -136,7 +136,7 @@ async fn boot(
         .zip(mocks)
         .map(|(spec, mock)| (spec, RunOptions::default(), mock as Arc<dyn CloudTransport>))
         .collect();
-    let handle = run_multi_with_transports_and_commands(&cfg, injections, commands)
+    let handle = run_multi_with_transports_and_commands(&cfg, injections, commands, false)
         .await
         .expect("multi-volume boot");
     (handle, specs)
@@ -463,6 +463,7 @@ async fn rebuild_refuses_a_volume_with_uploads_in_flight() {
         &process_config(),
         vec![(spec, RunOptions::default(), hold as Arc<dyn CloudTransport>)],
         RuntimeVolumeCommands::default(),
+        false,
     )
     .await
     .expect("boot with the held volume");
@@ -1056,6 +1057,7 @@ async fn uploads_resuming_mid_walk_interrupt_the_rebuild_recoverably() {
             },
             ..RuntimeVolumeCommands::default()
         },
+        false,
     )
     .await
     .expect("boot with the held volume");

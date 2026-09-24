@@ -2405,3 +2405,57 @@ async fn destroy_route_body_and_family_gates() {
         "actionable error: {body}"
     );
 }
+
+/// 负责人实测反馈（2026-09-24）：建卷表单的加密方案**默认 aead_v2**——
+/// 旧代码把下拉预选成 gcm（后端缺省其实早已是 aead_v2，前端预选把每个
+/// 「不选择」的新卷都钉成了 gcm）；编辑预填只把**显式存储的 gcm** 显示为
+/// gcm，缺省/空值一律显示 aead_v2。源码 pin（无 JS harness 的既有手法）。
+#[tokio::test]
+async fn volume_form_defaults_the_encryption_scheme_to_aead_v2() {
+    let server = multi_server(vec![]).await;
+    let addr = server.local_addr();
+    let resp = send(addr, &request("GET", "/static/js/volumes.js", addr, &[])).await;
+    assert_eq!(status_of(&resp), 200);
+    let js = body_of(&resp);
+
+    assert!(
+        js.contains("scheme.value = 'aead_v2';"),
+        "the create/edit form must default the scheme dropdown to aead_v2"
+    );
+    assert!(
+        !js.contains("scheme.value = 'gcm'"),
+        "the old gcm pre-selection must be gone"
+    );
+    assert!(
+        js.contains("=== 'gcm' ? 'gcm' : 'aead_v2'"),
+        "edit prefill maps only an EXPLICITLY stored gcm to gcm (absent/empty = default)"
+    );
+    server.shutdown().await;
+}
+
+/// Web 首启引导（FR2）：零卷空态文案是**引导语**——首启用户（无配置
+/// bootstrap 进 init 模式，注册表为空）看到的不再是纯陈述，而是指向
+/// 「＋ 添加卷」动作的指路文案。双语键对称；旧纯陈述文案删除。
+#[tokio::test]
+async fn empty_volume_state_copy_points_at_add_volume() {
+    let server = multi_server(vec![]).await;
+    let addr = server.local_addr();
+    let resp = send(addr, &request("GET", "/static/js/i18n.js", addr, &[])).await;
+    assert_eq!(status_of(&resp), 200);
+    let i18n = body_of(&resp);
+
+    assert!(
+        i18n.contains("No volumes yet — use ＋ Add Volume above to create your first one."),
+        "EN empty state must point at the Add Volume action"
+    );
+    assert!(
+        i18n.contains("尚无存储卷——点击上方「＋ 添加卷」创建第一个卷。"),
+        "ZH empty state must point at the Add Volume action"
+    );
+    assert!(
+        !i18n.contains("No volume files are configured on this instance.")
+            && !i18n.contains("本实例未配置任何卷文件。"),
+        "the old statement-only copy is gone"
+    );
+    server.shutdown().await;
+}

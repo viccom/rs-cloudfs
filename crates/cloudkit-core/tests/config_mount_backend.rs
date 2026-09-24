@@ -41,18 +41,18 @@ const BASE: &str = "bot_token = \"123:abc\"\nchat_id = 42\n";
 // ------------------------------------------------------- value & default ---
 
 #[test]
-fn default_mount_backend_is_webdav() {
+fn default_mount_backend_is_winfsp() {
     assert_eq!(
         CyDriveConfig::default().mount_backend,
-        MountBackend::Webdav,
-        "the dataclass default is the pre-Phase-3 net-use path"
+        MountBackend::Winfsp,
+        "the default is winfsp (负责人 2026-09-24 裁决: in-process mounts out of          the box, no net use fallback)"
     );
     let (_dir, path) = config_file("config.toml", BASE);
     let cfg = CyDriveConfig::load_toml(&path).expect("base config loads");
     assert_eq!(
         cfg.mount_backend,
-        MountBackend::Webdav,
-        "a file without the key keeps the webdav default (zero behavior change)"
+        MountBackend::Winfsp,
+        "a file without the key keeps the winfsp default"
     );
 }
 

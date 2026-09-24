@@ -65,7 +65,13 @@ fn version_line() -> &'static str {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Start the full stack: metadata DB, upload queue, WebDAV server.
-    Run,
+    Run {
+        /// Do not open the dashboard in a browser on a first-run boot
+        /// (headless machines / scripts; same effect as the
+        /// CYDRIVE_NO_OPEN_BROWSER environment variable).
+        #[arg(long)]
+        no_open_browser: bool,
+    },
     /// Gracefully stop a background `cydrive run` instance through its
     /// loopback control channel (must run in the same working directory
     /// as the instance).
@@ -181,7 +187,7 @@ enum CacheAction {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Run => run().await,
+        Command::Run { no_open_browser } => run(no_open_browser).await,
         Command::Stop => stop_cmd().await,
         Command::Status => status_cmd().await,
         Command::Push { path, dest } => push_cmd(path, dest).await,
@@ -436,11 +442,11 @@ async fn mount_cmd(
         );
         match &decision {
             cloudkit_cli::MountBackendDecision::WebDav => {}
-            cloudkit_cli::MountBackendDecision::WebDavFallback(reason) => {
+            cloudkit_cli::MountBackendDecision::WinfspUnavailable(reason) => {
                 tracing::error!(backend = "winfsp", %reason, "the winfsp mount backend is \
-                     unavailable for `cydrive mount`; falling back to the WebDAV drive \
-                     mapping (K40)");
-                println!("{}", cloudkit_cli::winfsp_fallback_notice(reason));
+                     unavailable for `cydrive mount`; no net use fallback - the volume \
+                     stays reachable without a drive letter");
+                println!("{}", cloudkit_cli::winfsp_unavailable_notice(reason));
             }
             cloudkit_cli::MountBackendDecision::WinFsp => {
                 return mount_cmd_winfsp(cfg, url, letter).await;
@@ -945,7 +951,15 @@ fn volumes_cmd() -> Result<()> {
 /// single-volume config runs the frozen path below, a `volumes_dir`
 /// config runs [`run_multi_volume`] (per-volume dispatch + the Volume
 /// Registry assembly).
-async fn run() -> Result<()> {
+async fn run(no_open_browser: bool) -> Result<()> {
+    // The CLI flag is the argument-shaped form of the CYDRIVE_NO_OPEN_BROWSER
+    // environment switch the boot's browser hand-off reads (lib.rs): setting
+    // it here keeps ONE decision point. The flag wins over the environment
+    // only in the obvious direction (flag = suppress; an absent flag never
+    // re-enables what the environment suppressed).
+    if no_open_browser {
+        std::env::set_var("CYDRIVE_NO_OPEN_BROWSER", "1");
+    }
     let cwd = std::env::current_dir().context("resolving the working directory")?;
     println!(
         "cydrive {} starting in {}",
@@ -957,10 +971,23 @@ async fn run() -> Result<()> {
     // disabled-volume skip note among them) must reach the log, not die
     // against a not-yet-installed subscriber.
     cloudkit_core::logging::init(&LogConfig::default()).context("initializing logging")?;
-    match discover_config_with_volumes().context("config discovery failed")? {
+    // Web first-run bootstrap (FR1 / D1): a `run` in a directory with
+    // NEITHER config.toml NOR a legacy config.json generates the minimal
+    // init configuration and boots into the empty, web-guided state.
+    // Every configured shape — and every other subcommand — reaches the
+    // ordinary discovery below byte-for-byte unchanged.
+    let first_run =
+        cloudkit_cli::bootstrap_first_run_cwd().context("first-run bootstrap failed")?;
+    let discovered = if first_run {
+        cloudkit_cli::discover_first_run_config()
+            .context("loading the generated first-run config failed")?
+    } else {
+        discover_config_with_volumes().context("config discovery failed")?
+    };
+    match discovered {
         DiscoveredConfig::Single(cfg) => run_single_volume(cfg, cwd).await,
         DiscoveredConfig::Multi { process, volumes } => {
-            run_multi_volume(process, volumes, cwd).await
+            run_multi_volume(process, volumes, cwd, first_run).await
         }
     }
 }
@@ -1018,10 +1045,14 @@ async fn run_single_volume(cfg: CyDriveConfig, cwd: std::path::PathBuf) -> Resul
 /// (baidu/local/sftp) — keyed
 /// on each volume's settings with K21 volume-home state directories),
 /// then the Volume Registry assembly and ONE process-level stop gate.
+/// `first_run` (web first-run bootstrap FR1) rides through to the boot:
+/// it is the empty-assembly pass that lets a freshly generated config
+/// boot with zero volumes (the dashboard is the boot's product).
 async fn run_multi_volume(
     process: CyDriveConfig,
     volumes: Vec<VolumeConfig>,
     _cwd: std::path::PathBuf,
+    first_run: bool,
 ) -> Result<()> {
     // (Logging is installed in `run` before discovery — see the note there.)
     println!("Assembling {} volume(s) ...", volumes.len());
@@ -1088,6 +1119,7 @@ async fn run_multi_volume(
             dispatch: Some(dispatch),
             ..cloudkit_cli::RuntimeVolumeCommands::default()
         },
+        first_run,
     )
     .await?;
     // K29 process-level banner: the volume list with per-volume status;
@@ -1106,6 +1138,11 @@ async fn run_multi_volume(
         Some(addr) => banner.push_str(&format!(
             "  |  WebDAV at http://{addr} (volumes at /vol/<name>)"
         )),
+        // First run: the listener is absent BY DESIGN (nothing to serve
+        // yet) — a "bind failed" would be a lie; it starts with the
+        // first volume.
+        None if first_run => banner
+            .push_str("  |  WebDAV starts with the first volume (add one through the dashboard)"),
         None => banner.push_str("  |  WebDAV unavailable (bind failed; see the log)"),
     }
     // MV3 / K24: the single dashboard port (the same line the

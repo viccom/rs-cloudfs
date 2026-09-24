@@ -102,9 +102,9 @@ fn default_matches_python_config() {
     assert_eq!(cfg.cache_path, "./Telegram_Cache");
     assert_eq!(cfg.db_path, "./cydrive_meta.db");
     assert_eq!(cfg.webdav_host, "127.0.0.1");
-    assert_eq!(cfg.webdav_port, 8080);
+    assert_eq!(cfg.webdav_port, 8485);
     assert_eq!(cfg.web_ui_host, "127.0.0.1");
-    assert_eq!(cfg.web_ui_port, 8088);
+    assert_eq!(cfg.web_ui_port, 8486);
     assert!(cfg.enable_web_ui);
     assert_eq!(cfg.drive_letter, "Y:");
     assert!(cfg.auto_mount_drive);
@@ -440,7 +440,7 @@ fn env_override_invalid_numbers_are_ignored_per_key() {
 
     let cfg = CyDriveConfig::default().with_env_overrides();
     assert_eq!(
-        cfg.webdav_port, 8080,
+        cfg.webdav_port, 8485,
         "out-of-range port must keep file/default value"
     );
     assert_eq!(cfg.web_ui_port, 9090);

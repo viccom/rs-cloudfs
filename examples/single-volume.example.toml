@@ -29,15 +29,15 @@ baidu_refresh_token = "REPLACE WITH YOUR BAIDU REFRESH TOKEN"
 # ── 挂载（Windows 盘符形态 "X:"；"Y"/"y" 会被规范化）──────────────────────
 drive_letter = "Z:"              # 默认 "Y:"
 auto_mount_drive = true          # 启动即挂载；默认 true
-mount_backend = "winfsp"         # 默认 "webdav"（net use）；"winfsp" 需 --features winfsp
+mount_backend = "winfsp"         # 默认 "winfsp"；"webdav"（net use）为显式回退，需 fix-reg
                                  # 构建且已装 WinFsp 运行时，缺失时可见降级回 webdav 不拒启
 # mount_point = "/home/me/CyDrive"         # 仅 Linux 生效；None = $HOME/CyDrive
 
 # ── 服务端口 ────────────────────────────────────────────────────────────────
 webdav_host = "127.0.0.1"        # 默认同值
-webdav_port = 8485               # 默认 8080
+webdav_port = 8485               # 默认 8485
 web_ui_host = "127.0.0.1"        # 默认同值
-web_ui_port = 8486               # 默认 8088
+web_ui_port = 8486               # 默认 8486
 enable_web_ui = true             # 默认 true
 
 # ── 加密（客户端侧；读路径按每行 scheme 分派，与这里无关）─────────────────

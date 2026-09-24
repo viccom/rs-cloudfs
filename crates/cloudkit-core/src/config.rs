@@ -293,19 +293,23 @@ impl Backend {
 /// `validate`, which therefore adds no rule for the key). *Availability*
 /// is deliberately not a config concern: `"winfsp"` on a machine without
 /// WinFsp (or in a binary built without the feature) is a legal config
-/// that the mount flow degrades visibly from (K40's fallback back to
-/// WebDAV — never a parse or validation error, never a refusal to boot).
+/// The default is [`MountBackend::Winfsp`] (负责人 2026-09-24 裁决: drive
+/// letters mount in-process out of the box; the legacy `net use` mapping
+/// needs a one-time elevated `cydrive fix-reg` on fresh machines and
+/// would fail the first claim with system error 67). A winfsp mount that
+/// cannot run or fails does NOT fall back to webdav — the volume stays
+/// reachable through the dashboard/WebDAV and the failure is announced
+/// with actionable hints (opt into webdav by setting the key explicitly).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MountBackend {
-    /// `net use` drive mapping onto the process WebDAV endpoint (the
-    /// Python baseline behavior; the default, and the fallback arm every
-    /// degraded winfsp mount lands on).
-    #[default]
-    Webdav,
     /// In-process WinFsp native mount (Phase 3, K38/K39) — needs a
     /// `--features winfsp` build and an installed WinFsp runtime.
+    #[default]
     Winfsp,
+    /// `net use` drive mapping onto the process WebDAV endpoint (the
+    /// Python baseline behavior; now an explicit opt-in).
+    Webdav,
 }
 
 impl MountBackend {
@@ -1476,9 +1480,9 @@ impl Default for CyDriveConfig {
             cache_path: "./Telegram_Cache".to_string(),
             db_path: "./cydrive_meta.db".to_string(),
             webdav_host: "127.0.0.1".to_string(),
-            webdav_port: 8080,
+            webdav_port: 8485,
             web_ui_host: "127.0.0.1".to_string(),
-            web_ui_port: 8088,
+            web_ui_port: 8486,
             enable_web_ui: true,
             allow_remote_admin: false,
             drive_letter: "Y:".to_string(),

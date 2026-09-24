@@ -1774,8 +1774,13 @@ pub async fn run_multi_with_transports(
     process_cfg: &CyDriveConfig,
     volumes: Vec<(VolumeConfig, RunOptions, Arc<dyn CloudTransport>)>,
 ) -> Result<MultiVolumeHandle> {
-    run_multi_with_transports_and_commands(process_cfg, volumes, RuntimeVolumeCommands::default())
-        .await
+    run_multi_with_transports_and_commands(
+        process_cfg,
+        volumes,
+        RuntimeVolumeCommands::default(),
+        false,
+    )
+    .await
 }
 
 /// [`run_multi_with_transports`] with the runtime-volume command surface
@@ -1815,10 +1820,23 @@ pub async fn run_multi_with_transports(
 /// one queue — the handler's own single-permit gate (K58-FB), with
 /// each execution detached from its caller's wait (a route budget that
 /// elapses abandons the REPLY, never the command).
+///
+/// `first_run` (web first-run bootstrap FR1 / D3) marks the init mode a
+/// `cydrive run` enters right after [`bootstrap_first_run_cwd`]
+/// generated a fresh configuration: with it, gate B (the
+/// no-enabled-volumes refusal) lets the EMPTY assembly through — the
+/// dashboard binds the empty registry so the first volume can be added
+/// through the web UI, the WebDAV listener stays unbound (the empty
+/// face set is a structural `None`), and the control channel answers
+/// `LIST` with zero volumes. On the bound dashboard a first run also
+/// opens the system browser at the dashboard address (suppressed with
+/// the `CYDRIVE_NO_OPEN_BROWSER` env var; a failed bind only warns —
+/// edit config.toml and run again).
 pub async fn run_multi_with_transports_and_commands(
     process_cfg: &CyDriveConfig,
     volumes: Vec<(VolumeConfig, RunOptions, Arc<dyn CloudTransport>)>,
     commands: RuntimeVolumeCommands,
+    first_run: bool,
 ) -> Result<MultiVolumeHandle> {
     // The double-start guard (see the single-volume call site): refuse a
     // second boot over a live instance before touching any volume.
@@ -1874,7 +1892,7 @@ pub async fn run_multi_with_transports_and_commands(
         }
     }
 
-    if runtimes.is_empty() {
+    if runtimes.is_empty() && !first_run {
         // Review M4: reachable since RV0 — every volume file disabled.
         // The assembly entry main.rs boots through IS the actionable
         // face (the skip itself is only an info line in the log), so
@@ -1883,7 +1901,12 @@ pub async fn run_multi_with_transports_and_commands(
         anyhow::bail!("{}", no_enabled_volumes_message(process_cfg));
     }
     let registry = RegistryHandle::new(runtimes);
-    if registry.all_failed() {
+    // The all-failed gate reads `all` — over an EMPTY registry that is
+    // vacuously true, so it is only meaningful when something actually
+    // assembled. The first-run boot reaches here with an empty registry
+    // BY DESIGN (gate B above let it through); every other empty
+    // assembly bailed one branch earlier.
+    if !registry.volumes().is_empty() && registry.all_failed() {
         anyhow::bail!(
             "every volume failed to assemble ({}): {} — fix the reported volume \
              configurations and run again",
@@ -1896,6 +1919,19 @@ pub async fn run_multi_with_transports_and_commands(
                 .join(", ")
         );
     }
+    if first_run && registry.status_list().is_empty() {
+        // The first-run init banner (D4): the configuration was just
+        // generated and nothing serves yet — point at the dashboard the
+        // boot is about to bind. The URL names the configured address
+        // (the template pins 127.0.0.1:8486); the actual bound address
+        // is announced by the boot's own web-UI line and the browser
+        // opens there.
+        tracing::info!(
+            url = %format!("http://{}:{}", process_cfg.web_ui_host, process_cfg.web_ui_port),
+            "first run: no volumes yet — add your first volume through the web \
+             dashboard's volumes page (the ＋ Add Volume button)"
+        );
+    }
 
     // The ONE WebDAV listener (K20): `/vol/<name>/` routes to every
     // running volume — through the shared face table (RV1/K51) the
@@ -1906,7 +1942,13 @@ pub async fn run_multi_with_transports_and_commands(
     // keep running; the WebDAV face is simply absent. The boot keeps a
     // clone of the face handle: RV2's ADD/REMOVE mutate the same table.
     let webdav_face = cloudkit_webdav::RegistryHandle::new(volume_fses);
-    let webdav_server = bind_multi_webdav(process_cfg, webdav_face.clone()).await;
+    // First run (FR1 fix): the empty registry still binds — the dashboard
+    // is the boot's product, and a drive-letter volume added through it
+    // mounts THROUGH this listener (the default `net use` backend's
+    // endpoint); leaving it unbound would roll every runtime ADD with a
+    // claimed letter back (the registry face is a per-request
+    // projection, so the empty bind serves late-added volumes).
+    let webdav_server = bind_multi_webdav(process_cfg, webdav_face.clone(), first_run).await;
     let webdav_addr = webdav_server.as_ref().map(WebDavServer::local_addr);
 
     // The ONE dashboard (K24 / MV3): a single process-level port serving
@@ -2061,6 +2103,29 @@ pub async fn run_multi_with_transports_and_commands(
     )
     .await;
     let web_ui_addr = web_ui.as_ref().map(WebUiServer::local_addr);
+    // First-run browser hand-off (D4): on a freshly generated config the
+    // dashboard IS the product — open it at the ACTUAL bound address once
+    // the bind succeeded. The env kill-switch is the headless-server exit
+    // (a server has no browser to open) and keeps automated boots (the
+    // offline test suite) browser-free; the spawn is fire-and-forget and
+    // deliberately carries NO behavioral assertion anywhere (a spawn side
+    // effect — only its compilation on both platforms is gated). A
+    // degraded bind warns instead: the init banner already named the URL,
+    // but nothing answers there — editing config.toml and rerunning is
+    // the way out.
+    if first_run {
+        match &web_ui {
+            Some(server) if std::env::var_os("CYDRIVE_NO_OPEN_BROWSER").is_none() => {
+                open_browser(&format!("http://{}", server.local_addr()));
+            }
+            Some(_) => {}
+            None => tracing::warn!(
+                "first run: the web dashboard did not bind — edit config.toml \
+                 (web_ui_host / web_ui_port) and run `cydrive run` again; the \
+                 volume-management UI lives there"
+            ),
+        }
+    }
 
     // Per-volume mounts (K27 + K40): only volumes that EXPLICITLY set a
     // drive_letter claim a mount (the parsed default letter is a
@@ -2279,15 +2344,20 @@ fn no_enabled_volumes_message(process_cfg: &CyDriveConfig) -> String {
 /// Binds the single multi-volume WebDAV listener (K20) or degrades
 /// visibly (K22): an address-parse or bind failure logs an error and
 /// returns `None` — the volumes keep running, only the WebDAV face is
-/// gone. An empty volume set cannot reach the bind (the
-/// no-enabled-volumes and all-failed guards bail first); the empty
-/// skip stays as a structural backstop — an empty router would bind a
-/// listener that can serve nothing.
+/// gone. An empty volume set cannot reach the bind on a configured
+/// boot (the no-enabled-volumes and all-failed guards bail first); the
+/// empty skip stays as a structural backstop for those — EXCEPT the
+/// first-run boot, which arrives with an empty registry BY DESIGN and
+/// binds anyway (`first_run`): the listener is the mount endpoint the
+/// first dashboard-created drive-letter volume goes through, and the
+/// registry face is a per-request projection that picks late-added
+/// volumes up without a rebind (RV1).
 async fn bind_multi_webdav(
     process_cfg: &CyDriveConfig,
     volumes: cloudkit_webdav::RegistryHandle,
+    first_run: bool,
 ) -> Option<WebDavServer> {
-    if volumes.is_empty() {
+    if volumes.is_empty() && !first_run {
         return None;
     }
     let bind = match process_cfg.webdav_host.parse::<IpAddr>() {
@@ -6733,7 +6803,7 @@ pub enum MountBackendDecision {
     WebDav,
     /// `mount_backend = "winfsp"` was asked for and cannot be honoured;
     /// the reason is user-facing and the WebDAV mapping runs instead.
-    WebDavFallback(String),
+    WinfspUnavailable(String),
 }
 
 impl MountBackendDecision {
@@ -6748,8 +6818,8 @@ impl MountBackendDecision {
         match self {
             MountBackendDecision::WinFsp => "winfsp".to_string(),
             MountBackendDecision::WebDav => "webdav".to_string(),
-            MountBackendDecision::WebDavFallback(reason) => {
-                format!("webdav (winfsp unavailable: {reason})")
+            MountBackendDecision::WinfspUnavailable(reason) => {
+                format!("winfsp (unavailable: {reason})")
             }
         }
     }
@@ -6794,9 +6864,11 @@ impl MountedBackend {
     }
 }
 
-/// K40's pure decision: the config's request against what this
-/// build/machine can do. `webdav` is never upgraded; `winfsp` lands on
-/// WebDAV (with a reason) whenever it cannot run.
+/// The pure decision: the config's request against what this
+/// build/machine can do. `webdav` is never upgraded; a `winfsp` request
+/// that cannot run does NOT fall back to webdav (负责人 2026-09-24 裁决) —
+/// it answers [`MountBackendDecision::WinfspUnavailable`] with the reason
+/// and the volume stays reachable without a drive letter.
 pub fn choose_mount_backend(
     backend: MountBackend,
     capability: &WinFspCapability,
@@ -6806,10 +6878,10 @@ pub fn choose_mount_backend(
         MountBackend::Winfsp => match capability {
             WinFspCapability::Ready => MountBackendDecision::WinFsp,
             WinFspCapability::NotCompiled => {
-                MountBackendDecision::WebDavFallback(WINFSP_FEATURE_REQUIRED.to_string())
+                MountBackendDecision::WinfspUnavailable(WINFSP_FEATURE_REQUIRED.to_string())
             }
             WinFspCapability::Unavailable(reason) => {
-                MountBackendDecision::WebDavFallback(reason.clone())
+                MountBackendDecision::WinfspUnavailable(reason.clone())
             }
         },
     }
@@ -6838,13 +6910,14 @@ pub fn winfsp_capability() -> WinFspCapability {
     WinFspCapability::NotCompiled
 }
 
-/// The one-line notice a degraded winfsp boot prints (and logs at error
-/// level) before the WebDAV mapping takes over: the backend, the reason,
-/// the fallback that runs and the fact that nothing was blocked.
-pub fn winfsp_fallback_notice(reason: &str) -> String {
+/// The one-line notice an unavailable-winfsp boot prints (and logs at error
+/// level): the backend, the reason, the fact that drive letters are simply
+/// not mounted, and the two ways up.
+pub fn winfsp_unavailable_notice(reason: &str) -> String {
     format!(
-        "winfsp mount backend unavailable ({reason}); falling back to the WebDAV drive \
-         mapping (net use) — nothing is blocked, and the volumes stay reachable"
+        "winfsp mount backend unavailable ({reason}); drive letters are not mounted (no \
+         mapping (net use) - install the WinFsp runtime, or set mount_backend =
+         \"webdav\" in config.toml to opt into it. The volumes stay reachable"
     )
 }
 
@@ -7082,27 +7155,20 @@ async fn mount_volumes_if_configured(plan: &MountPlan<'_>) -> VolumeMounts {
                 ),
                 ..VolumeMounts::default()
             },
-            // K40's visible degradation: error log + printed notice, then
-            // the same WebDAV pass, annotated per volume.
-            MountBackendDecision::WebDavFallback(reason) => {
+            // No net use fallback (负责人 2026-09-24 裁决): an unavailable
+            // winfsp backend means the drive letters simply do not mount —
+            // the volumes keep running and stay reachable through the
+            // dashboard / WebDAV endpoints, and the notice names the two
+            // ways up (install WinFsp, or opt into webdav explicitly).
+            MountBackendDecision::WinfspUnavailable(reason) => {
                 tracing::error!(
                     backend = "winfsp",
                     %reason,
-                    "the winfsp mount backend is unavailable; falling back to the WebDAV \
-                     drive mapping (K40 — visible degradation, the boot continues)"
+                    "the winfsp mount backend is unavailable; drive letters are not \
+                     mounted (no net use fallback) — the volumes stay reachable"
                 );
-                println!("{}", winfsp_fallback_notice(&reason));
-                VolumeMounts {
-                    mounted: mount_claims_via_webdav(
-                        plan.process_cfg,
-                        plan.claims,
-                        plan.webdav_available,
-                        |_| MountedBackend::WebDavFallback {
-                            reason: reason.clone(),
-                        },
-                    ),
-                    ..VolumeMounts::default()
-                }
+                println!("{}", winfsp_unavailable_notice(&reason));
+                VolumeMounts::default()
             }
             MountBackendDecision::WinFsp => mount_claims_via_winfsp(plan).await,
         }
@@ -7220,69 +7286,44 @@ async fn mount_claims_via_winfsp(plan: &MountPlan<'_>) -> VolumeMounts {
                     "winfsp mounting failed; falling back to the WebDAV drive mapping (K40)"
                 );
                 println!("winfsp mounting FAILED for volume {name} ({error}).");
-                // An occupied letter is the one failure where the WebDAV
-                // arm must NOT run: `mount_drive` clears the letter first
-                // (`net use /delete`), which would take over whatever
-                // holds it. Everything else falls back per claim.
-                if !matches!(error, MountError::LetterInUse { .. }) {
-                    if plan.webdav_available {
-                        println!("Falling back to the WebDAV drive mapping for volume {name}.");
-                        mounted.extend(mount_claims_via_webdav(
-                            plan.process_cfg,
-                            std::slice::from_ref(&(name.clone(), letter.clone())),
-                            plan.webdav_available,
-                            |_| MountedBackend::WebDavFallback {
-                                reason: format!("winfsp mounting failed: {error}"),
-                            },
-                        ));
-                    } else {
-                        println!(
-                            "No fallback for volume {name}: the WebDAV listener is not bound."
-                        );
-                    }
-                }
+                // No net use fallback: it would also hide an occupied letter
+                // (the webdav mapping clears the letter first, taking over
+                // whatever holds it). The volume stays reachable without the
+                // letter; webdav is an explicit config opt-in.
+                println!(
+                    "The volume stays reachable at {} without a drive letter - fix the                      cause (letter in use? WinFsp runtime?) or set mount_backend =                      \"webdav\" in config.toml to opt into the net use mapping.",
+                    volume_mount_url(plan.process_cfg, name)
+                );
             }
             Err(error) => {
                 tracing::error!(
                     volume = %name,
                     %error,
-                    "the winfsp mount task failed to complete; falling back to the WebDAV \
-                     drive mapping when the letter state allows (K40)"
+                    "the winfsp mount task failed to complete; no net use fallback - the \
+                     volume stays reachable without a drive letter"
                 );
                 println!("winfsp mount task FAILED for volume {name} ({error}).");
-                // A join failure means the mount task itself panicked, so
-                // there is no typed verdict about the letter — unlike the
-                // Ok(Err) arm, where `MountError::LetterInUse` is exactly
-                // the one outcome that must NOT fall back (the WebDAV
-                // mapping clears the letter first, taking over whatever
-                // holds it). The same carve-out, decided by a read-only
-                // occupancy probe instead: a letter that currently answers
-                // on anything (foreign mapping, someone else's volume, an
-                // orphan of the panicking mount) is left alone.
+                // A join failure means the mount task itself panicked: no
+                // typed verdict about the letter exists, so a read-only
+                // occupancy probe decides the WARNING's wording - a letter
+                // that currently answers on anything (foreign mapping,
+                // someone else's volume, an orphan of the panicking mount)
+                // is called out by name and never touched.
                 let letter_taken = cloudkit_platform::windows::used_drive_letters()
                     .iter()
                     .any(|used| used.eq_ignore_ascii_case(letter));
                 if letter_taken {
                     println!(
-                        "No WebDAV fallback for volume {name}: the drive letter {letter} is \
-                         already in use and the failed mount task left no typed verdict \
-                         about it — the letter is left alone. The volume stays reachable \
-                         at {}.",
-                        volume_mount_url(plan.process_cfg, name)
+                        "The drive letter {letter} is already in use and the failed mount \
+                         task left no typed verdict about it - the letter is left alone."
                     );
-                } else if plan.webdav_available {
-                    println!("Falling back to the WebDAV drive mapping for volume {name}.");
-                    mounted.extend(mount_claims_via_webdav(
-                        plan.process_cfg,
-                        std::slice::from_ref(&(name.clone(), letter.clone())),
-                        plan.webdav_available,
-                        |_| MountedBackend::WebDavFallback {
-                            reason: format!("winfsp mount task failed: {error}"),
-                        },
-                    ));
-                } else {
-                    println!("No fallback for volume {name}: the WebDAV listener is not bound.");
                 }
+                println!(
+                    "The volume stays reachable at {} without a drive letter - fix the \
+                     cause or set mount_backend = \"webdav\" in config.toml to opt into \
+                     the net use mapping.",
+                    volume_mount_url(plan.process_cfg, name)
+                );
             }
         }
     }
@@ -7692,6 +7733,128 @@ pub fn discover_config_with_volumes_and_store(
         "no config found in the current directory: write a config.toml (or a legacy \
          Python config.json) with bot_token and chat_id, then run cydrive again"
     )
+}
+
+// --------------------------- web first-run bootstrap (FR1, D1–D4) ---
+
+/// The first-run process `config.toml` (web first-run plan FR1 / D2):
+/// hand-written like the setup skeleton ([`crate::setup`]'s
+/// `MULTI_PROCESS_TOML`) — `save_toml` would pave every defaulted
+/// volume-scoped key and fail its own K19 mixing guard. Ports are the
+/// program defaults (8485 WebDAV / 8486 web UI, 负责人 2026-09-23
+/// 裁决); `auto_mount_drive` is process-scoped so the guard accepts it.
+/// `mount_backend` is deliberately ABSENT: the global default is winfsp
+/// (负责人 2026-09-24 裁决) and an absent key reads as that default.
+/// The file text is pinned byte for byte by
+/// `tests/multivolume_config.rs::first_run_template_pin_keys_ports_and_header`.
+const FIRST_RUN_PROCESS_TOML: &str = "\
+# cydrive process config — generated on first run: no config.toml or
+# config.json was found in this directory, so this minimal configuration
+# was written and the instance started so a first volume can be added
+# through the web dashboard. Process-level keys only — each volume's own
+# settings live in volumes/<name>.toml.
+volumes_dir = \"volumes\"
+
+webdav_host = \"127.0.0.1\"
+webdav_port = 8485
+enable_web_ui = true
+web_ui_host = \"127.0.0.1\"
+web_ui_port = 8486
+auto_mount_drive = true
+";
+
+/// The `run` bootstrap probe (web first-run plan FR1 / D1+D2): in a
+/// working directory with NEITHER `config.toml` NOR a legacy
+/// `config.json`, generate the minimal init configuration — the
+/// [`FIRST_RUN_PROCESS_TOML`] template through the one atomic-write
+/// primitive ([`cloudkit_core::config::write_config_atomically`], K58-H3)
+/// plus the empty `volumes/` directory it points at — and return `true`
+/// so the caller enters first-run mode. An existing configuration of
+/// EITHER shape disables the bootstrap entirely (`Ok(false)`): the probe
+/// runs before anything is written, so there is no overwrite path —
+/// a configured boot is byte-for-byte untouched.
+///
+/// Errors are the write/mkdir failures only; a *parse* failure of a
+/// pre-existing config is the ordinary discovery's business.
+pub fn bootstrap_first_run_cwd() -> Result<bool> {
+    if Path::new("config.toml").exists() || Path::new("config.json").exists() {
+        return Ok(false);
+    }
+    cloudkit_core::config::write_config_atomically(
+        Path::new("config.toml"),
+        FIRST_RUN_PROCESS_TOML,
+    )
+    .context("writing the first-run config.toml")?;
+    std::fs::create_dir_all("volumes").context("creating the volumes directory")?;
+    tracing::info!(
+        "first run: no configuration found — generated a minimal config.toml; \
+         add your first volume through the web dashboard"
+    );
+    Ok(true)
+}
+
+/// The first-run discovery (web first-run plan FR1 / D3): load the
+/// config.toml [`bootstrap_first_run_cwd`] just wrote through the SAME
+/// funnel the ordinary multi-volume discovery uses — parse with raw-key
+/// capture, the K19 mixing guard, validate — then return
+/// [`DiscoveredConfig::Multi`] with an EMPTY volume manifest. The empty
+/// manifest is the point: the ordinary discovery's volume load (core's
+/// `discover_volumes`) refuses an empty volumes directory (gate A), and
+/// the first-run boot must boot INTO the empty state the web UI exists
+/// to fill. This variant changes nothing in core and nothing in the
+/// ordinary functions beside it — it is only ever called on the file
+/// the bootstrap just generated (which always carries `volumes_dir`).
+pub fn discover_first_run_config() -> Result<DiscoveredConfig> {
+    let toml_path = Path::new("config.toml");
+    let (cfg, raw_keys) = CyDriveConfig::load_toml_with_keys(toml_path)
+        .with_context(|| format!("loading {}", toml_path.display()))?;
+    cloudkit_core::config::ensure_no_volume_keys_in_process(&raw_keys)
+        .context("the generated config.toml mixes process- and volume-scoped keys")?;
+    cfg.validate()
+        .context("invalid process-level configuration")?;
+    Ok(DiscoveredConfig::Multi {
+        process: cfg,
+        volumes: Vec::new(),
+    })
+}
+
+/// Opens the system browser at `url` (web first-run plan FR1 / D4) —
+/// fire-and-forget: the child is spawned detached from the boot flow and
+/// never waited on, so a spawn failure is only a `tracing::warn` (a
+/// headless machine must not fail its boot over a missing browser; the
+/// init banner already printed the URL). The function body carries NO
+/// behavioral test anywhere — asserting a spawn side effect would need a
+/// real browser on every test machine; both cfg arms are instead kept
+/// compilable on the other platform by the workspace gates (the R5
+/// cross-platform red line), and the production caller is suppressed in
+/// tests via `CYDRIVE_NO_OPEN_BROWSER`.
+fn open_browser(url: &str) {
+    #[cfg(unix)]
+    {
+        match std::process::Command::new("xdg-open").arg(url).spawn() {
+            Ok(_child) => tracing::info!(%url, "opening the dashboard in the browser"),
+            Err(error) => {
+                tracing::warn!(%url, %error, "could not open a browser (xdg-open)")
+            }
+        }
+    }
+
+    #[cfg(not(unix))]
+    {
+        use std::os::windows::process::CommandExt;
+        // CREATE_NO_WINDOW: the `start` shim must not flash a console.
+        const CREATE_NO_WINDOW: u32 = 0x0800_0000;
+        // `start`'s first quoted argument is the new window's TITLE —
+        // the empty string keeps the URL itself from being parsed as one.
+        let result = std::process::Command::new("cmd")
+            .args(["/c", "start", "", url])
+            .creation_flags(CREATE_NO_WINDOW)
+            .spawn();
+        match result {
+            Ok(_child) => tracing::info!(%url, "opening the dashboard in the browser"),
+            Err(error) => tracing::warn!(%url, %error, "could not open a browser (start)"),
+        }
+    }
 }
 
 /// The `migrate` subcommand body (M5): import a legacy Python
