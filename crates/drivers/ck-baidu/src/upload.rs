@@ -107,9 +107,6 @@ pub const EMPTY_MD5: &str = "d41d8cd98f00b204e9800998ecf8427e";
 /// 取舍」节，两条路径各守其契约）。
 pub(crate) const UPLOAD_WORKERS: usize = 4;
 
-/// 会话目录相对形态（K7 契约：`<sessions_dir>/baidu_state/sessions/`）。
-const SESSIONS_REL: [&str; 2] = ["baidu_state", "sessions"];
-
 /// K7 会话记录（落盘 JSON 形态；含 path/size/block_md5/uploadid/完成位图）。
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub(crate) struct SessionRecord {
@@ -131,17 +128,17 @@ pub(crate) struct SessionRecord {
 /// block_md5 不入定位键——precreate 时刻的分片列表可能只是部分（后续
 /// 数据未到），无法构成恢复查找键；内容一致性由恢复时的逐片 md5
 /// 校验保证（见 [`BaiduStager`] 文档「恢复三路」）。
-#[derive(Clone, Default)]
+#[derive(Clone)]
 pub(crate) struct SessionStore {
     map: Arc<Mutex<HashMap<String, SessionRecord>>>,
-    dir: Option<PathBuf>,
+    disk: cloudkit_storage::SessionDiskStore,
 }
 
 impl SessionStore {
     pub(crate) fn new(dir: Option<PathBuf>) -> Self {
         SessionStore {
             map: Arc::new(Mutex::new(HashMap::new())),
-            dir,
+            disk: cloudkit_storage::SessionDiskStore::new(dir, "baidu_state"),
         }
     }
 
@@ -149,13 +146,9 @@ impl SessionStore {
         format!("{path}|{size}")
     }
 
-    /// 定位键 → 落盘文件路径（`<dir>/baidu_state/sessions/<md5hex>.json`）。
-    fn file_path(&self, key: &str) -> Option<PathBuf> {
-        self.dir.as_ref().map(|root| {
-            root.join(SESSIONS_REL[0])
-                .join(SESSIONS_REL[1])
-                .join(format!("{}.json", md5_hex(key.as_bytes())))
-        })
+    /// 定位键 → 落盘文件名摘要（MD5 hex；本驱动自留——文件名不跨驱动共享）。
+    fn digest(key: &str) -> String {
+        md5_hex(key.as_bytes())
     }
 
     /// 取会话：内存优先，miss 且有磁盘层则读文件回填（跨进程恢复腿）。
@@ -164,47 +157,28 @@ impl SessionStore {
         if let Some(rec) = self.map.lock().unwrap().get(&key) {
             return Some(rec.clone());
         }
-        let file = self.file_path(&key)?;
-        let raw = tokio::fs::read_to_string(&file).await.ok()?;
+        let raw = self.disk.read(&Self::digest(&key)).await?;
         let rec: SessionRecord = serde_json::from_str(&raw).ok()?;
         self.map.lock().unwrap().insert(key, rec.clone());
         Some(rec)
     }
 
     /// 写会话：内存 + 磁盘（原子：tmp + rename；`baidu_state/sessions/`
-    /// 目录随需创建）。
+    /// 目录随需创建；tmp 名 pid+seq 随 L2 共核统一——本驱动原形态，非变更）。
     pub(crate) async fn put(&self, rec: SessionRecord) {
         let key = Self::key(&rec.path, rec.size);
         self.map.lock().unwrap().insert(key.clone(), rec.clone());
-        if let Some(file) = self.file_path(&key) {
-            if let Some(parent) = file.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
-            }
-            let body = serde_json::to_string(&rec).unwrap_or_default();
-            // 原子写：同目录 tmp + rename（Windows rename 覆盖已存在目标）。
-            let tmp = file.with_extension(format!(
-                "json.tmp-{}-{}",
-                std::process::id(),
-                TMP_COUNTER.fetch_add(1, std::sync::atomic::Ordering::Relaxed),
-            ));
-            if tokio::fs::write(&tmp, body).await.is_ok() {
-                let _ = tokio::fs::rename(&tmp, &file).await;
-            }
-        }
+        let body = serde_json::to_string(&rec).unwrap_or_default();
+        self.disk.write(&Self::digest(&key), &body).await;
     }
 
     /// 作废会话（create 成功 / 探活判死 / md5 校验不符）：内存 + 磁盘。
     pub(crate) async fn remove(&self, path: &str, size: u64) {
         let key = Self::key(path, size);
         self.map.lock().unwrap().remove(&key);
-        if let Some(file) = self.file_path(&key) {
-            let _ = tokio::fs::remove_file(&file).await;
-        }
+        self.disk.remove(&Self::digest(&key)).await;
     }
 }
-
-/// tmp 文件名去重计数器（多 stager 同 key 并发写的碰撞窗口隔离）。
-static TMP_COUNTER: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
 
 /// MD5 hex（分片 md5：4MiB 边界对齐内容逐片计算，非全文件 MD5）。
 pub(crate) fn md5_hex(data: &[u8]) -> String {

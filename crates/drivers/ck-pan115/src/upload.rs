@@ -67,17 +67,19 @@ pub struct UploadSession {
     pub callback: Option<(String, String)>,
 }
 
-/// 会话存储（baidu SessionStore 同形：内存优先 + 可选磁盘层）。
+/// 会话存储（内存优先 + 可选磁盘层；磁盘机制经 L2 [`SessionDiskStore`]，
+/// 架构审查 D4 项③——key 构造与摘要算法本驱动自留，tmp 命名随共核统一
+/// 为 pid+seq）。
 pub struct SessionStore {
     map: Arc<Mutex<std::collections::HashMap<String, UploadSession>>>,
-    dir: Option<PathBuf>,
+    disk: cloudkit_storage::SessionDiskStore,
 }
 
 impl SessionStore {
     pub fn new(dir: Option<PathBuf>) -> Self {
         SessionStore {
             map: Arc::new(Mutex::new(std::collections::HashMap::new())),
-            dir,
+            disk: cloudkit_storage::SessionDiskStore::new(dir, "pan115_state"),
         }
     }
 
@@ -85,15 +87,11 @@ impl SessionStore {
         format!("{path}|{size}|{sha1}")
     }
 
-    fn file_path(&self, key: &str) -> Option<PathBuf> {
-        self.dir.as_ref().map(|root| {
-            let mut h = Sha1::new();
-            h.update(key.as_bytes());
-            let hex = format!("{:x}", h.finalize());
-            root.join("pan115_state")
-                .join("sessions")
-                .join(format!("{hex}.json"))
-        })
+    /// key → 落盘文件名摘要（Sha1；本驱动自留，不跨驱动共享文件名）。
+    fn digest(key: &str) -> String {
+        let mut h = Sha1::new();
+        h.update(key.as_bytes());
+        format!("{:x}", h.finalize())
     }
 
     /// 取会话（内存优先；miss 且有磁盘层则读文件回填——跨进程腿）。
@@ -102,8 +100,7 @@ impl SessionStore {
         if let Some(rec) = self.map.lock().unwrap().get(&key).cloned() {
             return Some(rec);
         }
-        let file = self.file_path(&key)?;
-        let text = tokio::fs::read_to_string(&file).await.ok()?;
+        let text = self.disk.read(&Self::digest(&key)).await?;
         let rec: UploadSession = serde_json::from_str(&text).ok()?;
         self.map.lock().unwrap().insert(key, rec.clone());
         Some(rec)
@@ -113,16 +110,8 @@ impl SessionStore {
     pub async fn save(&self, path: &str, size: u64, sha1: &str, rec: &UploadSession) {
         let key = Self::key(path, size, sha1);
         self.map.lock().unwrap().insert(key.clone(), rec.clone());
-        if let Some(file) = self.file_path(&key) {
-            if let Some(parent) = file.parent() {
-                let _ = tokio::fs::create_dir_all(parent).await;
-            }
-            if let Ok(text) = serde_json::to_string(rec) {
-                let tmp = file.with_extension("json.tmp");
-                if tokio::fs::write(&tmp, text).await.is_ok() {
-                    let _ = tokio::fs::rename(&tmp, &file).await;
-                }
-            }
+        if let Ok(text) = serde_json::to_string(rec) {
+            self.disk.write(&Self::digest(&key), &text).await;
         }
     }
 
@@ -130,9 +119,7 @@ impl SessionStore {
     pub async fn remove(&self, path: &str, size: u64, sha1: &str) {
         let key = Self::key(path, size, sha1);
         self.map.lock().unwrap().remove(&key);
-        if let Some(file) = self.file_path(&key) {
-            let _ = tokio::fs::remove_file(&file).await;
-        }
+        self.disk.remove(&Self::digest(&key)).await;
     }
 }
 
@@ -598,34 +585,20 @@ impl Drop for Pan115Stager {
 #[async_trait]
 impl UploadStager for Pan115Stager {
     async fn write(&mut self, data: &[u8]) -> Result<(), StorageError> {
-        // u64 溢出守卫：checked_add 语义（天文数字级累积才可能触发，
-        // 形态上仍拒绝而非回绕）。
-        self.written
-            .checked_add(data.len() as u64)
-            .ok_or(StorageError::Invalid)?;
-        use tokio::io::AsyncWriteExt;
-        let mut file = tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(&self.spool)
-            .await
-            .map_err(|e| StorageError::Io(format!("spool append: {e}")))?;
-        file.write_all(data)
-            .await
-            .map_err(|e| StorageError::Io(format!("spool write: {e}")))?;
-        self.written += data.len() as u64;
-        // 超承诺：立刻失败（baidu 同款——不再拉数据做无用工）。
-        if let Some(hinted) = self.hint.size {
-            if self.written > hinted {
-                return Err(StorageError::Invalid);
-            }
-        }
+        // 共享机制件（L2 `spool_append_write`：溢出守卫 → append → 累计 →
+        // 超承诺拒绝 → 到齐判定——行为与原内联体逐形，架构审查 D4 项①）。
+        let arrived = cloudkit_storage::spool_append_write(
+            &self.spool,
+            &mut self.written,
+            data,
+            self.hint.size,
+        )
+        .await?;
         // **到齐即传**（115 的 init 会话锁定全量 block_list——到齐才
         // 起链无浪费；也让 conformance ⑦ 的差集观测点在 close 前成立）：
         // 承诺 size 到齐的那一次 write 之后立刻推传输链。
-        if let Some(hinted) = self.hint.size {
-            if self.written == hinted && self.transfer.is_none() {
-                self.run_transfer().await?;
-            }
+        if arrived && self.transfer.is_none() {
+            self.run_transfer().await?;
         }
         Ok(())
     }

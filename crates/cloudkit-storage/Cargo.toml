@@ -17,9 +17,13 @@ serde = { version = "1.0.229", features = ["derive"] }
 thiserror = "2"
 # transport::mock 的 open/open_range 注入人为延迟（stalling remote 模拟）；
 # mock 是 pub API（上游 core/webdav/web/cli 测试经 re-export 使用），
-# 故进正式依赖而非 dev-dependency。
-tokio = { version = "1", features = ["time"] }
+# 故进正式依赖而非 dev-dependency。`fs`/`io-util` 服务 spool.rs 的本地
+# 暂存 append 面；`sync` 服务 token_bucket.rs 的 Mutex（L2 共享机制件，
+# 见两模块文档）。
+tokio = { version = "1", features = ["time", "fs", "io-util", "sync"] }
 
 [dev-dependencies]
 serde_json = "1.0.151"
 tokio = { version = "1", features = ["rt", "macros"] }
+# spool.rs 单测的临时目录（workspace 既有模式：core/pan115 同款）。
+tempfile = "3"

@@ -11,11 +11,7 @@
 //!   桶空则节拍等待（锁外 sleep，不阻塞并发许可）；
 //! - 可测性：毫秒级参数注入（[`LimiterConfig::fast`]）；时间原语用
 //!   tokio::time（异步等待不占阻塞线程）。
-
-use std::time::Duration;
-
-use tokio::sync::Mutex;
-use tokio::time::Instant;
+use cloudkit_storage::{TokenBucket, TokenBucketConfig};
 
 /// 限流器参数（生产缺省 = 保守起步档；测试经 [`LimiterConfig::fast`]
 /// 注入毫秒级节拍）。
@@ -46,71 +42,46 @@ impl LimiterConfig {
     }
 }
 
-/// 桶的可变状态（Mutex 保护；等待发生在锁外）。
-#[derive(Debug)]
-struct LimiterState {
-    /// 当前令牌数（浮点：按流逝时间连续补充）。
-    tokens: f64,
-    /// 上次补充时刻。
-    last_refill: Instant,
-}
-
-impl LimiterState {
-    /// 按流逝时间补充令牌（封顶容量）。
-    fn refill(&mut self, cfg: &LimiterConfig, now: Instant) {
-        let elapsed = now
-            .saturating_duration_since(self.last_refill)
-            .as_secs_f64();
-        self.tokens = (self.tokens + elapsed * cfg.rate_per_sec).min(cfg.burst as f64);
-        self.last_refill = now;
+impl From<LimiterConfig> for TokenBucketConfig {
+    fn from(cfg: LimiterConfig) -> Self {
+        TokenBucketConfig {
+            rate_per_sec: cfg.rate_per_sec,
+            burst: cfg.burst,
+        }
     }
 }
 
 /// 全局限流器（api client 持有并共享——dispatch 前统一过门；「全局」
 /// 指**每卷一个**）。
 ///
+/// 令牌桶共核经 L2 [`TokenBucket`]（架构审查 D4 项②：两驱动的令牌桶
+/// 部分去注释后相同，pan115 的 770004 封锁窗状态机为扩展不进共核）。
+///
 /// 并发：全方法可并发调用（`&self` + 内部 Mutex）；等待（节拍 sleep）
 /// 发生在锁外，一个等待者不阻塞其他许可的推进。
 pub struct RateLimiter {
-    cfg: LimiterConfig,
-    state: Mutex<LimiterState>,
+    bucket: TokenBucket,
 }
 
 impl RateLimiter {
     /// 以给定参数构造（桶满——进程启动即允许初始突发）。
     pub fn new(cfg: LimiterConfig) -> Self {
-        let now = Instant::now();
         RateLimiter {
-            cfg,
-            state: Mutex::new(LimiterState {
-                tokens: cfg.burst as f64,
-                last_refill: now,
-            }),
+            bucket: TokenBucket::new(cfg.into()),
         }
     }
 
-    /// 取一张发送许可：桶内有令牌 → `Ok(())`（扣一）；桶空 → 节拍等待
-    /// （锁外 sleep 到下一张令牌可扣）后 `Ok`。
+    /// 取一张发送许可：桶内有令牌 → 扣一返回；桶空 → 节拍等待
+    /// （锁外 sleep 到下一张令牌可扣）后返回。
     pub async fn check_wait(&self) {
-        loop {
-            let wait = {
-                let mut state = self.state.lock().await;
-                let now = Instant::now();
-                state.refill(&self.cfg, now);
-                if state.tokens >= 1.0 {
-                    state.tokens -= 1.0;
-                    return;
-                }
-                // 桶空：等到下一张令牌（锁外 sleep——不阻塞并发许可）
-                Duration::from_secs_f64((1.0 - state.tokens) / self.cfg.rate_per_sec)
-            };
-            tokio::time::sleep(wait).await;
-        }
+        self.bucket.wait_one().await;
     }
 }
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::*;
 
     #[tokio::test]

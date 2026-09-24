@@ -28,6 +28,7 @@
 
 use std::time::Duration;
 
+use cloudkit_storage::{refill_tokens, TokenBucketConfig};
 use tokio::sync::Mutex;
 use tokio::time::Instant;
 
@@ -82,13 +83,15 @@ struct LimiterState {
 }
 
 impl LimiterState {
-    /// 按流逝时间补充令牌（封顶容量）。
+    /// 按流逝时间补充令牌（封顶容量）——refill 数学复用 L2 共核
+    /// [`refill_tokens`]（封锁窗状态机须与本桶同一锁内原子，故不整体套
+    /// `TokenBucket`；仅 refill 式为真共核，架构审查 D4 项②）。
     fn refill(&mut self, cfg: &LimiterConfig, now: Instant) {
-        let elapsed = now
-            .saturating_duration_since(self.last_refill)
-            .as_secs_f64();
-        self.tokens = (self.tokens + elapsed * cfg.rate_per_sec).min(cfg.burst as f64);
-        self.last_refill = now;
+        let bucket_cfg = TokenBucketConfig {
+            rate_per_sec: cfg.rate_per_sec,
+            burst: cfg.burst,
+        };
+        refill_tokens(&mut self.tokens, &mut self.last_refill, &bucket_cfg, now);
     }
 
     /// 封锁窗是否已过期；过期则清封锁并重置退避阶梯（恢复双入口之一）。

@@ -30,7 +30,10 @@ pub mod error;
 pub mod ids;
 pub mod mock;
 pub mod optional;
+pub mod session_disk;
+pub mod spool;
 pub mod stager;
+pub mod token_bucket;
 pub mod transport;
 pub mod vocab;
 pub mod vpath;
@@ -42,7 +45,10 @@ pub use error::StorageError;
 pub use ids::{BackendHandle, EntryId, VolumeId};
 pub use mock::MockStorageDriver;
 pub use optional::{ChangeEvent, ChangeFeed, ChangePage, RapidUpload, TokenEvents};
+pub use session_disk::SessionDiskStore;
+pub use spool::{spool_append_write, SpoolStage};
 pub use stager::UploadStager;
+pub use token_bucket::{refill_tokens, TokenBucket, TokenBucketConfig};
 pub use vocab::{
     ByteStream, Entry, EntryKind, Listing, Page, PageCursor, Quota, Range, RelPath, WriteHint,
 };
