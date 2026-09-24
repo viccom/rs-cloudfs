@@ -98,6 +98,11 @@ async fn boot_first_run() -> (cloudkit_cli::MultiVolumeHandle, SocketAddr) {
     };
     assert!(volumes.is_empty(), "no volumes right after the bootstrap");
     process.web_ui_port = 0;
+    // The WebDAV listener moves to an ephemeral port too (nothing dials
+    // it in these tests) — its PRESENCE is the assertion (FR1 fix: the
+    // first-run boot must bind it even with zero volumes, because the
+    // runtime ADD of a drive-letter volume mounts through it).
+    process.webdav_port = 0;
 
     let handle = run_multi_with_transports_and_commands(
         &process,
@@ -168,6 +173,10 @@ async fn first_run_gate_boots_empty_and_serves_the_volumes_page() {
 
     let (handle, web) = boot_first_run().await;
     assert_ne!(web.port(), 0, ":0 resolves to the real bound port");
+    assert!(
+        handle.webdav_addr().is_some(),
+        "first-run binds the WebDAV listener over the EMPTY registry — the mount          endpoint runtime-added drive-letter volumes go through"
+    );
 
     let resp = send_http(web, "/volumes").await;
     assert_eq!(status_of(&resp), 200, "the empty management page: {resp}");

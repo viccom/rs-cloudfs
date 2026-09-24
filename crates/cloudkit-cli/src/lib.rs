@@ -1942,7 +1942,13 @@ pub async fn run_multi_with_transports_and_commands(
     // keep running; the WebDAV face is simply absent. The boot keeps a
     // clone of the face handle: RV2's ADD/REMOVE mutate the same table.
     let webdav_face = cloudkit_webdav::RegistryHandle::new(volume_fses);
-    let webdav_server = bind_multi_webdav(process_cfg, webdav_face.clone()).await;
+    // First run (FR1 fix): the empty registry still binds — the dashboard
+    // is the boot's product, and a drive-letter volume added through it
+    // mounts THROUGH this listener (the default `net use` backend's
+    // endpoint); leaving it unbound would roll every runtime ADD with a
+    // claimed letter back (the registry face is a per-request
+    // projection, so the empty bind serves late-added volumes).
+    let webdav_server = bind_multi_webdav(process_cfg, webdav_face.clone(), first_run).await;
     let webdav_addr = webdav_server.as_ref().map(WebDavServer::local_addr);
 
     // The ONE dashboard (K24 / MV3): a single process-level port serving
@@ -2338,15 +2344,20 @@ fn no_enabled_volumes_message(process_cfg: &CyDriveConfig) -> String {
 /// Binds the single multi-volume WebDAV listener (K20) or degrades
 /// visibly (K22): an address-parse or bind failure logs an error and
 /// returns `None` — the volumes keep running, only the WebDAV face is
-/// gone. An empty volume set cannot reach the bind (the
-/// no-enabled-volumes and all-failed guards bail first); the empty
-/// skip stays as a structural backstop — an empty router would bind a
-/// listener that can serve nothing.
+/// gone. An empty volume set cannot reach the bind on a configured
+/// boot (the no-enabled-volumes and all-failed guards bail first); the
+/// empty skip stays as a structural backstop for those — EXCEPT the
+/// first-run boot, which arrives with an empty registry BY DESIGN and
+/// binds anyway (`first_run`): the listener is the mount endpoint the
+/// first dashboard-created drive-letter volume goes through, and the
+/// registry face is a per-request projection that picks late-added
+/// volumes up without a rebind (RV1).
 async fn bind_multi_webdav(
     process_cfg: &CyDriveConfig,
     volumes: cloudkit_webdav::RegistryHandle,
+    first_run: bool,
 ) -> Option<WebDavServer> {
-    if volumes.is_empty() {
+    if volumes.is_empty() && !first_run {
         return None;
     }
     let bind = match process_cfg.webdav_host.parse::<IpAddr>() {
