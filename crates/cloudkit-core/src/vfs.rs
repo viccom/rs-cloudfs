@@ -1422,6 +1422,42 @@ impl Vfs {
         }
     }
 
+    /// Remote-side directory creation (pan123 真机 e2e 必修项 BUG 3，
+    /// 2026-09-24 实证)。
+    ///
+    /// **为什么必须有**：`CyDriveFs::create_dir` 修此缺陷前只 upsert 本地行
+    /// （还标 `is_uploaded: true` 的假声明）——挂载卷上 MKCOL 报 201 而远端
+    /// 无此目录（真机：MKCOL 201 → 123 远端无目录，本地行随后被 read-through
+    /// reconcile 剪除）。与 [`Self::rename_remote_for_row`]（BUG 2）同构。
+    ///
+    /// 门控与降级（与 rename 同源的裁决）：
+    /// - 传输面**无宽面**（`as_driver()` None——telegram/mock 影子索引后端）
+    ///   → `Ok(())`：远端无按路径寻址面，本地行仍是权威，行为与修复前
+    ///   逐字一致；
+    /// - 宽面存在 → 调 `StorageDriver::mkdir`（宽面驱动均实现该面，无
+    ///   独立能力位）。`Exists` 上抛（调用方据此映射 WebDAV 405——目录
+    ///   已在远端是事实性冲突，不是可吞错误）。
+    ///
+    /// 调用顺序契约：**必须在本地行写入之前调用**；`Err` 时调用方不得
+    /// 写任何本地行。错误文案带路径与「本地行未写」的明确声明。
+    pub async fn mkdir_remote_for_row(&self, rel: &RelPath) -> Result<(), VfsError> {
+        let Some(driver) = self.transport.as_driver() else {
+            return Ok(()); // 无宽面：远端无按路径面（修复前语义）
+        };
+        let dir_vol = vol_rel(rel)?;
+        match driver.mkdir(&dir_vol).await {
+            Ok(()) => Ok(()),
+            // 已在远端：事实性冲突上抛（调用方映射 405/Exists），本地行
+            // 不写——沿用远端既有目录才是真态。
+            Err(StorageError::Exists) => Err(VfsError::Transport(StorageError::Exists)),
+            Err(other) => Err(VfsError::Transport(StorageError::Unavailable(format!(
+                "remote mkdir failed for {}: no local row was written (the remote and \
+                 local stay consistent); retry the create later: {other}",
+                rel.as_str()
+            )))),
+        }
+    }
+
     pub async fn delete_remote_for_row(&self, rel: &RelPath) -> Result<(), VfsError> {
         if !self.transport.capabilities().remote_delete {
             return Ok(());

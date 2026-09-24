@@ -2120,3 +2120,42 @@ async fn rename_on_a_wide_face_moves_the_remote_object() {
         "the remote object must be gone from the old path after rename"
     );
 }
+
+/// 12d. BUG-FIX 3 (pan123 真机 e2e, 2026-09-24): MKCOL on a WIDE face
+///     must reach the driver — the pre-fix `CyDriveFs::create_dir` only
+///     upserted a local row (flagged `is_uploaded: true`, a false claim),
+///     so a mounted volume answered 201 while the remote never gained
+///     the directory (真机实证：MKCOL 201 → 123 远端无此目录，本地行被
+///     read-through reconcile 正确剪除).
+///
+///     Red before the fix: the driver's `mkdir` is never called, so its
+///     remote never contains the new directory.
+#[tokio::test]
+async fn mkcol_on_a_wide_face_creates_the_remote_directory() {
+    let env = wide_env().await;
+    seed_wide_file(&env.driver, "existing.bin", b"x").await;
+    // Materialize a row off the remote (read-through), so the adapter
+    // exercises the same indexed-parent shape a mounted volume has.
+    let _ = env
+        .fs
+        .metadata(&DavPath::new("/existing.bin").expect("path"))
+        .await
+        .expect("row materialized from the remote");
+
+    env.fs
+        .create_dir(&DavPath::new("/made-by-mkcol").expect("path"))
+        .await
+        .expect("create_dir");
+
+    // The remote directory exists: the driver's own stat answers it as a
+    // directory, and it lists as empty.
+    let entry = env
+        .driver
+        .stat(&VolRel::new("made-by-mkcol").expect("rel"))
+        .await
+        .expect("the remote directory must exist after MKCOL");
+    assert!(
+        entry.kind == cloudkit_storage::EntryKind::Dir,
+        "got {entry:?}"
+    );
+}

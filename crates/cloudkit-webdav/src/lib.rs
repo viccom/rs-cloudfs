@@ -308,6 +308,12 @@ impl DavFileSystem for CyDriveFs {
                 return Err(FsError::Exists);
             }
             self.require_dir_parent(&rel)?;
+            // **远端先行**（BUG 3 修复，pan123 真机 e2e 2026-09-24）：宽面
+            // 后端上目录必须先落远端——失败/已存在则本地行不写（修复前只
+            // upsert 本地行并标 `is_uploaded: true` 的假声明，MKCOL 报 201
+            // 而远端无此目录）。无宽面的影子索引后端（telegram）如实降级
+            // 为 no-op，行为与修复前逐字一致。
+            self.vfs.mkdir_remote_for_row(&rel).await.map_err(vfs_err)?;
             let parent_dir = match rel.parent() {
                 Some(parent) => parent.as_str().to_string(),
                 None => "/".to_string(),

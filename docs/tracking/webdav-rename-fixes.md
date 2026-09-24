@@ -64,11 +64,47 @@
 工作台：`E:\Rs_Codes\pan115-verify`（plain + enc 双卷，aead_v2）。
 远端已清理回负责人原始 5 项；实例已停。
 
+## BUG 3（追加批，2026-09-24 晚）：MKCOL 假成功
+
+pan123 真机 e2e 第二轮（新账号，无配额限制）在项目 4 边界测试中揭出：
+`CyDriveFs::create_dir` 只 upsert 本地行并标 `is_uploaded: true`（假声明），
+**从不调驱动 `mkdir`**（全 L3+ 零调用点——与 BUG 2 的 `rename` 完全同构）。
+真机实证：MKCOL 201 → 123 远端无此目录；本地行随后被 read-through
+reconcile 正确剪除。**影响所有后端**（create_dir 为共享实现）。
+
+### 修复
+
+- `cloudkit-core/src/vfs.rs` 新增 `Vfs::mkdir_remote_for_row`——远端先行、
+  门控与 rename 同源：无宽面（telegram/mock）→ `Ok(())` 如实降级（行为与
+  修复前逐字一致）；宽面 → 调 `StorageDriver::mkdir`；`Exists` 上抛
+  （事实性冲突，本地行不写——沿用远端既有目录才是真态）；其他失败带路径
+  上抛且明示「本地行未写」。
+- `cloudkit-webdav/src/lib.rs` `create_dir` 在 upsert 前先走
+  `mkdir_remote_for_row`。
+
+### TDD + 真机证据
+
+- 红：`fs_adapter.rs::mkcol_on_a_wide_face_creates_the_remote_directory`
+  —— `the remote directory must exist after MKCOL: NotFound` → 绿。
+- **pan123 真机**：MKCOL 201 → 本地 207 → **123 远端出现 `zc-fix-dir`
+  (Type=1)**；嵌套 `zc-fix-dir/sub/` + 上传 `inside.bin`(4096B) 全落地。
+- **pan115 真机**：MKCOL 201 → 115 远端出现 `vr-fix-dir`（fc=0 目录）。
+- **目录改名真机腿补齐**（原「未覆盖」项）：pan115 `vr-fix-dir/` →
+  `vr-fix-dir-renamed/` MOVE 201，源 404/目标 207，115 远端确认为新名。
+
+### 门禁
+
+workspace **1689/0/62**（+1 新增）、clippy/fmt/layers/secrets 绿。
+过程注记：workspace 首跑撞 ck-webdav `concurrent_401s_with_the_same_nonce`
+flake 一次（L7 已记录的两个 pre-existing flake 之一，与改动无关——隔离
+重跑 3/3 绿，全量重跑 1689/0）。
+
+两处远端均已清理回负责人原始内容；实例已停。
+
 ## 未覆盖
 
 - **BUG 1 的跨卷 Destination 拒绝**：单测覆盖「跨卷前缀不剥」，但真机未
   构造「MOVE 到另一卷」用例（客户端一般不这么发）。
-- **目录改名**真机腿未跑（本轮只测文件改名；目录走同一 `rename` 路径，
-  单测 `rename_file_moves_row_cache_and_chunks` 旁有目录覆盖）。
+- ~~**目录改名**真机腿未跑~~ **已补齐**（见上：pan115 真机 201 + 远端确认）。
 - **已存在的 `Destination` 绝对 URI host 校验**由 dav-server 自行履行，
   本修复不介入（保 scheme+authority 原样）。
