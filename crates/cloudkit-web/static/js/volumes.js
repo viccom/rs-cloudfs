@@ -628,7 +628,7 @@ function resetVolumeForm() {
     const enabled = vfEl('vf-enabled');
     if (enabled) enabled.checked = true;
     const scheme = vfEl('vf-enc-scheme');
-    if (scheme) scheme.value = 'gcm';
+    if (scheme) scheme.value = 'aead_v2';
     const name = vfEl('vf-name');
     if (name) {
         name.readOnly = false;
@@ -716,7 +716,7 @@ function vfPrefillEdit(config) {
     const enc = vfEl('vf-enc');
     if (enc) enc.checked = config.enable_encryption === true;
     const scheme = vfEl('vf-enc-scheme');
-    if (scheme) scheme.value = config.encryption_scheme === 'aead_v2' ? 'aead_v2' : 'gcm';
+    if (scheme) scheme.value = config.encryption_scheme === 'gcm' ? 'gcm' : 'aead_v2';
     const chunk = vfEl('vf-chunk');
     if (chunk && typeof config.chunk_size_mb === 'number') chunk.value = config.chunk_size_mb;
     // sftp_port is a number-typed plain key (review fix): SHOW returns the
