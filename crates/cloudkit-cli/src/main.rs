@@ -65,7 +65,13 @@ fn version_line() -> &'static str {
 #[derive(Debug, Subcommand)]
 enum Command {
     /// Start the full stack: metadata DB, upload queue, WebDAV server.
-    Run,
+    Run {
+        /// Do not open the dashboard in a browser on a first-run boot
+        /// (headless machines / scripts; same effect as the
+        /// CYDRIVE_NO_OPEN_BROWSER environment variable).
+        #[arg(long)]
+        no_open_browser: bool,
+    },
     /// Gracefully stop a background `cydrive run` instance through its
     /// loopback control channel (must run in the same working directory
     /// as the instance).
@@ -181,7 +187,7 @@ enum CacheAction {
 async fn main() -> Result<()> {
     let cli = Cli::parse();
     match cli.command {
-        Command::Run => run().await,
+        Command::Run { no_open_browser } => run(no_open_browser).await,
         Command::Stop => stop_cmd().await,
         Command::Status => status_cmd().await,
         Command::Push { path, dest } => push_cmd(path, dest).await,
@@ -436,11 +442,11 @@ async fn mount_cmd(
         );
         match &decision {
             cloudkit_cli::MountBackendDecision::WebDav => {}
-            cloudkit_cli::MountBackendDecision::WebDavFallback(reason) => {
+            cloudkit_cli::MountBackendDecision::WinfspUnavailable(reason) => {
                 tracing::error!(backend = "winfsp", %reason, "the winfsp mount backend is \
-                     unavailable for `cydrive mount`; falling back to the WebDAV drive \
-                     mapping (K40)");
-                println!("{}", cloudkit_cli::winfsp_fallback_notice(reason));
+                     unavailable for `cydrive mount`; no net use fallback - the volume \
+                     stays reachable without a drive letter");
+                println!("{}", cloudkit_cli::winfsp_unavailable_notice(reason));
             }
             cloudkit_cli::MountBackendDecision::WinFsp => {
                 return mount_cmd_winfsp(cfg, url, letter).await;
@@ -945,7 +951,15 @@ fn volumes_cmd() -> Result<()> {
 /// single-volume config runs the frozen path below, a `volumes_dir`
 /// config runs [`run_multi_volume`] (per-volume dispatch + the Volume
 /// Registry assembly).
-async fn run() -> Result<()> {
+async fn run(no_open_browser: bool) -> Result<()> {
+    // The CLI flag is the argument-shaped form of the CYDRIVE_NO_OPEN_BROWSER
+    // environment switch the boot's browser hand-off reads (lib.rs): setting
+    // it here keeps ONE decision point. The flag wins over the environment
+    // only in the obvious direction (flag = suppress; an absent flag never
+    // re-enables what the environment suppressed).
+    if no_open_browser {
+        std::env::set_var("CYDRIVE_NO_OPEN_BROWSER", "1");
+    }
     let cwd = std::env::current_dir().context("resolving the working directory")?;
     println!(
         "cydrive {} starting in {}",
