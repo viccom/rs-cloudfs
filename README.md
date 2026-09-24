@@ -16,7 +16,7 @@ L1 驱动  telegram │ baidu │ local │ sftp │ pan115 │ pan123 │ webda
 
 **新后端接入 = 实现一个驱动 + 过 conformance 套件，上层全部能力（挂载/仪表盘/同步/CLI）自动可用。**驱动分两类（[driver-onboarding §10](docs/standards/driver-onboarding.md)）：后端有「按路径枚举」面的走 `StorageDriver` 宽面 + conformance（baidu/local/sftp）；没有的走 `CloudTransport` 窄面（telegram 先例——远端是消息，bot 读历史被平台拒绝，索引只存在于本地 db + sync）。**两类在编译开关上完全平权**（见下文 feature 门控）。
 
-## 状态（2026-09-23）
+## 状态（2026-09-24）
 
 | 阶段 | 内容 | 状态 |
 |---|---|---|
@@ -36,6 +36,7 @@ L1 驱动  telegram │ baidu │ local │ sftp │ pan115 │ pan123 │ webda
 | Phase 7 | WebDAV 存储驱动（ck-webdav：自铸薄客户端 reqwest + quick-xml，K80/K81；通用挂载协议——rclone serve/Alist/Nextcloud/群晖/mod_dav 皆成后端） | ✅ 完成（WD0–WD5：双桩制（RFC 严格建模手搓桩 + dav-server 参照桩）conformance 八断言绿；WD0 双真机服务器 11 项怪癖矩阵钉死；WD5 双服务器十腿全绿——上传回读逐字/Range/吞吐 214.8↑234.2↓ MiB/s/digest stale 恢复/断线自愈/覆盖写 stash 真机实证； Basic 预发+Digest 协商恰一次、rclone MKCOL-201 陷阱对策、外部文件 authoritative_index 实证） |
 | Phase 8 | read-through 按需逐层索引（K83；访问哪层回源哪层 + 物化缓存，rebuild 降级为可续跑/有界/会 prune 的全量校对工具） | ✅ 完成（RT0–RT5 + 合入前审查批 1H+7M+6L 清偿；机制五件套全在 L2/L3 共性面——六宽面驱动零代码接入，新驱动义务入 [driver-onboarding §11](docs/standards/driver-onboarding.md)；四消费面只换数据获取函数；webdav 真机矩阵 7/7（access log 差分精确计数）+ sftp/local 冒烟 + A1/A2 用户场景真机腿；加密卷读面零变化、不物化——后由 Phase 8-B 放开） |
 | Phase 8-B | 加密卷 read-through 放开（K84/K85；物化 cipher 真相三层优先 + 容器尺寸闭式反推 + 首读容器校验自愈 + rebuild 同开） | ✅ 完成（EB1–EB4：离线两阶段验收三腿进常规 CI + 真网 pan123 加密腿重跑 2/2、pan115 腿1 绿（腿2 refresh 失效挂真机窗口）+ web UI 门控收窄仅 telegram + Contract-6 加密空件例外） |
+| Web 首启引导 | 无配置开箱即用（K87；空目录 `run` 自动生成最小配置进 init 模式，仪表盘引导建第一个卷）+ 负责人验收三调整 | ✅ 完成（bootstrap + 零卷 boot 放行 + 空态引导文案；`--no-open-browser`；建卷加密默认 aead_v2；挂载默认全局翻 winfsp 且不回落 net use；端口默认 8485/8486；真机全链冒烟 PASS。1683 测试绿） |
 
 阶段计划与裁决：[docs/plans/2026-09-07-cloudfusion-foundation.md](docs/plans/2026-09-07-cloudfusion-foundation.md) ｜ 历史裁决：[docs/decisions.md](docs/decisions.md)
 
