@@ -803,3 +803,102 @@ async fn serve_volumes_stops_gracefully() {
     vol_a.shutdown().await;
     vol_b.shutdown().await;
 }
+
+// ------------------------------------------- BUG-FIX: MOVE under the prefix ---
+
+/// BUG-FIX（Phase 7 真机 e2e，pan115 2026-09-24 实证）：`/vol/<name>/`
+/// 前缀路由下的 **MOVE 必须落在正确的命名空间**。
+///
+/// 缺陷形态（修复前）：`VolumeRouter::dispatch` 只重写了请求 URI，未
+/// 同步改写 `Destination` 头——dav-server 拿到的 Destination 仍是
+/// `/vol/a/...`，与它内部的卷内命名空间错位，`has_parent(&dest)` 判定
+/// 失败 → **409 Conflict**，改名在多卷模式下恒不可用（真机实测：单卷
+/// 201 假成功 / 多卷 409）。
+///
+/// 契约：Destination 的 `/vol/a` 前缀必须与请求 URI 同样被剥掉；改名
+/// 后源路径消失、目标路径可读，且**不触碰兄弟卷 b**。
+#[tokio::test]
+async fn move_through_the_volume_prefix_rewrites_the_destination() {
+    let vol_a = volume_env().await;
+    let vol_b = volume_env().await;
+    let server = serve_two(vol_a.fs.clone(), vol_b.fs.clone()).await;
+    let addr = server.local_addr();
+
+    // Seed one row in volume a (same shape as the GET-range test above).
+    let rel = RelPath::new("/src.txt").expect("valid rel path");
+    let scratch = tempfile::tempdir().expect("seed scratch dir");
+    let local_path = scratch.path().join("src.txt");
+    std::fs::write(&local_path, b"payload").expect("write seed file");
+    let receipt = vol_a
+        .mock
+        .upload(&UploadJob {
+            rel_path: rel.clone(),
+            local_path,
+            size: 7,
+            chunk_count: 1,
+            chunk_size: 64,
+        })
+        .await
+        .expect("seed upload to volume a's remote");
+    vol_a
+        .db
+        .upsert_file(&FileUpsert {
+            rel_path: rel.as_str().to_string(),
+            name: rel.name().to_string(),
+            parent_dir: "/".to_string(),
+            size: 7,
+            mtime: 1_700_000_000.0,
+            sha256: None,
+            is_dir: false,
+            telegram_msg_id: Some(receipt.first_msg_id),
+            is_uploaded: true,
+            is_cached: false,
+            is_encrypted: false,
+            chunk_count: 1,
+            mime_type: None,
+        })
+        .expect("seed files row in volume a");
+
+    // MOVE /vol/a/src.txt -> /vol/a/dst.txt (the mounted-volume shape:
+    // the client addresses both ends through the volume prefix).
+    let dest = format!("http://127.0.0.1:{}/vol/a/dst.txt", addr.port());
+    let resp = send(
+        addr,
+        &request(
+            "MOVE",
+            "/vol/a/src.txt",
+            addr,
+            &[("Destination", &dest)],
+            "",
+        ),
+    )
+    .await;
+
+    let status = status_of(&resp);
+    assert!(
+        (200..300).contains(&status),
+        "MOVE under the prefix must succeed, got {status}: {resp}"
+    );
+    // The row moved: the old path is gone, the new one resolves.
+    let old = send(
+        addr,
+        &request("PROPFIND", "/vol/a/src.txt", addr, &[("Depth", "0")], ""),
+    )
+    .await;
+    assert_eq!(status_of(&old), 404, "old path gone: {old}");
+    let new = send(
+        addr,
+        &request("PROPFIND", "/vol/a/dst.txt", addr, &[("Depth", "0")], ""),
+    )
+    .await;
+    assert_eq!(status_of(&new), 207, "new path resolves: {new}");
+    // The sibling volume is untouched.
+    assert!(
+        vol_b.mock.upload_calls().is_empty() && vol_b.db.list_dir("/").expect("list b").is_empty(),
+        "volume b stays untouched by volume a's rename"
+    );
+
+    server.shutdown().await;
+    vol_a.shutdown().await;
+    vol_b.shutdown().await;
+}

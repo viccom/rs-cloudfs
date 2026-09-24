@@ -296,6 +296,20 @@ impl VolumeRouter {
     /// (query preserved) and hands the request to that volume's
     /// handler; an unroutable path (or an unregistered volume) answers
     /// 404 without touching any volume.
+    ///
+    /// **`Destination` rewrite (BUG-FIX, Phase 7 真机 e2e 2026-09-24)**:
+    /// the `Destination` header names an absolute URI in the SAME
+    /// external namespace as the request line, so it carries the
+    /// `/vol/<name>` prefix too. Rewriting only the URI left dav-server
+    /// with two disagreeing namespaces — its internal path was
+    /// `/dst.txt` while Destination still said `/vol/a/dst.txt` — and
+    /// `has_parent(&dest)` failed → **409 Conflict on every MOVE under a
+    /// mounted volume** (真机实测：多卷 MOVE 恒 409；单卷因无前缀而正常).
+    /// The header must therefore be stripped with the same prefix, and
+    /// only when it actually belongs to this volume: a Destination
+    /// addressing a different volume (or none) is left alone so the
+    /// handler's own validation rejects it rather than us silently
+    /// retargeting a cross-volume move.
     async fn dispatch(&self, req: Request<Incoming>) -> http::Response<DavBody> {
         let path = req.uri().path().to_owned();
         let Some((name, tail)) = split_volume_segment(&path) else {
@@ -313,14 +327,69 @@ impl VolumeRouter {
             Some(query) => format!("{tail}?{query}"),
             None => tail.to_string(),
         };
-        match path_and_query.parse::<http::Uri>() {
-            Ok(uri) => {
-                parts.uri = uri;
-                handler.handle(Request::from_parts(parts, body)).await
+        let Ok(uri) = path_and_query.parse::<http::Uri>() else {
+            return not_found();
+        };
+        // Same-prefix Destination rewrite (see the doc comment): rewrite
+        // the header's path component only, preserving its scheme/authority
+        // (dav-server validates the host itself). A header whose path does
+        // not sit under `/vol/<name>/` is cross-volume or foreign — leave
+        // it untouched for the handler to judge.
+        let volume_prefix = format!("/vol/{name}");
+        if let Some(destination) = parts.headers.get(DESTINATION_HEADER) {
+            let Ok(raw) = destination.to_str() else {
+                return not_found();
+            };
+            // A foreign/cross-volume Destination stays untouched (None).
+            if let Some(rewritten) = strip_destination_prefix(raw, &volume_prefix) {
+                let Ok(value) = http::HeaderValue::from_str(&rewritten) else {
+                    return not_found();
+                };
+                parts.headers.insert(DESTINATION_HEADER, value);
             }
-            Err(_) => not_found(),
         }
+        parts.uri = uri;
+        handler.handle(Request::from_parts(parts, body)).await
     }
+}
+
+/// The WebDAV `Destination` request header (RFC 4918 §10.3) — a
+/// non-standard addition to `http::header`, which has no constant for it.
+const DESTINATION_HEADER: &str = "destination";
+
+/// Rewrites a `Destination` header value onto the volume-relative
+/// namespace: `/vol/<name>/rest` → `/rest`, keeping the scheme and
+/// authority intact (`http://host:port/vol/a/x` →
+/// `http://host:port/x`). Origin-form values (no scheme, sent by some
+/// clients) are handled too.
+///
+/// Returns `None` when the header does not address this volume — a path
+/// that is not `/vol/<name>` (or `/vol/<name>/…`), or a scheme+authority
+/// value with no path at all. Leaving it untouched lets the handler
+/// report the real error instead of the router silently retargeting a
+/// cross-volume move.
+fn strip_destination_prefix(raw: &str, volume_prefix: &str) -> Option<String> {
+    // Split the authority off an absolute URI; an origin-form value keeps
+    // an empty `head` and is treated as a bare path. Search starts AFTER
+    // the `://` separator (searching from the scheme end would land on the
+    // separator's own slash).
+    let (head, path) = match raw.find("://") {
+        Some(scheme_end) => {
+            let after_separator = scheme_end + 3;
+            // `?` on the Option: scheme://authority with no path has
+            // nothing to rewrite (returns None from the helper).
+            let offset = raw[after_separator..].find('/')?;
+            raw.split_at(after_separator + offset)
+        }
+        None => ("", raw),
+    };
+    debug_assert!(path.starts_with('/') || head.is_empty());
+    let rest = if path == volume_prefix {
+        String::from("/")
+    } else {
+        format!("/{}", path.strip_prefix(&format!("{volume_prefix}/"))?)
+    };
+    Some(format!("{head}{rest}"))
 }
 
 /// The plain 404 for unrouted requests (no volume touched).
@@ -393,7 +462,7 @@ fn method_set() -> DavMethodSet {
 
 #[cfg(test)]
 mod tests {
-    use super::split_volume_segment;
+    use super::{split_volume_segment, strip_destination_prefix};
 
     #[test]
     fn splits_legal_volume_paths() {
@@ -420,5 +489,43 @@ mod tests {
         assert_eq!(split_volume_segment("/vol/"), None);
         // `/vol//x` has an empty volume name segment — not a volume.
         assert_eq!(split_volume_segment("/vol//x"), None);
+    }
+
+    /// BUG-FIX (Phase 7 真机 e2e): the `Destination` header carries the
+    /// same `/vol/<name>` prefix as the request line, so the router must
+    /// strip it from BOTH. These are the cases the fix had to get right —
+    /// the absolute-URI split in particular (搜索必须从 `://` 之后开始，
+    /// 否则落在分隔符自身的斜杠上)。
+    #[test]
+    fn destination_prefix_strips_same_volume_only() {
+        let p = "/vol/a";
+        // Absolute URI: scheme+authority preserved, path rewritten.
+        assert_eq!(
+            strip_destination_prefix("http://127.0.0.1:8485/vol/a/dst.txt", p).as_deref(),
+            Some("http://127.0.0.1:8485/dst.txt")
+        );
+        // Deep tail keeps every remaining segment.
+        assert_eq!(
+            strip_destination_prefix("http://h/vol/a/d/e.txt", p).as_deref(),
+            Some("http://h/d/e.txt")
+        );
+        // The volume root itself maps to `/`.
+        assert_eq!(
+            strip_destination_prefix("http://h/vol/a", p).as_deref(),
+            Some("http://h/")
+        );
+        // Origin-form value (no scheme) is handled too.
+        assert_eq!(
+            strip_destination_prefix("/vol/a/dst.txt", p).as_deref(),
+            Some("/dst.txt")
+        );
+        // Cross-volume / foreign targets are left ALONE (None) so the
+        // handler reports the real error rather than silently retargeting.
+        assert_eq!(strip_destination_prefix("http://h/vol/b/x", p), None);
+        assert_eq!(strip_destination_prefix("http://h/other/x", p), None);
+        // Prefix must match on a segment boundary (`/vol/ab` is not `/vol/a`).
+        assert_eq!(strip_destination_prefix("http://h/vol/ab/x", p), None);
+        // scheme://authority with no path — nothing to rewrite.
+        assert_eq!(strip_destination_prefix("http://h", p), None);
     }
 }

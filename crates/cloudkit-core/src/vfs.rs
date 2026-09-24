@@ -203,6 +203,17 @@ pub enum VfsError {
 /// on-disk limit.
 pub const MAX_SEGMENT_UTF16: usize = 255;
 
+/// Bridges the core lexical path type ([`RelPath`] — always a leading
+/// `/`, root spelled `"/"`) onto the driver-face path type
+/// ([`cloudkit_storage::RelPath`] — **no** leading `/`, root spelled
+/// `""`). The two share a name but not a spelling, so the leading slash
+/// must be stripped; an unparsable result is a programmer error surfaced
+/// as `Invalid` rather than a panic.
+fn vol_rel(rel: &RelPath) -> Result<cloudkit_storage::RelPath, VfsError> {
+    let stripped = rel.as_str().trim_start_matches('/');
+    cloudkit_storage::RelPath::new(stripped).map_err(VfsError::Transport)
+}
+
 /// Rejects a path whose any segment exceeds [`MAX_SEGMENT_UTF16`] UTF-16
 /// code units (review M3). Runs at the top of the put chain — before any
 /// byte is staged, renamed or published — so a refusal can never leave a
@@ -1358,6 +1369,59 @@ impl Vfs {
     /// declares no `remote_delete` (legacy semantics — telegram/mock)
     /// or the row does not exist, so an ungated caller is a no-op, never
     /// an error.
+    /// Remote-side rename of a row's object (Phase 7 真机 e2e 必修项，
+    /// 2026-09-24 pan115 实证)。
+    ///
+    /// **为什么必须有**：`CyDriveFs::rename` 修此缺陷前只改本地行——
+    /// 挂载的 115/123 卷上 MOVE 报成功而远端名字不动（单卷 201 假成功；
+    /// 多卷因 Destination 命名空间错位另报 409）。本方法把「远端先行」
+    /// 补成与 [`Vfs::delete_remote_for_row`] 同构的一段。
+    ///
+    /// 门控与降级：
+    /// - 传输面**无宽面**（`as_driver()` 为 `None`——telegram/mock 等
+    ///   影子索引后端）→ `Ok(())`：远端不存在可改的对象，行为与修复前
+    ///   逐字一致（本地行仍是权威），这不是吞错误而是如实降级；
+    /// - 宽面存在但 `server_side_move` 未声明 → 同样 `Ok(())`：驱动
+    ///   conformance 允许 copy+delete 降级，但那属驱动职责而非本层
+    ///   拼装（本层只转发单侧 move 语义）；
+    /// - 宽面 + 声明单侧 move → 调 `StorageDriver::rename`；`NotFound`
+    ///   （远端已无此对象，如 pending 行的竞态）容忍为 `Ok`——本地行
+    ///   仍需移动，virtually-deleted 的远端不是错误。
+    ///
+    /// 调用顺序契约（与 delete 同源）：**必须在本地行/缓存搬移之前
+    /// 调用**；`Err` 时调用方不得改动任何本地状态（否则远端与本地
+    /// 分裂）。错误文案带路径与「远端未动」的明确声明，供上层原样
+    /// 上抛。
+    pub async fn rename_remote_for_row(
+        &self,
+        from: &RelPath,
+        to: &RelPath,
+    ) -> Result<(), VfsError> {
+        let Some(driver) = self.transport.as_driver() else {
+            return Ok(()); // 无宽面：远端无对象可改（修复前语义）
+        };
+        if !driver.capabilities().server_side_move {
+            return Ok(()); // 未声明单侧 move：降级由驱动自负，本层不拼装
+        }
+        // 两种 `RelPath` 的桥接：core 面（`crate::rel_path`，根 = `""`，
+        // 词法上带前导 `/`）与驱动面（`cloudkit_storage::vocab::RelPath`，
+        // 根 = `""`，**禁前导 `/`**）。二者词法不同，按字符串去前导斜杠
+        // 转换（`""`/`"/"` 都落驱动根）。历史铁证：漏这一步会让所有 rename
+        // 在驱动面以 `Invalid` 失败。
+        let from_vol = vol_rel(from)?;
+        let to_vol = vol_rel(to)?;
+        match driver.rename(&from_vol, &to_vol).await {
+            // 远端已无此对象（pending 行竞态等）：本地行照搬。
+            Ok(()) | Err(StorageError::NotFound) => Ok(()),
+            Err(other) => Err(VfsError::Transport(StorageError::Unavailable(format!(
+                "remote rename failed for {} -> {}: the local row was KEPT at its old \
+                 path (remote and local stay consistent); retry the rename later: {other}",
+                from.as_str(),
+                to.as_str()
+            )))),
+        }
+    }
+
     pub async fn delete_remote_for_row(&self, rel: &RelPath) -> Result<(), VfsError> {
         if !self.transport.capabilities().remote_delete {
             return Ok(());

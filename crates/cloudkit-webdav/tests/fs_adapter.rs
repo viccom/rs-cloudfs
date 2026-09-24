@@ -2074,3 +2074,49 @@ async fn wrong_size_encrypted_row_repairs_content_length_before_the_get() {
         .expect("row exists");
     assert_eq!(row.size, plain_len as i64, "行 size 已按首读真值回写");
 }
+
+/// 12c. BUG-FIX (Phase 7 真机 e2e, pan115 2026-09-24): rename on a WIDE
+///     face must reach the driver — the pre-fix `CyDriveFs::rename` only
+///     rewrote local rows, so a mounted 115/123 volume reported MOVE OK
+///     while the remote kept the old name (真机实证：单卷 201 假成功 /
+///     多卷 409)。
+///
+///     Red before the fix: the driver's `stat` still answers the OLD path
+///     after `fs.rename`, i.e. the remote never moved.
+#[tokio::test]
+async fn rename_on_a_wide_face_moves_the_remote_object() {
+    let env = wide_env().await;
+    seed_wide_file(&env.driver, "old.bin", b"abcdefg").await;
+    // Materialize the row off the remote (read-through), so the adapter
+    // has a row to rename — exactly the mounted-volume shape.
+    let _ = env
+        .fs
+        .metadata(&DavPath::new("/old.bin").expect("path"))
+        .await
+        .expect("row materialized from the remote");
+
+    env.fs
+        .rename(
+            &DavPath::new("/old.bin").expect("path"),
+            &DavPath::new("/renamed.bin").expect("path"),
+        )
+        .await
+        .expect("rename file");
+
+    // The remote moved: the driver's own stat must follow the new name
+    // and stop answering the old one.
+    assert!(
+        env.driver
+            .stat(&VolRel::new("renamed.bin").expect("rel"))
+            .await
+            .is_ok(),
+        "the remote object must exist at the new path after rename"
+    );
+    assert!(
+        matches!(
+            env.driver.stat(&VolRel::new("old.bin").expect("rel")).await,
+            Err(StorageError::NotFound)
+        ),
+        "the remote object must be gone from the old path after rename"
+    );
+}
