@@ -50,16 +50,70 @@ struct Cli {
 /// `version` attribute. The `&'static str` return keeps clap's
 /// non-`string`-feature `From<&'static str>` path; the once-built line
 /// lives in the static.
+/// The `--version` payload (K32 + 负责人 2026-09-24 格式裁决):
+/// `<版本>-<git 短哈希>[-dirty], (drivers: <清单>)` — e.g.
+/// `0.10.0-9b2ca5a6e926-dirty, (drivers: telegram, baidu, local)`.
+///
+/// The identity segment is emitted by build.rs as `CYDRIVE_GIT_VERSION`
+/// (the semver-newer of the nearest git tag and the crate version, plus
+/// the 12-char hash and a `-dirty` mark when the worktree is dirty); a
+/// build without git (tarball export) falls back to the bare crate
+/// version. The driver list is the compiled-in feature set — a build
+/// with every driver feature off reports `(drivers: none)`. Serves both
+/// `-V` and `--version` through clap's `version` attribute. The
+/// `&'static str` return keeps clap's non-`string`-feature
+/// `From<&'static str>` path; the once-built line lives in the static.
 fn version_line() -> &'static str {
     static LINE: std::sync::OnceLock<String> = std::sync::OnceLock::new();
     LINE.get_or_init(|| {
         format!(
-            "{} (drivers: {})",
-            env!("CARGO_PKG_VERSION"),
+            "{}, (drivers: {})",
+            option_env!("CYDRIVE_GIT_VERSION").unwrap_or(env!("CARGO_PKG_VERSION")),
             cloudkit_cli::compiled_drivers()
         )
     })
     .as_str()
+}
+
+#[cfg(test)]
+mod version_tests {
+    use super::*;
+
+    /// 负责人 2026-09-24 格式裁决：`<版本>-<git 短哈希>[-dirty],
+    /// (drivers: <清单>)`——版本段来自 build.rs 喷的
+    /// `CYDRIVE_GIT_VERSION`（git tag 与 crate 版本 semver 取新者），
+    /// 无 git 环境（tarball 导出）回退裸 crate 版本。本测试钉两件事：
+    /// 拼接胶水（逗号分隔的两段）与身份段的形状（hash 十六进制、
+    /// dirty 后缀只在末位）。
+    #[test]
+    fn version_line_is_identity_comma_drivers() {
+        let line = version_line();
+        let expected_tail = format!(", (drivers: {})", cloudkit_cli::compiled_drivers());
+        assert!(
+            line.ends_with(&expected_tail),
+            "the line must end with `{expected_tail}`: got {line}"
+        );
+
+        let identity = &line[..line.len() - expected_tail.len()];
+        match option_env!("CYDRIVE_GIT_VERSION") {
+            Some(git) => {
+                assert_eq!(identity, git, "the head is the build-time git identity");
+                let dirty = identity.strip_suffix("-dirty").unwrap_or(identity);
+                let (_, hash) = dirty
+                    .rsplit_once('-')
+                    .unwrap_or_else(|| panic!("the identity carries `-<hash>`: {identity}"));
+                assert!(
+                    hash.len() >= 7 && hash.chars().all(|c| c.is_ascii_hexdigit()),
+                    "the hash segment is hexadecimal: {identity}"
+                );
+            }
+            None => assert_eq!(
+                identity,
+                env!("CARGO_PKG_VERSION"),
+                "without git the identity falls back to the crate version"
+            ),
+        }
+    }
 }
 
 #[derive(Debug, Subcommand)]
