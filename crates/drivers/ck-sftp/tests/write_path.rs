@@ -906,3 +906,154 @@ async fn stat_and_lstat_injection_knobs_are_independent() {
         "{err:?}"
     );
 }
+
+// --------------------------------- 审查修复批三（sftp-review 二轮）---
+
+/// ①：transport 上传错误路径必须显式 abort——裸 Drop 会把旧版本困在
+/// `.old`（final 被 stash 丢空，重试耗尽后文件对卷消失）。本腿注入
+/// 流中帧错误（upload_stream 的 `frame?` 早退点）。
+#[tokio::test]
+async fn transport_stream_error_restores_the_stashed_old_version() {
+    use bytes::Bytes;
+    use ck_sftp::SftpTransport;
+    use cloudkit_storage::transport::{ByteStream, CloudTransport, UploadJob};
+
+    let (stub, driver) = setup().await;
+    stub.add_file("/f.bin", b"old!");
+    let transport = SftpTransport::new(std::sync::Arc::new(driver));
+    transport.connect().await.expect("connect");
+
+    let job = UploadJob {
+        rel_path: cloudkit_storage::vpath::RelPath::new("/f.bin").expect("vpath"),
+        local_path: std::env::temp_dir().join("ck-sftp-unused-stream.bin"),
+        size: 4,
+        chunk_count: 1,
+        chunk_size: 4,
+    };
+    let frames: Vec<Result<Bytes, StorageError>> = vec![
+        Ok(Bytes::from_static(b"ab")),
+        Err(StorageError::Io("stream broke mid-flight".into())),
+    ];
+    let stream: ByteStream = Box::pin(futures_util::stream::iter(frames));
+
+    let err = transport
+        .upload_stream(&job, stream)
+        .await
+        .expect_err("the injected stream error must fail the upload");
+    assert!(matches!(err, StorageError::Io(_)), "{err:?}");
+    // 修复点：旧版本复位回 final（修复前困在 .old，final 空）
+    assert_eq!(
+        stub.file_bytes("/f.bin").as_deref(),
+        Some(b"old!".as_slice()),
+        "the previous version must be restored after the failed upload"
+    );
+    assert!(
+        stub.staging_artifacts().is_empty(),
+        "no staging residue: {:?}",
+        stub.staging_artifacts()
+    );
+}
+
+/// ①：upload 整文件腿同款（write 动词注入失败）。
+#[tokio::test]
+async fn transport_upload_write_error_restores_the_stashed_old_version() {
+    use ck_sftp::SftpTransport;
+    use cloudkit_storage::transport::{CloudTransport, UploadJob};
+
+    let (stub, driver) = setup().await;
+    stub.add_file("/f.bin", b"old!");
+    stub.fail_next_write();
+
+    let src = std::env::temp_dir().join(format!("ck-sftp-we-{}.bin", std::process::id()));
+    std::fs::write(&src, b"newdata").expect("write source file");
+    let transport = SftpTransport::new(std::sync::Arc::new(driver));
+    transport.connect().await.expect("connect");
+
+    let job = UploadJob {
+        rel_path: cloudkit_storage::vpath::RelPath::new("/f.bin").expect("vpath"),
+        local_path: src,
+        size: 7,
+        chunk_count: 1,
+        chunk_size: 7,
+    };
+    transport
+        .upload(&job)
+        .await
+        .expect_err("the injected write failure must fail the upload");
+    // 修复点：旧版本复位回 final
+    assert_eq!(
+        stub.file_bytes("/f.bin").as_deref(),
+        Some(b"old!".as_slice()),
+        "the previous version must be restored after the failed upload"
+    );
+    assert!(
+        stub.staging_artifacts().is_empty(),
+        "no staging residue: {:?}",
+        stub.staging_artifacts()
+    );
+}
+
+/// ②：mkdir 撞悬空 symlink 目标 → `Exists`（悬空链也是既有目录项；
+/// 跟随预检对悬空链误报 NotFound，修复前 surfaced 为假成功/桩污染）。
+#[tokio::test]
+async fn mkdir_onto_dangling_symlink_reports_exists() {
+    let (stub, driver) = setup().await;
+    stub.add_dangling_symlink("/d", "/nowhere");
+
+    let err = driver
+        .mkdir(&rel("d"))
+        .await
+        .expect_err("an existing entry (even a dangling link) must be refused");
+    assert!(matches!(err, StorageError::Exists), "{err:?}");
+    assert_eq!(
+        stub.symlink_target("/d").as_deref(),
+        Some("/nowhere"),
+        "the target link must be untouched"
+    );
+    assert!(
+        !stub.is_dir("/d"),
+        "no directory may be created over the link"
+    );
+}
+
+/// ③：悬空 symlink 作 rename 源合法（POSIX：rename 搬链接本体，不
+/// 解析目标）。跟随预检把悬空链误报 NotFound——修复前改名坏链报错。
+#[tokio::test]
+async fn rename_dangling_symlink_source_succeeds() {
+    let (stub, driver) = setup().await;
+    stub.add_dangling_symlink("/gone-link", "/nowhere");
+
+    driver
+        .rename(&rel("gone-link"), &rel("moved-link"))
+        .await
+        .expect("renaming a dangling link is legal (POSIX semantics)");
+    assert_eq!(
+        stub.symlink_target("/moved-link").as_deref(),
+        Some("/nowhere"),
+        "the link body must move with its target string intact"
+    );
+    assert_eq!(
+        stub.symlink_target("/gone-link"),
+        None,
+        "the old key must be gone"
+    );
+}
+
+/// ④（桩卫生）：add_symlink 的目标自动建目录不再向 dirs 表登记已被
+/// 文件/链接占据的组件（两表同键 = 桩状态污染）。
+#[tokio::test]
+async fn stub_add_symlink_does_not_pollute_dirs_for_file_targets() {
+    let (stub, _driver) = setup().await;
+    stub.add_file("/a.txt", b"z");
+    stub.add_symlink("/lnk", "/a.txt");
+
+    assert!(
+        !stub.is_dir("/a.txt"),
+        "the file target must not be registered as a dir"
+    );
+    assert_eq!(
+        stub.file_bytes("/a.txt").as_deref(),
+        Some(b"z".as_slice()),
+        "the file itself must be untouched"
+    );
+}
