@@ -181,6 +181,67 @@ impl SessionStore {
 }
 
 /// MD5 hex（分片 md5：4MiB 边界对齐内容逐片计算，非全文件 MD5）。
+/// 整文件上传的分片读取源（审查 M4，2026-09-25 内存有界化）：md5 预计算
+/// 与分片上传都按 [`CHUNK`] 窗口**按需读盘**——任意大文件不再全量驻
+/// `Bytes`（修复前 transport 面两臂都 `fs::read` 整文件，峰值=文件大小
+/// ×workers）。每次 `part` 独立开句柄（无跨任务锁；OS 页缓存承担重复
+/// 读的代价）。
+pub(crate) struct PartFile {
+    path: PathBuf,
+    size: u64,
+}
+
+impl PartFile {
+    pub(crate) fn new(path: PathBuf, size: u64) -> Self {
+        PartFile { path, size }
+    }
+
+    pub(crate) fn size(&self) -> u64 {
+        self.size
+    }
+
+    /// 流式分片 md5 预计算（逐 CHUNK 窗口；单窗驻内存）——与
+    /// 「到齐即传」的会话全量声明（31363）共用同一窗口数学。
+    async fn block_md5s(&self) -> Result<Vec<String>, StorageError> {
+        use tokio::io::AsyncReadExt;
+        let mut file = tokio::fs::File::open(&self.path)
+            .await
+            .map_err(|e| StorageError::Io(format!("part-source open: {e}")))?;
+        let mut md5s = Vec::new();
+        let mut remaining = self.size;
+        while remaining > 0 {
+            let cap = (CHUNK as u64).min(remaining) as usize;
+            let mut buf = vec![0u8; cap];
+            file.read_exact(&mut buf)
+                .await
+                .map_err(|e| StorageError::Unavailable(format!("part-source md5 read: {e}")))?;
+            md5s.push(md5_hex(&buf));
+            remaining -= cap as u64;
+        }
+        Ok(md5s)
+    }
+
+    /// 读第 idx 个分片（半开窗口 [idx*CHUNK, min((idx+1)*CHUNK, size))）。
+    /// 上传中途文件被缩短（并发截断）→ `read_exact` EOF → `Unavailable`
+    /// （会话位图保留，重试走全量重传——与 stager 语义一致）。
+    async fn part(&self, idx: u64) -> Result<Bytes, StorageError> {
+        use tokio::io::{AsyncReadExt, AsyncSeekExt, SeekFrom};
+        let start = idx * CHUNK as u64;
+        let len = (CHUNK as u64).min(self.size - start) as usize;
+        let mut file = tokio::fs::File::open(&self.path)
+            .await
+            .map_err(|e| StorageError::Io(format!("part-source open: {e}")))?;
+        file.seek(SeekFrom::Start(start))
+            .await
+            .map_err(|e| StorageError::Io(format!("part-source seek: {e}")))?;
+        let mut buf = vec![0u8; len];
+        file.read_exact(&mut buf)
+            .await
+            .map_err(|e| StorageError::Unavailable(format!("part-source read: {e}")))?;
+        Ok(Bytes::from(buf))
+    }
+}
+
 pub(crate) fn md5_hex(data: &[u8]) -> String {
     let mut hasher = Md5::new();
     hasher.update(data);
@@ -780,7 +841,7 @@ pub(crate) async fn upload_whole_file(
     volume: &VolumeId,
     root: &str,
     rel: &RelPath,
-    data: Bytes,
+    src: PartFile,
     sessions: &SessionStore,
     handles: &Arc<HandleCache>,
 ) -> Result<Entry, StorageError> {
@@ -788,13 +849,14 @@ pub(crate) async fn upload_whole_file(
         return Err(StorageError::Invalid); // 卷根不可作为上传目标
     }
     let abs = abs_of(root, rel);
-    let size = data.len() as u64;
+    let size = src.size();
+    let src = Arc::new(src);
     // 0 字节 wire 真形（2026-09-23 真网实测，[`EMPTY_MD5`] 文档）：
     // `[EMPTY_MD5]` 替代空数组（errno=2）；该块免传（下方探活/差集过滤）。
-    let block_md5: Vec<String> = if data.is_empty() {
+    let block_md5: Vec<String> = if size == 0 {
         vec![EMPTY_MD5.to_string()]
     } else {
-        data.chunks(CHUNK).map(md5_hex).collect()
+        src.block_md5s().await?
     };
 
     // 路一：会话表命中 → 全量 md5 一致才复用（整文件在手，比对全量
@@ -817,7 +879,7 @@ pub(crate) async fn upload_whole_file(
         if let Some(probe_idx) = (0..block_md5.len() as u64)
             .find(|i| !done.contains(i) && block_md5[*i as usize] != EMPTY_MD5)
         {
-            let part = part_slice(&data, probe_idx);
+            let part = src.part(probe_idx).await?;
             match client
                 .superfile2(&client.pcs_base, &abs, &uid, probe_idx, part)
                 .await
@@ -876,9 +938,10 @@ pub(crate) async fn upload_whole_file(
             let client = Arc::clone(client);
             let abs = abs.clone();
             let uid = uploadid.clone();
-            let part = part_slice(&data, idx);
+            let src = Arc::clone(&src);
             set.spawn(async move {
                 let _permit = permit;
+                let part = src.part(idx).await?;
                 client
                     .superfile2(&client.pcs_base, &abs, &uid, idx, part)
                     .await?;
@@ -946,14 +1009,8 @@ async fn persist_whole_session(
         .await;
 }
 
-/// 全量缓冲 `data` 的第 `idx` 个 4MiB 分片（Bytes 切片 = 引用计数视图，
-/// 并发 worker 零拷贝）。
-fn part_slice(data: &Bytes, idx: u64) -> Bytes {
-    let start = (idx as usize) * CHUNK;
-    let end = ((idx as usize) + 1) * CHUNK;
-    data.slice(start..end.min(data.len()))
-}
-
+// （原 part_slice 的文档注释——M4 移除该函数后，此处归 mod tests 头。
+// clippy mixed_attributes_style：外层用普通注释，模块文档在 `//!`。）
 #[cfg(test)]
 mod tests {
     //! β-1（Phase 8-B 审查修复批）：close 的 [`BaiduStager::finalize_tail`]
@@ -1057,5 +1114,54 @@ mod tests {
         let mut st = stager_with(buf, 0, vec![m0.clone(), m1.clone()], false);
         st.finalize_tail();
         assert_eq!(st.block_md5, vec![m0, m1]);
+    }
+}
+
+#[cfg(test)]
+mod part_file_tests {
+    use super::*;
+
+    /// PartFile 的窗口数学与 md5 全量一致性（审查 M4，2026-09-25）：
+    /// 分片读盘是整文件上传路径的唯一数据面——窗口边界（整块/尾块）
+    /// 与 `block_md5s` 对全缓冲分块 md5 的逐块等值在此隔离钉死（集成
+    /// 面另有三分片 partseq 齐集断言兜行为）。
+    #[tokio::test]
+    async fn part_windows_and_md5s_match_the_full_buffer() {
+        let size = CHUNK as u64 + 123;
+        let data: Vec<u8> = (0..size as usize).map(|i| (i % 251) as u8).collect();
+        let path = std::env::temp_dir().join(format!(
+            "ck-baidu-partsrc-{}-{}.bin",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .map(|d| d.subsec_nanos())
+                .unwrap_or(0)
+        ));
+        std::fs::write(&path, &data).expect("write part source");
+        let src = PartFile::new(path.clone(), size);
+        let _cleanup = scopeguard(&path);
+        assert_eq!(src.size(), size);
+
+        assert_eq!(src.part(0).await.expect("part 0").len(), CHUNK);
+        let tail = src.part(1).await.expect("part 1");
+        assert_eq!(tail.len(), 123);
+        assert_eq!(&tail[..], &data[CHUNK..]);
+
+        let md5s = src.block_md5s().await.expect("md5s");
+        let expect: Vec<String> = data.chunks(CHUNK).map(md5_hex).collect();
+        assert_eq!(
+            md5s, expect,
+            "streamed per-window md5 == full-buffer chunks"
+        );
+    }
+
+    fn scopeguard(path: &std::path::Path) -> impl Drop + '_ {
+        struct G<'a>(&'a std::path::Path);
+        impl Drop for G<'_> {
+            fn drop(&mut self) {
+                let _ = std::fs::remove_file(self.0);
+            }
+        }
+        G(path)
     }
 }

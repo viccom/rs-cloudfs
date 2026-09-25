@@ -6301,7 +6301,11 @@ pub enum BackendProbe {
 /// leg entirely instead of reporting a fake Unreachable.
 #[cfg(feature = "baidu")]
 pub async fn baidu_backend_probe(cfg: &CyDriveConfig) -> BackendProbe {
-    baidu_backend_probe_with(cfg, &BaiduEndpoints::default()).await
+    // 审查修复 M1（2026-09-25）：探针必须携带写回 store——探针期的 110
+    // 轮换一次一换，不落盘 = 烧毁唯一活 refresh_token（doctor 恰在 token
+    // 疑似过期时被运行）。与 run 单卷路径同源：cwd 的 config.toml。
+    let store: Arc<dyn ck_baidu::TokenStore> = Arc::new(ConfigTokenStore::default());
+    baidu_backend_probe_with(cfg, &BaiduEndpoints::default(), store).await
 }
 
 /// The sftp backend probe (Phase 4 / SF3 doctor leg): connects once
@@ -6366,6 +6370,7 @@ pub async fn webdav_backend_probe(cfg: &CyDriveConfig) -> ck_webdav::WebdavProbe
 pub async fn baidu_backend_probe_with(
     cfg: &CyDriveConfig,
     endpoints: &BaiduEndpoints,
+    token_store: Arc<dyn ck_baidu::TokenStore>,
 ) -> BackendProbe {
     // Incomplete credentials never reach the network: a clear
     // misconfiguration verdict beats a confusing connect failure.
@@ -6376,9 +6381,10 @@ pub async fn baidu_backend_probe_with(
         ));
     }
     let probe = async {
-        let params = baidu_params(cfg, endpoints, None, Path::new("."));
+        let params = baidu_params(cfg, endpoints, Some(token_store), Path::new("."));
         let driver = ck_baidu::factory(&params).await?;
-        StorageDriver::quota(driver.as_ref()).await?;
+        // quota API 在本 appkey 下恒 error_code=3 "Unsupported open api"
+        // （2026-09-25 真机探针实证）——探针只承重 token 活性，list 足证。
         StorageDriver::list(
             driver.as_ref(),
             &cloudkit_storage::RelPath::root(),

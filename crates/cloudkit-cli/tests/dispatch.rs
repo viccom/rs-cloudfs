@@ -549,11 +549,57 @@ async fn config_token_store_updates_the_two_token_keys() {
 #[tokio::test]
 async fn baidu_backend_probe_alive_against_mock() {
     let (addr, _calls) = spawn_mock_baidu(false).await;
-    let probe =
-        cloudkit_cli::baidu_backend_probe_with(&baidu_config(), &mock_endpoints(addr)).await;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let probe = cloudkit_cli::baidu_backend_probe_with(
+        &baidu_config(),
+        &mock_endpoints(addr),
+        Arc::new(cloudkit_cli::ConfigTokenStore::new(
+            dir.path().join("config.toml"),
+        )),
+    )
+    .await;
     assert!(
         matches!(probe, BackendProbe::Alive),
         "the healthy mock answers Alive, got: {probe:?}"
+    );
+}
+
+/// Review M1（2026-09-25，baidu 深度审查）：探针期的 110 轮换必须落盘。
+/// 修复前 `baidu_backend_probe_with` 传 `token_store = None`——刷新成功、
+/// 探针报 Alive，但一次一换的旧 refresh_token 已作废而新值未持久化，
+/// config.toml 里留着死 token（doctor 恰在 token 疑似过期时被运行）。
+/// 红（本测试以三参签名编写，对修复前的两参签名编译失败）→ 绿：轮换
+/// 对经注入的 ConfigTokenStore 写进临时 config.toml。
+#[cfg(feature = "baidu")]
+#[tokio::test]
+async fn baidu_backend_probe_persists_the_rotated_token_pair() {
+    let (addr, _calls) = spawn_mock_baidu(true).await;
+    let dir = tempfile::tempdir().expect("temp dir");
+    let path = dir.path().join("config.toml");
+    baidu_config().save_toml(&path).expect("seed config.toml");
+    let store = cloudkit_cli::ConfigTokenStore::new(path.clone());
+
+    let probe = cloudkit_cli::baidu_backend_probe_with(
+        &baidu_config(),
+        &mock_endpoints(addr),
+        Arc::new(store),
+    )
+    .await;
+    assert!(
+        matches!(probe, BackendProbe::Alive),
+        "the rotated replay connects, got: {probe:?}"
+    );
+
+    let reloaded = CyDriveConfig::load_toml(&path).expect("reload config");
+    assert_eq!(
+        reloaded.baidu_access_token.as_deref(),
+        Some("rotated-access"),
+        "the rotated access_token reached the config file"
+    );
+    assert_eq!(
+        reloaded.baidu_refresh_token.as_deref(),
+        Some("rotated-refresh"),
+        "the rotated refresh_token reached the config file (the only live value now)"
     );
 }
 

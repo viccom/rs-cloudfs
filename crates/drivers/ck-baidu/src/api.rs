@@ -8,7 +8,7 @@
 //!
 //! | 操作 | 端点 | 参数形态 | 源 |
 //! |---|---|---|---|
-//! | list | GET `/rest/2.0/xpan/file` | query 恰 `method=list&dir=<abs>&access_token`（**无分页参数**——driver 内 offset 游标切 Page，ck-local 先例） | spike api.rs:131-148；PCFS api.go:49-52 |
+//! | list | GET `/rest/2.0/xpan/file` | query `method=list&dir=<abs>&start=<off>&limit=1000`（H1 修复 2026-09-25：无参默认页 1000 **静默截断**，成对 start+limit 窗口方言逐页拉齐） | 真机探针定谳（2026-09-25，1010 播种三验）；spike api.rs:131-148 为陈旧前形态 |
 //! | ~~stat（meta&path）~~ | GET 同上 | **已停用**（真网 31300 实证 2026-09-08，见下节）——stat 改「list 父目录 + path 精确匹配」（`driver.rs` stat / `upload.rs` open_writer 预检共用） | 真网探针 #1 |
 //! | ~~stat（meta&fs_ids）~~ | GET 同上 | **已停用**（真网 31023 实证 2026-09-08）——fs_id → 条目解析改「句柄缓存（list/stat/Entry 流量填充）+ 未命中递归 list 扫描」（`driver.rs` HandleCache/scan_dir） | 真网探针 #2 |
 //! | mkdir | POST 同上 | query `method=create&access_token`；form 恰 `path=<abs>&isdir=1` 两字段（application/x-www-form-urlencoded） | PCFS api.go:708-735 |
@@ -137,23 +137,58 @@ pub(crate) fn parent_abs(abs: &str) -> String {
     }
 }
 
-/// GET `method=list&dir=<abs>`——depth-1 条目（无分页参数，见模块文档）。
+/// 单页请求的窗口大小（H1 真机定谳 2026-09-25：无参 list 默认页 1000
+/// **静默截断**——探针实测 1010 播种裸查恰 1000；成对 `start`+`limit`
+/// 窗口方言可用，本常量即每页 limit）。
+const LIST_PAGE: usize = 1000;
+
+/// GET `method=list&dir=<abs>&start=<off>&limit=1000`——depth-1 条目
+/// **全量拉齐**（H1 修复，2026-09-25 真机定谳）。逐页拼接直到短页；
+/// 「limit 单独出现或与 order 搭档被后端忽略」的实证怪癖由**恒发成对
+/// start/limit、不发 order** 规避；fs_id 去重防线跳出伪分页（参数被
+/// 整体忽略 → 页页全重复 → 零新增即止，不烧流量不死循环）。
 pub(crate) async fn list(
     client: &BaiduClient,
     dir: &str,
 ) -> Result<Vec<RemoteEntry>, StorageError> {
-    let v = client
-        .api_get(XPAN_FILE, &[("method", "list"), ("dir", dir)])
-        .await?;
-    let items = v
-        .get("list")
-        .and_then(Value::as_array)
-        .cloned()
-        .unwrap_or_default();
-    Ok(items
-        .iter()
-        .filter_map(|item| serde_json::from_value(item.clone()).ok())
-        .collect())
+    let mut all: Vec<RemoteEntry> = Vec::new();
+    let mut seen: std::collections::HashSet<i64> = std::collections::HashSet::new();
+    let mut start = 0usize;
+    let limit = LIST_PAGE.to_string();
+    loop {
+        let start_s = start.to_string();
+        let v = client
+            .api_get(
+                XPAN_FILE,
+                &[
+                    ("method", "list"),
+                    ("dir", dir),
+                    ("start", start_s.as_str()),
+                    ("limit", limit.as_str()),
+                ],
+            )
+            .await?;
+        let items = v
+            .get("list")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        let batch: Vec<RemoteEntry> = items
+            .iter()
+            .filter_map(|item| serde_json::from_value(item.clone()).ok())
+            .collect();
+        let page_len = batch.len();
+        let before = all.len();
+        all.extend(batch.into_iter().filter(|e| seen.insert(e.fs_id)));
+        if page_len < LIST_PAGE {
+            break; // 短页 = 尾页
+        }
+        if all.len() == before {
+            break; // 伪分页防线：页全重复（参数被忽略形态）——跳出防死循环
+        }
+        start += page_len;
+    }
+    Ok(all)
 }
 
 /// GET `method=meta&path=<abs>`——单条目元数据（PCFS api.go:110-113）。

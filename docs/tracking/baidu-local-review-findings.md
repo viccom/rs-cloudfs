@@ -81,3 +81,43 @@ CDN 三约束全落实（UA/≤4MiB/禁全量 GET，五钉测）；dlink TTL+两
 - 本批**只审查不修复**（负责人裁决必修项后开修复批）。
 - 优先级建议：H1 真机探针（数据完整性承重）> M1/M2/M3（baidu，各有钉测形态）> local M1/M2/M3 > 其余 L/I。
 - telegram 免审理由：rs-CyDrive 血统多轮审查 + review-fixes.md 工程债档案（H3+Low×5+K53 清偿）+ Phase 8 D10/K84 密文面审查覆盖，非无审查。
+
+## 修复批（2026-09-25，fix/baidu-review worktree，负责人指令「按建议执行」）
+
+### H1 真机定谳 + 修复（list 分页截断）
+
+**三轮真机探针定谳**（生产卷文件 token，测试目录 `_probe_pag*` 自建自清、residual 全 0）：
+
+1. 无参 `method=list` **默认页 1000 静默截断**（1010 播种裸查恰 1000）——五链路传播面坐实（list/scan_dir/删除递归/read-through 物化/rebuild）。
+2. 分页方言：`start`+`limit` **成对**才窗口生效（`start=500&limit=600` → 恰 484 条窗口、first=f0517）；`limit` 单独出现、或与 `order`/`web` 搭档时**被后端忽略**（恒回默认页）。修复只发成对 start/limit、不发 order。
+3. **修复后组合验证**（一次性实例 `cydrive rebuild` 真机）：1010 播种（p1=1000+p2=10）→ `rebuild complete: 1010 file row(s)` + stats=1010（修复前必 1000）。
+
+修复：`api::list` 逐页拉齐（短页即止 + fs_id 去重防线跳出伪分页死循环）；mock 按真形建模页上限（`LIST_PAGE_DEFAULT=1000` + 成对窗口）；新钉测 ×2（1005 全量可见 / 分页方言 wire 钉）；两处金身 query 钉测同步（list/stat 增 start/limit 对）。驱动内 offset 游标不变（现在切在全量上）。
+
+### M1 doctor 探针烧 refresh_token（修）
+
+`baidu_backend_probe_with` 增第三参 `token_store: Arc<dyn TokenStore>`（生产包装传 `ConfigTokenStore::default()`——与探针 cfg 同源的 cwd config.toml）；测试：轮换 mock + 临时 config 断言新 token 对落盘（红=两参签名编译失败）。**同批发现并修复**：quota API 在本 appkey 下恒 `error_code=3 "Unsupported open api"`（2026-09-25 真机实证）——探针的 quota 腿删除（list 已足证 token 活性，且此前该腿会让 doctor 误报 Unreachable）。
+
+### M2 rename 后句柄缓存（修）
+
+- rename 成功后 `HandleCache::move_subtree` **改写**缓存子树路径（文件腿自身/目录腿自身+全部后代；「改写」优于「失效」——持旧 fs_id 读零重扫流量，钉测断言 list 计数不变）。
+- reader 补 **-9 纠偏腿**（镜像 delete 腿：失效+重扫+重试恰一次）——外部搬移（绕过驱动的竞态窗）同款自愈。
+- mock 增 `rename_path` 旋钮（外部搬移场景桩面）；红 ×3（文件腿/目录腿/纠偏腿全 NotFound）→ 绿 15/15；外部搬移的 delete 纠偏腿补独立钉测（原测试走 driver.rename——缓存改写后不再撞 -9，纠偏语义由新腿保钉）。
+
+### M3 DlinkCache 无上界（修）
+
+`DLINK_CACHE_CAP=1024`（HandleCache 同款取舍：超容先清过期、仍满全清——条目廉价可重取）；单测钉 len ≤ cap（红：无界）。
+
+### M4 transport 上传面全量驻内存（修）
+
+`upload_whole_file` 的 `data: Bytes` 换 `PartFile`（path+size）：md5 预计算流式逐 CHUNK 窗口、分片上传按需开句柄读盘（每次独立句柄，无跨任务锁）；transport 两臂不再 `fs::read` 整文件——`upload` 走 metadata 计划校验，`upload_stream` 的 staging 落盘后**不再读回**（清理卫士 `StreamStagingGuard` 持有到上传结束）。任意大文件内存峰值 = CHUNK × workers。PartFile 单测（窗口数学 + 流式 md5 与全缓冲逐块等值）；既有三分片 partseq 齐集钉测承重行为面。
+
+### 探针期新事实（勘误/挂账）
+
+- **refresh_token 可重用**：2026-09-25 实测旧 RT 再次刷新成功（`has_access/has_refresh` 双真）——AGENTS「一次一换、旧值即刻作废（spike §1 实证）」记录**勘误**（保守落盘行为维持不变，无行为影响）。
+- quota API `error_code=3`（本 appkey 无该 API 权限）——已随 M1 从探针移除；`doctor` 的 quota 展示面（若有）挂账复查。
+- 探针过程教训（不入库的脚本纪律）：bash 变量含 `--noproxy *` 展开吞文件表；`-X POST -G` 混用把表单体搬进 query；`set -u` 下脚本引用外部变量。均已即时修正，零残留。
+
+### 验证
+
+worktree `fix/baidu-review`：ck-baidu + cloudkit-cli **324/0**（mock 级全绿）；clippy -D warnings 绿；fmt 绿；真机三轮探针 + 修复后 rebuild 组合验证 PASS；远端 `_probe_*` 目录全清（residual=0）；生产卷文件 token 未轮换未修改（活性全程可用）。

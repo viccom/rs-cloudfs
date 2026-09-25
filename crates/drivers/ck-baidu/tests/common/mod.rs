@@ -84,6 +84,9 @@ pub const CDN_PREFIX: &str = "/cdn/";
 
 /// 测试根（与生产缺省 `baidu_root` 同形态，K17）。
 pub const MOCK_ROOT: &str = "/apps/cloudfs";
+
+/// list 默认页大小（H1 真机定谳 2026-09-25：无参请求静默截断于此）。
+pub const LIST_PAGE_DEFAULT: usize = 1000;
 /// 假凭据（占位形态，绝非真实凭据——R3）。
 pub const MOCK_APP_KEY: &str = "mock-app-key";
 pub const MOCK_APP_SECRET: &str = "mock-app-secret";
@@ -338,6 +341,32 @@ impl MockBaidu {
     /// 注入 errno：下一个**业务**请求（xpan/file、xpan/nas）顶此错误。
     pub fn inject_errno(&self, errno: i64) {
         self.state.lock().unwrap().inject.push_back(errno);
+    }
+
+    /// 绕过驱动直接在后端状态里搬移条目（含子树前缀改写——与
+    /// filemanager move 处理器同语义）：钉「缓存陈旧」场景（外部搬移
+    /// 竞态窗），审查 M2 纠偏腿的独立红臂。
+    pub fn rename_path(&self, from: &str, to: &str) {
+        let mut st = self.state.lock().unwrap();
+        let prefix = format!("{from}/");
+        for e in st.entries.iter_mut() {
+            if e.path == from {
+                e.path = to.to_string();
+                e.server_filename = to
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&e.server_filename)
+                    .to_string();
+            } else if let Some(rest) = e.path.strip_prefix(&prefix) {
+                e.path = format!("{to}/{rest}");
+                e.server_filename = e
+                    .path
+                    .rsplit('/')
+                    .next()
+                    .unwrap_or(&e.server_filename)
+                    .to_string();
+            }
+        }
     }
 
     pub fn set_quota(&self, used: i64, total: i64) {
@@ -641,6 +670,17 @@ async fn xpan_file(
     match (method.as_str(), qp("method").unwrap_or_default().as_str()) {
         ("GET", "list") => {
             let dir = qp("dir").unwrap_or_default();
+            // 分页真形（H1 真机定谳，2026-09-25 探针轮次 3+6）：无参 →
+            // 默认页 1000 **静默截断**（1010 播种裸查恰 1000）；`start`+
+            // `limit` **成对**才窗口生效（limit 单独出现、或与 order 搭档
+            // 时均被后端忽略——只按实证建模，不臆造）。
+            let (start, limit) = match (qp("start"), qp("limit")) {
+                (Some(s), Some(l)) => (
+                    s.parse::<usize>().unwrap_or(0),
+                    l.parse::<usize>().unwrap_or(LIST_PAGE_DEFAULT),
+                ),
+                _ => (0, LIST_PAGE_DEFAULT),
+            };
             let st = state.lock().unwrap();
             if !st.entries.iter().any(|e| e.isdir && e.path == dir) {
                 return errno_json(-9); // 目录不存在
@@ -650,6 +690,8 @@ async fn xpan_file(
                 .iter()
                 .filter(|e| parent_of(&e.path) == Some(dir.as_str()))
                 .map(entry_json)
+                .skip(start)
+                .take(limit)
                 .collect();
             Json(json!({"errno": 0, "list": list})).into_response()
         }

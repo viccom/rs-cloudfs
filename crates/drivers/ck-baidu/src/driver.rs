@@ -22,7 +22,8 @@
 //!   失效 + 重扫 + 重试一次（防删错/删空）；xpan 删除走回收站 10 天是
 //!   后端已知限制，非驱动语义）；
 //! - **list**：depth-1、按 [`RelPath`] 字典序稳定有序、内部 offset 游标
-//!   切 [`Page`]（后端无分页参数——spike api.rs:131-148 实证；游标
+//!   切 [`Page`]（api::list 已按成对 start/limit 窗口方言全量拉齐——H1
+//!   修复 2026-09-25；游标
 //!   `off:{end}` 形态，ck-local/mock 先例）；卷外路径条目（后端异常回显）
 //!   跳过不透出；每次 list 顺带**批量填充句柄缓存**（一次 list 一次锁）；
 //! - **mtime**：读 `server_mtime`（api.rs 模块文档注源）；
@@ -76,8 +77,10 @@ const HANDLE_CACHE_CAP: usize = 4096;
 /// meta 端点在此 appkey 下全废（31300/31023），delete 句柄解析与 reader
 /// 的 dlink 签发路径需要 fs_id → path/isdir/size 的解析面——由本缓存 +
 /// 递归扫描（[`BaiduDriver::scan_dir`]）两级供给。**缓存只是解析层**：
-/// K5（handle=fs_id 跨 rename 稳定）不受影响，陈旧条目（rename 后指向
-/// 旧路径）由 delete 的纠偏腿（-9 → 失效重扫重试）兜底。
+/// K5（handle=fs_id 跨 rename 稳定）不受影响。陈旧路径三重防线（审查
+/// M2，2026-09-25）：rename 成功即 [`HandleCache::move_subtree`] 改写；
+/// delete 与 reader 各自的 -9 纠偏腿（失效 + 重扫 + 重试恰一次）兜住
+/// 绕过本驱动的外部搬移。
 ///
 /// 填充点：`list`（批量，一次 list 一次锁）/ `stat`（父目录批量）/
 /// `entry_for`（父目录批量）/ `scan_dir`（逐目录批量）/ writer 预检 /
@@ -115,6 +118,23 @@ impl HandleCache {
         }
         for e in entries {
             map.insert(e.fs_id, e.clone());
+        }
+    }
+
+    /// 审查 M2（2026-09-25）：rename 成功后把缓存里本子树（自身 + 全部
+    /// 后代）的解析路径整体改写到新位置。「改写」优于「失效」：持旧
+    /// fs_id 的读命中缓存即直达新路径，零重扫流量（fs_id 跨 rename 稳定
+    /// ——K5 不动，动的是解析层的 path 侧）。失败路径不调本方法（远端
+    /// 未动，缓存照旧正确）。
+    pub(crate) fn move_subtree(&self, from_abs: &str, to_abs: &str) {
+        let prefix = format!("{from_abs}/");
+        let mut map = self.map.lock().unwrap();
+        for e in map.values_mut() {
+            if e.path == from_abs {
+                e.path = to_abs.to_string();
+            } else if let Some(rest) = e.path.strip_prefix(&prefix) {
+                e.path = format!("{to_abs}/{rest}");
+            }
         }
     }
 }
@@ -175,17 +195,19 @@ impl BaiduDriver {
 
     /// transport 面整文件上传（B3b 段一）：委派 upload::upload_whole_file
     ///（[`UPLOAD_WORKERS`] 并发 superfile2 + K7 会话表与 stager 共用）。
+    /// 入参是**分片读取源**（审查 M4，2026-09-25）：md5 预计算与分片
+    /// 上传按 CHUNK 窗口按需读盘——不再全量驻内存。
     pub(crate) async fn upload_whole_file(
         &self,
         rel: &RelPath,
-        data: bytes::Bytes,
+        src: upload::PartFile,
     ) -> Result<Entry, StorageError> {
         upload::upload_whole_file(
             &self.client,
             &self.volume,
             &self.root,
             rel,
-            data,
+            src,
             &self.sessions,
             &self.handles,
         )
@@ -384,7 +406,7 @@ impl StorageDriver for BaiduDriver {
             .collect();
         // RelPath 字典序稳定排序（trait 契约；后端返回序是实现细节）
         entries.sort_by(|a, b| a.path.cmp(&b.path));
-        // 内部 offset 游标切 Page（后端无分页参数——模块文档注源）；
+        // 内部 offset 游标切 Page（api::list 已全量拉齐——H1 修复）；
         // 游标 `off:{end}` 不透明令牌（ck-local/mock 先例），伪令牌回退 0。
         let total = entries.len();
         let offset = match page.cursor {
@@ -501,10 +523,15 @@ impl StorageDriver for BaiduDriver {
         let src_abs = self.abs_path(from);
         // 源不存在 → NotFound（trait 契约；kind 决定文件腿/目录腿）。
         let st = self.stat(from).await?;
+        let dst_abs = self.abs_path(to);
         if st.kind == EntryKind::File {
             // 文件腿：单次 filemanager move（wire 契约钉死——metadata_ops
             // 断言恰一次调用）。
-            return api::filemanager_move(&self.client, &src_abs, &dest_dir, new_name).await;
+            api::filemanager_move(&self.client, &src_abs, &dest_dir, new_name).await?;
+            // 审查 M2：缓存路径随搬移改写——此后持旧句柄的 reader/stat
+            // 解析直达新路径（此前陈旧 path 签发 dlink 撞 -9 无自愈）。
+            self.handles.move_subtree(&src_abs, &dst_abs);
+            return Ok(());
         }
         // 目录腿：**客户端递归搬移**（conformance ⑥ 钉死子树跟随语义）——
         // 自身 move 先行 + 子条目按新前缀补搬（move 前收集子树清单）。
@@ -515,7 +542,6 @@ impl StorageDriver for BaiduDriver {
         let mut subtree = Vec::new();
         self.collect_subtree(&src_abs, &mut subtree).await?;
         api::filemanager_move(&self.client, &src_abs, &dest_dir, new_name).await?;
-        let dst_abs = self.abs_path(to);
         let old_prefix = format!("{src_abs}/");
         let new_prefix = format!("{dst_abs}/");
         for child_abs in subtree {
@@ -533,6 +559,9 @@ impl StorageDriver for BaiduDriver {
                 Err(e) => return Err(e),
             }
         }
+        // 审查 M2：子树整体改写（自身 + 全部后代——含补搬容错跳过的
+        // 条目；后端单调用递归形态下它们同样已在新位置）。
+        self.handles.move_subtree(&src_abs, &dst_abs);
         Ok(())
     }
 
@@ -549,7 +578,17 @@ impl StorageDriver for BaiduDriver {
             .parse()
             .map_err(|_| StorageError::Invalid)?;
         let remote = self.resolve_handle(fs_id).await?; // 全树无 → NotFound
-        download::open_range(&self.client, &self.dlinks, fs_id, &remote, range).await
+        match download::open_range(&self.client, &self.dlinks, fs_id, &remote, range).await {
+            // 陈旧缓存纠偏（审查 M2；delete 腿的镜像）：dlink 签发携旧
+            // path 撞 -9 → 失效 + 重扫 + 重试恰一次——外部搬移（绕过本
+            // 驱动的竞态窗）同样自愈；重扫也无 → 真 NotFound 上抛。
+            Err(StorageError::NotFound) => {
+                self.handles.invalidate(fs_id);
+                let fresh = self.resolve_handle(fs_id).await?;
+                download::open_range(&self.client, &self.dlinks, fs_id, &fresh, range).await
+            }
+            other => other,
+        }
     }
 
     async fn writer(

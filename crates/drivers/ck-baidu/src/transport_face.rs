@@ -44,6 +44,7 @@ use cloudkit_storage::transport::{
 use cloudkit_storage::vpath::RelPath as VPath;
 use cloudkit_storage::{BackendHandle, Capabilities, EntryId, Range, RelPath, StorageDriver};
 
+use crate::upload;
 use crate::BaiduDriver;
 
 /// upload_stream 的 staging 临时文件名序号（进程级单调）。
@@ -123,10 +124,16 @@ impl BaiduTransport {
         )
     }
 
-    /// 帧流 → staging 文件（OS 临时目录；逐帧落盘保内存有界）→ 全量
-    /// 读回。超计划/短流在落盘途中拒绝（计划与流必须逐字节一致——
-    /// precreate 的 size/block_list 声明容不得半点偏差）。
-    async fn stage_stream(&self, data: ByteStream, planned: u64) -> Result<Bytes, StorageError> {
+    /// 帧流 → staging 文件（OS 临时目录；逐帧落盘保内存有界）。超计划/
+    /// 短流在落盘途中拒绝（计划与流必须逐字节一致——precreate 的
+    /// size/block_list 声明容不得半点偏差）。**不再全量读回**（审查
+    /// M4，2026-09-25）：返回 staging 路径 + 清理卫士，后续 md5 预计算
+    /// 与分片上传按 CHUNK 窗口按需读盘。
+    async fn stage_stream(
+        &self,
+        data: ByteStream,
+        planned: u64,
+    ) -> Result<(PathBuf, StreamStagingGuard), StorageError> {
         // 唯一临时名：pid + 进程级单调序号；撞名递增重试（create_new）。
         let pid = std::process::id();
         let mut opened = None;
@@ -153,16 +160,7 @@ impl BaiduTransport {
                 "stream staging 命名冲突重试耗尽（pid={pid}）"
             )));
         };
-        // Drop 兜底清理：任意退出路径（含错误/panic）不留孤儿临时文件。
-        // Drop 内同步 remove 是单次快速元数据 syscall（tempfile crate 的
-        // TempDir 同款形态），不属 code-style §4 针对的重 IO 阻塞面。
-        struct Cleanup(PathBuf);
-        impl Drop for Cleanup {
-            fn drop(&mut self) {
-                let _ = std::fs::remove_file(&self.0);
-            }
-        }
-        let _cleanup = Cleanup(path.clone());
+        let cleanup = StreamStagingGuard(path.clone());
 
         let mut written: u64 = 0;
         let mut frames = data;
@@ -183,11 +181,19 @@ impl BaiduTransport {
                 "chunk plan mismatch: stream ended at {written} bytes, but the job planned {planned}"
             )));
         }
-        drop(file); // Windows：读回前显式关写句柄
-        let data = tokio::fs::read(&path)
-            .await
-            .map_err(|e| StorageError::Io(format!("stream staging read: {e}")))?;
-        Ok(Bytes::from(data))
+        drop(file); // Windows：分片读盘前显式关写句柄
+        Ok((path, cleanup))
+    }
+}
+
+/// staging 临时文件的 Drop 兜底清理（任意退出路径——含错误/panic——
+/// 不留孤儿临时文件）。Drop 内同步 remove 是单次快速元数据 syscall
+/// （tempfile crate 的 TempDir 同款形态），不属 code-style §4 针对的
+/// 重 IO 阻塞面。上传方持有到上传结束（`Ok`/`Err` 皆然）。
+pub(crate) struct StreamStagingGuard(PathBuf);
+impl Drop for StreamStagingGuard {
+    fn drop(&mut self) {
+        let _ = std::fs::remove_file(&self.0);
     }
 }
 
@@ -204,28 +210,35 @@ impl CloudTransport for BaiduTransport {
     /// （`first_msg_id = fs_id`）。
     async fn upload(&self, job: &UploadJob) -> Result<UploadReceipt, StorageError> {
         let rel = vocab_rel(&job.rel_path)?;
-        let data = tokio::fs::read(&job.local_path).await?;
-        if data.len() as u64 != job.size {
+        // 审查 M4：不再 `fs::read` 整文件入内存——元数据校验计划后按
+        // CHUNK 窗口按需读盘（`upload::PartFile`）。
+        let actual = tokio::fs::metadata(&job.local_path)
+            .await
+            .map_err(|e| StorageError::Io(format!("upload source stat: {e}")))?
+            .len();
+        if actual != job.size {
             return Err(StorageError::Unavailable(format!(
                 "upload job planned {} bytes but the local file holds {}",
-                job.size,
-                data.len()
+                job.size, actual
             )));
         }
-        self.finish_upload(&rel, Bytes::from(data)).await
+        let src = upload::PartFile::new(job.local_path.clone(), job.size);
+        self.finish_upload(&rel, src).await
     }
 
-    /// 流式上传：全缓冲到 staging 文件（31363 裁决——precreate 需全量
-    /// block_list，流式无法增量声明，全缓冲是唯一正确路径）后走整文件
-    /// 同路。`job.local_path` 是 provenance only（线上字节来自流）。
+    /// 流式上传：缓冲到 staging 文件（31363 裁决——precreate 需全量
+    /// block_list，流式无法增量声明，落盘缓冲是唯一正确路径）后走整
+    /// 文件同路（按需读盘，不驻内存——审查 M4）。`job.local_path` 是
+    /// provenance only（线上字节来自流）。清理卫士持有到上传结束。
     async fn upload_stream(
         &self,
         job: &UploadJob,
         data: ByteStream,
     ) -> Result<UploadReceipt, StorageError> {
         let rel = vocab_rel(&job.rel_path)?;
-        let staged = self.stage_stream(data, job.size).await?;
-        self.finish_upload(&rel, staged).await
+        let (path, _guard) = self.stage_stream(data, job.size).await?;
+        let src = upload::PartFile::new(path, job.size);
+        self.finish_upload(&rel, src).await
     }
 
     /// 全文件读：预算帽语义下等价 `open_range(0, total_size)`。
@@ -281,9 +294,9 @@ impl BaiduTransport {
     async fn finish_upload(
         &self,
         rel: &RelPath,
-        data: Bytes,
+        src: upload::PartFile,
     ) -> Result<UploadReceipt, StorageError> {
-        let entry = self.driver.upload_whole_file(rel, data).await?;
+        let entry = self.driver.upload_whole_file(rel, src).await?;
         // K5：Entry.handle 即 fs_id 十进制字符串（同一构造来源，parse 必
         // 成功；防御分支仍归一错误而非 panic）。
         let fs_id: i64 = entry.id.handle.as_str().parse().map_err(|_| {

@@ -16,8 +16,8 @@ use cloudkit_storage::{
 use serde_json::{json, Value};
 
 use common::{
-    assert_exact_pairs, assert_form_encoded, filter_recorded, parse_urlencoded, MockBaidu,
-    INITIAL_ACCESS_TOKEN, MOCK_ROOT, MOCK_UID, NETDISK_UA, XPAN_FILE, XPAN_NAS,
+    assert_exact_pairs, assert_form_encoded, filter_recorded, parse_urlencoded, pattern_bytes,
+    MockBaidu, INITIAL_ACCESS_TOKEN, MOCK_ROOT, MOCK_UID, NETDISK_UA, XPAN_FILE, XPAN_NAS,
 };
 
 /// 种子根目录 + 构造驱动（测试各自按需追加播种）。
@@ -47,14 +47,16 @@ async fn list_sends_exact_golden_query() {
 
     let recorded = mock.recorded();
     let reqs = filter_recorded(&recorded, "GET", XPAN_FILE, &["method=list"]);
-    assert_eq!(reqs.len(), 1, "list 恰一次后端调用");
-    // 黄金参照（spike api.rs:131-148 + PCFS api.go:49-52）：恰三参数——
-    // **无分页参数**（web/num 等一律不发，driver 内 offset 游标切 Page）。
+    assert_eq!(reqs.len(), 1, "list 恰一次后端调用（单页目录不起续页）");
+    // 黄金参照（H1 真机定谳 2026-09-25：无参默认页 1000 静默截断——
+    // 成对 start+limit 窗口方言逐页拉齐，不发 num/order/web）。
     assert_exact_pairs(
         &query_pairs(reqs[0]),
         &[
             ("method", "list"),
             ("dir", MOCK_ROOT),
+            ("start", "0"),
+            ("limit", "1000"),
             ("access_token", INITIAL_ACCESS_TOKEN),
         ],
     );
@@ -225,6 +227,8 @@ async fn stat_lists_parent_dir_with_exact_query_and_never_calls_meta() {
         &[
             ("method", "list"),
             ("dir", MOCK_ROOT),
+            ("start", "0"),
+            ("limit", "1000"),
             ("access_token", INITIAL_ACCESS_TOKEN),
         ],
     );
@@ -434,4 +438,191 @@ async fn list_parses_entries_sorted_with_root_stripped_and_server_mtime() {
     assert_eq!(s.size, 12345);
     assert_eq!(s.mtime, 1757311000.0);
     assert_eq!(s.id.handle.as_str(), fs_id.to_string());
+}
+
+// ----------------------------- 审查 M2（2026-09-25）：rename × 句柄缓存 -----------------
+
+async fn read_all(mut stream: cloudkit_storage::ByteStream) -> Vec<u8> {
+    use futures_util::StreamExt;
+    let mut out = Vec::new();
+    while let Some(item) = stream.next().await {
+        match item {
+            Ok(bytes) => out.extend_from_slice(&bytes),
+            Err(e) => panic!("读流中途错误: {e}"),
+        }
+    }
+    out
+}
+
+fn list_calls(mock: &MockBaidu) -> usize {
+    filter_recorded(&mock.recorded(), "GET", XPAN_FILE, &["method=list"]).len()
+}
+
+/// 文件腿：rename 后持旧句柄读必须读通，且**零额外解析流量**——修复前
+/// rename 不改写句柄缓存，reader 拿陈旧 path 签发 dlink 撞 -9 → NotFound
+/// 无自愈（审查 M2 红①）；修复选「改写」而非「失效」：命中缓存直达
+/// fetch_dlink(新路径)，无重扫 list（钉住设计选择）。
+#[tokio::test]
+async fn rename_rewrites_cached_paths_so_reads_follow_the_object() {
+    let (mock, driver) = setup().await;
+    let content = pattern_bytes(1000);
+    mock.seed_file_bytes(&format!("{MOCK_ROOT}/old.bin"), &content, 1757311000);
+
+    let entry = driver
+        .stat(&RelPath::new("old.bin").expect("rel"))
+        .await
+        .expect("stat 播种（缓存批量填充）");
+    driver
+        .rename(
+            &RelPath::new("old.bin").expect("rel"),
+            &RelPath::new("moved.bin").expect("rel"),
+        )
+        .await
+        .expect("rename");
+
+    let before = list_calls(&mock);
+    let stream = driver
+        .reader(&entry.id, None)
+        .await
+        .expect("rename 后持旧句柄读通（缓存路径已随搬移改写）");
+    assert_eq!(read_all(stream).await, content, "读到的是同一对象的内容");
+    assert_eq!(
+        list_calls(&mock),
+        before,
+        "零额外解析流量——缓存条目被改写而非失效"
+    );
+}
+
+/// 目录腿：rename 目录后，子条目旧句柄读通（缓存子树前缀整体改写）。
+#[tokio::test]
+async fn dir_rename_rewrites_the_cached_subtree_for_reads() {
+    let (mock, driver) = setup().await;
+    mock.seed_dir(&format!("{MOCK_ROOT}/d"));
+    let content = pattern_bytes(777);
+    mock.seed_file_bytes(&format!("{MOCK_ROOT}/d/kid.bin"), &content, 1757311000);
+
+    let entry = driver
+        .stat(&RelPath::new("d/kid.bin").expect("rel"))
+        .await
+        .expect("stat 播种");
+    driver
+        .rename(
+            &RelPath::new("d").expect("rel"),
+            &RelPath::new("d2").expect("rel"),
+        )
+        .await
+        .expect("rename 目录");
+
+    let stream = driver
+        .reader(&entry.id, None)
+        .await
+        .expect("目录搬移后子条目旧句柄读通");
+    assert_eq!(read_all(stream).await, content);
+    driver
+        .stat(&RelPath::new("d2/kid.bin").expect("rel"))
+        .await
+        .expect("新路径可见");
+}
+
+/// 纠偏腿（外部搬移场景）：绕过驱动的后端搬移让缓存陈旧——reader 必须像
+/// delete 一样自愈（失效 + 重扫 + 重试恰一次），而不是 NotFound 到进程
+/// 重启（审查 M2 红②；mock.rename_path = 外部竞态窗的桩面）。
+#[tokio::test]
+async fn reader_stale_cache_path_corrects_via_rescan_and_retry() {
+    let (mock, driver) = setup().await;
+    let content = pattern_bytes(500);
+    mock.seed_file_bytes(&format!("{MOCK_ROOT}/a.txt"), &content, 1757311000);
+
+    let entry = driver
+        .stat(&RelPath::new("a.txt").expect("rel"))
+        .await
+        .expect("stat 播种（缓存填充）");
+    // 后端侧搬移（驱动不知情）——缓存条目自此陈旧。
+    mock.rename_path(&format!("{MOCK_ROOT}/a.txt"), &format!("{MOCK_ROOT}/b.txt"));
+
+    let stream = driver
+        .reader(&entry.id, None)
+        .await
+        .expect("陈旧缓存经纠偏（失效+重扫+重试）后读通");
+    assert_eq!(read_all(stream).await, content);
+}
+
+/// delete 纠偏腿的外部搬移形态（既有测试走 driver.rename——M2 修复后缓存
+/// 即时改写、不再撞 -9；本腿用外部搬移保住纠偏语义的钉测）。
+#[tokio::test]
+async fn delete_stale_cache_path_corrects_after_external_move() {
+    let (mock, driver) = setup().await;
+    mock.seed_file(&format!("{MOCK_ROOT}/x.txt"), 10, 1757311000);
+    let listing = driver
+        .list(&RelPath::root(), Page::all())
+        .await
+        .expect("list");
+    let id = listing
+        .entries
+        .iter()
+        .find(|e| e.path.as_str() == "x.txt")
+        .expect("条目可见")
+        .id
+        .clone();
+    mock.rename_path(&format!("{MOCK_ROOT}/x.txt"), &format!("{MOCK_ROOT}/y.txt"));
+
+    driver.delete(&id).await.expect("陈旧缓存经纠偏后删除成功");
+    let err = driver
+        .stat(&RelPath::new("y.txt").expect("rel"))
+        .await
+        .expect_err("新路径必须 NotFound");
+    assert_eq!(err, StorageError::NotFound);
+}
+
+// ----------------------- H1（2026-09-25）：list 分页截断与拉齐 -----------------
+
+/// H1 真机定谳后的桩真形钉测：无参 list 默认页 1000 静默截断（探针实测
+/// 1010 播种裸查恰 1000）。驱动必须按「start+limit 成对窗口」方言逐页
+/// 拉齐。红：修复前 api::list 单次调用 → 驱动只见 1000。
+#[tokio::test]
+async fn list_pulls_all_pages_beyond_the_backend_default_page() {
+    let (mock, driver) = setup().await;
+    for i in 0..1005u32 {
+        mock.seed_file(&format!("{MOCK_ROOT}/p{i:04}.bin"), 1, 1757311000);
+    }
+
+    let listing = driver
+        .list(&RelPath::root(), Page::all())
+        .await
+        .expect("list");
+
+    assert_eq!(
+        listing.entries.len(),
+        1005,
+        "全量可见——分页拉齐修复前静默截断在 1000"
+    );
+}
+
+/// 分页方言钉测：驱动发出的 list 请求必带成对 start/limit（首页 0/1000，
+/// 续页按页长推进）——防止回退到「裸 list」形态（后端默认页截断的根源）。
+#[tokio::test]
+async fn list_requests_carry_paired_start_limit_windows() {
+    let (mock, driver) = setup().await;
+    for i in 0..1005u32 {
+        mock.seed_file(&format!("{MOCK_ROOT}/w{i:04}.bin"), 1, 1757311000);
+    }
+    let _ = driver
+        .list(&RelPath::root(), Page::all())
+        .await
+        .expect("list");
+
+    let recorded = mock.recorded();
+    let reqs = filter_recorded(&recorded, "GET", XPAN_FILE, &["method=list"]);
+    assert!(reqs.len() >= 2, "两页拉齐：{reqs:?}");
+    let first = query_pairs(reqs[0]);
+    assert!(
+        first.contains(&("start".to_string(), "0".to_string()))
+            && first.contains(&("limit".to_string(), "1000".to_string())),
+        "首页窗口 start=0&limit=1000：{first:?}"
+    );
+    let second = query_pairs(reqs[1]);
+    assert!(
+        second.contains(&("start".to_string(), "1000".to_string())),
+        "续页 start 按页长推进：{second:?}"
+    );
 }

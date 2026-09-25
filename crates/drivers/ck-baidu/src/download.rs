@@ -44,6 +44,11 @@ use crate::api;
 use crate::client::BaiduClient;
 use crate::upload::CHUNK;
 
+/// dlink 缓存容量上界（审查 M3，2026-09-25；pan115 K73 M-S5 同型缺口的
+/// baidu 镜像）：超容**先清过期，仍满全清**（HandleCache 同款取舍——
+/// 条目廉价可重取（一次 download 签发），LRU 簿记不抵复杂度）。
+const DLINK_CACHE_CAP: usize = 1024;
+
 /// dlink 缓存（fs_id → (url, expires_at)；driver 与流任务经 Arc 共享）。
 pub(crate) struct DlinkCache {
     map: Mutex<HashMap<String, (String, Instant)>>,
@@ -70,13 +75,19 @@ impl DlinkCache {
         None
     }
 
-    /// 写缓存（TTL 从 now 起算）。
+    /// 写缓存（TTL 从 now 起算）。超容治理（审查 M3）：先剔除过期项
+    /// （它们本就不可复用），仍满则全清——新条目随后照常进入。
     fn insert(&self, fs_id: &str, url: &str) {
         let expires = Instant::now() + self.ttl;
-        self.map
-            .lock()
-            .unwrap()
-            .insert(fs_id.to_string(), (url.to_string(), expires));
+        let mut map = self.map.lock().unwrap();
+        if map.len() >= DLINK_CACHE_CAP && !map.contains_key(fs_id) {
+            let now = Instant::now();
+            map.retain(|_, (_, exp)| *exp > now);
+            if map.len() >= DLINK_CACHE_CAP {
+                map.clear();
+            }
+        }
+        map.insert(fs_id.to_string(), (url.to_string(), expires));
     }
 }
 
@@ -255,5 +266,27 @@ impl Stream for ReceiverStream {
         cx: &mut std::task::Context<'_>,
     ) -> std::task::Poll<Option<Self::Item>> {
         self.rx.poll_recv(cx)
+    }
+}
+
+#[cfg(test)]
+mod dlink_cache_tests {
+    use super::*;
+
+    /// 审查 M3（2026-09-25）：dlink 缓存必须有容量上界——修复前 HashMap
+    /// 无界，TTL 仅在同键 get 时惰性剔除，长驻进程每读一个新文件驻留
+    /// 一条、永不清除（pan115 K73 M-S5 同型缺口）。红：CAP+1 个不同
+    /// fs_id 插入后 len 超界。
+    #[test]
+    fn insert_is_bounded_by_the_capacity() {
+        let cache = DlinkCache::new(Duration::from_secs(60));
+        for i in 0..=DLINK_CACHE_CAP {
+            cache.insert(&format!("fs-{i}"), "https://dlink.example/x");
+        }
+        let len = cache.map.lock().unwrap().len();
+        assert!(
+            len <= DLINK_CACHE_CAP,
+            "the dlink cache must stay bounded: len={len} > cap={DLINK_CACHE_CAP}"
+        );
     }
 }
