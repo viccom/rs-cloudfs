@@ -315,3 +315,26 @@ async fn connect_accepts_a_directory_volume_root() {
         .unwrap_or_else(|e| panic!("a directory volume root must connect: {e:?}"));
     assert!(stub.auth_success_count() >= 1);
 }
+
+/// 场景 3（存在但不可读，复审 D）：stat 只需路径可穿越照样通过——
+/// 列目录被拒的根必须在装配期拒绝（挂上去也是个读不出的死卷）。
+#[tokio::test]
+async fn connect_rejects_an_unlistable_volume_root() {
+    use russh_sftp::protocol::StatusCode;
+
+    let stub = stub_with_password().await;
+    stub.add_dir("/secret-root");
+    stub.fail_next_opendir(StatusCode::PermissionDenied);
+    let transport = transport_for(&rooted_pairs(&stub, "/secret-root"));
+    match transport.connect().await {
+        Err(StorageError::Unavailable(msg)) => {
+            assert!(
+                msg.contains("/secret-root") && msg.contains("listed"),
+                "the refusal names the root and the shape: {msg}"
+            );
+        }
+        other => panic!("an unlistable root must be refused, got {other:?}"),
+    }
+    // 认证与 stat 都已通过——失败发生在可读性校验（场景 3 的诊断面）。
+    assert_eq!(stub.auth_success_count(), 1);
+}

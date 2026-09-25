@@ -123,7 +123,22 @@ impl CloudTransport for SftpTransport {
     async fn connect(&self) -> Result<(), StorageError> {
         let root = self.driver.client().params().root.clone();
         match self.driver.client().metadata(&root).await {
-            Ok(attrs) if attrs.is_dir() => Ok(()),
+            Ok(attrs) if attrs.is_dir() => {
+                // 场景 3（可读性，复审 D 补强）：stat 只需路径可穿越——
+                // 不可列目录的根同样拒绝（挂上去是个读不出的死卷）；
+                // 一次 read_dir 零副作用，与首个 list 同价。
+                self.driver
+                    .client()
+                    .read_dir(&root)
+                    .await
+                    .map(|_| ())
+                    .map_err(|error| {
+                        StorageError::Unavailable(format!(
+                            "the sftp volume root {root} cannot be listed: {error} — the \
+                             volume needs read access to its root directory"
+                        ))
+                    })
+            }
             Ok(_) => Err(StorageError::Unavailable(format!(
                 "the sftp volume root {root} is not a directory — point sftp_root at a \
                  directory on the server"

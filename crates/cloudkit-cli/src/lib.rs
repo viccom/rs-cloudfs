@@ -5715,9 +5715,17 @@ async fn build_webdav_transport(cfg: &CyDriveConfig) -> Result<BackendTransport>
     let driver = ck_webdav::factory(&params)
         .await
         .map_err(|error| anyhow::anyhow!("initialising the webdav backend: {error}"))?;
-    Ok(BackendTransport::Webdav(Arc::new(
-        ck_webdav::WebdavTransport::new(driver),
-    )))
+    let transport = ck_webdav::WebdavTransport::new(driver);
+    // 复审推广（2026-09-25，负责人裁定「带病挂载」清剿）：装配期
+    // connect 门 = OPTIONS（传输 + D1 认证协商）+ 共享根 PROPFIND——
+    // 服务器不可达/URL 指错在这里拒绝装配（不挂载），connect 错误自带
+    // 可行动文案。D6「factory 离线构造」语义不变；装配后的首个网络
+    // 动作就是这道门（sftp 判例同型）。
+    transport
+        .connect()
+        .await
+        .map_err(|error| anyhow::anyhow!("the webdav volume is not usable: {error}"))?;
+    Ok(BackendTransport::Webdav(Arc::new(transport)))
 }
 
 /// The unified multi-volume backend dispatch (RV2 extraction shared by

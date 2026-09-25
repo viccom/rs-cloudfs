@@ -228,6 +228,26 @@ impl Pan123Driver {
             ));
         }
         driver.volume = VolumeId::new("pan123", &info.uid.to_string())?;
+        // 复审推广（2026-09-25，负责人裁定「带病挂载」清剿）：装配根
+        // 探测——root 是目录 FileId（id 非路径形态，配错无法自愈建出）；
+        // 装配期一次 file/info 以可行动错误拒绝之（Ok(None) = 账号内
+        // 不存在 / Err = 不可达；sftp/webdav connect 门同型）。
+        // "0" = 网盘根（虚拟容器，恒在）不探；非数字根同样在此拒绝。
+        let root_id: i64 = driver.params().root.trim().parse().unwrap_or(-1);
+        if root_id != 0 {
+            let refusal = |detail: String| {
+                StorageError::Unavailable(format!(
+                    "the pan123 root directory id {} is not usable: {detail} — set pan123_root \
+                     to an existing directory FileId (0 = the drive root)",
+                    driver.params().root
+                ))
+            };
+            match driver.client.file_info(root_id).await {
+                Ok(Some(_)) => {}
+                Ok(None) => return Err(refusal("the account has no such directory".to_string())),
+                Err(error) => return Err(refusal(error.to_string())),
+            }
+        }
         Ok(driver)
     }
 

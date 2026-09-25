@@ -634,6 +634,79 @@ async fn transport_connect_accepts_good_credentials_through_digest() {
     );
 }
 
+// ------------------------------------------------ 共享根校验门（复审）---
+
+/// 复审推广（2026-09-25，负责人裁定「带病挂载」全驱动清剿）：connect
+/// 的第二腿 = 共享根 PROPFIND Depth 0。服务器活着（OPTIONS 照答——
+/// rclone CORS 形态）但 URL 指错 → 404 必须以**可行动**错误拒绝（指名
+/// webdav_url 与 base），绝不带病挂载后逐操作 not found（sftp 报障
+/// 同型）。
+#[tokio::test]
+async fn transport_connect_rejects_a_missing_share_root_with_actionable_text() {
+    let handle = spawn_stub(
+        seeded_root(),
+        AuthMode::None,
+        Knobs::default(),
+        StubStyle::rclone(),
+    )
+    .await;
+    // 基地址指向桩上不存在的子路径：OPTIONS 路径无关照答 200，根
+    // PROPFIND 404 才是被测判据。
+    let url = format!("{}no-such-share/", handle.url);
+    let driver = WebdavDriver::new(params(&url, &[])).expect("driver");
+    let transport = WebdavTransport::new(std::sync::Arc::new(driver));
+    match transport.connect().await {
+        Err(StorageError::Unavailable(msg)) => {
+            assert!(
+                msg.contains("no-such-share") && msg.contains("webdav_url"),
+                "the refusal names the share and the config key: {msg}"
+            );
+        }
+        other => panic!("a missing share root must be an actionable Unavailable, got {other:?}"),
+    }
+    // OPTIONS 腿确实跑过（传输面先通、根校验后拒——两腿次序）。
+    assert!(
+        count(&handle.requests(), "OPTIONS").count() >= 1,
+        "leg 1 (OPTIONS) ran before the root check"
+    );
+    handle.shutdown().await;
+}
+
+/// 好形态对照：集合共享根（尾斜杠 base）→ connect Ok；顺带承接原
+/// dispatch 离线装配钉的 WD2b 能力位镜像（D6 钉推翻后迁此——transport
+/// capabilities = StorageDriver 位 + remote_delete）。
+#[tokio::test]
+async fn transport_connect_accepts_a_collection_share_root() {
+    let handle = spawn_stub(
+        seeded_root(),
+        AuthMode::None,
+        Knobs::default(),
+        StubStyle::rclone(),
+    )
+    .await;
+    let driver = WebdavDriver::new(params(&handle.url, &[])).expect("driver");
+    let transport = WebdavTransport::new(std::sync::Arc::new(driver));
+    transport
+        .connect()
+        .await
+        .expect("a live collection share root connects");
+    let caps = transport.capabilities();
+    assert!(
+        caps.range_read
+            && caps.server_side_move
+            && caps.authoritative_index
+            && caps.remote_delete
+            && !caps.resume
+            && !caps.multipart
+            && !caps.change_feed
+            && !caps.inbound
+            && !caps.chat
+            && !caps.rapid_upload,
+        "WD2b: the transport face mirrors the StorageDriver capability bits (got {caps:?})"
+    );
+    handle.shutdown().await;
+}
+
 // ------------------------------------------------------- doctor 探活 ---
 
 /// WD4：[`ck_webdav::probe`] 的行为面（doctor 五态的网络腿——判定文案

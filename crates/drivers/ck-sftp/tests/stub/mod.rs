@@ -122,6 +122,9 @@ struct VfsState {
     /// 注入面**——driver.stat 的非根路径自 K67 起实现为
     /// symlink_metadata，注入必须打在真实动词上；M3 独立性测试同用。
     fail_next_lstat: Option<StatusCode>,
+    /// 一次性 opendir 故障注入（复审 D）：**connect 可读性校验腿的
+    /// 构造面**——场景 3（根存在、stat 通过、列目录被拒）。
+    fail_next_opendir: Option<StatusCode>,
     /// 竞态注入（rename 撞车测试的注入面）：集合内的路径对 stat/
     /// lstat 请求隐身（NoSuchFile），在下一个 rename 请求到达时
     /// 现形——回放「驱动预检放行、执行撞已存在目标」的交错。
@@ -147,6 +150,7 @@ impl VfsState {
             mtime_tick: 0,
             fail_next_stat: None,
             fail_next_lstat: None,
+            fail_next_opendir: None,
             hidden: BTreeSet::new(),
             shrink_next_close: None,
             fail_next_write: false,
@@ -661,6 +665,11 @@ impl russh_sftp::server::Handler for SftpHandler {
 
     async fn opendir(&mut self, id: u32, path: String) -> Result<Handle, Self::Error> {
         let mut vfs = lock_vfs!(self);
+        // 复审 D 注入面：一次性 opendir 故障——connect 可读性校验腿
+        //（场景 3）的构造面，消费即清。
+        if let Some(code) = vfs.fail_next_opendir.take() {
+            return Err(code);
+        }
         // OpenSSH 语义：opendir 的路径解析**跟随**链接（symlink 根、
         // 或任何直指目录的链接都能打开）——「不下潜卷内链接」由驱动
         // 侧 lstat 预检保证（list(link) 在预检处 Invalid，桩对齐真机
@@ -1074,6 +1083,13 @@ impl Stub {
     /// 注入必须打在驱动实际发出的动词上。
     pub fn fail_next_lstat(&self, code: StatusCode) {
         self.lock_vfs().fail_next_lstat = Some(code);
+    }
+
+    /// opendir 故障注入（复审 D）：下一个 opendir 直接以 `code` 失败
+    ///（消费即清）——connect 可读性校验腿的构造面（场景 3：stat 通过、
+    /// 列目录被拒）。
+    pub fn fail_next_opendir(&self, code: StatusCode) {
+        self.lock_vfs().fail_next_opendir = Some(code);
     }
 
     /// H1 注入面：下一次可写 close 落盘时，句柄路径以 `path_prefix`

@@ -241,6 +241,20 @@ impl Pan115Driver {
             .filter(|s| !s.is_empty() && s != "null")
             .ok_or_else(|| StorageError::Unavailable("user/info: user_id missing".to_string()))?;
         driver.volume = VolumeId::new("pan115", &uid)?;
+        // 复审推广（2026-09-25，负责人裁定「带病挂载」清剿）：装配根
+        // 探测——root 是账号内分类 cid，配错即「死卷」（路径↔cid 永远
+        // 解析失败，且 id 非路径形态无法自愈建出）；装配期一次
+        // get_info 以可行动错误拒绝之（sftp/webdav connect 门同型）。
+        // "0" = 网盘根（虚拟容器，恒在）不探。
+        let root_cid = driver.root_cid().to_string();
+        if root_cid != "0" {
+            if let Err(error) = driver.client.get_info(&root_cid).await {
+                return Err(StorageError::Unavailable(format!(
+                    "the pan115 root category {root_cid} is not accessible: {error} — set \
+                     pan115_root to an existing category id (0 = the drive root)"
+                )));
+            }
+        }
         Ok(driver)
     }
 

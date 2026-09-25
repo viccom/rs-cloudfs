@@ -1114,3 +1114,54 @@ async fn root_parameter_scopes_the_whole_volume() {
         "{err:?}"
     );
 }
+
+// --------------------------------------------- 装配根探测（复审推广）---
+
+/// 复审推广（2026-09-25，负责人裁定「带病挂载」清剿）：connect 在 uid
+/// 之后校验**非零**根 cid 可达——配错 cid = 死卷（路径↔cid 永远解析
+/// 失败，且 id 非路径形态无法自愈建出），装配期以可行动错误拒绝
+///（sftp/webdav connect 门同型）。
+#[tokio::test]
+async fn connect_rejects_an_unknown_root_cid() {
+    let mock = Mock::start(Vfs::new()).await;
+    let params = Pan115Params {
+        client_id: "100197303".to_string(),
+        access_token: Some("mock-access".to_string()),
+        refresh_token: Some("mock-refresh".to_string()),
+        root: "999999".to_string(), // 账号里不存在
+        api_base: mock.base.clone(),
+        passport_base: mock.base.clone(),
+        token_store: None,
+        limiter: Some(LimiterConfig::fast()),
+        sessions_dir: None,
+    };
+    let err = Pan115Driver::connect(params)
+        .await
+        .err()
+        .expect("an unknown root cid must refuse the assembly");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("999999") && msg.contains("pan115_root"),
+        "the refusal names the cid and the config key: {msg}"
+    );
+}
+
+/// 对照腿：默认根 "0"（网盘根，虚拟容器恒在）不探——connect 照常成功。
+#[tokio::test]
+async fn connect_accepts_the_default_drive_root() {
+    let mock = Mock::start(Vfs::new()).await;
+    let params = Pan115Params {
+        client_id: "100197303".to_string(),
+        access_token: Some("mock-access".to_string()),
+        refresh_token: Some("mock-refresh".to_string()),
+        root: "0".to_string(),
+        api_base: mock.base.clone(),
+        passport_base: mock.base.clone(),
+        token_store: None,
+        limiter: Some(LimiterConfig::fast()),
+        sessions_dir: None,
+    };
+    Pan115Driver::connect(params)
+        .await
+        .expect("the drive root (0) assembles without a probe");
+}

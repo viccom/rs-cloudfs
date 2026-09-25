@@ -704,3 +704,49 @@ async fn rename_mod_pid_with_a_non_numeric_root_fails_instead_of_moving_to_root(
         "nothing moved into the netdisk root"
     );
 }
+
+// --------------------------------------------- 装配根探测（复审推广）---
+
+/// 复审推广（2026-09-25，负责人裁定「带病挂载」清剿）：connect 在 uid
+/// 之后校验**非零**根 FileId 存在——配错 id = 死卷（id 非路径形态无法
+/// 自愈建出），装配期以可行动错误拒绝（sftp/webdav connect 门同型）。
+#[tokio::test]
+async fn connect_rejects_an_unknown_root_file_id() {
+    let s = stub().await;
+    let params = Pan123Params {
+        token: Some("stub-token-0123456789".to_string()),
+        api_base: s.base.clone(),
+        fallback_base: s.base.clone(),
+        root: "999999".to_string(), // 账号里不存在
+        limiter: Some(ck_pan123::limiter::LimiterConfig::fast()),
+        retry: Some(ck_pan123::api::RetryConfig::fast()),
+        ..Pan123Params::default()
+    };
+    let err = Pan123Driver::connect(params)
+        .await
+        .err()
+        .expect("an unknown root FileId must refuse the assembly");
+    let msg = format!("{err}");
+    assert!(
+        msg.contains("999999") && msg.contains("pan123_root"),
+        "the refusal names the id and the config key: {msg}"
+    );
+}
+
+/// 对照腿：默认根 "0"（网盘根，虚拟容器恒在）不探——connect 照常成功。
+#[tokio::test]
+async fn connect_accepts_the_default_drive_root() {
+    let s = stub().await;
+    let params = Pan123Params {
+        token: Some("stub-token-0123456789".to_string()),
+        api_base: s.base.clone(),
+        fallback_base: s.base.clone(),
+        root: "0".to_string(),
+        limiter: Some(ck_pan123::limiter::LimiterConfig::fast()),
+        retry: Some(ck_pan123::api::RetryConfig::fast()),
+        ..Pan123Params::default()
+    };
+    Pan123Driver::connect(params)
+        .await
+        .expect("the drive root (0) assembles without a probe");
+}

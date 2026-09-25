@@ -28,7 +28,6 @@ use cloudkit_cli::{
 // Driver-gated enum pins (FT2 / FT3 / SF3): the `Baidu` / `Local` /
 // `Sftp` arm type-assertion tests are the only users of the enum name.
 #[cfg(any(feature = "baidu", feature = "local", feature = "sftp"))]
-use cloudkit_cli::BackendTransport;
 // Baidu-gated surface (FT2): the mock backend, the injected dispatch
 // seam and the driver trait only exist with the `baidu` feature.
 // Router is shared by the pan115/pan123 mocks below (123-5：pan123-only
@@ -167,6 +166,7 @@ fn sftp_config() -> CyDriveConfig {
 #[cfg(feature = "baidu")]
 #[tokio::test]
 async fn baidu_key_builds_baidu_transport() {
+    use cloudkit_cli::BackendTransport;
     let (addr, _calls) = spawn_mock_baidu(false).await;
     let dispatched = build_backend_transport_with(
         &baidu_config(),
@@ -211,6 +211,7 @@ async fn baidu_key_builds_baidu_transport() {
 #[cfg(feature = "local")]
 #[tokio::test]
 async fn local_key_builds_local_transport() {
+    use cloudkit_cli::BackendTransport;
     let dir = tempfile::tempdir().expect("temp dir");
     let dispatched = build_backend_transport(&local_config(dir.path()))
         .await
@@ -686,6 +687,7 @@ async fn missing_pan115_driver_refuses_with_the_rebuild_message() {
 #[cfg(feature = "pan115")]
 #[tokio::test]
 async fn pan115_key_builds_pan115_transport_with_the_account_identity() {
+    use cloudkit_cli::BackendTransport;
     let cfg = pan115_config();
     cfg.validate().expect("the test config validates");
     let base = pan115_user_info_mock().await;
@@ -923,12 +925,13 @@ async fn pan123_dead_probe(base: &str) -> ck_pan123::Pan123Probe {
 // tests). The volume identity mirrors the WD1a driver:
 // `webdav:<user>@<normalized-base-url>`.
 
-/// A validate-clean webdav config (anonymous would also do — the pair
-/// shape exercises the identity's user segment).
+/// A validate-clean webdav config pointed at a deterministically dead
+/// loopback port (`127.0.0.1:1` — instant refusal, no DNS shapes): the
+/// connect gate's refusal leg exercises without gambling on resolution.
 fn webdav_config() -> CyDriveConfig {
     CyDriveConfig {
         backend: Backend::Webdav,
-        webdav_url: Some("https://nas.lan:5006/dav".to_string()),
+        webdav_url: Some("http://127.0.0.1:1/dav".to_string()),
         webdav_username: Some("spike".to_string()),
         webdav_password: Some("pw".to_string()),
         ..CyDriveConfig::default()
@@ -950,47 +953,27 @@ async fn missing_webdav_driver_refuses_with_the_rebuild_message() {
     );
 }
 
-/// With the driver: the dispatch assembles the WebdavTransport offline
-/// (D6 — no server, no network), the volume identity is
-/// `webdav:<user>@<base-url>` with the trailing slash the WD1a config
-/// layer normalises in, the capability face mirrors the StorageDriver
-/// bits (WD2b wiring — range_read/server_side_move/authoritative_index/
-/// remote_delete true, resume/multipart false), and the sync
-/// namespace is the raw volume id (the pan115/pan123 shape).
+/// With the driver: `backend = "webdav"` now runs the **connect gate** at
+/// assembly (2026-09-25 owner ruling — same supersession as the sftp D3
+/// pin: a dead server or a wrong share URL must fail the boot with an
+/// actionable message, never mount and fail per-op; the D6 offline pin
+/// this test used to carry is superseded — the identity shape stays
+/// pinned by the combo file's offline sync-namespace derivation, and the
+/// WD2b capability bits moved to ck-webdav's connect suite). The dead
+/// loopback port refuses deterministically and the gate names the volume.
 #[cfg(feature = "webdav")]
 #[tokio::test]
-async fn webdav_key_builds_webdav_transport_offline() {
-    use cloudkit_cli::BackendTransport;
+async fn webdav_key_assembly_runs_the_connect_gate() {
     let cfg = webdav_config();
     cfg.validate().expect("the test config validates");
-    let dispatched = build_backend_transport(&cfg)
+    let err = build_backend_transport(&cfg)
         .await
-        .expect("the webdav arm assembles offline (D6 lazy connect)");
-    assert!(matches!(dispatched, BackendTransport::Webdav(_)));
-    assert_eq!(
-        dispatched.volume(),
-        "webdav:spike@https://nas.lan:5006/dav/",
-        "the identity is <user>@<normalized-base-url>"
-    );
-    let caps = dispatched.caps();
+        .err()
+        .expect("the webdav arm refuses when the share is unreachable");
+    let message = err.to_string();
     assert!(
-        caps.range_read
-            && caps.server_side_move
-            && caps.authoritative_index
-            && caps.remote_delete
-            && !caps.resume
-            && !caps.multipart
-            && !caps.change_feed
-            && !caps.inbound
-            && !caps.chat
-            && !caps.rapid_upload,
-        "WD2b: the transport face mirrors the StorageDriver capability bits \
-         (got {caps:?})"
-    );
-    assert_eq!(
-        dispatched.sync_namespace_key(),
-        "webdav:spike@https://nas.lan:5006/dav/",
-        "the sync namespace is the raw volume id (the pan115/pan123 shape)"
+        message.contains("the webdav volume is not usable"),
+        "the connect gate names the failure: {message}"
     );
 }
 

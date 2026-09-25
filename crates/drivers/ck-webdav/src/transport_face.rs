@@ -41,7 +41,7 @@ use cloudkit_storage::transport::{
 };
 use cloudkit_storage::vpath::RelPath as VPath;
 use cloudkit_storage::{
-    Capabilities, EntryId, Range, RelPath, StorageDriver, UploadStager, WriteHint,
+    Capabilities, EntryId, EntryKind, Range, RelPath, StorageDriver, UploadStager, WriteHint,
 };
 
 use crate::driver::WebdavDriver;
@@ -124,17 +124,35 @@ impl WebdavTransport {
 
 #[async_trait]
 impl CloudTransport for WebdavTransport {
-    /// 探活：OPTIONS 一轮（**真连接检查**——认证协商也在这里发生：401
+    /// 探活 = 两腿（复审 2026-09-25 推广，sftp connect 判例同型）：
+    /// ① OPTIONS 一轮（**真连接检查**——认证协商也在这里发生：401
     /// 协商/凭据被拒/NTLM 拒绝以 `Unauthorized` 浮现，connect 拒绝/超时
-    /// 以 `Unavailable` 浮现；OPTIONS 在重试白名单内，传输毛刺自愈）。
+    /// 以 `Unavailable` 浮现；OPTIONS 在重试白名单内，传输毛刺自愈）；
+    /// ② **共享根校验**（PROPFIND Depth 0）——服务器活着但 URL 指错
+    ///（404）/非集合形态以可行动错误拒绝，装配期的 connect 门据此
+    /// 拒绝挂载（「带病挂载」形态：修前服务器死/URL 错都照常挂载）。
     /// 外层 deadline 见模块文档。
     async fn connect(&self) -> Result<(), StorageError> {
         match tokio::time::timeout(CONNECT_PROBE_DEADLINE, self.driver.client().options()).await {
-            Ok(result) => result,
-            Err(_) => Err(StorageError::Unavailable(format!(
-                "webdav connect probe exceeded its {}s deadline",
-                CONNECT_PROBE_DEADLINE.as_secs()
+            Ok(result) => result?,
+            Err(_) => {
+                return Err(StorageError::Unavailable(format!(
+                    "webdav connect probe exceeded its {}s deadline",
+                    CONNECT_PROBE_DEADLINE.as_secs()
+                )))
+            }
+        };
+        let base = self.driver.client().base().clone();
+        match StorageDriver::stat(self.driver.as_ref(), &RelPath::root()).await {
+            Ok(entry) if entry.kind == EntryKind::Dir => Ok(()),
+            Ok(_) => Err(StorageError::Unavailable(format!(
+                "the webdav share at {base} is not a collection — webdav_url must point at a \
+                 directory share"
             ))),
+            Err(StorageError::NotFound) => Err(StorageError::Unavailable(format!(
+                "the webdav share at {base} does not exist — fix webdav_url in the volume file"
+            ))),
+            Err(other) => Err(other),
         }
     }
 
