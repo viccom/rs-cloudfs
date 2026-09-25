@@ -1,0 +1,7 @@
+# winfsp-sys (bindgen) needs libclang. Since K89 (2026-09-25) the winfsp
+# feature is in cloudkit-cli's `default`, so EVERY default build on this
+# machine compiles winfsp-sys and needs the path to the pip-packaged
+# clang below. Linux/macOS never resolve winfsp-sys (cfg(windows)
+# target-gated) and simply ignore the variable.
+[env]
+LIBCLANG_PATH = "D:/Python312/Lib/site-packages/clang/native"

@@ -23,7 +23,7 @@ path = "src/main.rs"
 # that refuses that driver's surfaces at runtime with the actionable
 # rebuild message (K31).
 [features]
-default = ["telegram", "baidu", "local", "sftp", "pan115", "pan123", "webdav"]
+default = ["telegram", "baidu", "local", "sftp", "pan115", "pan123", "webdav", "winfsp"]
 telegram = ["dep:ck-telegram"]
 baidu = ["dep:ck-baidu"]
 local = ["dep:ck-local"]
@@ -31,12 +31,16 @@ sftp = ["dep:ck-sftp"]
 pan115 = ["dep:ck-pan115"]
 pan123 = ["dep:ck-pan123"]
 webdav = ["dep:ck-webdav"]
-# WinFsp mount backend (Phase 3, K38/K40): OFF by default and it must
-# stay out of `default` — enabling it pulls the GPL-3.0 winfsp-rs
-# bindings into the graph, and the release artifacts must stay GPL-free.
-# WF4 wires the actual `mount_backend = "winfsp"` dispatch; WF1 lands the
-# dependency edge, the feature forwarding, and build.rs' delay-load link
-# args (the shipped exe is the artifact that needs them).
+# WinFsp mount backend (Phase 3, K38/K40): **default-on since K89
+# (2026-09-25, owner decision)** — the shipped binary now matches the
+# runtime's `mount_backend = "winfsp"` default (K87) out of the box.
+# The feature pulls the GPL-3.0 winfsp-rs bindings into the graph: the
+# default binary is no longer GPL-free (private, self-hosted
+# distribution), while `--no-default-features` builds (K30 driver
+# pruning, the CI `none` leg) keep a winfsp-free graph. WF4 wires the
+# actual `mount_backend = "winfsp"` dispatch; WF1 landed the dependency
+# edge, the feature forwarding, and build.rs' delay-load link args (the
+# shipped exe is the artifact that needs them).
 winfsp = ["dep:cloudkit-winfsp", "cloudkit-winfsp/winfsp"]
 
 [dependencies]

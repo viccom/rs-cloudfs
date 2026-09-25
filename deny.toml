@@ -7,33 +7,24 @@
 # (keyring windows-native / sync-secret-service, winreg, ...) are covered.
 all-features = true
 
-# K38 license isolation (docs/plans/2026-09-10-phase3-winfsp.md §1): the
-# `winfsp` feature is off by default, but `all-features = true` above
-# means this check would otherwise drag the GPL-3.0 winfsp-rs bindings
-# into the graph. The two crates are excluded from the *license* graph by
-# name — deliberately both, so the exclusion is exactly as wide as the
-# GPL edge: winfsp (the bindings) and winfsp-sys (bindgen output + the
-# vendored DLL import lib). Everything they pull in (bytemuck,
-# parking_lot, paste, static_assertions, widestring, windows) stays in
-# the graph and is checked as usual; nothing else is exempted, so the
-# default tree remains MIT-only. The mechanical half of the isolation —
-# "the default feature graph contains no winfsp at all" — lives in CI
-# (.github/workflows/ci.yml, the `cargo tree --prefix none --format
-# "{lib}"` step), because a dependency edge of an *enabled* feature is
-# not something cargo-deny can assert.
-#
-# Scope note (review cross-L7, RB4): a `[graph] exclude` entry removes
-# the named crates from EVERY cargo-deny check, not only licenses —
-# advisories and bans too. That is the deliberate K38 trade: both crates
-# are feature-gated (`winfsp`, default off) out of every shipped graph —
-# the default build, the driver-pruned builds (K30) and CI's default
-# target — so nothing they could flag reaches a shipped binary;
-# winfsp-sys is bindgen output plus a vendored DLL import lib with no
-# independent source/advisory feed of its own; and the compensating
-# controls are the CI `cargo tree` assertion above plus the winfsp leg's
-# own test suite, which compile and exercise exactly the excluded
-# subtree. Any future crate added to this list needs the same statement
-# of edge, reachability and compensation.
+# K38 → K89 evolution (docs/plans/2026-09-10-phase3-winfsp.md §1;
+# docs/decisions.md K89, 2026-09-25): K38 kept the `winfsp` feature off
+# by default so the default binary stayed GPL-free. Since K89 (owner
+# decision) the feature is IN cloudkit-cli's default — the shipped
+# Windows binary deliberately links the GPL-3.0 winfsp-rs bindings
+# (private, self-hosted distribution). The name-based exclusion below
+# therefore no longer models "GPL never ships"; it keeps the two
+# bindgen/vendored crates out of cargo-deny's license/ban/advisory
+# graphs so `all-features = true` stays usable and the strong-copyleft
+# allow-list policy for everything ELSE is preserved. Both crates are
+# still excluded from the driver-pruned graphs (K30) and from every
+# Linux/macOS target (cfg(windows) gate); the compensating control is
+# cloudkit-winfsp's own test suite, which now runs in the main CI
+# Windows leg and compiles/exercises exactly the excluded subtree. The
+# old mechanical CI `cargo tree` isolation assertion was inverted with
+# K89 (the default graph must KEEP winfsp). Any future crate added to
+# this list needs the same statement of edge, reachability and
+# compensation.
 exclude = ["winfsp", "winfsp-sys"]
 
 [licenses]
@@ -41,9 +32,12 @@ exclude = ["winfsp", "winfsp-sys"]
 version = 2
 
 # Licenses actually encountered in the dependency tree across BOTH
-# targets (host windows-msvc and x86_64-unknown-linux-gnu). GPL/AGPL/LGPL
-# and other strong-copyleft licenses are intentionally absent: CyDrive
-# ships as MIT and must stay that way. Note the one MPL-2.0 crate
+# targets (host windows-msvc and x86_64-unknown-linux-gnu). Strong
+# copyleft stays out of the allow list on principle: everything checked
+# here keeps the MIT-tree posture. The one GPL exception is handled at
+# the graph level, not here — the GPL-3.0 winfsp/winfsp-sys pair
+# (excluded above since K89 ships them in the default Windows binary)
+# never reaches this check. Note the one MPL-2.0 crate
 # (htmlescape, via keyring) — file-level weak copyleft, fine to
 # redistribute in binary form, MPL-covered files must keep their source
 # available upstream (they are).

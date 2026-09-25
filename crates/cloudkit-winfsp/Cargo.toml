@@ -1,6 +1,6 @@
 [package]
 name = "cloudkit-winfsp"
-description = "WinFsp native-mount adapter over the VFS (L5; the GPL-3.0 bindings are feature-gated, K38)"
+description = "WinFsp native-mount adapter over the VFS (L5; GPL-3.0 bindings behind the `winfsp` feature — default-on in the shipped binary since K89)"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
@@ -8,12 +8,12 @@ license.workspace = true
 [lints]
 workspace = true
 
-# K38 (docs/plans/2026-09-10-phase3-winfsp.md §1): OFF by default. The
-# feature pulls winfsp-rs (GPL-3.0) into the dependency graph, so the
-# default build — and every release artifact that does not opt in — stays
-# GPL-free (deny.toml MIT-only is not weakened). Only
-# `cargo build -p cloudkit-cli --features winfsp` crosses that line, and
-# that artifact is currently private to this repository.
+# K38 originally kept this feature off by default; **K89 (2026-09-25,
+# owner decision) turns it on via cloudkit-cli's `default`** — the GPL
+# line is accepted for the private, self-hosted binary. The feature
+# stays optional so `--no-default-features` builds (K30 driver pruning,
+# the CI `none` leg) keep a winfsp-free graph, and the target gate
+# below keeps every Linux/macOS build winfsp-free regardless.
 [features]
 winfsp = ["dep:winfsp", "dep:windows", "dep:futures-util"]
 

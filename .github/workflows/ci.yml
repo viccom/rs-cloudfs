@@ -61,25 +61,38 @@ jobs:
       # lockfile automatically.
       - uses: Swatinem/rust-cache@v2
 
-      # K38 license-isolation gate (phase 3 plan §1): the winfsp feature
-      # is off by default, so the GPL-3.0 bindings must not be reachable
-      # from the default graph at all. cargo-deny alone cannot assert this
-      # (deny.toml excludes the two crates by name so `all-features` stays
-      # usable), hence the mechanical tree check. `--prefix none --format
-      # "{lib}"` prints the bare library name per line — the default
-      # format also prints the source path, which would match this
-      # repository's own checkout path on a worktree whose directory name
-      # contains "winfsp".
-      - name: winfsp isolation (K38)
+      # K89 (2026-09-25, owner decision): the winfsp mount backend is a
+      # default capability — the shipped binary links the GPL-3.0
+      # winfsp-rs bindings on Windows. This guard is the inverse of the
+      # old K38 isolation check: the default graph must KEEP winfsp, so
+      # a future Cargo.toml edit that silently drops it turns red here.
+      # `--prefix none --format "{lib}"` prints the bare library name
+      # per line — the default format also prints the source path, which
+      # would match this repository's own checkout path on a worktree
+      # whose directory name contains "winfsp".
+      - name: winfsp stays in the default graph (K89)
         shell: bash
         run: |
           set -euo pipefail
-          if cargo tree -p cloudkit-cli --prefix none --format "{lib}" | grep -qi winfsp; then
-            echo "::error::cloudkit-cli's default graph contains winfsp"; exit 1
+          if ! cargo tree -p cloudkit-cli --prefix none --format "{lib}" | grep -qi winfsp; then
+            echo "::error::cloudkit-cli's default graph lost the winfsp mount backend"; exit 1
           fi
-          if cargo tree --workspace --prefix none --format "{lib}" | grep -v '^cloudkit_winfsp$' | grep -qi winfsp; then
-            echo "::error::the GPL winfsp bindings reached the default workspace graph"; exit 1
-          fi
+
+      # winfsp-sys (bindgen) needs libclang; with winfsp in the default
+      # feature set the Windows leg of the full suite compiles it. Linux
+      # legs never resolve the target-gated deps, so the step is
+      # windows-only.
+      - name: libclang for winfsp-sys (bindgen, windows)
+        if: matrix.os == 'windows-latest'
+        shell: pwsh
+        run: |
+          $candidates = @("$env:ProgramFiles\LLVM\bin", "${env:ProgramFiles(x86)}\LLVM\bin")
+          $found = $candidates | Where-Object { Test-Path (Join-Path $_ "libclang.dll") } | Select-Object -First 1
+          if (-not $found) {
+            choco install llvm -y
+            $found = "$env:ProgramFiles\LLVM\bin"
+          }
+          "LIBCLANG_PATH=$found" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
 
       - name: cargo fmt --check
         run: cargo fmt --all --check
@@ -129,65 +142,3 @@ jobs:
       - name: cargo test --workspace --no-default-features
         if: matrix.label == 'none'
         run: cargo test --workspace --no-default-features
-
-  # WinFsp feature leg (Phase 3, K38/K40): the `winfsp` feature is off
-  # everywhere else — the default graph must stay free of the GPL-3.0
-  # bindings — so this is the only place the winfsp-rs code is compiled
-  # and tested. Windows-only by construction: winfsp-sys' build script
-  # panics on any other target, and cloudkit-winfsp's own target gate
-  # makes the feature inert elsewhere anyway.
-  #
-  # NOTE (honesty, same as the file header): this job has NOT been run on
-  # a real runner yet. First-run calibration items:
-  #   - winfsp-sys generates its bindings with bindgen, which needs
-  #     libclang: the step below points LIBCLANG_PATH at the runner's
-  #     LLVM and falls back to `choco install llvm` if a future image
-  #     drops it.
-  #   - the tests must pass WITHOUT WinFsp installed: they never call a
-  #     WinFsp DLL export (see crates/cloudkit-winfsp/tests/metadata.rs).
-  #     If a test fails with exit 0xc06d007e (STATUS_DLL_NOT_FOUND, the
-  #     delay-load stub aborting), something reached the DLL — that is
-  #     the bug to fix, not the runner.
-  #   - delay-load linking means `cargo build` needs only the vendored
-  #     import lib, which ships inside winfsp-sys.
-  winfsp:
-    name: winfsp feature leg (windows)
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          components: clippy
-
-      - uses: Swatinem/rust-cache@v2
-
-      - name: libclang for winfsp-sys (bindgen)
-        shell: pwsh
-        run: |
-          $candidates = @("$env:ProgramFiles\LLVM\bin", "${env:ProgramFiles(x86)}\LLVM\bin")
-          $found = $candidates | Where-Object { Test-Path (Join-Path $_ "libclang.dll") } | Select-Object -First 1
-          if (-not $found) {
-            choco install llvm -y
-            $found = "$env:ProgramFiles\LLVM\bin"
-          }
-          "LIBCLANG_PATH=$found" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
-
-      - name: cargo clippy (-p cloudkit-winfsp --features winfsp)
-        run: cargo clippy -p cloudkit-winfsp --features winfsp --all-targets -- -D warnings
-
-      - name: cargo clippy (-p cloudkit-cli --features winfsp)
-        run: cargo clippy -p cloudkit-cli --features winfsp --all-targets -- -D warnings
-
-      - name: cargo test (-p cloudkit-winfsp --features winfsp)
-        run: cargo test -p cloudkit-winfsp --features winfsp
-
-      # RB3 (cli-M3): the cli crate's own suite against the winfsp leg —
-      # its feature-gated tests (mount_backend's runtime-gate matrix,
-      # doctor_winfsp) previously ran nowhere in CI, only locally.
-      # Same honesty rule as the winfsp crate's leg: they must pass
-      # WITHOUT WinFsp installed (never a DLL call).
-      - name: cargo test (-p cloudkit-cli --features winfsp)
-        run: cargo test -p cloudkit-cli --features winfsp
-
-      - name: cargo build (-p cloudkit-cli --features winfsp)
-        run: cargo build -p cloudkit-cli --features winfsp

@@ -6,6 +6,8 @@ crates/vendor/grammers-session/target/
 # 运行期产物（绝不提交）
 config.toml
 config.json
+# 例外：构建配置不是运行期凭据（上面的裸模式会误伤任意深度同名文件）
+!.cargo/config.toml
 *.session
 *.session-journal
 *.db

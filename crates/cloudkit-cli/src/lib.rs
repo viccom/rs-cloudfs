@@ -7231,14 +7231,12 @@ fn mount_claims_via_webdav(
 /// The WinFsp arm: every claim is mounted in-process through the native
 /// adapter. Each mount runs on the blocking pool (the bring-up and the
 /// readiness poll are synchronous WinFsp calls), and every failure
-/// degrades per volume exactly like the whole-arm fallback: log, print,
-/// then the WebDAV mapping for that claim — except an occupied letter,
-/// where the WebDAV mapping would `net use /delete` whatever holds the
-/// letter, so it is reported and skipped instead.
+/// degrades per volume per K87: log, print, no drive letter — the
+/// volume stays reachable through WebDAV/仪表盘 without any net use
+/// fallback (an occupied letter is reported and skipped, never taken
+/// over).
 #[cfg(all(windows, feature = "winfsp"))]
 async fn mount_claims_via_winfsp(plan: &MountPlan<'_>) -> VolumeMounts {
-    use cloudkit_winfsp::mount::MountError;
-
     let mut mounted = Vec::new();
     let mut handles = WinFspHandles::default();
     for (name, letter) in plan.claims {
