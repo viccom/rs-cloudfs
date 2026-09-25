@@ -210,7 +210,14 @@ enum Command {
     Rebuild,
     /// Diagnose the local installation: config, DB, cache, ports, and
     /// the Windows WebClient registry/service state.
-    Doctor,
+    Doctor {
+        /// Accept and pin the sftp server's host-key fingerprint into
+        /// the named volume file (D2 first-connection wizard: displays
+        /// the server's actual fingerprint, writes only on an explicit
+        /// y — changes to an already-pinned key are never accepted).
+        #[arg(long = "accept-host-key", value_name = "VOLUME")]
+        accept_host_key: Option<String>,
+    },
     /// Interactive first-time configuration wizard (bot token, chat ID,
     /// drive letter); secrets go to the OS credential store, or by
     /// explicit choice into config.toml when no credential store is
@@ -254,7 +261,7 @@ async fn main() -> Result<()> {
         Command::Migrate => migrate_cmd(),
         Command::Stats => stats_cmd(),
         Command::Rebuild => rebuild_cmd().await,
-        Command::Doctor => doctor_cmd().await,
+        Command::Doctor { accept_host_key } => doctor_cmd(accept_host_key).await,
         Command::Setup { multi } => setup_cmd(multi).await,
         Command::Volumes => volumes_cmd(),
     }
@@ -811,7 +818,10 @@ async fn rebuild_cmd() -> Result<()> {
 /// — a `volumes_dir` config runs the multi-volume doctor (process-level
 /// config + ports, then one check group per volume), anything else runs
 /// the frozen single-volume body below unchanged.
-async fn doctor_cmd() -> Result<()> {
+async fn doctor_cmd(accept_host_key: Option<String>) -> Result<()> {
+    if let Some(name) = accept_host_key {
+        return cloudkit_cli::accept_host_key_command(&name).await;
+    }
     let discovered = discover_config_with_volumes();
     if let Ok(DiscoveredConfig::Multi { process, volumes }) = &discovered {
         let mut results = cloudkit_cli::doctor::run_doctor_multi(process, volumes);

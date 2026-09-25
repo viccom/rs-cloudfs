@@ -5485,7 +5485,7 @@ async fn build_local_transport(cfg: &CyDriveConfig) -> Result<BackendTransport> 
 /// without touching the network; the first operation (or the transport
 /// `connect` probe) establishes the session.
 #[cfg(feature = "sftp")]
-fn sftp_params(cfg: &CyDriveConfig) -> Result<ck_sftp::SftpParams> {
+pub(crate) fn sftp_params(cfg: &CyDriveConfig) -> Result<ck_sftp::SftpParams> {
     // 展平为 (key, value) 对——非空值才入列（空串 = 未设置，与驱动侧
     // empty-means-unset 语义对齐）。
     fn push(pairs: &mut Vec<(String, String)>, key: &str, value: Option<&str>) {
@@ -5847,6 +5847,71 @@ async fn build_pan115_transport(
     Ok(BackendTransport::Pan115(Arc::new(
         ck_pan115::Pan115Transport::new(driver),
     )))
+}
+
+/// `doctor --accept-host-key` 的写回面（2026-09-25 批）：把服务器实际
+/// 指纹写入卷文件。UPDATE 控制命令的**同一文件漏斗**（旧文件全漏斗
+/// 先验 → 显式表 → 单键 overlay → 合并全漏斗 parse+validate → 原子
+/// 写）——不另造第二条写文件路径。指纹是公开身份值（非 SECRET 键）；
+/// 重渲染丢失手写注释（UPDATE 同款已知形态，流程文案明示）。
+#[cfg(feature = "sftp")]
+pub fn write_sftp_host_fingerprint(path: &Path, fingerprint: &str) -> Result<(), String> {
+    // The full funnel on the OLD file first: a half-validated file is
+    // never rewritten (the UPDATE precedent).
+    if let Err(error) = cloudkit_core::config::load_volume_config(path) {
+        return Err(format!(
+            "reading the volume file {} failed: {error} — nothing was written; fix it by \
+             hand and retry",
+            path.display()
+        ));
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|e| format!("reading the volume file {} failed: {e}", path.display()))?;
+    let explicit = parse_explicit_table_redacted(path, &text)?;
+    let mut overlay = toml::Table::new();
+    overlay.insert(
+        "sftp_host_fingerprint".to_string(),
+        toml::Value::String(fingerprint.to_string()),
+    );
+    let merged = cloudkit_core::config::render_volume_toml(&explicit, &overlay);
+    let name = path
+        .file_stem()
+        .and_then(|s| s.to_str())
+        .unwrap_or("volume");
+    let spec = cloudkit_core::config::parse_volume_toml(path, name, &merged)
+        .map_err(|e| format!("the merged volume file is invalid: {e} — nothing was written"))?;
+    if let Err(error) = spec.settings.validate() {
+        return Err(format!(
+            "invalid volume settings: {error} — nothing was written"
+        ));
+    }
+    cloudkit_core::config::write_config_atomically(path, &merged)
+        .map_err(|e| format!("writing the volume file {} failed: {e}", path.display()))
+}
+
+/// `cydrive doctor --accept-host-key <卷名>` 命令体（D2 首连确认向导，
+/// 2026-09-25 批——SF4 挂账「setup 交互式向导」的指纹面收口）。无
+/// sftp 驱动的裁剪二进制给可行动错误（K31 形态）。
+pub async fn accept_host_key_command(name: &str) -> Result<()> {
+    #[cfg(feature = "sftp")]
+    {
+        let discovered = discover_config_with_volumes();
+        let DiscoveredConfig::Multi { volumes, .. } = discovered? else {
+            anyhow::bail!(
+                "--accept-host-key edits a multi-volume volume file; in single-volume mode \
+                 pin sftp_host_fingerprint in config.toml by hand"
+            );
+        };
+        return doctor::accept_host_key_flow(&volumes, name).await;
+    }
+    #[cfg(not(feature = "sftp"))]
+    {
+        let _ = name;
+        anyhow::bail!(
+            "this binary has no sftp driver compiled in — --accept-host-key needs a build \
+             with the `sftp` feature"
+        );
+    }
 }
 
 /// The sftp factory assembly shared by the dispatch and the rebuild

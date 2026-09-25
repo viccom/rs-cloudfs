@@ -634,6 +634,131 @@ pub fn sftp_connectivity_check(probe: &ck_sftp::SftpProbe) -> CheckResult {
     }
 }
 
+// ------------------------------------------------- --accept-host-key ---
+
+/// `doctor --accept-host-key` 的接受决策（2026-09-25 批，D2 边界的可测
+/// 面）：**已钉恒拒**（替换指纹必须 out-of-band 核验后人工改文件——
+/// 指纹变更是 MITM 绊线，绝不自动换钉）；未钉 + 探针带回服务器实际
+/// 指纹（首握手即捕获、先于认证）= 可经确认写入；探针其他结论（不可
+/// 达/认证错/变更/已活）都不是接受窗口。
+#[cfg(feature = "sftp")]
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum HostKeyAccept {
+    /// 服务器实际指纹——经人工确认后可写入。
+    Acceptable { actual: String },
+    /// 拒绝 + 可行动文案。
+    Refused { reason: String },
+}
+
+#[cfg(feature = "sftp")]
+pub fn host_key_accept_decision(pinned: Option<&str>, probe: &ck_sftp::SftpProbe) -> HostKeyAccept {
+    use ck_sftp::SftpProbe;
+    if pinned.is_some_and(|v| !v.trim().is_empty()) {
+        return HostKeyAccept::Refused {
+            reason: PINNED_REFUSAL.to_string(),
+        };
+    }
+    match probe {
+        SftpProbe::HostKeyUnpinned(actual) => HostKeyAccept::Acceptable {
+            actual: actual.clone(),
+        },
+        other => {
+            let verdict = sftp_connectivity_check(other);
+            HostKeyAccept::Refused {
+                reason: format!(
+                    "{} — the host key is captured on the first handshake (before auth); fix \
+                     the connection and retry",
+                    verdict.detail
+                ),
+            }
+        }
+    }
+}
+
+/// 终端确认：显示服务器实际指纹，只有明确的 y/yes 才接受（缺省拒绝）。
+#[cfg(feature = "sftp")]
+fn confirm_host_key_acceptance(host: &str, port: u16, fingerprint: &str) -> bool {
+    println!("The server {host}:{port} presented this host key fingerprint:");
+    println!();
+    println!("    {fingerprint}");
+    println!();
+    println!(
+        "Accept and pin it? A man-in-the-middle would present its own fingerprint here —\n\
+         only accept on a network you trust."
+    );
+    print!("[y/N]: ");
+    let _ = std::io::Write::flush(&mut std::io::stdout());
+    let mut line = String::new();
+    if std::io::stdin().read_line(&mut line).is_err() {
+        return false;
+    }
+    matches!(line.trim(), "y" | "Y" | "yes")
+}
+
+/// 已钉恒拒的共用文案（决策函数与流程直查共用）。
+#[cfg(feature = "sftp")]
+const PINNED_REFUSAL: &str = "this volume already pins a host key — replacing it is a security \
+                              decision: verify the new fingerprint out-of-band, then edit \
+                              sftp_host_fingerprint in the volume file by hand (D2: changes \
+                              are never auto-accepted)";
+
+/// `doctor --accept-host-key <卷名>` 的流程：定位卷 → 已钉即拒（不探
+/// 针）→ 探针带回实际指纹 → 终端确认 → [`crate::write_sftp_host_
+/// fingerprint`] 写回（UPDATE 同一文件漏斗）。
+#[cfg(feature = "sftp")]
+pub async fn accept_host_key_flow(
+    volumes: &[cloudkit_core::config::VolumeConfig],
+    name: &str,
+) -> anyhow::Result<()> {
+    use anyhow::Context;
+    let spec = volumes.iter().find(|v| v.name == name).ok_or_else(|| {
+        anyhow::anyhow!(
+            "no volume named `{name}` in volumes_dir — configured: {}",
+            volumes
+                .iter()
+                .map(|v| v.name.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+    if spec.settings.backend != cloudkit_core::config::Backend::Sftp {
+        anyhow::bail!(
+            "volume `{name}` runs backend `{}` — host keys are an sftp-only concept",
+            spec.settings.backend.as_str()
+        );
+    }
+    // 已钉恒拒（D2）——不探针、不写盘。
+    if spec
+        .settings
+        .sftp_host_fingerprint
+        .as_deref()
+        .is_some_and(|v| !v.trim().is_empty())
+    {
+        anyhow::bail!("{PINNED_REFUSAL}");
+    }
+    let params = crate::sftp_params(&spec.settings).context("reading the sftp volume keys")?;
+    let probe = ck_sftp::probe(&params).await;
+    match host_key_accept_decision(None, &probe) {
+        HostKeyAccept::Acceptable { actual } => {
+            let host = spec.settings.sftp_host.clone().unwrap_or_default();
+            let port = spec.settings.sftp_port.unwrap_or(22);
+            if !confirm_host_key_acceptance(&host, port, &actual) {
+                println!("Declined — nothing was written.");
+                return Ok(());
+            }
+            crate::write_sftp_host_fingerprint(&spec.file_path, &actual)
+                .map_err(|message| anyhow::anyhow!(message))?;
+            println!(
+                "Pinned {actual} into {} — the volume file was rewritten (hand-written \
+                 comments are lost, the UPDATE precedent); re-run `cydrive doctor` to verify.",
+                spec.file_path.display()
+            );
+            Ok(())
+        }
+        HostKeyAccept::Refused { reason } => anyhow::bail!("{reason}"),
+    }
+}
+
 /// The local backend's root probe: `None` (no config to read a root
 /// from) is a Warn mirroring the db/cache checks; an existing writable
 /// directory is Ok (create_dir_all + write-and-remove probe file — the
