@@ -1,0 +1,207 @@
+# Release — tag-triggered binary builds (Linux/Windows × full/crop).
+#
+# Repo tag convention: NO "v" prefix (0.10.0, 0.12.0, …) — the trigger
+# pattern and the publish-job guard both enforce that shape.
+#
+# Matrix (4 artifacts per release):
+#   windows × full         default features (7 drivers + winfsp mount, K89)
+#   windows × sftp-winfsp  --no-default-features --features sftp,winfsp
+#                          (the minimal crop for an sftp-only deployment)
+#   linux   × full         default features (winfsp is a cfg(windows)
+#                          empty shell on Linux — nothing GPL is linked)
+#   linux   × sftp         the crop equivalent: winfsp cannot exist on
+#                          Linux, so the minimal variant is sftp-only
+#
+# Binary identity (K88): build.rs derives `<version>-<hash>` from
+# `git describe --tags`, hence checkout needs fetch-depth: 0.
+#
+# Profile: release-min (K68 — strip + fat LTO, codegen-units 1).
+#
+# NOTE (2026-09-25, honesty): first real run still pending — GitHub
+# refused to start ANY Actions job on this account at the time of
+# commit ("recent account payments have failed or your spending limit
+# needs to be increased"). The commands mirror the locally proven
+# platform-builds.md recipes and rs-f4ss's working release workflow,
+# but the first end-to-end run happens only after billing is fixed.
+
+name: Release
+
+on:
+  push:
+    tags:
+      - '[0-9]+.*'
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # Tag name (e.g. "0.12.0"). Kept in env to stay out of inline shell
+  # strings (rs-f4ss convention).
+  TAG: ${{ github.ref_name }}
+
+jobs:
+  # ─────────────────────────────────────────────────────────────────────
+  # Guard — reject non-release refs BEFORE burning build minutes
+  # (a workflow_dispatch from a branch would otherwise build 4 binaries
+  # and only fail at the publish step).
+  # ─────────────────────────────────────────────────────────────────────
+  guard:
+    name: tag shape guard
+    runs-on: ubuntu-latest
+    steps:
+      - name: Verify ref is a <major>.<minor>.<patch> tag
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${TAG}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::ref '${TAG}' does not match <major>.<minor>.<patch> (repo convention: no v prefix). workflow_dispatch must be run against a tag ref." >&2
+            exit 1
+          fi
+          echo "releasing ${TAG}"
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Build — one job per (os × variant), each uploads one archive
+  # ─────────────────────────────────────────────────────────────────────
+  build:
+    name: build (${{ matrix.os-name }} · ${{ matrix.variant }})
+    needs: guard
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            os-name: windows
+            variant: full
+            features: ""
+          - os: windows-latest
+            os-name: windows
+            variant: sftp-winfsp
+            features: "--no-default-features --features sftp,winfsp"
+          - os: ubuntu-latest
+            os-name: linux
+            variant: full
+            features: ""
+          - os: ubuntu-latest
+            os-name: linux
+            variant: sftp
+            features: "--no-default-features --features sftp"
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # build.rs (K88) reads `git describe --tags` — tags required.
+          fetch-depth: 0
+
+      # Matches rust-toolchain.toml (channel = "stable"); MSVC is the
+      # windows-latest default host (winfsp-sys panics on gnu toolchains).
+      - uses: dtolnay/rust-toolchain@stable
+
+      - uses: Swatinem/rust-cache@v2
+
+      # winfsp-sys (bindgen) needs libclang whenever the winfsp feature
+      # is compiled in — both windows variants here. Linux never
+      # resolves winfsp-sys (cfg(windows) target gate).
+      - name: libclang for winfsp-sys (bindgen, windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $candidates = @("$env:ProgramFiles\LLVM\bin", "${env:ProgramFiles(x86)}\LLVM\bin")
+          $found = $candidates | Where-Object { Test-Path (Join-Path $_ "libclang.dll") } | Select-Object -First 1
+          if (-not $found) {
+            choco install llvm -y
+            $found = "$env:ProgramFiles\LLVM\bin"
+          }
+          "LIBCLANG_PATH=$found" | Out-File -FilePath $env:GITHUB_ENV -Encoding utf8 -Append
+
+      - name: cargo build --profile release-min
+        shell: bash
+        run: cargo build --profile release-min -p cloudkit-cli --locked ${{ matrix.features }}
+
+      # Cheap post-build assertion: prints the K88 identity and the
+      # compiled driver list into the run log (K32) — also proves the
+      # binary executes on the build OS.
+      - name: Binary identity check
+        shell: bash
+        run: ./target/release-min/cydrive --version
+
+      - name: Package (windows zip)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        env:
+          OS_NAME: ${{ matrix.os-name }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          New-Item -ItemType Directory -Force -Path staging | Out-Null
+          Copy-Item target/release-min/cydrive.exe staging/
+          Copy-Item README.md staging/
+          Compress-Archive -Path staging/* -DestinationPath "cydrive-${env:TAG}-${env:OS_NAME}-x86_64-${env:VARIANT}.zip" -Force
+
+      - name: Package (linux tar.gz)
+        if: runner.os == 'Linux'
+        shell: bash
+        env:
+          OS_NAME: ${{ matrix.os-name }}
+          VARIANT: ${{ matrix.variant }}
+        run: |
+          set -euo pipefail
+          mkdir -p staging
+          cp target/release-min/cydrive staging/
+          cp README.md staging/
+          tar -czf "cydrive-${TAG}-${OS_NAME}-x86_64-${VARIANT}.tar.gz" -C staging .
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: cydrive-${{ matrix.os-name }}-x86_64-${{ matrix.variant }}
+          path: cydrive-${{ matrix.os-name }}-x86_64-${{ matrix.variant }}.*
+          if-no-files-found: error
+
+  # ─────────────────────────────────────────────────────────────────────
+  # Publish — merge all archives, checksum, attach to a GitHub Release
+  # ─────────────────────────────────────────────────────────────────────
+  release:
+    name: publish release
+    needs: build
+    runs-on: ubuntu-latest
+    steps:
+      - name: Download all artifacts
+        uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+
+      # Defence in depth (rs-f4ss convention): the tag glob could match
+      # a stray `0.13.0-rc1` or a dispatch run from a branch ref — both
+      # would publish a misnamed release. Reject anything that is not
+      # exactly <major>.<minor>.<patch> with no v prefix.
+      - name: Guard tag shape + checksums
+        env:
+          TAG: ${{ github.ref_name }}
+        run: |
+          set -euo pipefail
+          if [[ ! "${TAG}" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ ]]; then
+            echo "::error::tag '${TAG}' does not match <major>.<minor>.<patch> (repo convention: no v prefix). workflow_dispatch must be run against a tag ref." >&2
+            exit 1
+          fi
+          cd artifacts
+          ls -la
+          test "$(ls cydrive-* | wc -l)" -eq 4 || { echo "::error::expected exactly 4 cydrive archives"; ls cydrive-*; exit 1; }
+          sha256sum cydrive-* > SHA256SUMS.txt
+          cat SHA256SUMS.txt
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ github.ref_name }}
+          name: cydrive ${{ github.ref_name }}
+          generate_release_notes: true
+          fail_on_unmatched_files: true
+          files: |
+            artifacts/cydrive-*.zip
+            artifacts/cydrive-*.tar.gz
+            artifacts/SHA256SUMS.txt
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}

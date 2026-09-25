@@ -131,7 +131,15 @@ docker run --rm -v $PWD:/io -w /io ghcr.io/rust-cross/cargo-zigbuild \
 - **运行未验证**：类型检查与链接通过 ≠ 运行正确（keyring Keychain 后端、unix 信号路径、时区等需实机确认）。挂载功能 macOS 本来就没有（stub）。
 - 如需系统性支持 macOS：给 CI 矩阵加 `macos-latest` 一行即可获得真机构建 + 全量测试（成本最低的验证路径）。
 
-## 4. 跨平台坑速查（实测沉淀）
+## 4. CI 发布链（release.yml，2026-09-25 落地）
+
+- **触发**：`[0-9]+.*` 形状的 tag（本仓惯例无 v 前缀，如 `0.12.0`）或手动 dispatch。guard job 先验 `<major>.<minor>.<patch>` 形状——dispatch 从分支发起时 TAG 是分支名，提前拒绝避免白烧 4 个构建的分钟数。
+- **矩阵**：windows × {full, sftp-winfsp} + linux × {full, sftp}。winfsp 是 Windows 专属（cfg 门控空壳），Linux 精简版只能是 sftp-only；Linux full 不链任何 GPL 件。全功能 Windows 产物含 GPL winfsp 绑定 = 私有分发（K89 裁决边界内，私有仓 Release 即私有分发）。
+- **产物**：`cydrive-<tag>-<os>-x86_64-<variant>.zip/.tar.gz`（release-min 档二进制 + README）×4 + 汇总 `SHA256SUMS.txt`，挂 GitHub Release。
+- **Windows 腿装 LLVM** 供 winfsp-sys 的 bindgen（与 ci.yml 同模式）；checkout `fetch-depth: 0`——build.rs K88 身份段读 `git describe --tags`，浅克隆会把身份段退化成 crate 版本号。
+- **首轮真机未跑（如实标注）**：落地时账号 Actions 被计费层拒启（"recent account payments have failed or your spending limit needs to be increased"）——ci.yml 的全部历史 run 同因从未起跑。billing 修复后用下一个 tag（或删重推既有 tag）触发首轮校准。
+
+## 5. 跨平台坑速查（实测沉淀）
 
 | 坑 | 现象 | 解 |
 |---|---|---|
