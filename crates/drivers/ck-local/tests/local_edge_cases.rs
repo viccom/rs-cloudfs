@@ -22,9 +22,9 @@ use std::sync::Arc;
 use ck_local::{factory, LocalDriver, LocalParams};
 #[cfg(unix)]
 use cloudkit_storage::{EntryKind, Page, StorageError};
+use cloudkit_storage::{RelPath, StorageDriver, WriteHint};
 #[cfg(unix)]
 use std::path::Path;
-use cloudkit_storage::{RelPath, StorageDriver, WriteHint};
 
 async fn setup() -> (tempfile::TempDir, Arc<LocalDriver>) {
     let dir = tempfile::tempdir().expect("temp root");
