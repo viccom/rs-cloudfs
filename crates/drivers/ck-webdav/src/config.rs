@@ -149,11 +149,15 @@ fn normalize_base_url(value: &str) -> Result<Url, String> {
 /// - `webdav_auth` ∈ {auto, basic, digest}（宽大小写/白空格）；
 /// - `webdav_vendor` ∈ {generic, nextcloud}（同宽）；
 /// - `webdav_accept_invalid_certs` ∈ {"true", "false"}（同宽）；
-/// - 一切键空串视为未设置（empty-means-unset——UPDATE 的 write-only
-///   叠加依赖这一条，baidu/sftp 键同语义）。
+/// - 一切键空串/纯空白视为未设置（empty-means-unset——UPDATE 的
+///   write-only 叠加依赖这一条，baidu/sftp 键同语义；L3 复审：presence
+///   判定用 trim 与 core validate 对齐）。
 pub fn parse_from_map(map: &HashMap<String, String>) -> Result<WebdavParams, String> {
+    // L3（复审）：presence 判定用 trim（纯空白 = 未设置，与 core validate
+    // 的 `!v.trim().is_empty()` 同语义）；值本体原样保留——带首尾空格的
+    // 凭据是合法输入，只有「是否设置」用 trim。
     let non_empty =
-        |key: &str| -> Option<String> { map.get(key).filter(|v| !v.is_empty()).cloned() };
+        |key: &str| -> Option<String> { map.get(key).filter(|v| !v.trim().is_empty()).cloned() };
 
     for key in map.keys() {
         if !KNOWN_WEBDAV_KEYS.contains(&key.as_str()) {

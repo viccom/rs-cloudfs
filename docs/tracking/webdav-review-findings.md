@@ -70,3 +70,23 @@ K28 env 纪律 / dispatch 三臂 + K31 文案 / conformance 双桩接入 / as_dr
 ## 总评
 
 **测试面置信度 8.5/10**（上限被 M2 的时序彩票压住）。强项：手搓桩的 RFC 建模严格（Digest 服务端真实验证/response-uri 逐字节比对/nc 高水位/apache 多前缀 multistatus/SlashStrict 全动词 301）；双桩制的 davref 真实现腿 + 断言①裁决史在案；read_path 20 腿 + connect_auth 20 腿覆盖面完整（含 M1/M3/M6/M7/M9-M13 全部修复钉）。最大盲区 = M2（写动词连接杀的建模缺陷让 lost-ACK 覆盖时序化）。
+
+## 修复批（2026-09-25，负责人批准「先修必须修的，但要求复核确认是 BUG」）
+
+五项逐一复核：**四项确认真 BUG 修复（全 TDD 红→绿）；L4 复核不成立不修**。
+
+| 项 | 复核结论 | 修复 | 红证（缺陷运行时实证） | 绿证 |
+|---|---|---|---|---|
+| H1 | 真 BUG，②比原判更重（见下） | `transport_face.rs` 补 `upload_stream`（帧泵 `write_frames` + abort-on-error，sftp 判例逐字同型）+ `store_bytes` 错误路径显式 `abort()` + `receipt_of` 抽取 | 四腿全红：upload 写错误后 `take("/f.bin") == None`——旧版本困死 `.old`、final 丢空的运行时实证；upload_stream 三腿 = trait 缺省 `Unsupported`（缺口实证） | `tests/transport_face.rs` 4/4 |
+| M1 | 真 BUG（窄窗分类缺陷，K75-1 违反） | `driver.rs` 重试臂 `PreconditionFailed` 单列 → 抽 `precondition_failed_verdict`（首发/重试共用：stat 复核 → `Exists`/原文保留 `Unavailable`） | `rename_retry_412...` 红：错误形态 `not found`——412 被压成 NotFound(父) 实证 | write_path 26/26 |
+| M3 | 真 BUG（R3 凭据泄漏面） | core `config.rs` **六臂**去 `got {url:?}` 回显：webdav_url 四臂（2192/2199/2211/2218）+ sync_url 两臂（1997/2009，同族顺手）；最坏路径 = query 臂**先于** userinfo 臂裁决，userinfo+query 形态密码整串漏出；driver 侧 query 臂回显经核**无凭据可达**（userinfo 先检）不動 | 两测红：`SECRET9 leaked`——scheme/query 两臂原文回显实证 | config_backend 52 + config_sync 16 全绿零漂移 |
+| L3 | 真 BUG（core/driver 一致性瑕疵，方向安全） | driver `non_empty` presence 判定改 `!v.trim().is_empty()`（值本体不 trim——带空格凭据合法，与 core 同款） | 红：空白 username 单独出现报 pair 错误（core 判匿名放行——两层分叉实证） | ck-webdav lib 60/60 |
+| L4 | **复核不成立，不修** | — | `WebdavProbe` 五态本无 Misconfigured；**sftp 探针对配置不完整用同款 Unreachable+可行动文案**（cli lib.rs:6325，同注释「Incomplete config never reaches the network」）——单改 webdav 反制造驱动间分叉；baidu 的 NeedsReauth 是 token 状态面不同物 | — |
+
+**H1② 严重度复核补强**：`CloudTransport::upload_stream` 的 trait 缺省 = `Err(Unsupported)`（**非**缓冲回退），而 `upload_queue.rs:792-797` 的 use_v2 腿**无条件**走 `upload_v2_stream` 且无降级分支——aead_v2 是默认加密方案（84939ab）→ 修复前加密 webdav 卷上传 = 重试耗尽后 degrade。六宽面驱动里 webdav 曾是唯一缺口（local/sftp/baidu/pan115/pan123 均有覆写，rg 实证）。
+
+**新桩面**：`Knobs::concurrent_target_on_move`（逐 MOVE 计数；减到 0 的那次 MOVE 处理前把**本次目标**种成文件——「建父窗内并发写手抢占目标」的竞态建模，M1 构造面；`FaultLedger.concurrent_target` 运行副本）。
+
+**验证**：workspace **1855/0/63**（基线 1847 + 本批 8 新测试）；fmt / clippy `--workspace --all-targets -D warnings` / check_layers 全绿。构建插曲（环境非代码）：schannel E0460 双指纹（K73 同类，`cargo clean -p schannel` 定向清解）+ 高并发 rustc OOM（os error 1455 页面文件不足，`-j 2` 解——K73 既定解法）。
+
+**挂账维持**：M2（lost-ACK 桩建模「头前杀」改造 + 507 flake 压测复现）待单独批；L1/L2/I1-I4 原样；加密 webdav 卷真机 e2e 腿（upload_stream 修复解锁，随真机窗口）。

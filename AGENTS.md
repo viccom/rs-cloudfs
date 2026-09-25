@@ -50,7 +50,7 @@
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 1836 测试（2026-09-25：K89 winfsp 进 default——winfsp 套件 123（含真机挂载腿）与 cli winfsp 特性门测试并入默认图计数，+123 pass +1 ignored；同日 baidu 审查修复批（H1 分页拉齐/M1 探针持久化/M2 句柄缓存/M3 dlink 上界/M4 分片读盘）+ ck-local 审查修复批（lstat 面/大小写改名/崩窗清扫）累计；既有断言零漂移；ignored 63 = 真机/平台/真网类，其中 winfsp 真机挂载 1 + webdav live_readthrough 7 + webdav live_matrix 10 + sftp 真机矩阵 12 + sftp live_readthrough 3 + pan115 live_matrix 6 + pan115_e2e 4 + pan123 live_matrix 3 + pan123_e2e 5）
+cargo test --workspace --no-fail-fast            # 1855 测试（2026-09-25：webdav 复审修复批 +8——transport upload_stream 补面/store_bytes 显式 abort（H1）、rename 重试臂 412 复核（M1）、core 校验六臂去回显（M3）、webdav 纯空白=未设置（L3）；同日 sftp 复审两轮修复批 +11 累计；K89 winfsp 进 default——winfsp 套件 123（含真机挂载腿）与 cli winfsp 特性门测试并入默认图计数；同日 baidu 审查修复批（H1 分页拉齐/M1 探针持久化/M2 句柄缓存/M3 dlink 上界/M4 分片读盘）+ ck-local 审查修复批（lstat 面/大小写改名/崩窗清扫）累计；既有断言零漂移；ignored 63 = 真机/平台/真网类，其中 winfsp 真机挂载 1 + webdav live_readthrough 7 + webdav live_matrix 10 + sftp 真机矩阵 12 + sftp live_readthrough 3 + pan115 live_matrix 6 + pan115_e2e 4 + pan123 live_matrix 3 + pan123_e2e 5）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo build -p cloudkit-cli --no-default-features --features local,baidu   # 驱动裁剪构建（K30 四 feature）；缺驱动构建运行期报可行动错误（K31 rebuild 指引），cydrive --version 显示驱动清单（K32）

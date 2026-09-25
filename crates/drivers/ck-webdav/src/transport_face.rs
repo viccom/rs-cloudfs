@@ -12,6 +12,11 @@
 //! - **chunk 计划**：`UploadJob` 的 chunk_count/chunk_size 对整文件
 //!   PUT 的 WebDAV 无意义，不消费；`job.size` 作为 WriteHint 承诺由
 //!   stager close 校验（WD3）；
+//! - **upload_stream**：流式上传面（帧泵进 stager，无全缓冲——上传
+//!   队列 aead_v2 加密路径无条件走它，trait 缺省 `Unsupported` 无降
+//!   级）；两上传面的错误路径都显式 abort（复审 H1：writer 打开时
+//!   已执行的 stash 在裸 Drop 下会把旧版本困在 `.ckwd-*.old`——
+//!   sftp-review ① 判例同型）；
 //! - **connect**：OPTIONS 探活（含认证协商一轮——D1 状态机的首次驱动
 //!   点）+ 外层 deadline（belt-and-braces：per-request 30s 预算之上
 //!   再钉一道墙，防御重试退避叠加的病态形态）；
@@ -35,7 +40,9 @@ use cloudkit_storage::transport::{
     ByteStream, CloudTransport, RemoteHandle, StorageError, UploadJob, UploadReceipt,
 };
 use cloudkit_storage::vpath::RelPath as VPath;
-use cloudkit_storage::{Capabilities, EntryId, Range, RelPath, StorageDriver};
+use cloudkit_storage::{
+    Capabilities, EntryId, Range, RelPath, StorageDriver, UploadStager, WriteHint,
+};
 
 use crate::driver::WebdavDriver;
 
@@ -144,6 +151,41 @@ impl CloudTransport for WebdavTransport {
         self.store_bytes(&rel, job.size, &data).await
     }
 
+    /// 流式上传：字节逐帧进 stager（无内存全缓冲）；超计划拒绝、短流
+    /// 由 close 的承诺校验给 `Invalid`（ck-local/sftp 同款形态）。
+    ///
+    /// **错误路径显式 abort（复审 H1，sftp-review ① 判例同型）**：
+    /// `frame?`/`write?` 的早退若裸 Drop stager，覆盖写场景 writer 打开
+    /// 时已执行的 stash 会把旧版本困在 `.ckwd-*.old` 残件（final 丢
+    /// 空，重试耗尽后文件对卷消失）——错误必须经 `abort()` 复位现场
+    /// 后再上抛。
+    async fn upload_stream(
+        &self,
+        job: &UploadJob,
+        data: ByteStream,
+    ) -> Result<UploadReceipt, StorageError> {
+        let rel = vocab_rel(&job.rel_path)?;
+        if rel.is_root() {
+            return Err(StorageError::Invalid); // 卷根不可作为上传目标
+        }
+        let hint = WriteHint {
+            size: Some(job.size),
+            ..Default::default()
+        };
+        let mut stager = self.driver.writer(&rel, &hint).await?;
+        let outcome = write_frames(&mut stager, data, job.size).await;
+        match outcome {
+            Ok(()) => {
+                let entry = stager.close().await?;
+                Ok(receipt_of(entry.size))
+            }
+            Err(e) => {
+                let _ = stager.abort().await;
+                Err(e)
+            }
+        }
+    }
+
     /// 全文件读：预算帽语义下等价 `open_range(0, total_size)`。
     async fn open(&self, file: &RemoteHandle) -> Result<ByteStream, StorageError> {
         self.open_range(file, 0, file.total_size).await
@@ -193,23 +235,62 @@ impl WebdavTransport {
     /// 上传收尾共通（sftp `store_bytes` 同款薄壳）：writer + 全量
     /// write + close → K6 receipt（first_msg_id = 0、chunk_msg_ids =
     /// [0] 占位——整件 PUT 无 chunk 簿记）。
+    ///
+    /// **错误路径显式 abort（复审 H1①）**：`write?` 早退裸 Drop 会把
+    /// writer 打开时已 stash 的旧版本困在 `.ckwd-*.old`（final 丢空）——
+    /// 同 upload_stream 的恢复纪律。
     async fn store_bytes(
         &self,
         rel: &RelPath,
         promised: u64,
         data: &[u8],
     ) -> Result<UploadReceipt, StorageError> {
-        let hint = cloudkit_storage::WriteHint {
+        let hint = WriteHint {
             size: Some(promised),
             ..Default::default()
         };
         let mut stager = self.driver.writer(rel, &hint).await?;
-        stager.write(data).await?;
-        let entry = stager.close().await?;
-        Ok(UploadReceipt {
-            first_msg_id: 0,
-            chunk_msg_ids: vec![0],
-            uploaded_bytes: entry.size,
-        })
+        match stager.write(data).await {
+            Ok(()) => {
+                let entry = stager.close().await?;
+                Ok(receipt_of(entry.size))
+            }
+            Err(e) => {
+                let _ = stager.abort().await;
+                Err(e)
+            }
+        }
+    }
+}
+
+/// upload_stream 的帧泵（拆出使错误路径的 `stager.abort()` 借用成立）：
+/// 逐帧写 stager，超计划拒绝。
+async fn write_frames(
+    stager: &mut Box<dyn UploadStager>,
+    data: ByteStream,
+    planned: u64,
+) -> Result<(), StorageError> {
+    let mut frames = data;
+    let mut written: u64 = 0;
+    while let Some(frame) = futures_util::StreamExt::next(&mut frames).await {
+        let frame = frame?;
+        written += frame.len() as u64;
+        if written > planned {
+            return Err(StorageError::Unavailable(format!(
+                "stream exceeded the planned {planned} bytes"
+            )));
+        }
+        stager.write(&frame).await?;
+    }
+    Ok(())
+}
+
+/// K6 receipt 形态：msg_id 恒 0 占位（不语义化，sftp/local 同款）。
+fn receipt_of(uploaded_bytes: u64) -> UploadReceipt {
+    UploadReceipt {
+        first_msg_id: 0,
+        // K11 单 chunk 占位：`[0]`
+        chunk_msg_ids: vec![0],
+        uploaded_bytes,
     }
 }

@@ -200,6 +200,35 @@ fn sync_url_must_be_http_s_when_set() {
     }
 }
 
+/// 复审 M3 同族（2026-09-25）：sync_url 两臂同样不回显原文——sync_url
+/// 无 userinfo 拒收臂（内嵌凭据形态可穿过 host 检查），scheme/host 臂的
+/// 回显会把误用形态里的内嵌凭据带进错误链（R3 面，与 webdav_url 四臂
+/// 同治）。
+#[test]
+fn sync_url_validation_errors_never_echo_the_raw_url() {
+    for (label, url, marker) in [
+        (
+            "scheme arm",
+            "ftp://spike:SECRET9@sync.example.org",
+            "SECRET9",
+        ),
+        ("host arm", "https://:8290/HOSTMARK9", "HOSTMARK9"),
+    ] {
+        let cfg = CyDriveConfig {
+            sync_url: Some(url.to_string()),
+            ..CyDriveConfig::default()
+        };
+        let err = cfg
+            .validate()
+            .err()
+            .unwrap_or_else(|| panic!("{label} must be rejected"));
+        assert!(
+            matches!(err, ConfigError::Invalid(ref message) if !message.contains(marker)),
+            "{label}: the refusal must not echo the raw url ({marker} leaked): {err:?}"
+        );
+    }
+}
+
 #[test]
 fn sync_url_with_empty_host_rejected() {
     // Three malformed shapes that carry the right scheme prefix but no

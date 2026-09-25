@@ -377,6 +377,32 @@ mod tests {
         );
     }
 
+    /// 复审 L3（2026-09-25）：纯空白值 = 未设置——与 core validate 的
+    /// `!v.trim().is_empty()` 语义对齐（此前 driver `!v.is_empty()` 不
+    /// trim：空白 username 单独出现时 core 判匿名放行、driver 报 pair
+    /// 错误，两层分叉）。值本体不 trim（带空格的凭据是合法输入——
+    /// presence 判定才用 trim）。
+    #[test]
+    fn config_blank_values_read_as_unset() {
+        // 空白 username 单独出现 = 未设置（匿名，无 pair 错误）。
+        let params = parse_from_map(&map(&[
+            ("webdav_url", "https://nas.lan/dav/"),
+            ("webdav_username", "   "),
+        ]))
+        .expect("blank username reads as unset");
+        assert!(params.username.is_none(), "blank username is unset");
+        assert!(params.password.is_none());
+
+        // 双空白同理（双未设置 = 匿名，不是「双设置」）。
+        let params = parse_from_map(&map(&[
+            ("webdav_url", "https://nas.lan/dav/"),
+            ("webdav_username", "  "),
+            ("webdav_password", "\t"),
+        ]))
+        .expect("blank pair reads as unset");
+        assert!(params.username.is_none() && params.password.is_none());
+    }
+
     #[test]
     fn config_rejects_split_credentials() {
         let error = parse_from_map(&map(&[
