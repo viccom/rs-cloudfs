@@ -314,10 +314,21 @@ pub(crate) async fn probe_connect(params: &SftpParams) -> Result<(), SessionErro
     Ok(())
 }
 
+/// SSH 传输层配置（connect_once 用）。keepalive 30s（russh 缺省
+/// None）+ 缺省 3 次容忍：NAT/防火墙静默丢弃 idle 连接后，保活让死
+/// 连接在 ≤90s 内显式断开——下一操作直接走 with_retry 重连，而不是
+/// 必吃一次「先失败再重连」的往返（M1，sftp-review）。
+pub(crate) fn ssh_transport_config() -> Arc<client::Config> {
+    Arc::new(client::Config {
+        keepalive_interval: Some(Duration::from_secs(30)),
+        ..client::Config::default()
+    })
+}
+
 /// 建立一条完整连接：TCP + KEX（含 D2 host key 校验）→ 认证（D1）→
 /// sftp 子系统 → SftpSession。行为测试在 SF2 桩批。
 async fn connect_once(params: &SftpParams) -> Result<SshConnection, SessionError> {
-    let ssh_config = Arc::new(client::Config::default());
+    let ssh_config = ssh_transport_config();
     let handler = SshHandler {
         expected: params.host_fingerprint.clone(),
     };

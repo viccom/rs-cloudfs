@@ -286,6 +286,18 @@ mod tests {
         assert!(!caps.chat);
     }
 
+    /// M1（sftp-review）：keepalive 接线钉死——30s 间隔（russh 缺省
+    /// None）。NAT/防火墙静默丢弃 idle 连接后，保活让死连接在服务端
+    /// 侧显式断开（下一操作直接走 with_retry 重连），不再必吃一次
+    /// 「先失败再重连」的往返。
+    #[test]
+    fn ssh_transport_config_pins_keepalive() {
+        assert_eq!(
+            crate::client::ssh_transport_config().keepalive_interval,
+            Some(std::time::Duration::from_secs(30))
+        );
+    }
+
     // ----------------------------------------------------- error.rs ---
 
     use crate::error::{

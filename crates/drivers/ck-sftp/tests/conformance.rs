@@ -112,7 +112,11 @@ impl ConformanceHarness for SftpHarness {
             "SSH_FX_PERMISSION_DENIED" => StatusCode::PermissionDenied,
             other => panic!("error_table 码必须是可注入的状态码，got {other:?}"),
         };
-        self._stub.fail_next_stat(code);
+        // M3（sftp-review）：注入打在 **lstat** 旋钮上——K67 把
+        // driver.stat 的非根路径实现为 symlink_metadata（SSH_FXP_LSTAT），
+        // 注入必须打在驱动 stat 实际发出的协议动词上（修复前靠 lstat
+        // 处理器偷吃 stat 槽位假绿，拆分后此处即真相）。
+        self._stub.fail_next_lstat(code);
     }
 }
 
