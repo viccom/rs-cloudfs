@@ -48,6 +48,9 @@ pub struct LocalStager {
     tmp_path: PathBuf,
     /// 被 stash 的旧版本（overwrite 场景；`.old`）；None = 目标原本不存在。
     old_path: Option<PathBuf>,
+    /// stash 的 sidecar（`.old.meta`，审查 M3——恢复目标的卷内相对路径
+    /// 落盘）。与 old_path 同生共死：任何收尾路径都要把两者一起清。
+    old_meta: Option<PathBuf>,
     file: tokio::fs::File,
     /// 构造时的 size 承诺（WriteHint）；close 校验。
     hinted_size: Option<u64>,
@@ -62,7 +65,7 @@ impl LocalStager {
         final_rel: RelPath,
         final_path: PathBuf,
         tmp_path: PathBuf,
-        old_path: Option<PathBuf>,
+        stashed: Option<(PathBuf, PathBuf)>,
         file: tokio::fs::File,
         hinted_size: Option<u64>,
     ) -> Self {
@@ -71,7 +74,8 @@ impl LocalStager {
             final_rel,
             final_path,
             tmp_path,
-            old_path,
+            old_path: stashed.as_ref().map(|(old, _)| old.clone()),
+            old_meta: stashed.map(|(_, meta)| meta),
             file,
             hinted_size,
             finished: false,
@@ -87,6 +91,9 @@ impl LocalStager {
             } else {
                 let _ = tokio::fs::remove_file(old).await;
             }
+        }
+        if let Some(meta) = &self.old_meta {
+            let _ = tokio::fs::remove_file(meta).await;
         }
     }
 }
@@ -123,9 +130,12 @@ impl UploadStager for LocalStager {
             .map_err(map_io)?;
         self.finished = true;
         // 新版本已就位，stash 作废（best-effort——失败只留暂存区内不可见
-        // 文件，不致 close 失败）
+        // 文件，不致 close 失败；sidecar 与 .old 同生共死，审查 M3）
         if let Some(old) = &self.old_path {
             let _ = tokio::fs::remove_file(old).await;
+        }
+        if let Some(meta) = &self.old_meta {
+            let _ = tokio::fs::remove_file(meta).await;
         }
         let meta = tokio::fs::metadata(&self.final_path)
             .await
@@ -159,6 +169,9 @@ impl Drop for LocalStager {
                 } else {
                     let _ = std::fs::remove_file(old);
                 }
+            }
+            if let Some(meta) = &self.old_meta {
+                let _ = std::fs::remove_file(meta);
             }
         }
     }

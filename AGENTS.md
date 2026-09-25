@@ -49,7 +49,7 @@
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 1700 测试（2026-09-24：winfsp 盘符面 BUG2/3 类追修（rename 三臂/目录创建接远端先行，wide_mutations 5 测试在 winfsp 特性腿）+ L2 共享件抽取 + WebDAV 面修复批累计；既有断言零漂移；ignored 62 = 真机/平台/真网类，其中 webdav live_readthrough 7 + webdav live_matrix 10 + sftp 真机矩阵 12 + sftp live_readthrough 3 + pan115 live_matrix 6 + pan115_e2e 4 + pan123 live_matrix 3 + pan123_e2e 5）
+cargo test --workspace --no-fail-fast            # 1713 测试（2026-09-25：baidu 审查修复批（H1 分页拉齐/M1 探针持久化/M2 句柄缓存/M3 dlink 上界/M4 分片读盘）+ ck-local 审查修复批（lstat 面/大小写改名/崩窗清扫）；此前 2026-09-24 winfsp 盘符面 BUG2/3 类追修（rename 三臂/目录创建接远端先行，wide_mutations 5 测试在 winfsp 特性腿）+ L2 共享件抽取 + WebDAV 面修复批累计；既有断言零漂移；ignored 62 = 真机/平台/真网类，其中 webdav live_readthrough 7 + webdav live_matrix 10 + sftp 真机矩阵 12 + sftp live_readthrough 3 + pan115 live_matrix 6 + pan115_e2e 4 + pan123 live_matrix 3 + pan123_e2e 5）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo build -p cloudkit-cli --no-default-features --features local,baidu   # 驱动裁剪构建（K30 四 feature）；缺驱动构建运行期报可行动错误（K31 rebuild 指引），cydrive --version 显示驱动清单（K32）

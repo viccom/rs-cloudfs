@@ -121,3 +121,46 @@ CDN 三约束全落实（UA/≤4MiB/禁全量 GET，五钉测）；dlink TTL+两
 ### 验证
 
 worktree `fix/baidu-review`：ck-baidu + cloudkit-cli **324/0**（mock 级全绿）；clippy -D warnings 绿；fmt 绿；真机三轮探针 + 修复后 rebuild 组合验证 PASS；远端 `_probe_*` 目录全清（residual=0）；生产卷文件 token 未轮换未修改（活性全程可用）。
+
+## ck-local 修复批（2026-09-25 深夜，main 直做，负责人指令「开工」）
+
+### M1 symlink lstat 面（修；红证 Linux/WSL ×3）
+
+- `stat`/`mkdir` 预检/`delete`/`rename` 预检全改 `symlink_metadata`（本体形态，
+  sftp K67 先例）；`reader` **保持跟随**（读链接指向的内容——显式注释 + 特性化钉子）；
+  `writer` stash 判定保持跟随（目录性按真实目标）。list 靠 `DirEntry::metadata`
+  的 std lstat 语义天然本体——特性化钉子防改回。
+- **红证（WSL Ubuntu-24.04）**：断链 stat NotFound（修复前）→ 本体 File；活链
+  stat 报目标内容长 3 → 本体目标串长；断链 delete NotFound → 可删。
+- **实证勘误（审查断言②推翻）**：现行 std `remove_dir_all` 对 symlink-to-dir
+  已是 O_NOFOLLOW 安全、只删链（WSL rustc 探针：Ok + 链消失 + 目标完好）——
+  审查报告的「Unix ENOTDIR 删除失效」不成立于现行工具链；目录链删除腿留特性化
+  钉子。本体分支仍修 Windows junction 形态（remove_file 拒绝 reparse point →
+  remove_dir 回落）。
+- 教训：审查报告的「平台语义」类断言必须现行工具链实证后再修——本次若盲修
+  ENOTDIR 会写一条永假的注释。
+
+### M2 Windows 大小写改名（修；红证 Windows ×1）
+
+`rename` 目标预检命中时：canonicalize(from)==canonicalize(to) 且名字非逐字相同
+→ 放行让 `fs::rename` 翻拼写（winfsp C1 同款判据下沉到驱动面）。Unix 防过宽
+钉测：两个 case 变体是不同文件 → 照常 Exists 且目标不动。
+
+### M3 staging 崩窗孤儿启动清扫（修；红证 Windows ×2）
+
+- `writer` stash 前先落 **sidecar**（`.old.meta` = 卷内相对路径）——meta 写失败
+  即整体失败（绝不留无 sidecar 的 .old）；stager 三路收尾（close/abort/Drop）
+  sidecar 与 `.old` 同生共死。
+- `LocalDriver::new` 构造期 `sweep_staging`（名单制：只碰
+  `.part`/`.probe`/`.old`/`.old.meta`）：最终路径在 → 清陈旧对；缺 → 恢复旧版本
+  （父目录防御重建、恢复失败留待下次重试）；无 sidecar 的 `.old` 当垃圾清；
+  前提声明 = 同根单写者（驱动全程无锁的既有假设）。
+
+### 验证
+
+- Windows：ck-local **18/0**（sweep 白盒 2 + M2 腿 1 + 既有 15）；clippy
+  -D warnings 绿（too_many_arguments 以 `stashed: Option<(PathBuf, PathBuf)>`
+  打包消解）、fmt 绿。
+- Linux（WSL Ubuntu-24.04 原生克隆）：**24/0**（local_edge_cases 7/7 含全部
+  unix 腿）；红→绿全程双平台留证。
+- workspace **1713/0/62**（+3）；check_layers / scan_secrets 绿。
