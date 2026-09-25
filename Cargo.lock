@@ -605,7 +605,7 @@ dependencies = [
 
 [[package]]
 name = "ck-baidu"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -623,7 +623,7 @@ dependencies = [
 
 [[package]]
 name = "ck-local"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -637,7 +637,7 @@ dependencies = [
 
 [[package]]
 name = "ck-pan115"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -662,7 +662,7 @@ dependencies = [
 
 [[package]]
 name = "ck-pan123"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -684,7 +684,7 @@ dependencies = [
 
 [[package]]
 name = "ck-sftp"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -703,7 +703,7 @@ dependencies = [
 
 [[package]]
 name = "ck-telegram"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -719,7 +719,7 @@ dependencies = [
 
 [[package]]
 name = "ck-webdav"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -797,7 +797,7 @@ checksum = "c8d4a3bb8b1e0c1050499d1815f5ab16d04f0959b233085fb31653fbfc9d98f9"
 
 [[package]]
 name = "cloudkit-cli"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -838,7 +838,7 @@ dependencies = [
 
 [[package]]
 name = "cloudkit-core"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -862,7 +862,7 @@ dependencies = [
 
 [[package]]
 name = "cloudkit-crypto"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "aes-gcm",
  "base64 0.23.1",
@@ -875,7 +875,7 @@ dependencies = [
 
 [[package]]
 name = "cloudkit-platform"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "cloudkit-core",
  "tempfile",
@@ -885,7 +885,7 @@ dependencies = [
 
 [[package]]
 name = "cloudkit-storage"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -900,7 +900,7 @@ dependencies = [
 
 [[package]]
 name = "cloudkit-sync-server"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "anyhow",
  "axum",
@@ -922,7 +922,7 @@ dependencies = [
 
 [[package]]
 name = "cloudkit-web"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "axum",
@@ -940,7 +940,7 @@ dependencies = [
 
 [[package]]
 name = "cloudkit-webdav"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "bytes",
@@ -959,7 +959,7 @@ dependencies = [
 
 [[package]]
 name = "cloudkit-winfsp"
-version = "0.10.0"
+version = "0.12.0"
 dependencies = [
  "async-trait",
  "cloudkit-core",
