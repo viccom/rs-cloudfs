@@ -387,8 +387,10 @@ impl StorageDriver for SftpDriver {
         // 源必须存在（显式预检，语义早失败）
         self.stat_path(from).await?;
         // 目标已存在 → Exists（SFTP 服务器对 overwrite rename 的行为
-        // 不一致——OpenSSH 拒绝、部分实现覆盖——预检归一）
-        match self.stat_path(to).await {
+        // 不一致——OpenSSH 拒绝、部分实现覆盖——预检归一）。预检走
+        // **lstat**（M4：悬空链也是既有目录项——跟随 stat 对悬空链误报
+        // NotFound，把服务端必然的拒绝漏成 Io/假成功）。
+        match self.client.symlink_metadata(&self.path(to)).await {
             Ok(_) => return Err(StorageError::Exists),
             Err(StorageError::NotFound) => {}
             Err(other) => return Err(other),
@@ -402,8 +404,11 @@ impl StorageDriver for SftpDriver {
             Ok(()) => Ok(()),
             // 竞态窗内目标被抢占创建（reject 形态服务器对已存在目标回
             // Failure→Io）：按 trait 契约归一 Exists——镜像 mkdir 的
-            // 竞态臂（审查修复：修复前该交错 surfaced 为 Io）
-            Err(_) if self.stat_path(to).await.is_ok() => Err(StorageError::Exists),
+            // 竞态臂（审查修复：修复前该交错 surfaced 为 Io）。判定同
+            // 走 lstat（与预检同面，悬空链形态一致）。
+            Err(_) if self.client.symlink_metadata(&self.path(to)).await.is_ok() => {
+                Err(StorageError::Exists)
+            }
             Err(other) => Err(other),
         }
     }
@@ -643,7 +648,12 @@ impl UploadStager for SftpStager {
                 );
             if !already_committed {
                 self.finished = true;
-                self.restore_scene().await;
+                // rename 未确认落地（K67 重放窗的否臂）：恢复 writer 打开
+                // 前状态。final 可能被占（我方 rename 实已落地但回复形态
+                // 不在豁免内 / 竞态外物）——先清出 final 再走常规恢复；
+                // 直接 restore_scene 的 stash→final rename 会被占据的
+                // final 拒绝，其旧兜底还会误删 stash（旧版本唯一副本）。
+                self.restore_scene_after_commit().await;
                 return Err(e);
             }
         }
@@ -653,6 +663,11 @@ impl UploadStager for SftpStager {
         let attrs = self.client.metadata(&final_remote).await?;
         let remote_size = attrs.len();
         if remote_size != self.written {
+            // 提交已落但内容不可信（服务端短写/并发篡改）：同走提交窗
+            // 恢复——嫌疑版本清除、旧版本从 stash 复位。修复前该分支
+            // 直接返回：final 停在嫌疑版本，.old 永久遗留（旧版本从此
+            // 不可见 = 数据丢失，H1）。
+            self.restore_scene_after_commit().await;
             return Err(StorageError::Io(format!(
                 "sftp upload size mismatch: wrote {} bytes but the remote reports {remote_size}",
                 self.written
@@ -690,10 +705,21 @@ impl SftpStager {
         }
         if let Some(old) = &self.stash_remote {
             let final_remote = remote_path(&self.client.params().root, &self.final_rel);
-            if self.client.rename(old, &final_remote).await.is_err() {
-                let _ = self.client.remove_file(old).await;
-            }
+            // 复位失败只留不可见残件（模块文档「恢复失败只留不可见
+            // 残件」契约）——绝不删 stash 本体（旧版本唯一副本；修复前
+            // 的删除兜底在 final 被占形态下就是数据丢失，H1 家族）。
+            let _ = self.client.rename(old, &final_remote).await;
         }
+    }
+
+    /// 提交窗失败的恢复（close 的 rename 之后各失败臂共用）：回到
+    /// writer 打开前状态——先清出 final（NotFound = 本就空缺；占据者
+    /// 是我方嫌疑字节或竞态外物，staging 契约下该路径归 writer 所有），
+    /// 再走常规 [`Self::restore_scene`]（删 part 残件 + stash→final）。
+    async fn restore_scene_after_commit(&self) {
+        let final_remote = remote_path(&self.client.params().root, &self.final_rel);
+        let _ = self.client.remove_file(&final_remote).await;
+        self.restore_scene().await;
     }
 }
 

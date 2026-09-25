@@ -739,3 +739,170 @@ async fn rename_race_into_existing_target_reports_exists() {
         "a rename racing into a freshly created target must surface Exists, not Io"
     );
 }
+
+// --------------------------------- 审查修复批二（sftp-review，2026-09-25）---
+
+/// H1：close 的硬仗②大小校验失败必须恢复 writer 打开前状态——服务端
+/// 短写（close 确认正常、落盘字节 < written）时，嫌疑版本清除、旧版
+/// 本从 .old stash 复位回 final。修复前该分支直接返回 Err：final 停在
+/// 短写版本、旧版本遗留 .old 永久不可见（数据丢失级）。
+#[tokio::test]
+async fn close_size_mismatch_restores_the_previous_version() {
+    let (stub, driver) = setup().await;
+    stub.add_file("/f.bin", b"old-old!");
+
+    let hint = WriteHint {
+        size: Some(7),
+        ..Default::default()
+    };
+    let mut stager = driver.writer(&rel("f.bin"), &hint).await.expect("writer");
+    stager.write(b"newdata").await.expect("write");
+    // 服务端短写注入：close 落盘只保留 3 字节（part 路径前缀匹配）
+    stub.shrink_next_close("/f.bin.cksftp-", 3);
+
+    let err = stager
+        .close()
+        .await
+        .expect_err("size mismatch must fail the close");
+    assert!(
+        matches!(err, StorageError::Io(ref detail) if detail.contains("size mismatch")),
+        "{err:?}"
+    );
+    // 修复点：旧版本复位回 final，嫌疑版本与暂存残件清空
+    assert_eq!(
+        stub.file_bytes("/f.bin").as_deref(),
+        Some(b"old-old!".as_slice()),
+        "the previous version must be restored after the size-mismatch failure"
+    );
+    assert!(
+        stub.staging_artifacts().is_empty(),
+        "no staging residue may survive: {:?}",
+        stub.staging_artifacts()
+    );
+}
+
+/// H2：目录 rename 的子树迁移必须携带 symlink——真机 OpenSSH 的
+/// rename 是服务端原子子树迁移，链接一并随迁。桩此前只搬 dirs/files
+/// 两张表（symlink 键留旧前缀：新路径下不可见、删除删不到）。
+#[tokio::test]
+async fn rename_directory_subtree_carries_symlinks() {
+    let (stub, driver) = setup().await;
+    stub.add_dir("/sub");
+    stub.add_file("/sub/f.bin", b"payload");
+    stub.add_dir("/outside");
+    stub.add_file("/outside/keep.txt", b"guard");
+    stub.add_symlink("/sub/link", "/outside");
+
+    driver
+        .rename(&rel("sub"), &rel("moved"))
+        .await
+        .expect("rename");
+
+    // 链随迁：新路径下可见，本体是链接（lstat 面 stat → File 形态）
+    let entry = driver
+        .stat(&rel("moved/link"))
+        .await
+        .expect("the symlink must be visible under the new prefix");
+    assert_eq!(entry.kind, cloudkit_storage::EntryKind::File);
+
+    // 删除新子树：链接按文件语义删（绝不下潜 /outside）
+    driver
+        .delete(&entry_id(&driver, "moved"))
+        .await
+        .expect("recursive delete");
+    assert!(driver.stat(&rel("moved")).await.is_err(), "subtree gone");
+    assert_eq!(
+        stub.file_bytes("/outside/keep.txt").as_deref(),
+        Some(b"guard".as_slice()),
+        "the link target must survive the recursive delete"
+    );
+    assert_eq!(
+        stub.symlink_target("/moved/link"),
+        None,
+        "the moved link must be removed with its subtree"
+    );
+}
+
+/// M4-甲：rename 撞悬空 symlink 目标 → `Exists`。悬空链也是既有目录
+/// 项（OpenSSH 的 rename 恒拒覆盖）；驱动预检此前走跟随 stat——悬空
+/// 链误报 NotFound，把服务端必然的拒绝漏成 Io（桩修复前甚至是假成
+/// 功 + 桩状态错乱）。
+#[tokio::test]
+async fn rename_onto_dangling_symlink_reports_exists() {
+    let (stub, driver) = setup().await;
+    stub.add_file("/src.txt", b"src");
+    stub.add_dangling_symlink("/dangling", "/nowhere");
+
+    let err = driver
+        .rename(&rel("src.txt"), &rel("dangling"))
+        .await
+        .expect_err("an existing entry (even a dangling link) must be refused");
+    assert!(matches!(err, StorageError::Exists), "{err:?}");
+    // 源原位、目标仍是原链（桩状态未被写花）
+    assert_eq!(
+        stub.file_bytes("/src.txt").as_deref(),
+        Some(b"src".as_slice())
+    );
+    assert_eq!(
+        stub.symlink_target("/dangling").as_deref(),
+        Some("/nowhere"),
+        "the target link must be untouched"
+    );
+    assert!(
+        stub.file_bytes("/dangling").is_none(),
+        "no file may be created over the link"
+    );
+}
+
+/// M4-乙：活链目标同款（跟随预检即可命中——契约钉，修复前后恒绿）。
+#[tokio::test]
+async fn rename_onto_live_symlink_reports_exists() {
+    let (stub, driver) = setup().await;
+    stub.add_file("/src.txt", b"src");
+    stub.add_dir("/guard");
+    stub.add_symlink("/link", "/guard");
+
+    let err = driver
+        .rename(&rel("src.txt"), &rel("link"))
+        .await
+        .expect_err("a live link target must be refused");
+    assert!(matches!(err, StorageError::Exists), "{err:?}");
+    assert!(stub.is_dir("/guard"), "the link target must be untouched");
+}
+
+/// M3：stat/lstat 两个注入旋钮互不越界——stat 旋钮不被任何 lstat 面
+/// 消费（delete、driver.stat 非根），lstat 旋钮在 driver.stat 的真实
+/// 动词上生效（修复前单槽位共享 = 注入面比文档宽，conformance ⑤ 靠
+/// lstat 偷吃 stat 槽位假绿）。
+#[tokio::test]
+async fn stat_and_lstat_injection_knobs_are_independent() {
+    use russh_sftp::protocol::StatusCode;
+
+    let (stub, driver) = setup().await;
+    stub.add_file("/f.txt", b"x");
+    stub.add_file("/g.txt", b"y");
+
+    // stat 旋钮不被 lstat 面消费：delete（symlink_metadata = lstat）与
+    // driver.stat（非根 = SSH_FXP_LSTAT）都不受 stat 注入影响
+    stub.fail_next_stat(StatusCode::PermissionDenied);
+    driver
+        .delete(&entry_id(&driver, "f.txt"))
+        .await
+        .expect("lstat must not consume the stat injection");
+    driver
+        .stat(&rel("g.txt"))
+        .await
+        .expect("driver.stat issues lstat for non-root paths; the stat knob must not fire");
+
+    // lstat 旋钮恰好在 driver.stat 的真实动词上生效（conformance ⑤
+    // 的注入语义自此对齐 K67 后的 stat 实现）
+    stub.fail_next_lstat(StatusCode::PermissionDenied);
+    let err = driver
+        .stat(&rel("g.txt"))
+        .await
+        .expect_err("the lstat injection must fire on driver.stat");
+    assert!(
+        matches!(err, StorageError::Unauthorized { recoverable: false }),
+        "{err:?}"
+    );
+}

@@ -34,9 +34,11 @@
 //! - **host key**：服务端起好后经 [`Stub::fingerprint`] 暴露
 //!   `SHA256:...`（`ssh_key::PublicKey::fingerprint(HashAlg::Sha256)` 的
 //!   Display 形态，与 client.rs `check_server_key` 逐字同源）。
-//! - **stat 故障注入**（SF3 增补，conformance 断言⑤）：
-//!   [`Stub::fail_next_stat`] 让下一次 stat 以给定状态码失败——错误
-//!   映射经真实协议面回放（服务器 Status 码 → 客户端映射函数）。
+//! - **stat/lstat 故障注入**（SF3 增补；M3 拆分为双旋钮）：错误映射
+//!   经真实协议面回放（服务器 Status 码 → 客户端映射函数）。
+//!   [`Stub::fail_next_lstat`] = conformance 断言⑤的注入面（driver.stat
+//!   非根走 SSH_FXP_LSTAT，K67 语义）；[`Stub::fail_next_stat`] = stat
+//!   跟随面（卷根腿/connect）的对称旋钮，两注入面互不越界。
 //!
 //! SF3 的 conformance 复用本桩（`mod stub;` 从任意集成测试引入）。
 
@@ -112,14 +114,22 @@ struct VfsState {
     dir_handles: HashMap<String, DirHandle>,
     next_handle: u64,
     mtime_tick: u32,
-    /// 一次性 stat 故障注入（conformance 断言⑤的注入面）：下一次
-    /// `stat` 请求直接以该状态码失败——驱动的错误映射经真实协议
-    /// 回放（服务器回 Status 码 → 客户端 map_status）。消费即清空。
+    /// 一次性 stat 故障注入：下一次 `stat`（SSH_FXP_STAT，跟随面——
+    /// driver.stat 卷根腿 / transport connect）直接以该状态码失败。
+    /// 消费即清空。**只归 `stat`**——与 lstat 旋钮互不越界（M3）。
     fail_next_stat: Option<StatusCode>,
+    /// 一次性 lstat 故障注入（SSH_FXP_LSTAT 面）：**conformance ⑤ 的
+    /// 注入面**——driver.stat 的非根路径自 K67 起实现为
+    /// symlink_metadata，注入必须打在真实动词上；M3 独立性测试同用。
+    fail_next_lstat: Option<StatusCode>,
     /// 竞态注入（rename 撞车测试的注入面）：集合内的路径对 stat/
     /// lstat 请求隐身（NoSuchFile），在下一个 rename 请求到达时
     /// 现形——回放「驱动预检放行、执行撞已存在目标」的交错。
     hidden: BTreeSet<String>,
+    /// H1 注入面：下一次可写 close 落盘时，路径以前缀开头的句柄数据
+    /// 截到 N 字节——回放「服务端短写」（close 确认正常但落盘尺寸与
+    /// 客户端 written 不符，硬仗②校验的触发器）。
+    shrink_next_close: Option<(String, u64)>,
 }
 
 impl VfsState {
@@ -133,7 +143,9 @@ impl VfsState {
             next_handle: 0,
             mtime_tick: 0,
             fail_next_stat: None,
+            fail_next_lstat: None,
             hidden: BTreeSet::new(),
+            shrink_next_close: None,
         }
     }
 
@@ -506,7 +518,9 @@ impl russh_sftp::server::Handler for SftpHandler {
     /// SF4 真机矩阵揭出的 GAP-A02 缺陷在桩侧的可回放形态）。
     async fn lstat(&mut self, id: u32, path: String) -> Result<Attrs, Self::Error> {
         let mut vfs = lock_vfs!(self);
-        if let Some(code) = vfs.fail_next_stat.take() {
+        // M3：lstat 消费自己的注入旋钮——与 stat 的 fail_next_stat 互
+        // 不越界（注入面 = 文档声明）。
+        if let Some(code) = vfs.fail_next_lstat.take() {
             return Err(code);
         }
         if vfs.hidden.contains(&path) {
@@ -614,14 +628,16 @@ impl russh_sftp::server::Handler for SftpHandler {
         if let Some(mut fh) = vfs.file_handles.remove(&handle) {
             if fh.writable {
                 // commit-on-close：写缓冲此刻落 VFS
+                let mut data = std::mem::take(&mut fh.buf);
+                // H1 注入面：服务端短写回放（截到 N 字节再落盘——close
+                // 确认正常，远端尺寸与客户端 written 不符）
+                if let Some((prefix, size)) = vfs.shrink_next_close.take() {
+                    if fh.path.starts_with(&prefix) {
+                        data.truncate(size as usize);
+                    }
+                }
                 let mtime = vfs.next_mtime();
-                vfs.files.insert(
-                    fh.path.clone(),
-                    FileNode {
-                        data: std::mem::take(&mut fh.buf),
-                        mtime,
-                    },
-                );
+                vfs.files.insert(fh.path.clone(), FileNode { data, mtime });
             }
             self.counters
                 .open_file_handles
@@ -741,11 +757,19 @@ impl russh_sftp::server::Handler for SftpHandler {
         // 正常处理——已存在目标按 OpenSSH 形态回 Failure）
         vfs.hidden.clear();
         let source_is_dir = vfs.dirs.contains(&oldpath);
-        if !source_is_dir && !vfs.files.contains_key(&oldpath) {
+        if !source_is_dir
+            && !vfs.files.contains_key(&oldpath)
+            && !vfs.symlinks.contains_key(&oldpath)
+        {
             return Err(StatusCode::NoSuchFile);
         }
-        if vfs.files.contains_key(&newpath) || vfs.dirs.contains(&newpath) {
-            // OpenSSH：overwrite rename 恒拒（Failure 形态）
+        if vfs.files.contains_key(&newpath)
+            || vfs.dirs.contains(&newpath)
+            || vfs.symlinks.contains_key(&newpath)
+        {
+            // OpenSSH：overwrite rename 恒拒（Failure 形态）。M4：链接
+            // 也是既有目录项——此前漏查 symlinks 表会把文件写到与链
+            // 同键的位置（files/symlinks 两表各存一份，状态错乱）。
             return Err(StatusCode::Failure);
         }
         let new_parent = VfsState::parent_of(&newpath).to_string();
@@ -753,7 +777,9 @@ impl russh_sftp::server::Handler for SftpHandler {
             return Err(StatusCode::NoSuchFile);
         }
         if source_is_dir {
-            // 子树整体迁移（路径键模型下重写前缀——目录与文件都要搬）
+            // 子树整体迁移（路径键模型下重写前缀——目录、文件与链接
+            // 都要搬；H2：真机 rename 是服务端原子迁移，链接此前漏搬
+            // 让它留旧前缀——新路径不可见、删除删不到）
             let prefix = format!("{oldpath}/");
             let moved_dirs: Vec<String> = vfs
                 .dirs
@@ -781,6 +807,21 @@ impl russh_sftp::server::Handler for SftpHandler {
                 vfs.files
                     .insert(format!("{newpath}/{}", &path[prefix.len()..]), node);
             }
+            let moved_links: Vec<String> = vfs
+                .symlinks
+                .range(prefix.clone()..)
+                .take_while(|(p, _)| p.starts_with(&prefix))
+                .map(|(p, _)| p.clone())
+                .collect();
+            for path in moved_links {
+                let target = vfs.symlinks.remove(&path).expect("prefix-filtered");
+                vfs.symlinks
+                    .insert(format!("{newpath}/{}", &path[prefix.len()..]), target);
+            }
+        } else if let Some(target) = vfs.symlinks.remove(&oldpath) {
+            // 链接本体的 rename（OpenSSH 语义：rename 搬链接自身，
+            // 不解析目标）
+            vfs.symlinks.insert(newpath, target);
         } else {
             let node = vfs.files.remove(&oldpath).expect("checked above");
             vfs.files.insert(newpath, node);
@@ -959,6 +1000,23 @@ impl Stub {
         vfs.symlinks.insert(link.to_string(), target.to_string());
     }
 
+    /// 预置一个**悬空**符号链接（目标不创建——解析必 NotFound；M4
+    /// 测试面：「链接也是既有目录项」的拒绝形态）。
+    pub fn add_dangling_symlink(&self, link: &str, target: &str) {
+        let mut vfs = self.lock_vfs();
+        let parent = VfsState::parent_of(link).to_string();
+        assert!(
+            vfs.dirs.contains(&parent),
+            "stub: add_dangling_symlink parent must exist ({link})"
+        );
+        vfs.symlinks.insert(link.to_string(), target.to_string());
+    }
+
+    /// 读回链接目标（桩状态一致性断言面）。
+    pub fn symlink_target(&self, link: &str) -> Option<String> {
+        self.lock_vfs().symlinks.get(link).cloned()
+    }
+
     /// 读回文件字节（上传往返断言）。
     pub fn file_bytes(&self, path: &str) -> Option<Vec<u8>> {
         self.lock_vfs().files.get(path).map(|n| n.data.clone())
@@ -989,10 +1047,26 @@ impl Stub {
         self.counters.auth_successes.load(Ordering::SeqCst)
     }
 
-    /// 注入一次 stat 故障（conformance 断言⑤）：下一次到达服务端的
-    /// `stat`/`lstat` 直接以 `code` 失败，消费后恢复。
+    /// 注入一次 stat 故障：下一次到达服务端的 `stat`（SSH_FXP_STAT，
+    /// 跟随面——driver.stat 卷根腿 / transport connect）直接以 `code`
+    /// 失败，消费后恢复。**只归 stat**——lstat 走
+    /// [`Self::fail_next_lstat`]（M3 拆分）。
     pub fn fail_next_stat(&self, code: StatusCode) {
         self.lock_vfs().fail_next_stat = Some(code);
+    }
+
+    /// lstat 故障注入（SSH_FXP_LSTAT 面）：**conformance 断言⑤的注入
+    /// 面**——driver.stat 的非根路径自 K67 起实现为 `symlink_metadata`，
+    /// 注入必须打在驱动实际发出的动词上。
+    pub fn fail_next_lstat(&self, code: StatusCode) {
+        self.lock_vfs().fail_next_lstat = Some(code);
+    }
+
+    /// H1 注入面：下一次可写 close 落盘时，句柄路径以 `path_prefix`
+    /// 开头的把数据截到 `size` 字节——回放「服务端短写」（close 确认
+    /// 正常但远端尺寸与客户端 written 不符，硬仗②校验的触发器）。
+    pub fn shrink_next_close(&self, path_prefix: &str, size: u64) {
+        self.lock_vfs().shrink_next_close = Some((path_prefix.to_string(), size));
     }
 
     /// 竞态注入（rename 撞车测试）：路径对 stat/lstat 隐身
