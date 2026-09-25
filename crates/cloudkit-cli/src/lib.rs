@@ -1143,7 +1143,8 @@ pub type ReleaseFuture<'a> =
 
 /// The K50 mount-release step, abstracted over the mount backend so the
 /// removal sequence (and its abort path) is the same code for every
-/// backend — and testable in the default (winfsp-off) build. The
+/// backend — and testable without a WinFsp runtime (tests inject this
+/// trait). The
 /// default implementations are the WF4 pieces: [`WinFspRelease`] runs
 /// the real `MountHandle::unmount` (its own disappearance poll, the 10s
 /// K50 window) on the blocking pool; [`WebDavRelease`] deletes the
@@ -6764,15 +6765,17 @@ fn spawn_periodic_sync(
 
 // ------------------------------------------- mount backends (Phase 3 / WF4) ---
 //
-// K40: `mount_backend = "webdav" | "winfsp"` selects how a volume becomes
-// a Windows drive letter. `webdav` (the default) is the `net use` mapping
-// onto the process WebDAV endpoint — byte-identical to the Python
-// baseline. `winfsp` mounts the volume in-process through the native API
-// and needs two things the config cannot guarantee: a binary built with
-// `--features winfsp` (K38's GPL isolation keeps the feature off by
-// default) and an installed WinFsp runtime. When either is missing the
-// mount flow **degrades visibly to WebDAV** — an error log, a printed
-// notice and a per-volume banner label — and never refuses to start.
+// K87/K89: `mount_backend = "winfsp" | "webdav"` selects how a volume
+// becomes a Windows drive letter; the default is `winfsp` (in-process
+// native mount, and the feature is compiled into the default binary).
+// `webdav` is the `net use` mapping onto the process WebDAV endpoint —
+// byte-identical to the Python baseline — and needs one admin
+// `cydrive fix-reg` (explicit opt-in). The winfsp arm needs one thing
+// the config cannot guarantee: an installed WinFsp runtime. When the
+// runtime is missing (or a mount fails) there is **no net use
+// fallback**: the volume keeps no drive letter, stays reachable through
+// the WebDAV endpoint/dashboard, and the reason is logged and printed
+// visibly.
 //
 // The decision is a pure function of the config and the capability, which
 // is what makes it testable in both build legs (`tests/mount_backend.rs`).

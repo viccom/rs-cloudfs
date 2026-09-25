@@ -25,7 +25,7 @@
 ## 1. Windows（原生构建）
 
 ```powershell
-# 常规（默认四驱动 telegram/baidu/local/sftp；web 仪表盘/WebDAV 无条件编入）
+# 常规（默认七驱动 telegram/baidu/local/sftp/pan115/pan123/webdav + winfsp 挂载；web 仪表盘/WebDAV 无条件编入）
 cargo build --release -p cloudkit-cli
 
 # 裁剪（K30 四 feature；缺驱动运行期报可行动错误 K31；--version 显示驱动清单 K32）
@@ -37,7 +37,7 @@ cargo build --release -p cloudkit-cli --no-default-features --features sftp,winf
 ```
 
 - **winfsp 腿前置**：`LIBCLANG_PATH=D:/Python312/Lib/site-packages/clang/native`（winfsp-sys 的 bindgen 依赖；K89 起 winfsp 进 default，本仓 `.cargo/config.toml` 已内置该路径，命令行前缀可省）；**只能 MSVC 工具链**（对 gnu 工具链 panic——已知陷阱）。
-- **winfsp 是 GPL 绑定**（**K89 起（2026-09-25 负责人裁决）默认编译**，K40 的「永不进 `default`」就此废止）：默认二进制含 GPL 依赖（私有自用分发）；`--no-default-features` 裁剪构建仍 GPL-free。
+- **winfsp 是 GPL 绑定**（**K89 起默认编译**，2026-09-25 负责人裁决）：默认二进制含 GPL 依赖（私有自用分发）；`--no-default-features` 裁剪构建仍 GPL-free。
 - **exe 锁**：运行中的实例锁 `target/release/cydrive.exe`（替换报 os error 5）——先 `cydrive stop` 再 build。
 - doctor 的 winfsp 行是 **feature 感知**文案（434a668）：编了 winfsp 说 "ready"，没编才提示重建。
 

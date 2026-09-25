@@ -12,9 +12,8 @@
 //! `rename`, `set_delete`, `set_volume_label`).
 //!
 //! Deliberately NOT implemented here:
-//! - **WF4** owns `winfsp_init`, the host mount/unmount and the K40
-//!   WebDAV fallback; the DLL preload and mount-point rules live there,
-//!   not here.
+//! - **WF4** owns `winfsp_init` and the host mount/unmount; the DLL
+//!   preload and mount-point rules live there, not here.
 //!
 //! Case sensitivity (known, deliberate): lookups are byte-exact against
 //! the `/`-separated rows (`RelPath`'s contract). Windows sends the names

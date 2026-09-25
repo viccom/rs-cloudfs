@@ -7,24 +7,20 @@
 # (keyring windows-native / sync-secret-service, winreg, ...) are covered.
 all-features = true
 
-# K38 → K89 evolution (docs/plans/2026-09-10-phase3-winfsp.md §1;
-# docs/decisions.md K89, 2026-09-25): K38 kept the `winfsp` feature off
-# by default so the default binary stayed GPL-free. Since K89 (owner
-# decision) the feature is IN cloudkit-cli's default — the shipped
-# Windows binary deliberately links the GPL-3.0 winfsp-rs bindings
-# (private, self-hosted distribution). The name-based exclusion below
-# therefore no longer models "GPL never ships"; it keeps the two
-# bindgen/vendored crates out of cargo-deny's license/ban/advisory
-# graphs so `all-features = true` stays usable and the strong-copyleft
-# allow-list policy for everything ELSE is preserved. Both crates are
-# still excluded from the driver-pruned graphs (K30) and from every
-# Linux/macOS target (cfg(windows) gate); the compensating control is
-# cloudkit-winfsp's own test suite, which now runs in the main CI
-# Windows leg and compiles/exercises exactly the excluded subtree. The
-# old mechanical CI `cargo tree` isolation assertion was inverted with
-# K89 (the default graph must KEEP winfsp). Any future crate added to
-# this list needs the same statement of edge, reachability and
-# compensation.
+# The GPL-3.0 winfsp pair is excluded from cargo-deny's graphs BY NAME
+# (K89, 2026-09-25): since the owner's decision the `winfsp` feature
+# ships in cloudkit-cli's default — the Windows binary deliberately
+# links winfsp-rs (private, self-hosted distribution). This exclusion
+# keeps `all-features = true` usable and the strong-copyleft
+# allow-list below clean for everything ELSE. Consequences stated
+# honestly: the excluded crates are invisible to licenses, advisories
+# and bans alike; winfsp-sys is bindgen output plus a vendored DLL
+# import lib with no independent source/advisory feed; the compensating
+# control is cloudkit-winfsp's own test suite, which runs in the main
+# CI Windows leg and compiles and exercises exactly the excluded
+# subtree. Driver-pruned builds (K30) and every Linux/macOS target
+# (cfg(windows) gate) stay winfsp-free. Any future crate added to this
+# list needs the same statement of edge, reachability and compensation.
 exclude = ["winfsp", "winfsp-sys"]
 
 [licenses]

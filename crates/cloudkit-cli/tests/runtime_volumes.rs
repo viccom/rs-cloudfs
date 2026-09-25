@@ -806,8 +806,9 @@ async fn remove_drain_aborts_early_when_new_uploads_keep_arriving() {
 /// release reports failure stops the removal — the volume stays
 /// registered and its mount entry untouched; only a release that
 /// succeeds lets the removal complete. The probe is injected through the
-/// live-volume table seam, so this runs in the default (winfsp-off)
-/// build against the same code the winfsp unmount plugs into.
+/// live-volume table seam, so this runs in a plain test build — no
+/// WinFsp runtime needed — against the same code the winfsp unmount
+/// plugs into.
 #[tokio::test]
 async fn unmount_failure_aborts_the_removal_with_the_volume_intact() {
     let dir = tempfile::tempdir().expect("tempdir");

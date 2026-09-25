@@ -7,8 +7,10 @@
 //!
 //! Everything is behind `cfg(all(windows, feature = "winfsp"))`:
 //! without the feature (or off Windows) this crate compiles to an empty
-//! library and the workspace graph contains no winfsp dependency at all
-//! (K38 license isolation — the bindings are GPL-3.0).
+//! library, and the winfsp/windows dependencies only resolve on Windows
+//! (they are `cfg(windows)`-gated). Since K89 the shipped binary builds
+//! this feature by default; the GPL-3.0 bindings make that binary
+//! private-distribution only.
 //!
 //! Batch status (WF1 = skeleton + async bridge + readonly metadata face;
 //! WF2 = the read path):
@@ -20,8 +22,7 @@
 //!   bounded windows or [`reader::LocalReader`] over the hydrate arm),
 //!   the zero-side-effect `flush` and the K41 handle grace period;
 //!   WF3 adds the staged write path and the filesystem operations; WF4
-//!   the mount lifecycle, `winfsp_init` error surfacing and the K40
-//!   fallback to WebDAV.
+//!   the mount lifecycle and `winfsp_init` error surfacing.
 #![cfg_attr(not(all(windows, feature = "winfsp")), allow(unused))]
 
 #[cfg(all(windows, feature = "winfsp"))]

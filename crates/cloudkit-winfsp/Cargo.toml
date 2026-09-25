@@ -8,12 +8,11 @@ license.workspace = true
 [lints]
 workspace = true
 
-# K38 originally kept this feature off by default; **K89 (2026-09-25,
-# owner decision) turns it on via cloudkit-cli's `default`** — the GPL
-# line is accepted for the private, self-hosted binary. The feature
-# stays optional so `--no-default-features` builds (K30 driver pruning,
-# the CI `none` leg) keep a winfsp-free graph, and the target gate
-# below keeps every Linux/macOS build winfsp-free regardless.
+# K89 (2026-09-25, owner decision): default-on in the shipped binary
+# via cloudkit-cli's `default`. The feature stays optional so
+# `--no-default-features` builds (K30 driver pruning, the CI `none`
+# leg) keep a winfsp-free graph, and the target gate below keeps every
+# Linux/macOS build winfsp-free regardless.
 [features]
 winfsp = ["dep:winfsp", "dep:windows", "dep:futures-util"]
 

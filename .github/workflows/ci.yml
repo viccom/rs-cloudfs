@@ -62,10 +62,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       # K89 (2026-09-25, owner decision): the winfsp mount backend is a
-      # default capability — the shipped binary links the GPL-3.0
-      # winfsp-rs bindings on Windows. This guard is the inverse of the
-      # old K38 isolation check: the default graph must KEEP winfsp, so
-      # a future Cargo.toml edit that silently drops it turns red here.
+      # default capability — the shipped Windows binary links the
+      # GPL-3.0 winfsp-rs bindings. This guard fails if a future
+      # Cargo.toml edit silently drops it from the default graph.
       # `--prefix none --format "{lib}"` prints the bare library name
       # per line — the default format also prints the source path, which
       # would match this repository's own checkout path on a worktree

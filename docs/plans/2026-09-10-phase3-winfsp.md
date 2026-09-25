@@ -1,4 +1,5 @@
 # Phase 3：WinFsp 类本地盘挂载执行计划（简洁高效路线）
+> 编者注（2026-09-25）：K89 起 winfsp 已入 cloudkit-cli `default`，本文的「feature 默认关 / GPL-free 隔离」纪律已废止——现状见 decisions.md K89 与 docs/platform-builds.md。
 
 > **For Claude:** REQUIRED SUB-SKILL: 使用 executing-plans 编排执行（hub-and-spoke，TDD 红→绿留证；真机批次主会话执行）。
 

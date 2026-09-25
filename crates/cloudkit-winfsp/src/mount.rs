@@ -10,8 +10,9 @@
 //!   fails on a stock install — see the spike's finding) and finally
 //!   `winfsp::winfsp_init()`. Every failure is a *reason string*, never a
 //!   panic and never a process exit: that reason is what the CLI reports
-//!   and degrades from (K40's fallback to WebDAV), and it is why the CI
-//!   box (no WinFsp at all) can run this code path.
+//!   to the user (K87: no net use fallback — the volume just keeps no
+//!   drive letter), and it is why the CI box (no WinFsp at all) can run
+//!   this code path.
 //! * [`normalize_mount_point`] is the only accepted mount-point shape: a
 //!   drive letter (`"Q:"`). The FUSE-era `\\?\` device forms are refused
 //!   (K38 — this adapter is not the compat layer), as is everything that

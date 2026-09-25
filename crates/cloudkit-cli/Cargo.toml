@@ -31,16 +31,12 @@ sftp = ["dep:ck-sftp"]
 pan115 = ["dep:ck-pan115"]
 pan123 = ["dep:ck-pan123"]
 webdav = ["dep:ck-webdav"]
-# WinFsp mount backend (Phase 3, K38/K40): **default-on since K89
-# (2026-09-25, owner decision)** — the shipped binary now matches the
-# runtime's `mount_backend = "winfsp"` default (K87) out of the box.
-# The feature pulls the GPL-3.0 winfsp-rs bindings into the graph: the
-# default binary is no longer GPL-free (private, self-hosted
-# distribution), while `--no-default-features` builds (K30 driver
-# pruning, the CI `none` leg) keep a winfsp-free graph. WF4 wires the
-# actual `mount_backend = "winfsp"` dispatch; WF1 landed the dependency
-# edge, the feature forwarding, and build.rs' delay-load link args (the
-# shipped exe is the artifact that needs them).
+# WinFsp mount backend (K89, 2026-09-25 owner decision): default-on —
+# the shipped binary mounts volumes in-process (the K87 runtime default
+# `mount_backend = "winfsp"`) out of the box. The GPL-3.0 winfsp-rs
+# bindings make the default binary private-distribution only;
+# `--no-default-features` builds (K30 driver pruning, the CI `none`
+# leg) and Linux/macOS targets (cfg(windows) gate) stay winfsp-free.
 winfsp = ["dep:cloudkit-winfsp", "cloudkit-winfsp/winfsp"]
 
 [dependencies]

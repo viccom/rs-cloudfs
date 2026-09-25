@@ -1,4 +1,5 @@
 # Phase 3 WinFsp 任务跟踪单
+> 编者注（2026-09-25）：K89 起 winfsp 已入 `default`，本文遗留的「feature 默认关 / 不进 default」表述为历史批记录——现状见 decisions.md K89。
 
 > 计划：docs/plans/2026-09-10-phase3-winfsp.md ｜ 裁决 K38-K46 ｜ 研究：docs/reports/2026-09-10-rclone-vfs-winfsp-study.md
 > worktree：`feat/winfsp`（收口 merge 回 main）。
