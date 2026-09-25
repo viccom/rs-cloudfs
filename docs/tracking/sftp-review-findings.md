@@ -108,6 +108,17 @@
 3. **[L] rename 源为悬空 symlink**——源预检走跟随 stat，悬空链源报 NotFound（POSIX 下 rename 悬空链合法）。
 4. **[L] 桩 `add_symlink` 对文件目标会向 dirs 表插入文件路径**（目标自动建目录逻辑不分文件/目录）——现无测试触发（既有用例全为目录目标），潜在桩状态污染。
 
+## 二轮修复批销账（2026-09-25，负责人指令「①修；②③④零破坏低代价则修」——四项全修）
+
+| 项 | 状态 | 修法与证据 |
+|---|---|---|
+| ① 裸 Drop 困旧版 | **已修（生产可达已核实）** | `transport_face.rs`：`store_bytes` 与 `upload_stream` 的错误路径显式 `stager.abort().await` 再上抛（帧泵拆 `write_frames` 自由函数使借用成立）。**可达性核实**：两函数的 `?` 早退 = 裸 Drop 点（覆盖写失败重试耗尽 → 文件对卷消失，旧版本困 `.old`）。红：`transport_stream_error_restores_the_stashed_old_version`（流中帧错误注入，红 = final 空 + 残件遗留）→ 绿。`transport_upload_write_error_restores_the_stashed_old_version` 转为契约钉（russh-sftp 写缓冲到 flush 才落桩——write 注入失败走 close 内部恢复面，非裸 Drop 路径；两腿断言同形）。桩新增 `fail_next_write` 一次性旋钮。 |
+| ② mkdir 撞悬空链 | **已修** | `driver.rs` mkdir 预检与竞态臂从跟随 stat 改 **lstat**（与 M4 rename 同面）。红：`mkdir_onto_dangling_symlink_reports_exists`（修复前假成功+桩污染）→ 绿（Exists + 链原位 + 无目录覆写）。 |
+| ③ 悬空链源 rename | **已修** | `driver.rs` rename 源预检改 **lstat**（POSIX：rename 搬链接本体不解析目标；delete/recursive_remove 的 K67 lstat 契约同源）。红：`rename_dangling_symlink_source_succeeds`（修复前 NotFound）→ 绿（链接本体随迁、目标串不变）。 |
+| ④ 桩 add_symlink 污染 | **已修** | 目标自动建目录跳过已被文件/链接占据的组件。红证经回退重放捕获（`the file target must not be registered as a dir`）；**执行期陷阱记录**：红批后 `mv .bak` 恢复保留旧 mtime，cargo 判定文件未变跳过重编跑了回退版旧二进制——假红一例；`touch` 强制重编后绿。 |
+
+**验证**：ck-sftp **79/0/15**（write_path 30→35）+ clippy `-D warnings` + fmt 绿 + workspace 全量 **1847/0/63**（1842 基线 + 5 新测试）。
+
 ## 装配/集成面（子代理 B）——全绿
 
 K28 env 纪律、K30 三件套、D2 指纹显式接受、conformance 八断言接入、read-through 探针（as_driver + authoritative_index）、web 表单回填（K67 port 修复仍在）、R3 凭据红线（SftpParams 不派生 Debug、日志零凭据值）七个维度全部合规。唯一 Low = CI features 矩阵缺新驱动腿（L5）。

@@ -335,12 +335,16 @@ impl StorageDriver for SftpDriver {
     }
 
     /// mkdir：已存在 → Exists（预检）；缺失父目录隐式创建。
+    ///
+    /// 预检走 **lstat**（sftp-review ②：悬空链也是既有目录项——跟随
+    /// stat 对悬空链误报 NotFound，把服务端必然的拒绝漏成假成功/桩
+    /// 污染；与 M4 的 rename 预检同面）。
     async fn mkdir(&self, path: &RelPath) -> Result<(), StorageError> {
         if path.is_root() {
             return Err(StorageError::Exists); // 卷根恒存在
         }
-        match self.stat_path(path).await {
-            Ok(_) => return Err(StorageError::Exists), // 目录/同名文件皆拒
+        match self.client.symlink_metadata(&self.path(path)).await {
+            Ok(_) => return Err(StorageError::Exists), // 目录/同名文件/链接皆拒
             Err(StorageError::NotFound) => {}
             Err(other) => return Err(other),
         }
@@ -352,8 +356,11 @@ impl StorageDriver for SftpDriver {
         let target = self.path(path);
         match self.client.create_dir(&target).await {
             Ok(()) => Ok(()),
-            // 竞态窗内被他人抢先创建：按 trait 契约报 Exists
-            Err(_) if self.stat_path(path).await.is_ok() => Err(StorageError::Exists),
+            // 竞态窗内被他人抢先创建：按 trait 契约报 Exists（判定同
+            // 走 lstat，与预检同面）
+            Err(_) if self.client.symlink_metadata(&self.path(path)).await.is_ok() => {
+                Err(StorageError::Exists)
+            }
             Err(other) => Err(other),
         }
     }
@@ -384,8 +391,11 @@ impl StorageDriver for SftpDriver {
         if to.as_str().starts_with(&from_prefix) {
             return Err(StorageError::Invalid);
         }
-        // 源必须存在（显式预检，语义早失败）
-        self.stat_path(from).await?;
+        // 源必须存在（显式预检，语义早失败）。预检走 **lstat**（
+        // sftp-review ③：悬空链的本体存在——POSIX 允许 rename 链接
+        // 自身、不解析目标；跟随形态把悬空链误报 NotFound。与
+        // delete/recursive_remove 的 lstat 契约同源，K67）。
+        self.client.symlink_metadata(&self.path(from)).await?;
         // 目标已存在 → Exists（SFTP 服务器对 overwrite rename 的行为
         // 不一致——OpenSSH 拒绝、部分实现覆盖——预检归一）。预检走
         // **lstat**（M4：悬空链也是既有目录项——跟随 stat 对悬空链误报

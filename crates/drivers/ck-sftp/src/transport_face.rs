@@ -35,6 +35,7 @@ use cloudkit_storage::transport::{
     ByteStream, CloudTransport, RemoteHandle, StorageError, UploadJob, UploadReceipt,
 };
 use cloudkit_storage::vpath::RelPath as VPath;
+use cloudkit_storage::UploadStager;
 use cloudkit_storage::{Capabilities, EntryId, Range, RelPath, StorageDriver, WriteHint};
 
 use crate::driver::SftpDriver;
@@ -137,6 +138,11 @@ impl CloudTransport for SftpTransport {
 
     /// 流式上传：字节逐帧进 stager（无内存全缓冲）；超计划拒绝、短流
     /// 由 close 的承诺校验给 `Invalid`（ck-local 同款形态）。
+    ///
+    /// **错误路径显式 abort（sftp-review ①）**：`frame?`/`write?` 的
+    /// 早退若裸 Drop stager，覆盖写场景的旧版本会被困在 `.old` 残件
+    /// （final 被 stash 丢空，重试耗尽后文件对卷消失）——错误必须经
+    /// `abort()` 复位现场后再上抛。
     async fn upload_stream(
         &self,
         job: &UploadJob,
@@ -151,21 +157,17 @@ impl CloudTransport for SftpTransport {
             ..Default::default()
         };
         let mut stager = self.driver.writer(&rel, &hint).await?;
-        let mut frames = data;
-        let mut written: u64 = 0;
-        while let Some(frame) = futures_util::StreamExt::next(&mut frames).await {
-            let frame = frame?;
-            written += frame.len() as u64;
-            if written > job.size {
-                return Err(StorageError::Unavailable(format!(
-                    "stream exceeded the planned {} bytes",
-                    job.size
-                )));
+        let outcome = write_frames(&mut stager, data, job.size).await;
+        match outcome {
+            Ok(()) => {
+                let entry = stager.close().await?;
+                Ok(receipt_of(entry.size))
             }
-            stager.write(&frame).await?;
+            Err(e) => {
+                let _ = stager.abort().await;
+                Err(e)
+            }
         }
-        let entry = stager.close().await?;
-        Ok(receipt_of(entry.size))
     }
 
     /// 全文件读：预算帽语义下等价 `open_range(0, total_size)`。
@@ -216,6 +218,10 @@ impl CloudTransport for SftpTransport {
 
 impl SftpTransport {
     /// 两上传面的共通收尾：writer + 全量 write + close → K6 receipt。
+    ///
+    /// **错误路径显式 abort（sftp-review ①）**：`write?` 早退裸 Drop
+    /// 会把旧版本困在 `.old`（final 被 stash 丢空）——同 upload_stream
+    /// 的恢复纪律。
     async fn store_bytes(
         &self,
         rel: &RelPath,
@@ -227,10 +233,39 @@ impl SftpTransport {
             ..Default::default()
         };
         let mut stager = self.driver.writer(rel, &hint).await?;
-        stager.write(data).await?;
-        let entry = stager.close().await?;
-        Ok(receipt_of(entry.size))
+        match stager.write(data).await {
+            Ok(()) => {
+                let entry = stager.close().await?;
+                Ok(receipt_of(entry.size))
+            }
+            Err(e) => {
+                let _ = stager.abort().await;
+                Err(e)
+            }
+        }
     }
+}
+
+/// upload_stream 的帧泵（拆出使错误路径的 `stager.abort()` 借用成立）：
+/// 逐帧写 stager，超计划拒绝。
+async fn write_frames(
+    stager: &mut Box<dyn UploadStager>,
+    data: ByteStream,
+    planned: u64,
+) -> Result<(), StorageError> {
+    let mut frames = data;
+    let mut written: u64 = 0;
+    while let Some(frame) = futures_util::StreamExt::next(&mut frames).await {
+        let frame = frame?;
+        written += frame.len() as u64;
+        if written > planned {
+            return Err(StorageError::Unavailable(format!(
+                "stream exceeded the planned {planned} bytes"
+            )));
+        }
+        stager.write(&frame).await?;
+    }
+    Ok(())
 }
 
 /// K6 receipt 形态：msg_id 恒 0 占位（不语义化，local 同款）。

@@ -130,6 +130,9 @@ struct VfsState {
     /// 截到 N 字节——回放「服务端短写」（close 确认正常但落盘尺寸与
     /// 客户端 written 不符，硬仗②校验的触发器）。
     shrink_next_close: Option<(String, u64)>,
+    /// ① 注入面：下一次 write 动词直接失败（服务端写错误回放——
+    /// transport 上传错误路径的裸 Drop 触发器）。
+    fail_next_write: bool,
 }
 
 impl VfsState {
@@ -146,6 +149,7 @@ impl VfsState {
             fail_next_lstat: None,
             hidden: BTreeSet::new(),
             shrink_next_close: None,
+            fail_next_write: false,
         }
     }
 
@@ -607,6 +611,11 @@ impl russh_sftp::server::Handler for SftpHandler {
         data: Vec<u8>,
     ) -> Result<Status, Self::Error> {
         let mut vfs = lock_vfs!(self);
+        // ① 注入面：一次性写失败（消费即清）——先于句柄查找，回放
+        // 「服务端在写路径上报错」形态
+        if std::mem::take(&mut vfs.fail_next_write) {
+            return Err(StatusCode::Failure);
+        }
         let fh = vfs
             .file_handles
             .get_mut(&handle)
@@ -995,6 +1004,11 @@ impl Stub {
         for comp in target.split('/').filter(|c| !c.is_empty()) {
             current.push('/');
             current.push_str(comp);
+            // ④：已被文件/链接占据的组件不再向 dirs 表登记（两表同键
+            // = 桩状态污染）；目录目标不受影响（dirs 幂等）。
+            if vfs.files.contains_key(&current) || vfs.symlinks.contains_key(&current) {
+                continue;
+            }
             vfs.dirs.insert(current.clone());
         }
         vfs.symlinks.insert(link.to_string(), target.to_string());
@@ -1067,6 +1081,11 @@ impl Stub {
     /// 正常但远端尺寸与客户端 written 不符，硬仗②校验的触发器）。
     pub fn shrink_next_close(&self, path_prefix: &str, size: u64) {
         self.lock_vfs().shrink_next_close = Some((path_prefix.to_string(), size));
+    }
+
+    /// ① 注入面：下一次 `write` 动词直接以 Failure 失败（消费即清）。
+    pub fn fail_next_write(&self) {
+        self.lock_vfs().fail_next_write = true;
     }
 
     /// 竞态注入（rename 撞车测试）：路径对 stat/lstat 隐身
