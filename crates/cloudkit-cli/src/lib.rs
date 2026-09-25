@@ -5849,9 +5849,17 @@ async fn build_sftp_transport(cfg: &CyDriveConfig) -> Result<BackendTransport> {
     let driver = ck_sftp::factory(&params)
         .await
         .map_err(|error| anyhow::anyhow!("initialising the sftp backend: {error}"))?;
-    Ok(BackendTransport::Sftp(Arc::new(
-        ck_sftp::SftpTransport::new(driver),
-    )))
+    let transport = ck_sftp::SftpTransport::new(driver);
+    // 复审修复（2026-09-25 负责人真机报障裁定「不存在就别带病挂载」）：
+    // 装配期 connect 门 = 卷根校验——根不存在/不是目录在这里拒绝装配
+    //（不挂载、不进上传队列带病重试），connect 的错误自带可行动文案
+    //（指名 sftp_root 与路径）。D3 的「factory 不连接」语义不变；装配
+    // 后的首个网络动作就是这道门（服务器不可达同样在此拒绝）。
+    transport
+        .connect()
+        .await
+        .map_err(|error| anyhow::anyhow!("the sftp volume is not usable: {error}"))?;
+    Ok(BackendTransport::Sftp(Arc::new(transport)))
 }
 
 /// [`build_backend_transport`] with the endpoint set, the K13

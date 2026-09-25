@@ -331,38 +331,27 @@ async fn missing_sftp_driver_refuses_with_the_rebuild_message() {
     );
 }
 
-/// With the driver: `backend = "sftp"` assembles a SftpTransport over
-/// the configured identity — the factory only constructs (D3 lazy
-/// connect), so the volume identity and the capability face are
-/// available without a server. This pins the dispatch's sftp arm end
-/// to end (the §4.2 capability bits ride the transport face).
+/// With the driver: `backend = "sftp"` now runs the **connect gate** at
+/// assembly (2026-09-25 owner ruling after a real-machine outage: a volume
+/// root that does not exist must fail the boot with an actionable message —
+/// never mount and then fail every upload; the offline-assembly D3 pin this
+/// test used to carry is superseded, and the capability bits stay pinned in
+/// ck-sftp's conformance table). No usable server on the loopback port →
+/// the gate refuses and the message names the volume.
 #[cfg(feature = "sftp")]
 #[tokio::test]
-async fn sftp_key_builds_sftp_transport() {
+async fn sftp_key_assembly_runs_the_connect_gate() {
     let cfg = sftp_config();
     cfg.validate().expect("the test config validates");
-    let dispatched = build_backend_transport(&cfg)
+    let err = build_backend_transport(&cfg)
         .await
-        .expect("the sftp arm assembles without connecting (D3)");
-    assert!(matches!(dispatched, BackendTransport::Sftp(_)));
-    assert_eq!(
-        dispatched.volume(),
-        "sftp:tester@127.0.0.1:2222",
-        "volume identity is <user>@<host>:<port>"
-    );
-    let caps = dispatched.caps();
-    assert!(caps.range_read, "sftp declares range_read (§4.2)");
-    assert!(caps.server_side_move, "sftp declares server_side_move");
+        .err()
+        .expect("the sftp arm refuses when the volume root is unreachable");
+    let message = err.to_string();
     assert!(
-        caps.authoritative_index,
-        "sftp declares authoritative_index"
+        message.contains("the sftp volume is not usable"),
+        "the connect gate names the failure: {message}"
     );
-    assert!(
-        caps.remote_delete,
-        "the transport face declares remote_delete"
-    );
-    assert!(!caps.resume, "sftp does not declare resume");
-    assert!(!caps.multipart, "sftp does not declare multipart");
     // The K12 sync ruling: sftp never runs the sync task (the remote
     // filesystem is the source of truth — same as local).
     assert!(

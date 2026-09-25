@@ -114,12 +114,26 @@ impl SftpTransport {
 
 #[async_trait]
 impl CloudTransport for SftpTransport {
-    /// 探活：SFTP 会话上对卷根 stat 一次（惰性连接世界的首次建立；
-    /// 失败按 error.rs 映射归一——host key 未接受/认证失败在这里以
-    /// `Unauthorized` 浮现）。
+    /// 探活 = **卷根校验**（复审修复 2026-09-25，负责人真机报障裁定
+    /// 「根目录不存在就别带病挂载」）：stat 卷根——不存在/不是目录以
+    /// **可行动**错误拒绝（指名 sftp_root 键与路径，装配期的 connect 门
+    /// 据此拒绝挂载——报障形态即挂载成功后每个上传 not found 重试到
+    /// degrade）。host key 未接受/认证失败仍以 `Unauthorized` 浮现；
+    /// 传输类按 error.rs 映射（含重连骨架的一次重放）。
     async fn connect(&self) -> Result<(), StorageError> {
         let root = self.driver.client().params().root.clone();
-        self.driver.client().metadata(&root).await.map(|_| ())
+        match self.driver.client().metadata(&root).await {
+            Ok(attrs) if attrs.is_dir() => Ok(()),
+            Ok(_) => Err(StorageError::Unavailable(format!(
+                "the sftp volume root {root} is not a directory — point sftp_root at a \
+                 directory on the server"
+            ))),
+            Err(StorageError::NotFound) => Err(StorageError::Unavailable(format!(
+                "the sftp volume root {root} does not exist on the server — create it there \
+                 or fix sftp_root in the volume file"
+            ))),
+            Err(other) => Err(other),
+        }
     }
 
     /// 整文件复制上传：读盘 → writer + write 全量 + close。receipt 遵循

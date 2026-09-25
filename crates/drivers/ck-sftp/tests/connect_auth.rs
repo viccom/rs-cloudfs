@@ -10,11 +10,17 @@
 //! - **D1 认证**：密码正确通过；密码错/用户名错 → `Unauthorized{false}`；
 //!   私钥形态（加密 PEM + passphrase 经 tempfile）通过；私钥与密码均错
 //!   → `Unauthorized{false}`（AuthFailed）；
-//! - **D3 单连接**：多次操作只建立一条 SSH 连接（连接计数观测）。
+//! - **D3 单连接**：多次操作只建立一条 SSH 连接（连接计数观测）；
+//! - **卷根校验门（复审 2026-09-25）**：connect = 卷根存在且是目录——
+//!   不存在/不是目录以可行动错误拒绝（指名 sftp_root 与路径），装配期
+//!   connect 门据此拒绝挂载（负责人裁定：不存在就别带病挂载）。
 
 mod stub;
 
-use ck_sftp::{SftpDriver, SftpParams};
+use std::sync::Arc;
+
+use ck_sftp::{SftpDriver, SftpParams, SftpTransport};
+use cloudkit_storage::transport::CloudTransport;
 use cloudkit_storage::{RelPath, StorageDriver, StorageError};
 use stub::{Stub, StubAuth};
 
@@ -239,4 +245,73 @@ async fn sequential_operations_reuse_one_connection() {
         1,
         "five sequential ops must reuse the single lazy connection"
     );
+}
+
+// ------------------------------------------------- 卷根校验门（复审）---
+
+/// 复审修复（2026-09-25，负责人真机报障裁定「不存在就别带病挂载」）：
+/// connect = 卷根校验——装配期的 connect 门据此拒绝挂载。根不存在必须
+/// 以**可行动**错误拒绝（指名 sftp_root 键与路径），绝不裸 NotFound
+///（报障形态：挂载成功后每个上传 not found 重试到 degrade）。
+fn rooted_pairs(stub: &Stub, root: &str) -> Vec<(String, String)> {
+    let mut pairs = stub.param_pairs();
+    pairs.push((
+        "sftp_host_fingerprint".to_string(),
+        stub.fingerprint().to_string(),
+    ));
+    pairs.push(("sftp_root".to_string(), root.to_string()));
+    pairs
+}
+
+fn transport_for(pairs: &[(String, String)]) -> SftpTransport {
+    let params = SftpParams::from_pairs(pairs).expect("params parse");
+    SftpTransport::new(Arc::new(
+        SftpDriver::new(params).expect("driver constructs"),
+    ))
+}
+
+#[tokio::test]
+async fn connect_rejects_a_missing_volume_root_with_actionable_text() {
+    let stub = stub_with_password().await;
+    let transport = transport_for(&rooted_pairs(&stub, "/no-such-volume-root"));
+    match transport.connect().await {
+        Err(StorageError::Unavailable(msg)) => {
+            assert!(
+                msg.contains("/no-such-volume-root") && msg.contains("sftp_root"),
+                "the refusal names the root path and the config key: {msg}"
+            );
+        }
+        other => panic!("missing volume root must be an actionable Unavailable, got {other:?}"),
+    }
+    // 认证已成功——失败发生在根校验，不是连不上（区分诊断面）。
+    assert_eq!(stub.auth_success_count(), 1);
+}
+
+#[tokio::test]
+async fn connect_rejects_a_file_volume_root() {
+    let stub = stub_with_password().await;
+    stub.add_file("/plain-file", b"x");
+    let transport = transport_for(&rooted_pairs(&stub, "/plain-file"));
+    match transport.connect().await {
+        Err(StorageError::Unavailable(msg)) => {
+            assert!(
+                msg.contains("not a directory") && msg.contains("/plain-file"),
+                "the refusal names the shape and the path: {msg}"
+            );
+        }
+        other => panic!("a file volume root must be refused, got {other:?}"),
+    }
+    assert_eq!(stub.auth_success_count(), 1);
+}
+
+#[tokio::test]
+async fn connect_accepts_a_directory_volume_root() {
+    let stub = stub_with_password().await;
+    stub.add_dir("/volume-root");
+    let transport = transport_for(&rooted_pairs(&stub, "/volume-root"));
+    transport
+        .connect()
+        .await
+        .unwrap_or_else(|e| panic!("a directory volume root must connect: {e:?}"));
+    assert!(stub.auth_success_count() >= 1);
 }
