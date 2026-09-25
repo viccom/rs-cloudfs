@@ -1993,9 +1993,11 @@ impl CyDriveConfig {
                 .strip_prefix("http://")
                 .or_else(|| url.strip_prefix("https://"));
             let Some(rest) = rest else {
-                return Err(ConfigError::Invalid(format!(
-                    "sync_url must start with http:// or https://, got {url:?}"
-                )));
+                // M3（复审）同族：sync_url 无 userinfo 拒收臂，内嵌凭据
+                // 形态可穿过 host 检查——两臂同样不回显原文（R3）。
+                return Err(ConfigError::Invalid(
+                    "sync_url must start with http:// or https://".to_string(),
+                ));
             };
             // Minimal authority parse (no url crate in core): the
             // authority runs to the first '/', '?' or '#', the host to
@@ -2005,9 +2007,9 @@ impl CyDriveConfig {
             let authority = rest.split(['/', '?', '#']).next().unwrap_or_default();
             let host = authority.split(':').next().unwrap_or_default();
             if host.is_empty() {
-                return Err(ConfigError::Invalid(format!(
-                    "sync_url needs a host, e.g. \"http://sync.example.org:8290\", got {url:?}"
-                )));
+                return Err(ConfigError::Invalid(
+                    "sync_url needs a host, e.g. \"http://sync.example.org:8290\"".to_string(),
+                ));
             }
         }
         // Phase 2 / K17 cross-field rules, gated on the backend so the
@@ -2189,16 +2191,21 @@ impl CyDriveConfig {
                 .strip_prefix("http://")
                 .or_else(|| url.strip_prefix("https://"))
             else {
-                return Err(ConfigError::Invalid(format!(
-                    "webdav_url must start with http:// or https://, got {url:?} (a WebDAV \
-                     share is a plain http(s) URL, e.g. https://nas.lan:5006/dav/)"
-                )));
+                // M3（复审 2026-09-25）：四臂文案一律不回显原文——URL 可
+                // 内嵌凭据，而 Invalid 不经 redact_credential_values 漏斗
+                //（脱敏只挂 Parse 构造点），回显即密码进错误链（R3）。
+                return Err(ConfigError::Invalid(
+                    "webdav_url must start with http:// or https:// (a WebDAV share is a \
+                     plain http(s) URL, e.g. https://nas.lan:5006/dav/)"
+                        .to_string(),
+                ));
             };
             if url.contains(['?', '#']) {
-                return Err(ConfigError::Invalid(format!(
-                    "webdav_url must not carry a query or fragment, got {url:?} (the share URL \
-                     is a plain http(s) path, e.g. https://nas.lan:5006/dav/)"
-                )));
+                return Err(ConfigError::Invalid(
+                    "webdav_url must not carry a query or fragment (the share URL is a plain \
+                     http(s) path, e.g. https://nas.lan:5006/dav/)"
+                        .to_string(),
+                ));
             }
             let authority = rest.split('/').next().unwrap_or_default();
             // WD4 挂账①：userinfo 形态（`https://user:pass@host/`）会把
@@ -2206,17 +2213,18 @@ impl CyDriveConfig {
             // URL）——第一道漏斗拒收并指路凭据键（驱动 parse_from_map
             // 是第二道）。
             if authority.contains('@') {
-                return Err(ConfigError::Invalid(format!(
-                    "webdav_url must not embed credentials as userinfo (user:pass@host), \
-                     got {url:?}: set webdav_username and webdav_password instead — the \
-                     separate keys keep the credentials out of the volume URL"
-                )));
+                return Err(ConfigError::Invalid(
+                    "webdav_url must not embed credentials as userinfo (user:pass@host): set \
+                     webdav_username and webdav_password instead — the separate keys keep the \
+                     credentials out of the volume URL"
+                        .to_string(),
+                ));
             }
             let host = authority.split(':').next().unwrap_or_default();
             if host.is_empty() {
-                return Err(ConfigError::Invalid(format!(
-                    "webdav_url needs a host, e.g. \"https://nas.lan:5006/dav/\", got {url:?}"
-                )));
+                return Err(ConfigError::Invalid(
+                    "webdav_url needs a host, e.g. \"https://nas.lan:5006/dav/\"".to_string(),
+                ));
             }
             // Credentials arrive as a pair (both absent = anonymous).
             let has_username = self

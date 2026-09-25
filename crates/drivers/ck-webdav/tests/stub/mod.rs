@@ -621,6 +621,10 @@ pub struct Knobs {
     /// 腿「服务端瞬态 5xx 落在 MOVE 上」；与 `transient_5xx` 不共计数，
     /// 因 stat 预检的 PROPFIND 重试链会先吃光共享计数）。
     pub transient_5xx_move: usize,
+    /// 计数大于 0 时逐 MOVE 递减；减到 0 的那次 MOVE 在处理前把**本次
+    /// MOVE 的目标路径**种成文件——「建父窗内并发写手抢占目标」的竞态
+    /// 建模（复审 M1 注入面：缺父 → 建父 → 重试撞 412 的构造面）。
+    pub concurrent_target_on_move: usize,
     /// 前 N 次请求（全部动词）回 429，可带 Retry-After 秒数。
     pub rate_limit_429: Option<(usize, Option<u64>)>,
     /// 对**文件** PROPFIND 回 301 + Location（意外重定向的错误分类面；
@@ -685,6 +689,7 @@ struct FaultLedger {
     member_500: bool,
     transient_left: usize,
     transient_move_left: usize,
+    concurrent_target: usize,
     rate_left: Option<(usize, Option<u64>)>,
     lost_ack: bool,
     lost_ack_skip: usize,
@@ -1367,6 +1372,15 @@ impl StubState {
         }
         let destination = normalize(&percent_decode(&destination_path(&destination_raw)));
         let mut inner = self.lock();
+        // M1 注入面（复审）：建父窗内的并发写手——计数递减到 0 的那次
+        // MOVE 在处理前先把**本次目标**种成文件（真实竞态建模：首发缺
+        // 父失败与隐式建父重试之间目标被他人创建 → 重试撞 412）。
+        if inner.ledger.concurrent_target > 0 {
+            inner.ledger.concurrent_target -= 1;
+            if inner.ledger.concurrent_target == 0 {
+                inner.vfs.seed_file(&destination, b"concurrent-writer");
+            }
+        }
         if !inner.vfs.exists(&ctx.canonical) {
             return (StatusCode::NOT_FOUND, "404 Not Found (stub)").into_response();
         }
@@ -2111,6 +2125,7 @@ pub async fn spawn_stub(vfs: Vfs, auth: AuthMode, knobs: Knobs, style: StubStyle
         member_500: knobs.member_500_once,
         transient_left: knobs.transient_5xx,
         transient_move_left: knobs.transient_5xx_move,
+        concurrent_target: knobs.concurrent_target_on_move,
         rate_left: knobs.rate_limit_429,
         lost_ack: knobs.lost_ack_after_effect,
         lost_ack_skip: knobs.lost_ack_after_effect_skip,

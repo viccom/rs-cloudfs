@@ -460,6 +460,50 @@ async fn rename_missing_parent_409_is_created_then_retried() {
     assert_eq!(requests_of(&handle, "MOVE").len(), 2);
 }
 
+/// 复审 M1（2026-09-25）：缺父 → 建父 → 重试撞**并发占位**（412）——
+/// 重试臂必须与首发同判（stat 复核 → `Exists`），绝不压成 `NotFound`
+/// （父）。构造面：`concurrent_target_on_move = 2`——第 2 个 MOVE（建父
+/// 后的重试）处理前并发写手落地目标。
+#[tokio::test]
+async fn rename_retry_412_classifies_exists_not_missing_parent() {
+    let mut vfs = Vfs::new();
+    vfs.seed_file("/src.bin", b"source");
+    // 目标 newdir/sub/g.bin 的父链不存在：首发 MOVE 缺父 409 →
+    // ParentSuspect → stat 父 NotFound → MKCOL 建父 → 重试。
+    let knobs = Knobs {
+        concurrent_target_on_move: 2,
+        ..Knobs::default()
+    };
+    let handle = spawn_stub(
+        vfs,
+        stub::AuthMode::None,
+        knobs,
+        StubStyle {
+            move_missing_parent: stub::MoveMissingParent::Apache409,
+            ..StubStyle::rclone()
+        },
+    )
+    .await;
+    let driver = driver(&handle);
+
+    let err = driver
+        .rename(&rel("src.bin"), &rel("newdir/sub/g.bin"))
+        .await
+        .expect_err("retry-412 rename must fail");
+    assert!(
+        matches!(err, StorageError::Exists),
+        "重试撞 412 = 目标被并发占位，必须 Exists（不压成 NotFound/父）: {err}"
+    );
+    assert!(handle.exists("/src.bin"), "412 先于移动——源原位");
+    assert!(
+        handle.exists("/newdir/sub/g.bin"),
+        "并发占位的目标仍在（rename 未覆盖它）"
+    );
+    // MOVE 恰两次（首发 409 + 撞 412 的重试）。
+    assert_eq!(requests_of(&handle, "MOVE").len(), 2);
+    handle.shutdown().await;
+}
+
 /// M13③ 补臂：409 + 目标父路径被文件占住 → `Exists`（占位冲突——隐式
 /// 建父不可行，与既有 Apache500 腿同型判定；传输/服务端类绝不映射
 /// Exists 的 K75-1 纪律不适用于此：这是 stat 核实的真实占位）。

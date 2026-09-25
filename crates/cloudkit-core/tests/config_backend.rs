@@ -1261,6 +1261,52 @@ fn webdav_url_must_not_embed_userinfo_credentials() {
     }
 }
 
+/// 复审 M3（2026-09-25）：校验失败文案绝不回显 webdav_url 原文。嵌入
+/// 凭据的误用形态命中**任一臂**都不得把密码带进错误链——
+/// `ConfigError::Invalid` 不经 `redact_credential_values` 漏斗（脱敏只挂
+/// Parse 构造点），回显即凭据随 boot 错误/ADD 回复/tracing 落日志（R3）。
+/// 最坏路径 = query/fragment 臂先于 userinfo 臂裁决：userinfo+query 形态
+/// 的密码从 query 臂整串漏出。driver 侧同纪律镜像钉 = ck-webdav lib.rs
+/// 的 M4 断言组。
+#[test]
+fn webdav_url_validation_errors_never_echo_the_raw_url() {
+    for (label, url, marker) in [
+        // scheme 臂：非 http(s) 形态整串回显（含密码）。
+        ("scheme arm", "ftp://spike:SECRET9@nas.lan/dav/", "SECRET9"),
+        // query/fragment 臂先于 userinfo 臂——userinfo+query 形态的
+        // 密码从这里漏（最坏路径）。
+        (
+            "query arm",
+            "https://spike:SECRET9@nas.lan/dav/?x=1",
+            "SECRET9",
+        ),
+        (
+            "fragment arm",
+            "https://spike:SECRET9@nas.lan/dav/#f",
+            "SECRET9",
+        ),
+        // userinfo 臂自身同样回显原文。
+        (
+            "userinfo arm",
+            "https://spike:SECRET9@nas.lan:5006/dav/",
+            "SECRET9",
+        ),
+        // host 臂（无凭据可达形态）同纪律不回显——统一去原文。
+        ("host arm", "https://:5006/HOSTMARK9", "HOSTMARK9"),
+    ] {
+        let mut cfg = webdav_config();
+        cfg.webdav_url = Some(url.to_string());
+        let err = cfg
+            .validate()
+            .err()
+            .unwrap_or_else(|| panic!("{label} must be rejected"));
+        assert!(
+            matches!(&err, ConfigError::Invalid(msg) if !msg.contains(marker)),
+            "{label}: the refusal must not echo the raw url ({marker} leaked): {err:?}"
+        );
+    }
+}
+
 #[test]
 fn webdav_credentials_must_arrive_as_a_pair() {
     for (label, drop_username) in [("username only", true), ("password only", false)] {

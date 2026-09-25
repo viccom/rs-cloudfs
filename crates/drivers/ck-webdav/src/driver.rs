@@ -168,6 +168,25 @@ impl WebdavDriver {
         }
         self.client.move_(&from_url, &to_url, overwrite).await
     }
+
+    /// 412 复核（首发与建父重试共用，K75-1）：目标在 = 真撞 →
+    /// `Exists`；不在 = 状态异常（`Unavailable` 保留 412 原文）；复核
+    /// 自身出错 = `Unavailable` 带复核错误。重试臂曾把再撞的 412 压成
+    /// `NotFound`（父）——同一条 rename 路径上 412 的分类必须一致
+    /// （复审 M1）。
+    async fn precondition_failed_verdict(&self, to: &RelPath, diagnostic: &str) -> StorageError {
+        match self.stat_entry(to).await {
+            Ok(_) => StorageError::Exists,
+            Err(StorageError::NotFound) => StorageError::Unavailable(format!(
+                "webdav MOVE failed with 412 Precondition Failed but the destination \
+                 is absent: {diagnostic}"
+            )),
+            Err(other) => StorageError::Unavailable(format!(
+                "webdav MOVE failed with 412 Precondition Failed and the destination \
+                 re-check errored ({other}): {diagnostic}"
+            )),
+        }
+    }
 }
 
 // ----------------------------------------------- 写面共享助手（stager 共用）---
@@ -593,7 +612,8 @@ impl StorageDriver for WebdavDriver {
     ///   传输/服务端类绝不映射 Exists）；
     /// - 403/409/500（缺父嫌疑三态：rclone403 / apache500 / RFC 409）→
     ///   stat 目标父核实：缺 → 隐式建父重试恰一次（仍败 → `NotFound`
-    ///   （父），§4.4 行）；在 → 按 §4.4 通用表归一（403→Unauthorized /
+    ///   （父），§4.4 行；**412 例外**——重试撞并发占位经同款复核归
+    ///   `Exists`，复审 M1）；在 → 按 §4.4 通用表归一（403→Unauthorized /
     ///   409→Invalid / 500→Unavailable）；
     /// - `to` 是 `from` 的后代 → `Invalid`（自搬进自身，sftp 先例）；
     ///   任一端点是卷根 → `Invalid`。
@@ -613,17 +633,7 @@ impl StorageDriver for WebdavDriver {
             Ok(crate::client::MoveOutcome::PreconditionFailed { diagnostic }) => {
                 // 412 = Overwrite:F 撞既有目标：重 stat 复核后 Exists——
                 // 目标在 = 真撞；不在 = 状态异常（保留 412 原文）。
-                match self.stat_entry(to).await {
-                    Ok(_) => Err(StorageError::Exists),
-                    Err(StorageError::NotFound) => Err(StorageError::Unavailable(format!(
-                        "webdav MOVE failed with 412 Precondition Failed but the destination \
-                         is absent: {diagnostic}"
-                    ))),
-                    Err(other) => Err(StorageError::Unavailable(format!(
-                        "webdav MOVE failed with 412 Precondition Failed and the destination \
-                         re-check errored ({other}): {diagnostic}"
-                    ))),
-                }
+                Err(self.precondition_failed_verdict(to, &diagnostic).await)
             }
             Ok(crate::client::MoveOutcome::ParentSuspect { status, diagnostic }) => {
                 // 缺父嫌疑核实：父在 → 非缺父形态（403 的真拒绝 / 500 的
@@ -642,9 +652,13 @@ impl StorageDriver for WebdavDriver {
                 ensure_parents(&self.client, to).await?;
                 // 重试恰一次；仍败 → NotFound（父）（§4.4 终局形态——
                 // 竞态窗内的新失败不逐类细分，调用方按「路径当前不可
-                // 达」处置）。
+                // 达」处置；例外 = 412：目标被并发占位是真实终局，必须
+                // 与首发同判复核后 Exists——复审 M1）。
                 match self.move_rel(from, to, dir_leg, false).await {
                     Ok(crate::client::MoveOutcome::Done) => Ok(()),
+                    Ok(crate::client::MoveOutcome::PreconditionFailed { diagnostic }) => {
+                        Err(self.precondition_failed_verdict(to, &diagnostic).await)
+                    }
                     _ => Err(StorageError::NotFound),
                 }
             }
