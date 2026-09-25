@@ -20,7 +20,9 @@
 //!
 //! - `.cklocal-staging/`（卷根下）：上传暂存目录（[`crate::stager`]），
 //!   `list(根)` 恒过滤它——它是驱动实现细节，不是卷内容（conformance
-//!   断言③的集合完整性依赖此过滤）；
+//!   断言③的集合完整性依赖此过滤）。stash 的 sidecar
+//!   （`.old.meta` = 卷内相对路径）与构造期孤儿清扫（`sweep_staging`，
+//!   审查 M3）同属此目录的私有形态；
 //! - 文件名含 Windows 保留/ADS 语义字符（`:` `?` `*` `<` `>` `|` `"`）
 //!   的条目不可见且不可寻址（[`LocalDriver::fs_path`] 的硬化校验）；
 //! - 非 UTF-8 文件名：无法经词汇层（`RelPath`）往返，list 中不可见。
@@ -34,7 +36,7 @@
 //! 消失的条目（不承诺快照一致性）。
 
 use std::io;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{SystemTime, UNIX_EPOCH};
 
@@ -99,7 +101,8 @@ pub(crate) fn mtime_secs(t: SystemTime) -> f64 {
 ///   复原同一 rel；根 = 空串）；
 /// - 目录 size 恒 0（conformance 断言③；Windows 目录 metadata 的 len()
 ///   是实现细节值，不透出）；
-/// - mtime 取 modified()（跟随符号链接——fs::metadata 语义）。
+/// - mtime 取 modified()（stat 传入 lstat metadata——本体形态，审查
+///   M1；writer 的 stash 判定传入跟随 metadata——目录性按真实目标）。
 pub(crate) fn entry_from_meta(volume: &VolumeId, rel: &RelPath, meta: &std::fs::Metadata) -> Entry {
     let is_dir = meta.is_dir();
     Entry {
@@ -144,11 +147,69 @@ impl LocalDriver {
     pub fn new(root: PathBuf) -> Result<Self, StorageError> {
         std::fs::create_dir_all(&root).map_err(map_io)?;
         let canonical = std::fs::canonicalize(&root).map_err(map_io)?;
+        // staging 崩窗孤儿清扫（审查 M3，2026-09-25）：崩溃可能死在
+        // stash 与 close 之间（旧版本滞留 `.old`、最终路径缺失）或 writer
+        // 打开中（`.part` 垃圾）——构造时一次清扫恢复/清除。前提：同根
+        // 单写者（驱动全程无锁，本就按此假设运行）。
+        Self::sweep_staging(&canonical, &canonical.join(STAGING_DIR_NAME));
         let volume = VolumeId::new("local", &canonical.to_string_lossy())?;
         Ok(LocalDriver {
             volume,
             root: canonical,
         })
+    }
+
+    /// staging 孤儿清扫（同步形态——`new` 是同步构造；best-effort，单项
+    /// 失败静默忽略，与 Drop 收尾同纪律）。恢复/清除矩阵：
+    ///
+    /// - `*.part` / `*.probe`：从未 commit 的暂存与探针残渣 → 删（源
+    ///   字节在 VFS 缓存树，暂存文件只是 commit-on-close 的中转）；
+    /// - `*.old` + sidecar（`.old.meta` = 卷内相对路径）：最终路径在 →
+    ///   close 已成功、.old 陈旧 → 双删；最终路径缺 → 崩在 stash 与
+    ///   close 之间 → 恢复旧版本（父目录防御性重建；恢复失败保留
+    ///   `.old`+meta 下次启动重试）；
+    /// - `*.old` 无 sidecar：无法定位恢复目标（正常流程 meta 先于 stash
+    ///   落盘，此形态只来自外部垃圾）→ 删——放行会永久滞留；
+    /// - `*.old.meta` 无配对 `.old`：清。
+    ///
+    /// 名单制（只碰这四个后缀）——staging 目录是驱动私有保留名，但名单
+    /// 制让「未来新增暂存形态」必须显式入册才会被清扫。
+    fn sweep_staging(root: &Path, staging: &Path) {
+        let Ok(rd) = std::fs::read_dir(staging) else {
+            return; // 无 staging 目录 = 无孤儿
+        };
+        let mut paths: Vec<PathBuf> = rd.flatten().map(|e| e.path()).collect();
+        paths.sort(); // 确定性（测试可重复）
+        for p in paths {
+            let Some(name) = p.file_name().and_then(|n| n.to_str()) else {
+                continue;
+            };
+            if name.ends_with(".part") || name.ends_with(".probe") {
+                let _ = std::fs::remove_file(&p);
+            } else if let Some(base) = name.strip_suffix(".old.meta") {
+                if !staging.join(format!("{base}.old")).exists() {
+                    let _ = std::fs::remove_file(&p);
+                }
+            } else if let Some(base) = name.strip_suffix(".old") {
+                let meta = staging.join(format!("{base}.old.meta"));
+                let Ok(rel_text) = std::fs::read_to_string(&meta) else {
+                    let _ = std::fs::remove_file(&p);
+                    continue;
+                };
+                let final_path = root.join(rel_text);
+                if final_path.exists() {
+                    let _ = std::fs::remove_file(&p);
+                    let _ = std::fs::remove_file(&meta);
+                } else {
+                    if let Some(parent) = final_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if std::fs::rename(&p, &final_path).is_ok() {
+                        let _ = std::fs::remove_file(&meta);
+                    }
+                }
+            }
+        }
     }
 
     /// 规范化卷根绝对路径（transport 面 connect 探针的落点；组合根取
@@ -238,7 +299,9 @@ impl StorageDriver for LocalDriver {
             let Some(child) = join_validated(dir, name) else {
                 continue; // 保留字符名：不可寻址即不可见
             };
-            // 竞态窗内消失的条目跳过（不承诺快照一致性）
+            // 竞态窗内消失的条目跳过（不承诺快照一致性）。
+            // DirEntry::metadata 是 std lstat 语义（不跟随 symlink）——
+            // 列举报本体形态（审查 M1；特性化钉子在 local_edge_cases）。
             if let Ok(m) = de.metadata().await {
                 entries.push(entry_from_meta(&self.volume, &child, &m));
             }
@@ -266,15 +329,18 @@ impl StorageDriver for LocalDriver {
 
     async fn stat(&self, path: &RelPath) -> Result<Entry, StorageError> {
         let p = self.fs_path(path)?;
-        // fs::metadata 跟随符号链接；断链 symlink → NotFound（kind 归一）
-        let meta = tokio::fs::metadata(&p).await.map_err(map_io)?;
+        // 本体形态（审查 M1，2026-09-25；sftp K67 先例）：symlink_metadata
+        // 不跟随——symlink 条目报本体（kind 按本体），断链也是可寻址本体
+        // 而非 NotFound。reader 保持跟随（读的是链接指向的内容）。
+        let meta = tokio::fs::symlink_metadata(&p).await.map_err(map_io)?;
         Ok(entry_from_meta(&self.volume, path, &meta))
     }
 
     async fn mkdir(&self, path: &RelPath) -> Result<(), StorageError> {
         let p = self.fs_path(path)?;
-        // 已存在（含卷根本身）→ Exists（断言④；mock 同款——根恒存在）
-        if tokio::fs::metadata(&p).await.is_ok() {
+        // 已存在（含卷根本身、含 symlink 本体——审查 M1 本体面）→
+        // Exists（断言④；mock 同款——根恒存在）
+        if tokio::fs::symlink_metadata(&p).await.is_ok() {
             return Err(StorageError::Exists);
         }
         // create_dir_all = 隐式父目录（断言④）
@@ -296,8 +362,20 @@ impl StorageDriver for LocalDriver {
             return Err(StorageError::Invalid);
         }
         let p = self.fs_path(&rel)?;
-        let meta = tokio::fs::metadata(&p).await.map_err(map_io)?;
-        if meta.is_dir() {
+        // 本体形态（审查 M1）：symlink（含 Windows junction）只删链本身
+        // ——跟随语义会把 link-to-dir 送进 remove_dir_all。现行 std 的
+        // remove_dir_all 已是 O_NOFOLLOW 安全（2026-09-25 WSL 实证只删
+        // 链），但预检仍按本体分支：断链可删（跟随语义下 NotFound 永远
+        // 删不掉）、目录链的 Windows 删除走 remove_dir 回落（RemoveFileW
+        // 拒绝 directory reparse point）。
+        let meta = tokio::fs::symlink_metadata(&p).await.map_err(map_io)?;
+        let ft = meta.file_type();
+        if ft.is_symlink() {
+            match tokio::fs::remove_file(&p).await {
+                Ok(()) => {}
+                Err(_) => tokio::fs::remove_dir(&p).await.map_err(map_io)?,
+            }
+        } else if meta.is_dir() {
             // 目录递归删除（断言④）
             tokio::fs::remove_dir_all(&p).await.map_err(map_io)?;
         } else {
@@ -317,13 +395,26 @@ impl StorageDriver for LocalDriver {
         }
         let from_path = self.fs_path(from)?;
         let to_path = self.fs_path(to)?;
-        // 源必须存在（fs::rename 对缺失源在两平台都报 NotFound kind，
-        // 预检让语义显式且错误更早浮现）
-        tokio::fs::metadata(&from_path).await.map_err(map_io)?;
-        // 目标已存在 → Exists（trait 契约）——必须预检：Windows/POSIX 的
-        // rename 对已存在目标是「原子覆盖」而非报错
-        if tokio::fs::metadata(&to_path).await.is_ok() {
-            return Err(StorageError::Exists);
+        // 源本体必须存在（审查 M1：lstat——断链 symlink 也是本体，可搬；
+        // fs::rename 对缺失源在两平台都报 NotFound kind，预检让语义显式
+        // 且错误更早浮现）
+        tokio::fs::symlink_metadata(&from_path)
+            .await
+            .map_err(map_io)?;
+        // 目标本体已存在 → Exists（trait 契约）——必须预检：Windows/POSIX
+        // 的 rename 对已存在目标是「原子覆盖」而非报错。
+        // 大小写放行（审查 M2，2026-09-25）：大小写不敏感 FS（Windows）上
+        // `Mixed.TXT`→`mixed.txt` 的目标预检会命中**源自身**——
+        // canonicalize 同一文件且名字非逐字相同 → 放行让 fs::rename 翻
+        // 拼写。Unix 大小写敏感、两个 case 变体可各自存在 → canonicalize
+        // 不同 → 照常 Exists（防过宽钉测在 local_edge_cases）。
+        if tokio::fs::symlink_metadata(&to_path).await.is_ok() {
+            let case_only = from.as_str() != to.as_str()
+                && tokio::fs::canonicalize(&from_path).await.ok()
+                    == tokio::fs::canonicalize(&to_path).await.ok();
+            if !case_only {
+                return Err(StorageError::Exists);
+            }
         }
         if let Some(parent) = to_path.parent() {
             // 隐式父目录（写入路径契约）
@@ -342,6 +433,8 @@ impl StorageDriver for LocalDriver {
         }
         let rel = rel_from_handle(id).ok_or(StorageError::Invalid)?;
         let p = self.fs_path(&rel)?;
+        // 保持跟随（审查 M1 裁决，sftp 同款：读的是链接指向的内容——
+        // 与 stat 的本体面刻意不同）。
         let meta = tokio::fs::metadata(&p).await.map_err(map_io)?;
         if meta.is_dir() {
             return Err(StorageError::Invalid); // 句柄指向目录（trait 契约）
@@ -434,16 +527,32 @@ impl StorageDriver for LocalDriver {
         // stash 旧版本（overwrite 场景）：commit-on-close 要求 close 前对象
         // 不可见——旧对象也一并搬进暂存区；close 删 stash、abort/Drop 恢复
         //（放弃上传 = 回到 writer 打开前状态）。与 tmp 同 seq 配对命名。
-        let old_path = match tokio::fs::metadata(&final_path).await {
+        // stash 判定保持跟随语义（目标若是 symlink-to-dir，拒绝而非把
+        // 链搬进暂存区——目录性按真实目标判定）。
+        let stashed = match tokio::fs::metadata(&final_path).await {
             Ok(m) if m.is_file() => {
                 let old = staging_dir.join(format!("{pid}-{seq}.old"));
+                let old_meta = staging_dir.join(format!("{pid}-{seq}.old.meta"));
+                // Sidecar 先落（审查 M3 崩窗序）：meta 在、.old 未搬 →
+                // sweep 见 final 在清 meta；meta+.old、final 缺 → 恢复。
+                // meta 写失败 = 不 stash 直接失败（绝不留无 sidecar 的
+                // .old——那会被 sweep 当垃圾清掉丢数据）。
+                let rel_text = path.as_str().trim_start_matches('/');
+                if let Err(e) = tokio::fs::write(&old_meta, rel_text).await {
+                    let _ = tokio::fs::remove_file(&tmp_path).await;
+                    return Err(map_io(e));
+                }
                 match tokio::fs::rename(&final_path, &old).await {
-                    Ok(()) => Some(old),
+                    Ok(()) => Some((old, old_meta)),
                     // 竞态窗内旧对象消失：无 stash（同「原本不存在」）
-                    Err(e) if e.kind() == io::ErrorKind::NotFound => None,
+                    Err(e) if e.kind() == io::ErrorKind::NotFound => {
+                        let _ = tokio::fs::remove_file(&old_meta).await;
+                        None
+                    }
                     Err(e) => {
                         // 收拾刚建的 tmp 再报错（不留孤儿）
                         let _ = tokio::fs::remove_file(&tmp_path).await;
+                        let _ = tokio::fs::remove_file(&old_meta).await;
                         return Err(map_io(e));
                     }
                 }
@@ -455,7 +564,7 @@ impl StorageDriver for LocalDriver {
             path.clone(),
             final_path,
             tmp_path,
-            old_path,
+            stashed,
             file,
             hint.size,
         )))
@@ -480,4 +589,85 @@ fn join_validated(dir: &RelPath, name: &str) -> Option<RelPath> {
         return None;
     }
     dir.join(name).ok() // join 自拒 "."/".."/空/含 '/'
+}
+
+#[cfg(test)]
+mod staging_sweep_tests {
+    //! 审查 M3（2026-09-25）：staging 崩窗孤儿启动清扫的白盒钉测——
+    //! 崩窗形态只能靠直接布景（活 stager 不会留下孤儿：close/abort/Drop
+    //! 三路收尾各有覆盖）。
+
+    use super::*;
+    use std::fs;
+    use std::path::Path;
+
+    fn staging_of(root: &Path) -> PathBuf {
+        root.join(STAGING_DIR_NAME)
+    }
+
+    /// 崩窗形态全覆盖：①stash 后崩溃（.old + sidecar、最终路径缺）→
+    /// 恢复；②close 已成功、stash 未及删（最终路径在）→ 清陈旧 .old；
+    /// ③裸 .part / .probe / 无配对 meta → 垃圾清除。修复前红：
+    /// notes.txt 缺失（旧版无清扫）。
+    #[test]
+    fn startup_sweep_restores_the_stashed_old_and_clears_orphans() {
+        let dir = tempfile::tempdir().expect("temp root");
+        let root = dir.path().to_path_buf();
+        let staging = staging_of(&root);
+        fs::create_dir_all(&staging).expect("staging dir");
+
+        // ①stash 后崩溃：/notes.txt 的旧版本滞留 .old，最终路径缺失
+        fs::write(staging.join("111-7.old"), b"previous-v1").expect("old");
+        fs::write(staging.join("111-7.old.meta"), "notes.txt").expect("meta");
+        // ②close 已成功：/other.txt 新版本在位，.old 陈旧
+        fs::write(root.join("other.txt"), b"current").expect("final");
+        fs::write(staging.join("555-2.old"), b"stale").expect("stale old");
+        fs::write(staging.join("555-2.old.meta"), "other.txt").expect("meta2");
+        // ③垃圾：part / probe / 无配对 .old 的 meta
+        fs::write(staging.join("222-8.part"), b"junk").expect("part");
+        fs::write(staging.join("333-9.probe"), b"").expect("probe");
+        fs::write(staging.join("444-1.old.meta"), "phantom.txt").expect("orphan meta");
+
+        LocalDriver::new(root.clone()).expect("构造即清扫");
+
+        assert_eq!(
+            fs::read(root.join("notes.txt")).expect("恢复"),
+            b"previous-v1",
+            "缺失的最终路径由 .old 恢复（修复前缺失——红）"
+        );
+        assert_eq!(
+            fs::read(root.join("other.txt")).expect("read"),
+            b"current",
+            "最终路径在位时不被陈旧 .old 覆盖"
+        );
+        for gone in [
+            "111-7.old",
+            "111-7.old.meta",
+            "555-2.old",
+            "555-2.old.meta",
+            "222-8.part",
+            "333-9.probe",
+            "444-1.old.meta",
+        ] {
+            assert!(!staging.join(gone).exists(), "{gone} 应被清扫");
+        }
+    }
+
+    /// 无 sidecar 的 .old（无法定位恢复目标）按垃圾清——放行会永久滞留。
+    #[test]
+    fn startup_sweep_clears_an_old_without_its_sidecar() {
+        let dir = tempfile::tempdir().expect("temp root");
+        let root = dir.path().to_path_buf();
+        let staging = staging_of(&root);
+        fs::create_dir_all(&staging).expect("staging dir");
+        fs::write(staging.join("9-9.old"), b"unmapped").expect("old");
+
+        LocalDriver::new(root.clone()).expect("construct");
+
+        assert!(
+            !staging.join("9-9.old").exists(),
+            "无 sidecar 的 .old 不应永久滞留"
+        );
+        assert!(!root.join("unmapped").exists(), "绝不盲恢复到猜测路径");
+    }
 }
