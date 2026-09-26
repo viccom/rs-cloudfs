@@ -7178,6 +7178,7 @@ struct MountPlan<'a> {
     process_cfg: &'a CyDriveConfig,
     /// The `(volume, letter)` claims: volumes that explicitly set a
     /// `drive_letter` (K27).
+    #[cfg_attr(unix, allow(dead_code))]
     claims: &'a [(String, String)],
     /// The registry, for each claim's own VFS (the winfsp arm mounts it).
     ///
@@ -7191,8 +7192,10 @@ struct MountPlan<'a> {
     rt: &'a tokio::runtime::Handle,
     /// Whether the single WebDAV listener bound — the webdav arm's target
     /// and the fallback's only possible landing spot.
+    #[cfg_attr(unix, allow(dead_code))]
     webdav_available: bool,
     /// This build's + machine's WinFsp capability.
+    #[cfg_attr(unix, allow(dead_code))]
     winfsp: WinFspCapability,
 }
 
@@ -7430,8 +7433,10 @@ async fn mount_claims_via_winfsp(plan: &MountPlan<'_>) -> VolumeMounts {
 /// cannot answer [`MountBackendDecision::WinFsp`] here (the capability is
 /// always `NotCompiled`), so this arm is unreachable — kept as a loud
 /// no-op rather than an `unreachable!()` so a future refactor that breaks
-/// that invariant cannot mount nothing in silence.
-#[cfg(not(all(windows, feature = "winfsp")))]
+/// that invariant cannot mount nothing in silence. Unix builds exclude it
+/// entirely: the dispatch lives in the `not(unix)` arm above, so there it
+/// would be dead code (the 2026-09-26 CI first-run lesson).
+#[cfg(not(any(unix, all(windows, feature = "winfsp"))))]
 async fn mount_claims_via_winfsp(_plan: &MountPlan<'_>) -> VolumeMounts {
     tracing::error!(
         "the winfsp mount backend is not compiled into this binary: {}",
