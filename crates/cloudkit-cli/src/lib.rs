@@ -7171,14 +7171,18 @@ pub struct VolumeMounts {
 }
 
 /// Everything the per-volume mount dispatch reads (K27's claims plus K40's
-/// decision inputs), bundled so the signature stays readable.
+/// decision inputs), bundled so the signature stays readable. Unix builds
+/// compile the struct but read none of it (the dispatch itself is the
+/// `not(unix)` no-op arm), so the whole struct carries a unix dead-code
+/// exemption — per-field attrs would whack-a-mole as fields come and go
+/// (the 2026-09-26 CI calibration lesson).
+#[cfg_attr(unix, allow(dead_code))]
 struct MountPlan<'a> {
     /// The process-level config (the `mount_backend` policy and the
     /// `auto_mount_drive` gate).
     process_cfg: &'a CyDriveConfig,
     /// The `(volume, letter)` claims: volumes that explicitly set a
     /// `drive_letter` (K27).
-    #[cfg_attr(unix, allow(dead_code))]
     claims: &'a [(String, String)],
     /// The registry, for each claim's own VFS (the winfsp arm mounts it).
     ///
@@ -7192,10 +7196,8 @@ struct MountPlan<'a> {
     rt: &'a tokio::runtime::Handle,
     /// Whether the single WebDAV listener bound — the webdav arm's target
     /// and the fallback's only possible landing spot.
-    #[cfg_attr(unix, allow(dead_code))]
     webdav_available: bool,
     /// This build's + machine's WinFsp capability.
-    #[cfg_attr(unix, allow(dead_code))]
     winfsp: WinFspCapability,
 }
 

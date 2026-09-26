@@ -30,7 +30,10 @@ use cloudkit_cli::{discover_config, discover_config_with_volumes, DiscoveredConf
 // Driver-only run-flow glue moved with `dispatch_unified_backend_volume`
 // into the lib (115 review batch): BaiduEndpoints and the K13
 // ConfigTokenStore are assembled behind that seam now.
-use cloudkit_core::config::{Backend, CyDriveConfig, MountBackend, VolumeConfig};
+use cloudkit_core::config::{Backend, CyDriveConfig, VolumeConfig};
+// Windows-only reads (the unmount probe): unix builds never resolve it.
+#[cfg(not(unix))]
+use cloudkit_core::config::MountBackend;
 use cloudkit_core::logging::LogConfig;
 #[cfg(feature = "telegram")]
 use cloudkit_core::rel_path::RelPath;
@@ -598,8 +601,10 @@ async fn mount_cmd_winfsp(
 /// The no-feature twin: unreachable in practice (the decision above only
 /// answers [`cloudkit_cli::MountBackendDecision::WinFsp`] when the feature
 /// is compiled in) — kept as an actionable refusal so a future refactor
-/// cannot silently ignore a winfsp request.
-#[cfg(not(all(windows, feature = "winfsp")))]
+/// cannot silently ignore a winfsp request. Unix excludes it outright:
+/// the mount command's dispatch is Windows-only, so there it would be
+/// dead code (the 2026-09-26 CI calibration lesson).
+#[cfg(not(any(unix, all(windows, feature = "winfsp"))))]
 async fn mount_cmd_winfsp(
     _cfg: CyDriveConfig,
     _url: Option<String>,
