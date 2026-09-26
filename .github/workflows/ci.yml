@@ -132,6 +132,13 @@ jobs:
             features: "--features local"
     steps:
       - uses: actions/checkout@v4
+        with:
+          # Tags for build.rs's git identity (K88): a shallow checkout
+          # makes `git describe --tags` miss and the --version identity
+          # degrades to the bare crate version — the main check job has
+          # always had this; the features job needs it too.
+          fetch-depth: 0
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy

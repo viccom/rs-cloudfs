@@ -102,13 +102,22 @@ mod version_tests {
             Some(git) => {
                 assert_eq!(identity, git, "the head is the build-time git identity");
                 let dirty = identity.strip_suffix("-dirty").unwrap_or(identity);
-                let (_, hash) = dirty
-                    .rsplit_once('-')
-                    .unwrap_or_else(|| panic!("the identity carries `-<hash>`: {identity}"));
-                assert!(
-                    hash.len() >= 7 && hash.chars().all(|c| c.is_ascii_hexdigit()),
-                    "the hash segment is hexadecimal: {identity}"
-                );
+                match dirty.rsplit_once('-') {
+                    Some((_, hash)) => {
+                        assert!(
+                            hash.len() >= 7 && hash.chars().all(|c| c.is_ascii_hexdigit()),
+                            "the hash segment is hexadecimal: {identity}"
+                        );
+                    }
+                    // The no-tag fallback (e.g. a shallow checkout that
+                    // fetched no tags) legitimately emits the bare
+                    // version with no hash segment — a semver triple.
+                    None => assert!(
+                        dirty.split('.').count() == 3
+                            && dirty.chars().all(|c| c.is_ascii_digit() || c == '.'),
+                        "the fallback identity is a bare semver triple: {identity}"
+                    ),
+                }
             }
             None => assert_eq!(
                 identity,
