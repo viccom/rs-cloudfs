@@ -2002,16 +2002,50 @@ async fn disable_write_failure_leaves_the_runtime_untouched() {
     .await;
     let addr = control_addr();
 
-    // Make the volume file unwritable (the Windows readonly attribute
-    // denies fs::write).
-    let mut perms = fs::metadata(&file).expect("file metadata").permissions();
-    perms.set_readonly(true);
-    fs::set_permissions(&file, perms).expect("make the file read-only");
+    // Make the volume file unwritable so the DISABLE-side config write
+    // fails. The injection is platform-shaped: Windows denies the write
+    // via the file's readonly attribute, but POSIX `rename` replaces a
+    // readonly file freely (write_config_atomically's tmp+rename would
+    // SUCCEED) — on unix the volumes DIRECTORY loses its write bit
+    // instead, so the tmp file cannot be created there: the same refusal
+    // point the assertion exercises.
+    #[cfg(windows)]
+    {
+        let mut perms = fs::metadata(&file).expect("file metadata").permissions();
+        perms.set_readonly(true);
+        fs::set_permissions(&file, perms).expect("make the file read-only");
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let volumes_dir = dir.path().join("volumes");
+        let mut perms = fs::metadata(&volumes_dir)
+            .expect("dir metadata")
+            .permissions();
+        perms.set_mode(perms.mode() & !0o222); // strip every write bit
+        fs::set_permissions(&volumes_dir, perms).expect("make the volumes dir unwritable");
+    }
 
     let reply = send_cmd(addr, "DISABLE a").await;
-    let mut perms = fs::metadata(&file).expect("file metadata").permissions();
-    perms.set_readonly(false);
-    let _ = fs::set_permissions(&file, perms); // restore for the TempDir drop
+
+    // Restore for the TempDir drop (both shapes must be undone before
+    // the guard's cleanup runs).
+    #[cfg(windows)]
+    {
+        let mut perms = fs::metadata(&file).expect("file metadata").permissions();
+        perms.set_readonly(false);
+        let _ = fs::set_permissions(&file, perms);
+    }
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        let volumes_dir = dir.path().join("volumes");
+        let mut perms = fs::metadata(&volumes_dir)
+            .expect("dir metadata")
+            .permissions();
+        perms.set_mode(perms.mode() | 0o200); // owner write back for cleanup
+        let _ = fs::set_permissions(&volumes_dir, perms);
+    }
     assert!(
         reply.starts_with("ERR:") && reply.contains("writing"),
         "the write failure is the refusal: {reply}"
