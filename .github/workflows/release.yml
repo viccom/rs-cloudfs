@@ -164,7 +164,11 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: cydrive-${{ matrix.os-name }}-x86_64-${{ matrix.variant }}
-          path: cydrive-${{ matrix.os-name }}-x86_64-${{ matrix.variant }}.*
+          # The archive name carries the tag segment (cydrive-<tag>-<os>-
+          # x86_64-<variant>), so the glob must not spell the name without
+          # it — each job produces exactly one archive, the loose glob is
+          # exact in practice.
+          path: cydrive-*
           if-no-files-found: error
 
   # ─────────────────────────────────────────────────────────────────────
