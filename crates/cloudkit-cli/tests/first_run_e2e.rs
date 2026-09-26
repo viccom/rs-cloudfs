@@ -155,7 +155,10 @@ fn status_of(resp: &str) -> u16 {
         .expect("numeric status code")
 }
 
-/// The response body (everything after the blank line).
+/// The response body (everything after the blank line). Rides the same
+/// `local` gate as its only consumer (the gated e2e) — otherwise the
+/// none build's `-D warnings` flags it dead.
+#[cfg(feature = "local")]
 fn body_of(resp: &str) -> &str {
     resp.split_once("\r\n\r\n").map_or("", |(_, body)| body)
 }
