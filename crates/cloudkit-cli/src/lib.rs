@@ -1729,7 +1729,10 @@ async fn assemble_volume(
     options: &RunOptions,
     transport: Arc<dyn CloudTransport>,
     watch: &Arc<ShutdownWatch>,
-) -> std::result::Result<AssembledVolume, (cloudkit_web::WebUiConfig, anyhow::Error)> {
+    // The Err tuple (144 bytes) is boxed: clippy 1.98's result_large_err
+    // gate fires on the bare tuple (CI's stable runs ahead of the local
+    // toolchain that authored the original signature).
+) -> std::result::Result<AssembledVolume, Box<(cloudkit_web::WebUiConfig, anyhow::Error)>> {
     let name = spec.name.clone();
     // The dashboard identity pieces (K24), captured before the
     // transport moves into the core: the running arm reports the
@@ -1754,7 +1757,7 @@ async fn assemble_volume(
     };
     let (runtime, stop_unit, sync_task, fs) = build_volume_runtime(spec, options, transport, watch)
         .await
-        .map_err(|error| (ui_config.clone(), error))?;
+        .map_err(|error| Box::new((ui_config.clone(), error)))?;
     let vfs = Arc::clone(runtime.vfs().expect("a running volume carries its vfs"));
     Ok(AssembledVolume {
         runtime,
@@ -1871,7 +1874,8 @@ pub async fn run_multi_with_transports_and_commands(
                     },
                 );
             }
-            Err((ui_config, error)) => {
+            Err(failed) => {
+                let (ui_config, error) = *failed;
                 tracing::error!(
                     volume = %name,
                     %error,
@@ -3694,7 +3698,8 @@ impl RuntimeVolumeControl {
             match assemble_volume(&self.process_cfg, &spec, &options, transport, &self.watch).await
             {
                 Ok(assembled) => assembled,
-                Err((_, error)) => {
+                Err(failed) => {
+                    let (_, error) = *failed;
                     return (
                         format!(
                             "ERR: assembling volume `{name}` failed: {error:#} — nothing was \

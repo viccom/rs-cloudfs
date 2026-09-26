@@ -2,16 +2,15 @@
 # desktop platforms: architecture/secret gates (R1/R3), fmt, clippy
 # (deny warnings), full test suite.
 #
-# NOTE (honesty): this workflow has NOT been triggered yet — it was
-# committed from a dev environment with no push access. Expect
-# first-run calibration. In particular:
-#   - Linux system deps: none are expected to be needed. SQLite is
-#     compiled from source by rusqlite's "bundled" feature (needs only a
-#     C toolchain, preinstalled on ubuntu-latest), and keyring's
-#     sync-secret-service backend talks D-Bus through zbus, a pure-Rust
-#     client (no libdbus). If the first Linux run fails on a missing
-#     system library, add the apt-get step here and record the lesson.
-#   - Windows: MSVC toolchain is preinstalled on windows-latest.
+# NOTE (first-run calibration, 2026-09-26 — the workflow's first REAL
+# run; every earlier run was billing-refused before any job started):
+#   - Linux system deps: keyring's sync-secret-service backend links
+#     the C libdbus (libdbus-sys via dbus-secret-service — NOT the
+#     pure-Rust zbus path this header originally assumed), so the Linux
+#     legs apt-install libdbus-1-dev + pkg-config. SQLite needs only
+#     the C toolchain (preinstalled on ubuntu-latest).
+#   - Windows: MSVC toolchain is preinstalled on windows-latest; the
+#     libclang step below covers winfsp-sys's bindgen.
 
 name: CI
 
@@ -56,6 +55,13 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
+
+      # keyring's sync-secret-service backend links the C libdbus —
+      # libdbus-sys needs the headers + pkg-config (first-run
+      # calibration 2026-09-26; the Linux legs only).
+      - name: libdbus headers (linux)
+        if: matrix.os == 'ubuntu-latest'
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
 
       # Cache cargo registry + target dir across runs; keys off the
       # lockfile automatically.
@@ -129,6 +135,11 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+
+      # Same libdbus requirement as the check job (keyring is an
+      # unconditional cloudkit-cli dependency).
+      - name: libdbus headers (linux)
+        run: sudo apt-get update && sudo apt-get install -y libdbus-1-dev pkg-config
 
       - uses: Swatinem/rust-cache@v2
 

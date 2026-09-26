@@ -137,7 +137,7 @@ docker run --rm -v $PWD:/io -w /io ghcr.io/rust-cross/cargo-zigbuild \
 - **矩阵**：windows × {full, sftp-winfsp} + linux × {full, sftp}。winfsp 是 Windows 专属（cfg 门控空壳），Linux 精简版只能是 sftp-only；Linux full 不链任何 GPL 件。全功能 Windows 产物含 GPL winfsp 绑定 = 私有分发（K89 裁决边界内，私有仓 Release 即私有分发）。
 - **产物**：`cydrive-<tag>-<os>-x86_64-<variant>.zip/.tar.gz`（release-min 档二进制 + README）×4 + 汇总 `SHA256SUMS.txt`，挂 GitHub Release。
 - **Windows 腿装 LLVM** 供 winfsp-sys 的 bindgen（与 ci.yml 同模式）；checkout `fetch-depth: 0`——build.rs K88 身份段读 `git describe --tags`，浅克隆会把身份段退化成 crate 版本号。
-- **首轮真机未跑（如实标注）**：落地时账号 Actions 被计费层拒启（"recent account payments have failed or your spending limit needs to be increased"）——ci.yml 的全部历史 run 同因从未起跑。billing 修复后用下一个 tag（或删重推既有 tag）触发首轮校准。
+- ~~**首轮真机未跑（如实标注）**：落地时账号 Actions 被计费层拒启~~ **已解除（2026-09-26 仓库转公开——公开仓标准 runner 免费，计费拒启自动消失）**。CI 首次真实运行（rerun 36154955450）揭出两条环境校准债并当日修复：①keyring `sync-secret-service` 实链 C libdbus（`libdbus-sys`，**非** zbus 纯 Rust——ci.yml 头注释原断言错误已改）→ Linux 腿 apt 装 `libdbus-1-dev pkg-config`；②clippy 1.98 对 `assemble_volume` 的 144 字节 Err 元组触发 `result_large_err`（本地 1.97 未及）→ Err 装箱。release workflow 的 tag 首轮仍待下一个 tag。
 
 ## 5. 跨平台坑速查（实测沉淀）
 
@@ -149,5 +149,7 @@ docker run --rm -v $PWD:/io -w /io ghcr.io/rust-cross/cargo-zigbuild \
 | 9p 文件系统慢 | `/mnt/e` 上编译极慢 | 源码拷进 WSL 原生路径构建 |
 | 共享 CARGO_TARGET_DIR 跨 worktree 污染 | 同名包 rmeta 互喂 → E0308 | worktree 用独立 target；merge 后 `cargo clean` 共享 target |
 | winfsp-sys 构建失败 | bindgen 找不到 libclang / gnu 工具链 panic | `LIBCLANG_PATH` 指向 pip 的 clang/native；只用 MSVC |
+| Linux 缺 libdbus 头 | `libdbus-sys` build script 失败（keyring `sync-secret-service` 链 C 库 dbus-secret-service 路线，**非** zbus） | `apt install libdbus-1-dev pkg-config`（ci.yml/release.yml Linux 腿已内置） |
+| CI stable 领先本地 stable | 本地绿的 clippy 在 CI 红（实例：1.98 `result_large_err`） | 本地及时 `rustup update`；修法按 CI 版本为准 |
 | wsl.exe 直传复杂命令 | 引号吞噬/变量丢失 | 一律 `.sh` 脚本路线（写 Windows temp → `cp` 进 WSL → `sed -i 's/\r$//'` → bash 执行） |
 | Git Bash MSYS 路径改写 | `/srv/...` 变 `C:/Program Files/Git/srv/...` | `MSYS_NO_PATHCONV=1` |
