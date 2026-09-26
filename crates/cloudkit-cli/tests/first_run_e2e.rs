@@ -229,6 +229,10 @@ async fn non_first_run_empty_assembly_keeps_the_existing_bail() {
 /// RED 4: the full first-run chain — bootstrap → init boot →
 /// `POST /api/volumes` creates a LOCAL volume through the real dispatch
 /// → the listing carries it and the volume file landed under `volumes/`.
+/// Driver-gated (K30/K31): the none build refuses the local backend's
+/// surfaces with the actionable rebuild message, so the CREATE can
+/// never answer 200 there.
+#[cfg(feature = "local")]
 #[tokio::test]
 async fn first_run_e2e_creates_the_first_volume_through_the_web() {
     let dir = tempfile::tempdir().expect("tempdir");
