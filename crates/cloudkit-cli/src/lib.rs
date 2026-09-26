@@ -8433,19 +8433,33 @@ mod tests {
 
         let mut expected = inserted.lock().expect("inserted log").clone();
         expected.sort();
+        // The table itself is the third account bucket: an insert that
+        // lands after the drainer's final sweep is still legitimately IN
+        // the table — which thread finishes last is schedule-dependent
+        // (the CI runners' constrained cores expose orderings a many-core
+        // dev box never produces). Losslessness = every letter sits in
+        // exactly one bucket: taken, drained, or still in the table.
+        let remaining: Vec<String> = table
+            .take_all()
+            .into_iter()
+            .map(|(_, entry)| entry.mount.expect("every entry carries its id").letter)
+            .collect();
         let mut accounted: Vec<String> = taken
             .lock()
             .expect("taken log")
             .drain(..)
             .chain(drained.lock().expect("drained log").drain(..))
+            .chain(remaining)
             .collect();
         accounted.sort();
         // Entries move out of the table exactly once, so the multiset
         // equality is losslessness: every inserted id was handed to
-        // exactly one consumer (a take or the take_all drain).
+        // exactly one consumer (a take, the take_all drain, or no
+        // consumer yet — still parked in the table).
         assert_eq!(
             accounted, expected,
-            "every inserted entry is either taken by name or drained by take_all — none lost"
+            "every inserted entry is either taken by name, drained by take_all, or still in \
+             the table — none lost"
         );
     }
 
