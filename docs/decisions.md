@@ -172,7 +172,7 @@
 - **ghost-pending 语义**：payload 含 is_uploaded=0 的行照常传播；pull 端无本地字节副本即跳过（不写行不写 mirror），源端后来上传成功（hash 变）会以更高版本重新可达。
 - **secret 只 gate push**：wire 契约 pull 请求无 secret 字段（计划原文如此），读取暴露面由监听边界（默认 127.0.0.1/反代）承担；客户端 secret 走 env `CYDRIVE_SYNC_SECRET`（不加 config 键，计划外最小补面）。
 - **其他小裁定**：服务端 push body 上限 64MB（axum 默认 2MB 装不下全盘首次推送）；HTTP 客户端每请求 300s 宽超时；run 周期任务 shutdown 用 abort（引擎幂等可重跑）；`sync_mirror_all` ORDER BY rel_path 确定性。
-- **真机验收（2026-09-04，本机+WSL，生产 db 只读拷贝、事后哈希核验未变）**：server 0.0.0.0:18390；实例 A（生产 db 副本 9 行/10 chunks，含中文名与 2GB 多块行）push 9 → 空盘 B pull 9 全应用，双库全字段一致；B 侧 db 直改一行（LWW 后推者胜，双侧 size/mtime 一致）+ 删一行（墓碑双侧消失）；幂等轮全零；WSL 空盘实例 C（172.17.96.1 跨 NAT 到宿主 server）pull 9 = 8 应用 + 1 墓碑，与 A 全字段一致、二轮空转。
+- **真机验收（2026-09-04，本机+WSL，生产 db 只读拷贝、事后哈希核验未变）**：server 0.0.0.0:18390；实例 A（生产 db 副本 9 行/10 chunks，含中文名与 2GB 多块行）push 9 → 空盘 B pull 9 全应用，双库全字段一致；B 侧 db 直改一行（LWW 后推者胜，双侧 size/mtime 一致）+ 删一行（墓碑双侧消失）；幂等轮全零；WSL 空盘实例 C（192.0.2.1 跨 NAT 到宿主 server）pull 9 = 8 应用 + 1 墓碑，与 A 全字段一致、二轮空转。
 - **待人工**：cydrive-sync-server 部署到负责人服务器（deploy/cydrive-sync.service 已就绪，SYNC_SECRET 建议 + TLS 归反代）；生产各机 config.toml 增 sync_url 指向该服务器。
 
 ## 2026-09-05 sync-lite 二复审（独立双审查员）+ sync-server 参数守卫修复
@@ -714,7 +714,7 @@ s-cloudfs fork 自 rs-CyDrive@9a691f2（全历史保留；remote 改名 upstream
 
 - **K67.1 驱动修复五项（全部红→绿留证）**：①**symlink 卷根不可用**（H 级——`list`/`stat` 的 lstat 预检拒绝 symlink 根，整卷 Invalid；修复 = 卷根走跟随 stat，卷内条目维持 lstat，GAP-A02 防线不重开）；②**不可寻址名可见**（`\`/`\0` 名句柄往返必败 + 非 UTF-8 名被 russh-sftp 协议层 lossy 成 U+FFFD——修复 = `name_is_addressable` 过滤，「list 产出即可寻址」，ck-local 同源硬化）；③**rename 竞态臂报 Io**（修复 = 镜像 mkdir 竞态臂复查归一 Exists）；④**close 重放窗数据丢失**（H 级——rename ACK 丢失重放后 restore_scene 会把已提交新版本覆盖回旧版；修复 = NotFound + final 已就位且 size 吻合 → 按已提交继续）；⑤**SSH IO 死形态分类**（TCP 拒连/重置/超时按 `io::ErrorKind` 归 Unavailable——重连骨架触发形态对齐）。
 - **K67.2 集成修复四项**：①**`CYDRIVE_SFTP_*` env 违背 K28**（装配点直读绕过多卷跳过——跨卷凭据串味；修复 = 两键挪进 `with_env_overrides`（单卷链、空串=清除对齐 baidu），cli 撤 env 直读，多卷免疫由构造保证）；②`sftp_private_key_path` 相对路径 K21 rebase（原锚进程 CWD）；③web 编辑回填漏 `sftp_port`；④`app.js`/`system.js` 标签表漏 sftp 行。
-- **K67.3 真机复验**：u18（172.27.199.30）**12/12**——11 旧腿零回归 + 新增 ⑥c symlink 根腿（H1 的 E2E 证明）；吞吐 130.3↑/63.2↓ MiB/s 与修复前同档。
+- **K67.3 真机复验**：u18（192.0.2.10）**12/12**——11 旧腿零回归 + 新增 ⑥c symlink 根腿（H1 的 E2E 证明）；吞吐 130.3↑/63.2↓ MiB/s 与修复前同档。
 - **K67.4 既有功能零破坏的证据**：workspace 1149/0（基线 1141 + 8 新测试，既有断言零漂移）；conformance 八断言绿；裁剪构建（local,baidu）绿；clippy/fmt/layers/secrets 全绿。
 - **K67.5 挂账（审查发现、本批不修——桩加固/覆盖缺口，非当前掩盖）**：桩 read 不校验句柄可读性（A-M1）、reader early-EOF 分支桩不可达（A-M2，快照 buf 模型）、quota 真值分支零覆盖（A-M3，桩不声明 statvfs 且无开关）、symlink×rename 组合桩不支持含 writer stash 对 symlink 目标的双侧空白（A-M4）、真机断线重连腿仅有桩覆盖（A-M5——重连行为对真实 OpenSSH TCP 形态的验证仍空）、`is_staging_artifact` 对用户合法文件 `report.cksftp-0-0.part` 的隐藏边界（已在 lib 单测文档化钉死）、非 UTF-8 名 lossy 的根因在 russh-sftp buf.rs（上游形态，驱动侧不可见化已是本仓能做的全部）。
 - **K67.6 回滚点**：分支 `fix/phase4-review`（单 commit），merge 前可整支丢弃；merge 后 `git revert -m 1 <merge>`；env 路由单独回退 = 撤 with_env_overrides 两键 + sftp_params 恢复直读（改动各 ≤10 行）。

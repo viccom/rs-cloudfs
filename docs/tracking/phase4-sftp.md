@@ -44,7 +44,7 @@
   - **未询问的决定（自主裁决，最可逆方向）**：①H1 根跟随只对卷根开（卷内 lstat 契约不动——GAP-A02 修复语义零漂移）；②M-a 选择「不可见」而非「报错」（list 是流式集合面，单条坏名不该炸整卷——local 同款立场）；③H2 重放窗探测限定 rename NotFound 形态（不扩大到 Io——重放窗的确定性信号只有 part 消失）；④B-M1 env 走 with_env_overrides 而非卷模式感知（前者是既有 K28 机制，零新逻辑面）；⑤B-M2 rebase 仅相对路径（绝对直通，幂等）。
 
 - **2026-09-15 第二轮真机：u18（负责人指名服务器，Phase 4 合入后）**：
-  - **范围**：负责人提供 u18（172.27.199.30，Ubuntu 24.04 OpenSSH，root + 本机 RSA 私钥）要求验证 sftp 功能。live_matrix 原只喂密码认证（SF4 fixture 形态），本批补 `CYDRIVE_SFTP_TEST_KEY_PATH`（未加密私钥路径，`password`/`key_path` 二者至少其一；模块文档同步）——**私钥认证腿首次对真实 OpenSSH 验证**（SF4 仅密码；D1 私钥形态此前只有进程内桩覆盖）。
+  - **范围**：负责人提供 u18（192.0.2.10，Ubuntu 24.04 OpenSSH，root + 本机 RSA 私钥）要求验证 sftp 功能。live_matrix 原只喂密码认证（SF4 fixture 形态），本批补 `CYDRIVE_SFTP_TEST_KEY_PATH`（未加密私钥路径，`password`/`key_path` 二者至少其一；模块文档同步）——**私钥认证腿首次对真实 OpenSSH 验证**（SF4 仅密码；D1 私钥形态此前只有进程内桩覆盖）。
   - **服务器侧 fixture**：`/root/cydrive-sf4`（link_test 三件套 + link_guard/victim + protector，步骤同 fixture 文档）；指纹经 `ssh-keygen -F` 取自 known_hosts（**不入仓库**—— reinstall 即换）；递归删除腿消费 link_guard 后已重建，测试残留（`sf4/*` 工作目录）已清理。
   - **结果：11/11 通过（6.87s）**；吞吐 128 MiB 上行 133.5 MiB/s / 下行 61.3 MiB/s——与 WSL2 回环（131.7/65.6）同档，u18 链路无可见带宽税。D2 三态（pin 通过/未 pin 拒/错指纹恒拒）在第二台真实服务器复验；符号链接双腿（⑥a 不下潜/⑥b 删链不伤目标）同过。
   - 验证：`cargo test -p ck-sftp --test live_matrix -- --ignored --test-threads=1` 11/11；`cargo test -p ck-sftp` 离线 63/0（改动无回归）；clippy `-D warnings` 绿；fmt 归一绿。

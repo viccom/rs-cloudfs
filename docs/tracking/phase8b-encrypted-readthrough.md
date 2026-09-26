@@ -2,7 +2,7 @@
 
 > 计划：`docs/plans/2026-09-23-encrypted-readthrough.md` ｜ 批准链：负责人 2026-09-23 三点指示 → K84 立项（D10 修订留痕）→ 深度分析五环 + 计划 §0 八项代码查证 → 计划落档
 > 基线：`feat/readthrough-index`@77a58cc（Phase 8 RT0–RT5+审查批+文档批已落，workspace 1643/0/60 五门禁绿，**待合入**）
-> 状态：**Phase 8-B 全批次完成（EB1–EB4）+ sftp 加密真机腿（2026-09-23，负责人提供 172.27.199.30），待合入**（EB1 2026-09-23 五红→绿+七门禁绿；EB2 五红→绿+六门禁绿+审查回派二红→绿；EB3 四红→绿+六门禁绿；EB4 两阶段验收三腿+Contract-6 修复+真网重跑+web 同步+K85 收口+五门禁与七组合终跑全绿；**K85.6 修复批 + sftp 加密真机两腿全绿（加密模式首落 sftp），无产品缺陷**——详见批次日志 EB4/K85.6 与「sftp 加密真机腿」节）
+> 状态：**Phase 8-B 全批次完成（EB1–EB4）+ sftp 加密真机腿（2026-09-23，负责人提供 192.0.2.10），待合入**（EB1 2026-09-23 五红→绿+七门禁绿；EB2 五红→绿+六门禁绿+审查回派二红→绿；EB3 四红→绿+六门禁绿；EB4 两阶段验收三腿+Contract-6 修复+真网重跑+web 同步+K85 收口+五门禁与七组合终跑全绿；**K85.6 修复批 + sftp 加密真机两腿全绿（加密模式首落 sftp），无产品缺陷**——详见批次日志 EB4/K85.6 与「sftp 加密真机腿」节）
 > worktree：`feat/readthrough-index`（与 Phase 8 同一支，连续批次）；独立 target
 > 编号：执行记录入 decisions 用 **K85**；批次 **EB1–EB4**
 
@@ -251,9 +251,9 @@
 
 **提交**：`fix(upload): 明文 0 字节在权威后端落真实对象——Contract 6 收窄至影子索引后端（K85.6）`。
 
-### sftp 加密真机腿（2026-09-23，负责人提供 172.27.199.30）
+### sftp 加密真机腿（2026-09-23，负责人提供 192.0.2.10）
 
-**背景**：EB4 的两阶段加密验收落在离线 local/TempDir（`cloudkit-cli/tests/encrypted_readthrough_e2e.rs` 三腿）与真网 pan115/pan123 上；sftp 是**唯一宽面驱动尚无加密真机覆盖**者。负责人 2026-09-23 提供真机 sftp 服务器（`root@172.27.199.30:22`，测试根 `/srv/cydrive-rt-enc`，ED25519 指纹 `SHA256:mpap…IeQ` 已由主会话明文腿钉过），本条把 EB4 腿 1 / 腿 2 的协议语义搬到真 sftp 上——**加密模式首次落到 sftp 驱动**。
+**背景**：EB4 的两阶段加密验收落在离线 local/TempDir（`cloudkit-cli/tests/encrypted_readthrough_e2e.rs` 三腿）与真网 pan115/pan123 上；sftp 是**唯一宽面驱动尚无加密真机覆盖**者。负责人 2026-09-23 提供真机 sftp 服务器（`root@192.0.2.10:22`，测试根 `/srv/cydrive-rt-enc`，ED25519 指纹 `SHA256:mpap…IeQ` 已由主会话明文腿钉过），本条把 EB4 腿 1 / 腿 2 的协议语义搬到真 sftp 上——**加密模式首次落到 sftp 驱动**。
 
 **形态**：`crates/drivers/ck-sftp/tests/live_readthrough.rs` 追加两腿（同文件的 `#[ignore]` 真机纪律、env helper、stamp 唯一名、K72/K77.6 按轮随机 LCG 载荷、收尾核空全部复用）：
 

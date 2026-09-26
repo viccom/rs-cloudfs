@@ -73,10 +73,10 @@ cargo test -p ck-sftp --test live_matrix -- --ignored --test-threads=1 --nocaptu
 
 ## 第二轮：u18 真机（2026-09-15，Phase 4 合入后）
 
-负责人指名的第二台真机：**u18**（`172.27.199.30`，Ubuntu 24.04 OpenSSH，
+负责人指名的第二台真机：**u18**（`192.0.2.10`，Ubuntu 24.04 OpenSSH，
 **root + 本机 RSA 私钥**——`CYDRIVE_SFTP_TEST_KEY_PATH` 腿首次真机验证）。
 fixture 建在 `/root/cydrive-sf4`（link_test/link_guard/protector 同上节）；
-指纹经 `ssh-keygen -F 172.27.199.30 -l` 取自 known_hosts（ED25519，
+指纹经 `ssh-keygen -F 192.0.2.10 -l` 取自 known_hosts（ED25519，
 **不入仓库**）。递归删除腿消费 link_guard 后需重建（同上节脚本）。
 
 | 项 | 结果 |
