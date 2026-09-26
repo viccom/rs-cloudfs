@@ -513,50 +513,56 @@ impl Pan115Stager {
     }
 
     /// 读回 spool 的区间字节（sign_val 的区间哈希与分片切分共用）。
+    ///
+    /// std::fs on the blocking pool — NOT tokio::fs：Linux 上 tokio 的
+    /// fs future 完成时序不可信（2026-09-26 CI 定谳，见 L2
+    /// [`cloudkit_storage::spool_append_write`] 注释）——读面与写面同源
+    /// 换 std，保证「读到的一定是已落盘字节」。
     async fn spool_range(&self, start: u64, len: u64) -> Result<Vec<u8>, StorageError> {
-        use tokio::io::{AsyncReadExt, AsyncSeekExt};
-        let mut file = tokio::fs::File::open(&self.spool)
-            .await
-            .map_err(|e| StorageError::Io(format!("spool open: {e}")))?;
-        file.seek(std::io::SeekFrom::Start(start))
-            .await
-            .map_err(|e| StorageError::Io(format!("spool seek: {e}")))?;
-        let mut buf = vec![0u8; len as usize];
-        file.read_exact(&mut buf)
-            .await
-            .map_err(|e| StorageError::Io(format!("spool read: {e}")))?;
-        Ok(buf)
+        let path = self.spool.clone();
+        tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = std::fs::File::open(&path)?;
+            file.seek(SeekFrom::Start(start))?;
+            let mut buf = vec![0u8; len as usize];
+            file.read_exact(&mut buf)?;
+            Ok(buf)
+        })
+        .await
+        .map_err(|e| StorageError::Io(format!("spool join: {e}")))?
+        .map_err(|e| StorageError::Io(format!("spool range: {e}")))
     }
 
     /// 全量 SHA1 + preid（大写 hex；K69.6）。
     async fn hashes(&self) -> Result<(String, String), StorageError> {
-        use tokio::io::AsyncReadExt;
-        let mut file = tokio::fs::File::open(&self.spool)
-            .await
-            .map_err(|e| StorageError::Io(format!("spool open: {e}")))?;
-        let mut full = Sha1::new();
-        let mut prefix = Sha1::new();
-        let mut buf = vec![0u8; 256 * 1024];
-        let mut read_total: u64 = 0;
-        loop {
-            let n = file
-                .read(&mut buf)
-                .await
-                .map_err(|e| StorageError::Io(format!("spool read: {e}")))?;
-            if n == 0 {
-                break;
+        let path = self.spool.clone();
+        tokio::task::spawn_blocking(move || -> std::io::Result<(String, String)> {
+            use std::io::Read;
+            let mut file = std::fs::File::open(&path)?;
+            let mut full = Sha1::new();
+            let mut prefix = Sha1::new();
+            let mut buf = vec![0u8; 256 * 1024];
+            let mut read_total: u64 = 0;
+            loop {
+                let n = file.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                full.update(&buf[..n]);
+                if read_total < PREID_LEN {
+                    let take = ((PREID_LEN - read_total) as usize).min(n);
+                    prefix.update(&buf[..take]);
+                }
+                read_total += n as u64;
             }
-            full.update(&buf[..n]);
-            if read_total < PREID_LEN {
-                let take = ((PREID_LEN - read_total) as usize).min(n);
-                prefix.update(&buf[..take]);
-            }
-            read_total += n as u64;
-        }
-        Ok((
-            format!("{:X}", full.finalize()),
-            format!("{:X}", prefix.finalize()),
-        ))
+            Ok((
+                format!("{:X}", full.finalize()),
+                format!("{:X}", prefix.finalize()),
+            ))
+        })
+        .await
+        .map_err(|e| StorageError::Io(format!("spool join: {e}")))?
+        .map_err(|e| StorageError::Io(format!("spool hashes: {e}")))
     }
 
     /// 分片大小：min 5MiB；超 10000 片时向上取整到 MiB（115-plus-desktop

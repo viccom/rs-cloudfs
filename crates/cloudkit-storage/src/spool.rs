@@ -46,19 +46,30 @@ pub async fn spool_append_write(
     written
         .checked_add(data.len() as u64)
         .ok_or(StorageError::Invalid)?;
-    use tokio::io::AsyncWriteExt;
-    let mut file = tokio::fs::OpenOptions::new()
-        .append(true)
-        // create(true) 对驱动侧既有的「构造即建 spool」是幂等无操作
-        // （文件已在）；对本件的独立使用/单测则保证首写可自建——行为
-        // 等价（D-4），仅放宽「文件必须预存在」这一隐含前置。
-        .create(true)
-        .open(spool)
-        .await
-        .map_err(|e| StorageError::Io(format!("spool append: {e}")))?;
-    file.write_all(data)
-        .await
-        .map_err(|e| StorageError::Io(format!("spool write: {e}")))?;
+    // std::fs on the blocking pool — NOT tokio::fs: on Linux the tokio
+    // write future can report completion while the write syscall is
+    // still in flight (strace-verified, tokio 1.53.1; the 2026-09-26 CI
+    // calibration). The arrival-triggered transfer then reads a spool
+    // whose tail has not landed — shifted or short part bytes reach the
+    // backend. std write_all on a blocking thread has honest completion
+    // semantics (the identical std shape verified clean where the
+    // tokio::fs shape reproduced the loss 100%).
+    let path = spool.to_path_buf();
+    let bytes = data.to_vec();
+    tokio::task::spawn_blocking(move || {
+        use std::io::Write;
+        let mut file = std::fs::OpenOptions::new()
+            .append(true)
+            // create(true) 对驱动侧既有的「构造即建 spool」是幂等无操作
+            // （文件已在）；对本件的独立使用/单测则保证首写可自建——行为
+            // 等价（D-4），仅放宽「文件必须预存在」这一隐含前置。
+            .create(true)
+            .open(&path)?;
+        file.write_all(&bytes)
+    })
+    .await
+    .map_err(|e| StorageError::Io(format!("spool join: {e}")))?
+    .map_err(|e| StorageError::Io(format!("spool append: {e}")))?;
     *written += data.len() as u64;
     // 超承诺：立刻失败（不再拉数据做无用工）。
     if let Some(hinted) = hint_size {
@@ -148,5 +159,41 @@ mod tests {
         let (_guard, spool) = tmp_spool();
         let mut stage = SpoolStage::new(spool);
         assert!(!stage.write(b"abcdef", None).await.expect("no-hint write"));
+    }
+
+    /// 写后立即可见性钉子（2026-09-26 CI 定谳的回归锁）：append 的
+    /// `write()` 返回后，spool 文件必须立刻呈现出全部字节——到齐即传
+    /// 的读面与它零间隙衔接。修前形态（tokio::fs）在 Linux 上 write
+    /// future 曾早于系统调用完成就 Ready，立即读回看到缺尾/错位内容
+    /// （WSL 与 GH ubuntu 双环境实证；std+spawn_blocking 修复）。
+    #[tokio::test]
+    async fn every_append_is_immediately_visible_in_the_file() {
+        let (_guard, spool) = tmp_spool();
+        let mut stage = SpoolStage::new(spool.clone());
+        let chunk = vec![0xA5u8; 256 * 1024];
+        let rounds = 24u64;
+        for i in 0..rounds {
+            let arrived = stage
+                .write(&chunk, Some(rounds * 256 * 1024))
+                .await
+                .expect("append");
+            assert_eq!(
+                arrived,
+                i + 1 == rounds,
+                "only the last append reports arrival"
+            );
+            let len = std::fs::metadata(&spool).expect("metadata").len();
+            assert_eq!(
+                len,
+                (i + 1) * 256 * 1024,
+                "spool length right after append {i}"
+            );
+        }
+        let back = std::fs::read(&spool).expect("read back");
+        assert_eq!(back.len() as u64, rounds * 256 * 1024);
+        assert!(
+            back.iter().all(|&b| b == 0xA5),
+            "content is the appended pattern"
+        );
     }
 }

@@ -522,19 +522,24 @@ impl Pan123Stager {
     }
 
     /// 读回 spool 的区间字节（分片切分）。
+    ///
+    /// std::fs on the blocking pool — NOT tokio::fs：Linux 上 tokio 的
+    /// fs future 完成时序不可信（2026-09-26 CI 定谳，见 L2
+    /// [`cloudkit_storage::spool_append_write`] 注释）——读面与写面同源
+    /// 换 std，保证「读到的一定是已落盘字节」。
     async fn spool_range(&self, start: u64, len: u64) -> Result<Vec<u8>, StorageError> {
-        use tokio::io::{AsyncReadExt, AsyncSeekExt};
-        let mut file = tokio::fs::File::open(&self.spool)
-            .await
-            .map_err(|e| StorageError::Io(format!("spool open: {e}")))?;
-        file.seek(std::io::SeekFrom::Start(start))
-            .await
-            .map_err(|e| StorageError::Io(format!("spool seek: {e}")))?;
-        let mut buf = vec![0u8; len as usize];
-        file.read_exact(&mut buf)
-            .await
-            .map_err(|e| StorageError::Io(format!("spool read: {e}")))?;
-        Ok(buf)
+        let path = self.spool.clone();
+        tokio::task::spawn_blocking(move || -> std::io::Result<Vec<u8>> {
+            use std::io::{Read, Seek, SeekFrom};
+            let mut file = std::fs::File::open(&path)?;
+            file.seek(SeekFrom::Start(start))?;
+            let mut buf = vec![0u8; len as usize];
+            file.read_exact(&mut buf)?;
+            Ok(buf)
+        })
+        .await
+        .map_err(|e| StorageError::Io(format!("spool join: {e}")))?
+        .map_err(|e| StorageError::Io(format!("spool range: {e}")))
     }
 
     /// 全量 MD5（小写 hex——etag 必填真值；一遍哈希 IO 代价照付）。
@@ -542,24 +547,25 @@ impl Pan123Stager {
     /// `hint.content_hash` **不采信**：错哈希 → 假 etag → 未来秒传命中
     /// 会取回错误内容（123-0 ⑥ 推论）——本地重算是唯一可信源。
     async fn hash_md5(&self) -> Result<String, StorageError> {
-        use tokio::io::AsyncReadExt;
-        let mut file = tokio::fs::File::open(&self.spool)
-            .await
-            .map_err(|e| StorageError::Io(format!("spool open: {e}")))?;
-        let mut hasher = Md5::new();
-        let mut buf = vec![0u8; 256 * 1024];
-        loop {
-            let n = file
-                .read(&mut buf)
-                .await
-                .map_err(|e| StorageError::Io(format!("spool read: {e}")))?;
-            if n == 0 {
-                break;
+        let path = self.spool.clone();
+        tokio::task::spawn_blocking(move || -> std::io::Result<String> {
+            use std::io::Read;
+            let mut file = std::fs::File::open(&path)?;
+            let mut hasher = Md5::new();
+            let mut buf = vec![0u8; 256 * 1024];
+            loop {
+                let n = file.read(&mut buf)?;
+                if n == 0 {
+                    break;
+                }
+                hasher.update(&buf[..n]);
             }
-            hasher.update(&buf[..n]);
-        }
-        let out = hasher.finalize();
-        Ok(out.iter().map(|b| format!("{b:02x}")).collect())
+            let out = hasher.finalize();
+            Ok(out.iter().map(|b| format!("{b:02x}")).collect())
+        })
+        .await
+        .map_err(|e| StorageError::Io(format!("spool join: {e}")))?
+        .map_err(|e| StorageError::Io(format!("spool md5: {e}")))
     }
 
     /// 完成态的本地收尾：会话清除 + spool 清理 + 父目录缓存失效。

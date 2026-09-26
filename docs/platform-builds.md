@@ -155,3 +155,4 @@ docker run --rm -v $PWD:/io -w /io ghcr.io/rust-cross/cargo-zigbuild \
 | rustup 换工具链后测试报 E0786 | 旧工具链 rmeta 指纹残留（invalid metadata files） | `cargo clean -p <包>` 定向清后重跑（K73 同族） |
 | wsl.exe 直传复杂命令 | 引号吞噬/变量丢失 | 一律 `.sh` 脚本路线（写 Windows temp → `cp` 进 WSL → `sed -i 's/\r$//'` → bash 执行） |
 | Git Bash MSYS 路径改写 | `/srv/...` 变 `C:/Program Files/Git/srv/...` | `MSYS_NO_PATHCONV=1` |
+| **tokio::fs Linux 写完成时序谎报** | `write().await` 返回时 syscall 仍在途（strace 实证，tokio 1.53.1；WSL2 与 GH ubuntu 双环境复现，**Windows 免疫**）——写后零间隙读回看到缺尾/错位字节，**生产数据破坏级**（2026-09-26 CI 首轮真实运行揭出：pan115/pan123 spool 上传链曾把错位内容传给服务端） | 写读交织面一律 **std::fs + `spawn_blocking`**（std 同形态三重验证 100% 可靠：std 臂/Python 原生 syscall/Windows）。已修：L2 `spool_append_write` + 两驱动 spool 读面；钉子 = `spool.rs::every_append_is_immediately_visible_in_the_file`。仓内其余 tokio::fs 面（vfs/ck-local/cli/web）挂账评估 |
