@@ -191,15 +191,23 @@ impl UploadStager for WebdavStager {
             .written
             .checked_add(data.len() as u64)
             .ok_or(StorageError::Invalid)?;
-        use tokio::io::AsyncWriteExt;
-        let mut file = tokio::fs::OpenOptions::new()
-            .append(true)
-            .open(self.spool.path())
+        // std::fs on the blocking pool — NOT tokio::fs: on Linux the
+        // tokio write future can report completion while the syscall is
+        // still in flight (2026-09-26 CI 定谳，见 L2
+        // `cloudkit_storage::spool_append_write` 注释）。close 紧随其后
+        // 整读本 spool 作 PUT body——写读零间隙，必须诚实完成语义。
+        {
+            let path = self.spool.path().to_path_buf();
+            let bytes = data.to_vec();
+            tokio::task::spawn_blocking(move || {
+                use std::io::Write;
+                let mut file = std::fs::OpenOptions::new().append(true).open(&path)?;
+                file.write_all(&bytes)
+            })
             .await
+            .map_err(|error| StorageError::Io(format!("webdav spool join: {error}")))?
             .map_err(|error| StorageError::Io(format!("webdav spool append: {error}")))?;
-        file.write_all(data)
-            .await
-            .map_err(|error| StorageError::Io(format!("webdav spool write: {error}")))?;
+        }
         if let Some(hinted) = self.hinted_size {
             if self.written > hinted {
                 return Err(StorageError::Invalid);
@@ -221,9 +229,12 @@ impl UploadStager for WebdavStager {
                 return Err(StorageError::Invalid);
             }
         }
-        // 字节源：整读 spool（v1 已知上界——模块文档）。
-        let bytes = tokio::fs::read(self.spool.path())
+        // 字节源：整读 spool（v1 已知上界——模块文档）。std 读面同源
+        // （写面同批换 std 的同一场缺陷——读必须看到已落盘字节）。
+        let spool_path = self.spool.path().to_path_buf();
+        let bytes = tokio::task::spawn_blocking(move || std::fs::read(&spool_path))
             .await
+            .map_err(|error| StorageError::Io(format!("webdav spool join: {error}")))?
             .map_err(|error| StorageError::Io(format!("webdav spool read: {error}")))?;
         let part_rel = self.part_rel()?;
         // ① 隐式建父（trait 契约；PUT 到缺父路径的 409 从严形态在桩上
