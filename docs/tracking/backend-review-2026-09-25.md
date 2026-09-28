@@ -157,3 +157,6 @@ storage（5）：spool 每写 open/close+全量拷贝（性能，量级可接受
 - **版本卫生**：workspace version 0.12.1→0.12.2（0.12.2 tag 漏 bump；K88 取新者故二进制身份无损）；README 身份示例同步。
 
 **夹具观察（未动，非文档）**：cloudkit-platform 测试的 CYDRIVE_TEST_MOUNT_URL 夹具默认 8080——ignored 真机测试的手动便利默认，与生产默认 8485 不再对齐；属测试夹具代码，留待下次触碰该 crate 时顺手。
+## M15 销账（2026-09-28，K91 裁决批）
+
+M15（boot 一卷 connect 失败全体中止 vs K22 矛盾）经负责人裁决**方向 A：容忍**——修法与测试见 decisions **K91**（`assemble_volume_injections` 可测缝 + 失败点名公告 + 单卷流维持 exit；`boot_assembly.rs` 两条红→绿；同批 AGENTS 增「范围纪律」硬规则一行）。M15 就此销账——档案 Medium 17 条全部处置完毕，无悬案。

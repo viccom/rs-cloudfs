@@ -1126,6 +1126,8 @@ async fn run_single_volume(cfg: CyDriveConfig, cwd: std::path::PathBuf) -> Resul
 /// `first_run` (web first-run bootstrap FR1) rides through to the boot:
 /// it is the empty-assembly pass that lets a freshly generated config
 /// boot with zero volumes (the dashboard is the boot's product).
+/// Assembly failures are tolerated (M15/K91): a failing volume is
+/// announced by name and skipped, the rest of the volumes boot.
 async fn run_multi_volume(
     process: CyDriveConfig,
     volumes: Vec<VolumeConfig>,
@@ -1135,51 +1137,29 @@ async fn run_multi_volume(
     // (Logging is installed in `run` before discovery — see the note there.)
     println!("Assembling {} volume(s) ...", volumes.len());
 
-    let mut injections = Vec::new();
-    for spec in volumes {
-        // K21: the volume's home directory anchors its session, baidu
-        // state and (in the assembly) its db/cache paths.
-        let home = cloudkit_cli::volume_home(&spec)?;
-        let settings = cloudkit_cli::resolve_volume_settings(&spec)?;
-        settings
-            .validate()
-            .with_context(|| format!("invalid configuration for volume `{}`", spec.name))?;
-        let mut run_options = cloudkit_cli::RunOptions::default();
-        let transport: Arc<dyn cloudkit_core::transport::CloudTransport> = match settings.backend {
-            Backend::Telegram => {
-                if !settings.is_configured() {
-                    anyhow::bail!(
-                        "volume `{}` is not configured: set bot_token (a \"<id>:<secret>\" \
-                         BotFather token) and chat_id in the volume file {}",
-                        spec.name,
-                        spec.file_path.display()
-                    );
-                }
-                println!("Connecting volume {} to Telegram ...", spec.name);
-                match connect_telegram_volume(&settings, &home).await? {
-                    Some(transport) => transport,
-                    None => return Ok(()), // Ctrl+C during the connect
-                }
-            }
-            backend => {
-                println!(
-                    "Connecting volume {name} to the {backend} backend ...",
-                    name = spec.name,
-                    backend = backend.as_str()
-                );
-                // RV2 extraction: the arm below is shared verbatim with
-                // the runtime ADD's dispatch (`dispatch_runtime_volume`)
-                // so the two dispatch sites cannot drift.
-                cloudkit_cli::dispatch_unified_backend_volume(
-                    &spec,
-                    &settings,
-                    &home,
-                    &mut run_options,
-                )
-                .await?
-            }
-        };
-        injections.push((spec, run_options, transport));
+    // M15/K91 (方向 A, 负责人 2026-09-28 裁决): the assembly tolerates a
+    // bad volume — every per-volume failure (config, validation, connect)
+    // folds into a named failure row instead of killing the boot (K22
+    // 「坏卷不伤兄弟」, now true for the boot loop too). The failures are
+    // announced below; the good volumes boot and serve.
+    let (injections, failures, interrupted) =
+        cloudkit_cli::assemble_volume_injections(volumes).await;
+    if interrupted {
+        return Ok(()); // Ctrl+C during a telegram connect
+    }
+    for failure in &failures {
+        println!(
+            "Volume `{name}` failed to assemble and will NOT serve in this boot: {error}",
+            name = failure.name,
+            error = failure.error
+        );
+    }
+    if !failures.is_empty() {
+        println!(
+            "{count} volume(s) failed; the boot continues without them. Fix the volume via \
+             the dashboard /volumes page or its file, then restart to bring it up.",
+            count = failures.len()
+        );
     }
 
     // RV2 (K48): the runtime-volume command surface — the runtime ADD
@@ -1332,36 +1312,14 @@ async fn connect_telegram_volume(
     cfg: &CyDriveConfig,
     state_base: &std::path::Path,
 ) -> Result<Option<Arc<dyn cloudkit_core::transport::CloudTransport>>> {
-    let transport_config = cloudkit_cli::transport_config_from(cfg, state_base);
-    println!(
-        "Connecting to Telegram (session: {}) ...",
-        transport_config.session_path.display()
-    );
-    let connect = cloudkit_cli::connect_with_deadline(
-        GrammersTransport::connect(transport_config),
-        cloudkit_cli::CONNECT_DEADLINE,
-    );
-    let transport = tokio::select! {
-        result = connect => match result {
-            Ok(transport) => transport,
-            Err(error) => {
-                eprintln!("Error: connecting the Telegram transport");
-                match &error {
-                    cloudkit_cli::ConnectGuardError::Deadline(_) => {}
-                    cloudkit_cli::ConnectGuardError::Inner(source) => {
-                        eprintln!("Caused by:\n    {source}");
-                    }
-                }
-                eprintln!("{}", cloudkit_cli::connect_failure_hint());
-                std::process::exit(1);
-            }
-        },
-        _ = tokio::signal::ctrl_c() => {
-            println!("Interrupted while connecting to Telegram; exiting.");
-            return Ok(None);
-        }
-    };
-    Ok(Some(Arc::new(transport)))
+    // The diagnostics print inside the shared connect
+    // (`connect_telegram_transport`); the single-volume flow has nothing
+    // else to serve, so a connect failure still exits the process — the
+    // M15 tolerance is a multi-volume boot semantic only.
+    match cloudkit_cli::connect_telegram_transport(cfg, state_base).await {
+        Err(_) => std::process::exit(1),
+        other => other,
+    }
 }
 
 /// The no-driver twin (K31): the signature is identical so both run

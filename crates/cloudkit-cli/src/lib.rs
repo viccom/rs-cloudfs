@@ -1788,6 +1788,144 @@ pub async fn run_multi_with_transports(
     .await
 }
 
+// ------------------------------------------------- M15/K91: tolerant boot assembly ---
+
+/// One volume that failed boot assembly (M15 方向 A / K91, 负责人
+/// 2026-09-28 裁决): the failure is named loudly on the console and the
+/// boot continues without the volume (K22 「坏卷不伤兄弟」 extended to
+/// the boot assembly loop) instead of the whole process dying on it.
+/// A ready volume's boot-assembly product: the config spec, its filled
+/// run options (mount decisions ride here) and the connected transport
+/// — the tuple shape [] consumes.
+pub type VolumeInjection = (VolumeConfig, RunOptions, Arc<dyn CloudTransport>);
+
+#[derive(Debug, Clone)]
+pub struct AssemblyFailure {
+    /// The volume's name (the config file's `name` key).
+    pub name: String,
+    /// The failure cause (anyhow chain, formatted) for the announcement.
+    pub error: String,
+}
+
+/// Per-volume boot assembly (the `run_multi_volume` loop body, extracted
+/// for the M15 tolerance seam): validate + dispatch with every failure
+/// mode — config resolution, validation, the sftp-style assembly connect
+/// gates, a refused telegram connect — folded into the `Err` arm
+/// instead of killing the boot. `Ok(None)` = Ctrl+C won the telegram
+/// connect race → the clean boot abort.
+async fn assemble_one_volume(spec: VolumeConfig) -> anyhow::Result<Option<VolumeInjection>> {
+    let name = spec.name.clone();
+    let assembled: anyhow::Result<Option<VolumeInjection>> = async {
+        let home = volume_home(&spec)?;
+        let settings = resolve_volume_settings(&spec)?;
+        settings
+            .validate()
+            .with_context(|| format!("invalid configuration for volume `{name}`"))?;
+        let mut run_options = RunOptions::default();
+        match settings.backend {
+            #[cfg(feature = "telegram")]
+            Backend::Telegram => {
+                if !settings.is_configured() {
+                    anyhow::bail!(
+                        "volume `{name}` is not configured: set bot_token (a \"<id>:<secret>\" \
+                         BotFather token) and chat_id in the volume file {}",
+                        spec.file_path.display()
+                    );
+                }
+                println!("Connecting volume {name} to Telegram ...");
+                // `Ok(None)` = Ctrl+C during the connect — propagates as
+                // the clean-abort arm of the caller's match.
+                connect_telegram_transport(&settings, &home)
+                    .await
+                    .map(|transport| transport.map(|t| (spec, run_options, t)))
+            }
+            #[cfg(not(feature = "telegram"))]
+            Backend::Telegram => Err(anyhow::anyhow!(TELEGRAM_DRIVER_REQUIRED)),
+            backend => {
+                println!(
+                    "Connecting volume {name} to the {backend} backend ...",
+                    name = name,
+                    backend = backend.as_str()
+                );
+                let transport =
+                    dispatch_unified_backend_volume(&spec, &settings, &home, &mut run_options)
+                        .await?;
+                Ok(Some((spec, run_options, transport)))
+            }
+        }
+    }
+    .await;
+    assembled
+}
+
+/// Boot assembly with tolerance (M15 / K91): assembles every volume,
+/// folding failures into named [`AssemblyFailure`] rows instead of
+/// aborting the boot. Returns the ready injections (the same shape
+/// [`run_multi_with_transports_and_commands`] consumes), the failure
+/// rows (the console announcement is the caller's), and the Ctrl+C flag
+/// — `true` means "stop assembling, exit quietly".
+pub async fn assemble_volume_injections(
+    volumes: Vec<VolumeConfig>,
+) -> (Vec<VolumeInjection>, Vec<AssemblyFailure>, bool) {
+    let mut injections = Vec::new();
+    let mut failures = Vec::new();
+    for spec in volumes {
+        let name = spec.name.clone();
+        match assemble_one_volume(spec).await {
+            Ok(Some(injection)) => injections.push(injection),
+            Ok(None) => return (injections, failures, true),
+            Err(error) => failures.push(AssemblyFailure {
+                name,
+                error: format!("{error:#}"),
+            }),
+        }
+    }
+    (injections, failures, false)
+}
+
+/// The telegram transport connect shared by both run flows (M15/K91
+/// extraction of main.rs's `connect_telegram_volume`): deadline-bounded
+/// connect raced against Ctrl+C (`Ok(None)`), diagnostics printed here
+/// — the CALLER decides the consequence. The single-volume flow exits
+/// the process on the error (nothing else would serve); the multi-volume
+/// assembly tolerates it into a Failed row (K22 坏卷不伤兄弟).
+#[cfg(feature = "telegram")]
+pub async fn connect_telegram_transport(
+    cfg: &CyDriveConfig,
+    state_base: &std::path::Path,
+) -> anyhow::Result<Option<Arc<dyn CloudTransport>>> {
+    let transport_config = transport_config_from(cfg, state_base);
+    println!(
+        "Connecting to Telegram (session: {}) ...",
+        transport_config.session_path.display()
+    );
+    let connect = connect_with_deadline(
+        GrammersTransport::connect(transport_config),
+        CONNECT_DEADLINE,
+    );
+    let transport = tokio::select! {
+        result = connect => match result {
+            Ok(transport) => transport,
+            Err(error) => {
+                eprintln!("Error: connecting the Telegram transport");
+                match &error {
+                    ConnectGuardError::Deadline(_) => {}
+                    ConnectGuardError::Inner(source) => {
+                        eprintln!("Caused by:\n    {source}");
+                    }
+                }
+                eprintln!("{}", connect_failure_hint());
+                anyhow::bail!("telegram connect failed");
+            }
+        },
+        _ = tokio::signal::ctrl_c() => {
+            println!("Interrupted while connecting to Telegram; exiting.");
+            return Ok(None);
+        }
+    };
+    Ok(Some(Arc::new(transport)))
+}
+
 /// [`run_multi_with_transports`] with the runtime-volume command surface
 /// (Phase 3.6 / RV2, K48): the process-level control channel gains
 /// `ADD <name>` / `REMOVE <name>` / `LIST` — ADD assembles a volume at

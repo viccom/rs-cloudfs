@@ -51,7 +51,7 @@
 
 ## 常用命令（仓库根）
 ```
-cargo test --workspace --no-fail-fast            # 1897 测试（2026-09-25：复审 Medium 批十二项修复（worktree 终树实测 1897/0/63，-j 2）——webdav 三（M4 rename 重试臂同形分类/M5 200-回退流式丢前缀/M16 暂存名随机化+Drop 清理）、pan115 四（M8 close 补差集门/M9 读窗三防线+自愈臂按实收推进/M10 resume 瞬态保会话/M11 OSS 数据面体量超时）、local M7 list 过滤反斜杠、pan123 M12 配额码 24010 映射、顺手修 M1 淘汰 keep-set/M6 sftp stash lost-ACK 探测/M13 baidu 删除双核对（warm 零流量钉两处同步 +1 核对 list）；既有断言零漂移（M13 两处为语义变更见 findings 档案）；ignored 63 = 真机/平台/真网类，其中 winfsp 真机挂载 1 + webdav live_readthrough 7 + webdav live_matrix 10 + sftp 真机矩阵 12 + sftp live_readthrough 3 + pan115 live_matrix 6 + pan115_e2e 4 + pan123 live_matrix 3 + pan123_e2e 5）
+cargo test --workspace --no-fail-fast            # 1899 测试（2026-09-28：M15 boot 装配容忍（方向 A，+2）+ 文档同步批（0 增）；2026-09-25：复审 Medium 批十二项修复（worktree 终树实测 1897/0/63，-j 2）——webdav 三（M4 rename 重试臂同形分类/M5 200-回退流式丢前缀/M16 暂存名随机化+Drop 清理）、pan115 四（M8 close 补差集门/M9 读窗三防线+自愈臂按实收推进/M10 resume 瞬态保会话/M11 OSS 数据面体量超时）、local M7 list 过滤反斜杠、pan123 M12 配额码 24010 映射、顺手修 M1 淘汰 keep-set/M6 sftp stash lost-ACK 探测/M13 baidu 删除双核对（warm 零流量钉两处同步 +1 核对 list）；既有断言零漂移（M13 两处为语义变更见 findings 档案）；ignored 63 = 真机/平台/真网类，其中 winfsp 真机挂载 1 + webdav live_readthrough 7 + webdav live_matrix 10 + sftp 真机矩阵 12 + sftp live_readthrough 3 + pan115 live_matrix 6 + pan115_e2e 4 + pan123 live_matrix 3 + pan123_e2e 5）
 cargo clippy --workspace --all-targets -- -D warnings
 cargo fmt --all -- --check
 cargo build -p cloudkit-cli --no-default-features --features local,baidu   # 驱动裁剪构建（K30 四 feature）；缺驱动构建运行期报可行动错误（K31 rebuild 指引），cydrive --version 显示驱动清单（K32）
@@ -73,6 +73,7 @@ MSYS_NO_PATHCONV=1 CYDRIVE_SFTP_TEST_HOST=127.0.0.1 CYDRIVE_SFTP_TEST_PORT=2222 
 - **大任务纪律（负责人 2026-09-07 指令）**：代码量较大的任务必须以 TDD 思想为指导；**每个计划必须配套任务单与跟踪记录表**（`docs/tracking/<phase>.md`——任务分解×状态×完成情况×证据，每批收口更新并随 commit 提交）
 - 提交：conventional commits、不加署名尾注、批次 worktree 隔离
 - 文档：行为变更同批更新 README/AGENTS 计数/相关 docs；裁决入 decisions.md
+- **范围纪律（负责人 2026-09-28 裁决）**：执行分配任务途中的顺带发现只报告挂账，未经指令不就地开修
 
 ## 已知陷阱（自 rs-CyDrive 继承 + 融合新增）
 - Windows Git Bash：`ls`/`tree`/`du`/`ps` 别名禁用（用 `fd`/`rg`）；wsl.exe 复杂命令须 `.sh` 脚本路线（引号吞噬）
