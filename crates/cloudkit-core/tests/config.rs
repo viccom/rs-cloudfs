@@ -824,8 +824,7 @@ fn legacy_json_rejects_mount_point() {
 fn legacy_json_wrong_typed_credential_value_is_redacted_in_the_parse_error() {
     let dir = tempfile::tempdir().expect("tempdir");
     let path = dir.path().join("config.json");
-    std::fs::write(&path, r#"{ "bot_token": 123456789012345, "chat_id": 7 }"#)
-        .expect("write");
+    std::fs::write(&path, r#"{ "bot_token": 123456789012345, "chat_id": 7 }"#).expect("write");
     let err = CyDriveConfig::load_legacy_json(&path).expect_err("wrong-typed credential");
     assert!(matches!(err, ConfigError::Parse { .. }), "got: {err:?}");
     let ConfigError::Parse { message, .. } = &err else {

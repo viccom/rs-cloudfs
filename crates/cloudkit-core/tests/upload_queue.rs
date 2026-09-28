@@ -1370,8 +1370,14 @@ async fn same_path_rewrite_during_inflight_upload_keeps_the_new_version() {
     gate.notify_waiters();
     handle.shutdown().await;
 
-    let row = db.get_file("/doc.txt").expect("db read").expect("row exists");
-    assert!(row.is_uploaded, "the superseding job must own the completion");
+    let row = db
+        .get_file("/doc.txt")
+        .expect("db read")
+        .expect("row exists");
+    assert!(
+        row.is_uploaded,
+        "the superseding job must own the completion"
+    );
     assert_eq!(
         row.size, 14,
         "the row must describe the NEW version — a stale-snapshot persist clobbers it back to 5"
