@@ -236,8 +236,10 @@ async fn upload_empty_file_roundtrip() {
     assert!(got.is_empty());
 }
 
-/// delete_remote warm 缓存命中路径：上传顺带填句柄缓存 → 删除零 list
-/// 流量（无全树扫描）→ 条目真删（stat NotFound + 再删 NotFound）。
+/// delete_remote warm 缓存命中路径：上传顺带填句柄缓存 → 删除零**递归
+/// 扫描**（复审 M13 后缓存命中恰增一次父目录 list 做「路径 + fs_id」
+/// 双核对——删错对象不可逆；无全树扫描）→ 条目真删（stat NotFound +
+/// 再删 NotFound）。
 #[tokio::test]
 async fn delete_remote_warm_cache_hit() {
     let (mock, transport) = setup().await;
@@ -254,8 +256,8 @@ async fn delete_remote_warm_cache_hit() {
         .expect("delete_remote");
     assert_eq!(
         list_requests(&mock),
-        mark,
-        "warm 缓存命中：删除解析零 list 流量（无扫描）"
+        mark + 1,
+        "warm 缓存命中：恰一次核对 list（M13 双核对），无递归扫描"
     );
 
     // 真删：StorageDriver 面 stat NotFound；幂等再删 NotFound。

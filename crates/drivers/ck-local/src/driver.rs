@@ -63,13 +63,17 @@ static STAGING_SEQ: AtomicU64 = AtomicU64::new(0);
 
 /// 组件名是否含 Windows 保留/ADS 语义字符。
 ///
-/// `\` 与 `\0` 在词汇层（`RelPath::new`）已被拒；这里是驱动侧对 `:`
-/// 等字符的追加硬化——词汇层必须允许 `:`（VolumeId key 形态需要），
-/// 但作为文件名组件在 Windows 上是 NTFS 备用数据流/非法形态。驱动可比
-/// L2 词汇层更严（跨平台统一拒绝，避免「Linux 可建、Windows 不可寻址」
-/// 的跨平台条目）。`\0` 一并列出是防御性冗余（词汇层已拦）。
+/// `:` 等字符是驱动侧对词汇层的追加硬化——词汇层必须允许 `:`
+///（VolumeId key 形态需要），但作为文件名组件在 Windows 上是 NTFS
+/// 备用数据流/非法形态。驱动可比 L2 词汇层更严（跨平台统一拒绝，
+/// 避免「Linux 可建、Windows 不可寻址」的跨平台条目）。
+///
+/// `\` 与 `\0` 由词汇层 `RelPath::new` 拒绝（句柄回环面走它）——
+/// `RelPath::join` 只拒 `/`，所以 list 过滤必须在此一并拒绝，否则
+/// Linux 卷内 `a\b` 名「可见不可寻址」（复审 M7；`\0` 与之同源，
+/// U+FFFD 形态 local 侧由 `to_str()` 失败跳过）。
 fn has_reserved_char(comp: &str) -> bool {
-    comp.contains([':', '?', '*', '<', '>', '|', '"', '\0'])
+    comp.contains([':', '?', '*', '<', '>', '|', '"', '\\', '\0'])
 }
 
 /// io::Error → StorageError 的 kind 敏感映射（模块文档映射表）。
@@ -589,6 +593,33 @@ fn join_validated(dir: &RelPath, name: &str) -> Option<RelPath> {
         return None;
     }
     dir.join(name).ok() // join 自拒 "."/".."/空/含 '/'
+}
+
+#[cfg(test)]
+mod addressability_tests {
+    //! 复审 M7（2026-09-25）：「list 产出即可寻址」不变量的白盒钉测。
+    //! `a\b` 在 Linux 是合法文件名，但词汇层 `RelPath::new` 拒 `\`
+    //!（句柄回环面 `rel_from_handle` 走它）——list 过滤必须与之一致，
+    //! 否则条目「可见不可寻址」（K67 声称已达成的不变量在 local 侧漏
+    //! 了 `\`）。Windows 上无法建出该名字的文件（跨平台单测只能钉
+    //! 纯函数面），Linux 真机卷是实际暴露面。
+
+    use super::*;
+
+    #[test]
+    fn backslash_names_are_filtered_from_list_output() {
+        let root = RelPath::root();
+        assert!(
+            join_validated(&root, "a\\b").is_none(),
+            "a name containing `\\` is unaddressable (RelPath::new rejects it) — \
+             it must not be listed"
+        );
+        assert!(join_validated(&root, "ab").is_some());
+        assert!(
+            join_validated(&root, "a:b").is_none(),
+            "the NTFS-ADS char stays filtered"
+        );
+    }
 }
 
 #[cfg(test)]

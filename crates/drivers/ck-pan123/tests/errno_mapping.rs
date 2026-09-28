@@ -113,6 +113,33 @@ fn classify_covers_the_read_write_face_codes() {
     }
 }
 
+/// 复审 M12（2026-09-25；真机 2026-09-24 实证）：`24010` = 目标空间
+/// 容量/配额不足（123 的多空间形态——标准/专业空间配额相互独立，
+/// 撞的是**目标目录所在空间**的配额而非账号总量）。必须显式分类，
+/// 不得落 Rejected 泛化 Unavailable（语义类缺失、无行动指引）。
+#[test]
+fn classify_covers_the_quota_face_code() {
+    assert_eq!(classify(24010), ErrKind::QuotaExceeded, "space-quota face");
+}
+
+#[test]
+fn quota_exceeded_maps_to_an_actionable_unavailable() {
+    match map_rejection(24010, "当前目录空间不足") {
+        StorageError::Unavailable(msg) => {
+            assert!(msg.contains("24010"), "the raw code rides along: {msg}");
+            assert!(
+                msg.contains("当前目录空间不足"),
+                "the backend message rides along: {msg}"
+            );
+            assert!(
+                msg.contains("空间") && msg.contains("目录"),
+                "the diagnostic points at the per-space quota shape: {msg}"
+            );
+        }
+        other => panic!("24010 must map to Unavailable, got {other:?}"),
+    }
+}
+
 #[test]
 fn map_rejection_routes_each_kind_to_its_storage_error() {
     // 未登录：无 refresh（K76.4）——不可恢复，重扫码是唯一出路

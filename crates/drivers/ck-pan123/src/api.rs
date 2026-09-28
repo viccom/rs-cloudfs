@@ -258,6 +258,11 @@ pub enum ErrKind {
     NameConflict,
     /// `5113` / `5114`：每日下载流量限额（D5：不绕过——人话指引经 warn）。
     TrafficExceeded,
+    /// `24010`：目标空间容量/配额不足（真机 2026-09-24 实证——多空间
+    /// 形态：标准/专业空间配额相互独立，撞的是目标目录所在空间的配额
+    /// 而非账号总量）。终态 `Unavailable` + 行动指引（换目录/清空间），
+    /// 重试无意义。
+    QuotaExceeded,
     /// `-1`：rpc 形态失败（写路径采样 MalformedXML / ListParts
     /// NoSuchKey；Io 保留原文）。
     RpcFailure,
@@ -275,6 +280,7 @@ pub fn classify(code: i64) -> ErrKind {
         20101 | 401 => ErrKind::NotLoggedIn,
         5060 => ErrKind::NameConflict,
         5113 | 5114 => ErrKind::TrafficExceeded,
+        24010 => ErrKind::QuotaExceeded,
         -1 => ErrKind::RpcFailure,
         400 => ErrKind::BadParams,
         _ => ErrKind::Rejected,
@@ -290,6 +296,13 @@ pub fn map_rejection(code: i64, message: &str) -> StorageError {
         ErrKind::NameConflict => StorageError::Exists,
         // D5：流量限额不绕过——人话指引走 warn 通道（见 to_storage_error）。
         ErrKind::TrafficExceeded => StorageError::RateLimited { retry_after: None },
+        // 空间配额不足（复审 M12；真机实证 2026-09-24）：终态 + 行动
+        // 指引——123 的多空间（标准/专业）配额相互独立，出路是换目标
+        // 目录所在空间或清容量，不是重试。
+        ErrKind::QuotaExceeded => StorageError::Unavailable(format!(
+            "pan123 code={code}: {message}（目标空间容量不足——123 的多空间配额 \
+             相互独立，请在网页端核对目标目录所在空间）"
+        )),
         // rpc 形态失败：Io 保留原码与消息（可诊断；写路径采样形态）。
         ErrKind::RpcFailure => StorageError::Io(format!("pan123 code={code}: {message}")),
         // 参数类：Invalid 无载荷——后端消息经 warn 保留（R2 双通道）。

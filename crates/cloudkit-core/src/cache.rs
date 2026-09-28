@@ -241,6 +241,21 @@ impl CacheManager {
     /// Directories are never deleted. Deleting everything and still not
     /// fitting is not an error (Python returns silently in that case).
     pub fn evict_lru(&self, needed_bytes: u64) -> io::Result<Vec<RelPath>> {
+        self.evict_lru_except(needed_bytes, &[])
+    }
+
+    /// [`CacheManager::evict_lru`] with a keep-set (review M1): paths in
+    /// `keep` are never deletion candidates (they still count toward the
+    /// size budget — eviction may legitimately fail to make room, same
+    /// "not fitting is not an error" contract). The hydrate path hands
+    /// the pending uploads' paths here: for a pending upload the local
+    /// cache copy is the only copy of the bytes (`clear_except` carries
+    /// the same keep-set discipline for `cache clear`).
+    pub fn evict_lru_except(
+        &self,
+        needed_bytes: u64,
+        keep: &[RelPath],
+    ) -> io::Result<Vec<RelPath>> {
         let mut paths = Vec::new();
         collect_files(&self.root, &mut paths);
 
@@ -258,6 +273,11 @@ impl CacheManager {
                 Some(rel) => rel,
                 None => continue,
             };
+            if keep.iter().any(|k| k == &rel) {
+                // Keep-set entries stay (they still occupy the budget).
+                current_size += meta.len();
+                continue;
+            }
             let accessed = log
                 .get(&rel)
                 .copied()

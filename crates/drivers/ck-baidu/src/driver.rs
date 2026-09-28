@@ -291,6 +291,19 @@ impl BaiduDriver {
         self.scan_dir(&self.root.clone(), fs_id).await
     }
 
+    /// 缓存条目的「路径 + fs_id」双核对（复审 M13）：列父目录，确认该
+    /// 路径**当前**站着的条目就是这个 fs_id。核对不过 = 缓存陈旧（对象
+    /// 已搬走/路径被复用）——调用方失效缓存后走递归扫描。一次父目录
+    /// list 是数据安全级核对的代价（删错对象不可逆；-9 纠偏只覆盖
+    /// 「路径已空」形态）。
+    async fn path_matches_id(&self, entry: &api::RemoteEntry) -> Result<bool, StorageError> {
+        let parent = api::parent_abs(&entry.path);
+        let children = api::list(&self.client, &parent).await?;
+        Ok(children
+            .iter()
+            .any(|c| c.path == entry.path && c.fs_id == entry.fs_id))
+    }
+
     /// 递归 list 扫描（卷根深度优先；冷句柄的解析兜底）：逐目录列举
     /// （顺带批量填充句柄缓存）→ 本层 fs_id 匹配即返回 → 目录下沉递归。
     /// 只扫本卷子树（卷外回显经 rel_from_abs 过滤——防御）；全树无 →
@@ -490,7 +503,19 @@ impl StorageDriver for BaiduDriver {
         };
         // fs_id → path 解析两级（真网实证 #3：filemanager delete 只支持
         // path 形态；#1/#2：meta 直查全废）：句柄缓存 → 递归扫描。
-        let remote = self.resolve_handle(fs_id).await?;
+        //
+        // 复审 M13：缓存命中先按「路径 + fs_id」**双核对**——陈旧缓存 ×
+        // 旧路径被外部复用（新对象落原位）时，按路径删会删错对象且
+        // 「成功」（-9 纠偏腿覆盖不到：路径存在、删除不失败）。核对
+        // 不过 → 失效 + 递归扫描真路径（扫描出自实时列举，天然吻合）。
+        let remote = match self.handles.get(fs_id) {
+            Some(hit) if self.path_matches_id(&hit).await? => hit,
+            Some(_) => {
+                self.handles.invalidate(fs_id);
+                self.scan_dir(&self.root.clone(), fs_id).await?
+            }
+            None => self.scan_dir(&self.root.clone(), fs_id).await?,
+        };
         match self.delete_resolved(&remote).await {
             Err(StorageError::NotFound) => {
                 // 缓存陈旧纠偏（decisions 2026-09-08 连带项）：rename 后

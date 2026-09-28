@@ -520,8 +520,21 @@ impl StorageDriver for SftpDriver {
         let stash = if existing {
             match self.client.rename(&final_remote, &old_remote).await {
                 Ok(()) => Some(old_remote),
-                // 竞态窗内旧对象消失：按「原本不存在」继续
-                Err(StorageError::NotFound) => None,
+                Err(StorageError::NotFound) => {
+                    // 两种形态都长这样（复审 M6）：
+                    // ① 竞态窗内旧对象真消失；
+                    // ② lost-ACK 重放——首个 rename 已在服务端生效
+                    //    （final → .old），ACK 丢失后 with_retry 重连重放，
+                    //    服务端如实回 NoSuchFile（源已不在）。
+                    // `.old` 名带 pid-seq 唯一段，**只可能是我们的
+                    // rename 造的**——探测它定夺：在 = stash 已就位（②，
+                    // 失败路径仍可复位）；不在 = 真消失（①，按「原本不
+                    // 存在」继续）。
+                    match self.client.metadata(&old_remote).await {
+                        Ok(_) => Some(old_remote),
+                        Err(_) => None,
+                    }
+                }
                 Err(other) => {
                     // 收拾刚建的 part 再报错（不留孤儿）
                     let _ = self.client.remove_file(&part_remote).await;

@@ -188,6 +188,10 @@ struct OssRequest<'a> {
     content_type: Option<&'static str>,
     body: Vec<u8>,
     callback: Option<&'a UploadCallback>,
+    /// 每请求总超时（`None` = 继承共享客户端 60s）。数据面（分片 PUT /
+    /// PutObject）按体量缩放——复审 M11：共享 60s 对大分片上行是硬顶
+    ///（≥100GiB 文件在普通上行必死），控制面动词不受影响。
+    timeout: Option<std::time::Duration>,
 }
 
 /// 执行一个签名请求：构造 URL（全参数排序 + encode）与 Canonicalized
@@ -302,6 +306,10 @@ async fn oss_execute(
             reqwest::header::AUTHORIZATION,
             format!("OSS {}:{}", ctx.access_key_id, auth),
         );
+    // 每请求总超时（`Some` 时覆盖共享客户端的 60s——复审 M11 数据面）。
+    if let Some(timeout) = req.timeout {
+        request = request.timeout(timeout);
+    }
     if let Some(ct) = req.content_type {
         request = request.header(reqwest::header::CONTENT_TYPE, ct);
     }
@@ -381,6 +389,15 @@ fn xml_blocks<'a>(xml: &'a str, tag: &str) -> Vec<&'a str> {
 
 /// PUT 整对象（小文件路径；callback 头随行——K69.8：callback 挂 Put）。
 /// 响应体可能是 OSS XML 或 115 callback 的 JSON 回应，原样返回。
+/// 数据面请求（分片 PUT / PutObject）的体量缩放总超时（复审 M11）：
+/// `max(300s, 每 MiB × 2s)`——pan123 分片同款公式。典型分片（≤5MiB）
+/// 命中 300s 基线；超大分片（100GiB/10000 片 ≈ 10.5MiB 仍 300s，
+/// ≥150MiB 才开始上浮）只在体量真正需要时放宽——共享客户端的 60s 硬顶
+/// 对大分片普通上行是「必死」约束。
+fn data_timeout(body_len: u64) -> std::time::Duration {
+    std::time::Duration::from_secs((300).max(body_len / (1024 * 1024) * 2))
+}
+
 pub async fn put_object(
     client: &reqwest::Client,
     ctx: &OssCtx,
@@ -394,6 +411,7 @@ pub async fn put_object(
             verb: "PUT",
             params: vec![],
             content_type: Some("application/octet-stream"),
+            timeout: Some(data_timeout(body.len() as u64)),
             body,
             callback,
         },
@@ -416,6 +434,7 @@ pub async fn initiate_multipart(
             params: vec![("uploads", String::new()), ("sequential", String::new())],
             content_type: None,
             body: Vec::new(),
+            timeout: None,
             callback: None,
         },
     )
@@ -452,6 +471,7 @@ pub async fn upload_part(
                 ("uploadId", upload_id.to_string()),
             ],
             content_type: Some("application/octet-stream"),
+            timeout: Some(data_timeout(body.len() as u64)),
             body,
             callback: None,
         },
@@ -503,6 +523,7 @@ pub async fn list_parts(
                 verb: "GET",
                 params,
                 content_type: None,
+                timeout: None,
                 body: Vec::new(),
                 callback: None,
             },
@@ -582,6 +603,7 @@ pub async fn complete_multipart(
             verb: "POST",
             params: vec![("uploadId", upload_id.to_string())],
             content_type: Some("application/xml"),
+            timeout: None,
             body: xml.into_bytes(),
             callback,
         },
@@ -606,6 +628,7 @@ pub async fn abort_multipart(
             params: vec![("uploadId", upload_id.to_string())],
             content_type: None,
             body: Vec::new(),
+            timeout: None,
             callback: None,
         },
     )
@@ -636,5 +659,28 @@ pub(crate) mod tests {
         resource: &str,
     ) -> String {
         super::string_to_sign(verb, content_type, date, oss_headers, resource)
+    }
+
+    /// 复审 M11：数据面体量缩放超时——典型分片（≤149MiB）命中 300s
+    /// 基线（共享客户端 60s 硬顶对大分片上行是「必死」约束）；≥150MiB
+    /// 起按每 MiB × 2s 上浮。零字节形态 = 基线（300s ≥ 60s，纯放宽）。
+    #[test]
+    fn data_timeout_scales_with_body_size() {
+        assert_eq!(super::data_timeout(0), std::time::Duration::from_secs(300));
+        assert_eq!(
+            super::data_timeout(5 * 1024 * 1024),
+            std::time::Duration::from_secs(300),
+            "a typical 5MiB part rides the 300s baseline"
+        );
+        assert_eq!(
+            super::data_timeout(149 * 1024 * 1024),
+            std::time::Duration::from_secs(300),
+            "149MiB still rides the baseline (298s < 300s)"
+        );
+        assert_eq!(
+            super::data_timeout(160 * 1024 * 1024),
+            std::time::Duration::from_secs(320),
+            "160MiB scales to 320s (160MiB / 1MiB * 2s)"
+        );
     }
 }

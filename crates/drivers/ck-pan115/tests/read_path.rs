@@ -70,6 +70,18 @@ struct Vfs {
     /// ufile/move 传输失败注入（K75-1：返回 502 + 非 JSON 体——网络/网关
     /// 错形态；rename 的错误映射不得把它误报成目标占用）
     move_transport_fail: bool,
+    /// CDN 206 空体注入（复审 M9：Content-Range 吻合但 body 空——
+    /// 「零信号截断」形态；**持续**注入）
+    cdn_empty_206: bool,
+    /// CDN 206 越窗注入（复审 M9：body 超出请求窗多给——拼接错位 =
+    /// 数据损坏面；**持续**注入）
+    cdn_over_206: bool,
+    /// 仅 **start > 0 的窗**消耗的 403 预算（复审 M9：把 403 打在后续
+    /// 窗的首 GET 上，让重取直链后的自愈 GET 撞上下一条短体注入）
+    cdn_403_later_budget: u32,
+    /// 仅 **start > 0 的窗**消耗的短体预算（复审 M9：自愈臂必须按实收
+    /// 字节推进 pos——短体 1 字节是旧实现跳字节缺陷的触发形态）
+    cdn_short_206_later_budget: u32,
 }
 
 impl Vfs {
@@ -452,6 +464,25 @@ async fn cdn_get(
         let node = vfs.nodes.values().find(|n| n.pick_code == pc).cloned();
         (node, ignore, force, gone)
     };
+    // 复审 M9 注入面：仅凭 Range 头的 start 分流（start > 0 = 非首窗）。
+    let range_start_now = headers
+        .get(axum::http::header::RANGE)
+        .and_then(|v| v.to_str().ok())
+        .and_then(|r| r.strip_prefix("bytes="))
+        .and_then(|s| s.split('-').next())
+        .and_then(|s| s.parse::<u64>().ok())
+        .unwrap_or(0);
+    let later_403 = {
+        let mut vfs = vfs.lock().unwrap();
+        let later_403 = range_start_now > 0 && vfs.cdn_403_later_budget > 0;
+        if later_403 {
+            vfs.cdn_403_later_budget -= 1;
+        }
+        later_403
+    };
+    if later_403 {
+        return (StatusCode::FORBIDDEN, "rate limited (later window)").into_response();
+    }
     if force_403 {
         return (StatusCode::FORBIDDEN, "rate limited").into_response();
     }
@@ -488,14 +519,38 @@ async fn cdn_get(
             }
             let end = end.min(size); // 半开
             let slice = data[start as usize..end as usize].to_vec();
+            // 复审 M9 注入：Content-Range 恒按请求窗声明（服务器谎报
+            // 形态），body 按旋钮给空/越窗/短体。
+            let (empty, over) = {
+                let vfs = vfs.lock().unwrap();
+                (vfs.cdn_empty_206, vfs.cdn_over_206)
+            };
+            // 短体预算在**真正出 206 体**时才消耗（403 短路不吃预算——
+            // 预算要留给 403 之后的自愈 GET）。
+            let later_short = {
+                let mut vfs = vfs.lock().unwrap();
+                let hit = range_start_now > 0 && vfs.cdn_short_206_later_budget > 0;
+                if hit {
+                    vfs.cdn_short_206_later_budget -= 1;
+                }
+                hit
+            };
+            let body: Vec<u8> = if empty {
+                Vec::new()
+            } else if over {
+                data[start as usize..].to_vec() // 越窗：给到 EOF
+            } else if later_short {
+                slice[..1].to_vec() // 短体：只回窗内第 1 字节
+            } else {
+                slice
+            };
             Response::builder()
                 .status(StatusCode::PARTIAL_CONTENT)
                 .header(
                     "content-range",
                     format!("bytes {}-{}/{}", start, end - 1, size),
                 )
-                .header("content-length", slice.len().to_string())
-                .body(Body::from(slice))
+                .body(Body::from(body))
                 .unwrap()
         }
         _ => Response::builder()
@@ -1032,6 +1087,105 @@ async fn reader_maps_cdn_403_to_rate_limited() {
         }
     }
     assert!(saw_rate_limit, "CDN 403 classifies as RateLimited");
+}
+
+/// 复审 M9（2026-09-25）：CDN 206 空体（Content-Range 吻合、body 空）是
+/// 服务器侧截断真形——读流必须**带错拒绝**，不得静默 break 结流（旧形
+/// 态 = 消费方拿到「成功」的短流，零信号数据截断）。
+#[tokio::test]
+async fn reader_rejects_an_empty_206_window_instead_of_silent_truncation() {
+    let mut vfs = Vfs::new();
+    vfs.put_file(
+        "0",
+        "hole.bin",
+        (0..100_000u32).map(|i| (i % 251) as u8).collect(),
+    );
+    vfs.cdn_empty_206 = true;
+    let mock = Mock::start(vfs).await;
+    let drv = mock.driver();
+    let entry = drv.stat(&path("/hole.bin")).await.expect("stat");
+
+    let mut stream = drv.reader(&entry.id, None).await.expect("stream opens");
+    use futures_util::StreamExt;
+    // 单帧定夺：空 206 的第一帧必为错误帧（否则就是静默截断/数据帧）。
+    match stream.next().await {
+        Some(Err(cloudkit_storage::StorageError::Unavailable(_))) => {}
+        Some(Ok(bytes)) => panic!(
+            "an empty 206 must not produce data frames, got {} bytes",
+            bytes.len()
+        ),
+        Some(Err(other)) => panic!("expected Unavailable, got {other:?}"),
+        None => panic!("the stream must terminate with an error frame, got clean EOF"),
+    }
+}
+
+/// 复审 M9（续）：CDN 206 越窗多给（body 超出请求窗）= 拼接错位的数据
+/// 损坏面——整窗拒绝（pan123 M6 形态同款纪律），不得把多余字节透传
+/// 消费方（旧形态 = 流按实收字节数推进，交付超出请求范围的数据）。
+#[tokio::test]
+async fn reader_rejects_an_over_window_206_instead_of_over_delivery() {
+    // payload 必须跨窗（WINDOW = 4 MiB）：首窗请求 [0,4MiB)，越窗体给到
+    // EOF（4MiB+5000）才构成「多给」。
+    const WINDOW: u64 = 4 * 1024 * 1024;
+    let mut vfs = Vfs::new();
+    vfs.put_file(
+        "0",
+        "wide.bin",
+        (0..(WINDOW + 5000) as u32)
+            .map(|i| (i % 249) as u8)
+            .collect(),
+    );
+    vfs.cdn_over_206 = true;
+    let mock = Mock::start(vfs).await;
+    let drv = mock.driver();
+    let entry = drv.stat(&path("/wide.bin")).await.expect("stat");
+
+    let mut stream = drv.reader(&entry.id, None).await.expect("stream opens");
+    use futures_util::StreamExt;
+    // 单帧定夺：越窗 206 的第一帧必为错误帧（否则就是超范围交付）。
+    match stream.next().await {
+        Some(Err(cloudkit_storage::StorageError::Unavailable(_))) => {}
+        Some(Ok(bytes)) => panic!(
+            "an over-window 206 must not produce data frames, got {} bytes",
+            bytes.len()
+        ),
+        Some(Err(other)) => panic!("expected Unavailable, got {other:?}"),
+        None => panic!("the stream must terminate with an error frame, got clean EOF"),
+    }
+}
+
+/// 复审 M9（续）：403 自愈臂必须按**实收字节**推进 pos——旧实现
+/// `pos += 窗长` 在自愈 GET 短给时跳过未收字节（静默跳字节 = 数据
+/// 损坏）。构造：首窗正常；第二窗首 GET 403（消耗 later-403 预算）→
+/// 重取直链后的自愈 GET 只回窗内第 1 字节（消耗 later-short 预算）→
+/// 正确行为 = 从实收位置续拉直至补齐（旧行为 = 流提前「成功」结束，
+/// 缺 W-1 字节）。payload 跨两窗（WINDOW = 4 MiB）。
+#[tokio::test]
+async fn rate_limited_heal_arm_advances_by_actual_bytes() {
+    const WINDOW: u64 = 4 * 1024 * 1024;
+    let payload: Vec<u8> = (0..(WINDOW * 2 + 1234) as u32)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let mut vfs = Vfs::new();
+    vfs.put_file("0", "skip.bin", payload.clone());
+    vfs.cdn_403_later_budget = 1;
+    vfs.cdn_short_206_later_budget = 1;
+    let mock = Mock::start(vfs).await;
+    let drv = mock.driver();
+    let entry = drv.stat(&path("/skip.bin")).await.expect("stat");
+
+    let mut stream = drv.reader(&entry.id, None).await.expect("stream opens");
+    use futures_util::StreamExt;
+    let mut got: Vec<u8> = Vec::new();
+    while let Some(chunk) = stream.next().await {
+        got.extend_from_slice(&chunk.expect("chunk"));
+    }
+    assert_eq!(
+        got.len(),
+        payload.len(),
+        "the healed stream must deliver every byte (no window skip, no truncation)"
+    );
+    assert_eq!(got, payload, "byte-exact after the short heal fetch");
 }
 
 /// M-S3：直链中途过期（CDN 410）必须自愈——失效缓存、重取直链、续传

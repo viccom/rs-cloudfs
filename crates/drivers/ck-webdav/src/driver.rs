@@ -650,16 +650,29 @@ impl StorageDriver for WebdavDriver {
                     Ok(_) => return Err(StorageError::Exists),
                 }
                 ensure_parents(&self.client, to).await?;
-                // 重试恰一次；仍败 → NotFound（父）（§4.4 终局形态——
-                // 竞态窗内的新失败不逐类细分，调用方按「路径当前不可
-                // 达」处置；例外 = 412：目标被并发占位是真实终局，必须
-                // 与首发同判复核后 Exists——复审 M1）。
+                // 重试恰一次；与首发**同形分类**（复审 M4：重试臂曾把
+                // 传输/认证/5xx 全折叠 `NotFound`——消费面按「路径不可
+                // 达」处置会造成本地/远端分裂）。缺父嫌疑三态重 stat 父
+                // 核实：缺 → `NotFound`（父）（§4.4 终局形态）；在 → 按
+                // 通用表归一；被文件占 → `Exists`。`Err` 原样透传（首发
+                // 同款）。例外 = 412：目标被并发占位是真实终局，复核后
+                // `Exists`——复审 M1。
                 match self.move_rel(from, to, dir_leg, false).await {
                     Ok(crate::client::MoveOutcome::Done) => Ok(()),
                     Ok(crate::client::MoveOutcome::PreconditionFailed { diagnostic }) => {
                         Err(self.precondition_failed_verdict(to, &diagnostic).await)
                     }
-                    _ => Err(StorageError::NotFound),
+                    Ok(crate::client::MoveOutcome::ParentSuspect { status, diagnostic }) => {
+                        match self.stat_entry(&parent).await {
+                            Err(StorageError::NotFound) => Err(StorageError::NotFound),
+                            Err(other) => Err(other),
+                            Ok(parent_entry) if parent_entry.kind == EntryKind::Dir => {
+                                Err(map_status_of(status, "MOVE", &diagnostic))
+                            }
+                            Ok(_) => Err(StorageError::Exists),
+                        }
+                    }
+                    Err(error) => Err(error),
                 }
             }
             Err(error) => Err(error),

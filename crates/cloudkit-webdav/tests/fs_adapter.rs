@@ -1086,6 +1086,86 @@ async fn open_write_flushes_into_vfs_upload_path() {
     assert!(!final_local.exists(), "cache copy deleted after upload");
 }
 
+/// 复审 M16（2026-09-25）：staging sibling 必须带唯一段（winfsp 审查 M1
+/// 同型修复的移植）——固定 `.{name}.tmp` 是**合法虚拟路径**：远端行
+/// `/.foo.tmp` 的缓存副本恰落在该处时，对 `/foo` 的编辑器临时文件形态
+/// PUT 会 truncate 掉那个 pending 行的唯一字节副本。两个并发写手必须
+/// 各持各的暂存名。
+#[tokio::test]
+async fn open_write_staging_siblings_are_unique_per_handle() {
+    let (_dir, _db, cache_root, _mock, _vfs, fs) = test_env(u64::MAX).await;
+    fs.create_dir(&DavPath::new("/uploads").expect("path"))
+        .await
+        .expect("create parent dir");
+    let mut h1 = fs
+        .open(
+            &DavPath::new("/uploads/put.txt").expect("path"),
+            write_options(Some(4)),
+        )
+        .await
+        .expect("open writer 1");
+    h1.write_bytes(b"AAAA".to_vec().into())
+        .await
+        .expect("write via handle 1");
+    let mut h2 = fs
+        .open(
+            &DavPath::new("/uploads/put.txt").expect("path"),
+            write_options(Some(4)),
+        )
+        .await
+        .expect("open writer 2");
+    h2.write_bytes(b"BBBB".to_vec().into())
+        .await
+        .expect("write via handle 2");
+
+    // 两个活写手 → 两个不同的暂存件。固定名形态（旧）只有一个
+    // `.put.txt.tmp` 且第二个 open 已 truncate 掉第一个的全部字节。
+    let mut all_files = Vec::new();
+    collect_files(&cache_root, &mut all_files);
+    let staged: Vec<String> = all_files
+        .iter()
+        .map(|p| p.file_name().unwrap().to_string_lossy().into_owned())
+        .filter(|n| n.starts_with(".put.txt.") && n.ends_with(".tmp"))
+        .collect();
+    assert_eq!(
+        staged.len(),
+        2,
+        "two live writers must hold two distinct staging siblings: {all_files:?}"
+    );
+    assert_ne!(staged[0], staged[1], "the staging names must differ");
+    drop(h1);
+    drop(h2);
+}
+
+/// 复审 M16（续）：未 flush 即 Drop（消费者异常路径——客户端中断上传
+/// 后 dav-server 丢弃句柄）→ 暂存件必须被清理（孤儿 `.tmp` 累积 =
+/// 「StagedFile 无 Drop 清理」Low 挂账同面收口）。
+#[tokio::test]
+async fn open_write_dropped_without_flush_leaves_no_staged_orphan() {
+    let (_dir, _db, cache_root, _mock, _vfs, fs) = test_env(u64::MAX).await;
+    fs.create_dir(&DavPath::new("/uploads").expect("path"))
+        .await
+        .expect("create parent dir");
+    let mut file = fs
+        .open(
+            &DavPath::new("/uploads/put.txt").expect("path"),
+            write_options(Some(6)),
+        )
+        .await
+        .expect("open for write");
+    file.write_bytes(b"WebDAV".to_vec().into())
+        .await
+        .expect("write bytes");
+    drop(file); // 不 flush 直接丢弃
+
+    let mut all_files = Vec::new();
+    collect_files(&cache_root, &mut all_files);
+    assert!(
+        all_files.is_empty(),
+        "a dropped-without-flush handle must leave no staged orphan: {all_files:?}"
+    );
+}
+
 /// 8. open write 0-byte flush: the existing 0-byte put semantics — the
 ///    transport is never called and the row ends uploaded after the
 ///    drain (Explorer placeholder guard, compat contract 6).
