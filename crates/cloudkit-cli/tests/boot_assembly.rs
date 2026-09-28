@@ -19,6 +19,9 @@ use cloudkit_core::config::load_volumes;
 
 /// A good local volume TOML (root = an existing directory; no
 /// `drive_letter` — this test exercises assembly only, not mounting).
+/// `local`-gated with the mixed leg it serves: the crop builds have no
+/// driver at all, so neither the volume nor this constant exists there.
+#[cfg(feature = "local")]
 const GOOD_LOCAL_TOML: &str = "backend = \"local\"\nlocal_root = \"root\"\n";
 
 /// A bad sftp volume TOML: every key validates, but the host:port is a
