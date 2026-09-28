@@ -268,7 +268,9 @@ async fn delete_cold_handle_resolves_via_recursive_scan() {
 }
 
 /// 真网 31300 实证驱动的缓存面：list 流量批量填充句柄缓存（一次 list 一次
-/// 锁），此后 delete 命中缓存——**零额外解析流量**（无递归扫描、无 meta）。
+/// 锁），此后 delete 命中缓存——**零递归扫描**（复审 M13 后缓存命中
+/// 增加恰一次父目录 list 做「路径 + fs_id」双核对——删错对象不可逆，
+/// 这一次核对是数据安全级的固定代价；无 meta）。
 #[tokio::test]
 async fn delete_warm_handle_hits_cache_without_resolution_traffic() {
     let (mock, driver) = setup().await;
@@ -290,8 +292,9 @@ async fn delete_warm_handle_hits_cache_without_resolution_traffic() {
 
     let lists_after = filter_recorded(&mock.recorded(), "GET", XPAN_FILE, &["method=list"]).len();
     assert_eq!(
-        lists_before, lists_after,
-        "缓存命中 delete 零额外 list 流量（解析纯缓存）"
+        lists_before + 1,
+        lists_after,
+        "缓存命中 delete 恰一次核对 list（M13 双核对），零递归扫描"
     );
     let recorded = mock.recorded();
     let metas = filter_recorded(&recorded, "GET", XPAN_FILE, &["method=meta"]);
@@ -348,6 +351,51 @@ async fn delete_stale_cache_path_corrects_via_rescan_and_retry() {
         .await
         .expect_err("新路径必须 NotFound（对象确已删除）");
     assert_eq!(err, StorageError::NotFound);
+}
+
+/// 复审 M13（2026-09-25）：陈旧缓存 × **路径被外部复用**——旧路径上
+/// 站着另一个对象（filemanager delete 按路径删 → 删错对象且「成功」，
+/// -9 纠偏腿覆盖不到：路径存在、删除不失败）。修复：缓存命中先列父
+/// 目录按「路径 + fs_id」双核对；不吻合 → 失效 + 扫描真路径（扫描
+/// 出自实时列举，天然吻合）。
+#[tokio::test]
+async fn delete_stale_cache_with_a_reused_path_deletes_the_right_object() {
+    let (mock, driver) = setup().await;
+    mock.seed_file(&format!("{MOCK_ROOT}/a.txt"), 10, 1757311000);
+
+    // list 填充缓存（fs_id → /…/a.txt）。
+    let listing = driver
+        .list(&RelPath::root(), Page::all())
+        .await
+        .expect("list");
+    let id = listing
+        .entries
+        .iter()
+        .find(|e| e.path.as_str() == "a.txt")
+        .expect("条目可见")
+        .id
+        .clone();
+
+    // 外部改动（不经驱动——驱动缓存自此陈旧）：a.txt 搬到 b.txt；
+    // **另一个对象**落到 a.txt 原位。
+    mock.rename_path(&format!("{MOCK_ROOT}/a.txt"), &format!("{MOCK_ROOT}/b.txt"));
+    mock.seed_file(&format!("{MOCK_ROOT}/a.txt"), 20, 1757312000);
+
+    // delete 旧句柄：必须删 b.txt（该 fs_id 的真身），a.txt（新对象）不动。
+    driver
+        .delete(&id)
+        .await
+        .expect("delete resolves the true object of the handle");
+
+    let err = driver
+        .stat(&RelPath::new("b.txt").expect("rel path"))
+        .await
+        .expect_err("真身对象确已删除");
+    assert_eq!(err, StorageError::NotFound);
+    driver
+        .stat(&RelPath::new("a.txt").expect("rel path"))
+        .await
+        .expect("复用路径上的新对象必须幸存（删错它 = 数据丢失级）");
 }
 
 #[tokio::test]

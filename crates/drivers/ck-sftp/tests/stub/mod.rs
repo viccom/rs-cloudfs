@@ -129,6 +129,10 @@ struct VfsState {
     /// lstat 请求隐身（NoSuchFile），在下一个 rename 请求到达时
     /// 现形——回放「驱动预检放行、执行撞已存在目标」的交错。
     hidden: BTreeSet<String>,
+    /// 复审 M6 注入：armed 路径的下一次 rename **应用效果后回
+    /// NoSuchFile**（lost-ACK 重放形态——首个 rename 已成功、ACK
+    /// 丢失、重放请求如实撞「源不在」）。一次性。
+    apply_rename_but_no_such_file: Option<String>,
     /// H1 注入面：下一次可写 close 落盘时，路径以前缀开头的句柄数据
     /// 截到 N 字节——回放「服务端短写」（close 确认正常但落盘尺寸与
     /// 客户端 written 不符，硬仗②校验的触发器）。
@@ -152,6 +156,7 @@ impl VfsState {
             fail_next_lstat: None,
             fail_next_opendir: None,
             hidden: BTreeSet::new(),
+            apply_rename_but_no_such_file: None,
             shrink_next_close: None,
             fail_next_write: false,
         }
@@ -774,6 +779,22 @@ impl russh_sftp::server::Handler for SftpHandler {
         // 竞态注入解除：hidden 路径在 rename 请求到达时现形（此后
         // 正常处理——已存在目标按 OpenSSH 形态回 Failure）
         vfs.hidden.clear();
+        // 复审 M6 注入（lost-ACK 重放形态）：rename 效果已落地（首个
+        // 请求成功、ACK 丢失），重放请求到达时源已不在——真实服务端
+        // 此刻如实回 NoSuchFile。桩 = 应用效果（文件/链接单件搬移，
+        // 目录腿不在本旋钮射程）+ 回 NoSuchFile——确定性模拟，无需
+        // 连接手术。
+        if let Some(armed) = vfs.apply_rename_but_no_such_file.clone() {
+            if oldpath == armed {
+                vfs.apply_rename_but_no_such_file = None;
+                if let Some(node) = vfs.files.remove(&oldpath) {
+                    vfs.files.insert(newpath.clone(), node);
+                } else if let Some(target) = vfs.symlinks.remove(&oldpath) {
+                    vfs.symlinks.insert(newpath.clone(), target);
+                }
+                return Err(StatusCode::NoSuchFile);
+            }
+        }
         let source_is_dir = vfs.dirs.contains(&oldpath);
         if !source_is_dir
             && !vfs.files.contains_key(&oldpath)
@@ -1109,6 +1130,12 @@ impl Stub {
     /// 预检放行、执行撞已存在目标」的交错。
     pub fn hide_until_next_rename(&self, path: &str) {
         self.lock_vfs().hidden.insert(path.to_string());
+    }
+
+    /// 复审 M6 注入（lost-ACK 重放形态）：armed 路径的下一次 rename
+    /// 应用效果后回 NoSuchFile（见 [`VfsState::apply_rename_but_no_such_file`]）。
+    pub fn apply_rename_but_reply_no_such_file(&self, path: &str) {
+        self.lock_vfs().apply_rename_but_no_such_file = Some(path.to_string());
     }
 
     /// 模拟「rename 已在服务端执行但 ACK 丢失」（close 重放窗测试）：

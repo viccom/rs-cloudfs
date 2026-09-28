@@ -628,8 +628,20 @@ impl Vfs {
         let handle = self.remote_handle_for(rel, &row, HandlePolicy::Read)?;
 
         // Make room before filling: every evicted row keeps all fields
-        // except the cached flag.
-        for victim in self.cache.evict_lru(row.size.max(0) as u64)? {
+        // except the cached flag. Review M1: the pending uploads' local
+        // copies are their rows' only copy of the bytes — they ride as a
+        // keep-set (`clear_cache_preserving_pending` discipline for
+        // `cache clear`, now mirrored on the eviction path).
+        let keep: Vec<RelPath> = self
+            .db
+            .pending_file_paths()?
+            .iter()
+            .filter_map(|path| RelPath::new(path).ok())
+            .collect();
+        for victim in self
+            .cache
+            .evict_lru_except(row.size.max(0) as u64, &keep)?
+        {
             if let Some(victim_row) = self.db.get_file(victim.as_str())? {
                 // is_cached-only flip — targeted column write, never a
                 // whole-row upsert of a possibly-stale snapshot (P3

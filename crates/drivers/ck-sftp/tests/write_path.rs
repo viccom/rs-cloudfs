@@ -514,6 +514,40 @@ async fn abort_restores_the_stashed_old_version() {
     assert_eq!(got, old, "abort must restore the pre-writer version");
 }
 
+/// 复审 M6（2026-09-25）：stash rename 的 **lost-ACK 重放**形态——首个
+/// rename 已在服务端生效（final → `.old`），ACK 丢失后 with_retry 重连
+/// 重放，服务端如实回 NoSuchFile（源已不在）。旧实现把它判成「旧对象
+/// 消失」→ stash=None → 失败路径（abort）无 stash 可复位 → 旧版本困死
+/// `.old`、final 永空。修复：NotFound 臂探测唯一名 `.old`——在 = 我们
+/// 的 stash 已就位（pid-seq 唯一名，只可能是我们的 rename 造的）。
+#[tokio::test]
+async fn stash_rename_lost_ack_replay_still_restores_the_old_version() {
+    let (stub, driver) = setup().await;
+    let old = pattern(3000);
+    stub.add_file("/keep.bin", &old);
+    // 武装 lost-ACK 重放：writer 打开时的 stash rename（/keep.bin →
+    // .cksftp-<pid>-<seq>.old）效果落地、回包 NoSuchFile。
+    stub.apply_rename_but_reply_no_such_file("/keep.bin");
+    let mut stager = driver
+        .writer(&rel("keep.bin"), &WriteHint::default())
+        .await
+        .expect("writer opens despite the replay-shaped stash rename");
+    stager.write(&pattern(100)).await.expect("write");
+    stager.abort().await.expect("abort");
+    let got = read_all(
+        driver
+            .reader(&entry_id(&driver, "keep.bin"), None)
+            .await
+            .expect("reader after abort restores old"),
+    )
+    .await
+    .expect("read");
+    assert_eq!(
+        got, old,
+        "the lost-ACK replayed stash rename must still restore the old version"
+    );
+}
+
 /// 暂存件对 list 不可见（驱动实现细节，不是卷内容——conformance 断言③
 /// 的集合完整性依赖它；local 的 `.cklocal-staging/` 过滤同源）。
 #[tokio::test]

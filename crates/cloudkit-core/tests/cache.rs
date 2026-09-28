@@ -220,3 +220,45 @@ fn clear_all_empties_tree_but_keeps_root() {
     );
     assert!(root.is_dir(), "the cache root itself survives");
 }
+
+// ------------------------------------------- evict_lru_except (M1) ---
+
+/// 复审 M1（2026-09-25）：pending 上传的本地副本是该行的**唯一**字节
+/// 副本——LRU 淘汰必须把它当 keep-set 保护（`clear_except` 的同款纪律，
+/// 此前只有 `cache clear` 有保护、hydrate 驱动的淘汰没有）。最旧的
+/// 恰是 pending 副本时，旧实现会把它删掉。
+#[test]
+fn evict_lru_except_never_deletes_a_kept_path_even_when_oldest() {
+    let (_dir, _root, cm) = new_cm(15);
+    let pending_path = write_cached(&cm, "/pending.bin", &[7u8; 10]);
+    let fresh_path = write_cached(&cm, "/fresh.bin", &[9u8; 10]);
+    // pending 是最旧的（mtime 回拨到过去）。
+    set_mtime(&pending_path, SystemTime::UNIX_EPOCH);
+    thread::sleep(Duration::from_millis(20));
+
+    let keep = vec![rp("/pending.bin")];
+    let evicted = cm.evict_lru_except(10, &keep).expect("evict with keep-set");
+    assert!(
+        evicted.iter().all(|r| r != &rp("/pending.bin")),
+        "the kept pending copy must never be a victim: {evicted:?}"
+    );
+    assert!(pending_path.exists(), "the pending copy survived on disk");
+    // 新鲜件被淘汰腾位（limit 15 + need 10 > 20）。
+    assert_eq!(evicted, vec![rp("/fresh.bin")], "the newer file is the victim");
+    assert!(!fresh_path.exists());
+}
+
+/// keep-set 条目仍计入容量预算（不是「免费保留」）——保护不放大
+/// 缓存上限；全部文件都在 keep-set 时淘汰不删除任何东西（「腾不出
+/// 不是错误」契约保持）。
+#[test]
+fn evict_lru_except_kept_paths_still_count_toward_the_budget() {
+    let (_dir, _root, cm) = new_cm(15);
+    let a = write_cached(&cm, "/a.bin", &[1u8; 10]);
+    let b = write_cached(&cm, "/b.bin", &[2u8; 10]);
+
+    let keep = vec![rp("/a.bin"), rp("/b.bin")];
+    let evicted = cm.evict_lru_except(10, &keep).expect("evict");
+    assert!(evicted.is_empty(), "nothing is deletable: {evicted:?}");
+    assert!(a.exists() && b.exists(), "both kept copies survive");
+}
