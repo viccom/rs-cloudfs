@@ -2570,6 +2570,15 @@ fn split_name_payload(rest: &str) -> Option<(&str, &str)> {
 /// credential the form left empty overlays nothing) and whose type
 /// refusals name the key, never the value (M3 — the payload may carry
 /// credentials). Every refusal text is a complete `ERR: ...\n` reply.
+/// K58-M4 复审 M14：命令行进入日志前的单一脱敏口。CREATE/UPDATE 的
+/// 第三段载荷「MAY carry credentials」（[`volume_payload_table`] 契约）
+/// ——panic 路径的 `command = %line` 必须走本函数，凭据值不得以任何
+/// 形态落日志；其余命令原样透传（不含载荷）。
+pub(crate) fn loggable_command_line(line: &str) -> String {
+    // RED 桩（当前行为：透传）——修复批按关键字裁掉载荷段。
+    line.to_string()
+}
+
 fn volume_payload_table(payload: &str) -> Result<toml::Table, String> {
     let value: serde_json::Value = match serde_json::from_str(payload) {
         Ok(value) => value,
@@ -6511,6 +6520,17 @@ pub async fn baidu_backend_probe_with(
 /// (single mapping, no drift) and carries the K13 write-back store —
 /// a refresh triggered mid-walk must persist its rotated pair or the
 /// next boot reads a dead refresh_token.
+/// 复审 H3：rebuild 驱动装配所用 token 存储的目标文件。多卷模式必须
+/// 指向卷自己的 toml（`spec.file_path`）——轮换对写进**进程**
+/// config.toml 会以卷域键身份触发 K19 混键守卫，下次启动被拒启。
+/// `None` = 单卷模式（cwd config.toml 即卷配置，现状语义不变）。
+#[cfg(any(feature = "baidu", feature = "pan115"))]
+fn rebuild_token_store(secrets: Option<&Path>) -> ConfigTokenStore {
+    // RED 桩（当前装配行为：恒进程 config.toml）。
+    let _ = secrets;
+    ConfigTokenStore::default()
+}
+
 async fn build_driver(cfg: &CyDriveConfig) -> Result<Arc<dyn StorageDriver>> {
     match cfg.backend {
         Backend::Telegram => anyhow::bail!("{TELEGRAM_REBUILD_REFUSAL}"),
@@ -8108,6 +8128,49 @@ pub fn run_migrate(store: &dyn CredentialStore) -> Result<String> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    // 复审 M14（红测——桩当前透传）：CREATE/UPDATE 命令行进入日志前
+    // 必须裁掉载荷段，凭据值与载荷键名都不得残留。
+    #[test]
+    fn panic_log_command_lines_redact_create_update_payloads() {
+        let line = "CREATE vol1 {\"baidu_access_token\":\"SUPERSECRET\",\"baidu_refresh_token\":\"R2\",\"baidu_app_key\":\"k\"}";
+        let logged = loggable_command_line(line);
+        assert!(logged.contains("CREATE"), "the keyword stays actionable: {logged}");
+        assert!(logged.contains("vol1"), "the volume name stays: {logged}");
+        assert!(
+            !logged.contains("SUPERSECRET"),
+            "credential values never ride the log line: {logged}"
+        );
+        assert!(
+            !logged.contains("R2"),
+            "credential values never ride the log line: {logged}"
+        );
+        assert!(
+            !logged.contains("baidu_app_key"),
+            "even the payload's key names are gone: {logged}"
+        );
+        // 无载荷命令原样透传。
+        assert_eq!(loggable_command_line("LIST"), "LIST");
+        assert_eq!(loggable_command_line("DESTROY vol1 confirm"), "DESTROY vol1 confirm");
+    }
+
+    // 复审 H3（红测——桩当前恒进程 config.toml）：rebuild 轮换的目标
+    // 文件必须随卷，多卷模式的轮换不得写进进程 config.toml。
+    #[cfg(any(feature = "baidu", feature = "pan115"))]
+    #[test]
+    fn rebuild_rotation_targets_the_volume_file_not_the_process_config() {
+        let volume_file = std::path::Path::new("volumes/b.toml");
+        assert_eq!(
+            rebuild_token_store(Some(volume_file)).path,
+            volume_file,
+            "multi-volume rebuild rotations must land in the volume's own toml"
+        );
+        assert_eq!(
+            rebuild_token_store(None).path,
+            std::path::Path::new("config.toml"),
+            "single-volume rebuild keeps the cwd config.toml semantics"
+        );
+    }
 
     /// K58-M5: the UPDATE re-read parse (the overlay base) routes its
     /// error through the core redaction funnel — it was the one toml

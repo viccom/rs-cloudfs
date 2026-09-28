@@ -815,3 +815,28 @@ fn legacy_json_rejects_mount_point() {
     let err = CyDriveConfig::load_legacy_json(&path).expect_err("legacy rejects mount_point");
     assert!(matches!(err, ConfigError::Parse { .. }), "got: {err:?}");
 }
+
+// 复审 M2（legacy JSON 凭据泄漏）：错误类型的凭据值让 serde_json 在
+// 错误信息里原样引用该值（「invalid type: integer `…`」），而那条消息
+// 不携带键名——脱敏漏斗按键名触发、无从命中，load_legacy_json 的两处
+// Parse 构造也不经过漏斗。凭据值不得以任何形态进入 ConfigError::Parse。
+#[test]
+fn legacy_json_wrong_typed_credential_value_is_redacted_in_the_parse_error() {
+    let dir = tempfile::tempdir().expect("tempdir");
+    let path = dir.path().join("config.json");
+    std::fs::write(&path, r#"{ "bot_token": 123456789012345, "chat_id": 7 }"#)
+        .expect("write");
+    let err = CyDriveConfig::load_legacy_json(&path).expect_err("wrong-typed credential");
+    assert!(matches!(err, ConfigError::Parse { .. }), "got: {err:?}");
+    let ConfigError::Parse { message, .. } = &err else {
+        unreachable!("matched above")
+    };
+    assert!(
+        message.contains("bot_token"),
+        "the key must be named for actionability: {message}"
+    );
+    assert!(
+        !message.contains("123456789012345"),
+        "the credential VALUE must never ride the parse error: {message}"
+    );
+}
