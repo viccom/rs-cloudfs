@@ -17,12 +17,13 @@
 #
 # Profile: release-min (K68 — strip + fat LTO, codegen-units 1).
 #
-# NOTE (2026-09-25, honesty): first real run still pending — GitHub
-# refused to start ANY Actions job on this account at the time of
-# commit ("recent account payments have failed or your spending limit
-# needs to be increased"). The commands mirror the locally proven
-# platform-builds.md recipes and rs-f4ss's working release workflow,
-# but the first end-to-end run happens only after billing is fixed.
+# Track record (updated 2026-09-28; the 2026-09-25 billing-refusal note
+# below was written before the repo went public and is kept only as the
+# calibration history): 0.12.1 (2026-09-26) was the first end-to-end run
+# — four builds green, the release job failed only on a missing tag
+# segment in the upload glob, fixed same day (f26e025) → all green. 0.12.2
+# (2026-09-28) passed end-to-end first try: guard + 4 builds + release,
+# five assets published.
 
 name: Release
 
