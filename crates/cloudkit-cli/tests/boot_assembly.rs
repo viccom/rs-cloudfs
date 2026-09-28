@@ -8,7 +8,12 @@
 //! The bad volume here is an sftp config pointing at a guaranteed-closed
 //! loopback port: with the `sftp` feature compiled the connect is
 //! refused instantly (TCP), without it the K31 driver-required error
-//! fires — both are assembly failures, so the test is crop-independent.
+//! fires — both are assembly failures, so the all-failing test is
+//! crop-independent. The \*\*mixed\*\* test needs a volume that really does
+//! assemble, which takes a compiled driver: it is gated on `local`
+//! (present in the default build and the local crop; the `none` crop has
+//! no driver at all, so no good volume can exist there — the CI
+//! `feature gates (none)` leg caught exactly that assumption once).
 
 use cloudkit_core::config::load_volumes;
 
@@ -35,6 +40,11 @@ fn write_volume(dir: &std::path::Path, name: &str, body: &str) {
 /// 方向 A 主腿：坏卷折叠成 `AssemblyFailure`（带名字与原因），好卷照常
 /// 装配，boot 信号 = 继续。修复前红：`assemble_volume_injections` 不存在
 /// （seam 缺失），且旧行为里坏卷的 Err 直接炸掉整个装配环。
+///
+/// `local` 门控：本腿需要一个**真能装配**的好卷，而裁剪构建
+/// （`--no-default-features`）里一个驱动都没有——那种图下不存在好卷，
+/// 该组合由下面的全坏腿覆盖（CI none 腿曾揭出本测试此前的这一假定）。
+#[cfg(feature = "local")]
 #[tokio::test]
 async fn a_failed_volume_is_folded_into_a_named_failure_while_good_volumes_assemble() {
     let dir = tempfile::tempdir().expect("tempdir");
