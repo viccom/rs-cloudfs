@@ -655,17 +655,13 @@ impl WebdavClient {
                 ))),
             }
         } else {
-            // 200 族回退：body 自文件头起——封顶 = 窗口终点 `end`（覆盖
-            // 请求区间 → 截断，§4.4；不足 → Io）。
-            let bytes = read_capped(response, end as usize).await?;
-            if (bytes.len() as u64) < end {
-                return Err(StorageError::Io(format!(
-                    "webdav server ignored the Range and its {}-byte body does not cover the \
-                     window [{start},{end})",
-                    bytes.len()
-                )));
-            }
-            Ok(Some(bytes.slice(start as usize..end as usize)))
+            // 200 族回退：body 自文件头起——复审 M5：流式消费**丢弃
+            // `[0,start)` 前缀、只累积窗长**（旧 `read_capped(end)` 按绝
+            // 对窗口终点缓冲——高偏移窗口整前缀进内存，OOM 面只关一半；
+            // 网络侧整前缀重读是服务器忽略 Range 的固有代价，内存侧在
+            // 此封顶）。覆盖不足 → Io（函数内判，见其文档）。
+            let bytes = read_200_window(response, start, end).await?;
+            Ok(Some(bytes))
         }
     }
 
@@ -1154,6 +1150,48 @@ async fn read_capped(
     Ok(bytes::Bytes::from(out))
 }
 
+/// 200-回退窗读取（复审 M5）：流式消费 body——`[0,start)` 前缀按块
+/// 丢弃（跨块精确切片），只累积 `[start,end)` 窗长；窗口读满即停
+/// （其余 body 随连接放弃，与 [`read_capped`] 的封顶语义同源）。流提前
+/// 结束（覆盖不足窗终点）→ `Io`。
+///
+/// 内存峰位 = 窗长 + 单块（旧 `read_capped(end)` 按绝对窗口终点缓冲
+/// ——高偏移窗口整前缀进内存，OOM 面只关一半；网络侧整前缀重读是
+/// 服务器忽略 Range 的固有代价，内存侧在此封顶）。
+async fn read_200_window(
+    mut response: reqwest::Response,
+    start: u64,
+    end: u64,
+) -> Result<bytes::Bytes, StorageError> {
+    let window = end.saturating_sub(start) as usize;
+    let mut out: Vec<u8> = Vec::with_capacity(window.min(1024 * 1024));
+    let mut pos: u64 = 0;
+    while pos < end {
+        match response.chunk().await.map_err(map_transport)? {
+            Some(chunk) => {
+                let chunk_end = pos + chunk.len() as u64;
+                let take_start = pos.max(start);
+                let take_end = chunk_end.min(end);
+                if take_end > take_start {
+                    let from = (take_start - pos) as usize;
+                    let to = from + (take_end - take_start) as usize;
+                    out.extend_from_slice(&chunk[from..to]);
+                }
+                pos = chunk_end;
+            }
+            None => break,
+        }
+    }
+    if pos < end {
+        return Err(StorageError::Io(format!(
+            "webdav server ignored the Range and its {}-byte body does not cover the \
+             window [{start},{end})",
+            pos
+        )));
+    }
+    Ok(bytes::Bytes::from(out))
+}
+
 /// PROPFIND 深度（`0` = stat 语义，`1` = 列目录语义）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) enum Depth {
@@ -1168,5 +1206,72 @@ impl Depth {
             Depth::Zero => "0",
             Depth::One => "1",
         }
+    }
+}
+
+// ------------------------------------------------ M5 seam 测试（单测面）---
+
+#[cfg(test)]
+mod read_200_window_tests {
+    use super::*;
+
+    /// 由定长块序列合成一个可 `chunk()` 的 200 响应（wrap_stream——块
+    /// 边界完全受测（控），覆盖 start/end 跨块的切片形态）。
+    fn response_of_chunks(chunks: Vec<Vec<u8>>) -> reqwest::Response {
+        let stream = futures_util::stream::iter(
+            chunks
+                .into_iter()
+                .map(|c| Ok::<bytes::Bytes, std::io::Error>(bytes::Bytes::from(c)))
+                .collect::<Vec<_>>(),
+        );
+        let body = reqwest::Body::wrap_stream(stream);
+        let response = http::Response::builder().status(200).body(body).unwrap();
+        reqwest::Response::from(response)
+    }
+
+    /// 复审 M5：200-回退必须**流式丢弃 `[0,start)` 前缀、只累积窗长**
+    /// ——前缀块整块扔、跨块的 start/end 精确切片；窗口读满即停（其
+    /// 余 body 随连接放弃，与旧 read_capped 封顶语义同源）。红形态：
+    /// 旧实现按绝对终点缓冲（`read_capped(end)`），高偏移窗口整前缀进
+    /// 内存——本 seam 面（输出逐字等价，缺陷在内存峰位）先行钉住切
+    /// 片数学，资源面由实现结构保证（无整前缀累积点）。
+    #[tokio::test]
+    async fn discards_the_prefix_chunkwise_and_keeps_only_the_window() {
+        // 块边界故意与 start=10 / end=14 错开（4+6+4+6）。
+        let body: Vec<u8> = (0u8..20).collect();
+        let response = response_of_chunks(vec![
+            body[0..4].to_vec(),
+            body[4..10].to_vec(),
+            body[10..14].to_vec(),
+            body[14..20].to_vec(),
+        ]);
+        let bytes = read_200_window(response, 10, 14).await.expect("window bytes");
+        assert_eq!(&*bytes, &body[10..14], "exactly the [start,end) window");
+    }
+
+    /// 覆盖不足（body 短于窗口终点）→ `Io`（与旧「不足 → Io」契约同
+    /// 形；诊断不再携带缓冲字节数——错误面只讲覆盖事实）。
+    #[tokio::test]
+    async fn short_body_is_an_io_error() {
+        let response = response_of_chunks(vec![vec![0u8; 5]]);
+        let err = read_200_window(response, 10, 14)
+            .await
+            .expect_err("body shorter than the window end");
+        assert!(matches!(err, StorageError::Io(_)), "{err:?}");
+        assert!(
+            err.to_string().contains("does not cover the window"),
+            "diagnostic names the uncovered window: {err}"
+        );
+    }
+
+    /// 窗口起点为 0（无前缀）与窗口恰好读满 body 的两端形态。
+    #[tokio::test]
+    async fn zero_start_and_exact_fit_shapes_hold() {
+        let response = response_of_chunks(vec![vec![1, 2, 3, 4]]);
+        let bytes = read_200_window(response, 0, 4).await.expect("window bytes");
+        assert_eq!(&*bytes, &[1, 2, 3, 4]);
+        let response = response_of_chunks(vec![vec![1, 2, 3, 4, 5, 6]]);
+        let bytes = read_200_window(response, 0, 4).await.expect("window bytes");
+        assert_eq!(&*bytes, &[1, 2, 3, 4], "extra bytes beyond the window are dropped");
     }
 }

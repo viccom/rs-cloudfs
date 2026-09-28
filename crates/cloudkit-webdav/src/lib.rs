@@ -21,7 +21,7 @@
 //!   requests on a range-incapable transport still slice the local
 //!   cached copy (R-5) — pinned by the smoke test
 //!   `get_range_without_range_read_capability_still_slices`;
-//! - writes stage into a `.{name}.tmp` sibling of the cache path and
+//! - writes stage into a `.{name}.{rand8}.tmp` sibling of the cache path and
 //!   commit on `flush` — fsync, atomic rename, pending row, enqueued
 //!   upload — never reading the payload back into memory;
 //! - delete removes the row plus any cached copy; the remote side is
@@ -239,6 +239,7 @@ impl DavFileSystem for CyDriveFs {
                     vfs: Arc::clone(&self.vfs),
                     db: Arc::clone(&self.db),
                     flushed: false,
+                    committed: false,
                 }) as Box<dyn DavFile>);
             }
             Err(FsError::GeneralFailure)
@@ -769,7 +770,7 @@ impl DavFile for RangeFile {
     }
 }
 
-/// Write-state [`DavFile`] (PUT): a `.{name}.tmp` sibling of the final
+/// Write-state [`DavFile`] (PUT): a `.{name}.{rand8}.tmp` sibling of the final
 /// cache path. `flush` is the PUT completion point — fsync, hand the
 /// staged file to [`Vfs::put_staged`] (atomic rename + pending row +
 /// enqueued upload) — after which further writes are rejected.
@@ -780,6 +781,21 @@ struct StagedFile {
     vfs: Arc<Vfs>,
     db: Arc<MetaDatabase>,
     flushed: bool,
+    /// The flush committed (`put_staged` renamed the sibling away): `Drop`
+    /// must not treat the (now gone) sibling as an orphan to clean up.
+    committed: bool,
+}
+
+impl Drop for StagedFile {
+    /// A handle dropped without a successful flush never committed: the
+    /// staged sibling is an orphan (client-aborted upload shape) and is
+    /// removed best-effort here — with the unique tag (review M16) the
+    /// sibling can never be another row's cache path, so removal is safe.
+    fn drop(&mut self) {
+        if !self.committed {
+            let _ = std::fs::remove_file(&self.staged);
+        }
+    }
 }
 
 impl std::fmt::Debug for StagedFile {
@@ -788,6 +804,7 @@ impl std::fmt::Debug for StagedFile {
             .field("rel", &self.rel)
             .field("staged", &self.staged)
             .field("flushed", &self.flushed)
+            .field("committed", &self.committed)
             .finish_non_exhaustive()
     }
 }
@@ -873,10 +890,13 @@ impl DavFile for StagedFile {
                 file.sync_all().map_err(io_err)?;
             }
             let mtime = unix_now();
-            self.vfs
-                .put_staged(&self.rel, &self.staged, mtime)
-                .await
-                .map_err(vfs_err)
+            match self.vfs.put_staged(&self.rel, &self.staged, mtime).await {
+                Ok(()) => {
+                    self.committed = true;
+                    Ok(())
+                }
+                Err(e) => Err(vfs_err(e)),
+            }
         })
     }
 }
@@ -977,15 +997,30 @@ fn dav_to_rel(path: &DavPath) -> FsResult<RelPath> {
     RelPath::new(normalized).map_err(|_| FsError::GeneralFailure)
 }
 
-/// Staging sibling of the final cache path: `.{name}.tmp` in the same
-/// directory (same-dir renames are atomic; the leading dot keeps the
-/// half-written file out of the visible namespace).
+/// Staging sibling of the final cache path: `.{name}.{rand8}.tmp` in the
+/// same directory (same-dir renames are atomic; the leading dot keeps the
+/// half-written file out of the visible namespace). The random segment
+/// (review M16, porting the winfsp writer's M1 fix) is what keeps the
+/// sibling from ever being another row's cache path — the fixed
+/// `.{name}.tmp` spelling is a legal virtual path, so a remote row
+/// `/.foo.tmp` could have its only pending copy truncated by an
+/// editor-temp-file-shaped PUT of `/foo`.
 fn staged_sibling(final_local: &Path) -> PathBuf {
     let name = final_local.file_name().map_or_else(
         || "cydrive".to_string(),
         |n| n.to_string_lossy().into_owned(),
     );
-    final_local.with_file_name(format!(".{name}.tmp"))
+    final_local.with_file_name(format!(".{name}.{}.tmp", random_tag()))
+}
+
+/// One 32-bit random tag: a per-instance OS seed runs through a fresh
+/// hasher — no extra dependency, and two calls differ with overwhelming
+/// probability (the winfsp writer's `random_tag` twin — cross-crate
+/// sharing would violate the layer graph for a 7-line helper).
+fn random_tag() -> String {
+    use std::hash::{BuildHasher, Hasher};
+    let hasher = std::collections::hash_map::RandomState::new().build_hasher();
+    format!("{:08x}", hasher.finish() as u32)
 }
 
 /// Best-effort recursive move of a cached directory subtree (cache

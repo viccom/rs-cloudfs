@@ -504,6 +504,85 @@ async fn rename_retry_412_classifies_exists_not_missing_parent() {
     handle.shutdown().await;
 }
 
+/// 复审 M4（2026-09-25）：缺父 → 建父 → 重试 MOVE 撞**传输/服务端瞬态**
+/// （503）——重试臂必须与首发同形分类（5xx → `Unavailable` 透传），绝不
+/// 折叠 `NotFound`（父）：NotFound 会让消费面按「路径不可达」处置本地
+/// 行，本地/远端分裂。构造面：`transient_5xx_move_skip = 1` 让 503 恰
+/// 落在**建父后的重试**上（首发 409 缺父先行消耗 skip 槽）。
+#[tokio::test]
+async fn rename_retry_transient_5xx_is_not_folded_into_not_found() {
+    let mut vfs = Vfs::new();
+    vfs.seed_file("/src.bin", b"source");
+    // 目标父链不存在：首发 MOVE 缺父 409 → ParentSuspect → 建父 → 重试
+    // 撞 503。
+    let knobs = Knobs {
+        transient_5xx_move: 1,
+        transient_5xx_move_skip: 1,
+        ..Knobs::default()
+    };
+    let handle = spawn_stub(
+        vfs,
+        stub::AuthMode::None,
+        knobs,
+        StubStyle {
+            move_missing_parent: stub::MoveMissingParent::Apache409,
+            ..StubStyle::rclone()
+        },
+    )
+    .await;
+    let driver = driver(&handle);
+
+    let err = driver
+        .rename(&rel("src.bin"), &rel("newdir/sub/g.bin"))
+        .await
+        .expect_err("retry-503 rename must fail truthfully");
+    assert!(
+        matches!(err, StorageError::Unavailable(_)),
+        "重试撞 5xx = 服务端瞬态，必须 Unavailable 透传（不折叠 NotFound/父）: {err}"
+    );
+    assert!(handle.exists("/src.bin"), "503 先于移动——源原位");
+    // MOVE 恰两次（首发 409 + 撞 503 的重试）。
+    assert_eq!(requests_of(&handle, "MOVE").len(), 2);
+    handle.shutdown().await;
+}
+
+/// 复审 M4（续）：重试臂撞**缺父嫌疑三态但父在**（rclone 对存在父的真
+/// 403——认证/拒绝类）——必须重 stat 父后按通用表归一（403 →
+/// `Unauthorized`），绝不折叠 `NotFound`（父）。构造面：
+/// `false_403_move_with_parent = 1`——仅当目标父集合存在时消耗（首发
+/// 409 缺父不消耗，建父后的重试才命中）。
+#[tokio::test]
+async fn rename_retry_false_403_with_parent_present_is_not_not_found() {
+    let mut vfs = Vfs::new();
+    vfs.seed_file("/src.bin", b"source");
+    let knobs = Knobs {
+        false_403_move_with_parent: 1,
+        ..Knobs::default()
+    };
+    let handle = spawn_stub(
+        vfs,
+        stub::AuthMode::None,
+        knobs,
+        StubStyle {
+            move_missing_parent: stub::MoveMissingParent::Apache409,
+            ..StubStyle::rclone()
+        },
+    )
+    .await;
+    let driver = driver(&handle);
+
+    let err = driver
+        .rename(&rel("src.bin"), &rel("newdir/sub/g.bin"))
+        .await
+        .expect_err("retry-403-with-parent rename must fail truthfully");
+    assert!(
+        matches!(err, StorageError::Unauthorized { .. }),
+        "父在的 403 = 真拒绝（认证类），必须 Unauthorized（不折叠 NotFound/父）: {err}"
+    );
+    assert!(handle.exists("/src.bin"), "拒绝先于移动——源原位");
+    handle.shutdown().await;
+}
+
 /// M13③ 补臂：409 + 目标父路径被文件占住 → `Exists`（占位冲突——隐式
 /// 建父不可行，与既有 Apache500 腿同型判定；传输/服务端类绝不映射
 /// Exists 的 K75-1 纪律不适用于此：这是 stat 核实的真实占位）。

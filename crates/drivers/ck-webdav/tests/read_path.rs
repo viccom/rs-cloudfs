@@ -643,6 +643,45 @@ async fn window_416_recheck_stat_error_surfaces_unchanged() {
     );
 }
 
+/// 复审 M5（2026-09-25）：200-回退在**高偏移窗口**下的输出等价护栏
+/// ——流式丢弃前缀实现（`read_200_window`）与旧的整读切片必须逐字同
+/// 出：窗口 `[8MiB,10MiB)` 落在 12MiB body 中段，前缀丢弃/跨块切片的
+/// 数学若有偏差即在此暴露（资源缺陷本身——内存峰位——不在单测可观测
+/// 面，由 seam 单测 + 实现结构保证，见 client.rs `read_200_window`）。
+#[tokio::test]
+async fn range_ignored_200_high_offset_window_is_sliced_byte_exact() {
+    let total = 12 * 1024 * 1024;
+    let start = 8 * 1024 * 1024;
+    let window = 2 * 1024 * 1024;
+    let mut vfs = Vfs::new();
+    vfs.seed_file("/f.bin", &pattern(total));
+    let style = StubStyle {
+        range_ignore: true,
+        ..StubStyle::rclone()
+    };
+    let handle = spawn_stub(vfs, AuthMode::None, Knobs::default(), style).await;
+    let driver = driver(&handle);
+    let entry = driver.stat(&rel("f.bin")).await.expect("stat");
+
+    let bytes = collect(
+        driver
+            .reader(
+                &entry.id,
+                Some(Range::new(start, Some(start + window as u64)).expect("range")),
+            )
+            .await
+            .expect("reader"),
+    )
+    .await
+    .expect("high-offset window bytes");
+    assert_eq!(
+        bytes,
+        pattern(total)[start as usize..(start + window) as usize],
+        "the 200 body is sliced to the high-offset window byte-exactly"
+    );
+    handle.shutdown().await;
+}
+
 /// §4.4：malformed multistatus（截断无闭合）→ `Io` 带截断片段（≤200 字
 /// 节、脱敏）——不崩不静默。
 #[tokio::test]

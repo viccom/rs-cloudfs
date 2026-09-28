@@ -625,6 +625,14 @@ pub struct Knobs {
     /// MOVE 的目标路径**种成文件——「建父窗内并发写手抢占目标」的竞态
     /// 建模（复审 M1 注入面：缺父 → 建父 → 重试撞 412 的构造面）。
     pub concurrent_target_on_move: usize,
+    /// 与 `transient_5xx_move` 组合：先放过前 N 个 MOVE，之后
+    /// `transient_5xx_move` 才开始生效——「503 恰落在**建父后的重试**
+    /// 上」的注入面（复审 M4：重试臂错误折叠 NotFound 的红测构造）。
+    pub transient_5xx_move_skip: usize,
+    /// 计数大于 0 时逐 MOVE 递减（仅当目标父集合**存在**时消耗）：回
+    /// 403——「rclone 对存在父的真 403 拒绝（认证类）落在重试上」的
+    /// 注入面（复审 M4：重试臂 ParentSuspect 不得折叠 NotFound）。
+    pub false_403_move_with_parent: usize,
     /// 前 N 次请求（全部动词）回 429，可带 Retry-After 秒数。
     pub rate_limit_429: Option<(usize, Option<u64>)>,
     /// 对**文件** PROPFIND 回 301 + Location（意外重定向的错误分类面；
@@ -689,6 +697,8 @@ struct FaultLedger {
     member_500: bool,
     transient_left: usize,
     transient_move_left: usize,
+    transient_move_skip: usize,
+    false_403_move_with_parent: usize,
     concurrent_target: usize,
     rate_left: Option<(usize, Option<u64>)>,
     lost_ack: bool,
@@ -978,13 +988,17 @@ impl StubState {
             // stat 预检在 MOVE 之前且 PROPFIND 重试链会把共享计数先吃光，
             // 「503 恰落在 MOVE 上」需要独立计数面。
             if ctx.method.as_str() == "MOVE" && inner.ledger.transient_move_left > 0 {
-                inner.ledger.transient_move_left -= 1;
-                return Some(
-                    Response::builder()
-                        .status(StatusCode::SERVICE_UNAVAILABLE)
-                        .body(Body::from("503 transient on MOVE (stub)"))
-                        .unwrap(),
-                );
+                if inner.ledger.transient_move_skip > 0 {
+                    inner.ledger.transient_move_skip -= 1;
+                } else {
+                    inner.ledger.transient_move_left -= 1;
+                    return Some(
+                        Response::builder()
+                            .status(StatusCode::SERVICE_UNAVAILABLE)
+                            .body(Body::from("503 transient on MOVE (stub)"))
+                            .unwrap(),
+                    );
+                }
             }
         }
         if self.knobs.unexpected_301 && ctx.method.as_str() == "PROPFIND" {
@@ -1390,6 +1404,16 @@ impl StubState {
             return redirect_response(&format!("{}/", href_encode(&ctx.canonical)));
         }
         let destination_parent = parent_of(&destination);
+        if inner.ledger.false_403_move_with_parent > 0 && inner.vfs.is_dir(&destination_parent) {
+            // 父集合存在时的 403 = rclone 对真拒绝（认证类）的形态——
+            // 复审 M4 注入面：重试臂撞此形态不得折叠 NotFound。
+            inner.ledger.false_403_move_with_parent -= 1;
+            return (
+                StatusCode::FORBIDDEN,
+                "403 denied with the parent present (stub)",
+            )
+                .into_response();
+        }
         if !inner.vfs.is_dir(&destination_parent) {
             return match self.style.move_missing_parent {
                 MoveMissingParent::Rclone403 => (
@@ -2121,11 +2145,13 @@ pub async fn spawn_stub(vfs: Vfs, auth: AuthMode, knobs: Knobs, style: StubStyle
     let addr = listener.local_addr().expect("stub local addr");
     let url = format!("http://{addr}/");
     let knobs = Arc::new(knobs);
-    let ledger = FaultLedger {
-        member_500: knobs.member_500_once,
-        transient_left: knobs.transient_5xx,
-        transient_move_left: knobs.transient_5xx_move,
-        concurrent_target: knobs.concurrent_target_on_move,
+        let ledger = FaultLedger {
+            member_500: knobs.member_500_once,
+            transient_left: knobs.transient_5xx,
+            transient_move_left: knobs.transient_5xx_move,
+            transient_move_skip: knobs.transient_5xx_move_skip,
+            false_403_move_with_parent: knobs.false_403_move_with_parent,
+            concurrent_target: knobs.concurrent_target_on_move,
         rate_left: knobs.rate_limit_429,
         lost_ack: knobs.lost_ack_after_effect,
         lost_ack_skip: knobs.lost_ack_after_effect_skip,

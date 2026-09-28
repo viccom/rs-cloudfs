@@ -74,10 +74,9 @@ fn random_tag() -> String {
 /// `.{name}.tmp` spelling is a legal virtual path, so a remote could hold
 /// a row whose cache copy sits exactly there (and staging truncated it).
 ///
-/// Divergence from the WebDAV writer (deliberate): that adapter keeps the
-/// plain `.{name}.tmp` spelling (`cloudkit-webdav` src/lib.rs:914), and
-/// `cloudkit-core`'s own `tmp_sibling` (`vfs.rs:145`) uses
-/// `name.ext.tmp` — both remain fixed-name transients.
+/// The WebDAV writer converged on the same randomized spelling (review
+/// M16, 2026-09-25); `cloudkit-core`'s own `tmp_sibling` (`vfs.rs:145`)
+/// uses `name.ext.tmp` — a single-writer transient, still fixed-name.
 pub fn staged_sibling(final_local: &Path) -> PathBuf {
     let name = final_local.file_name().map_or_else(
         || "cydrive".to_string(),

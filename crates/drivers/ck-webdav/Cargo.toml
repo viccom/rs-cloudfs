@@ -34,9 +34,11 @@ url = "2"
 # 既有版本；`rand::rng()` 在默认特性面内）。
 rand = "0.10"
 # HTTP/WebDAV 动词面（rustls 禁 native-tls——ck-pan115/ck-pan123 同款
-# 特性面先例；WD2 加 stream 特性做窗口流）。
+# 特性面先例；WD2 加 stream 特性做窗口流；复审 M5 的读面单测用
+# wrap_stream 合成定长块流——200-回退流式丢弃前缀的 seam 面同样依赖）。
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
+    "stream",
 ] }
 # multistatus 流式解析（本计划唯一新增 crates.io 直接依赖；版本对齐
 # WD0 spike 真机验证过的 0.37 线）。
