@@ -350,7 +350,7 @@ impl ControlServer {
                                                 "<non-string panic payload>".to_string()
                                             });
                                         tracing::error!(
-                                            command = %line,
+                                            command = %crate::loggable_command_line(&line),
                                             %reason,
                                             "a volume command handler panicked; the \
                                              control channel stays up"

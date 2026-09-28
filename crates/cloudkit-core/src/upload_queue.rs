@@ -812,6 +812,53 @@ async fn process_job(
         };
         match outcome {
             Ok((receipt, target)) => {
+                // 复审 H2（同路径改写竞态）：上传期间同路径被新 PUT 超车
+                // ——新行已与开工快照不符（size/mtime）。此刻用快照整行回
+                // 写会把新版本打回旧元数据再标记已上传，随后的
+                // delete_local_copy 还会删掉超车任务唯一的本地字节；上方
+                // 0 字节工件守卫只盖 size==0 变体（field log 同族）。两形
+                // 处置：
+                // · 新行仍 pending（超车任务未跑）——不回写、不删本地副
+                //   本，行留给超车任务；计 degraded（每个 claimed job 恰
+                //   一终态的账目不变量）。
+                // · 新行已 uploaded 且与快照不符（双 worker 下超车任务先
+                //   完成）——同样不回写（那会回退已完成的行）；本上传确
+                //   已成功，计 succeeded。
+                match db.get_file(job.rel_path.as_str()) {
+                    Ok(Some(fresh)) if fresh.size != row.size || fresh.mtime != row.mtime => {
+                        if fresh.is_uploaded {
+                            tracing::warn!(
+                                rel_path = %job.rel_path,
+                                stale_size = row.size,
+                                fresh_size = fresh.size,
+                                "upload raced a newer completed upload; keeping the newer row"
+                            );
+                            bump(&stats.succeeded);
+                        } else {
+                            tracing::warn!(
+                                rel_path = %job.rel_path,
+                                stale_size = row.size,
+                                fresh_size = fresh.size,
+                                "upload superseded by a newer pending put; the row stays \
+                                 with the superseding job"
+                            );
+                            bump(&stats.degraded);
+                        }
+                        return; // `enc_tmp` drops here too.
+                    }
+                    Ok(None) => {
+                        // 行中途消失（用户删除）——upsert 会复活已删文件
+                        // 的行；本上传确已成功，本地清理照走。
+                        tracing::warn!(
+                            rel_path = %job.rel_path,
+                            "files row vanished mid-upload (deleted?); not resurrecting it"
+                        );
+                        delete_local_copy(&job.local_path);
+                        bump(&stats.succeeded);
+                        return;
+                    }
+                    _ => {}
+                }
                 // The digest was computed up front (before the first
                 // attempt), so it is already in hand for both the staged
                 // (plaintext digest of the encrypted upload) and the

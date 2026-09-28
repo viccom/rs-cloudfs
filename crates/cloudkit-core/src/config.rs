@@ -1671,7 +1671,7 @@ impl CyDriveConfig {
         let mut root: serde_json::Value =
             serde_json::from_str(&text).map_err(|err| ConfigError::Parse {
                 path: path_str.clone(),
-                message: err.to_string(),
+                message: redact_credential_values(&err.to_string()),
             })?;
         // The legacy key set is frozen at the Python dataclass fields: the
         // Rust-added tuning keys are rejected instead of silently ignored
@@ -1704,11 +1704,30 @@ impl CyDriveConfig {
                 }
             }
         }
+        // 复审 M2（凭据泄漏）：serde_json 的类型错误会原样引用值
+        // （「invalid type: integer `…`」）且不携带键名——脱敏漏斗按键名
+        // 触发、无从命中。凭据键的值只允许字符串/null：错误类型提前
+        // 拒绝，消息只报键名，值不进入。
+        if let serde_json::Value::Object(map) = &root {
+            for key in SECRET_VALUED_KEYS {
+                if let Some(value) = map.get(*key) {
+                    if !value.is_string() && !value.is_null() {
+                        return Err(ConfigError::Parse {
+                            path: path_str.clone(),
+                            message: format!(
+                                "credential key `{key}` must be a string (the supplied \
+                                 value is redacted)"
+                            ),
+                        });
+                    }
+                }
+            }
+        }
         // Derived `Deserialize` on `CyDriveConfig`: unknown keys ignored,
         // missing fields defaulted (`#[serde(default)]`), wrong types error.
         serde_json::from_value(root).map_err(|err| ConfigError::Parse {
             path: path_str,
-            message: err.to_string(),
+            message: redact_credential_values(&err.to_string()),
         })
     }
 

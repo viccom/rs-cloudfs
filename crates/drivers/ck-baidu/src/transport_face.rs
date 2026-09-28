@@ -163,33 +163,40 @@ async fn stage_stream_to_disk(
     planned: u64,
 ) -> Result<(PathBuf, StreamStagingGuard), StorageError> {
     // 唯一临时名：pid + 进程级单调序号；撞名递增重试（create_new）。
+    // std::fs 建名（单次快速元数据 syscall——同 StreamStagingGuard 的
+    // Drop 形态，不属 code-style §4 的重 IO 阻塞面）。
     let pid = std::process::id();
-    let mut opened = None;
+    let mut claimed: Option<PathBuf> = None;
     for _ in 0..8 {
         let seq = STAGING_SEQ.fetch_add(1, Ordering::Relaxed);
-        let tmp: PathBuf =
-            std::env::temp_dir().join(format!("ck-baidu-tstream-{pid}-{seq}.part"));
-        match tokio::fs::OpenOptions::new()
+        let tmp: PathBuf = std::env::temp_dir().join(format!("ck-baidu-tstream-{pid}-{seq}.part"));
+        match std::fs::OpenOptions::new()
             .write(true)
             .create_new(true)
             .open(&tmp)
-            .await
         {
-            Ok(file) => {
-                opened = Some((file, tmp));
+            Ok(_claim) => {
+                claimed = Some(tmp);
                 break;
             }
             Err(e) if e.kind() == std::io::ErrorKind::AlreadyExists => continue,
             Err(e) => return Err(StorageError::Io(format!("stream staging open: {e}"))),
         }
     }
-    let Some((mut file, path)) = opened else {
+    let Some(path) = claimed else {
         return Err(StorageError::Io(format!(
             "stream staging 命名冲突重试耗尽（pid={pid}）"
         )));
     };
     let cleanup = StreamStagingGuard(path.clone());
 
+    // std::fs on the blocking pool — NOT tokio::fs（复审 H1）：Linux 上
+    // tokio::fs File 句柄的 write().await 返回时 write syscall 可能在途
+    // （WSL 实测：6 MiB 流返回瞬间盘上缺 192 KiB——stage_visibility 钉测
+    // 红腿 6094848/6291456）。紧随其后的 `PartFile::block_md5s` 零间隙读
+    // 回会把缺尾/错位字节算进 md5，经 precreate 的全量 block_list 声明
+    // 永久落服务端。std write_all 在阻塞线程上有诚实的完成语义（L2
+    // `cloudkit_storage::spool_append_write` 同款定谳）。
     let mut written: u64 = 0;
     let mut frames = data;
     while let Some(frame) = futures_util::StreamExt::next(&mut frames).await {
@@ -200,52 +207,25 @@ async fn stage_stream_to_disk(
                 "stream exceeded the planned {planned} bytes"
             )));
         }
-        tokio::io::AsyncWriteExt::write_all(&mut file, &frame)
-            .await
-            .map_err(|e| StorageError::Io(format!("stream staging write: {e}")))?;
+        let target = path.clone();
+        let bytes = frame.to_vec();
+        tokio::task::spawn_blocking(move || {
+            use std::io::Write;
+            std::fs::OpenOptions::new()
+                .append(true)
+                .open(&target)?
+                .write_all(&bytes)
+        })
+        .await
+        .map_err(|e| StorageError::Io(format!("stream staging join: {e}")))?
+        .map_err(|e| StorageError::Io(format!("stream staging write: {e}")))?;
     }
     if written != planned {
         return Err(StorageError::Unavailable(format!(
             "chunk plan mismatch: stream ended at {written} bytes, but the job planned {planned}"
         )));
     }
-    drop(file); // Windows：分片读盘前显式关写句柄
     Ok((path, cleanup))
-}
-
-#[cfg(test)]
-mod stage_visibility_tests {
-    use super::*;
-
-    /// 复审 H1 钉测：staging 返回的瞬间全部帧必须已在盘上（std 视角
-    /// 可见）——`PartFile::block_md5s` 的零间隙读回依赖它。Linux 上
-    /// tokio::fs 句柄写形态会红（write().await 返回时 syscall 在途，
-    /// WSL 复现；Windows 免疫——两平台形态见 L2 spool 定谳）。
-    #[tokio::test]
-    async fn staged_frames_are_fully_on_disk_the_moment_staging_returns() {
-        const ROUNDS: usize = 3;
-        const FRAMES: usize = 24;
-        const FRAME: usize = 256 * 1024;
-        for round in 0..ROUNDS {
-            let frames: Vec<Result<Bytes, StorageError>> = (0..FRAMES)
-                .map(|i| Ok(Bytes::from(vec![(i % 251) as u8 + round as u8; FRAME])))
-                .collect();
-            let stream: ByteStream = Box::pin(futures_util::stream::iter(frames));
-            let planned = (FRAMES * FRAME) as u64;
-            let (path, _guard) = stage_stream_to_disk(stream, planned)
-                .await
-                .expect("staging completes");
-            let len = std::fs::metadata(&path)
-                .expect("immediate std stat after staging returns")
-                .len();
-            assert_eq!(
-                len, planned,
-                "every staged frame must be visible the moment staging returns \
-                 (the md5 read-back runs zero-gap right after)"
-            );
-            let _ = std::fs::remove_file(&path); // guard Drop 亦删；幂等
-        }
-    }
 }
 
 #[async_trait]
@@ -362,5 +342,40 @@ impl BaiduTransport {
             chunk_msg_ids: vec![fs_id],
             uploaded_bytes: entry.size,
         })
+    }
+}
+
+#[cfg(test)]
+mod stage_visibility_tests {
+    use super::*;
+
+    /// 复审 H1 钉测：staging 返回的瞬间全部帧必须已在盘上（std 视角
+    /// 可见）——`PartFile::block_md5s` 的零间隙读回依赖它。Linux 上
+    /// tokio::fs 句柄写形态会红（write().await 返回时 syscall 在途，
+    /// WSL 复现；Windows 免疫——两平台形态见 L2 spool 定谳）。
+    #[tokio::test]
+    async fn staged_frames_are_fully_on_disk_the_moment_staging_returns() {
+        const ROUNDS: usize = 3;
+        const FRAMES: usize = 24;
+        const FRAME: usize = 256 * 1024;
+        for round in 0..ROUNDS {
+            let frames: Vec<Result<Bytes, StorageError>> = (0..FRAMES)
+                .map(|i| Ok(Bytes::from(vec![(i % 251) as u8 + round as u8; FRAME])))
+                .collect();
+            let stream: ByteStream = Box::pin(futures_util::stream::iter(frames));
+            let planned = (FRAMES * FRAME) as u64;
+            let (path, _guard) = stage_stream_to_disk(stream, planned)
+                .await
+                .expect("staging completes");
+            let len = std::fs::metadata(&path)
+                .expect("immediate std stat after staging returns")
+                .len();
+            assert_eq!(
+                len, planned,
+                "every staged frame must be visible the moment staging returns \
+                 (the md5 read-back runs zero-gap right after)"
+            );
+            let _ = std::fs::remove_file(&path); // guard Drop 亦删；幂等
+        }
     }
 }
