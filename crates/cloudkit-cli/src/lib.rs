@@ -1668,8 +1668,9 @@ pub type RuntimeRebuildFuture =
 /// walk); the tests inject fakes that park on channels, fail, or count
 /// calls — the R4/R5 supervision (timeout + checkpoint abort) lives
 /// AROUND the executor, so a fake exercises it without a real backend.
-pub type RuntimeRebuild =
-    Arc<dyn Fn(&str, &CyDriveConfig) -> RuntimeRebuildFuture + Send + Sync + 'static>;
+pub type RuntimeRebuild = Arc<
+    dyn Fn(&str, &CyDriveConfig, Option<&Path>) -> RuntimeRebuildFuture + Send + Sync + 'static,
+>;
 
 /// The RV2 boot extras: what the runtime-volume command surface needs
 /// beyond the plain boot. [`Default`] (no dispatch, production tuning)
@@ -1998,12 +1999,21 @@ pub async fn run_multi_with_transports_and_commands(
     // deadline), so the core walk gets `time_budget: None`.
     let rebuild_tuning = commands.rebuild_tuning;
     let rebuild_executor: RuntimeRebuild = commands.rebuild.clone().unwrap_or_else(move || {
-        Arc::new(move |_name: &str, settings: &CyDriveConfig| {
-            let settings = settings.clone();
-            Box::pin(async move {
-                run_rebuild_command_with_limits(&settings, rebuild_tuning.limits(false)).await
-            })
-        })
+        Arc::new(
+            move |_name: &str, settings: &CyDriveConfig, secrets: Option<&Path>| {
+                let settings = settings.clone();
+                // RuntimeRebuildFuture 是 'static：秘密路径按值带入。
+                let secrets = secrets.map(std::path::Path::to_path_buf);
+                Box::pin(async move {
+                    run_rebuild_command_with_limits(
+                        &settings,
+                        rebuild_tuning.limits(false),
+                        secrets.as_deref(),
+                    )
+                    .await
+                })
+            },
+        )
     });
     let command_surface = Arc::new(RuntimeVolumeControl {
         process_cfg: process_cfg.clone(),
@@ -2077,7 +2087,7 @@ pub async fn run_multi_with_transports_and_commands(
                             .or_else(|| panic.downcast_ref::<String>().cloned())
                             .unwrap_or_else(|| "<non-string panic payload>".to_string());
                         tracing::error!(
-                            command = %line,
+                            command = %loggable_command_line(&line),
                             %reason,
                             "a volume command execution panicked; the command surface stays up"
                         );
@@ -2570,6 +2580,25 @@ fn split_name_payload(rest: &str) -> Option<(&str, &str)> {
 /// credential the form left empty overlays nothing) and whose type
 /// refusals name the key, never the value (M3 — the payload may carry
 /// credentials). Every refusal text is a complete `ERR: ...\n` reply.
+/// K58-M4 复审 M14：命令行进入日志前的单一脱敏口。CREATE/UPDATE 的
+/// 第三段载荷「MAY carry credentials」（[`volume_payload_table`] 契约）
+/// ——panic 路径的 `command = %line` 必须走本函数，凭据值不得以任何
+/// 形态落日志；其余命令原样透传（不含载荷）。
+pub(crate) fn loggable_command_line(line: &str) -> String {
+    // CREATE/UPDATE 的第三段是 JSON 载荷（位置切分——载荷内空白不参与
+    // 切分）：凭据值随载荷进入 panic 路径的 `command = %line`——裁掉
+    // 载荷段，只留关键字与卷名（可行动且无泄漏）。其余命令无载荷透传。
+    let mut parts = line.splitn(3, ' ');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(keyword), Some(name), Some(_payload))
+            if keyword.eq_ignore_ascii_case("CREATE") || keyword.eq_ignore_ascii_case("UPDATE") =>
+        {
+            format!("{keyword} {name} <payload redacted>")
+        }
+        _ => line.to_string(),
+    }
+}
+
 fn volume_payload_table(payload: &str) -> Result<toml::Table, String> {
     let value: serde_json::Value = match serde_json::from_str(payload) {
         Ok(value) => value,
@@ -4131,6 +4160,7 @@ impl RuntimeVolumeControl {
             RebuildTask {
                 name: name.to_string(),
                 settings: resolved,
+                secrets: Some(runtime.spec().file_path.clone()),
                 registry: self.registry.clone(),
                 watch: Arc::clone(&self.watch),
                 rebuilds: Arc::clone(&self.rebuilds),
@@ -4217,6 +4247,9 @@ enum RebuildExit {
 struct RebuildTask {
     name: String,
     settings: CyDriveConfig,
+    /// 复审 H3：卷自己的 toml 路径——执行器的驱动装配用它做 token 轮换
+    /// 的落盘目标（写进进程 config.toml 会以卷域键触发 K19 拒启）。
+    secrets: Option<std::path::PathBuf>,
     registry: RegistryHandle,
     watch: Arc<ShutdownWatch>,
     rebuilds: Arc<std::sync::Mutex<std::collections::HashMap<String, std::time::SystemTime>>>,
@@ -4243,7 +4276,11 @@ impl RebuildTask {
     /// NEXT tick, not mid-list — accepted, one tick's worth).
     async fn run(self) {
         let deadline = tokio::time::Instant::now() + self.tuning.timeout;
-        let mut work = tokio::spawn((self.run)(&self.name, &self.settings));
+        let mut work = tokio::spawn((self.run)(
+            &self.name,
+            &self.settings,
+            self.secrets.as_deref(),
+        ));
         let mut checkpoints = tokio::time::interval(self.tuning.checkpoint_interval);
         checkpoints.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
         let exit = loop {
@@ -4918,7 +4955,7 @@ pub const TELEGRAM_REBUILD_REFUSAL: &str =
 /// budget extended to the offline path), and an interrupted pass
 /// reports `RebuildOutcome::interrupted` instead of failing.
 pub async fn run_rebuild_command(cfg: &CyDriveConfig) -> Result<rebuild::RebuildOutcome> {
-    run_rebuild_command_with_limits(cfg, RebuildTuning::default().limits(true)).await
+    run_rebuild_command_with_limits(cfg, RebuildTuning::default().limits(true), None).await
 }
 
 /// [`run_rebuild_command`] with explicit per-pass bounds — the live
@@ -4928,8 +4965,9 @@ pub async fn run_rebuild_command(cfg: &CyDriveConfig) -> Result<rebuild::Rebuild
 async fn run_rebuild_command_with_limits(
     cfg: &CyDriveConfig,
     limits: rebuild::RebuildLimits,
+    secrets: Option<&Path>,
 ) -> Result<rebuild::RebuildOutcome> {
-    let driver = build_driver(cfg).await?;
+    let driver = build_driver(cfg, secrets).await?;
     run_rebuild_with_driver_and_limits(cfg, driver.as_ref(), limits).await
 }
 
@@ -4956,7 +4994,15 @@ pub async fn run_rebuild_multi(
             if settings.backend == Backend::Telegram {
                 anyhow::bail!("{TELEGRAM_REBUILD_REFUSAL}");
             }
-            run_rebuild_command(&settings).await
+            // 复审 H3：多卷离线 rebuild 的 token 轮换必须落卷自己的
+            // toml——写进进程 config.toml 的卷域键会让下次 boot 被 K19
+            // 混键守卫拒启。
+            run_rebuild_command_with_limits(
+                &settings,
+                RebuildTuning::default().limits(true),
+                Some(spec.file_path.as_path()),
+            )
+            .await
         }
         .await
         .map_err(|error| format!("{error:#}"));
@@ -6511,7 +6557,26 @@ pub async fn baidu_backend_probe_with(
 /// (single mapping, no drift) and carries the K13 write-back store —
 /// a refresh triggered mid-walk must persist its rotated pair or the
 /// next boot reads a dead refresh_token.
-async fn build_driver(cfg: &CyDriveConfig) -> Result<Arc<dyn StorageDriver>> {
+/// 复审 H3：rebuild 驱动装配所用 token 存储的目标文件。多卷模式必须
+/// 指向卷自己的 toml（`spec.file_path`）——轮换对写进**进程**
+/// config.toml 会以卷域键身份触发 K19 混键守卫，下次启动被拒启。
+/// `None` = 单卷模式（cwd config.toml 即卷配置，现状语义不变）。
+#[cfg(any(feature = "baidu", feature = "pan115"))]
+fn rebuild_token_store(secrets: Option<&Path>) -> ConfigTokenStore {
+    match secrets {
+        Some(volume_file) => ConfigTokenStore::new(volume_file.to_path_buf()),
+        // 单卷模式：cwd config.toml 即卷配置（现状语义）。
+        None => ConfigTokenStore::default(),
+    }
+}
+
+async fn build_driver(
+    cfg: &CyDriveConfig,
+    secrets: Option<&Path>,
+) -> Result<Arc<dyn StorageDriver>> {
+    // crop 组合（无 baidu/pan115 特性）下本参数无读者——显式沉默保
+    // 组合构建的 -D warnings。
+    let _ = secrets;
     match cfg.backend {
         Backend::Telegram => anyhow::bail!("{TELEGRAM_REBUILD_REFUSAL}"),
         // With the driver: the factory assembly sharing [`baidu_params`]
@@ -6523,7 +6588,7 @@ async fn build_driver(cfg: &CyDriveConfig) -> Result<Arc<dyn StorageDriver>> {
             let params = baidu_params(
                 cfg,
                 &BaiduEndpoints::default(),
-                Some(Arc::new(ConfigTokenStore::default())),
+                Some(Arc::new(rebuild_token_store(secrets))),
                 Path::new("."),
             );
             let driver = ck_baidu::factory(&params)
@@ -6575,7 +6640,7 @@ async fn build_driver(cfg: &CyDriveConfig) -> Result<Arc<dyn StorageDriver>> {
         #[cfg(feature = "pan115")]
         Backend::Pan115 => {
             let mut params = pan115_params(cfg)?;
-            params.token_store = Some(Arc::new(ConfigTokenStore::default()));
+            params.token_store = Some(Arc::new(rebuild_token_store(secrets)));
             let driver = ck_pan115::factory(&params)
                 .await
                 .map_err(|error| anyhow::anyhow!("initialising the pan115 backend: {error}"))?;
@@ -8109,6 +8174,55 @@ pub fn run_migrate(store: &dyn CredentialStore) -> Result<String> {
 mod tests {
     use super::*;
 
+    // 复审 M14（红测——桩当前透传）：CREATE/UPDATE 命令行进入日志前
+    // 必须裁掉载荷段，凭据值与载荷键名都不得残留。
+    #[test]
+    fn panic_log_command_lines_redact_create_update_payloads() {
+        let line = "CREATE vol1 {\"baidu_access_token\":\"SUPERSECRET\",\"baidu_refresh_token\":\"R2\",\"baidu_app_key\":\"k\"}";
+        let logged = loggable_command_line(line);
+        assert!(
+            logged.contains("CREATE"),
+            "the keyword stays actionable: {logged}"
+        );
+        assert!(logged.contains("vol1"), "the volume name stays: {logged}");
+        assert!(
+            !logged.contains("SUPERSECRET"),
+            "credential values never ride the log line: {logged}"
+        );
+        assert!(
+            !logged.contains("R2"),
+            "credential values never ride the log line: {logged}"
+        );
+        assert!(
+            !logged.contains("baidu_app_key"),
+            "even the payload's key names are gone: {logged}"
+        );
+        // 无载荷命令原样透传。
+        assert_eq!(loggable_command_line("LIST"), "LIST");
+        assert_eq!(
+            loggable_command_line("DESTROY vol1 confirm"),
+            "DESTROY vol1 confirm"
+        );
+    }
+
+    // 复审 H3（红测——桩当前恒进程 config.toml）：rebuild 轮换的目标
+    // 文件必须随卷，多卷模式的轮换不得写进进程 config.toml。
+    #[cfg(any(feature = "baidu", feature = "pan115"))]
+    #[test]
+    fn rebuild_rotation_targets_the_volume_file_not_the_process_config() {
+        let volume_file = std::path::Path::new("volumes/b.toml");
+        assert_eq!(
+            rebuild_token_store(Some(volume_file)).path,
+            volume_file,
+            "multi-volume rebuild rotations must land in the volume's own toml"
+        );
+        assert_eq!(
+            rebuild_token_store(None).path,
+            std::path::Path::new("config.toml"),
+            "single-volume rebuild keeps the cwd config.toml semantics"
+        );
+    }
+
     /// K58-M5: the UPDATE re-read parse (the overlay base) routes its
     /// error through the core redaction funnel — it was the one toml
     /// parse surface that bypassed it, bare-concatenating the raw error
@@ -8496,15 +8610,17 @@ mod tests {
                 tuning: RemoveTuning::fast(),
                 rebuilds: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
                 rebuild_tuning: RebuildTuning::fast(),
-                rebuild: Arc::new(|_name: &str, _settings: &CyDriveConfig| {
-                    Box::pin(async {
-                        Ok(rebuild::RebuildOutcome {
-                            files: 0,
-                            dirs: 0,
-                            ..Default::default()
+                rebuild: Arc::new(
+                    |_name: &str, _settings: &CyDriveConfig, _secrets: Option<&Path>| {
+                        Box::pin(async {
+                            Ok(rebuild::RebuildOutcome {
+                                files: 0,
+                                dirs: 0,
+                                ..Default::default()
+                            })
                         })
-                    })
-                }),
+                    },
+                ),
             }
         }
         fn unit_volume_toml() -> String {

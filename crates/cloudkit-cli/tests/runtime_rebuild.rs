@@ -255,34 +255,36 @@ fn rebuild_probe() -> (
     let seam: RuntimeRebuild = {
         let probe = Arc::clone(&probe);
         let go_rx = go_rx;
-        Arc::new(move |name: &str, _settings: &CyDriveConfig| {
-            let name = name.to_string();
-            let probe = Arc::clone(&probe);
-            let mut go_rx = go_rx.clone();
-            probe.calls.fetch_add(1, Ordering::SeqCst);
-            Box::pin(async move {
-                let _ = probe.entered.send(name.clone());
-                /// The cancellation witness: dropping the future (the
-                /// supervisor's abort) flips the flag.
-                struct CancelOnDrop(Arc<AtomicBool>);
-                impl Drop for CancelOnDrop {
-                    fn drop(&mut self) {
-                        self.0.store(true, Ordering::SeqCst);
+        Arc::new(
+            move |name: &str, _settings: &CyDriveConfig, _secrets: Option<&std::path::Path>| {
+                let name = name.to_string();
+                let probe = Arc::clone(&probe);
+                let mut go_rx = go_rx.clone();
+                probe.calls.fetch_add(1, Ordering::SeqCst);
+                Box::pin(async move {
+                    let _ = probe.entered.send(name.clone());
+                    /// The cancellation witness: dropping the future (the
+                    /// supervisor's abort) flips the flag.
+                    struct CancelOnDrop(Arc<AtomicBool>);
+                    impl Drop for CancelOnDrop {
+                        fn drop(&mut self) {
+                            self.0.store(true, Ordering::SeqCst);
+                        }
                     }
-                }
-                let _witness = CancelOnDrop(Arc::clone(&probe.cancelled));
-                while !*go_rx.borrow_and_update() {
-                    if go_rx.changed().await.is_err() {
-                        break;
+                    let _witness = CancelOnDrop(Arc::clone(&probe.cancelled));
+                    while !*go_rx.borrow_and_update() {
+                        if go_rx.changed().await.is_err() {
+                            break;
+                        }
                     }
-                }
-                Ok(cloudkit_core::rebuild::RebuildOutcome {
-                    files: 1,
-                    dirs: 1,
-                    ..Default::default()
+                    Ok(cloudkit_core::rebuild::RebuildOutcome {
+                        files: 1,
+                        dirs: 1,
+                        ..Default::default()
+                    })
                 })
-            })
-        })
+            },
+        )
     };
     (seam, probe, entered_rx)
 }

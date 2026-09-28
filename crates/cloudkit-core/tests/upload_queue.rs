@@ -1324,6 +1324,69 @@ async fn stale_empty_put_artifact_neither_phantom_uploads_nor_deletes_cache() {
     assert_eq!(chunks[0].telegram_msg_id, Some(2));
 }
 
+// ---------------------------------------------------------------------------
+// 复审 H2（非零同路径改写竞态）：上传在途的同路径非零 PUT——旧任务的
+// persist_success 以开工时的行快照整行回写（is_uploaded=true + 旧
+// size/mtime + 旧回执），随后 delete_local_copy 删掉超车任务还要读的
+// 新字节——新版本远端与本地俱失。上方 0 字节守卫只盖 size==0 变体
+// （2026-09-09 field log）；本测试把同一竞态的非零变体钉成确定性：
+// 门控传输让任务 1 停在 upload 内（process_job 顶部的行快照已读），
+// 此刻落地 v2 改写，放行后排空。
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn same_path_rewrite_during_inflight_upload_keeps_the_new_version() {
+    let (_dir, db, cache, mock) = test_env().await;
+    let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+    let gate = Arc::new(tokio::sync::Notify::new());
+    let transport: Arc<dyn CloudTransport> = Arc::new(GatedHonestUploadTransport {
+        inner: mock.clone(),
+        gate: gate.clone(),
+        entered: entered_tx,
+        first_upload_seen: AtomicBool::new(false),
+    });
+    let handle = spawn_queue(db.clone(), transport, test_cfg(64));
+
+    // v1（5 字节）pending 行 + 任务 1：worker 进入 upload 停在门上——
+    // 任务 1 已持有 v1 行快照（process_job 顶部读的那份）。
+    seed_pending(&db, &cache, "/doc.txt", b"v1!!!", 1);
+    handle
+        .enqueue(job_for(&cache, "/doc.txt", 5, 1, 64))
+        .await
+        .expect("enqueue v1");
+    entered_rx
+        .recv()
+        .await
+        .expect("worker parked inside upload holding the v1 snapshot");
+
+    // 上传在途的同路径 v2 改写：缓存重写 + 新 pending 行（size 14）+ 任务 2。
+    let doc = cache.local_path(&RelPath::new("/doc.txt").expect("valid rel path"));
+    std::fs::write(&doc, b"v2-supersede!!").expect("rewrite the cache copy");
+    seed_row(&db, "/doc.txt", 14, 1, false, None);
+    handle
+        .enqueue(job_for(&cache, "/doc.txt", 14, 1, 64))
+        .await
+        .expect("enqueue v2");
+
+    gate.notify_waiters();
+    handle.shutdown().await;
+
+    let row = db.get_file("/doc.txt").expect("db read").expect("row exists");
+    assert!(row.is_uploaded, "the superseding job must own the completion");
+    assert_eq!(
+        row.size, 14,
+        "the row must describe the NEW version — a stale-snapshot persist clobbers it back to 5"
+    );
+    assert_eq!(
+        row.telegram_msg_id,
+        Some(2),
+        "identified by the superseding job's receipt (v1=1, v2=2); Some(1) means the \
+         stale job's snapshot persist won the race and the new bytes were deleted"
+    );
+    let chunks = db.get_chunks_by_file_id(row.id).expect("read chunks");
+    assert_eq!(chunks.len(), 1);
+    assert_eq!(chunks[0].size, 14, "chunk sizes follow the new version");
+}
+
 /// H2（幽灵 outstanding）：过期空 PUT 工件的 skip 路径也必须落到某个
 /// 终态计数器——工件任务入队时已计入 enqueued，若 skip 时既不计
 /// succeeded 也不计 degraded，则 enqueued − (succeeded + degraded)
