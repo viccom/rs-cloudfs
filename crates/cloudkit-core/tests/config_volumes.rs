@@ -636,18 +636,31 @@ fn load_volumes_skips_disabled_volumes() {
 #[test]
 fn load_volumes_announces_the_disabled_skip_in_the_log() {
     // RV0: "info! 声明，不静默" — a skip is a visible, one-line
-    // declaration naming the volume, never a silent drop. Captured
-    // through a thread-local dispatcher (the tests/logging.rs pattern;
-    // each integration test is its own process, so the interest-cache
-    // rebuild cannot race another test's subscriber here).
+    // declaration naming the volume, never a silent drop.
+    //
+    // Process-wide log sink (the run_e2e.rs / volume_create_update.rs
+    // pattern — 2026-09-28 CI-flake fix): the capture installs this
+    // binary's only subscriber via `set_global_default`. The previous
+    // thread-local `set_default` + `rebuild_interest_cache` pair loses a
+    // callsite-registration race against sibling tests: tracing pins a
+    // callsite's Interest process-wide at its FIRST touch, evaluated
+    // against the touching thread's current dispatch — a sibling hitting
+    // the SAME info! callsite (load_volumes_skips_disabled_volumes) on a
+    // bare thread (no-op global dispatch) pins it to `never`, and the
+    // rebuild — running BEFORE the callsite ever registered — is a no-op,
+    // so this test's asserted event is silently dropped (WSL Linux, 8
+    // test threads: 5/12 repro; single-threaded or winning the race:
+    // green — why Windows legs never showed it). One global default
+    // covers every thread uniformly; sibling events draining into the
+    // sink are harmless (the asserts below are contains-based).
     use std::io::Write;
-    use std::sync::{Arc, Mutex};
+    use std::sync::Mutex;
 
-    struct Sink(Arc<Mutex<Vec<u8>>>);
+    static LOGS: Mutex<Vec<u8>> = Mutex::new(Vec::new());
+    struct Sink;
     impl Write for Sink {
         fn write(&mut self, buf: &[u8]) -> std::io::Result<usize> {
-            self.0
-                .lock()
+            LOGS.lock()
                 .unwrap_or_else(|poisoned| poisoned.into_inner())
                 .extend_from_slice(buf);
             Ok(buf.len())
@@ -657,17 +670,14 @@ fn load_volumes_announces_the_disabled_skip_in_the_log() {
         }
     }
 
-    let buf: Arc<Mutex<Vec<u8>>> = Arc::default();
-    let subscriber = tracing_subscriber::fmt()
-        .with_max_level(tracing::Level::INFO)
-        .with_writer({
-            let buf = Arc::clone(&buf);
-            move || Sink(Arc::clone(&buf))
-        })
-        .finish();
-    let dispatch = tracing::Dispatch::new(subscriber);
-    let _guard = tracing::dispatcher::set_default(&dispatch);
-    tracing::callsite::rebuild_interest_cache();
+    // set_global_default 全进程恰一次；本二进制仅此测试安装（未来新增
+    // 同型测试时 Err 被忽略——复用既有全局，contains 断言幂等安全）。
+    let _ = tracing::dispatcher::set_global_default(tracing::Dispatch::new(
+        tracing_subscriber::fmt()
+            .with_max_level(tracing::Level::INFO)
+            .with_writer(|| Sink)
+            .finish(),
+    ));
 
     let dir = tempfile::tempdir().expect("tempdir");
     write_file(
@@ -682,7 +692,7 @@ fn load_volumes_announces_the_disabled_skip_in_the_log() {
     );
 
     let captured = String::from_utf8(
-        buf.lock()
+        LOGS.lock()
             .unwrap_or_else(|poisoned| poisoned.into_inner())
             .clone(),
     )
