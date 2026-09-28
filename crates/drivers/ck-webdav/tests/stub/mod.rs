@@ -2145,13 +2145,13 @@ pub async fn spawn_stub(vfs: Vfs, auth: AuthMode, knobs: Knobs, style: StubStyle
     let addr = listener.local_addr().expect("stub local addr");
     let url = format!("http://{addr}/");
     let knobs = Arc::new(knobs);
-        let ledger = FaultLedger {
-            member_500: knobs.member_500_once,
-            transient_left: knobs.transient_5xx,
-            transient_move_left: knobs.transient_5xx_move,
-            transient_move_skip: knobs.transient_5xx_move_skip,
-            false_403_move_with_parent: knobs.false_403_move_with_parent,
-            concurrent_target: knobs.concurrent_target_on_move,
+    let ledger = FaultLedger {
+        member_500: knobs.member_500_once,
+        transient_left: knobs.transient_5xx,
+        transient_move_left: knobs.transient_5xx_move,
+        transient_move_skip: knobs.transient_5xx_move_skip,
+        false_403_move_with_parent: knobs.false_403_move_with_parent,
+        concurrent_target: knobs.concurrent_target_on_move,
         rate_left: knobs.rate_limit_429,
         lost_ack: knobs.lost_ack_after_effect,
         lost_ack_skip: knobs.lost_ack_after_effect_skip,

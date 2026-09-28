@@ -961,14 +961,21 @@ async fn close_reconciles_a_transfer_that_failed_midway() {
         ..WriteHint::default()
     };
     mock.set_fail_part_after(1); // 第 1 片之后失败（write 上抛、stager 存活）
-    let mut stager = drv.writer(&path("/halfway.bin"), &hint).await.expect("writer");
+    let mut stager = drv
+        .writer(&path("/halfway.bin"), &hint)
+        .await
+        .expect("writer");
     let res = stager.write(&payload).await;
     match res {
         Err(cloudkit_storage::StorageError::Unavailable(_))
         | Err(cloudkit_storage::StorageError::RateLimited { .. }) => {}
         other => panic!("the injected OSS failure must surface, got {other:?}"),
     }
-    assert_eq!(mock.st().part_put_count, 1, "part 1 landed before the failure");
+    assert_eq!(
+        mock.st().part_put_count,
+        1,
+        "part 1 landed before the failure"
+    );
 
     // 消费面（dav-server/队列）在 write 错后仍会 close——盲信即灾难。
     mock.clear_part_failure();
@@ -976,7 +983,11 @@ async fn close_reconciles_a_transfer_that_failed_midway() {
         .close()
         .await
         .expect("close re-drives the missing parts before committing");
-    assert_eq!(entry.size, payload.len() as u64, "the committed object is whole");
+    assert_eq!(
+        entry.size,
+        payload.len() as u64,
+        "the committed object is whole"
+    );
     assert_eq!(
         mock.st().part_put_count,
         3,
@@ -1004,7 +1015,10 @@ async fn resume_endpoint_transient_error_keeps_the_session_record() {
     // 第一轮：第 1 片后中断 → drop 留会话。
     mock.set_fail_part_after(1);
     {
-        let mut stager = drv.writer(&path("/keep.bin"), &hint).await.expect("writer 1");
+        let mut stager = drv
+            .writer(&path("/keep.bin"), &hint)
+            .await
+            .expect("writer 1");
         let res = stager.write(&payload).await;
         assert!(res.is_err(), "the injected OSS failure must surface");
     }
@@ -1016,24 +1030,31 @@ async fn resume_endpoint_transient_error_keeps_the_session_record() {
     mock.clear_part_failure();
     mock.set_fail_resume(1);
     {
-        let mut stager = drv.writer(&path("/keep.bin"), &hint).await.expect("writer 2");
+        let mut stager = drv
+            .writer(&path("/keep.bin"), &hint)
+            .await
+            .expect("writer 2");
         let res = stager.write(&payload).await;
         match res {
             Err(cloudkit_storage::StorageError::Unavailable(_)) => {}
-            other => panic!(
-                "a transient resume failure must propagate (session kept), got {other:?}"
-            ),
+            other => {
+                panic!("a transient resume failure must propagate (session kept), got {other:?}")
+            }
         }
     }
     assert_eq!(
-        mock.st().part_put_count, after_first,
+        mock.st().part_put_count,
+        after_first,
         "no part may be uploaded while the resume path is failing"
     );
 
     // 第三轮：resume 恢复 → 差集续传只补 2 片（会话资产仍在的实证）。
     mock.clear_fail_resume();
     {
-        let mut stager = drv.writer(&path("/keep.bin"), &hint).await.expect("writer 3");
+        let mut stager = drv
+            .writer(&path("/keep.bin"), &hint)
+            .await
+            .expect("writer 3");
         stager.write(&payload).await.expect("write 3");
         let e = stager.close().await.expect("close after the healed resume");
         assert_eq!(e.size, payload.len() as u64);

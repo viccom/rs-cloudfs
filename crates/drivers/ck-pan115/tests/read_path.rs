@@ -481,8 +481,7 @@ async fn cdn_get(
         later_403
     };
     if later_403 {
-        return (StatusCode::FORBIDDEN, "rate limited (later window)")
-            .into_response();
+        return (StatusCode::FORBIDDEN, "rate limited (later window)").into_response();
     }
     if force_403 {
         return (StatusCode::FORBIDDEN, "rate limited").into_response();
@@ -1096,7 +1095,11 @@ async fn reader_maps_cdn_403_to_rate_limited() {
 #[tokio::test]
 async fn reader_rejects_an_empty_206_window_instead_of_silent_truncation() {
     let mut vfs = Vfs::new();
-    vfs.put_file("0", "hole.bin", (0..100_000u32).map(|i| (i % 251) as u8).collect());
+    vfs.put_file(
+        "0",
+        "hole.bin",
+        (0..100_000u32).map(|i| (i % 251) as u8).collect(),
+    );
     vfs.cdn_empty_206 = true;
     let mock = Mock::start(vfs).await;
     let drv = mock.driver();
@@ -1104,18 +1107,16 @@ async fn reader_rejects_an_empty_206_window_instead_of_silent_truncation() {
 
     let mut stream = drv.reader(&entry.id, None).await.expect("stream opens");
     use futures_util::StreamExt;
-    let mut saw_error = false;
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(bytes) => panic!("an empty 206 must not produce data frames, got {} bytes", bytes.len()),
-            Err(cloudkit_storage::StorageError::Unavailable(_)) => {
-                saw_error = true;
-                break;
-            }
-            Err(other) => panic!("expected Unavailable, got {other:?}"),
-        }
+    // 单帧定夺：空 206 的第一帧必为错误帧（否则就是静默截断/数据帧）。
+    match stream.next().await {
+        Some(Err(cloudkit_storage::StorageError::Unavailable(_))) => {}
+        Some(Ok(bytes)) => panic!(
+            "an empty 206 must not produce data frames, got {} bytes",
+            bytes.len()
+        ),
+        Some(Err(other)) => panic!("expected Unavailable, got {other:?}"),
+        None => panic!("the stream must terminate with an error frame, got clean EOF"),
     }
-    assert!(saw_error, "an empty 206 window must terminate the stream with an error");
 }
 
 /// 复审 M9（续）：CDN 206 越窗多给（body 超出请求窗）= 拼接错位的数据
@@ -1130,7 +1131,9 @@ async fn reader_rejects_an_over_window_206_instead_of_over_delivery() {
     vfs.put_file(
         "0",
         "wide.bin",
-        (0..(WINDOW + 5000) as u32).map(|i| (i % 249) as u8).collect(),
+        (0..(WINDOW + 5000) as u32)
+            .map(|i| (i % 249) as u8)
+            .collect(),
     );
     vfs.cdn_over_206 = true;
     let mock = Mock::start(vfs).await;
@@ -1139,21 +1142,16 @@ async fn reader_rejects_an_over_window_206_instead_of_over_delivery() {
 
     let mut stream = drv.reader(&entry.id, None).await.expect("stream opens");
     use futures_util::StreamExt;
-    let mut saw_error = false;
-    while let Some(chunk) = stream.next().await {
-        match chunk {
-            Ok(bytes) => panic!(
-                "an over-window 206 must not produce data frames, got {} bytes",
-                bytes.len()
-            ),
-            Err(cloudkit_storage::StorageError::Unavailable(_)) => {
-                saw_error = true;
-                break;
-            }
-            Err(other) => panic!("expected Unavailable, got {other:?}"),
-        }
+    // 单帧定夺：越窗 206 的第一帧必为错误帧（否则就是超范围交付）。
+    match stream.next().await {
+        Some(Err(cloudkit_storage::StorageError::Unavailable(_))) => {}
+        Some(Ok(bytes)) => panic!(
+            "an over-window 206 must not produce data frames, got {} bytes",
+            bytes.len()
+        ),
+        Some(Err(other)) => panic!("expected Unavailable, got {other:?}"),
+        None => panic!("the stream must terminate with an error frame, got clean EOF"),
     }
-    assert!(saw_error, "an over-window 206 must terminate the stream with an error");
 }
 
 /// 复审 M9（续）：403 自愈臂必须按**实收字节**推进 pos——旧实现

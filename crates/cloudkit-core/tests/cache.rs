@@ -244,7 +244,11 @@ fn evict_lru_except_never_deletes_a_kept_path_even_when_oldest() {
     );
     assert!(pending_path.exists(), "the pending copy survived on disk");
     // 新鲜件被淘汰腾位（limit 15 + need 10 > 20）。
-    assert_eq!(evicted, vec![rp("/fresh.bin")], "the newer file is the victim");
+    assert_eq!(
+        evicted,
+        vec![rp("/fresh.bin")],
+        "the newer file is the victim"
+    );
     assert!(!fresh_path.exists());
 }
 

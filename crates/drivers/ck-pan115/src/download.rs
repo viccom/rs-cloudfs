@@ -164,16 +164,16 @@ pub(crate) async fn open_range(
                         tokio::time::sleep(delay).await;
                         if let Ok(fresh) = fetch_dlink(&client, &pc).await {
                             cache_handle.insert(&pc, &fresh).await;
-                        if let Ok(bytes) = get_window(&client, &fresh, pos, win_end).await {
-                            if tx.send(Ok(bytes.clone())).await.is_err() {
-                                return;
+                            if let Ok(bytes) = get_window(&client, &fresh, pos, win_end).await {
+                                if tx.send(Ok(bytes.clone())).await.is_err() {
+                                    return;
+                                }
+                                // M9：按**实收字节**推进（旧 `pos += 窗长` 在
+                                // 自愈 GET 短给时跳过未收字节 = 静默跳字节）。
+                                pos += bytes.len() as u64;
+                                ok = true;
+                                break;
                             }
-                            // M9：按**实收字节**推进（旧 `pos += 窗长` 在
-                            // 自愈 GET 短给时跳过未收字节 = 静默跳字节）。
-                            pos += bytes.len() as u64;
-                            ok = true;
-                            break;
-                        }
                         }
                     }
                     if !ok {

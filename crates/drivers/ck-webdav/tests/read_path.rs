@@ -667,7 +667,7 @@ async fn range_ignored_200_high_offset_window_is_sliced_byte_exact() {
         driver
             .reader(
                 &entry.id,
-                Some(Range::new(start, Some(start + window as u64)).expect("range")),
+                Some(Range::new(start, Some(start + window)).expect("range")),
             )
             .await
             .expect("reader"),

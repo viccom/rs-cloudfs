@@ -111,3 +111,35 @@ storage（5）：spool 每写 open/close+全量拷贝（性能，量级可接受
 **验证**：五红（四本地 + H1 WSL）→ 五绿（本地目标测试 + 触碰面回归 upload_queue 30/config 40/cli lib 13/runtime_rebuild 10/dispatch 23 全绿 + **WSL H1 红→绿**）+ 三触碰 crate clippy `-D warnings` 绿 + fmt 绿。worktree 全量：**192 套件 / 1876 通过 / 0 失败**（`-j 2`；默认并发下 rustc 崩溃一次——与基线 round1/2 同形态的环境问题，K73 解法降并发后全绿）。
 
 **批次链**：`bce6cfd`（五红留证）→ `e13b57b`（五修复全绿）。
+
+## Medium 批复核与修复（2026-09-25，worktree `fix/review-medium`，负责人令「必修 7 条再次复核确认真 BUG 后逐一修复；其余零破坏低成本顺手修」）
+
+**复核结论：必修 7 条全部再次亲核源码定谳为真 BUG**（复核记录见批次链 commit message；M5 的资源缺陷为输出等价型——消费面逐字相同、缺陷纯在内存峰位，红走 seam 级）：
+
+| # | 复核定谳（机制链） | 红证据 | 修复 |
+|---|---|---|---|
+| M4 | 重试臂 `_ => Err(NotFound)` 折叠一切（driver.rs:657-663 旧）——传输/认证/5xx 与「父仍在的 403」全部变 NotFound | 桩红×2：503 落重试 → 得 `not found`（应 Unavailable）；父在 403 → 得 `not found`（应 Unauthorized） | 重试臂与首发同形分类：ParentSuspect 重 stat 父（缺→NotFound(父)/在→通用表/文件占→Exists）、Err 原样透传；桩新增 `transient_5xx_move_skip` + `false_403_move_with_parent` 两注入面 |
+| M5 | 200-回退 `read_capped(end)` 按绝对窗口终点缓冲（client.rs:660）——高偏移窗口整前缀进内存 | seam 红（函数缺失编译红）+ 高偏移输出等价护栏 | `read_200_window`：流式按块丢弃 `[0,start)` 前缀、只累积窗长；覆盖不足 Io（消息保留实收字节数——既有钉测零漂移）；reqwest 增 `stream` 特性（wrap_stream 合成块流面） |
+| M7 | `RelPath::new` 拒 `\` 而 `join` 不拒 + `has_reserved_char` 漏 `\` → Linux 卷 `a\b` 名可见不可寻址 | 白盒红：`join_validated(root,"a\b")` 得 Some | 过滤表增 `\`（sftp `name_is_addressable` 同源）；注释纠偏（旧注释误称词汇层已拒故可不列） |
+| M8 | write 中途失败后 transfer=Some（部分片）→ close 跳过 run_transfer 盲 complete 缺片 → 远端**截断可见对象**落地 + 会话删除（size 复核在残骸之后才拒） | 红实测：close 得 `Unavailable("upload size mismatch: local 12582912 vs remote 5242880")` + part_put_count=1 残骸 | `transfer_incomplete()` 门（rapid=完整/multipart 看片覆盖/单片看 put_done）→ close 先补差集（幂等）再提交 |
+| M9 | `get_window` 无 body 长度校验：空体 → 读流静默 `break`（零信号截断）；越窗多给透传；403 自愈臂 `pos += 窗长` 而非实收（短给即跳字节） | 红×3：空体得 0 字节 Ok 流；越窗得整 body 数据帧；自愈短给实测缺 4MiB−1 字节（left 4195539 / right 8389842） | get_window 增两防线（pan123 M6 同款：越窗拒/空体拒/少给非空保留）+ 删静默 break + 自愈臂 `pos += bytes.len()`；桩新增空体/越窗/later-403/later-短体注入面（短体预算只在真正出 206 体时消耗——403 短路不吃） |
+| M12 | classify 表无 24010 → 落 Rejected 泛化 Unavailable（真机 2026-09-24 撞过：多空间配额形态） | 编译红（ErrKind::QuotaExceeded 不存在）+ 两条钉测 | `24010 → QuotaExceeded → Unavailable` 带行动指引（多空间配额独立，换目录/清容量，重试无意义） |
+| M16 | `staged_sibling` 固定 `.{name}.tmp` 是合法虚拟路径——远端行 `/.foo.tmp` 缓存副本恰在该处时，编辑器临时文件形态 PUT `/foo` truncate 掉 pending 行唯一副本；且 StagedFile 无 Drop 清理（Low 同面） | 红×2：两个并发写手只得 1 个暂存件（后者 truncate 前者）；不 flush 丢弃留孤儿 .tmp | 移植 winfsp M1 随机段 `.{name}.{rand8}.tmp` + `committed` 标记 + Drop 清理；winfsp writer 分歧注释同步收敛 |
+
+**顺手修批（零破坏低成本，负责人令「其他的如是零破坏低成本顺手修」）**：
+
+| # | 定谳 | 红 | 修复 | 破坏面 |
+|---|---|---|---|---|
+| M1 | evict_lru 无 keep-set——LRU 淘汰可删 pending 上传唯一副本（clear_except 有保护、淘汰没有） | seam 红（evict_lru_except 缺失）+ 旧路径无 keep-set 源码实证；两条保护钉测 | `evict_lru_except(keep)`（evict_lru 委托空 keep）+ hydrate 喂 `pending_file_paths` | 零（只多保护；keep 条目仍计容量预算） |
+| M6 | stash rename lost-ACK 重放（首 rename 已生效、重放如实撞源不在）被判「旧对象消失」→ stash=None → 失败不复位 → 旧版困死 .old、final 永空 | 红实测：abort 后 reader NotFound（旧版 3000 字节困死） | NotFound 臂 lstat 探测 `.old` 唯一名（pid-seq 段——只可能是我们的 rename 造的）；桩新增 apply-then-NoSuchFile 注入面 | 零（仅 NotFound 角落多一次探测） |
+| M10 | resume 臂**任何**错误都删本地会话记录 → 瞬态错（传输/限流/5xx）也毁差集资产 + 回退全量 init | 红实测：瞬态错后 write 返回 Ok（全量重传 3 片）而非上抛保会话 | 对齐 pan123 SessionGone-only：瞬态错上抛保留记录；仅 object 换代（确不可续）删记录 | 零（原「回退 init」形态仅剩确不可续分支；瞬态错由上层重试纪律兜底） |
+| M11（超时半边） | OSS 数据面 PUT 继承共享 60s 总超时——大分片普通上行必死 | seam 红（data_timeout 缺失）+ 四边界钉测 | `max(300s, MiB×2s)` 每请求超时（典型 5MiB 分片命中 300s 基线）；控制面动词不受影响 | 零（纯放宽）。**retryable 半边维持 K75.4 裁决不动**（status=0 传输错不标可重试——M10 保会话后重试语义已自洽） |
+| M13 | 陈旧 fs_id 缓存 × 路径被外部复用 → delete 按路径删**错对象**且「成功」（-9 纠偏只盖路径已空形态） | 红实测：外部搬 a→b + 新对象落 a 原位 → 旧实现删掉 a 原位新对象、真身 b 幸存 | 缓存命中先列父目录「路径+fs_id」双核对，不过 → 失效+扫描真路径 | 两处 warm 零流量钉测同步为「恰一次核对 list」（**语义变更非漂移**：删错对象不可逆 > 零流量钉——本行为裁决记录） |
+
+**不动/放弃**：M15（boot 全有全无 vs 容忍 Failed 行）维持待产品裁决；M3（极窄 TOCTOU 自愈）与 M17（lib.rs 拆分工程债）按「没有价值的放弃」销账。
+
+**新观察（本批复核揭出，未修）**：M7 同型暴露面存在于其余宽面驱动的**远端名**——webdav/pan115/pan123/baidu 的 list 未过滤远端 `\` 名（Linux 服务器/网盘侧合法名经 WebDAV/网关可见后同样不可寻址）。超出本档案 M7 条目范围，记此待后续批统一裁决（与 sftp/local 的谓词共用方案）。
+
+**验证**：每项红→绿独立留证（见上表红证据列 + 各 commit）；触碰面回归全绿（ck-webdav 63+28+29+48、cloudkit-webdav 全、ck-pan115 全、ck-local 全、ck-pan123 全、ck-sftp 全、ck-baidu 全、cloudkit-core cache 12）；worktree 全量 `-j 2` 见批次收尾记录。
+
+**批次链**：`8f9f826`（webdav M4+M5+M16）→ `9a9bd94`（pan115 M8+M9+M10+M11）→ `2843bb7`（local M7 + pan123 M12）→ `70074ab`（core M1 + sftp M6 + baidu M13）。

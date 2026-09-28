@@ -615,7 +615,10 @@ mod addressability_tests {
              it must not be listed"
         );
         assert!(join_validated(&root, "ab").is_some());
-        assert!(join_validated(&root, "a:b").is_none(), "the NTFS-ADS char stays filtered");
+        assert!(
+            join_validated(&root, "a:b").is_none(),
+            "the NTFS-ADS char stays filtered"
+        );
     }
 }
 

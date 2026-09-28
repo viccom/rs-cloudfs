@@ -638,10 +638,7 @@ impl Vfs {
             .iter()
             .filter_map(|path| RelPath::new(path).ok())
             .collect();
-        for victim in self
-            .cache
-            .evict_lru_except(row.size.max(0) as u64, &keep)?
-        {
+        for victim in self.cache.evict_lru_except(row.size.max(0) as u64, &keep)? {
             if let Some(victim_row) = self.db.get_file(victim.as_str())? {
                 // is_cached-only flip — targeted column write, never a
                 // whole-row upsert of a possibly-stale snapshot (P3

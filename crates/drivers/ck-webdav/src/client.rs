@@ -1245,7 +1245,9 @@ mod read_200_window_tests {
             body[10..14].to_vec(),
             body[14..20].to_vec(),
         ]);
-        let bytes = read_200_window(response, 10, 14).await.expect("window bytes");
+        let bytes = read_200_window(response, 10, 14)
+            .await
+            .expect("window bytes");
         assert_eq!(&*bytes, &body[10..14], "exactly the [start,end) window");
     }
 
@@ -1272,6 +1274,10 @@ mod read_200_window_tests {
         assert_eq!(&*bytes, &[1, 2, 3, 4]);
         let response = response_of_chunks(vec![vec![1, 2, 3, 4, 5, 6]]);
         let bytes = read_200_window(response, 0, 4).await.expect("window bytes");
-        assert_eq!(&*bytes, &[1, 2, 3, 4], "extra bytes beyond the window are dropped");
+        assert_eq!(
+            &*bytes,
+            &[1, 2, 3, 4],
+            "extra bytes beyond the window are dropped"
+        );
     }
 }
