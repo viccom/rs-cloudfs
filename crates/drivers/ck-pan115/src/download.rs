@@ -148,9 +148,8 @@ pub(crate) async fn open_range(
             let win_end = (pos + WINDOW).min(end); // 半开
             match get_window(&client, &url, pos, win_end).await {
                 Ok(bytes) => {
-                    if bytes.is_empty() {
-                        break; // 服务端提前 EOF：停止（截断流为真）
-                    }
+                    // get_window 拒空体/越窗（M9）——此处只可能拿到非空
+                    // 且 ≤ 窗长的体；少给非空按实收推进（续窗自洽）。
                     let n = bytes.len() as u64;
                     if tx.send(Ok(bytes)).await.is_err() {
                         return; // 消费方丢弃
@@ -165,14 +164,16 @@ pub(crate) async fn open_range(
                         tokio::time::sleep(delay).await;
                         if let Ok(fresh) = fetch_dlink(&client, &pc).await {
                             cache_handle.insert(&pc, &fresh).await;
-                            if let Ok(bytes) = get_window(&client, &fresh, pos, win_end).await {
-                                if tx.send(Ok(bytes)).await.is_err() {
-                                    return;
-                                }
-                                pos += win_end - pos;
-                                ok = true;
-                                break;
+                        if let Ok(bytes) = get_window(&client, &fresh, pos, win_end).await {
+                            if tx.send(Ok(bytes.clone())).await.is_err() {
+                                return;
                             }
+                            // M9：按**实收字节**推进（旧 `pos += 窗长` 在
+                            // 自愈 GET 短给时跳过未收字节 = 静默跳字节）。
+                            pos += bytes.len() as u64;
+                            ok = true;
+                            break;
+                        }
                         }
                     }
                     if !ok {
@@ -327,6 +328,26 @@ async fn get_window(
         .bytes()
         .await
         .map_err(|e| StorageError::Unavailable(format!("CDN body: {}", e.without_url())))?;
+    // M9 窗口长度防线（pan123 M6 形态同款纪律）：只拦「越窗多给」与
+    // 「空体」——
+    // - 越窗多给 → 整窗拒绝（多余字节透传后按窗拼接即错位 = 数据
+    //   损坏面）；
+    // - 空体（期望非零）→ 拒（旧「读流静默 break」= 零信号截断）；
+    // - 少给非空保留（续窗自洽：消费方按实收字节推进 pos）。
+    let expected = end - start;
+    if body.len() as u64 > expected {
+        return Err(StorageError::Unavailable(format!(
+            "CDN 206 body exceeds the requested window: got {} bytes, expected {} \
+             (Content-Range {content_range:?})",
+            body.len(),
+            expected,
+        )));
+    }
+    if body.is_empty() {
+        return Err(StorageError::Unavailable(
+            "CDN returned an empty 206 body".to_string(),
+        ));
+    }
     Ok(body)
 }
 

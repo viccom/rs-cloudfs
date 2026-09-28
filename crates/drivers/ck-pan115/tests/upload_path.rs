@@ -72,6 +72,9 @@ struct UState {
     force_zero_size: bool,
     /// 第 N 片之后的 PUT 失败（分片级 resume 用例的中断注入）
     fail_part_after: Option<u32>,
+    /// `/open/upload/resume` 的失败预算（复审 M10：瞬态传输错注入——
+    /// 非分类错误码，每次消耗一次）
+    fail_resume: Option<u32>,
     /// pick_code → object key（resume 会话复用：同一 pc 回同一对象）
     pc_objects: HashMap<String, String>,
     /// get_token 调用计数（M-S2 断言面：STS 每传输链只取一次）
@@ -151,6 +154,17 @@ impl Mock {
 
     fn clear_part_failure(&self) {
         self.state.lock().unwrap().fail_part_after = None;
+    }
+
+    /// 复审 M10 注入：让 `/open/upload/resume` 接下来 N 次调用返回
+    /// 非分类错误码（→ `Unavailable`，传输类形态——会话真伪未知的
+    /// 瞬态失败）。
+    fn set_fail_resume(&self, n: u32) {
+        self.state.lock().unwrap().fail_resume = Some(n);
+    }
+
+    fn clear_fail_resume(&self) {
+        self.state.lock().unwrap().fail_resume = None;
     }
 }
 
@@ -304,6 +318,17 @@ thread_local! {
 async fn upload_resume(State(state): State<Arc<Mutex<UState>>>, body: String) -> Response {
     let form = parse_form(&body);
     let pc = form.get("pick_code").cloned().unwrap_or_default();
+    // 复审 M10：瞬态失败注入（非分类码 → Unavailable——会话真伪未知
+    // 的传输类形态；调用方必须保留会话记录上抛，不得销毁差集资产）。
+    {
+        let mut st = state.lock().unwrap();
+        if let Some(n) = st.fail_resume {
+            if n > 0 {
+                st.fail_resume = Some(n - 1);
+                return err_json(990001, "resume 通道繁忙（注入）");
+            }
+        }
+    }
     let st = state.lock().unwrap();
     // 会话复用语义：同一 pick_code → 同一对象（含已传分片与 uploadId）
     let Some(key) = st.pc_objects.get(&pc).cloned() else {
@@ -914,6 +939,109 @@ async fn resume_diff_only_uploads_missing_parts() {
     assert_eq!(
         second_pass, 2,
         "the resumed pass uploads only the two missing parts (part 1 is reused)"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 复审 M8（2026-09-25，pan123 K78/M8 的 confirmed 门移植）：write 在
+/// 传输链中途失败上抛后 `transfer` 已是 Some（部分片、未确认态）——
+/// close **不得盲信直接 complete**：缺片提交 = 远端留下截断的可见对
+/// 象（本地行随后被 size 复核拒绝，但残骸已落地且会话记录被删）。
+/// 正确行为：close 复跑差集补齐（幂等）再提交。
+#[tokio::test]
+async fn close_reconciles_a_transfer_that_failed_midway() {
+    let mock = Mock::start(0, false).await;
+    arm_base(&mock.base);
+    let dir = tmpdir();
+    let drv = mock.driver(dir.clone());
+
+    let payload: Vec<u8> = (0..12 * 1024 * 1024u32).map(|i| (i % 249) as u8).collect();
+    let hint = WriteHint {
+        size: Some(payload.len() as u64),
+        ..WriteHint::default()
+    };
+    mock.set_fail_part_after(1); // 第 1 片之后失败（write 上抛、stager 存活）
+    let mut stager = drv.writer(&path("/halfway.bin"), &hint).await.expect("writer");
+    let res = stager.write(&payload).await;
+    match res {
+        Err(cloudkit_storage::StorageError::Unavailable(_))
+        | Err(cloudkit_storage::StorageError::RateLimited { .. }) => {}
+        other => panic!("the injected OSS failure must surface, got {other:?}"),
+    }
+    assert_eq!(mock.st().part_put_count, 1, "part 1 landed before the failure");
+
+    // 消费面（dav-server/队列）在 write 错后仍会 close——盲信即灾难。
+    mock.clear_part_failure();
+    let entry = stager
+        .close()
+        .await
+        .expect("close re-drives the missing parts before committing");
+    assert_eq!(entry.size, payload.len() as u64, "the committed object is whole");
+    assert_eq!(
+        mock.st().part_put_count,
+        3,
+        "close uploaded the two missing parts (1 from the failed pass + 2 reconciled)"
+    );
+    let _ = std::fs::remove_dir_all(&dir);
+}
+
+/// 复审 M10（2026-09-25）：`/open/upload/resume` 的**瞬态**失败（传输类，
+/// 会话真伪未知）不得销毁本地会话记录——旧实现任何错误都删记录 + 全量
+/// init（差集资产毁弃 + OSS 孤儿分片不 abort）。对齐 pan123 的
+/// SessionGone-only 纪律：瞬态错上抛保留记录，重试仍可差集续传。
+#[tokio::test]
+async fn resume_endpoint_transient_error_keeps_the_session_record() {
+    let mock = Mock::start(0, false).await;
+    arm_base(&mock.base);
+    let dir = tmpdir();
+    let drv = mock.driver(dir.clone());
+
+    let payload: Vec<u8> = (0..12 * 1024 * 1024u32).map(|i| (i % 251) as u8).collect();
+    let hint = WriteHint {
+        size: Some(payload.len() as u64),
+        ..WriteHint::default()
+    };
+    // 第一轮：第 1 片后中断 → drop 留会话。
+    mock.set_fail_part_after(1);
+    {
+        let mut stager = drv.writer(&path("/keep.bin"), &hint).await.expect("writer 1");
+        let res = stager.write(&payload).await;
+        assert!(res.is_err(), "the injected OSS failure must surface");
+    }
+    let after_first = mock.st().part_put_count;
+    assert_eq!(after_first, 1);
+
+    // 第二轮：resume 端点瞬态失败——write 必须上抛（不得回退全量 init
+    // 「成功」），会话记录保留。
+    mock.clear_part_failure();
+    mock.set_fail_resume(1);
+    {
+        let mut stager = drv.writer(&path("/keep.bin"), &hint).await.expect("writer 2");
+        let res = stager.write(&payload).await;
+        match res {
+            Err(cloudkit_storage::StorageError::Unavailable(_)) => {}
+            other => panic!(
+                "a transient resume failure must propagate (session kept), got {other:?}"
+            ),
+        }
+    }
+    assert_eq!(
+        mock.st().part_put_count, after_first,
+        "no part may be uploaded while the resume path is failing"
+    );
+
+    // 第三轮：resume 恢复 → 差集续传只补 2 片（会话资产仍在的实证）。
+    mock.clear_fail_resume();
+    {
+        let mut stager = drv.writer(&path("/keep.bin"), &hint).await.expect("writer 3");
+        stager.write(&payload).await.expect("write 3");
+        let e = stager.close().await.expect("close after the healed resume");
+        assert_eq!(e.size, payload.len() as u64);
+    }
+    let third_pass = mock.st().part_put_count - after_first;
+    assert_eq!(
+        third_pass, 2,
+        "the healed pass resumes the kept session (differential), not a fresh full upload"
     );
     let _ = std::fs::remove_dir_all(&dir);
 }
