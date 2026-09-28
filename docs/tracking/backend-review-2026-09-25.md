@@ -143,3 +143,17 @@ storage（5）：spool 每写 open/close+全量拷贝（性能，量级可接受
 **验证**：每项红→绿独立留证（见上表红证据列 + 各 commit）；触碰面回归全绿（ck-webdav 63+28+29+48、cloudkit-webdav 全、ck-pan115 全、ck-local 全、ck-pan123 全、ck-sftp 全、ck-baidu 全、cloudkit-core cache 12）；worktree 全量 `-j 2` 见批次收尾记录。
 
 **批次链**：`8f9f826`（webdav M4+M5+M16）→ `9a9bd94`（pan115 M8+M9+M10+M11）→ `2843bb7`（local M7 + pan123 M12）→ `70074ab`（core M1 + sftp M6 + baidu M13）。
+
+## 文档同步批销账（2026-09-28，b3fb35f）
+
+文档-代码同步批清偿以下 Low/Info 文档项（全部注释/文档/版本号，零行为代码；cargo check --all-targets + fmt 绿）：
+
+- **Low 架构（5 之 4）**：mount_backend 字段 rustdoc 的 net-use 回落旧语义、MountBackend 枚举文档新旧默认自相矛盾（含一句 K87 编辑截断残句）、cli lib.rs:522 残留 8080 注释、web_e2e/smoke 两测试注释的 8080/8088 production 声明——均随 K87 端口裁决/K87 默认翻转同步（config.rs 两处整段重写）。**未清**：MountedBackend::WebDavFallback 死变体（代码清理项，非文档）。
+- **Info 架构（6 之 2 + 1 已过期）**：architecture.md §4 crate 树补 4 驱动与 cloudkit-winfsp；driver-onboarding §5.4「九位」→「十位」（capability.rs 实测 10 bool）；cli Cargo.toml winfsp 注释一条经复核已是 K89 现行文本（档案项过期，无需动作）。**未清/不修**：rust-rewrite-design.md 历史 8080（历史记录不回改）、Cargo.lock 双版本密码学依赖（已知取舍）、web 面零 tracing（代码项）。
+- **Info baidu（6 之 1）**：refresh_token「一次一换」注释勘误落地（oauth.rs 三处 + cli doctor 注释改「保守模型」措辞；2026-09-25 实测 RT 可复用，保守落盘行为不变）。pan115 同词不动（语义独立未被勘误）。
+- **Low core（4 之 1）**：hydrate 阻塞式 std 写取舍注释落档（「文档化即可」兑现）。
+- **Low storage/L2（9 之 1）**：vocab.rs Range 文档矛盾（start>=end 非法 vs 代码/测试空窗合法）改为 start>end 非法 + start==end 合法空窗。
+- **联动更新**：webdav M5 之后 get_range「读取封顶」文档改窗长口径、read_capped 现役面注释；K87 端口残留另清 webdav server.rs×2 与 index.html 占位（审查清单外补捞）。
+- **版本卫生**：workspace version 0.12.1→0.12.2（0.12.2 tag 漏 bump；K88 取新者故二进制身份无损）；README 身份示例同步。
+
+**夹具观察（未动，非文档）**：cloudkit-platform 测试的 CYDRIVE_TEST_MOUNT_URL 夹具默认 8080——ignored 真机测试的手动便利默认，与生产默认 8485 不再对齐；属测试夹具代码，留待下次触碰该 crate 时顺手。
