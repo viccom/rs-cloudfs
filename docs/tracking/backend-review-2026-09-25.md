@@ -138,7 +138,7 @@ storage（5）：spool 每写 open/close+全量拷贝（性能，量级可接受
 
 **不动/放弃**：M15（boot 全有全无 vs 容忍 Failed 行）维持待产品裁决；M3（极窄 TOCTOU 自愈）与 M17（lib.rs 拆分工程债）按「没有价值的放弃」销账。
 
-**新观察（本批复核揭出，未修）**：M7 同型暴露面存在于其余宽面驱动的**远端名**——webdav/pan115/pan123/baidu 的 list 未过滤远端 `\` 名（Linux 服务器/网盘侧合法名经 WebDAV/网关可见后同样不可寻址）。超出本档案 M7 条目范围，记此待后续批统一裁决（与 sftp/local 的谓词共用方案）。
+**新观察（本批揭出 → 同日查证后撤销）**：批内曾记「webdav/pan115/pan123/baidu 的 list 未过滤远端 `\` 名（M7 同型暴露面）」——**经逐驱动源码查证该记录不实，撤销**：webdav（xml.rs `is_addressable_name`，list/stat 双面过滤）/ pan115（`entry_from_row` `name_is_addressable` + debug 日志）/ pan123（同款 + warn 日志）三驱动**均有 K67 血统的显式守卫**（分别来自 Phase 7 WD / K73 / K78 批）；baidu 无显式守卫但 `rel_from_abs` → `RelPath::new` 拒 `\` → list/stat 的 filter_map 天然跳过（**不可见**而非「可见不可寻址」，与 K67「不可寻址即不可见」纪律殊途同归）；telegram 窄面无 list。**全后端无 M7 同型暴露面**。残余化妆级差异（不构成缺陷，随手项）：baidu/webdav 的跳过无日志（pan115 debug / pan123 warn）；四驱动可寻址谓词各持一份拷贝（未来可与 L2 共享件合并去重——挂 pending 的 `feat/l2-shared-helpers` 若合入时顺手）。教训已记：K90 原句系凭审查期印象下笔、未先查证——与「承重结论必须亲验」纪律相悖，本条即更正。
 
 **验证**：每项红→绿独立留证（见上表红证据列 + 各 commit）；触碰面回归全绿（ck-webdav 63+28+29+48、cloudkit-webdav 全、ck-pan115 全、ck-local 全、ck-pan123 全、ck-sftp 全、ck-baidu 全、cloudkit-core cache 12）；worktree 全量 `-j 2` 见批次收尾记录。
 
