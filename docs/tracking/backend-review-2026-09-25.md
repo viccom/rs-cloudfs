@@ -94,4 +94,20 @@ storage（5）：spool 每写 open/close+全量拷贝（性能，量级可接受
 
 - round1（9 子代理并发时）：rustc alloc_error（编译器 OOM）→ E0463 级联。
 - round2（1 子代理并发）：rustc STATUS_STACK_BUFFER_OVERRUN（0xc0000409，hashbrown/interner 路径）→ 同级联。两轮均为**本地编译器资源崩溃**，非代码回归；CI windows/ubuntu 双平台在 20bedee、f26e025 全绿为反证。
-- round3（`-j 2` 降并发重跑）：结果待补（本档案提交时在跑）。
+- round3（`-j 2` 降并发重跑）：**exit 0 全绿**——round1/2 定谳为环境资源压力（K73 陷阱族），基线无恙。
+
+## 必修批复核与修复（2026-09-25，worktree `fix/review-mustfix`，负责人令「确保一定是 BUG 才修复」）
+
+**复核结论：五项全部定谳为真 BUG**（主会话逐环亲验机制链，非仅采信子代理）：
+
+| # | 复核定谳关键证据（亲验） | 红测证据 | 修法 |
+|---|---|---|---|
+| H1 | tokio 1.53.1 `poll_write`（file.rs:741-770）spawn 阻塞写后**立即返回 Ready**；tokio File **无 Drop 实现**（drop 不等在途写）；baidu `upload_stream→stage_stream→drop→finish_upload→block_md5s`（新句柄零间隙读回）链路逐行读通 | WSL 钉测红：staging 返回瞬间盘上 **6094848/6291456（缺 192 KiB = 0.75 帧）**；Windows 绿（免疫平台，钉测可跑） | `stage_stream_to_disk` 写面 std::fs + spawn_blocking（L2 spool 同款）；错误文案逐字保留；WSL 红→绿 |
+| H2 | `put_staged→commit_put` 新 pending 行+enqueue（vfs.rs:563-572）可在 job1 在途时发生；`persist_success` 用 :624 快照整行回写（:1011-1027）+ `delete_local_copy` 无守卫直删（:1045-1055）；唯一守卫只盖 size==0 | 门控传输确定性红：**Some(1) ≠ Some(2)**（旧任务快照回写抢行、超车任务因本地副本被删而降级） | Ok 臂前置超车守卫：重读行，size/mtime 与快照不符→pending 形不回写不删本地（计 degraded）、已上传形不回写（计 succeeded）；行中途消失→不复活（upsert 复活已删行同批堵住） |
+| H3 | 链 `main.rs:793→run_rebuild_multi→run_rebuild_command:4932→build_driver→ConfigTokenStore::default()`（"config.toml"）；save_tokens 整结构回写；baidu_access_token 在 VOLUME_SCOPED_KEYS（:385）；`ensure_no_volume_keys_in_process` 返 Err 拒启（:1093）；**live 执行器（lib.rs:2004 经 RuntimeRebuild）同样走 build_driver——live REBUILD 轮换同病** | 桩红：store 路径恒 "config.toml" ≠ 卷文件 | `rebuild_token_store(Option<&Path>)`；`RuntimeRebuild` 类型与 with_limits/build_driver 穿参；run_rebuild_multi 与 rebuild_volume（RebuildTask.secrets）两路都传 `spec.file_path`；单卷语义不变（None→cwd config.toml） |
+| M2 | `load_legacy_json` 两处 Parse 直出 `err.to_string()`（:1671/:1709）不过漏斗；漏斗按键名触发（:566）而 serde_json 类型错误只带值不带键名 | 红：错误消息原文 `invalid type: integer \`123456789012345\`, expected a string`——**值裸奔且无键名**（双缺口一次坐实） | 凭据键值非 string/null 预扫描拒绝（消息只报键名）；两处 Parse 构造均过 `redact_credential_values`（单一漏斗规则） |
+| M14 | lib.rs:2079 与 control.rs:352 两处 panic 日志打 `command = %line` 原始命令行；CREATE/UPDATE 载荷「MAY carry credentials」（:3090 契约自认）——K58-H4 本应消灭的落盘点 | 桩红：透传泄漏 SUPERSECRET | `loggable_command_line`：CREATE/UPDATE 裁第三段载荷只留关键字+卷名；两 catch 位接线；无载荷命令透传 |
+
+**验证**：五红（四本地 + H1 WSL）→ 五绿（本地目标测试 + 触碰面回归 upload_queue 30/config 40/cli lib 13/runtime_rebuild 10/dispatch 23 全绿 + **WSL H1 红→绿**）+ 三触碰 crate clippy `-D warnings` 绿 + fmt 绿。worktree 全量：**192 套件 / 1876 通过 / 0 失败**（`-j 2`；默认并发下 rustc 崩溃一次——与基线 round1/2 同形态的环境问题，K73 解法降并发后全绿）。
+
+**批次链**：`bce6cfd`（五红留证）→ `e13b57b`（五修复全绿）。
