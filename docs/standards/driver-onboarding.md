@@ -43,7 +43,7 @@
 1. 驱动 crate 导出 `pub fn factory(cfg: &DriverParams) -> Result<Arc<dyn CloudTransport>, ...>` 形态的构造函数（ck-telegram 先例）。
 2. 组合根 `cloudkit-cli`：`backend` 键 dispatch 到工厂 → 装配 Vfs/队列/WebDAV（同层依赖豁免点，唯一允许 import 驱动符号的 crate）。
 3. doctor/setup 相应分支（setup 引导鉴权流程、doctor 增驱动检查项——B3 范围）。
-4. 装配期打一行能力声明横幅（info，九位全列——R-5 先例）。
+4. 装配期打一行能力声明横幅（info，十位全列——R-5 先例）。
 
 ## 6. conformance 验收（D9，不得缩减）
 

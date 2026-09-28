@@ -281,25 +281,26 @@ impl Backend {
     }
 }
 
-/// How a volume is exposed as a Windows drive letter (Phase 3 / K40).
+/// How a volume is exposed as a Windows drive letter (Phase 3; default
+/// flipped by the 负责人 2026-09-24 裁决 / K87).
 ///
 /// The wire names are the stable `config.toml` spellings
 /// (`mount_backend = "webdav" | "winfsp"`). The default —
-/// [`MountBackend::Webdav`] — is the full-compatibility contract: a
-/// config without the key keeps the Python baseline's `net use` drive
-/// mapping, byte for byte. Value validation is exhaustive at parse time
-/// (the field is a typed enum — an unknown variant is a
+/// [`MountBackend::Winfsp`] — mounts drive letters in-process out of the
+/// box; the legacy `net use` mapping (the Python baseline behavior) is
+/// now an explicit opt-in that needs a one-time elevated
+/// `cydrive fix-reg` on fresh machines and otherwise fails the first
+/// claim with system error 67. Value validation is exhaustive at parse
+/// time (the field is a typed enum — an unknown variant is a
 /// [`ConfigError::Parse`] naming all accepted values and never reaches
-/// `validate`, which therefore adds no rule for the key). *Availability*
-/// is deliberately not a config concern: `"winfsp"` on a machine without
-/// WinFsp (or in a binary built without the feature) is a legal config
-/// The default is [`MountBackend::Winfsp`] (负责人 2026-09-24 裁决: drive
-/// letters mount in-process out of the box; the legacy `net use` mapping
-/// needs a one-time elevated `cydrive fix-reg` on fresh machines and
-/// would fail the first claim with system error 67). A winfsp mount that
-/// cannot run or fails does NOT fall back to webdav — the volume stays
-/// reachable through the dashboard/WebDAV and the failure is announced
-/// with actionable hints (opt into webdav by setting the key explicitly).
+/// `validate`, which therefore adds no rule for the key).
+/// *Availability* is deliberately not a config concern: `"winfsp"` on a
+/// machine without WinFsp (or in a binary built without the feature) is
+/// a legal config value — the mount flow reports unavailability at
+/// mount time (`MountBackendDecision::WinfspUnavailable`) instead of
+/// rejecting the config, and a winfsp mount that fails does NOT fall
+/// back to webdav (the volume stays reachable through the dashboard/
+/// WebDAV; opt into `net use` by setting the key explicitly).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq, serde::Serialize, serde::Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum MountBackend {
@@ -1234,15 +1235,20 @@ pub struct CyDriveConfig {
     pub drive_letter: String,
     /// Whether to auto-mount the drive on startup.
     pub auto_mount_drive: bool,
-    /// How to expose the drive on Windows (Phase 3 / K40):
-    /// [`MountBackend::Webdav`] (the default — the `net use` mapping the
-    /// Python baseline used) or [`MountBackend::Winfsp`] (the in-process
-    /// WinFsp native mount; needs a `--features winfsp` build and an
-    /// installed WinFsp runtime — when either is missing the mount flow
-    /// logs, says so on the banner and falls back to WebDAV instead of
-    /// refusing to start). A **process-scoped** key (K19 partition): it
-    /// governs every volume's mount in one process. Value validation is
-    /// exhaustive at parse time (typed enum — see [`MountBackend`]).
+    /// How to expose the drive on Windows (Phase 3; default flipped by
+    /// the 负责人 2026-09-24 裁决 / K87): [`MountBackend::Winfsp`] (the
+    /// default — in-process native mount; K89 makes it a default-feature
+    /// build, still needs an installed WinFsp runtime) or
+    /// [`MountBackend::Webdav`] (the `net use` mapping — needs the WebDAV
+    /// endpoint up and a one-time elevated `cydrive fix-reg` on fresh
+    /// machines, system error 67 otherwise). A winfsp mount that cannot
+    /// run or fails does NOT fall back to webdav: the volume stays
+    /// reachable through the dashboard/WebDAV and the failure is
+    /// announced with actionable hints
+    /// (`MountBackendDecision::WinfspUnavailable`). A **process-scoped**
+    /// key (K19 partition): it governs every volume's mount in one
+    /// process. Value validation is exhaustive at parse time (typed
+    /// enum — see [`MountBackend`]).
     #[serde(default)]
     pub mount_backend: MountBackend,
     /// Linux mount point for `cydrive mount` / startup auto-mount

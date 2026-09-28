@@ -200,7 +200,7 @@ pub struct WebUiConfig {
     /// default would be a phantom mount claim); single-volume mode
     /// always carries `Some`.
     pub drive_letter: Option<String>,
-    /// WebDAV URL reported by `/api/stats` (`"http://127.0.0.1:8080"`).
+    /// WebDAV URL reported by `/api/stats` (`"http://127.0.0.1:8485"`).
     /// The handler glue also derives the `webdav_host` / `webdav_port`
     /// keys from this single URL (the frozen config carries no separate
     /// host/port fields).

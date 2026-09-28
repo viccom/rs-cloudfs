@@ -2,7 +2,7 @@
 //!
 //! Each test spins up a fresh environment — temp SQLite + cache tree +
 //! pre-connected `MockTransport` + Vfs + `CyDriveFs` — serves it on an
-//! ephemeral loopback port (`127.0.0.1:0`, production's 127.0.0.1:8080
+//! ephemeral loopback port (`127.0.0.1:0`, production's 127.0.0.1:8485
 //! contract is the caller's concern) and drives it with hand-rolled
 //! HTTP/1.1 over a raw `TcpStream` (no HTTP client dependency). The
 //! scenarios pin the Python baseline's observable wire behavior:

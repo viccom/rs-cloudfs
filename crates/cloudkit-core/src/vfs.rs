@@ -657,6 +657,11 @@ impl Vfs {
         // the WebDAV thread's `future.result(timeout=180)` cap). Cache
         // hits and the LRU bookkeeping above are local fast paths and
         // stay outside the bound.
+        // Known trade-off (documented 2026-09-28): the staged write is
+        // blocking std::fs inside this async fn — small bounded frames
+        // onto a local cache disk, and tokio::fs's Linux completion
+        // timing is untrusted anyway (see the L2 spool_append_write
+        // note) — the blocking form is the deliberate, honest shape.
         // Download budget (E-5): encrypted rows hydrate through a
         // `total_size` of u64::MAX — the full rationale (plaintext vs
         // container length, AEAD self-validation) lives with the budget

@@ -54,9 +54,11 @@ crates/
   cloudkit-storage   (L2)  ← 新建
   cloudkit-core      (L3+L4) ← cydrive-core 改造
   cloudkit-crypto    (L4)  ← 新建（方案 trait + gcm-v1 + aead-v2）
-  drivers/ck-telegram  drivers/ck-baidu  drivers/ck-local   (L1)
+  drivers/ck-telegram  drivers/ck-baidu  drivers/ck-local       (L1)
+  drivers/ck-sftp  drivers/ck-pan115  drivers/ck-pan123  drivers/ck-webdav (L1; Phase 4–7)
   cloudkit-sync-server (L4 服务, 独立部署)
   cloudkit-webdav / cloudkit-web / cloudkit-platform / cloudkit-cli (L5)
+  cloudkit-winfsp (L5; Windows 挂载 FSD 适配层, --features winfsp)
 ```
 
 - **二进制名保持 `cydrive`**（部署位零感知）+ 新增 `cydrive-sync-server` 不变；

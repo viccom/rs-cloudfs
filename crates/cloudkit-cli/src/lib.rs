@@ -519,7 +519,7 @@ pub fn transport_capabilities_line(caps: &Capabilities) -> String {
 ///
 /// Start order: DB + cache → Vfs → pending requeue → WebDAV serve. The
 /// returned handle answers [`RunHandle::local_addr`] with the bound
-/// address (production binds `127.0.0.1:8080` via the config; a `:0`
+/// address (production binds `127.0.0.1:8485` via the config; a `:0`
 /// port binds an ephemeral one — validation of non-zero ports is the
 /// caller's concern, which is why tests may pass `0` here).
 pub async fn run_with_transport(
@@ -6435,7 +6435,7 @@ pub enum BackendProbe {
 #[cfg(feature = "baidu")]
 pub async fn baidu_backend_probe(cfg: &CyDriveConfig) -> BackendProbe {
     // 审查修复 M1（2026-09-25）：探针必须携带写回 store——探针期的 110
-    // 轮换一次一换，不落盘 = 烧毁唯一活 refresh_token（doctor 恰在 token
+    // 轮换可能作废旧值（保守模型），不落盘 = 烧毁唯一活 refresh_token（doctor 恰在 token
     // 疑似过期时被运行）。与 run 单卷路径同源：cwd 的 config.toml。
     let store: Arc<dyn ck_baidu::TokenStore> = Arc::new(ConfigTokenStore::default());
     baidu_backend_probe_with(cfg, &BaiduEndpoints::default(), store).await

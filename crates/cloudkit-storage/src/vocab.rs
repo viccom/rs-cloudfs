@@ -116,7 +116,8 @@ impl FromStr for RelPath {
 ///
 /// - `end = None` 表示开放区间（读到 EOF）；
 /// - `end` 越界时由驱动**钳制到 EOF**（conformance 断言②钉死）；
-/// - `start >= end`（end 为 Some 时）为非法构造 → `Invalid`。
+/// - `start > end`（end 为 Some 时）为非法构造 → `Invalid`；`start == end`
+///   是合法的**空窗**（conformance 断言②的空窗口形态，消费面产出空流）。
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub struct Range {
     pub start: u64,
@@ -125,7 +126,8 @@ pub struct Range {
 }
 
 impl Range {
-    /// 构造并校验：`end` 为 `Some` 且 `<= start` 时返回 `Invalid`。
+    /// 构造并校验：`end` 为 `Some` 且 `< start` 时返回 `Invalid`（`== start`
+    /// 是合法空窗）。
     pub fn new(start: u64, end: Option<u64>) -> Result<Self, StorageError> {
         if let Some(e) = end {
             if e < start {

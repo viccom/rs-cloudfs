@@ -8,7 +8,7 @@
 //! - **errno 111**（refresh_token 过期）/ **-6**（鉴权失败）：
 //!   `Unauthorized { recoverable: false }`，**零刷新调用**——上层给
 //!   「重新走授权流程」指引，绝不死循环（§7a）；
-//! - **刷新产物即刻持久化**：refresh_token 一次一换、旧值即刻作废
+//! - **刷新产物即刻持久化**：refresh_token 实测可复用（2026-09-25 勘误，旧值并非即刻作废），仍按保守策略即刻落盘
 //!   （spike §1 实证）——刷新响应到达即回调 [`TokenStore::save_tokens`]，
 //!   即便随后的重放失败也不回收（新 refresh_token 已是唯一活值）；
 //! - oauth 端点错误形态：顶层 `error`/`error_description` 字符串（HTTP
@@ -30,7 +30,7 @@ use cloudkit_storage::StorageError;
 /// （防重入），且应自行处理持久化失败（阻塞或吞掉由实现方决定，但不得
 /// 丢失新 refresh_token——它是唯一的活值）。
 pub trait TokenStore: Send + Sync {
-    /// 持久化刷新产物（access_token 与 refresh_token 一次一换，成对落盘）。
+    /// 持久化刷新产物（access_token 与 refresh_token 成对落盘——RT 实测可复用，保守策略不变）。
     fn save_tokens(&self, access_token: &str, refresh_token: &str);
 }
 
@@ -78,7 +78,7 @@ pub(crate) async fn refresh_grant(
         .map_err(|_| StorageError::Unavailable(format!("oauth non-json (http {status})")))?;
     if let Some(_err) = v.get("error").and_then(|e| e.as_str()) {
         // oauth 端点错误形态：顶层 error 字符串（spike api.rs:49-55 实抓）。
-        // invalid_grant = refresh_token 陈旧/失效（一次一换下旧值即刻作废）
+        // invalid_grant = refresh_token 陈旧/失效（保守模型下旧值视为不可依赖）
         // → Unauthorized{recoverable:false}（K13 三档之二）。Unauthorized
         // 无载荷位，error/error_description 明细不外带（二者不含凭据值，
         // 丢弃明细是分类学形态的既有取舍）。

@@ -14,7 +14,7 @@
 //!   through PUT; PROPPATCH answers 207 so MiniRedir does not roll
 //!   Explorer copies back);
 //! - no auth and no principal negotiation — loopback only is the
-//!   contract (production binds 127.0.0.1:8080, compat contract 1).
+//!   contract (production binds 127.0.0.1:8485, compat contract 1).
 
 use std::convert::Infallible;
 use std::net::SocketAddr;
@@ -149,7 +149,7 @@ impl RegistryHandle {
 
 impl WebDavServer {
     /// Binds `addr` and serves `fs`. Loopback no-auth is the contract
-    /// (production binds 127.0.0.1:8080); tests bind 127.0.0.1:0.
+    /// (production binds 127.0.0.1:8485); tests bind 127.0.0.1:0.
     pub async fn serve(fs: CyDriveFs, addr: SocketAddr) -> Result<Self, ServerError> {
         let listener = TcpListener::bind(addr)
             .await

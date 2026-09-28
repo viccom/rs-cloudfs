@@ -74,7 +74,7 @@ cargo build --release --no-default-features --features local       # 纯本地
 cargo build --release --no-default-features --features local,baidu # 本地+百度
 ```
 
-缺驱动的二进制运行到对应表面时得到可行动报错（给出 rebuild 命令与 backend 改法，而非隐藏命令）；`cydrive --version` 显示本构建的驱动清单与 git 身份，如 `cydrive 0.10.0-9b2ca5a6e926-dirty, (drivers: telegram, baidu, local, sftp, pan115, pan123, webdav)`——身份段 = 版本（git tag 与 crate 版本 semver 取新者）`-` 12 位提交短哈希，已跟踪文件有未提交改动时追加 `-dirty`（`git describe --dirty` 口径，未跟踪文件不计）；无 git 环境的构建回退裸 crate 版本。全关构建显示 `(drivers: none)`。裁剪掉 `sftp` 时整个 russh 协议栈都不进依赖图。
+缺驱动的二进制运行到对应表面时得到可行动报错（给出 rebuild 命令与 backend 改法，而非隐藏命令）；`cydrive --version` 显示本构建的驱动清单与 git 身份，如 `cydrive 0.12.2-08bb91170941-dirty, (drivers: telegram, baidu, local, sftp, pan115, pan123, webdav)`——身份段 = 版本（git tag 与 crate 版本 semver 取新者）`-` 12 位提交短哈希，已跟踪文件有未提交改动时追加 `-dirty`（`git describe --dirty` 口径，未跟踪文件不计）；无 git 环境的构建回退裸 crate 版本。全关构建显示 `(drivers: none)`。裁剪掉 `sftp` 时整个 russh 协议栈都不进依赖图。
 
 **三平台构建**：Windows（原生，主力）/ Linux（原生，WSL2 实测含 sftp 真机连通）均可直接编译运行；macOS 编译面已验证（交叉工具链可出 Mach-O 二进制，挂载功能未实现、运行未实机验证，SDK 许可有灰色地带）——完整指南见 [docs/platform-builds.md](docs/platform-builds.md)（命令、实测数字、四个 macOS 交叉坑的解、坑速查表）。
 
